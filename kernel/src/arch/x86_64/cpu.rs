@@ -1,7 +1,7 @@
 //! CPU tables (GDT, TSS, IDT), exception entry and control registers.
 
-use super::qemu::QemuExit;
-use super::serial::Serial;
+use super::console::BootConsole;
+use super::power::Machine;
 use crate::sync::Global;
 use core::arch::asm;
 use rhizo_core::exception::{self, ExceptionInfo};
@@ -214,8 +214,8 @@ extern "C" fn rhizo_exception_handler(frame: &ExceptionFrame) -> ! {
         rip: frame.rip,
         fault_address: (vector == exception::PAGE_FAULT).then(read_cr2),
     };
-    exception::report_exception(&mut Serial::com1(), &info);
-    QemuExit.exit(ExitStatus::Failure)
+    exception::report_exception(&mut BootConsole, &info);
+    Machine.exit(ExitStatus::Failure)
 }
 
 fn load_idt() {
@@ -250,6 +250,13 @@ pub fn init() {
 // ---------------------------------------------------------------------------
 // Control registers and TLB
 // ---------------------------------------------------------------------------
+
+/// Whether the CPU supports 1 GiB pages (`CPUID.80000001h:EDX[26]`).
+pub fn supports_1gib_pages() -> bool {
+    // CPUID leaf 0x8000_0001 exists on every x86_64 CPU.
+    let leaf = core::arch::x86_64::__cpuid(0x8000_0001);
+    leaf.edx & (1 << 26) != 0
+}
 
 /// Faulting address of the last page fault.
 pub fn read_cr2() -> u64 {

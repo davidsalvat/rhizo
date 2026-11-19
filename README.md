@@ -46,11 +46,26 @@ The proof of concept must demonstrate one measurable claim:
 > cells running real Linux programs orders of magnitude faster than today's
 > microVM- and userspace-kernel-based sandboxes.
 
-Initial targets (hypotheses to be validated, not promises):
+## Performance targets
 
-- `fork` of a ~50 MB cell: **< 1 ms**
-- `resume` from memory: **< 100 µs**
-- Overhead per idle cell: **a few KB** plus its own pages
+These are **hypotheses to validate**, not results. The comparison figures are
+what each project or its users have published, on different hardware and with
+different measurement methods, so they are orders of magnitude to aim at, not
+a like-for-like comparison. `cargo xtask bench` produces the like-for-like
+numbers (see [Benchmarks](#benchmarks)).
+
+| Metric | Rhizo target | Firecracker | Unikraft | Hyperlight |
+|---|---|---|---|---|
+| Boot: VMM launch → guest ready (KVM) | **≤ 10 ms** (kernel part ≤ 1 ms) | < 125 ms to a Linux guest accepting API calls[^fc] | < 1 ms guest boot, ~3 ms including the Firecracker VMM[^uk] | sub-millisecond partition creation, no guest OS (reported)[^hl] |
+| Resume a suspended cell / VM | **< 100 µs** (in-kernel, no VMM) | 4–28 ms snapshot restore reported[^fcr] | — | ~0.9 ms snapshot restore (hyperlight-unikraft v0.16)[^hlu] |
+| Fork a 50 MiB cell | **< 1 ms** (stretch: < 200 µs with lazy copy-on-write) | no native fork (snapshot + restore of a copy) | no native fork in the open-source core | no native fork |
+| Idle cell overhead | **a few KiB** plus its own pages | a microVM per sandbox (MiBs) | a microVM per app | a micro-VM per sandbox |
+
+[^fc]: Agache et al., *Firecracker: Lightweight Virtualization for Serverless Applications*, NSDI 2020.
+[^uk]: [Unikraft performance documentation](https://unikraft.org/docs/concepts/performance).
+[^hl]: [Firecracker vs Microsoft Hyperlight](https://www.pandastack.ai/blog/firecracker-vs-microsoft-hyperlight/) (qualitative, not an official measurement).
+[^fcr]: [Benchmarking Firecracker boot and restore](https://numavm.com/blog/2026-03-10-1-second-boot/) and [Restoring uniqueness in microVM snapshots](https://arxiv.org/pdf/2102.12892).
+[^hlu]: [hyperlight-unikraft v0.16.0 release notes](https://github.com/hyperlight-dev/hyperlight-unikraft/releases/tag/v0.16.0).
 
 ## Principles
 
@@ -69,19 +84,28 @@ Initial targets (hypotheses to be validated, not promises):
 
 ## Roadmap (proof of concept)
 
-| Milestone | Goal | Status |
-|---|---|---|
-| H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | Done |
-| H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | Done |
-| H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | — |
-| H3 | Multiple cells, scheduler, isolation tests | — |
-| H4 | Suspend / resume with snapshot-equivalence tests | — |
-| H5 | `fork(n)` with copy-on-write | — |
-| H6 | Real workload (MicroPython) with differential tests against Linux | — |
-| H7 | Reproducible benchmarks against existing sandboxes | — |
+| Milestone | Goal | Speed work (each with its benchmark) | Status |
+|---|---|---|---|
+| H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | — | Done |
+| H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | Word-level frame bitmap, zero-cost init | Done |
+| H1.5 | Fast boot and benchmarks: microvm, Firecracker, Cloud Hypervisor, fast console, release profile, CI gates | 1 GiB direct-map pages (`memory.kernel_pt_frames`, `boot.kernel_cycles`) | In progress |
+| H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | 2 MiB pages for cell memory where possible (`cell.spawn_us`, `cell.pt_frames`) | — |
+| H3 | Multiple cells, scheduler, isolation tests | PCID: no TLB flush when switching cells (`cell.switch_ns`) | — |
+| H4 | Suspend / resume with snapshot-equivalence tests | Lazy restore: snapshot pages mapped on first touch, an in-kernel analogue of Firecracker + `userfaultfd` (`cell.resume_us`, `cell.resume_touch_us`) | — |
+| H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`); pre-warmed cell templates (`cell.spawn_from_template_us`) | — |
+| H6 | Real workload (MicroPython) with differential tests against Linux | Template of a warm interpreter cell (`cell.spawn_from_template_us`) | — |
+| H7 | Reproducible benchmarks against existing sandboxes | Dedicated KVM machine with tight thresholds | — |
 
 Out of scope for the proof of concept: networking, multicore, real disks,
 hardware other than virtio/QEMU, full CPython, SDKs.
+
+## Benchmarks
+
+<!-- bench:start -->
+_No timing results yet._
+<!-- bench:end -->
+
+How benchmarks, environments and baselines work: [`bench/README.md`](bench/README.md).
 
 ## Getting started
 
@@ -101,22 +125,26 @@ Commands:
 | Command | What it does |
 |---|---|
 | `cargo xtask build` | Build the kernel image |
-| `cargo xtask run` | Build and boot the kernel in QEMU, serial output on your terminal |
+| `cargo xtask run` | Build and boot the kernel (QEMU `microvm` by default; `--vmm firecracker`, `--vmm cloud-hypervisor`, `--machine q35`) and report the time to ready |
 | `cargo test` | Host tests only (no QEMU needed) |
 | `cargo xtask test` | Host tests, boot check, in-kernel tests in QEMU and harness self-checks |
+| `cargo xtask bench` | Release-build boot benchmarks on every available VMM, against a reference Linux guest |
 | `cargo xtask ci` | Everything CI runs: formatting, clippy and all tests |
 
 A successful boot looks like this:
 
 ```
 Rhizo 0.1.0
-memory: 126 MiB usable, 126 MiB free
-boot time: 15231730 cycles
+memory: 126 MiB usable, 126 MiB free, 5 page-table frames
+rhizo-ready cycles=13759354
+boot time: 13759354 cycles
 boot complete
+[xtask] qemu-microvm: time to ready 51.18 ms (host), 13759354 kernel cycles
 ```
 
 QEMU uses KVM automatically when `/dev/kvm` is available and falls back to
-emulation otherwise (slower; boot-time numbers are then not meaningful).
+emulation otherwise (slower; timings are then not meaningful). Firecracker and
+Cloud Hypervisor need KVM; `xtask` downloads pinned releases on first use.
 
 ## Repository layout
 

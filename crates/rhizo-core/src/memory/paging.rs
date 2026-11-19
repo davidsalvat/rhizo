@@ -18,7 +18,7 @@ impl PageFlags {
     pub const WRITABLE: Self = Self(1 << 1);
     /// Accessible from user mode.
     pub const USER: Self = Self(1 << 2);
-    /// Entry maps a large page (2 MiB at the PD level).
+    /// Entry maps a large page (2 MiB at the PD level, 1 GiB at the PDPT level).
     pub const HUGE: Self = Self(1 << 7);
     /// Instruction fetches not allowed (requires `EFER.NXE`).
     pub const NO_EXECUTE: Self = Self(1 << 63);
@@ -68,6 +68,8 @@ pub enum PageSize {
     Small,
     /// 2 MiB page.
     Large,
+    /// 1 GiB page (requires CPU support for 1 GiB pages).
+    Huge,
 }
 
 impl PageSize {
@@ -76,9 +78,30 @@ impl PageSize {
         match self {
             PageSize::Small => FRAME_SIZE,
             PageSize::Large => LARGE_PAGE_SIZE,
+            PageSize::Huge => HUGE_PAGE_SIZE,
+        }
+    }
+
+    /// Page-table level of the leaf entry (0 = PT, 1 = PD, 2 = PDPT).
+    const fn leaf_level(self) -> u32 {
+        match self {
+            PageSize::Small => 0,
+            PageSize::Large => 1,
+            PageSize::Huge => 2,
+        }
+    }
+
+    const fn from_leaf_level(level: u32) -> Self {
+        match level {
+            0 => PageSize::Small,
+            1 => PageSize::Large,
+            _ => PageSize::Huge,
         }
     }
 }
+
+/// Size of a huge (1 GiB) page.
+pub const HUGE_PAGE_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Why a mapping could not be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,10 +200,7 @@ impl PageTable {
         {
             return Err(MapError::Misaligned);
         }
-        let leaf_level = match size {
-            PageSize::Small => 0,
-            PageSize::Large => 1,
-        };
+        let leaf_level = size.leaf_level();
 
         let mut table = self.root;
         for level in (leaf_level + 1..=3).rev() {
@@ -203,7 +223,7 @@ impl PageTable {
             return Err(MapError::AlreadyMapped(virt));
         }
         let mut bits = phys | flags.0 | PageFlags::PRESENT.0;
-        if size == PageSize::Large {
+        if size != PageSize::Small {
             bits |= PageFlags::HUGE.0;
         }
         mem.write_u64(slot, bits);
@@ -213,11 +233,7 @@ impl PageTable {
     /// Returns the physical address and flags `virt` maps to, if any.
     pub fn translate(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<Translation> {
         let (entry, level) = self.leaf(mem, virt)?;
-        let size = if level == 1 {
-            PageSize::Large
-        } else {
-            PageSize::Small
-        };
+        let size = PageSize::from_leaf_level(level);
         let offset = virt & (size.bytes() - 1);
         let base = entry & ADDR_MASK & !(size.bytes() - 1);
         Some(Translation {
@@ -238,11 +254,7 @@ impl PageTable {
         let (slot, entry, level) = self
             .leaf_slot(mem, virt)
             .ok_or(UnmapError::NotMapped(virt))?;
-        let size = if level == 1 {
-            PageSize::Large
-        } else {
-            PageSize::Small
-        };
+        let size = PageSize::from_leaf_level(level);
         mem.write_u64(slot, 0);
         tlb.flush_page(virt & !(size.bytes() - 1));
         Ok((entry & ADDR_MASK & !(size.bytes() - 1), size))
@@ -265,12 +277,8 @@ impl PageTable {
             if entry & PageFlags::PRESENT.0 == 0 {
                 return None;
             }
-            if level == 0 || (level == 1 && entry & PageFlags::HUGE.0 != 0) {
+            if level == 0 || (level <= 2 && entry & PageFlags::HUGE.0 != 0) {
                 return Some((slot, entry, level));
-            }
-            if entry & PageFlags::HUGE.0 != 0 {
-                // 1 GiB pages are not created by Rhizo.
-                return None;
             }
             table = entry & ADDR_MASK;
         }
@@ -342,6 +350,72 @@ mod tests {
         assert_eq!(t.phys, 0x21_2345);
         assert_eq!(t.size, PageSize::Large);
         assert!(!t.flags.contains(PageFlags::HUGE), "HUGE is internal");
+    }
+
+    #[test]
+    fn huge_pages_translate_and_unmap() {
+        let mut mem = FakePhysicalMemory::new();
+        let mut alloc = frames();
+        let pt = PageTable::new(&mut mem, &mut alloc).unwrap();
+        let virt = 0xffff_8000_4000_0000;
+        pt.map(
+            &mut mem,
+            &mut alloc,
+            virt,
+            HUGE_PAGE_SIZE,
+            PageSize::Huge,
+            RW_NX,
+        )
+        .unwrap();
+        let t = pt.translate(&mem, virt + 0x1234_5678).unwrap();
+        assert_eq!(t.phys, HUGE_PAGE_SIZE + 0x1234_5678);
+        assert_eq!(t.size, PageSize::Huge);
+        assert!(t.flags.is_writable() && !t.flags.is_executable());
+
+        // Nothing smaller can be mapped inside it, and it needs no PD or PT.
+        assert_eq!(
+            pt.map(
+                &mut mem,
+                &mut alloc,
+                virt + 0x20_0000,
+                0,
+                PageSize::Large,
+                RW_NX
+            ),
+            Err(MapError::AlreadyMapped(virt + 0x20_0000))
+        );
+        let mut tlb = RecordingTlb::default();
+        assert_eq!(
+            pt.unmap(&mut mem, &mut tlb, virt + 0x1000),
+            Ok((HUGE_PAGE_SIZE, PageSize::Huge))
+        );
+        assert_eq!(tlb.flushed, vec![virt]);
+        assert_eq!(
+            pt.map(&mut mem, &mut alloc, virt, 0x1000, PageSize::Huge, RW_NX),
+            Err(MapError::Misaligned)
+        );
+    }
+
+    #[test]
+    fn huge_page_needs_only_root_and_pdpt() {
+        let mut mem = FakePhysicalMemory::new();
+        let mut count = 0;
+        let mut inner = frames();
+        let mut alloc = || {
+            count += 1;
+            inner()
+        };
+        let pt = PageTable::new(&mut mem, &mut alloc).unwrap();
+        pt.map(
+            &mut mem,
+            &mut alloc,
+            0xffff_8000_0000_0000,
+            0,
+            PageSize::Huge,
+            RW_NX,
+        )
+        .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

@@ -49,6 +49,12 @@ This repository uses spec-driven development with
 6. **Cell state must be serializable.** Any per-cell kernel state (memory,
    registers, file descriptors, timers…) must be designed so it can be
    snapshotted and cloned. This is the core of the project.
+7. **Speed first.** Among correct options, choose the fastest. Every
+   optimization ships with a benchmark that demonstrates it (a metric in
+   `cargo xtask bench`, see `bench/README.md`).
+8. **No silent regressions.** No pull request may make a benchmark metric
+   worse without a written justification in the pull request; updating
+   `bench/baseline.json` is an explicit, justified change.
 
 ## Conventions
 
@@ -69,6 +75,11 @@ Requires the Rust toolchain (via rustup) and `qemu-system-x86_64`.
   harness self-checks.
 - `cargo xtask ci`: formatting, clippy (host crates and every kernel feature
   set) and all tests. **Run this before proposing any change.**
+- `cargo xtask bench`: release-build boot benchmarks per VMM; add
+  `--env ci --check` to compare with the stored baseline.
+- VMMs: `--vmm qemu-microvm` (default), `qemu-q35`, `firecracker`,
+  `cloud-hypervisor` (the last two need KVM). The kernel reads `console=` and
+  `exit=` from the PVH command line; `xtask` passes the right values.
 
 Layout and where code belongs:
 

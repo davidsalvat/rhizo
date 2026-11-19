@@ -15,7 +15,7 @@ use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
 macro_rules! suite {
     ($($extra:path),* $(,)?) => {
         &[
-            ktest_case!(serial_output_works),
+            ktest_case!(console_output_works),
             ktest_case!(cycle_counter_is_monotonic),
             ktest_case!(boot_cycles_precede_now),
             ktest_case!(start_info_has_pvh_magic),
@@ -24,6 +24,7 @@ macro_rules! suite {
             ktest_case!(kernel_code_is_executable_not_writable),
             ktest_case!(kernel_data_is_writable_not_executable),
             ktest_case!(stack_guard_page_is_unmapped),
+            ktest_case!(direct_map_uses_largest_pages),
             ktest_case!(frames_are_unique_and_aligned),
             ktest_case!(contiguous_frames),
             ktest_case!(map_use_and_unmap_a_page),
@@ -73,9 +74,8 @@ pub static ALL: &[TestCase] = suite!(allocate_too_much);
 
 // --- H0 tests ---------------------------------------------------------------
 
-fn serial_output_works() {
-    let mut serial = arch::serial::Serial::com1();
-    serial.write_bytes(b"[serial] ");
+fn console_output_works() {
+    arch::console::BootConsole.write_bytes(b"[console] ");
 }
 
 fn cycle_counter_is_monotonic() {
@@ -140,6 +140,19 @@ fn stack_guard_page_is_unmapped() {
     let guard = arch::boot::layout::stack_guard();
     assert_eq!(memory::translate(guard), None);
     assert!(memory::translate(guard + FRAME_SIZE).is_some());
+}
+
+fn direct_map_uses_largest_pages() {
+    use rhizo_core::memory::paging::PageSize;
+    let t = memory::translate(DirectMap::virt(0x20_1000)).expect("direct map present");
+    assert_eq!(t.phys, 0x20_1000);
+    let expected = if arch::cpu::supports_1gib_pages() {
+        PageSize::Huge
+    } else {
+        PageSize::Large
+    };
+    assert_eq!(t.size, expected);
+    assert!(t.flags.is_writable() && !t.flags.is_executable());
 }
 
 // --- Physical memory --------------------------------------------------------
