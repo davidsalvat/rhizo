@@ -2,6 +2,7 @@
 //! timing it from the host, and deciding how the run ended.
 
 use crate::Result;
+use crate::arch::{self, Arch};
 use crate::tools;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -23,9 +24,11 @@ pub const READY_MARKER: &str = "rhizo-ready";
 /// A supported virtual machine monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Vmm {
-    /// QEMU `microvm` machine (default).
+    /// QEMU `virt` machine (AArch64 default).
+    QemuVirt,
+    /// QEMU `microvm` machine (x86_64 default).
     QemuMicrovm,
-    /// QEMU `q35` machine.
+    /// QEMU `q35` machine (x86_64).
     QemuQ35,
     /// Firecracker.
     Firecracker,
@@ -34,17 +37,28 @@ pub enum Vmm {
 }
 
 impl Vmm {
-    /// Every VMM, in the order benchmarks report them.
-    pub const ALL: [Vmm; 4] = [
-        Vmm::QemuMicrovm,
-        Vmm::QemuQ35,
-        Vmm::Firecracker,
-        Vmm::CloudHypervisor,
-    ];
+    /// The VMMs of an architecture, in the order benchmarks report them.
+    pub fn for_arch(arch: Arch) -> &'static [Vmm] {
+        match arch {
+            Arch::Aarch64 => &[Vmm::QemuVirt, Vmm::Firecracker, Vmm::CloudHypervisor],
+            Arch::X86_64 => &[
+                Vmm::QemuMicrovm,
+                Vmm::QemuQ35,
+                Vmm::Firecracker,
+                Vmm::CloudHypervisor,
+            ],
+        }
+    }
+
+    /// The default VMM of an architecture.
+    pub fn default_for(arch: Arch) -> Vmm {
+        Vmm::for_arch(arch)[0]
+    }
 
     /// Stable identifier used on the command line and in results.
     pub fn id(self) -> &'static str {
         match self {
+            Vmm::QemuVirt => "qemu-virt",
             Vmm::QemuMicrovm => "qemu-microvm",
             Vmm::QemuQ35 => "qemu-q35",
             Vmm::Firecracker => "firecracker",
@@ -52,15 +66,18 @@ impl Vmm {
         }
     }
 
-    /// Parses an identifier (also accepts `microvm` and `q35`).
+    /// Parses an identifier (also accepts `virt`, `microvm` and `q35`).
     pub fn parse(name: &str) -> Result<Self> {
         match name {
-            "qemu-microvm" | "microvm" | "qemu" => Ok(Vmm::QemuMicrovm),
+            "qemu-virt" | "virt" => Ok(Vmm::QemuVirt),
+            "qemu-microvm" | "microvm" => Ok(Vmm::QemuMicrovm),
             "qemu-q35" | "q35" => Ok(Vmm::QemuQ35),
+            "qemu" => Ok(Vmm::default_for(arch::current())),
             "firecracker" | "fc" => Ok(Vmm::Firecracker),
             "cloud-hypervisor" | "ch" => Ok(Vmm::CloudHypervisor),
             other => Err(format!(
-                "unknown VMM `{other}` (expected qemu-microvm, qemu-q35, firecracker or cloud-hypervisor)"
+                "unknown VMM `{other}` (expected qemu-virt, qemu-microvm, qemu-q35, firecracker \
+                 or cloud-hypervisor)"
             )),
         }
     }
@@ -70,27 +87,46 @@ impl Vmm {
         matches!(self, Vmm::Firecracker | Vmm::CloudHypervisor)
     }
 
-    /// Whether the VMM reports the kernel's success/failure as its exit status.
-    fn has_exit_device(self) -> bool {
-        matches!(self, Vmm::QemuMicrovm | Vmm::QemuQ35)
+    /// Whether the run's exit status carries the kernel's success/failure:
+    /// QEMU's exit device on x86_64, semihosting under emulation on AArch64.
+    fn has_exit_device(self, kvm: bool) -> bool {
+        match self {
+            Vmm::QemuMicrovm | Vmm::QemuQ35 => true,
+            Vmm::QemuVirt => !kvm,
+            _ => false,
+        }
     }
 
     /// Command-line options telling the Rhizo kernel how to talk to this VMM.
-    fn rhizo_cmdline(self) -> &'static str {
+    fn rhizo_cmdline(self, kvm: bool) -> &'static str {
         match self {
             Vmm::QemuMicrovm | Vmm::QemuQ35 => "console=e9 exit=debug-exit",
+            Vmm::QemuVirt if kvm => "console=serial exit=psci",
+            Vmm::QemuVirt => "console=serial exit=semihosting",
+            Vmm::Firecracker if arch::current() == Arch::Aarch64 => "console=serial exit=psci",
             Vmm::Firecracker => "console=serial exit=i8042",
+            Vmm::CloudHypervisor if arch::current() == Arch::Aarch64 => "console=serial exit=psci",
             Vmm::CloudHypervisor => "console=e9 exit=ch-acpi",
         }
     }
 
     /// Why this VMM cannot run here, if it cannot.
     pub fn unavailable_reason(self, accel: Accel) -> Option<String> {
+        let arch = arch::current();
+        if !Vmm::for_arch(arch).contains(&self) {
+            return Some(format!("not a VMM for {}", arch.id()));
+        }
         if self.requires_kvm() && !kvm_available() {
-            return Some("needs KVM (/dev/kvm is not usable here)".into());
+            return Some(format!(
+                "needs KVM for {} guests (/dev/kvm unusable, or the host is not {})",
+                arch.id(),
+                arch.id()
+            ));
         }
         if !self.requires_kvm() && accel == Accel::Kvm && !kvm_available() {
-            return Some("--accel kvm requested but /dev/kvm is not usable".into());
+            return Some(
+                "--accel kvm requested but KVM is not usable for this architecture".into(),
+            );
         }
         None
     }
@@ -129,13 +165,15 @@ impl Accel {
     }
 }
 
-/// Whether `/dev/kvm` can be opened for reading and writing.
+/// Whether KVM can run guests of the selected architecture: `/dev/kvm` opens
+/// for reading and writing, and the host CPU has that architecture.
 pub fn kvm_available() -> bool {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
+    arch::current().is_native()
+        && OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
 }
 
 /// What to boot.
@@ -220,20 +258,32 @@ pub fn parse_ready_cycles(output: &str) -> Option<u64> {
 /// Builds the command that launches `guest` on `vmm`.
 fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
     match vmm {
-        Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
+        Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
         Vmm::Firecracker => firecracker_command(guest, scratch),
         Vmm::CloudHypervisor => cloud_hypervisor_command(guest),
     }
 }
 
-/// Reference guest command line. `earlyprintk` is needed on QEMU `microvm`,
-/// where Linux otherwise registers no serial console and `/init` output is lost.
-const LINUX_CMDLINE: &str = "console=ttyS0 earlyprintk=ttyS0 quiet loglevel=0 panic=-1 \
-                             reboot=k pci=off nomodule rdinit=/init";
+/// Reference guest command line for `vmm`. `earlyprintk` is needed on QEMU
+/// `microvm`, where Linux otherwise registers no serial console and `/init`
+/// output is lost. On AArch64 the console is the PL011 (`ttyAMA0`) except on
+/// Firecracker, which emulates a 16550 (`ttyS0`).
+fn linux_cmdline(vmm: Vmm) -> &'static str {
+    match (arch::current(), vmm) {
+        (Arch::X86_64, _) => {
+            "console=ttyS0 earlyprintk=ttyS0 quiet loglevel=0 panic=-1 reboot=k pci=off \
+             nomodule rdinit=/init"
+        }
+        (Arch::Aarch64, Vmm::Firecracker) => {
+            "console=ttyS0 quiet loglevel=0 panic=-1 nomodule rdinit=/init"
+        }
+        (Arch::Aarch64, _) => "console=ttyAMA0 quiet loglevel=0 panic=-1 nomodule rdinit=/init",
+    }
+}
 
 fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
-    let qemu = std::env::var("RHIZO_QEMU").unwrap_or_else(|_| "qemu-system-x86_64".into());
-    let mut cmd = Command::new(qemu);
+    let kvm = opts.accel.uses_kvm();
+    let mut cmd = Command::new(arch::current().qemu());
     // The microvm option ROM must stay enabled: it implements PVH boot for
     // -kernel. Each guest gets the smallest machine it needs: Rhizo needs no
     // legacy timers or interrupt controller; Linux needs them to calibrate its
@@ -245,25 +295,33 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
         (Vmm::QemuMicrovm, Guest::ReferenceLinux { .. }) => {
             cmd.args(["-M", "microvm,isa-serial=on"])
         }
+        (Vmm::QemuVirt, _) => cmd.args(["-M", "virt"]),
         _ => cmd.args(["-M", "q35"]),
     };
-    cmd.args([
-        "-cpu",
-        "max",
-        "-m",
-        "128M",
-        "-nodefaults",
-        "-no-user-config",
-    ])
-    .args(["-display", "none", "-no-reboot"])
-    .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-    .args(["-accel", if opts.accel.uses_kvm() { "kvm" } else { "tcg" }]);
+    let cpu = if vmm == Vmm::QemuVirt && kvm {
+        "host"
+    } else {
+        "max"
+    };
+    cmd.args(["-cpu", cpu, "-m", "128M", "-nodefaults", "-no-user-config"])
+        .args(["-display", "none", "-no-reboot"])
+        .args(["-accel", if kvm { "kvm" } else { "tcg" }]);
+    if vmm != Vmm::QemuVirt {
+        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    } else if !kvm {
+        // Semihosting gives the run an exit status under emulation.
+        cmd.arg("-semihosting");
+    }
     match guest {
         Guest::Rhizo(kernel) => {
-            cmd.args(["-debugcon", "stdio", "-serial", "none"])
-                .arg("-kernel")
+            if vmm == Vmm::QemuVirt {
+                cmd.args(["-serial", "stdio"]);
+            } else {
+                cmd.args(["-debugcon", "stdio", "-serial", "none"]);
+            }
+            cmd.arg("-kernel")
                 .arg(kernel)
-                .args(["-append", vmm.rhizo_cmdline()]);
+                .args(["-append", vmm.rhizo_cmdline(kvm)]);
         }
         Guest::ReferenceLinux { kernel, initramfs } => {
             cmd.args(["-serial", "stdio"])
@@ -271,7 +329,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
                 .arg(kernel)
                 .arg("-initrd")
                 .arg(initramfs)
-                .args(["-append", LINUX_CMDLINE]);
+                .args(["-append", linux_cmdline(vmm)]);
         }
     }
     if opts.gdb {
@@ -283,10 +341,12 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
 fn firecracker_command(guest: &Guest, scratch: &Path) -> Result<Command> {
     let binary = tools::firecracker()?;
     let (kernel, initrd, args) = match guest {
-        Guest::Rhizo(kernel) => (kernel.clone(), None, Vmm::Firecracker.rhizo_cmdline()),
-        Guest::ReferenceLinux { kernel, initramfs } => {
-            (kernel.clone(), Some(initramfs.clone()), LINUX_CMDLINE)
-        }
+        Guest::Rhizo(kernel) => (kernel.clone(), None, Vmm::Firecracker.rhizo_cmdline(true)),
+        Guest::ReferenceLinux { kernel, initramfs } => (
+            kernel.clone(),
+            Some(initramfs.clone()),
+            linux_cmdline(Vmm::Firecracker),
+        ),
     };
     let initrd_json = match &initrd {
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
@@ -324,15 +384,19 @@ fn cloud_hypervisor_command(guest: &Guest) -> Result<Command> {
         Guest::Rhizo(kernel) => {
             cmd.arg("--kernel")
                 .arg(kernel)
-                .args(["--cmdline", Vmm::CloudHypervisor.rhizo_cmdline()])
-                .args(["--serial", "off", "--debug-console", "tty"]);
+                .args(["--cmdline", Vmm::CloudHypervisor.rhizo_cmdline(true)]);
+            if arch::current() == Arch::X86_64 {
+                cmd.args(["--serial", "off", "--debug-console", "tty"]);
+            } else {
+                cmd.args(["--serial", "tty"]);
+            }
         }
         Guest::ReferenceLinux { kernel, initramfs } => {
             cmd.arg("--kernel")
                 .arg(kernel)
                 .arg("--initramfs")
                 .arg(initramfs)
-                .args(["--cmdline", LINUX_CMDLINE])
+                .args(["--cmdline", linux_cmdline(Vmm::CloudHypervisor)])
                 .args(["--serial", "tty"]);
         }
     }
@@ -412,7 +476,7 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
             break VmResult::StoppedAtReady;
         }
         match child.try_wait() {
-            Ok(Some(status)) => break finish(vmm, status.code(), &captured),
+            Ok(Some(status)) => break finish(vmm, opts.accel.uses_kvm(), status.code(), &captured),
             Ok(None) if started.elapsed() >= opts.timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -454,8 +518,8 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
     })
 }
 
-fn finish(vmm: Vmm, code: Option<i32>, captured: &Mutex<Vec<u8>>) -> VmResult {
-    if vmm.has_exit_device() {
+fn finish(vmm: Vmm, kvm: bool, code: Option<i32>, captured: &Mutex<Vec<u8>>) -> VmResult {
+    if vmm.has_exit_device(kvm) {
         interpret_exit(code)
     } else {
         let output = String::from_utf8_lossy(&captured.lock().expect("capture lock")).into_owned();
@@ -515,21 +579,50 @@ mod tests {
 
     #[test]
     fn vmm_names_round_trip() {
-        for vmm in Vmm::ALL {
-            assert_eq!(Vmm::parse(vmm.id()), Ok(vmm));
+        for arch in [Arch::Aarch64, Arch::X86_64] {
+            for &vmm in Vmm::for_arch(arch) {
+                assert_eq!(Vmm::parse(vmm.id()), Ok(vmm));
+            }
         }
         assert_eq!(Vmm::parse("q35"), Ok(Vmm::QemuQ35));
+        assert_eq!(Vmm::parse("virt"), Ok(Vmm::QemuVirt));
         assert!(Vmm::parse("xen").is_err());
+        assert_eq!(Vmm::default_for(Arch::Aarch64), Vmm::QemuVirt);
+        assert_eq!(Vmm::default_for(Arch::X86_64), Vmm::QemuMicrovm);
     }
 
     #[test]
     fn rhizo_cmdlines_pick_console_and_exit() {
-        assert!(Vmm::Firecracker.rhizo_cmdline().contains("console=serial"));
-        assert!(
-            Vmm::CloudHypervisor
-                .rhizo_cmdline()
-                .contains("exit=ch-acpi")
+        assert_eq!(
+            Vmm::QemuMicrovm.rhizo_cmdline(false),
+            "console=e9 exit=debug-exit"
         );
-        assert!(Vmm::QemuMicrovm.rhizo_cmdline().contains("console=e9"));
+        assert_eq!(
+            Vmm::QemuVirt.rhizo_cmdline(false),
+            "console=serial exit=semihosting"
+        );
+        assert_eq!(
+            Vmm::QemuVirt.rhizo_cmdline(true),
+            "console=serial exit=psci"
+        );
+        assert!(
+            Vmm::Firecracker
+                .rhizo_cmdline(true)
+                .contains("console=serial")
+        );
+    }
+
+    #[test]
+    fn exit_status_carriers() {
+        assert!(Vmm::QemuQ35.has_exit_device(true));
+        assert!(
+            Vmm::QemuVirt.has_exit_device(false),
+            "semihosting under emulation"
+        );
+        assert!(
+            !Vmm::QemuVirt.has_exit_device(true),
+            "no semihosting under KVM"
+        );
+        assert!(!Vmm::Firecracker.has_exit_device(true));
     }
 }

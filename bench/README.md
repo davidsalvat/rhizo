@@ -7,6 +7,12 @@ way. Firecracker and Cloud Hypervisor need KVM.
 
 ## Known issues
 
+- The arm64 reference kernel (Firecracker's CI build) has no PL011 driver,
+  which is the UART of QEMU `virt` and Cloud Hypervisor, so on AArch64 the
+  reference Linux guest is measured on Firecracker only. A reference kernel
+  with both drivers would fix this.
+- GitHub's ARM64 runners do not expose KVM, so AArch64 CI runs are emulated
+  and AArch64 benchmarks need the `dedicated` environment below.
 - The reference Linux guest is not measured on QEMU `microvm`: it resets right
   after KASLR setup, before `/init`, both with and without KVM. It is measured
   on QEMU `q35`, Firecracker and Cloud Hypervisor.
@@ -40,6 +46,39 @@ machines whose TSC frequencies differ, so cycle counts are not comparable
 between runs there. The `ci` gate therefore only catches gross regressions
 (for example, a boot that doubles); the `dedicated` run is the precise one. It runs from the `bench-dedicated` workflow, started manually
 (Actions → bench-dedicated → Run workflow) once such a runner is registered.
+
+## Measuring on real ARM64 hardware (`dedicated`)
+
+Any ARM64 Linux machine with KVM works; the benchmarks only need QEMU,
+Firecracker and Cloud Hypervisor to run guests with hardware acceleration.
+
+| Machine | Notes |
+|---|---|
+| Raspberry Pi 5 (8 GB) | Cortex-A76; use a 64-bit OS with KVM enabled (Raspberry Pi OS 64-bit or Ubuntu Server). Cheapest option; thermal throttling: add a fan and fix the CPU governor |
+| Orange Pi 5 / RK3588 boards | Cortex-A76 + A55: pin the benchmark to the big cores (`taskset -c 4-7`) |
+| Cloud bare metal | AWS Graviton `*.metal` (e.g. `c7g.metal`), Ampere Altra servers (Oracle A1 bare metal, Hetzner RX): closest to production |
+
+Setup, once:
+
+```bash
+sudo apt-get install -y qemu-system-arm
+```
+
+```bash
+ls -l /dev/kvm
+```
+
+```bash
+sudo cpupower frequency-set -g performance
+```
+
+Then register the machine as a self-hosted GitHub Actions runner with the
+labels `self-hosted`, `rhizo-bench` and `arm64`, and start the
+`bench-dedicated` workflow with `arch: aarch64`. The first run downloads the
+AArch64 Firecracker and Cloud Hypervisor releases, which are not pinned yet:
+check them, add their SHA-256 to `xtask/src/tools.rs` (the run prints them),
+and commit the result before trusting the numbers. To try once before
+pinning: `RHIZO_ALLOW_UNPINNED=1 cargo xtask bench`.
 
 ## Updating a baseline
 

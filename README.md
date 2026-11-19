@@ -38,6 +38,32 @@ The name comes from the *rhizome*: an underground stem that branches into
 independent shoots (fork), can regrow a whole plant from a fragment (snapshot)
 and lies dormant until it sprouts again (suspend/resume).
 
+## Why ARM64
+
+AArch64 is the primary architecture; x86_64 is kept as a second one behind
+the same `arch/` boundary (see below). Rhizo's primitives are dominated by
+address-space and TLB costs, and AArch64 handles those better:
+
+- **16-bit ASIDs.** Each address space carries one of 65,536 tags (x86_64 has
+  4,096 PCIDs), so thousands of cells keep their TLB entries across switches
+  instead of flushing them.
+- **TLB invalidation broadcast in hardware.** `TLBI ... IS` removes a stale
+  translation on every core at once. x86_64 needs inter-processor interrupts
+  (TLB shootdowns) for the same thing, which is what copy-on-write `fork` and
+  unmapping do all the time.
+- **Lighter virtualization.** A dedicated hypervisor level (EL2, with VHE) and
+  a simple boot protocol (an image header and a device tree, no firmware, no
+  legacy devices) mean smaller VMMs and faster guest entry.
+- **Server efficiency.** Graviton, Ampere and Cobalt instances give more cores
+  per watt and per dollar, which matters for dense, mostly idle cells.
+
+Why x86_64 stays: GitHub's x86_64 runners are the only place where CI can
+measure with KVM today (the ARM64 runners do not expose it), and the sandboxes
+Rhizo is compared with (Agent Substrate, Firecracker, E2B) run mostly on
+x86_64. Shared code is written once; only the thin `arch/` layer exists twice,
+and every spec is tested on both. The trade-offs are in
+[`openspec/changes/archive/*switch-to-arm64*/design.md`](openspec/changes/archive/).
+
 ## Thesis
 
 The proof of concept must demonstrate one measurable claim:
@@ -89,8 +115,9 @@ numbers (see [Benchmarks](#benchmarks)).
 | H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | — | Done |
 | H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | Word-level frame bitmap, zero-cost init | Done |
 | H1.5 | Fast boot and benchmarks: microvm, Firecracker, Cloud Hypervisor, fast console, release profile, CI gates | 1 GiB direct-map pages (`memory.kernel_pt_frames`, `boot.kernel_cycles`) | Done |
+| H1.6 | AArch64 as primary architecture (QEMU `virt`, Firecracker, Cloud Hypervisor), x86_64 kept as second | 1 GiB blocks for the direct map; broadcast TLB invalidation | In progress |
 | H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | 2 MiB pages for cell memory where possible (`cell.spawn_us`, `cell.pt_frames`) | — |
-| H3 | Multiple cells, scheduler, isolation tests | PCID: no TLB flush when switching cells (`cell.switch_ns`) | — |
+| H3 | Multiple cells, scheduler, isolation tests | ASIDs (PCID on x86_64): no TLB flush when switching cells (`cell.switch_ns`) | — |
 | H4 | Suspend / resume with snapshot-equivalence tests | Lazy restore: snapshot pages mapped on first touch, an in-kernel analogue of Firecracker + `userfaultfd` (`cell.resume_us`, `cell.resume_touch_us`) | — |
 | H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`); pre-warmed cell templates (`cell.spawn_from_template_us`) | — |
 | H6 | Real workload (MicroPython) with differential tests against Linux | Template of a warm interpreter cell (`cell.spawn_from_template_us`) | — |
@@ -126,52 +153,56 @@ How benchmarks, environments and baselines work: [`bench/README.md`](bench/READM
 
 Prerequisites:
 
-- [rustup](https://rustup.rs). The pinned toolchain (`rust-toolchain.toml`) is
-  installed automatically on first use.
-- QEMU for x86_64 (`qemu-system-x86_64`), version 8.2 or later is verified by
-  CI; any version with PVH boot support (4.0+) should work. On Debian/Ubuntu:
+- [rustup](https://rustup.rs). The pinned toolchain (`rust-toolchain.toml`,
+  with both kernel targets) is installed automatically on first use.
+- QEMU 8.2 or later (verified by CI). AArch64 is the default architecture;
+  install the x86_64 emulator too to work on both. On Debian/Ubuntu:
 
 ```bash
-sudo apt-get install qemu-system-x86
+sudo apt-get install qemu-system-arm qemu-system-x86
 ```
 
-Commands:
+Commands (add `--arch x86_64` right after `cargo xtask` for the second
+architecture):
 
 | Command | What it does |
 |---|---|
+| `cargo xtask check` | Fast loop, about a second: format, lints, host tests, crate rules |
 | `cargo xtask build` | Build the kernel image |
-| `cargo xtask run` | Build and boot the kernel (QEMU `microvm` by default; `--vmm firecracker`, `--vmm cloud-hypervisor`, `--machine q35`) and report the time to ready |
-| `cargo test` | Host tests only (no QEMU needed) |
-| `cargo xtask test` | Host tests, boot check, in-kernel tests in QEMU and harness self-checks |
+| `cargo xtask run` | Build and boot the kernel (QEMU `virt` on AArch64, `microvm` on x86_64; `--vmm firecracker`, `--vmm cloud-hypervisor`) and report the time to ready |
+| `cargo xtask test` | Host tests, boot check, in-kernel tests and harness self-checks |
 | `cargo xtask bench` | Release-build boot benchmarks on every available VMM, against a reference Linux guest |
-| `cargo xtask ci` | Everything CI runs: formatting, clippy and all tests |
+| `cargo xtask ci` | Everything CI runs for one architecture |
 
-A successful boot looks like this:
+A successful boot on AArch64 (QEMU `virt`, emulated) looks like this:
 
 ```
 Rhizo 0.1.0
-memory: 126 MiB usable, 126 MiB free, 5 page-table frames
-rhizo-ready cycles=13759354
-boot time: 13759354 cycles
+memory: 126 MiB usable, 126 MiB free, 9 page-table frames
+rhizo-ready cycles=1114569
+boot time: 1114569 cycles (17833 us)
 boot complete
-[xtask] qemu-microvm: time to ready 51.18 ms (host), 13759354 kernel cycles
 ```
 
-QEMU uses KVM automatically when `/dev/kvm` is available and falls back to
-emulation otherwise (slower; timings are then not meaningful). Firecracker and
-Cloud Hypervisor need KVM; `xtask` downloads pinned releases on first use.
+QEMU uses KVM automatically when `/dev/kvm` is available and the host CPU has
+the kernel's architecture, and falls back to emulation otherwise (timings are
+then not meaningful). Firecracker and Cloud Hypervisor need KVM; `xtask`
+downloads pinned releases on first use.
 
 ## Repository layout
 
 ```
-kernel/              Bootable kernel image (x86_64-unknown-none)
-  src/arch/x86_64/   PVH boot trampoline and hardware drivers
-crates/rhizo-hal/    Hardware interfaces (traits) and host test doubles
-crates/rhizo-core/   Hardware-independent kernel logic, tested on the host
-xtask/               Developer tool: build, run, test, ci
-openspec/            Specifications and change proposals (spec-driven development)
-AGENTS.md            Instructions for AI coding agents (open standard, any vendor)
-CONTRIBUTING.md      How to contribute, with or without AI tools
+kernel/                Bootable kernel image
+  src/arch/aarch64/    Image header and EL1 entry, MMU, vectors, PL011/16550, PSCI
+  src/arch/x86_64/     PVH entry, paging, IDT/GDT, serial and debug port
+crates/rhizo-hal/      Hardware interfaces (traits) and host test doubles
+crates/rhizo-core/     Boot reports, options, device tree, exception reports
+crates/rhizo-mm/       Frames, page tables (both entry formats), heap
+xtask/                 Developer tool: check, build, run, test, bench, ci
+openspec/              Specifications and change proposals (spec-driven development)
+.agents/skills/        Project skills (open Agent Skills format)
+AGENTS.md              Instructions for AI coding agents (open standard, any vendor)
+CONTRIBUTING.md        How to contribute, with or without AI tools
 ```
 
 ## Contributing

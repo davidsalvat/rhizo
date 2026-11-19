@@ -4,6 +4,12 @@ name: bench-dedicated
 # Manual only: it needs a runner labelled `rhizo-bench`.
 on:
   workflow_dispatch:
+    inputs:
+      arch:
+        description: "Kernel architecture (the runner must have that CPU and KVM)"
+        default: "aarch64"
+        type: choice
+        options: [aarch64, x86_64]
 
 permissions:
   contents: read
@@ -17,7 +23,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
       - name: Benchmarks and regression gate
-        run: cargo xtask bench --env dedicated --check --runs 50 --output bench-results.json
+        run: cargo xtask --arch "${{ inputs.arch }}" bench --env dedicated --check --runs 50 --output bench-results.json
       - name: Publish results
         if: always()
         run: |

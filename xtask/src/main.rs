@@ -4,6 +4,7 @@
 //! and QEMU (`qemu-system-x86_64`) are required; Firecracker, Cloud Hypervisor
 //! and the reference guest are downloaded on demand.
 
+mod arch;
 mod bench;
 mod deps;
 mod refguest;
@@ -18,7 +19,6 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 use vmm::{Accel, Guest, RunOptions, VmResult, VmRun, Vmm};
 
-const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const KERNEL_PACKAGE: &str = "rhizo-kernel";
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
 /// Timeout for the self-check that expects a hanging kernel.
@@ -60,6 +60,7 @@ Commands:
   help                       Show this message
 
 Global options:
+  --arch <aarch64|x86_64>    Kernel architecture (default aarch64)
   --json                     One JSON object per line on stdout (step,
                              failure, data, summary); other output on stderr
 
@@ -74,6 +75,20 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
     report::set_json(args.iter().any(|a| a == "--json"));
     args.retain(|a| a != "--json");
+    if let Some(i) = args.iter().position(|a| a == "--arch") {
+        match args.get(i + 1).map(|name| arch::Arch::parse(name)) {
+            Some(Ok(selected)) => arch::select(selected),
+            Some(Err(e)) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+            None => {
+                eprintln!("error: --arch needs a value");
+                return ExitCode::FAILURE;
+            }
+        }
+        args.drain(i..i + 2);
+    }
     let rest = args.get(1..).unwrap_or_default();
     let result = match args.first().map(String::as_str) {
         Some("check") => cmd_check(),
@@ -151,7 +166,7 @@ impl RunArgs {
     fn parse(args: &[String]) -> Result<Self> {
         let mut parsed = Self {
             profile: Profile::from_args(args),
-            vmm: Vmm::QemuMicrovm,
+            vmm: Vmm::default_for(arch::current()),
             accel: Accel::Auto,
             gdb: false,
             only: None,
@@ -169,9 +184,14 @@ impl RunArgs {
                 "--vmm" => parsed.vmm = Vmm::parse(&value("--vmm")?)?,
                 "--machine" => {
                     parsed.vmm = match value("--machine")?.as_str() {
+                        "virt" => Vmm::QemuVirt,
                         "microvm" => Vmm::QemuMicrovm,
                         "q35" => Vmm::QemuQ35,
-                        other => return Err(format!("unknown machine `{other}` (microvm or q35)")),
+                        other => {
+                            return Err(format!(
+                                "unknown machine `{other}` (virt, microvm or q35)"
+                            ));
+                        }
                     }
                 }
                 "--accel" => parsed.accel = Accel::parse(&value("--accel")?)?,
@@ -200,8 +220,11 @@ impl RunArgs {
 
     /// Command that reruns `step` with the same VMM.
     fn reproduce(&self, step: &str) -> String {
-        let mut cmd = format!("cargo xtask test --only {step}");
-        if self.vmm != Vmm::QemuMicrovm {
+        let mut cmd = format!(
+            "cargo xtask --arch {} test --only {step}",
+            arch::current().id()
+        );
+        if self.vmm != Vmm::default_for(arch::current()) {
             cmd += &format!(" --vmm {}", self.vmm.id());
         }
         cmd
@@ -367,7 +390,7 @@ fn cmd_test(args: &RunArgs) -> Result {
             ),
             &run,
         )?;
-        for needle in check.output {
+        for needle in check.expected_output() {
             check_vm(
                 run.output.contains(needle),
                 vm_check(
@@ -458,19 +481,21 @@ fn cmd_check() -> Result {
         "-D",
         "warnings",
     ])?;
-    step("clippy (kernel)");
-    cargo(&[
-        "clippy",
-        "-p",
-        KERNEL_PACKAGE,
-        "--target",
-        KERNEL_TARGET,
-        "--features",
-        "ktest",
-        "--",
-        "-D",
-        "warnings",
-    ])?;
+    for arch in [arch::Arch::Aarch64, arch::Arch::X86_64] {
+        step(&format!("clippy (kernel, {})", arch.id()));
+        cargo(&[
+            "clippy",
+            "-p",
+            KERNEL_PACKAGE,
+            "--target",
+            arch.target(),
+            "--features",
+            "ktest",
+            "--",
+            "-D",
+            "warnings",
+        ])?;
+    }
     step("host tests");
     cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
     step("crate dependency rules");
@@ -508,7 +533,8 @@ fn cmd_ci() -> Result {
         .chain(SELF_CHECKS.iter().map(|c| c.feature));
     for features in features {
         step(&format!("clippy (kernel, features: `{features}`)"));
-        let mut args = vec!["clippy", "-p", KERNEL_PACKAGE, "--target", KERNEL_TARGET];
+        let target = arch::current().target();
+        let mut args = vec!["clippy", "-p", KERNEL_PACKAGE, "--target", target];
         if !features.is_empty() {
             args.extend(["--features", features]);
         }
@@ -520,6 +546,9 @@ fn cmd_ci() -> Result {
     deps::check()?;
 
     cmd_test(&RunArgs::parse(&[])?)?;
+    if arch::current() != arch::Arch::X86_64 {
+        return Ok(());
+    }
 
     step("boot check on qemu-q35");
     let kernel = build_kernel(Profile::Debug, &[])?;
@@ -536,7 +565,7 @@ fn cmd_ci() -> Result {
             kind: "boot",
             what: "q35 boot must exit successfully".into(),
             expected: "Passed".into(),
-            reproduce: "cargo xtask test --only boot --vmm qemu-q35".into(),
+            reproduce: "cargo xtask --arch x86_64 test --only boot --vmm qemu-q35".into(),
         },
         &run,
     )
@@ -549,7 +578,19 @@ struct SelfCheck {
     expected: VmResult,
     /// Overrides the test timeout (for checks that expect a timeout).
     timeout_secs: Option<u64>,
+    /// Expected output on x86_64.
     output: &'static [&'static str],
+    /// Expected output on AArch64, when it differs (exception reports).
+    output_aarch64: Option<&'static [&'static str]>,
+}
+
+impl SelfCheck {
+    fn expected_output(&self) -> &'static [&'static str] {
+        match (arch::current(), self.output_aarch64) {
+            (arch::Arch::Aarch64, Some(output)) => output,
+            _ => self.output,
+        }
+    }
 }
 
 const SELF_CHECKS: &[SelfCheck] = &[
@@ -563,6 +604,7 @@ const SELF_CHECKS: &[SelfCheck] = &[
             "PANIC at kernel/src/tests.rs:",
             "deliberate panic",
         ],
+        output_aarch64: None,
     },
     SelfCheck {
         feature: "ktest-hang",
@@ -570,6 +612,7 @@ const SELF_CHECKS: &[SelfCheck] = &[
         expected: VmResult::TimedOut,
         timeout_secs: Some(HANG_CHECK_TIMEOUT_SECS),
         output: &["test hang_forever ... "],
+        output_aarch64: None,
     },
     SelfCheck {
         feature: "ktest-page-fault",
@@ -580,13 +623,21 @@ const SELF_CHECKS: &[SelfCheck] = &[
             "EXCEPTION: page fault (vector 14",
             "address 0x0: write, page not present, kernel mode",
         ],
+        output_aarch64: Some(&[
+            "EXCEPTION: data abort (class 0x25",
+            "address 0x0: write, translation fault",
+        ]),
     },
     SelfCheck {
         feature: "ktest-stack-overflow",
-        description: "stack exhaustion is reported as a double fault",
+        description: "stack exhaustion is reported, not a silent reset",
         expected: VmResult::Failed,
         timeout_secs: None,
         output: &["EXCEPTION: double fault (vector 8"],
+        output_aarch64: Some(&[
+            "EXCEPTION: data abort (class 0x25",
+            "kernel stack overflow (guard page hit)",
+        ]),
     },
     SelfCheck {
         feature: "ktest-invalid-opcode",
@@ -594,6 +645,7 @@ const SELF_CHECKS: &[SelfCheck] = &[
         expected: VmResult::Failed,
         timeout_secs: None,
         output: &["EXCEPTION: invalid opcode (vector 6"],
+        output_aarch64: Some(&["EXCEPTION: undefined instruction (class 0x0"]),
     },
     SelfCheck {
         feature: "ktest-oom",
@@ -604,6 +656,7 @@ const SELF_CHECKS: &[SelfCheck] = &[
             "PANIC at",
             "memory allocation of 1099511627776 bytes failed",
         ],
+        output_aarch64: None,
     },
 ];
 
@@ -611,8 +664,11 @@ const SELF_CHECKS: &[SelfCheck] = &[
 // Building
 // ---------------------------------------------------------------------------
 
+/// Builds the kernel for the selected architecture and returns the image the
+/// VMMs boot (the ELF on x86_64, a flat arm64 Image on AArch64).
 pub(crate) fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBuf> {
-    let mut args = vec!["build", "-p", KERNEL_PACKAGE, "--target", KERNEL_TARGET];
+    let target = arch::current().target();
+    let mut args = vec!["build", "-p", KERNEL_PACKAGE, "--target", target];
     if profile == Profile::Release {
         args.push("--release");
     }
@@ -621,10 +677,15 @@ pub(crate) fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBu
         args.extend(["--features", &joined]);
     }
     cargo(&args)?;
-    Ok(target_dir()
-        .join(KERNEL_TARGET)
+    arch::current().bootable_image(&kernel_elf(profile))
+}
+
+/// The linked kernel ELF (with symbols) for the selected architecture.
+fn kernel_elf(profile: Profile) -> PathBuf {
+    target_dir()
+        .join(arch::current().target())
         .join(profile.dir())
-        .join(KERNEL_PACKAGE))
+        .join(KERNEL_PACKAGE)
 }
 
 fn cargo(args: &[&str]) -> Result {
@@ -727,11 +788,7 @@ fn check_vm(ok: bool, check: VmCheck, run: &VmRun) -> Result {
     } else if let Some((summary, rip)) = report::exception_location(&run.output) {
         failure = failure.location(format!("rip {rip}")).hint(format!(
             "map the address to source with: addr2line -f -e {} {rip}",
-            target_dir()
-                .join(KERNEL_TARGET)
-                .join("debug")
-                .join(KERNEL_PACKAGE)
-                .display()
+            kernel_elf(Profile::Debug).display()
         ));
         actual += &format!(", exception: {summary}");
     } else if run.output.trim().is_empty() {
@@ -765,7 +822,11 @@ mod tests {
         let a = parse(&[]).unwrap();
         assert_eq!(
             (a.vmm, a.accel, a.profile),
-            (Vmm::QemuMicrovm, Accel::Auto, Profile::Debug)
+            (
+                Vmm::default_for(arch::current()),
+                Accel::Auto,
+                Profile::Debug
+            )
         );
         assert_eq!(parse(&["--machine", "q35"]).unwrap().vmm, Vmm::QemuQ35);
         assert_eq!(

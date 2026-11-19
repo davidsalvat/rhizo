@@ -11,7 +11,9 @@ unit is the **agent cell**: an isolated environment that can be created,
 suspended, resumed and forked natively. See [README.md](README.md) for the
 thesis and roadmap.
 
-The project is a proof of concept targeting x86_64 under QEMU/KVM.
+The project is a proof of concept. AArch64 is the primary architecture and
+x86_64 the second one; both run under QEMU, Firecracker and Cloud Hypervisor,
+and every spec must hold on both.
 
 ## Workflow: specs first (OpenSpec)
 
@@ -76,7 +78,9 @@ This repository uses spec-driven development with
 
 ## Build and test
 
-Requires the Rust toolchain (via rustup) and `qemu-system-x86_64`.
+Requires the Rust toolchain (via rustup), `qemu-system-aarch64` and, for the
+second architecture, `qemu-system-x86_64`. Every `cargo xtask` command takes
+`--arch aarch64` (default) or `--arch x86_64` right after `xtask`.
 
 The feedback loop, fastest first:
 
@@ -97,9 +101,11 @@ The feedback loop, fastest first:
 - Property tests use a fixed seed (`.cargo/config.toml`); override with
   `PROPTEST_RNG_SEED`. Commit any `proptest-regressions/` file a failure
   creates.
-- VMMs: `--vmm qemu-microvm` (default), `qemu-q35`, `firecracker`,
-  `cloud-hypervisor` (the last two need KVM). The kernel reads `console=` and
-  `exit=` from the PVH command line; `xtask` passes the right values.
+- VMMs: AArch64 `qemu-virt` (default), x86_64 `qemu-microvm` (default) and
+  `qemu-q35`; both `firecracker` and `cloud-hypervisor` (need KVM for the
+  kernel's architecture). The kernel reads `console=` and `exit=` from its
+  command line (PVH on x86_64, `/chosen/bootargs` on AArch64); `xtask` passes
+  the right values.
 - Project skills (open Agent Skills format) live in `.agents/skills/`:
   `openspec-change`, `kernel-test`, `benchmarks`, `boot-debugging`.
 
@@ -108,9 +114,9 @@ The feedback loop, fastest first:
 | Crate | Owns | May depend on (workspace) |
 |---|---|---|
 | `crates/rhizo-hal` | Hardware interfaces (traits) and host test doubles | — |
-| `crates/rhizo-core` | Boot reports, boot options, exception reports, in-kernel test runner | `rhizo-hal` |
-| `crates/rhizo-mm` | Memory map, frame allocator, page tables, kernel heap | `rhizo-hal` |
-| `kernel` | Platform code (`src/arch/`) and wiring; in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm` |
+| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
+| `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), kernel heap | `rhizo-hal` |
+| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm` |
 | `xtask` | Developer tooling (host only) | — |
 
 Planned, created by the milestone that adds their code (not before):
@@ -125,17 +131,29 @@ Rules, checked by `cargo xtask check` (`xtask/src/deps.rs`): no cycles;
 the same pull request. Prefer putting logic in a library crate so it is
 tested on the host.
 
-Memory layout (see `openspec/specs/virtual-memory`):
+The `arch` interface (`kernel/src/arch/mod.rs` lists it) is the only thing
+shared kernel code may use: `boot`, `platform`, `console`, `power`, `cpu`,
+`timer`, `tests`. Anything instruction-set specific (assembly, system
+registers, ports, MMIO registers, entry encodings) goes behind it. New arch
+hooks are written for AArch64 first and must reach x86_64 in the same
+milestone. Tests that need architecture details go in `arch/<cpu>/tests.rs`.
+
+Memory layout, the same on both architectures (see
+`openspec/specs/virtual-memory`):
 
 - Lower half (`0x0000_…`): empty, reserved for cells.
 - `0xffff_8000_0000_0000 + phys`: direct map of RAM (RW, NX). Access physical
   memory only through `PhysicalMemory` (kernel: `memory::DirectMap`).
 - `0xffff_ffff_8000_0000 + phys`: kernel image with W^X; the page under the
   kernel stack is an unmapped guard page.
+- AArch64 only: `0xffff_c000_0000_0000 + phys` is a device-memory window
+  for MMIO (the UART); the kernel half lives in `TTBR1_EL1`, and `TTBR0_EL1`
+  (cells) is an empty table.
 - Kernel globals use `sync::Global` (single CPU, panics on reentrance).
 
-The kernel crate only builds for `x86_64-unknown-none`; plain `cargo` commands
-skip it (it is not a default workspace member). Use `cargo xtask` for it.
+The kernel crate only builds for `aarch64-unknown-none-softfloat` and
+`x86_64-unknown-none`; plain `cargo` commands skip it (it is not a default
+workspace member). Use `cargo xtask` for it.
 
 ## Tool-specific files
 

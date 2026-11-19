@@ -3,10 +3,13 @@
 pub mod boot;
 pub mod console;
 pub mod cpu;
+pub mod platform;
 pub mod port;
 pub mod power;
 pub mod serial;
-pub mod tsc;
+#[cfg(feature = "ktest")]
+pub mod tests;
+pub mod timer;
 
 /// Stops the CPU forever with interrupts disabled.
 pub fn halt_forever() -> ! {

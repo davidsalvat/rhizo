@@ -246,6 +246,11 @@ pub mod layout {
         (symbol_address!(__data_start), symbol_address!(__bss_end))
     }
 
+    /// Physical address of a kernel-image virtual address.
+    pub fn virt_to_phys(virt: u64) -> u64 {
+        virt - rhizo_mm::KERNEL_BASE
+    }
+
     /// Virtual address of the guard page below the kernel stack.
     pub fn stack_guard() -> u64 {
         symbol_address!(rhizo_kernel_stack_guard)
@@ -254,29 +259,35 @@ pub mod layout {
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-static ENTRY_TSC: AtomicU64 = AtomicU64::new(0);
-static START_INFO: AtomicU64 = AtomicU64::new(0);
+static ENTRY_CYCLES: AtomicU64 = AtomicU64::new(0);
+static BOOT_ARG: AtomicU64 = AtomicU64::new(0);
 
 /// Records the values the trampoline passed to `kernel_main`.
-pub fn record(start_info: u64, entry_tsc: u64) {
-    START_INFO.store(start_info, Ordering::Relaxed);
-    ENTRY_TSC.store(entry_tsc, Ordering::Relaxed);
+pub fn record(boot_arg: u64, entry_cycles: u64) {
+    BOOT_ARG.store(boot_arg, Ordering::Relaxed);
+    ENTRY_CYCLES.store(entry_cycles, Ordering::Relaxed);
 }
 
 #[cfg_attr(
     not(feature = "ktest"),
-    allow(dead_code, reason = "used by in-kernel tests; cells use it from H2")
+    allow(dead_code, reason = "used by in-kernel tests only")
 )]
-/// The TSC value read at the very first instruction of the kernel.
+/// The cycle counter value read at the very first instruction of the kernel.
 pub fn entry_cycles() -> u64 {
-    ENTRY_TSC.load(Ordering::Relaxed)
+    ENTRY_CYCLES.load(Ordering::Relaxed)
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    allow(dead_code, reason = "used by in-kernel tests; cells use it from H2")
-)]
-/// Physical address of the `hvm_start_info` structure passed by the hypervisor.
-pub fn start_info_addr() -> u64 {
-    START_INFO.load(Ordering::Relaxed)
+/// What the boot protocol passed: the physical address of `hvm_start_info`.
+pub fn boot_arg() -> u64 {
+    BOOT_ARG.load(Ordering::Relaxed)
+}
+
+/// Checks the boot information the hypervisor passed (in-kernel test).
+#[cfg(feature = "ktest")]
+pub fn assert_boot_info_is_valid() {
+    use rhizo_hal::PhysicalMemory;
+    let addr = boot_arg();
+    assert!(addr != 0, "no hvm_start_info pointer was recorded");
+    let magic = crate::memory::DirectMap.read_u64(addr & !7) >> ((addr & 7) * 8);
+    assert_eq!(magic as u32, PVH_START_INFO_MAGIC);
 }

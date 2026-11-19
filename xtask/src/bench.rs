@@ -37,7 +37,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             runs: 20,
-            vmms: Vmm::ALL.to_vec(),
+            vmms: Vmm::for_arch(crate::arch::current()).to_vec(),
             accel: Accel::Auto,
             env: "local".into(),
             output: None,
@@ -270,6 +270,17 @@ fn measure(opts: &Options) -> Result<Results> {
         }
         if let Some(reference) = &reference {
             let kvm = vmm::kvm_available() && opts.accel != Accel::Tcg;
+            if crate::arch::current() == crate::arch::Arch::Aarch64 && vmm != Vmm::Firecracker {
+                // Firecracker's arm64 CI kernel has no PL011 driver, the UART
+                // of QEMU virt and Cloud Hypervisor, so it has no console there.
+                skipped.push((
+                    format!("linux/{}", vmm.id()),
+                    "the arm64 reference kernel has no PL011 driver (known issue, see \
+                     bench/README.md)"
+                        .into(),
+                ));
+                continue;
+            }
             if vmm == Vmm::QemuMicrovm {
                 // Observed with and without KVM: the reference kernel often
                 // resets right after KASLR setup on QEMU microvm, before /init.
@@ -569,6 +580,7 @@ fn update_baseline(env: &str, results: &Results) -> Result {
 
 fn vmm_label(id: &str) -> &str {
     match id {
+        "qemu-virt" => "QEMU virt",
         "qemu-microvm" => "QEMU microvm",
         "qemu-q35" => "QEMU q35",
         "firecracker" => "Firecracker",

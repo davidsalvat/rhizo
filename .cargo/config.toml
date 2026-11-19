@@ -1,6 +1,11 @@
 [alias]
 xtask = "run --package xtask --quiet --"
 
+[target.aarch64-unknown-none-softfloat]
+# The image is linked at a fixed higher-half address and relocates itself
+# only through PC-relative addressing in its entry code.
+rustflags = ["-C", "relocation-model=static"]
+
 [target.x86_64-unknown-none]
 # The kernel is loaded at a fixed physical address by the hypervisor.
 rustflags = ["-C", "relocation-model=static"]

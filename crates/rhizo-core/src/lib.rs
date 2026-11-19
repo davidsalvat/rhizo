@@ -7,6 +7,7 @@
 
 pub mod boot;
 pub mod exception;
+pub mod fdt;
 pub mod ktest;
 pub mod options;
 pub mod panic;
