@@ -42,6 +42,11 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("libc_alloc", "allocator checksum 154285459\n", Ending::Exit(0)),
     ("libc_float", "fp ok: 20100.0\n", Ending::Exit(0)),
     (
+        "libc_warm",
+        "warm\nprimes below 2000000: 148933, below 1000: 168\n",
+        Ending::Exit(0),
+    ),
+    (
         "counter",
         "step 07 digest 6b4e24cdafe14e6b\nstep 15 digest c93f1c055e5410cf\nstep 23 digest 65632246df41d107\nstep 31 digest a7c1ff878b0627df\nstep 39 digest 9a1ea881edd8f792\n",
         Ending::Exit(0),

@@ -351,6 +351,7 @@ fn measure_cells(
         let (mut suspend, mut resume, mut eager, mut touch) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut cold, mut warm) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -368,6 +369,10 @@ fn measure_cells(
                     run.push(c.run_ns as f64 / 1000.0);
                     switch.push(c.switch_ns as f64);
                     untagged.push(c.switch_untagged_ns as f64);
+                    if let Some((c, w)) = parse_workload_line(&out.output) {
+                        cold.push(c as f64 / 1000.0);
+                        warm.push(w as f64 / 1000.0);
+                    }
                     if let Some(f) = parse_fork_line(&out.output) {
                         fork.push(f.fork_ns as f64 / 1000.0);
                         fork_touch.push(f.fork_touch_ns as f64 / 1000.0);
@@ -407,6 +412,8 @@ fn measure_cells(
             ("cell.fork_us", "us", &mut fork),
             ("cell.fork_touch_us", "us", &mut fork_touch),
             ("cell.spawn_from_template_us", "us", &mut template),
+            ("workload.cold_us", "us", &mut cold),
+            ("workload.warm_us", "us", &mut warm),
         ] {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -436,6 +443,18 @@ fn measure_cells(
         ));
     }
     Ok(())
+}
+
+/// `(cold_ns, warm_ns)` of the real-workload line of a `bench-cell` kernel.
+fn parse_workload_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-workload "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("cold_ns")?, field("warm_ns")?))
 }
 
 /// Fork and template figures printed by a `bench-cell` kernel.
@@ -1157,6 +1176,14 @@ mod tests {
         assert_eq!(o.vmms, vec![Vmm::QemuQ35, Vmm::Firecracker]);
         assert!(o.check && o.env == "ci");
         assert!(Options::parse(&["--runs".to_string(), "0".to_string()]).is_err());
+    }
+
+    #[test]
+    fn workload_line_is_parsed() {
+        assert_eq!(
+            parse_workload_line("x\nrhizo-workload cold_ns=900 warm_ns=30\n"),
+            Some((900, 30))
+        );
     }
 
     #[test]
