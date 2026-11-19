@@ -62,19 +62,18 @@ pub fn copy_from<F: EntryFormat>(
         fn write_u64(&mut self, _: u64, _: u64) {
             unreachable!("copy_from never writes")
         }
+        fn read_bytes(&self, phys: u64, out: &mut [u8]) {
+            self.0.read_bytes(phys, out);
+        }
     }
+    // One bulk read per page piece (a `memcpy` in the kernel).
     for_each_piece(
         pt,
         &mut Ro(mem),
         addr,
         out.len(),
         false,
-        |m, phys, off, n| {
-            for (i, byte) in out[off..off + n].iter_mut().enumerate() {
-                let p = phys + i as u64;
-                *byte = (m.read_u64(p & !7) >> ((p & 7) * 8)) as u8;
-            }
-        },
+        |m, phys, off, n| m.read_bytes(phys, &mut out[off..off + n]),
     )
 }
 

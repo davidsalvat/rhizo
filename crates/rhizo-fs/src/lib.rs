@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod codec;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -79,11 +80,16 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 type Block = [u8; BLOCK];
 
+/// A block shared between forks. The count lives apart from the data
+/// (`Arc<Box<_>>`, not `Arc<Block>`), so the data fills exactly one page of
+/// the kernel heap instead of spilling 16 bytes into a second one.
+type Shared = Arc<Box<Block>>;
+
 /// Contents of a regular file: blocks never written are holes (zeros).
 #[derive(Debug, Clone, Default)]
 struct File {
     size: u64,
-    blocks: Vec<Option<Arc<Block>>>,
+    blocks: Vec<Option<Shared>>,
 }
 
 impl File {
@@ -558,80 +564,156 @@ impl Tables {
         }
     }
 
-    /// `pread64`-style read at `offset` (or the description's offset, which
-    /// then advances). Returns bytes read (0 at the end).
-    pub fn read(&mut self, fd: Fd, out: &mut [u8], offset: Option<u64>) -> Result<usize> {
-        let (_, file, desc) = self.file_of(fd)?;
+    /// Where a read on `fd` starts: `offset`, or the description's offset.
+    /// Fails for descriptors that cannot be read as a file.
+    pub fn read_position(&self, fd: Fd, offset: Option<u64>) -> Result<u64> {
+        let (_, _, desc) = self.file_of(fd)?;
         if desc.flags & 3 == 1 {
             return Err(Error::BadFd); // O_WRONLY
         }
-        let at = offset.unwrap_or(desc.offset);
-        let n = (file.size.saturating_sub(at).min(out.len() as u64)) as usize;
-        let mut done = 0;
-        while done < n {
-            let pos = at as usize + done;
-            let (b, off) = (pos / BLOCK, pos % BLOCK);
-            let len = (BLOCK - off).min(n - done);
-            let dst = &mut out[done..done + len];
-            match file.blocks.get(b) {
-                Some(Some(block)) => dst.copy_from_slice(&block[off..off + len]),
-                _ => dst.fill(0),
-            }
-            done += len;
-        }
-        if offset.is_none() {
-            self.desc_mut(fd)?.offset = at + n as u64;
-        }
-        Ok(n)
+        Ok(offset.unwrap_or(desc.offset))
     }
 
-    /// Writes `data` at `offset` (or at the description's offset, or at the
-    /// end with `O_APPEND`); returns bytes written.
-    pub fn write(&mut self, fd: Fd, data: &[u8], offset: Option<u64>) -> Result<usize> {
+    /// Where a write on `fd` starts: `offset`, the end with `O_APPEND`, or the
+    /// description's offset. Fails for descriptors not open for writing as a
+    /// file.
+    pub fn write_position(&self, fd: Fd, offset: Option<u64>) -> Result<u64> {
         if self.desc(fd)?.flags & 3 == 0 {
             return Err(Error::BadFd); // O_RDONLY (directories included)
         }
-        let (ino, file, desc) = self.file_of(fd)?;
-        let at = match offset {
+        let (_, file, desc) = self.file_of(fd)?;
+        Ok(match offset {
             Some(at) => at,
             None if desc.flags & O_APPEND_FLAG != 0 => file.size,
             None => desc.offset,
-        };
-        if data.is_empty() {
-            return Ok(0);
+        })
+    }
+
+    /// Moves the offset of `fd`'s description (after a read or write that
+    /// passed explicit positions).
+    pub fn set_offset(&mut self, fd: Fd, offset: u64) -> Result<()> {
+        self.desc_mut(fd)?.offset = offset;
+        Ok(())
+    }
+
+    /// Hands `drain` the file bytes of `fd` from `at`, at most `len` and
+    /// within one block (holes read as zeros); returns how many, 0 at the
+    /// end, or `None` if `drain` refused them. The offset does not move.
+    pub fn read_with(
+        &self,
+        fd: Fd,
+        at: u64,
+        len: usize,
+        drain: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Option<usize>> {
+        const HOLE: Block = [0; BLOCK];
+        let (_, file, _) = self.file_of(fd)?;
+        let (b, off) = (at as usize / BLOCK, at as usize % BLOCK);
+        let n = file
+            .size
+            .saturating_sub(at)
+            .min((BLOCK - off).min(len) as u64) as usize;
+        if n == 0 {
+            return Ok(Some(0));
         }
+        let block = match file.blocks.get(b) {
+            Some(Some(block)) => &block[..],
+            _ => &HOLE[..],
+        };
+        Ok(drain(&block[off..off + n]).then_some(n))
+    }
+
+    /// Hands `fill` the file bytes of `fd` from `at`, at most `len` and
+    /// within one block, to overwrite; returns how many, or `None` if `fill`
+    /// failed (then the file is as before). The offset does not move.
+    pub fn write_with(
+        &mut self,
+        fd: Fd,
+        at: u64,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<Option<usize>> {
+        let (ino, file, _) = self.file_of(fd)?;
+        let (b, off) = (at as usize / BLOCK, at as usize % BLOCK);
+        let n = (BLOCK - off).min(len);
         let end = at
-            .checked_add(data.len() as u64)
+            .checked_add(n as u64)
             .filter(|&end| end <= DATA_MAX)
             .ok_or(Error::TooBig)?;
-        let (first, blocks) = (at as usize / BLOCK, (end as usize).div_ceil(BLOCK));
-        let new = (first..blocks)
-            .filter(|&b| file.blocks.get(b).is_none_or(Option::is_none))
-            .count() as u64;
-        if self.used + new > DATA_MAX / BLOCK as u64 {
+        if n == 0 {
+            return Ok(Some(0));
+        }
+        let new = file.blocks.get(b).is_none_or(Option::is_none);
+        if new && self.used >= DATA_MAX / BLOCK as u64 {
             return Err(Error::NoSpace);
         }
-        self.used += new;
         let Node::File(file) = &mut self.inode_mut(ino).node else {
             return Err(Error::IsDir);
         };
-        if file.blocks.len() < blocks {
-            file.blocks.resize(blocks, None);
+        if file.blocks.len() <= b {
+            file.blocks.resize(b + 1, None);
         }
-        let mut done = 0;
-        while done < data.len() {
-            let pos = at as usize + done;
-            let (b, off) = (pos / BLOCK, pos % BLOCK);
-            let n = (BLOCK - off).min(data.len() - done);
-            let block = file.blocks[b].get_or_insert_with(|| Arc::new([0; BLOCK]));
-            Arc::make_mut(block)[off..off + n].copy_from_slice(&data[done..done + n]);
-            done += n;
+        let block = file.blocks[b].get_or_insert_with(|| Arc::new(Box::new([0; BLOCK])));
+        if !fill(&mut Arc::make_mut(block)[off..off + n]) {
+            if new {
+                // Nothing was written: no block, and no block list past the end.
+                file.blocks[b] = None;
+                file.blocks.truncate((file.size as usize).div_ceil(BLOCK));
+            }
+            return Ok(None);
         }
         file.size = file.size.max(end);
-        if offset.is_none() {
-            self.desc_mut(fd)?.offset = end;
+        if new {
+            self.used += 1;
         }
-        Ok(data.len())
+        Ok(Some(n))
+    }
+
+    /// `read`/`pread64` into `out`, at `offset` or the description's offset
+    /// (which then advances). Returns bytes read (0 at the end).
+    pub fn read(&mut self, fd: Fd, out: &mut [u8], offset: Option<u64>) -> Result<usize> {
+        let start = self.read_position(fd, offset)?;
+        let mut done = 0;
+        while done < out.len() {
+            let dst = &mut out[done..];
+            let got = self.read_with(fd, start + done as u64, dst.len(), |src| {
+                dst[..src.len()].copy_from_slice(src);
+                true
+            })?;
+            match got {
+                Some(n) if n > 0 => done += n,
+                _ => break,
+            }
+        }
+        if offset.is_none() {
+            self.set_offset(fd, start + done as u64)?;
+        }
+        Ok(done)
+    }
+
+    /// Writes `data` at `offset` (or at the description's offset, or at the
+    /// end with `O_APPEND`); returns bytes written (fewer if the data bound
+    /// is reached part way).
+    pub fn write(&mut self, fd: Fd, data: &[u8], offset: Option<u64>) -> Result<usize> {
+        let start = self.write_position(fd, offset)?;
+        let mut done = 0;
+        while done < data.len() {
+            let src = &data[done..];
+            let wrote = self.write_with(fd, start + done as u64, src.len(), |dst| {
+                dst.copy_from_slice(&src[..dst.len()]);
+                true
+            });
+            match wrote {
+                Ok(Some(n)) => done += n,
+                Ok(None) => break,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        if offset.is_none() {
+            self.set_offset(fd, start + done as u64)?;
+        }
+        Ok(done)
     }
 
     /// `lseek`.

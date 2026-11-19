@@ -87,36 +87,31 @@ pub(crate) fn read<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         Ok(Kind::Console) => return 0, // standard input is empty
         Ok(_) => {}
     }
-    let start = match offset {
-        Some(at) => at,
-        None => cx.fs.seek(fd, 0, Whence::Current).unwrap_or(0),
+    let start = match cx.fs.read_position(fd, offset) {
+        Ok(at) => at,
+        Err(e) => return err(e),
     };
-    let mut buf = [0u8; FRAME_SIZE as usize];
+    // One copy per piece, file block to cell memory; a piece stays within
+    // one cell page and one block, so a fault copies nothing of it.
     let mut done = 0u64;
     while done < len {
         let at = addr.wrapping_add(done);
         let n = piece(at, len - done);
-        let got = match cx.fs.read(fd, &mut buf[..n], Some(start + done)) {
-            Ok(got) => got,
+        let (pt, mem, pager) = (&cx.pt, &mut *cx.mem, &mut *cx.pager);
+        let got = cx.fs.read_with(fd, start + done, n, |src| {
+            memory::write(pt, mem, pager, at, src).is_ok()
+        });
+        match got {
+            Ok(Some(0)) => break,
+            Ok(Some(got)) => done += got as u64,
+            Ok(None) if done == 0 => return -EFAULT,
+            Ok(None) => break,
             Err(e) if done == 0 => return err(e),
             Err(_) => break,
-        };
-        if got == 0 {
-            break;
-        }
-        if cx.write(at, &buf[..got]).is_err() {
-            if done == 0 {
-                return -EFAULT;
-            }
-            break;
-        }
-        done += got as u64;
-        if got < n {
-            break;
         }
     }
     if offset.is_none() {
-        let _ = cx.fs.seek(fd, (start + done) as i64, Whence::Set);
+        let _ = cx.fs.set_offset(fd, start + done);
     }
     done as i64
 }
@@ -136,37 +131,29 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         Ok(Kind::Console) => return console(cx, addr, len),
         Ok(_) => {}
     }
-    let append = cx.fs.status_flags(fd).unwrap_or(0) & O_APPEND as u32 != 0;
-    let start = match offset {
-        Some(at) => at,
-        None if append => cx.fs.fstat(fd).ok().flatten().map_or(0, |s| s.size),
-        None => cx.fs.seek(fd, 0, Whence::Current).unwrap_or(0),
+    let start = match cx.fs.write_position(fd, offset) {
+        Ok(at) => at,
+        Err(e) => return err(e),
     };
-    let mut buf = [0u8; FRAME_SIZE as usize];
+    // One copy per piece, cell memory to file block (see `read`).
     let mut done = 0u64;
     while done < len {
         let at = addr.wrapping_add(done);
         let n = piece(at, len - done);
-        if cx.read(at, &mut buf[..n]).is_err() {
-            if done == 0 {
-                return -EFAULT;
-            }
-            break;
-        }
-        match cx.fs.write(fd, &buf[..n], Some(start + done)) {
-            Ok(_) => done += n as u64,
+        let (pt, mem, pager) = (&cx.pt, &mut *cx.mem, &mut *cx.pager);
+        let wrote = cx.fs.write_with(fd, start + done, n, |dst| {
+            memory::read(pt, mem, pager, at, dst).is_ok()
+        });
+        match wrote {
+            Ok(Some(n)) => done += n as u64,
+            Ok(None) if done == 0 => return -EFAULT,
+            Ok(None) => break,
             Err(e) if done == 0 => return err(e),
             Err(_) => break,
         }
     }
-    if len == 0 {
-        // Linux checks the descriptor even for an empty write.
-        if let Err(e) = cx.fs.write(fd, &[], Some(start)) {
-            return err(e);
-        }
-    }
     if offset.is_none() {
-        let _ = cx.fs.seek(fd, (start + done) as i64, Whence::Set);
+        let _ = cx.fs.set_offset(fd, start + done);
     }
     done as i64
 }

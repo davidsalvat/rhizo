@@ -87,6 +87,56 @@ fn write_read_seek_and_holes() {
 }
 
 #[test]
+fn block_pieces_and_failed_fills() {
+    let mut fs = Fs::new();
+    let fd = fs.open(None, b"/f", RW, 2).unwrap();
+    // A piece never crosses a block.
+    assert_eq!(
+        fs.write_with(fd, 4000, 500, |d| {
+            d.fill(7);
+            true
+        }),
+        Ok(Some(96))
+    );
+    assert_eq!(fs.stat(None, b"/f").unwrap().size, 4096);
+    // A refused fill changes nothing: no size, no block, no data counted.
+    let used = fs.data_bytes();
+    assert_eq!(fs.write_with(fd, 3 * BLOCK as u64, 10, |_| false), Ok(None));
+    assert_eq!(fs.stat(None, b"/f").unwrap().size, 4096);
+    assert_eq!(fs.data_bytes(), used);
+    let mut bytes = Vec::new();
+    fs.encode(&mut bytes);
+    Fs::decode(&bytes).expect("still consistent");
+    // Reads stop at the block and at the end; holes read as zeros.
+    fs.write(fd, b"!", Some(9000)).unwrap();
+    let mut seen = Vec::new();
+    assert_eq!(
+        fs.read_with(fd, 4090, 100, |s| {
+            seen.extend_from_slice(s);
+            true
+        }),
+        Ok(Some(6))
+    );
+    assert_eq!(seen, [7; 6], "up to the end of the block");
+    assert_eq!(
+        fs.read_with(fd, 8999, 100, |s| s == [0, b'!']),
+        Ok(Some(2)),
+        "a hole, then data"
+    );
+    assert_eq!(
+        fs.read_with(fd, 9001, 100, |_| true),
+        Ok(Some(0)),
+        "end of file"
+    );
+    assert_eq!(fs.read_with(fd, 0, 10, |_| false), Ok(None));
+    assert_eq!(
+        fs.read_position(fd, None),
+        Ok(0),
+        "explicit positions move no offset"
+    );
+}
+
+#[test]
 fn truncate_zeroes_what_it_cuts() {
     let mut fs = Fs::new();
     fs.put_file(b"/f", &[1u8; 5000]).unwrap();
