@@ -5,6 +5,7 @@
 //! `RHIZO_REFERENCE_KERNEL` point at local files instead of downloading.
 
 use crate::Result;
+use crate::arch::{self, Arch};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,24 +20,54 @@ struct Artifact {
 }
 
 const FIRECRACKER_VERSION: &str = "v1.15.1";
-const FIRECRACKER: Artifact = Artifact {
-    file: "firecracker-v1.15.1-x86_64.tgz",
-    url: "https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-x86_64.tgz",
-    sha256: "d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a",
-};
 
-const CLOUD_HYPERVISOR: Artifact = Artifact {
-    file: "cloud-hypervisor-v54.0",
-    url: "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static",
-    sha256: "4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b",
-};
+fn firecracker_artifact(arch: Arch) -> Artifact {
+    match arch {
+        Arch::X86_64 => Artifact {
+            file: "firecracker-v1.15.1-x86_64.tgz",
+            url: "https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-x86_64.tgz",
+            sha256: "d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a",
+        },
+        // Pinned on the first verified run on ARM64 hardware with KVM.
+        Arch::Aarch64 => Artifact {
+            file: "firecracker-v1.15.1-aarch64.tgz",
+            url: "https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-aarch64.tgz",
+            sha256: "",
+        },
+    }
+}
 
-/// Firecracker's published CI guest kernel (Linux 6.1, PVH and initrd enabled).
-const REFERENCE_KERNEL: Artifact = Artifact {
-    file: "vmlinux-6.1.155",
-    url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155",
-    sha256: "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
-};
+fn cloud_hypervisor_artifact(arch: Arch) -> Artifact {
+    match arch {
+        Arch::X86_64 => Artifact {
+            file: "cloud-hypervisor-v54.0",
+            url: "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static",
+            sha256: "4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b",
+        },
+        // Pinned on the first verified run on ARM64 hardware with KVM.
+        Arch::Aarch64 => Artifact {
+            file: "cloud-hypervisor-v54.0-aarch64",
+            url: "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static-aarch64",
+            sha256: "",
+        },
+    }
+}
+
+/// Firecracker's published CI guest kernels (Linux 6.1).
+fn reference_kernel_artifact(arch: Arch) -> Artifact {
+    match arch {
+        Arch::X86_64 => Artifact {
+            file: "vmlinux-6.1.155",
+            url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155",
+            sha256: "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+        },
+        Arch::Aarch64 => Artifact {
+            file: "vmlinux-6.1.155-aarch64",
+            url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155",
+            sha256: "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591",
+        },
+    }
+}
 
 /// The tools directory, created if needed.
 pub fn dir() -> Result<PathBuf> {
@@ -51,17 +82,18 @@ pub fn firecracker() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     let dir = dir()?;
-    let binary = dir.join(format!("firecracker-{FIRECRACKER_VERSION}"));
+    let arch = arch::current();
+    let binary = dir.join(format!("firecracker-{FIRECRACKER_VERSION}-{}", arch.id()));
     if !binary.exists() {
-        let archive = fetch(&FIRECRACKER)?;
+        let archive = fetch(&firecracker_artifact(arch))?;
         run(Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
             .arg("-C")
             .arg(&dir))?;
         let extracted = dir
-            .join(format!("release-{FIRECRACKER_VERSION}-x86_64"))
-            .join(format!("firecracker-{FIRECRACKER_VERSION}-x86_64"));
+            .join(format!("release-{FIRECRACKER_VERSION}-{}", arch.id()))
+            .join(format!("firecracker-{FIRECRACKER_VERSION}-{}", arch.id()));
         fs::rename(&extracted, &binary)
             .map_err(|e| format!("unexpected Firecracker archive layout: {e}"))?;
     }
@@ -73,7 +105,7 @@ pub fn cloud_hypervisor() -> Result<PathBuf> {
     if let Some(path) = env::var_os("RHIZO_CLOUD_HYPERVISOR") {
         return Ok(PathBuf::from(path));
     }
-    let binary = fetch(&CLOUD_HYPERVISOR)?;
+    let binary = fetch(&cloud_hypervisor_artifact(arch::current()))?;
     make_executable(&binary)?;
     Ok(binary)
 }
@@ -83,7 +115,7 @@ pub fn reference_kernel() -> Result<PathBuf> {
     if let Some(path) = env::var_os("RHIZO_REFERENCE_KERNEL") {
         return Ok(PathBuf::from(path));
     }
-    fetch(&REFERENCE_KERNEL)
+    fetch(&reference_kernel_artifact(arch::current()))
 }
 
 /// Downloads `artifact` unless already present, and verifies its checksum.
@@ -112,6 +144,13 @@ fn fetch(artifact: &Artifact) -> Result<PathBuf> {
         ));
         if env::var_os("GITHUB_ACTIONS").is_some() {
             println!("::notice title=unpinned-sha256::{} {actual}", artifact.file);
+        }
+        if env::var_os("RHIZO_ALLOW_UNPINNED").is_none() {
+            return Err(format!(
+                "refusing to run unpinned download {}; check it, then pin its sha256 in \
+                 xtask/src/tools.rs (or set RHIZO_ALLOW_UNPINNED=1 to run it once)",
+                artifact.file
+            ));
         }
     } else if actual != artifact.sha256 {
         let _ = fs::remove_file(&path);

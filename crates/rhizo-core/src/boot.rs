@@ -20,14 +20,15 @@ pub fn report_ready(console: &mut impl Console, start: u64, end: u64) {
     );
 }
 
-/// Prints how long boot took and that boot has finished.
-///
-/// `start` and `end` are cycle counts taken at kernel entry and at the end of
-/// boot. A counter that went backwards is reported as zero cycles rather than
-/// wrapping around.
-pub fn report_boot_complete(console: &mut impl Console, start: u64, end: u64) {
+/// Prints how long boot took and that boot has finished. `cycles` is the
+/// cycle count from kernel entry to the end of boot; `nanos` is the same
+/// duration in nanoseconds when the architecture knows its counter frequency.
+pub fn report_boot_complete(console: &mut impl Console, cycles: u64, nanos: Option<u64>) {
     let mut out = ConsoleWriter(console);
-    let _ = writeln!(out, "boot time: {} cycles", end.saturating_sub(start));
+    let _ = match nanos {
+        Some(ns) => writeln!(out, "boot time: {cycles} cycles ({} us)", ns / 1000),
+        None => writeln!(out, "boot time: {cycles} cycles"),
+    };
     let _ = writeln!(out, "boot complete");
 }
 
@@ -69,9 +70,19 @@ mod tests {
         counter.advance(2_500);
 
         let mut console = RecordingConsole::new();
-        report_boot_complete(&mut console, start, counter.cycles());
+        report_boot_complete(&mut console, counter.cycles() - start, None);
 
         assert_eq!(console.text(), "boot time: 2500 cycles\nboot complete\n");
+    }
+
+    #[test]
+    fn boot_report_adds_microseconds_when_known() {
+        let mut console = RecordingConsole::new();
+        report_boot_complete(&mut console, 62_500, Some(1_250_400));
+        assert_eq!(
+            console.text(),
+            "boot time: 62500 cycles (1250 us)\nboot complete\n"
+        );
     }
 
     #[test]
@@ -89,12 +100,5 @@ mod tests {
             console.text(),
             "memory: 127 MiB usable, 120 MiB free, 7 page-table frames\n"
         );
-    }
-
-    #[test]
-    fn boot_report_never_wraps_on_backwards_counter() {
-        let mut console = RecordingConsole::new();
-        report_boot_complete(&mut console, 10, 5);
-        assert!(console.text().starts_with("boot time: 0 cycles\n"));
     }
 }

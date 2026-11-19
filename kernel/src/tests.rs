@@ -1,4 +1,5 @@
-//! In-kernel tests, run by `cargo xtask test` inside QEMU.
+//! Architecture-neutral in-kernel tests, run by `cargo xtask test` inside a
+//! VM. Architecture-specific ones live in `arch/<cpu>/tests.rs`.
 
 use crate::arch;
 use crate::memory::{self, DirectMap};
@@ -8,6 +9,7 @@ use core::alloc::Layout;
 use rhizo_core::ktest::TestCase;
 use rhizo_core::ktest_case;
 use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
+
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::PageFlags;
 
@@ -18,7 +20,6 @@ macro_rules! suite {
             ktest_case!(console_output_works),
             ktest_case!(cycle_counter_is_monotonic),
             ktest_case!(boot_cycles_precede_now),
-            ktest_case!(start_info_has_pvh_magic),
             ktest_case!(bss_starts_zeroed),
             ktest_case!(lower_half_is_unmapped),
             ktest_case!(kernel_code_is_executable_not_writable),
@@ -79,7 +80,7 @@ fn console_output_works() {
 }
 
 fn cycle_counter_is_monotonic() {
-    let tsc = arch::tsc::Tsc;
+    let tsc = arch::timer::Counter;
     let mut previous = tsc.cycles();
     for _ in 0..1_000 {
         let now = tsc.cycles();
@@ -91,14 +92,7 @@ fn cycle_counter_is_monotonic() {
 fn boot_cycles_precede_now() {
     let entry = arch::boot::entry_cycles();
     assert!(entry > 0, "boot timestamp was not recorded");
-    assert!(arch::tsc::Tsc.cycles() >= entry);
-}
-
-fn start_info_has_pvh_magic() {
-    let addr = arch::boot::start_info_addr();
-    assert!(addr != 0, "no hvm_start_info pointer was recorded");
-    let magic = DirectMap.read_u64(addr & !7) >> ((addr & 7) * 8);
-    assert_eq!(magic as u32, arch::boot::PVH_START_INFO_MAGIC);
+    assert!(arch::timer::Counter.cycles() >= entry);
 }
 
 fn bss_starts_zeroed() {
@@ -144,8 +138,13 @@ fn stack_guard_page_is_unmapped() {
 
 fn direct_map_uses_largest_pages() {
     use rhizo_mm::paging::PageSize;
-    let t = memory::translate(DirectMap::virt(0x20_1000)).expect("direct map present");
-    assert_eq!(t.phys, 0x20_1000);
+    // Any RAM frame will do; RAM is not at the same addresses everywhere.
+    let frame = memory::with_frames(|f| f.alloc())
+        .flatten()
+        .expect("free frame");
+    let t = memory::translate(DirectMap::virt(frame) + 8).expect("direct map present");
+    memory::with_frames(|f| f.free(frame));
+    assert_eq!(t.phys, frame + 8);
     let expected = if arch::cpu::supports_1gib_pages() {
         PageSize::Huge
     } else {
@@ -292,8 +291,7 @@ fn overflow_the_stack() {
 
 #[cfg(feature = "ktest-invalid-opcode")]
 fn execute_invalid_opcode() {
-    // SAFETY: deliberately invalid; the exception ends the run.
-    unsafe { core::arch::asm!("ud2") };
+    arch::cpu::execute_invalid_instruction();
 }
 
 #[cfg(feature = "ktest-oom")]

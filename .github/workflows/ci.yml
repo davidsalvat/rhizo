@@ -17,7 +17,7 @@ env:
 
 jobs:
   ci:
-    name: fmt, clippy, tests (host and QEMU)
+    name: x86_64 fmt, clippy, tests (host and QEMU)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -43,7 +43,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run all checks
-        run: cargo xtask ci
+        run: cargo xtask --arch x86_64 ci
+
+  ci-arm64:
+    name: AArch64 fmt, clippy, tests (QEMU virt)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm
+          qemu-system-aarch64 --version
+
+      - name: Report whether this runner offers KVM
+        run: |
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "::notice title=kvm::/dev/kvm is usable on ubuntu-24.04-arm"
+          else
+            echo "::notice title=kvm::no usable /dev/kvm on ubuntu-24.04-arm; AArch64 runs are emulated"
+          fi
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run all checks
+        run: cargo xtask --arch aarch64 ci
 
   quality:
     name: dependency policy, unused dependencies, dependency rules
@@ -111,13 +140,13 @@ jobs:
           key: tools-${{ hashFiles('xtask/src/tools.rs') }}
 
       - name: Boot on Firecracker
-        run: cargo xtask run --release --vmm firecracker
+        run: cargo xtask --arch x86_64 run --release --vmm firecracker
 
       - name: Boot on Cloud Hypervisor
-        run: cargo xtask run --release --vmm cloud-hypervisor
+        run: cargo xtask --arch x86_64 run --release --vmm cloud-hypervisor
 
       - name: Benchmarks and regression gate
-        run: cargo xtask bench --env ci --check --output bench-results.json
+        run: cargo xtask --arch x86_64 bench --env ci --check --output bench-results.json
 
       - name: Publish results
         if: always()

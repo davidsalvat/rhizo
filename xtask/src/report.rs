@@ -182,7 +182,13 @@ pub fn panic_location(output: &str) -> Option<(String, String)> {
 /// Extracts the exception summary and faulting instruction address.
 pub fn exception_location(output: &str) -> Option<(String, String)> {
     let line = output.lines().find(|l| l.starts_with("EXCEPTION: "))?;
-    let rip = line.rsplit("at rip ").next()?.trim().to_string();
+    // x86_64 reports "at rip <addr>", AArch64 "at pc <addr>".
+    let rip = line
+        .rsplit(" at ")
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .to_string();
     Some((line.trim_start_matches("EXCEPTION: ").to_string(), rip))
 }
 
@@ -239,6 +245,8 @@ mod tests {
                 "0xffffffff80111220".into()
             ))
         );
+        let out = "\nEXCEPTION: data abort (class 0x25, ESR 0x96000044) at pc 0xffffffff80003194\n";
+        assert_eq!(exception_location(out).unwrap().1, "0xffffffff80003194");
         assert_eq!(panic_location("all good"), None);
     }
 }

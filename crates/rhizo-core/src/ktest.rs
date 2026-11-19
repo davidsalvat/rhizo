@@ -28,7 +28,8 @@ macro_rules! ktest_case {
     };
 }
 
-/// Runs every test case in order and returns the status to exit the VM with.
+/// Runs every test case of every suite, in order, and returns the status to
+/// exit the VM with.
 ///
 /// Output format, one line per test:
 ///
@@ -38,18 +39,15 @@ macro_rules! ktest_case {
 /// test second ... ok
 /// test result: ok. 2 passed
 /// ```
-pub fn run(console: &mut impl Console, cases: &[TestCase]) -> ExitStatus {
-    let _ = writeln!(ConsoleWriter(console), "running {} tests", cases.len());
-    for case in cases {
+pub fn run(console: &mut impl Console, suites: &[&[TestCase]]) -> ExitStatus {
+    let total: usize = suites.iter().map(|s| s.len()).sum();
+    let _ = writeln!(ConsoleWriter(console), "running {total} tests");
+    for case in suites.iter().flat_map(|s| s.iter()) {
         let _ = write!(ConsoleWriter(console), "test {} ... ", case.name);
         (case.run)();
         let _ = writeln!(ConsoleWriter(console), "ok");
     }
-    let _ = writeln!(
-        ConsoleWriter(console),
-        "test result: ok. {} passed",
-        cases.len()
-    );
+    let _ = writeln!(ConsoleWriter(console), "test result: ok. {total} passed");
     ExitStatus::Success
 }
 
@@ -75,7 +73,7 @@ mod tests {
         let mut console = RecordingConsole::new();
         let cases = [ktest_case!(passing), ktest_case!(passing)];
 
-        let status = run(&mut console, &cases);
+        let status = run(&mut console, &[&cases]);
 
         assert_eq!(status, ExitStatus::Success);
         assert_eq!(CALLS.load(Ordering::SeqCst) - before, 2);
@@ -103,8 +101,9 @@ mod tests {
         let mut console = RecordingConsole::new();
         let cases = [ktest_case!(passing), ktest_case!(failing)];
 
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut console, &cases)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(&mut console, &[&cases])
+        }));
 
         assert!(result.is_err(), "a failing case must not report success");
         assert!(console.text().ends_with("test failing ... "));

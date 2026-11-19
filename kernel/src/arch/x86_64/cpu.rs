@@ -258,6 +258,13 @@ pub fn supports_1gib_pages() -> bool {
     leaf.edx & (1 << 26) != 0
 }
 
+/// Executes an undefined instruction (self-check `ktest-invalid-opcode`).
+#[cfg(feature = "ktest-invalid-opcode")]
+pub fn execute_invalid_instruction() {
+    // SAFETY: deliberately invalid; the exception ends the run.
+    unsafe { asm!("ud2") };
+}
+
 /// Faulting address of the last page fault.
 pub fn read_cr2() -> u64 {
     let value: u64;
@@ -271,7 +278,7 @@ pub fn read_cr2() -> u64 {
 /// # Safety
 /// The new tables must map the currently executing code, the stack and all
 /// kernel data at the same virtual addresses.
-pub unsafe fn write_cr3(root: u64) {
+pub unsafe fn activate(root: u64, _alloc: &mut impl FnMut() -> Option<u64>) {
     // SAFETY: guaranteed by the caller.
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }

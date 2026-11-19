@@ -95,6 +95,86 @@ pub fn report_exception(console: &mut impl Console, info: &ExceptionInfo) {
     }
 }
 
+/// What the kernel knows about an AArch64 synchronous exception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aarch64Exception {
+    /// `ESR_EL1`: exception syndrome.
+    pub esr: u64,
+    /// `FAR_EL1`: faulting address (valid for aborts).
+    pub far: u64,
+    /// `ELR_EL1`: address of the faulting instruction.
+    pub elr: u64,
+    /// The kernel stack's guard page `[start, end)`, to recognize overflows.
+    pub stack_guard: (u64, u64),
+}
+
+/// Name of an AArch64 exception class (`ESR_EL1.EC`).
+pub fn aarch64_class_name(ec: u64) -> &'static str {
+    match ec {
+        0x00 => "undefined instruction",
+        0x15 => "supervisor call",
+        0x18 => "system register trap",
+        0x20 | 0x21 => "instruction abort",
+        0x22 => "PC alignment fault",
+        0x24 | 0x25 => "data abort",
+        0x26 => "SP alignment fault",
+        0x3c => "breakpoint",
+        _ => "exception",
+    }
+}
+
+/// Prints an AArch64 exception report, in the same shape as the x86_64 one:
+///
+/// ```text
+/// EXCEPTION: data abort (class 0x25, ESR 0x96000045) at pc 0xffffffff80081234
+///   address 0x0: write, translation fault (level 0), kernel mode
+/// ```
+pub fn report_aarch64(console: &mut impl Console, info: &Aarch64Exception) {
+    let mut out = ConsoleWriter(console);
+    let ec = (info.esr >> 26) & 0x3f;
+    let _ = writeln!(
+        out,
+        "\nEXCEPTION: {} (class {:#x}, ESR {:#x}) at pc {:#x}",
+        aarch64_class_name(ec),
+        ec,
+        info.esr,
+        info.elr
+    );
+    if matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) {
+        let fsc = info.esr & 0x3f;
+        let level = fsc & 0b11;
+        let cause = match fsc >> 2 {
+            0b0000 => "address size fault",
+            0b0001 => "translation fault",
+            0b0010 => "access flag fault",
+            0b0011 => "permission fault",
+            _ if fsc == 0b10_0001 => "alignment fault",
+            _ => "other fault",
+        };
+        let access = if matches!(ec, 0x20 | 0x21) {
+            "instruction fetch"
+        } else if info.esr & (1 << 6) != 0 {
+            "write"
+        } else {
+            "read"
+        };
+        let mode = if matches!(ec, 0x20 | 0x24) {
+            "user"
+        } else {
+            "kernel"
+        };
+        let _ = writeln!(
+            out,
+            "  address {:#x}: {access}, {cause} (level {level}), {mode} mode",
+            info.far
+        );
+        let (guard_start, guard_end) = info.stack_guard;
+        if (guard_start..guard_end).contains(&info.far) {
+            let _ = writeln!(out, "  kernel stack overflow (guard page hit)");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +281,77 @@ mod tests {
         for (vector, text) in expected {
             assert_eq!(name(vector), text, "vector {vector}");
         }
+    }
+
+    #[test]
+    fn aarch64_data_abort_report() {
+        let mut console = RecordingConsole::new();
+        // EC 0x25 (data abort, same EL), WnR = 1, DFSC = translation fault level 0.
+        let esr = (0x25 << 26) | (1 << 25) | (1 << 6) | 0b000100;
+        report_aarch64(
+            &mut console,
+            &Aarch64Exception {
+                esr,
+                far: 0,
+                elr: 0x1000,
+                stack_guard: (0x8000, 0x9000),
+            },
+        );
+        assert_eq!(
+            console.text(),
+            "\nEXCEPTION: data abort (class 0x25, ESR 0x96000044) at pc 0x1000\n  \
+             address 0x0: write, translation fault (level 0), kernel mode\n"
+        );
+    }
+
+    #[test]
+    fn aarch64_stack_overflow_is_recognized() {
+        let mut console = RecordingConsole::new();
+        let esr = (0x25 << 26) | (1 << 6) | 0b000111; // write, translation fault level 3
+        report_aarch64(
+            &mut console,
+            &Aarch64Exception {
+                esr,
+                far: 0x8ff0,
+                elr: 0x2000,
+                stack_guard: (0x8000, 0x9000),
+            },
+        );
+        assert!(console.text().ends_with(
+            "  address 0x8ff0: write, translation fault (level 3), kernel mode\n  \
+             kernel stack overflow (guard page hit)\n"
+        ));
+    }
+
+    #[test]
+    fn aarch64_other_classes() {
+        let report = |esr: u64| {
+            let mut console = RecordingConsole::new();
+            report_aarch64(
+                &mut console,
+                &Aarch64Exception {
+                    esr,
+                    far: 0x40,
+                    elr: 0,
+                    stack_guard: (0, 0),
+                },
+            );
+            console.text()
+        };
+        assert_eq!(
+            report(0x0200_0000),
+            "\nEXCEPTION: undefined instruction (class 0x0, ESR 0x2000000) at pc 0x0\n"
+        );
+        assert!(
+            report((0x21 << 26) | 0b001111)
+                .contains("instruction fetch, permission fault (level 3), kernel mode")
+        );
+        assert!(
+            report((0x24 << 26) | 0b000101)
+                .contains("read, translation fault (level 1), user mode")
+        );
+        assert_eq!(aarch64_class_name(0x3c), "breakpoint");
+        assert_eq!(aarch64_class_name(0x3f), "exception");
     }
 
     #[test]

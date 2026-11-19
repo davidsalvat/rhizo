@@ -6,7 +6,8 @@
 //! - `console=e9` (debug port 0xE9) or `console=serial` (default)
 //! - `exit=debug-exit` (QEMU `isa-debug-exit`, default), `exit=i8042`
 //!   (keyboard-controller reset, Firecracker) or `exit=ch-acpi`
-//!   (Cloud Hypervisor ACPI shutdown device)
+//!   (Cloud Hypervisor ACPI shutdown device), `exit=psci` (AArch64 PSCI) or
+//!   `exit=semihosting` (AArch64 under QEMU emulation)
 
 use rhizo_hal::PhysicalMemory;
 
@@ -28,6 +29,11 @@ pub enum ExitKind {
     I8042Reset,
     /// Cloud Hypervisor ACPI shutdown device; the VMM process ends.
     CloudHypervisorAcpi,
+    /// PSCI `SYSTEM_OFF` (AArch64); the VMM process ends.
+    Psci,
+    /// Semihosting `SYS_EXIT_EXTENDED` (AArch64 under QEMU emulation):
+    /// carries a success/failure status.
+    Semihosting,
 }
 
 /// Parsed boot options.
@@ -59,6 +65,8 @@ impl BootOptions {
                 b"exit=debug-exit" => options.exit = ExitKind::DebugExit,
                 b"exit=i8042" => options.exit = ExitKind::I8042Reset,
                 b"exit=ch-acpi" => options.exit = ExitKind::CloudHypervisorAcpi,
+                b"exit=psci" => options.exit = ExitKind::Psci,
+                b"exit=semihosting" => options.exit = ExitKind::Semihosting,
                 _ => {}
             }
         }
@@ -112,6 +120,11 @@ mod tests {
         assert_eq!(
             BootOptions::parse(b"exit=ch-acpi").exit,
             ExitKind::CloudHypervisorAcpi
+        );
+        assert_eq!(BootOptions::parse(b"exit=psci").exit, ExitKind::Psci);
+        assert_eq!(
+            BootOptions::parse(b"exit=semihosting").exit,
+            ExitKind::Semihosting
         );
         assert_eq!(
             BootOptions::parse(b"console=e9 console=serial").console,

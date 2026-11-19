@@ -73,6 +73,7 @@ yet; when one is, it will be listed here with its license and maintainer.
 | `cargo-machete` | Unused dependencies (CI runs it) | `cargo install --locked cargo-machete` |
 | `actionlint` | Workflow file checks in `cargo xtask check` (CI runs it) | see github.com/rhysd/actionlint |
 | `cargo-mutants` | `cargo xtask mutants` | `cargo install --locked cargo-mutants` |
+| QEMU for AArch64 and x86_64 | Required for `cargo xtask test` | `sudo apt-get install qemu-system-arm qemu-system-x86` |
 | Miri | Undefined-behavior check of the heap (CI runs it) | `rustup toolchain install nightly --component miri`, then `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p rhizo-mm -- heap::` |
 | `cargo-nextest` | Faster, machine-readable host test runs | `cargo install --locked cargo-nextest` |
 | `cargo-bloat`, `cargo-show-asm` | Size and code-generation work | `cargo install --locked cargo-bloat cargo-show-asm` |

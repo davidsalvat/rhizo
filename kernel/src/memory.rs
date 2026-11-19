@@ -2,15 +2,14 @@
 
 use crate::arch::boot::layout;
 use crate::arch::cpu::{self, CpuTlb};
+use crate::arch::platform::{self, Format};
 use crate::sync::Global;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::frames::FrameAllocator;
-use rhizo_mm::memmap::{BootInfo, RegionKind};
 use rhizo_mm::paging::{MapError, PageFlags, PageSize, PageTable, Translation, UnmapError};
-use rhizo_mm::{DIRECT_MAP_BASE, FRAME_SIZE, KERNEL_BASE, MAX_PHYS, align_up};
+use rhizo_mm::{DIRECT_MAP_BASE, FRAME_SIZE, MAX_PHYS, align_down, align_up};
 
-const ONE_MIB: u64 = 1024 * 1024;
 const BITMAP_WORDS: usize = (MAX_PHYS / FRAME_SIZE / 64) as usize;
 
 /// Physical memory accessed through the direct map.
@@ -71,37 +70,38 @@ fn take_bitmap() -> &'static mut [u64] {
     unsafe { core::slice::from_raw_parts_mut(ptr, BITMAP_WORDS) }
 }
 
+/// Most RAM regions the kernel tracks for its direct map.
+const MAX_RAM_REGIONS: usize = 16;
+
 /// Sets up physical memory and the kernel's final address space.
-pub fn init(start_info: u64) -> Summary {
+pub fn init() -> Summary {
     let mut mem = DirectMap;
-    let info = BootInfo::read(&mem, start_info)
-        .unwrap_or_else(|e| panic!("memory map is missing or invalid: {e:?}"));
 
     // The bitmap is a zeroed static (all frames in use), so no clearing pass.
     let mut frames = FrameAllocator::from_zeroed(take_bitmap(), (MAX_PHYS / FRAME_SIZE) as usize);
-    let mut top = 0;
-    for region in info.regions(&mem) {
-        if region.kind == RegionKind::Ram {
-            let end = region.end().min(MAX_PHYS);
-            frames.add_free_region(region.start.max(ONE_MIB), end);
-            top = top.max(end);
+    let mut ram = [(0u64, 0u64); MAX_RAM_REGIONS];
+    let mut ram_count = 0;
+    platform::for_each_ram(|start, end| {
+        let end = end.min(MAX_PHYS);
+        if start < end && ram_count < MAX_RAM_REGIONS {
+            frames.add_free_region(start, end);
+            ram[ram_count] = (start, end);
+            ram_count += 1;
         }
-    }
+    });
     let (kernel_start, kernel_end) = layout::kernel_phys();
-    frames.reserve(0, ONE_MIB);
     frames.reserve(kernel_start, kernel_end);
-    for (start, end) in info.occupied() {
-        frames.reserve(start, end);
-    }
+    platform::for_each_reserved(|start, end| frames.reserve(start, end));
     let usable = frames.usable_frames() as u64 * FRAME_SIZE;
 
     let before = frames.free_frames();
-    let root = build_kernel_tables(&mut mem, &mut frames, top)
+    let root = build_kernel_tables(&mut mem, &mut frames, &ram[..ram_count])
         .unwrap_or_else(|e| panic!("cannot build kernel page tables: {e:?}"));
-    let page_table_frames = (before - frames.free_frames()) as u64;
+    let mut alloc = || frames.alloc();
     // SAFETY: the new tables map the kernel image (code, data, stack) at the
     // same virtual addresses and the direct map at the same offset.
-    unsafe { cpu::write_cr3(root.root()) };
+    unsafe { cpu::activate(root.root(), &mut alloc) };
+    let page_table_frames = (before - frames.free_frames()) as u64;
     KERNEL_ROOT.store(root.root(), Ordering::Release);
 
     FRAMES.with(|slot| *slot = Some(frames));
@@ -115,21 +115,29 @@ pub fn init(start_info: u64) -> Summary {
 fn build_kernel_tables(
     mem: &mut DirectMap,
     frames: &mut FrameAllocator<'static>,
-    top: u64,
-) -> Result<PageTable, MapError> {
+    ram: &[(u64, u64)],
+) -> Result<PageTable<Format>, MapError> {
     let mut alloc = || frames.alloc();
     let pt = PageTable::new(mem, &mut alloc)?;
 
-    // Direct map of physical memory: the largest pages the CPU supports
-    // (fewest table frames and TLB entries), read/write, never executable.
+    // Direct map of RAM: the largest pages the CPU supports (fewest table
+    // frames and TLB entries), read/write, never executable. Regions are
+    // rounded out to whole pages; a page already mapped by a neighbouring
+    // region is skipped.
     let rw_nx = PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
     let page = if cpu::supports_1gib_pages() {
         PageSize::Huge
     } else {
         PageSize::Large
     };
-    for phys in (0..align_up(top, page.bytes())).step_by(page.bytes() as usize) {
-        pt.map(mem, &mut alloc, DirectMap::virt(phys), phys, page, rw_nx)?;
+    for &(start, end) in ram {
+        let first = align_down(start, page.bytes());
+        for phys in (first..align_up(end, page.bytes())).step_by(page.bytes() as usize) {
+            match pt.map(mem, &mut alloc, DirectMap::virt(phys), phys, page, rw_nx) {
+                Ok(()) | Err(MapError::AlreadyMapped(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     // Kernel image with W^X: code RX, read-only data R, data RW (no guard page).
@@ -146,21 +154,20 @@ fn build_kernel_tables(
                     mem,
                     &mut alloc,
                     virt,
-                    virt - KERNEL_BASE,
+                    layout::virt_to_phys(virt),
                     PageSize::Small,
                     flags,
                 )?;
             }
         }
     }
+
+    // Devices the kernel keeps using (for example a memory-mapped UART).
+    platform::map_devices(&pt, &mut alloc)?;
     Ok(pt)
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    allow(dead_code, reason = "used by in-kernel tests; cells use it from H2")
-)]
-fn kernel_tables() -> PageTable {
+fn kernel_tables() -> PageTable<Format> {
     let root = KERNEL_ROOT.load(Ordering::Acquire);
     assert!(root != 0, "memory not initialized");
     PageTable::from_root(root)
