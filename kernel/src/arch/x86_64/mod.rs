@@ -1,6 +1,7 @@
 //! x86_64 platform code: everything that touches hardware lives here.
 
 pub mod boot;
+pub mod cpu;
 pub mod port;
 pub mod qemu;
 pub mod serial;

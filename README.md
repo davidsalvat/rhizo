@@ -72,7 +72,7 @@ Initial targets (hypotheses to be validated, not promises):
 | Milestone | Goal | Status |
 |---|---|---|
 | H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | Done |
-| H1 | Physical memory, paging, kernel heap | — |
+| H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | In progress |
 | H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | — |
 | H3 | Multiple cells, scheduler, isolation tests | — |
 | H4 | Suspend / resume with snapshot-equivalence tests | — |
@@ -110,7 +110,8 @@ A successful boot looks like this:
 
 ```
 Rhizo 0.1.0
-boot time: 1198606 cycles
+memory: 126 MiB usable, 126 MiB free
+boot time: 15231730 cycles
 boot complete
 ```
 

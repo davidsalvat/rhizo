@@ -130,8 +130,10 @@ fn cmd_test() -> Result {
         &run,
     )?;
     expect(
-        run.output.contains("Rhizo ") && run.output.contains("boot complete"),
-        "boot must print the banner and `boot complete`",
+        run.output.contains("Rhizo ")
+            && run.output.contains("\nmemory: ")
+            && run.output.contains("boot complete"),
+        "boot must print the banner, the memory line and `boot complete`",
         &run,
     )?;
 
@@ -149,26 +151,27 @@ fn cmd_test() -> Result {
         &run,
     )?;
 
-    step("self-check: a panicking test fails the run");
-    let kernel = build_kernel(Profile::Debug, &["ktest-should-panic"])?;
-    let run = run_vm(&kernel, timeout)?;
-    expect(
-        run.result == VmResult::Failed,
-        "panic must fail the run",
-        &run,
-    )?;
-    expect(
-        run.output.contains("test deliberate_panic ... ")
-            && run.output.contains("PANIC at kernel/src/tests.rs:")
-            && run.output.contains("deliberate panic"),
-        "panic report must name the test, the file/line and the message",
-        &run,
-    )?;
-
-    step("self-check: a hanging test times out");
-    let kernel = build_kernel(Profile::Debug, &["ktest-hang"])?;
-    let run = run_vm(&kernel, Duration::from_secs(HANG_CHECK_TIMEOUT_SECS))?;
-    expect(run.result == VmResult::TimedOut, "hang must time out", &run)?;
+    for check in SELF_CHECKS {
+        step(&format!("self-check: {}", check.description));
+        let kernel = build_kernel(Profile::Debug, &[check.feature])?;
+        let limit = check
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(timeout);
+        let run = run_vm(&kernel, limit)?;
+        expect(
+            run.result == check.expected,
+            &format!("{} must end with {:?}", check.feature, check.expected),
+            &run,
+        )?;
+        for needle in check.output {
+            expect(
+                run.output.contains(needle),
+                &format!("{} output must contain `{needle}`", check.feature),
+                &run,
+            )?;
+        }
+    }
 
     println!("\nall checks passed");
     Ok(())
@@ -190,7 +193,11 @@ fn cmd_ci() -> Result {
         "warnings",
     ])?;
 
-    for features in ["", "ktest", "ktest-should-panic", "ktest-hang"] {
+    let features = [""]
+        .into_iter()
+        .chain(["ktest"])
+        .chain(SELF_CHECKS.iter().map(|c| c.feature));
+    for features in features {
         step(&format!("clippy (kernel, features: `{features}`)"));
         let mut args = vec!["clippy", "-p", KERNEL_PACKAGE, "--target", KERNEL_TARGET];
         if !features.is_empty() {
@@ -202,6 +209,71 @@ fn cmd_ci() -> Result {
 
     cmd_test()
 }
+
+/// A kernel build that must fail in a specific, detectable way.
+struct SelfCheck {
+    feature: &'static str,
+    description: &'static str,
+    expected: VmResult,
+    /// Overrides the test timeout (for checks that expect a timeout).
+    timeout_secs: Option<u64>,
+    output: &'static [&'static str],
+}
+
+const SELF_CHECKS: &[SelfCheck] = &[
+    SelfCheck {
+        feature: "ktest-should-panic",
+        description: "a panicking test fails the run",
+        expected: VmResult::Failed,
+        timeout_secs: None,
+        output: &[
+            "test deliberate_panic ... ",
+            "PANIC at kernel/src/tests.rs:",
+            "deliberate panic",
+        ],
+    },
+    SelfCheck {
+        feature: "ktest-hang",
+        description: "a hanging test times out",
+        expected: VmResult::TimedOut,
+        timeout_secs: Some(HANG_CHECK_TIMEOUT_SECS),
+        output: &["test hang_forever ... "],
+    },
+    SelfCheck {
+        feature: "ktest-page-fault",
+        description: "a null write is reported as a page fault",
+        expected: VmResult::Failed,
+        timeout_secs: None,
+        output: &[
+            "EXCEPTION: page fault (vector 14",
+            "address 0x0: write, page not present, kernel mode",
+        ],
+    },
+    SelfCheck {
+        feature: "ktest-stack-overflow",
+        description: "stack exhaustion is reported as a double fault",
+        expected: VmResult::Failed,
+        timeout_secs: None,
+        output: &["EXCEPTION: double fault (vector 8"],
+    },
+    SelfCheck {
+        feature: "ktest-invalid-opcode",
+        description: "an invalid instruction is reported",
+        expected: VmResult::Failed,
+        timeout_secs: None,
+        output: &["EXCEPTION: invalid opcode (vector 6"],
+    },
+    SelfCheck {
+        feature: "ktest-oom",
+        description: "an impossible allocation panics with its size",
+        expected: VmResult::Failed,
+        timeout_secs: None,
+        output: &[
+            "PANIC at",
+            "memory allocation of 1099511627776 bytes failed",
+        ],
+    },
+];
 
 // ---------------------------------------------------------------------------
 // Building

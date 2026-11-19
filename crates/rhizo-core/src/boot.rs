@@ -20,6 +20,17 @@ pub fn report_boot_complete(console: &mut impl Console, start: u64, end: u64) {
     let _ = writeln!(out, "boot complete");
 }
 
+/// Prints the memory summary: usable RAM and RAM still free, in MiB.
+pub fn report_memory(console: &mut impl Console, usable_bytes: u64, free_bytes: u64) {
+    const MIB: u64 = 1024 * 1024;
+    let _ = writeln!(
+        ConsoleWriter(console),
+        "memory: {} MiB usable, {} MiB free",
+        usable_bytes / MIB,
+        free_bytes / MIB
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,6 +54,13 @@ mod tests {
         report_boot_complete(&mut console, start, counter.cycles());
 
         assert_eq!(console.text(), "boot time: 2500 cycles\nboot complete\n");
+    }
+
+    #[test]
+    fn memory_report_is_in_mib() {
+        let mut console = RecordingConsole::new();
+        report_memory(&mut console, 127 * 1024 * 1024 + 5, 120 * 1024 * 1024);
+        assert_eq!(console.text(), "memory: 127 MiB usable, 120 MiB free\n");
     }
 
     #[test]

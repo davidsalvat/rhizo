@@ -15,10 +15,14 @@ bench = false
 [features]
 # Test build: run the in-kernel test suite instead of the normal boot path.
 ktest = []
-# Harness self-checks used by `cargo xtask test`: a suite that panics and a
-# suite that hangs, to prove failures and timeouts are detected.
+# Harness self-checks used by `cargo xtask test`: each adds one failing test
+# to prove panics, hangs, exceptions and out-of-memory are detected.
 ktest-should-panic = ["ktest"]
 ktest-hang = ["ktest"]
+ktest-page-fault = ["ktest"]
+ktest-stack-overflow = ["ktest"]
+ktest-invalid-opcode = ["ktest"]
+ktest-oom = ["ktest"]
 
 [dependencies]
 rhizo-hal = { path = "../crates/rhizo-hal" }

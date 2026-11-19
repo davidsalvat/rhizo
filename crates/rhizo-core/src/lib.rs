@@ -6,7 +6,9 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod boot;
+pub mod exception;
 pub mod ktest;
+pub mod memory;
 pub mod panic;
 
 /// The kernel version, taken from the workspace version.
