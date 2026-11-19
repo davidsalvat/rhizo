@@ -1,0 +1,16 @@
+[package]
+name = "rhizo-sched"
+description = "Run queue and sleep list for Rhizo cells"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Not published to crates.io (workspace path dependencies only).
+publish = false
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

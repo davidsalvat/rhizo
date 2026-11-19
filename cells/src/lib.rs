@@ -16,6 +16,8 @@ pub mod nr {
     pub const CLOCK_GETTIME: usize = 113;
     pub const GETRANDOM: usize = 278;
     pub const GETPID: usize = 172;
+    pub const SCHED_YIELD: usize = 124;
+    pub const NANOSLEEP: usize = 101;
 }
 
 /// Linux system-call numbers for the target architecture.
@@ -30,6 +32,8 @@ pub mod nr {
     pub const CLOCK_GETTIME: usize = 228;
     pub const GETRANDOM: usize = 318;
     pub const GETPID: usize = 39;
+    pub const SCHED_YIELD: usize = 24;
+    pub const NANOSLEEP: usize = 35;
 }
 
 /// Raw system call with up to six arguments; returns the kernel's value
@@ -97,13 +101,53 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     exit(101)
 }
 
+/// Gives up the CPU to the next runnable cell.
+pub fn yield_now() {
+    syscall(nr::SCHED_YIELD, [0; 6]);
+}
+
+/// Sleeps for `ns` nanoseconds.
+pub fn sleep_ns(ns: u64) {
+    let ts = [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64];
+    syscall(nr::NANOSLEEP, [ts.as_ptr() as usize, 0, 0, 0, 0, 0]);
+}
+
+/// Address of `argc` on the initial stack, saved by `_start`.
+static mut STACK: *const usize = core::ptr::null();
+
+/// Command-line argument `n` (0 is the program name).
+pub fn arg(n: usize) -> Option<&'static [u8]> {
+    // SAFETY: `_start` stores the initial stack pointer before `main` runs;
+    // the kernel (or Linux) put argc, then argc NUL-terminated strings there,
+    // and nothing writes to them.
+    unsafe {
+        let sp = core::ptr::addr_of!(STACK).read();
+        if sp.is_null() || n >= *sp {
+            return None;
+        }
+        let s = *sp.add(1 + n) as *const u8;
+        let mut len = 0;
+        while *s.add(len) != 0 {
+            len += 1;
+        }
+        Some(core::slice::from_raw_parts(s, len))
+    }
+}
+
+#[doc(hidden)]
+pub fn start(sp: *const usize, main: fn() -> i32) -> ! {
+    // SAFETY: single-threaded program; written once, before any reader.
+    unsafe { core::ptr::addr_of_mut!(STACK).write(sp) };
+    exit(main())
+}
+
 /// Defines `_start`, which calls `$main` and exits with its return value.
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
         #[unsafe(no_mangle)]
-        extern "C" fn rhizo_cell_main() -> ! {
-            $crate::exit($main())
+        extern "C" fn rhizo_cell_main(sp: *const usize) -> ! {
+            $crate::start(sp, $main)
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -112,6 +156,7 @@ macro_rules! entry {
             "_start:",
             "    mov x29, xzr",
             "    mov x30, xzr",
+            "    mov x0, sp",
             "    bl rhizo_cell_main",
         );
 
@@ -120,6 +165,7 @@ macro_rules! entry {
             ".globl _start",
             "_start:",
             "    xor ebp, ebp",
+            "    mov rdi, rsp",
             "    and rsp, -16",
             "    call rhizo_cell_main",
         );

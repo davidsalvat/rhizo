@@ -28,6 +28,8 @@ unsafe extern "C" {
 pub enum Trap {
     /// `SYSCALL`: the system call is in the saved registers.
     Syscall,
+    /// An interrupt (the end of its time slice): the cell can be resumed.
+    Interrupt,
     /// An exception: the cell cannot continue.
     Fault(UserFault),
 }
@@ -72,6 +74,13 @@ pub fn enter_user(root: u64, regs: &mut Registers) -> Trap {
         return Trap::Syscall;
     }
     let vector = vector as u8;
+    if vector == super::irq::TIMER_VECTOR {
+        super::irq::acknowledge();
+        return Trap::Interrupt;
+    }
+    if vector == super::irq::SPURIOUS_VECTOR {
+        return Trap::Interrupt;
+    }
     Trap::Fault(UserFault(ExceptionInfo {
         vector,
         // SAFETY: written by the trap path just before returning.

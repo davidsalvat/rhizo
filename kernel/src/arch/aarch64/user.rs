@@ -26,6 +26,8 @@ unsafe extern "C" {
 pub enum Trap {
     /// `SVC #0`: the system call is in the saved registers.
     Syscall,
+    /// An interrupt (the end of its time slice): the cell can be resumed.
+    Interrupt,
     /// Any other exception: the cell cannot continue.
     Fault(UserFault),
 }
@@ -77,6 +79,10 @@ pub fn enter_user(root: u64, regs: &mut Registers) -> Trap {
     }
     if vector == 8 && (esr >> 26) & 0x3f == 0x15 {
         return Trap::Syscall;
+    }
+    if vector == 9 {
+        super::irq::acknowledge();
+        return Trap::Interrupt;
     }
     Trap::Fault(UserFault(Aarch64Exception {
         esr,

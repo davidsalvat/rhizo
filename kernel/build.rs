@@ -16,12 +16,27 @@ fn main() {
 /// the build output, where `include_bytes!` finds them. Without it (a plain
 /// `cargo clippy`), empty files stand in and spawning them fails with
 /// `NotElf`, which the in-kernel tests report.
+/// Every program in `cells/src/bin`.
+const CELLS: &[&str] = &[
+    "hello",
+    "exit3",
+    "abi",
+    "fault_null",
+    "fault_kernel",
+    "chatter",
+    "spin",
+    "sleeper",
+    "same_addr",
+    "mapper",
+    "peek",
+];
+
 fn embed_cells() {
     println!("cargo:rerun-if-env-changed=RHIZO_CELLS_DIR");
     let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("cells");
     std::fs::create_dir_all(&out).expect("create OUT_DIR/cells");
     let from = std::env::var("RHIZO_CELLS_DIR").ok();
-    for name in ["hello", "exit3", "abi", "fault_null", "fault_kernel"] {
+    for name in CELLS {
         let data = match &from {
             Some(dir) => {
                 let path = Path::new(dir).join(name);

@@ -24,4 +24,13 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ),
     ("fault_null", "", Ending::Fault),
     ("fault_kernel", "", Ending::Fault),
+    ("chatter", "x\nx\nx\n", Ending::Exit(0)),
+    ("sleeper", "slept ok\n", Ending::Exit(0)),
+    ("same_addr", "own value ok\n", Ending::Exit(0)),
+    ("peek", "", Ending::Fault),
 ];
+
+/// Test cells that never end on their own (they are killed by the tests):
+/// not run by the differential check.
+#[allow(dead_code)]
+pub const ENDLESS: &[&str] = &["spin", "mapper"];

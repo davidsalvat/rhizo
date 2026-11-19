@@ -82,6 +82,11 @@ fn read_cells(value: &[u8], cells: u32) -> Option<u64> {
 
 /// The first `(base, size)` pair of a `reg` property.
 fn first_reg(value: &[u8], address_cells: u32, size_cells: u32) -> Option<Region> {
+    nth_reg(value, address_cells, size_cells, 0)
+}
+
+fn nth_reg(value: &[u8], address_cells: u32, size_cells: u32, n: usize) -> Option<Region> {
+    let value = value.get(n * (address_cells + size_cells) as usize * 4..)?;
     let base = read_cells(value, address_cells)?;
     let size = read_cells(value.get(address_cells as usize * 4..)?, size_cells)?;
     Some(Region { base, size })
@@ -267,6 +272,17 @@ impl<'a> Fdt<'a> {
     /// The first `reg` region of the first node whose `compatible` list
     /// contains `compatible`, using its parent's cell sizes.
     pub fn find_compatible(&self, compatible: &[u8]) -> Result<Option<Region>, FdtError> {
+        self.find_compatible_reg(compatible, 0)
+    }
+
+    /// Region `index` of the `reg` property of the first node whose
+    /// `compatible` list contains `compatible` (for example the GICv3
+    /// distributor, 0, and redistributors, 1).
+    pub fn find_compatible_reg(
+        &self,
+        compatible: &[u8],
+        index: usize,
+    ) -> Result<Option<Region>, FdtError> {
         let mut cells = [DEFAULT_CELLS; MAX_DEPTH + 1];
         let mut matches = [false; MAX_DEPTH + 1];
         let mut regs: [Option<&'a [u8]>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
@@ -295,7 +311,7 @@ impl<'a> Fdt<'a> {
                         && let Some(reg) = regs[node]
                     {
                         let parent = cells[depth];
-                        found = first_reg(reg, parent.address, parent.size);
+                        found = nth_reg(reg, parent.address, parent.size, index);
                         return false;
                     }
                 }
@@ -313,6 +329,31 @@ mod tests {
     /// Device tree dumped from QEMU 8.2 `-M virt -m 128M` with
     /// `-append "console=serial exit=psci"` (compacted with dtc).
     const QEMU_VIRT: &[u8] = include_bytes!("../fixtures/qemu-virt.dtb");
+
+    /// Same, with `-M virt,gic-version=3` (the GIC of Firecracker and Cloud
+    /// Hypervisor too).
+    const QEMU_VIRT_GICV3: &[u8] = include_bytes!("../fixtures/qemu-virt-gicv3.dtb");
+
+    #[test]
+    fn finds_both_gicv3_regions() {
+        let fdt = Fdt::new(QEMU_VIRT_GICV3).unwrap();
+        let reg = |i| fdt.find_compatible_reg(b"arm,gic-v3", i).unwrap();
+        assert_eq!(
+            reg(0),
+            Some(Region {
+                base: 0x800_0000,
+                size: 0x1_0000
+            })
+        );
+        assert_eq!(
+            reg(1),
+            Some(Region {
+                base: 0x80a_0000,
+                size: 0xf6_0000
+            })
+        );
+        assert_eq!(reg(2), None);
+    }
 
     #[test]
     fn reads_qemu_virt() {

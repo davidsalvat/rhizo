@@ -56,6 +56,9 @@ enum Sys {
     RtSigprocmask,
     Ioctl,
     ArchPrctl,
+    SchedYield,
+    Nanosleep,
+    ClockNanosleep,
 }
 
 impl Arch {
@@ -78,6 +81,9 @@ impl Arch {
             (Arch::Aarch64, 215) | (Arch::X86_64, 11) => Munmap,
             (Arch::Aarch64, 222) | (Arch::X86_64, 9) => Mmap,
             (Arch::Aarch64, 278) | (Arch::X86_64, 318) => Getrandom,
+            (Arch::Aarch64, 124) | (Arch::X86_64, 24) => SchedYield,
+            (Arch::Aarch64, 101) | (Arch::X86_64, 35) => Nanosleep,
+            (Arch::Aarch64, 115) | (Arch::X86_64, 230) => ClockNanosleep,
             (Arch::X86_64, 158) => ArchPrctl,
             _ => return None,
         })
@@ -119,6 +125,10 @@ pub trait Services: Console {
 pub enum Outcome {
     /// Return to the cell (the result is in its registers).
     Resume,
+    /// Let other cells run first, then resume this one.
+    Yield,
+    /// Resume the cell no earlier than this monotonic time (nanoseconds).
+    Sleep(u64),
     /// The cell exited with this status (0–255).
     Exit(i32),
 }
@@ -196,6 +206,24 @@ impl Abi {
             Some(Sys::RtSigprocmask) => zero_out(cx, a[2], a[3].min(128)),
             Some(Sys::Ioctl) => -ENOTTY,
             Some(Sys::ArchPrctl) => arch_prctl(cell, cx, a[0], a[1]),
+            Some(Sys::SchedYield) => {
+                cell.regs.gpr[0] = 0;
+                return Outcome::Yield;
+            }
+            Some(Sys::Nanosleep) => match sleep_until(cx, 1, 0, a[0]) {
+                Ok(until) => {
+                    cell.regs.gpr[0] = 0;
+                    return Outcome::Sleep(until);
+                }
+                Err(e) => e,
+            },
+            Some(Sys::ClockNanosleep) => match sleep_until(cx, a[0], a[1], a[2]) {
+                Ok(until) => {
+                    cell.regs.gpr[0] = 0;
+                    return Outcome::Sleep(until);
+                }
+                Err(e) => e,
+            },
             None => {
                 self.report_unimplemented(cell.id, nr, cx.services);
                 -ENOSYS
@@ -448,6 +476,40 @@ fn getrandom<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         done += n as u64;
     }
     done as i64
+}
+
+/// Monotonic deadline of a sleep on `clock` for the `timespec` at `addr`
+/// (relative, or absolute with `TIMER_ABSTIME` in `flags`).
+fn sleep_until<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    clock: u64,
+    flags: u64,
+    addr: u64,
+) -> Result<u64, i64> {
+    const TIMER_ABSTIME: u64 = 1;
+    let mut ts = [0u8; 16];
+    memory::copy_from(&cx.pt, cx.mem, addr, &mut ts).map_err(|_| -EFAULT)?;
+    let sec = i64::from_le_bytes(ts[..8].try_into().unwrap_or_default());
+    let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap_or_default());
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(-EINVAL);
+    }
+    let value = (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64);
+    let now = cx.services.monotonic_ns();
+    let realtime = match clock {
+        0 => true,      // CLOCK_REALTIME
+        1 | 7 => false, // CLOCK_MONOTONIC, CLOCK_BOOTTIME
+        _ => return Err(-EINVAL),
+    };
+    Ok(if flags & TIMER_ABSTIME == 0 {
+        now.saturating_add(value)
+    } else if realtime {
+        now.saturating_add(value.saturating_sub(cx.services.realtime_ns()))
+    } else {
+        value
+    })
 }
 
 fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(

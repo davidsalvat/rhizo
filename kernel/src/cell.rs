@@ -1,14 +1,16 @@
-//! Running cells: spawn from a static executable, run until exit or fault,
-//! then return every frame (specs `cells` and `linux-abi`).
+//! Running cells: spawn from static executables, schedule them on this CPU
+//! until they exit, fault or are killed, then return every frame (specs
+//! `cells`, `linux-abi` and `scheduling`).
 
 use crate::arch::console::BootConsole;
 use crate::arch::cpu::CpuTlb;
+use crate::arch::irq;
 use crate::arch::platform::Format;
 use crate::arch::timer::{self, Counter};
 use crate::arch::user::{self, Trap};
 use crate::memory::{self, DirectMap};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
 use rhizo_cell::Cell;
 use rhizo_cell::elf::{ElfError, Image};
@@ -16,6 +18,7 @@ use rhizo_cell::space::{self, Frames};
 use rhizo_hal::{Console, CycleCounter};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{PageSize, PageTable};
+use rhizo_sched::{SLICE_NS, Scheduler};
 
 /// How a cell ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +27,8 @@ pub enum Ending {
     Exit(i32),
     /// It raised an exception and was killed.
     Fault,
+    /// The kernel ended it (`Host::kill`).
+    Killed,
 }
 
 /// The kernel's frame allocator, as cells see it.
@@ -92,107 +97,263 @@ impl Services for KernelServices<'_> {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+static IRQ_READY: AtomicBool = AtomicBool::new(false);
 
-/// A cell created and ready to run.
-#[derive(Debug)]
-pub struct Spawned {
-    cell: Cell,
-    seed: u64,
+/// Monotonic time in nanoseconds since boot (0 if the counter frequency is
+/// unknown).
+fn now_ns() -> u64 {
+    timer::cycles_to_ns(Counter.cycles()).unwrap_or(0)
 }
 
-impl Spawned {
-    /// Page-table frames of the cell's own (lower) half.
+/// A live cell and what the kernel keeps for it.
+#[derive(Debug)]
+struct Live {
+    cell: Cell,
+    abi: Abi,
+    output: Option<Vec<u8>>,
+    echo: bool,
+    random: u64,
+}
+
+/// A cell that ended, with its captured output.
+#[derive(Debug)]
+pub struct Finished {
+    pub id: u32,
+    pub ending: Ending,
+    pub output: Vec<u8>,
+}
+
+/// The cells of this CPU: the scheduler holds the live ones (spec
+/// `scheduling`); ended ones are kept until the caller looks at them.
+#[derive(Debug)]
+pub struct Host {
+    sched: Scheduler<Live>,
+    finished: Vec<Finished>,
+}
+
+impl Host {
+    /// An empty host; sets up the timer interrupt the first time.
+    pub fn new() -> Self {
+        if !IRQ_READY.swap(true, Ordering::Relaxed) {
+            irq::init();
+        }
+        Self {
+            sched: Scheduler::new(),
+            finished: Vec::new(),
+        }
+    }
+
+    /// Creates a cell from the static executable `image` with `argv` and
+    /// makes it runnable. Its output goes to the console when `echo` is set
+    /// and is kept in [`Finished::output`] when `capture` is set.
+    pub fn spawn(
+        &mut self,
+        image: &[u8],
+        argv: &[&[u8]],
+        capture: bool,
+        echo: bool,
+    ) -> Result<u32, ElfError> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut services = KernelServices {
+            capture: None,
+            echo: false,
+            random: Counter.cycles() | 1,
+        };
+        let mut random = [0u8; 16];
+        services.random(&mut random);
+        let kernel = memory::kernel_tables();
+        let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
+        let cell = rhizo_cell::spawn::<Format>(
+            id,
+            image,
+            user::MACHINE,
+            kernel_half,
+            &mut DirectMap,
+            &mut KernelFrames,
+            argv,
+            &[],
+            random,
+        )?;
+        sync_code(&PageTable::<Format>::from_root(cell.root), image);
+        self.sched.add(Live {
+            cell,
+            abi: Abi::new(user::ABI),
+            output: capture.then(Vec::new),
+            echo,
+            random: services.random,
+        });
+        Ok(id)
+    }
+
+    /// Page-table frames of the own half of live cell `id`.
     #[cfg_attr(
         not(feature = "bench-cell"),
         allow(dead_code, reason = "benchmark metric")
     )]
-    pub fn table_frames(&self) -> usize {
-        PageTable::<Format>::from_root(self.cell.root).lower_half_tables(&DirectMap)
+    pub fn table_frames(&mut self, id: u32) -> Option<usize> {
+        let live = self.sched.remove(|l| l.cell.id == id)?;
+        let frames = PageTable::<Format>::from_root(live.cell.root).lower_half_tables(&DirectMap);
+        self.sched.add(live);
+        Some(frames)
+    }
+
+    /// Runs cells until none is left or `stop` holds (checked whenever a cell
+    /// ends or gives up the CPU).
+    pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
+        while !stop(self) {
+            let now = now_ns();
+            let Some(mut live) = self.sched.next(now) else {
+                match self.sched.next_wake() {
+                    Some(wake) => idle_until(wake),
+                    None => return,
+                }
+                continue;
+            };
+            if irq::available() {
+                irq::arm_after_ns(SLICE_NS);
+            }
+            self.run_slice(&mut live);
+        }
+    }
+
+    /// Runs `live` until it ends, sleeps, yields or is preempted, and files it
+    /// accordingly.
+    fn run_slice(&mut self, live: &mut Live) {
+        let pt = PageTable::<Format>::from_root(live.cell.root);
+        loop {
+            match user::enter_user(live.cell.root, &mut live.cell.regs) {
+                Trap::Syscall => {
+                    let mut services = KernelServices {
+                        capture: live.output.as_mut(),
+                        echo: live.echo,
+                        random: live.random,
+                    };
+                    let mut cx = Context {
+                        pt,
+                        mem: &mut DirectMap,
+                        tlb: &mut CpuTlb,
+                        frames: &mut KernelFrames,
+                        services: &mut services,
+                    };
+                    let outcome = live.abi.handle(&mut live.cell, &mut cx);
+                    live.random = services.random;
+                    match outcome {
+                        Outcome::Resume => continue,
+                        Outcome::Yield => self.sched.add(take(live)),
+                        Outcome::Sleep(until) => self.sched.sleep(take(live), until),
+                        Outcome::Exit(status) => self.end(take(live), Ending::Exit(status)),
+                    }
+                }
+                Trap::Interrupt => self.sched.add(take(live)),
+                Trap::Fault(fault) => {
+                    let mut services = KernelServices {
+                        capture: live.output.as_mut(),
+                        echo: live.echo,
+                        random: 0,
+                    };
+                    fault.report(&mut services, live.cell.id);
+                    self.end(take(live), Ending::Fault);
+                }
+            }
+            return;
+        }
+    }
+
+    /// Ends live cell `id` if it exists; returns whether it did.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn kill(&mut self, id: u32) -> bool {
+        match self.sched.remove(|l| l.cell.id == id) {
+            Some(live) => {
+                self.end(live, Ending::Killed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How cell `id` ended, if it has.
+    pub fn finished(&self, id: u32) -> Option<&Finished> {
+        self.finished.iter().find(|f| f.id == id)
+    }
+
+    /// Number of live cells.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn live(&self) -> usize {
+        self.sched.len()
+    }
+
+    fn end(&mut self, live: Live, ending: Ending) {
+        user::release_user();
+        space::destroy(
+            PageTable::<Format>::from_root(live.cell.root),
+            &mut DirectMap,
+            &mut KernelFrames,
+        );
+        self.finished.push(Finished {
+            id: live.cell.id,
+            ending,
+            output: live.output.unwrap_or_default(),
+        });
     }
 }
 
-/// Creates a cell from the static executable `image` with `argv`.
-pub fn spawn(image: &[u8], argv: &[&[u8]]) -> Result<Spawned, ElfError> {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let mut services = KernelServices {
-        capture: None,
-        echo: false,
-        random: Counter.cycles() | 1,
-    };
-    let mut random = [0u8; 16];
-    services.random(&mut random);
-    let kernel = memory::kernel_tables();
-    let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
-    let cell = rhizo_cell::spawn::<Format>(
-        id,
-        image,
-        user::MACHINE,
-        kernel_half,
-        &mut DirectMap,
-        &mut KernelFrames,
-        argv,
-        &[],
-        random,
-    )?;
-    sync_code(&PageTable::<Format>::from_root(cell.root), image);
-    Ok(Spawned {
-        cell,
-        seed: services.random,
-    })
-}
-
-/// Runs a spawned cell on this CPU until it exits or faults, then frees it.
-/// Its output (and a fault report) goes to the console when `echo` is set,
-/// and to `capture` when given.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "taking the cell by value ends it: it cannot be run twice"
-)]
-pub fn finish(spawned: Spawned, capture: Option<&mut Vec<u8>>, echo: bool) -> Ending {
-    let Spawned { mut cell, seed } = spawned;
-    let mut services = KernelServices {
-        capture,
-        echo,
-        random: seed,
-    };
-    let pt = PageTable::<Format>::from_root(cell.root);
-    let mut abi = Abi::new(user::ABI);
-    let ending = loop {
-        match user::enter_user(cell.root, &mut cell.regs) {
-            Trap::Syscall => {
-                let mut cx = Context {
-                    pt,
-                    mem: &mut DirectMap,
-                    tlb: &mut CpuTlb,
-                    frames: &mut KernelFrames,
-                    services: &mut services,
-                };
-                if let Outcome::Exit(status) = abi.handle(&mut cell, &mut cx) {
-                    break Ending::Exit(status);
-                }
-            }
-            Trap::Fault(fault) => {
-                fault.report(&mut services, cell.id);
-                break Ending::Fault;
-            }
+impl Drop for Host {
+    fn drop(&mut self) {
+        while let Some(live) = self.sched.remove(|_| true) {
+            self.end(live, Ending::Killed);
         }
-    };
-    user::release_user();
-    space::destroy(pt, &mut DirectMap, &mut KernelFrames);
-    ending
+    }
 }
 
-/// Spawns and runs a cell to its end, echoing its output to the console.
+/// Moves a live cell out of a `&mut` slot (the slot is not used again).
+fn take(live: &mut Live) -> Live {
+    Live {
+        cell: live.cell,
+        abi: core::mem::replace(&mut live.abi, Abi::new(user::ABI)),
+        output: live.output.take(),
+        echo: live.echo,
+        random: live.random,
+    }
+}
+
+/// Waits without running anything until monotonic time `wake`.
+fn idle_until(wake: u64) {
+    let now = now_ns();
+    if wake <= now {
+        return;
+    }
+    if irq::available() {
+        irq::arm_after_ns(wake - now);
+        irq::wait();
+    } else {
+        while now_ns() < wake {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Spawns and runs one cell to its end, echoing its output to the console;
+/// returns how it ended and what it printed (including a fault report).
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "used by in-kernel tests")
 )]
-pub fn run(
-    image: &[u8],
-    argv: &[&[u8]],
-    capture: Option<&mut Vec<u8>>,
-) -> Result<Ending, ElfError> {
-    Ok(finish(spawn(image, argv)?, capture, true))
+pub fn run(image: &[u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), ElfError> {
+    let mut host = Host::new();
+    let id = host.spawn(image, argv, true, true)?;
+    host.run(|_| false);
+    let done = host
+        .finished
+        .pop()
+        .filter(|f| f.id == id)
+        .expect("the cell ended");
+    Ok((done.ending, done.output))
 }
 
 /// `bench-cell`: spawns and runs the hello cell repeatedly and prints the
@@ -206,17 +367,20 @@ pub fn bench(console: &mut impl Console) {
     let mut spawn_ns = Vec::with_capacity(RUNS);
     let mut run_ns = Vec::with_capacity(RUNS);
     let mut tables = 0;
-    let mut out = Vec::with_capacity(64);
+    let mut host = Host::new();
     for _ in 0..RUNS {
-        out.clear();
+        host.finished.clear();
         let t0 = Counter.cycles();
-        let spawned = spawn(image, &[b"hello"]).expect("the hello cell spawns");
+        let id = host
+            .spawn(image, &[b"hello"], true, false)
+            .expect("the hello cell spawns");
         let t1 = Counter.cycles();
-        tables = spawned.table_frames();
-        let ending = finish(spawned, Some(&mut out), false);
+        tables = host.table_frames(id).unwrap_or(0);
+        host.run(|_| false);
         let t2 = Counter.cycles();
-        assert_eq!(ending, Ending::Exit(0), "the hello cell exits with 0");
-        assert_eq!(out, b"hello from a cell\n");
+        let done = host.finished(id).expect("the hello cell ended");
+        assert_eq!(done.ending, Ending::Exit(0), "the hello cell exits with 0");
+        assert_eq!(done.output, b"hello from a cell\n");
         spawn_ns.push(timer::cycles_to_ns(t1 - t0).unwrap_or(0));
         run_ns.push(timer::cycles_to_ns(t2 - t0).unwrap_or(0));
     }
@@ -256,5 +420,17 @@ pub fn test_image(name: &str) -> &'static [u8] {
             }
         };
     }
-    cells!("hello", "exit3", "abi", "fault_null", "fault_kernel")
+    cells!(
+        "hello",
+        "exit3",
+        "abi",
+        "fault_null",
+        "fault_kernel",
+        "chatter",
+        "spin",
+        "sleeper",
+        "same_addr",
+        "mapper",
+        "peek"
+    )
 }

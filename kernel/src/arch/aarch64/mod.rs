@@ -3,6 +3,8 @@
 pub mod boot;
 pub mod console;
 pub mod cpu;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod irq;
 pub mod platform;
 pub mod power;
 #[cfg(feature = "ktest")]
