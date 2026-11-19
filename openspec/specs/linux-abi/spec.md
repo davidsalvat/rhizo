@@ -42,3 +42,13 @@ call's name or number and the cell once, so missing calls are found quickly.
 #### Scenario: Unknown call
 - **WHEN** a cell invokes a system call Rhizo does not implement
 - **THEN** it receives `-ENOSYS` and the console shows `unimplemented syscall` with the call
+
+### Requirement: Scheduling calls
+The kernel SHALL implement `sched_yield`, `nanosleep` and `clock_nanosleep`
+(relative sleeps on `CLOCK_MONOTONIC` and `CLOCK_REALTIME`, and absolute
+`TIMER_ABSTIME` sleeps) with Linux semantics; a bad pointer returns `-EFAULT`
+and an invalid time `-EINVAL`.
+
+#### Scenario: Invalid sleep
+- **WHEN** a cell calls `nanosleep` with nanoseconds outside 0–999,999,999
+- **THEN** it receives `-EINVAL`
