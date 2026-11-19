@@ -79,7 +79,9 @@ This repository uses spec-driven development with
 ## Build and test
 
 Requires the Rust toolchain (via rustup), `qemu-system-aarch64` and, for the
-second architecture, `qemu-system-x86_64`. Every `cargo xtask` command takes
+second architecture, `qemu-system-x86_64`, plus gcc with a static glibc for
+the C cells (`gcc`, `libc6-dev`; to cross-build, `gcc-aarch64-linux-gnu` or
+`gcc-x86-64-linux-gnu`). Every `cargo xtask` command takes
 `--arch aarch64` (default) or `--arch x86_64` right after `xtask`.
 
 The feedback loop, fastest first:
@@ -121,7 +123,7 @@ The feedback loop, fastest first:
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |
 | `crates/rhizo-sched` | Run queue, sleep list and time slice (time passed in, never read); address-space tag pool | — |
 | `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop (`src/cell.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot` |
-| `cells` | Test programs run as cells: `no_std` static Linux executables, expectations in `cells/expected.rs` (also checked natively on a Linux host) | — |
+| `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
 | `xtask` | Developer tooling (host only) | — |
 
 Planned crates are created by the milestone that adds their code, not

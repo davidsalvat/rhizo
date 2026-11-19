@@ -5,7 +5,7 @@
 use super::cpu::{EMPTY_ROOT, USER_ROOT};
 use core::arch::asm;
 use core::sync::atomic::Ordering;
-use rhizo_cell::Registers;
+use rhizo_cell::{FpState, Registers};
 use rhizo_core::exception::{self, Aarch64Exception};
 use rhizo_hal::Console;
 
@@ -28,6 +28,9 @@ pub enum Trap {
     Syscall,
     /// An interrupt (the end of its time slice): the cell can be resumed.
     Interrupt,
+    /// A first FP/SIMD instruction while the registers belong to another
+    /// cell (see [`fp_trap`]): swap the state and resume.
+    FpUnavailable,
     /// Any other exception: the cell cannot continue.
     Fault(UserFault),
 }
@@ -61,9 +64,124 @@ impl UserFault {
     }
 }
 
-/// Enables 16-bit ASIDs when the CPU has them and returns the highest tag
-/// cells may use (65535, or 255 with 8-bit ASIDs). Call once.
+// FP/SIMD state of a cell: q0-q31 at 0-511, FPCR at 512, FPSR at 520.
+core::arch::global_asm!(
+    r#"
+    .arch_extension fp
+    .arch_extension simd
+    .text
+    .global rhizo_fp_save
+rhizo_fp_save:
+    stp q0, q1, [x0, #0]
+    stp q2, q3, [x0, #32]
+    stp q4, q5, [x0, #64]
+    stp q6, q7, [x0, #96]
+    stp q8, q9, [x0, #128]
+    stp q10, q11, [x0, #160]
+    stp q12, q13, [x0, #192]
+    stp q14, q15, [x0, #224]
+    stp q16, q17, [x0, #256]
+    stp q18, q19, [x0, #288]
+    stp q20, q21, [x0, #320]
+    stp q22, q23, [x0, #352]
+    stp q24, q25, [x0, #384]
+    stp q26, q27, [x0, #416]
+    stp q28, q29, [x0, #448]
+    stp q30, q31, [x0, #480]
+    mrs x1, fpcr
+    mrs x2, fpsr
+    str x1, [x0, #512]
+    str x2, [x0, #520]
+    ret
+
+    .global rhizo_fp_load
+rhizo_fp_load:
+    ldp q0, q1, [x0, #0]
+    ldp q2, q3, [x0, #32]
+    ldp q4, q5, [x0, #64]
+    ldp q6, q7, [x0, #96]
+    ldp q8, q9, [x0, #128]
+    ldp q10, q11, [x0, #160]
+    ldp q12, q13, [x0, #192]
+    ldp q14, q15, [x0, #224]
+    ldp q16, q17, [x0, #256]
+    ldp q18, q19, [x0, #288]
+    ldp q20, q21, [x0, #320]
+    ldp q22, q23, [x0, #352]
+    ldp q24, q25, [x0, #384]
+    ldp q26, q27, [x0, #416]
+    ldp q28, q29, [x0, #448]
+    ldp q30, q31, [x0, #480]
+    ldr x1, [x0, #512]
+    ldr x2, [x0, #520]
+    msr fpcr, x1
+    msr fpsr, x2
+    ret
+    "#
+);
+
+unsafe extern "C" {
+    fn rhizo_fp_save(state: *mut FpState);
+    fn rhizo_fp_load(state: *const FpState);
+}
+
+/// Whether FP/SIMD use by cell code traps (`CPACR_EL1.FPEN` = 0b01: EL0
+/// traps, EL1 does not, so the kernel can still save and load).
+static FP_TRAPS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Makes FP/SIMD use by cell code trap (`true`) or not, writing `CPACR_EL1`
+/// only when that changes.
+pub fn fp_trap(enable: bool) {
+    if FP_TRAPS.swap(enable, Ordering::Relaxed) == enable {
+        return;
+    }
+    let fpen: u64 = if enable { 0b01 } else { 0b11 };
+    // SAFETY: CPACR_EL1.FPEN only decides whether FP/SIMD traps; EL1 access
+    // stays enabled either way.
+    unsafe {
+        asm!(
+            "mrs {t}, cpacr_el1",
+            "bic {t}, {t}, #(3 << 20)",
+            "orr {t}, {t}, {f}",
+            "msr cpacr_el1, {t}",
+            "isb",
+            t = out(reg) _,
+            f = in(reg) fpen << 20,
+            options(nostack)
+        );
+    }
+}
+
+/// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
+/// state of the cell that last ran).
+pub fn fp_save(state: &mut FpState) {
+    // SAFETY: `state` is 528 writable bytes; FP access is enabled at EL1.
+    unsafe { rhizo_fp_save(state) }
+}
+
+/// Loads the FP/SIMD registers for the cell about to run.
+pub fn fp_load(state: &FpState) {
+    // SAFETY: `state` is 528 readable bytes; FP access is enabled at EL1.
+    unsafe { rhizo_fp_load(state) }
+}
+
+/// Enables FP/SIMD for cells (and for the save and load above), and 16-bit
+/// ASIDs when the CPU has them; returns the highest tag cells may use
+/// (65535, or 255 with 8-bit ASIDs). Call once.
 pub fn init_tags() -> u16 {
+    // SAFETY: CPACR_EL1.FPEN = 0b11 stops trapping FP/SIMD at EL0 and EL1;
+    // the kernel is built without FP instructions, so only cells and the
+    // explicit save/load use them.
+    unsafe {
+        asm!(
+            "mrs {t}, cpacr_el1",
+            "orr {t}, {t}, #(3 << 20)",
+            "msr cpacr_el1, {t}",
+            "isb",
+            t = out(reg) _,
+            options(nostack)
+        );
+    }
     let mmfr0: u64;
     // SAFETY: reading an ID register has no side effects.
     unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack)) };
@@ -143,6 +261,9 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     if vector == 8 && (esr >> 26) & 0x3f == 0x15 {
         return Trap::Syscall;
     }
+    if vector == 8 && (esr >> 26) & 0x3f == 0x07 {
+        return Trap::FpUnavailable;
+    }
     if vector == 9 {
         super::irq::acknowledge();
         return Trap::Interrupt;
@@ -153,6 +274,12 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
         elr: regs.pc,
         stack_guard: (0, 0),
     }))
+}
+
+/// Drops the translations of a cell that keeps running (its permissions
+/// shrank, as after a fork).
+pub fn flush_user(root: u64, tag: u16) {
+    release_user(root, tag);
 }
 
 /// Points `TTBR0_EL1` back at the empty table and drops every translation

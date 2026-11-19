@@ -4,7 +4,7 @@
 use super::cpu::{read_cr2, wrmsr};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use rhizo_cell::Registers;
+use rhizo_cell::{FpState, Registers};
 use rhizo_core::exception::{self, ExceptionInfo};
 use rhizo_hal::Console;
 
@@ -30,6 +30,9 @@ pub enum Trap {
     Syscall,
     /// An interrupt (the end of its time slice): the cell can be resumed.
     Interrupt,
+    /// A first FP/SIMD instruction while the registers belong to another
+    /// cell (`#NM`, see [`fp_trap`]): swap the state and resume.
+    FpUnavailable,
     /// An exception: the cell cannot continue.
     Fault(UserFault),
 }
@@ -75,9 +78,65 @@ static LAST_FS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// CR3 bit 63 with PCIDs on: keep the translations of the new PCID.
 const NO_FLUSH: u64 = 1 << 63;
 
-/// Enables PCIDs when the CPU has them and returns the highest tag cells may
-/// use (4095), or 0 without PCIDs (every switch flushes). Call once.
+/// Whether `CR0.TS` is set: the next FP/SIMD instruction raises `#NM`.
+static FP_TRAPS: AtomicBool = AtomicBool::new(false);
+
+/// Makes FP/SIMD use trap (`CR0.TS`, `#NM`) or not, writing CR0 only when
+/// that changes.
+pub fn fp_trap(enable: bool) {
+    if FP_TRAPS.swap(enable, Ordering::Relaxed) == enable {
+        return;
+    }
+    // SAFETY: CR0.TS only makes FP/SIMD instructions raise #NM; the kernel
+    // uses none except `fp_save`/`fp_load`, which clear it first.
+    unsafe {
+        if enable {
+            asm!("mov {t}, cr0", "or {t}, 8", "mov cr0, {t}", t = out(reg) _, options(nostack));
+        } else {
+            asm!("clts", options(nostack));
+        }
+    }
+}
+
+/// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
+/// state of the cell that last ran).
+pub fn fp_save(state: &mut FpState) {
+    fp_trap(false);
+    // SAFETY: `state` is 16-byte aligned and at least 512 bytes; SSE is
+    // enabled by `init_tags`.
+    unsafe { asm!("fxsave64 [{}]", in(reg) state, options(nostack)) };
+}
+
+/// Loads the FP/SIMD registers for the cell about to run.
+pub fn fp_load(state: &FpState) {
+    fp_trap(false);
+    // SAFETY: as for `fp_save`; `FXRSTOR` only loads valid images (reserved
+    // MXCSR bits are cleared by the kernel's initial image and cannot be set
+    // by a cell without faulting in `LDMXCSR` first).
+    unsafe { asm!("fxrstor64 [{}]", in(reg) state, options(nostack)) };
+}
+
+/// Enables SSE for cells (and for the save and load above), and PCIDs when
+/// the CPU has them; returns the highest tag cells may use (4095), or 0
+/// without PCIDs (every switch flushes). Call once.
 pub fn init_tags() -> u16 {
+    // SAFETY: CR0.MP set, CR0.EM clear, CR4.OSFXSR and OSXMMEXCPT set: SSE
+    // works with FXSAVE support. The kernel is built without SSE.
+    unsafe {
+        asm!(
+            "mov {t}, cr0",
+            "and {t}, {em}",
+            "or {t}, 2",
+            "mov cr0, {t}",
+            "mov {t}, cr4",
+            "or {t}, {sse}",
+            "mov cr4, {t}",
+            t = out(reg) _,
+            em = const !(1u64 << 2),
+            sse = const (1u64 << 9) | (1u64 << 10),
+            options(nostack)
+        );
+    }
     if core::arch::x86_64::__cpuid(1).ecx & (1 << 17) == 0 {
         return 0;
     }
@@ -135,6 +194,9 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
         return Trap::Syscall;
     }
     let vector = vector as u8;
+    if vector == 7 {
+        return Trap::FpUnavailable;
+    }
     if vector == super::irq::TIMER_VECTOR {
         super::irq::acknowledge();
         return Trap::Interrupt;
@@ -151,16 +213,26 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     }))
 }
 
-/// Switches CR3 back to the kernel's tables and drops every translation of
-/// the cell (`root`, `tag`): call before freeing its tables and its tag.
-pub fn release_user(root: u64, tag: u16) {
+/// Switches CR3 back to the kernel's tables: call before freeing the tables
+/// and the tag of the cell (`root`, `tag`).
+pub fn release_user(_root: u64, _tag: u16) {
+    // The tag's translations are dropped when its next cell first loads it
+    // (`enter_user` with `fresh`): one CR3 load here, not two (under nested
+    // virtualization each load can cost a VM exit).
+    let pcid = PCID.load(Ordering::Relaxed);
+    let kernel = crate::memory::kernel_tables().root();
+    USER_CR3.store(kernel, Ordering::Relaxed);
+    load_cr3(if pcid { kernel | NO_FLUSH } else { kernel });
+}
+
+/// Drops the translations of a cell that keeps running (its permissions
+/// shrank, as after a fork); the next entry reloads its tables.
+pub fn flush_user(root: u64, tag: u16) {
     let pcid = PCID.load(Ordering::Relaxed);
     if pcid && tag != 0 {
         load_cr3(root | tag as u64); // without bit 63: flushes this PCID
     }
-    let kernel = crate::memory::kernel_tables().root();
-    USER_CR3.store(kernel, Ordering::Relaxed);
-    load_cr3(if pcid { kernel | NO_FLUSH } else { kernel });
+    release_user(root, tag);
 }
 
 /// Nothing to do on x86_64: instruction fetch sees data writes.

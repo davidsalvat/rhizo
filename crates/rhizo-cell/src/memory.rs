@@ -98,6 +98,10 @@ pub trait Pager<F: EntryFormat, M: PhysicalMemory> {
     /// Tries to make the page containing `addr` accessible (writable when
     /// `write`); returns whether it did.
     fn page_in(&mut self, pt: &PageTable<F>, mem: &mut M, addr: u64, write: bool) -> bool;
+
+    /// Forgets pages in `addr..addr + len` that are not in memory yet: the
+    /// cell unmapped them, so they must not come back.
+    fn discard(&mut self, _addr: u64, _len: u64) {}
 }
 
 /// No paging: what is not mapped stays a fault.

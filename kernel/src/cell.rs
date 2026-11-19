@@ -202,6 +202,17 @@ impl Lazy {
         true
     }
 
+    /// Drops pending pages inside `addr..addr + len` (the cell unmapped them).
+    fn discard(&mut self, addr: u64, len: u64) {
+        for i in 0..self.pending.len() {
+            let page = self.snapshot.page(i);
+            if self.pending[i] && page.virt >= addr && page.virt + page.size.bytes() <= addr + len {
+                self.pending[i] = false;
+                self.left -= 1;
+            }
+        }
+    }
+
     /// Restores every page still pending.
     fn finish(&mut self, pt: &PageTable<Format>) {
         for i in 0..self.pending.len() {
@@ -228,6 +239,12 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
             return true;
         }
         write && resolve_write(pt, addr)
+    }
+
+    fn discard(&mut self, addr: u64, len: u64) {
+        if let Some(lazy) = self.0.as_mut() {
+            lazy.discard(addr, len);
+        }
     }
 }
 
@@ -266,6 +283,9 @@ pub struct Host {
     finished: Vec<Finished>,
     /// Frozen cells: never run, only forked (spec `fork`, templates).
     templates: Vec<Cell>,
+    /// Cell whose FP/SIMD state is in the registers (0: none). The kernel
+    /// never uses them, so they are saved only when another cell runs.
+    fp_owner: u32,
 }
 
 impl Host {
@@ -280,6 +300,7 @@ impl Host {
             tags: TagPool::new(MAX_TAG.load(Ordering::Relaxed)),
             finished: Vec::new(),
             templates: Vec::new(),
+            fp_owner: 0,
         }
     }
 
@@ -337,6 +358,17 @@ impl Host {
         Ok(id)
     }
 
+    /// Brings `live`'s FP/SIMD state up to date in its registers, if it is in
+    /// the CPU; with `leaving`, the CPU's copy stops belonging to it.
+    fn sync_fp(&mut self, live: &mut Live, leaving: bool) {
+        if self.fp_owner == live.cell.id {
+            user::fp_save(&mut live.cell.regs.fp);
+            if leaving {
+                self.fp_owner = 0;
+            }
+        }
+    }
+
     /// Suspends live cell `id` into a snapshot and frees all its memory
     /// (spec `snapshots`). Its captured output stays with the host.
     pub fn suspend(&mut self, id: u32) -> Option<Snapshot> {
@@ -345,6 +377,7 @@ impl Host {
         if let Some(lazy) = live.lazy.as_mut() {
             lazy.finish(&pt);
         }
+        self.sync_fp(&mut live, true);
         let remaining = wake.map_or(0, |w| w.saturating_sub(now_ns()).max(1));
         let snapshot =
             Snapshot::capture::<Format>(user::MACHINE, &live.cell, remaining, &DirectMap);
@@ -452,6 +485,8 @@ impl Host {
     /// Runs `live` until it ends, sleeps, yields or is preempted, and files it
     /// accordingly.
     fn run_slice(&mut self, live: &mut Live) {
+        // FP/SIMD state moves only if this cell actually uses it (design D1).
+        user::fp_trap(self.fp_owner != live.cell.id);
         let pt = PageTable::<Format>::from_root(live.cell.root);
         // Ticks seen in this slice: the first may have been pending since
         // before the cell was picked, so a cell is preempted at the second,
@@ -486,6 +521,16 @@ impl Host {
                         Outcome::Sleep(until) => self.sched.sleep(take(live), until),
                         Outcome::Exit(status) => self.end(take(live), Ending::Exit(status)),
                     }
+                }
+                Trap::FpUnavailable => {
+                    let owner = self.fp_owner;
+                    if let Some(previous) = self.sched.find_mut(|l| l.cell.id == owner) {
+                        user::fp_save(&mut previous.cell.regs.fp);
+                    }
+                    user::fp_load(&live.cell.regs.fp);
+                    user::fp_trap(false);
+                    self.fp_owner = live.cell.id;
+                    continue;
                 }
                 Trap::Interrupt => {
                     ticks += 1;
@@ -539,6 +584,7 @@ impl Host {
             lazy.finish(&pt);
         }
         parent.lazy = None;
+        self.sync_fp(&mut parent, false);
         let mut children = Vec::with_capacity(n);
         for _ in 0..n {
             let Some(child) = self.child_of(&parent.cell, parent.output.is_some(), parent.echo)
@@ -550,7 +596,7 @@ impl Host {
         }
         // The parent lost write access to everything it shares: drop what its
         // TLB still caches.
-        user::release_user(parent.cell.root, parent.tag);
+        user::flush_user(parent.cell.root, parent.tag);
         self.requeue(parent, wake);
         (children.len() == n).then_some(children)
     }
@@ -593,6 +639,7 @@ impl Host {
         if let Some(lazy) = live.lazy.as_mut() {
             lazy.finish(&pt);
         }
+        self.sync_fp(&mut live, true);
         user::release_user(live.cell.root, live.tag);
         if live.tag != 0 {
             self.tags.free(live.tag);
@@ -640,6 +687,9 @@ impl Host {
     }
 
     fn end(&mut self, live: Live, ending: Ending) {
+        if self.fp_owner == live.cell.id {
+            self.fp_owner = 0;
+        }
         user::release_user(live.cell.root, live.tag);
         if live.tag != 0 {
             self.tags.free(live.tag);
@@ -767,6 +817,11 @@ pub fn bench(console: &mut impl Console) {
         f[2],
         f[3]
     );
+    let (cold, warm) = workload();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-workload cold_ns={cold} warm_ns={warm}"
+    );
     let s = suspend_resume();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -777,6 +832,45 @@ pub fn bench(console: &mut impl Console) {
         s[3],
         s[4]
     );
+}
+
+/// A real program (`libc_warm`, static glibc) answering one request: started
+/// cold from its executable (warm-up included), and forked from a template
+/// frozen after its warm-up. Medians over 7 rounds.
+#[cfg(feature = "bench-cell")]
+fn workload() -> (u64, u64) {
+    const ROUNDS: usize = 7;
+    let image = test_image("libc_warm");
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let (mut cold, mut warm) = (Vec::new(), Vec::new());
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn(image, &[b"libc_warm"], true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        cold.push(ns(t0, Counter.cycles()));
+    }
+    let template = host
+        .spawn(image, &[b"libc_warm"], true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"warm\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    cold.sort_unstable();
+    warm.sort_unstable();
+    (cold[ROUNDS / 2], warm[ROUNDS / 2])
 }
 
 /// Medians over several rounds: forking a 50 MiB cell (frozen as a template,

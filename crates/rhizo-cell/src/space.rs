@@ -112,6 +112,51 @@ pub fn unmap<F: EntryFormat>(
     Ok(())
 }
 
+/// Changes the permissions of every page in `addr..addr + len` (spec
+/// `linux-abi`, `mprotect`). Fails, changing nothing, if a page in the range
+/// is not mapped or the range splits a 2 MiB page.
+pub fn protect<F: EntryFormat>(
+    pt: &PageTable<F>,
+    mem: &mut impl PhysicalMemory,
+    tlb: &mut impl Tlb,
+    frames: &mut impl Frames,
+    addr: u64,
+    len: u64,
+    flags: PageFlags,
+) -> Result<(), ProtectError> {
+    let end = addr.saturating_add(len);
+    let mut at = addr;
+    while at < end {
+        let t = pt.translate(mem, at).ok_or(ProtectError::NotMapped(at))?;
+        let base = at & !(t.size.bytes() - 1);
+        if base < addr || base + t.size.bytes() > end {
+            return Err(ProtectError::PartialLargePage(base));
+        }
+        at = base + t.size.bytes();
+    }
+    let mut at = addr;
+    while at < end {
+        pt.unshare_path(mem, frames, at)
+            .map_err(|_| ProtectError::OutOfMemory)?;
+        let size = pt
+            .protect(mem, tlb, at, flags)
+            .map_err(|_| ProtectError::NotMapped(at))?;
+        at = (at & !(size.bytes() - 1)) + size.bytes();
+    }
+    Ok(())
+}
+
+/// Why permissions cannot be changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectError {
+    /// A page in the range is not mapped.
+    NotMapped(u64),
+    /// The range covers only part of a 2 MiB page.
+    PartialLargePage(u64),
+    /// No memory to make a shared page table private.
+    OutOfMemory,
+}
+
 /// Frees the whole user half of `pt`: drops its reference to every mapped
 /// page and table (freeing what no other cell shares), and the root.
 pub fn destroy<F: EntryFormat>(
@@ -227,7 +272,25 @@ mod tests {
             mod x86_64 { $(#[test] fn $name() { super::$name::<super::X86_64>(); })* }
         };
     }
+    fn protect_needs_every_page_mapped<F: EntryFormat>() {
+        let (pt, mut mem, mut tlb, mut frames) = setup::<F>();
+        map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, 0x1000, 0x3000, RW).unwrap();
+        let ro = PageFlags::USER | PageFlags::NO_EXECUTE;
+        assert_eq!(
+            protect(&pt, &mut mem, &mut tlb, &mut frames, 0x1000, 0x4000, ro),
+            Err(ProtectError::NotMapped(0x4000))
+        );
+        assert!(
+            pt.translate(&mem, 0x1000).unwrap().flags.is_writable(),
+            "nothing changed"
+        );
+        protect(&pt, &mut mem, &mut tlb, &mut frames, 0x2000, 0x2000, ro).unwrap();
+        assert!(pt.translate(&mem, 0x1000).unwrap().flags.is_writable());
+        assert!(!pt.translate(&mem, 0x3fff).unwrap().flags.is_writable());
+    }
+
     both_formats!(
+        protect_needs_every_page_mapped,
         large_regions_use_large_pages,
         teardown_returns_every_frame,
         memory_starts_zeroed_and_unmap_refuses_to_split,

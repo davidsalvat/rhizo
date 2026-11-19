@@ -17,7 +17,9 @@ use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
 
 /// Linux `errno` values used here.
 pub mod errno {
+    pub const ENOENT: i64 = 2;
     pub const EBADF: i64 = 9;
+    pub const EAGAIN: i64 = 11;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
@@ -60,6 +62,20 @@ enum Sys {
     SchedYield,
     Nanosleep,
     ClockNanosleep,
+    Mprotect,
+    SetRobustList,
+    Rseq,
+    Prlimit64,
+    Getrlimit,
+    Readlink,
+    Readlinkat,
+    Ids,
+    Getppid,
+    Sigaltstack,
+    Madvise,
+    Futex,
+    Fstat,
+    Newfstatat,
 }
 
 impl Arch {
@@ -83,6 +99,21 @@ impl Arch {
             (Arch::Aarch64, 222) | (Arch::X86_64, 9) => Mmap,
             (Arch::Aarch64, 278) | (Arch::X86_64, 318) => Getrandom,
             (Arch::Aarch64, 124) | (Arch::X86_64, 24) => SchedYield,
+            (Arch::Aarch64, 226) | (Arch::X86_64, 10) => Mprotect,
+            (Arch::Aarch64, 99) | (Arch::X86_64, 273) => SetRobustList,
+            (Arch::Aarch64, 293) | (Arch::X86_64, 334) => Rseq,
+            (Arch::Aarch64, 261) | (Arch::X86_64, 302) => Prlimit64,
+            (Arch::Aarch64, 163) | (Arch::X86_64, 97) => Getrlimit,
+            (Arch::X86_64, 89) => Readlink,
+            (Arch::Aarch64, 78) | (Arch::X86_64, 267) => Readlinkat,
+            // getuid, geteuid, getgid, getegid
+            (Arch::Aarch64, 174..=177) | (Arch::X86_64, 102 | 104 | 107 | 108) => Ids,
+            (Arch::Aarch64, 173) | (Arch::X86_64, 110) => Getppid,
+            (Arch::Aarch64, 132) | (Arch::X86_64, 131) => Sigaltstack,
+            (Arch::Aarch64, 233) | (Arch::X86_64, 28) => Madvise,
+            (Arch::Aarch64, 98) | (Arch::X86_64, 202) => Futex,
+            (Arch::Aarch64, 80) | (Arch::X86_64, 5) => Fstat,
+            (Arch::Aarch64, 79) | (Arch::X86_64, 262) => Newfstatat,
             (Arch::Aarch64, 101) | (Arch::X86_64, 35) => Nanosleep,
             (Arch::Aarch64, 115) | (Arch::X86_64, 230) => ClockNanosleep,
             (Arch::X86_64, 158) => ArchPrctl,
@@ -229,6 +260,22 @@ impl Abi {
             Some(Sys::RtSigprocmask) => zero_out(cx, a[2], a[3].min(128)),
             Some(Sys::Ioctl) => -ENOTTY,
             Some(Sys::ArchPrctl) => arch_prctl(cell, cx, a[0], a[1]),
+            Some(Sys::Mprotect) => mprotect(cx, a[0], a[1], a[2]),
+            // No threads: the robust futex list is never walked.
+            Some(Sys::SetRobustList) => 0,
+            // Declined on purpose (as on Linux built without it): libc falls
+            // back, so it is not reported as missing.
+            Some(Sys::Rseq) => -ENOSYS,
+            Some(Sys::Prlimit64) => rlimit(cx, a[1], a[3]),
+            Some(Sys::Getrlimit) => rlimit(cx, a[0], a[1]),
+            // No file system yet: no link exists.
+            Some(Sys::Readlink | Sys::Readlinkat) => -ENOENT,
+            // Cells run as root of their own world: uid, gid 0; no parent.
+            Some(Sys::Ids | Sys::Getppid) => 0,
+            Some(Sys::Sigaltstack | Sys::Madvise) => 0,
+            Some(Sys::Futex) => futex(a[1]),
+            Some(Sys::Fstat) => fstat(cx, self.arch, a[0], a[1]),
+            Some(Sys::Newfstatat) => newfstatat(cx, self.arch, a[0], a[1], a[2], a[3]),
             Some(Sys::SchedYield) => {
                 cell.regs.gpr[0] = 0;
                 return Outcome::Yield;
@@ -419,7 +466,10 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         return -EINVAL;
     }
     match space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr) {
-        Ok(()) => 0,
+        Ok(()) => {
+            cx.pager.discard(addr, end - addr);
+            0
+        }
         Err(_) => -EINVAL,
     }
 }
@@ -533,6 +583,133 @@ fn sleep_until<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     } else {
         value
     })
+}
+
+fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+    len: u64,
+    prot: u64,
+) -> i64 {
+    const PROT_READ: u64 = 1;
+    if !addr.is_multiple_of(FRAME_SIZE) || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return -EINVAL;
+    }
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return -EACCES; // cells are W^X
+    }
+    if prot == 0 {
+        return -EINVAL; // inaccessible pages are not supported yet
+    }
+    let Some(end) = addr.checked_add(len).map(|e| align_up(e, FRAME_SIZE)) else {
+        return -ENOMEM;
+    };
+    // Pages not in memory yet (lazy resume) are brought in first.
+    let mut at = addr;
+    while at < end {
+        if cx.pt.translate(cx.mem, at).is_none() {
+            cx.pager.page_in(&cx.pt, cx.mem, at, false);
+        }
+        at += FRAME_SIZE;
+    }
+    let mut flags = PageFlags::USER;
+    if prot & PROT_WRITE != 0 {
+        flags = flags | PageFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        flags = flags | PageFlags::NO_EXECUTE;
+    }
+    match space::protect(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr, flags) {
+        Ok(()) => 0,
+        Err(space::ProtectError::PartialLargePage(_)) => -EINVAL,
+        Err(_) => -ENOMEM,
+    }
+}
+
+/// `getrlimit`/`prlimit64` (no new limit is enforced): an 8 MiB stack, 1024
+/// files, everything else unlimited.
+fn rlimit<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    resource: u64,
+    old: u64,
+) -> i64 {
+    const INFINITY: u64 = u64::MAX;
+    let (cur, max) = match resource {
+        3 => (8 << 20, INFINITY), // RLIMIT_STACK
+        7 => (1024, 1024),        // RLIMIT_NOFILE
+        0..=15 => (INFINITY, INFINITY),
+        _ => return -EINVAL,
+    };
+    if old == 0 {
+        return 0;
+    }
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&cur.to_le_bytes());
+    out[8..].copy_from_slice(&max.to_le_bytes());
+    put(cx, old, &out)
+}
+
+/// Cells have one thread: a wake wakes nobody, a wait would wait forever.
+fn futex(op: u64) -> i64 {
+    const FUTEX_WAKE: u64 = 1;
+    match op & 0x7f {
+        FUTEX_WAKE => 0,
+        _ => -EAGAIN,
+    }
+}
+
+/// `struct stat` of a character device (the console) for the standard
+/// descriptors, in each architecture's layout.
+fn fstat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    arch: Arch,
+    fd: u64,
+    addr: u64,
+) -> i64 {
+    if fd > 2 {
+        return -EBADF;
+    }
+    const S_IFCHR: u64 = 0o020_000;
+    let mode = S_IFCHR | 0o620;
+    let mut st = [0u8; 144];
+    let mut set =
+        |at: usize, v: u64, n: usize| st[at..at + n].copy_from_slice(&v.to_le_bytes()[..n]);
+    let len = match arch {
+        // st_dev, st_ino, st_nlink (8), st_mode (4), ..., st_blksize at 56
+        Arch::X86_64 => {
+            set(16, 1, 8);
+            set(24, mode, 4);
+            set(56, 1024, 8);
+            144
+        }
+        // st_dev, st_ino, st_mode (4) at 16, st_nlink (4), ..., st_blksize (4) at 56
+        Arch::Aarch64 => {
+            set(16, mode, 4);
+            set(20, 1, 4);
+            set(56, 1024, 4);
+            128
+        }
+    };
+    put(cx, addr, &st[..len])
+}
+
+fn newfstatat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    arch: Arch,
+    dirfd: u64,
+    path: u64,
+    addr: u64,
+    flags: u64,
+) -> i64 {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let mut first = [0u8; 1];
+    if cx.read(path, &mut first).is_err() {
+        return -EFAULT;
+    }
+    if flags & AT_EMPTY_PATH != 0 && first[0] == 0 {
+        return fstat(cx, arch, dirfd, addr);
+    }
+    -ENOENT // no file system yet
 }
 
 fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
