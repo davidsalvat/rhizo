@@ -119,7 +119,7 @@ numbers (see [Benchmarks](#benchmarks)).
 | H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | 2 MiB pages for cell memory where possible (`cell.spawn_us`, `cell.run_us`, `cell.pt_frames`) | Done |
 | H3 | Multiple cells, scheduler, isolation tests | ASIDs (PCID on x86_64): no TLB flush when switching cells (`cell.switch_ns` vs `cell.switch_untagged_ns`) | Done |
 | H4 | Suspend / resume with snapshot-equivalence tests | Lazy restore: snapshot pages mapped on first touch, an in-kernel analogue of Firecracker + `userfaultfd` (`cell.resume_us` vs `cell.resume_eager_us`, `cell.resume_touch_us`) | Done |
-| H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`); pre-warmed cell templates (`cell.spawn_from_template_us`) | — |
+| H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`, `cell.fork_touch_us`); pre-warmed cell templates (`cell.spawn_from_template_us` vs `cell.spawn_us`) | Done |
 | H6 | Real workload (MicroPython) with differential tests against Linux | Template of a warm interpreter cell (`cell.spawn_from_template_us`) | — |
 | H7 | Reproducible benchmarks against existing sandboxes | Dedicated KVM machine with tight thresholds | — |
 

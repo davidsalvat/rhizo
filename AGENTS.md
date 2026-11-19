@@ -115,7 +115,7 @@ The feedback loop, fastest first:
 |---|---|---|
 | `crates/rhizo-hal` | Hardware interfaces (traits) and host test doubles | — |
 | `crates/rhizo-core` | Boot reports, boot options, device-tree reader, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
-| `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), kernel heap | `rhizo-hal` |
+| `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, write resolution), kernel heap | `rhizo-hal` |
 | `crates/rhizo-cell` | Cells as plain data, static ELF loader and initial stack, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
 | `crates/rhizo-abi` | Linux system calls of cells (both conventions), `EFAULT`/`ENOSYS`, scheduling outcomes (yield, sleep, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |

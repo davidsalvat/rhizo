@@ -4,6 +4,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod cow;
 pub mod frames;
 pub mod heap;
 pub mod memmap;

@@ -48,6 +48,16 @@ impl UserFault {
             .flatten()
     }
 
+    /// The address of a write refused by permissions (a page fault with the
+    /// present and write bits set), if that is what it was: possibly a
+    /// copy-on-write page.
+    pub fn write_denied(&self) -> Option<u64> {
+        let info = &self.0;
+        (info.vector == exception::PAGE_FAULT && info.error_code & 0b11 == 0b11)
+            .then_some(info.fault_address)
+            .flatten()
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_exception(console, cell, &self.0);

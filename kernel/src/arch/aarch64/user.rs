@@ -45,6 +45,16 @@ impl UserFault {
         (matches!(ec, 0x20 | 0x24) && translation).then_some(self.0.far)
     }
 
+    /// The address of a write refused by permissions (a data abort from EL0
+    /// with a permission fault on a write), if that is what it was: possibly
+    /// a copy-on-write page.
+    pub fn write_denied(&self) -> Option<u64> {
+        let esr = self.0.esr;
+        let permission = (esr & 0x3f) >> 2 == 0b0011;
+        let write = esr & (1 << 6) != 0;
+        ((esr >> 26) & 0x3f == 0x24 && permission && write).then_some(self.0.far)
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_aarch64(console, cell, &self.0);

@@ -119,15 +119,17 @@ pub mod testing {
     use std::collections::BTreeMap;
     use std::vec::Vec;
 
-    /// Frames from an endless address range, recycled after `free`, that
-    /// tracks what is outstanding and panics on a bad or double free.
+    /// Frames from an endless address range, recycled after their last
+    /// reference is dropped, that tracks what is outstanding and panics on a
+    /// bad or double free.
     #[derive(Debug)]
     pub struct CountingFrames {
         next_small: u64,
         next_large: u64,
         free_small: Vec<u64>,
         free_large: Vec<u64>,
-        live: BTreeMap<u64, PageSize>,
+        /// Live pages: size and number of references.
+        live: BTreeMap<u64, (PageSize, u32)>,
         /// Allocations fail once this many are outstanding.
         pub limit: usize,
     }
@@ -164,7 +166,7 @@ pub mod testing {
                     self.next_large - LARGE_PAGE_SIZE
                 }),
             };
-            self.live.insert(phys, size);
+            self.live.insert(phys, (size, 1));
             Some(phys)
         }
     }
@@ -179,11 +181,31 @@ pub mod testing {
         }
 
         fn free(&mut self, phys: u64, size: PageSize) {
-            assert_eq!(self.live.remove(&phys), Some(size), "bad free of {phys:#x}");
+            let entry = self
+                .live
+                .get_mut(&phys)
+                .unwrap_or_else(|| panic!("bad free of {phys:#x}"));
+            assert_eq!(entry.0, size, "bad free of {phys:#x}");
+            entry.1 -= 1;
+            if entry.1 > 0 {
+                return;
+            }
+            self.live.remove(&phys);
             match size {
                 PageSize::Small => self.free_small.push(phys),
                 _ => self.free_large.push(phys),
             }
+        }
+
+        fn share(&mut self, phys: u64) {
+            self.live
+                .get_mut(&phys)
+                .unwrap_or_else(|| panic!("share of free {phys:#x}"))
+                .1 += 1;
+        }
+
+        fn is_shared(&self, phys: u64) -> bool {
+            self.live.get(&phys).is_some_and(|e| e.1 > 1)
         }
     }
 }

@@ -87,7 +87,8 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 }
 
 fn encode_flags(f: PageFlags) -> u8 {
-    (f.contains(PageFlags::WRITABLE) as u8)
+    // A copy-on-write page is writable for the cell; its copy is private.
+    (f.contains(PageFlags::WRITABLE) || f.contains(PageFlags::COPY_ON_WRITE)) as u8
         | ((f.contains(PageFlags::USER) as u8) << 1)
         | ((f.contains(PageFlags::NO_EXECUTE) as u8) << 2)
 }
