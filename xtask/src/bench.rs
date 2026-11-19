@@ -269,13 +269,15 @@ fn measure(opts: &Options) -> Result<Results> {
         }
         if let Some(reference) = &reference {
             let kvm = vmm::kvm_available() && opts.accel != Accel::Tcg;
-            if vmm == Vmm::QemuMicrovm && !kvm {
-                // Observed: under emulation the reference kernel often resets
-                // before /init on microvm (timer calibration), so results
-                // would be noise.
+            if vmm == Vmm::QemuMicrovm {
+                // Observed with and without KVM: the reference kernel often
+                // resets right after KASLR setup on QEMU microvm, before /init.
+                // Until that is understood, no number is better than noise.
                 skipped.push((
                     "linux/qemu-microvm".into(),
-                    "reference Linux on microvm needs KVM (unreliable under emulation)".into(),
+                    "the reference Linux kernel resets before /init on QEMU microvm \
+                     (known issue, see bench/README.md)"
+                        .into(),
                 ));
                 continue;
             }

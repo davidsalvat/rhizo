@@ -110,6 +110,9 @@ fn fetch(artifact: &Artifact) -> Result<PathBuf> {
             "[xtask] {} is not pinned yet; sha256 = {actual} (add it to xtask/src/tools.rs)",
             artifact.file
         );
+        if env::var_os("GITHUB_ACTIONS").is_some() {
+            println!("::notice title=unpinned-sha256::{} {actual}", artifact.file);
+        }
     } else if actual != artifact.sha256 {
         let _ = fs::remove_file(&path);
         return Err(format!(

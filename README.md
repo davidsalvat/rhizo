@@ -102,7 +102,31 @@ hardware other than virtio/QEMU, full CPython, SDKs.
 ## Benchmarks
 
 <!-- bench:start -->
-_No timing results yet._
+Time from launching the VMM to the guest being ready (median, lower is better).
+Rhizo prints its ready line at the end of boot; the reference is Firecracker's
+CI Linux guest kernel with a minimal `/init` that prints the same line, booted
+on the same machine with the same timing method.
+
+```mermaid
+xychart-beta
+    title "Time to ready (ms, median, lower is better)"
+    x-axis ["Rhizo · QEMU microvm", "Rhizo · QEMU q35", "Linux · QEMU q35", "Rhizo · Firecracker", "Linux · Firecracker", "Rhizo · Cloud Hypervisor", "Linux · Cloud Hypervisor"]
+    y-axis "milliseconds"
+    bar [42.0, 53.8, 160.7, 5.5, 171.7, 8.1, 100.9]
+```
+
+| Guest | VMM | Median (ms) | p90 (ms) | Runs |
+|---|---|---:|---:|---:|
+| Rhizo | QEMU microvm | 42.0 | 43.9 | 20 |
+| Rhizo | QEMU q35 | 53.8 | 56.5 | 20 |
+| Linux (reference) | QEMU q35 | 160.7 | 166.6 | 20 |
+| Rhizo | Firecracker | 5.5 | 6.3 | 20 |
+| Linux (reference) | Firecracker | 171.7 | 175.4 | 20 |
+| Rhizo | Cloud Hypervisor | 8.1 | 11.0 | 20 |
+| Linux (reference) | Cloud Hypervisor | 100.9 | 112.4 | 20 |
+
+Environment: `ci`, KVM: yes, measured 2026-11-19. Regenerate with
+`cargo xtask bench --readme`.
 <!-- bench:end -->
 
 How benchmarks, environments and baselines work: [`bench/README.md`](bench/README.md).
