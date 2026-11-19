@@ -18,9 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-mutants
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants
       - name: Run mutation testing
         run: cargo xtask mutants
       - name: Keep the report
