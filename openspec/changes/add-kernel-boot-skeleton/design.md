@@ -120,19 +120,23 @@ scripts:
 
 - `cargo xtask build`: build the kernel image.
 - `cargo xtask run`: build and boot it in QEMU with the serial port on stdout.
-- `cargo xtask test`: host tests, then the in-kernel `ktest` build in QEMU,
-  with a timeout (default 30 s, overridable with `RHIZO_TEST_TIMEOUT`).
+- `cargo xtask test`: host tests, a boot check of the normal kernel, the
+  in-kernel `ktest` build in QEMU, and two harness self-checks (a suite with a
+  panicking test must fail with a panic report; a hanging suite must time
+  out). Timeout per VM: default 30 s, overridable with `RHIZO_TEST_TIMEOUT`.
+- `cargo xtask ci`: `cargo fmt --check`, clippy with warnings denied (host
+  crates, and the kernel with every feature set), then `cargo xtask test`.
 
-QEMU runs with `-machine q35 -display none -serial stdio -no-reboot` and
-`-accel kvm -accel tcg`, so it uses KVM when available and falls back to
-emulation (CI). QEMU's `microvm` machine type will be evaluated later for
-boot-latency work.
+QEMU runs with `-machine q35 -cpu max -display none -serial stdio -no-reboot`.
+`xtask` passes `-accel kvm` when `/dev/kvm` is usable and `-accel tcg`
+otherwise, so runs never print KVM fallback noise. QEMU's `microvm` machine
+type will be evaluated later for boot-latency work.
 
 ### D8. Continuous integration
 
-GitHub Actions on Ubuntu: install `qemu-system-x86`, install the pinned
-toolchain, then run `cargo fmt --check`, `cargo clippy` (host crates and the
-kernel target, warnings denied) and `cargo xtask test`.
+GitHub Actions on Ubuntu 24.04: install `qemu-system-x86`, enable KVM when the
+runner exposes it, install the pinned toolchain, then run `cargo xtask ci`, so
+CI and contributors run exactly the same checks.
 
 ### New external dependencies
 

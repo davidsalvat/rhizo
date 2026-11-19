@@ -71,7 +71,7 @@ Initial targets (hypotheses to be validated, not promises):
 
 | Milestone | Goal | Status |
 |---|---|---|
-| H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | Proposed |
+| H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | In progress |
 | H1 | Physical memory, paging, kernel heap | — |
 | H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | — |
 | H3 | Multiple cells, scheduler, isolation tests | — |
@@ -83,15 +83,52 @@ Initial targets (hypotheses to be validated, not promises):
 Out of scope for the proof of concept: networking, multicore, real disks,
 hardware other than virtio/QEMU, full CPython, SDKs.
 
+## Getting started
+
+Prerequisites:
+
+- [rustup](https://rustup.rs). The pinned toolchain (`rust-toolchain.toml`) is
+  installed automatically on first use.
+- QEMU for x86_64 (`qemu-system-x86_64`), version 8.2 or later is verified by
+  CI; any version with PVH boot support (4.0+) should work. On Debian/Ubuntu:
+
+```bash
+sudo apt-get install qemu-system-x86
+```
+
+Commands:
+
+| Command | What it does |
+|---|---|
+| `cargo xtask build` | Build the kernel image |
+| `cargo xtask run` | Build and boot the kernel in QEMU, serial output on your terminal |
+| `cargo test` | Host tests only (no QEMU needed) |
+| `cargo xtask test` | Host tests, boot check, in-kernel tests in QEMU and harness self-checks |
+| `cargo xtask ci` | Everything CI runs: formatting, clippy and all tests |
+
+A successful boot looks like this:
+
+```
+Rhizo 0.1.0
+boot time: 1198606 cycles
+boot complete
+```
+
+QEMU uses KVM automatically when `/dev/kvm` is available and falls back to
+emulation otherwise (slower; boot-time numbers are then not meaningful).
+
 ## Repository layout
 
 ```
-openspec/        Specifications and change proposals (spec-driven development)
-AGENTS.md        Instructions for AI coding agents (open standard, any vendor)
-CONTRIBUTING.md  How to contribute, with or without AI tools
+kernel/              Bootable kernel image (x86_64-unknown-none)
+  src/arch/x86_64/   PVH boot trampoline and hardware drivers
+crates/rhizo-hal/    Hardware interfaces (traits) and host test doubles
+crates/rhizo-core/   Hardware-independent kernel logic, tested on the host
+xtask/               Developer tool: build, run, test, ci
+openspec/            Specifications and change proposals (spec-driven development)
+AGENTS.md            Instructions for AI coding agents (open standard, any vendor)
+CONTRIBUTING.md      How to contribute, with or without AI tools
 ```
-
-Code layout will be defined by milestone H0.
 
 ## Contributing
 
