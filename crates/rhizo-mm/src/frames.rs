@@ -277,6 +277,56 @@ mod tests {
     }
 
     #[test]
+    fn search_wraps_around_after_the_hint() {
+        let mut bits = [0u64; 4];
+        let mut fa = allocator(&mut bits, 200);
+        fa.add_free_region(0, 200 * FRAME_SIZE);
+        let all: Vec<_> = std::iter::from_fn(|| fa.alloc()).collect();
+        assert_eq!(all.len(), 200);
+        assert_eq!(
+            all[199],
+            199 * FRAME_SIZE,
+            "frames are handed out in address order"
+        );
+        // Free one frame far below the hint (which now points past the end).
+        fa.free(3 * FRAME_SIZE);
+        assert_eq!(fa.alloc(), Some(3 * FRAME_SIZE));
+        fa.free(130 * FRAME_SIZE);
+        fa.free(131 * FRAME_SIZE);
+        assert_eq!(fa.alloc_contiguous(2), Some(130 * FRAME_SIZE));
+    }
+
+    #[test]
+    fn contiguous_requests_at_the_edge_of_free_memory() {
+        let mut bits = [0u64; 1];
+        let mut fa = allocator(&mut bits, 64);
+        fa.add_free_region(10 * FRAME_SIZE, 14 * FRAME_SIZE);
+        assert_eq!(fa.alloc_contiguous(5), None, "more than is free");
+        assert_eq!(fa.alloc_contiguous(0), None);
+        assert_eq!(
+            fa.alloc_contiguous(4),
+            Some(10 * FRAME_SIZE),
+            "exactly what is free"
+        );
+        assert_eq!(fa.free_frames(), 0);
+    }
+
+    #[test]
+    fn usable_and_free_counts_follow_regions_and_reservations() {
+        let mut bits = [0u64; 2];
+        let mut fa = allocator(&mut bits, 128);
+        fa.add_free_region(0, 100 * FRAME_SIZE);
+        fa.add_free_region(50 * FRAME_SIZE, 120 * FRAME_SIZE); // overlaps
+        assert_eq!((fa.usable_frames(), fa.free_frames()), (120, 120));
+        fa.reserve(60 * FRAME_SIZE, 70 * FRAME_SIZE);
+        assert_eq!((fa.usable_frames(), fa.free_frames()), (110, 110));
+        // Free runs are now frames 0..60 and 70..120; 64 fits in neither.
+        assert_eq!(fa.alloc_contiguous(64), None);
+        assert_eq!(fa.alloc_contiguous(50), Some(0));
+        assert_eq!((fa.usable_frames(), fa.free_frames()), (110, 60));
+    }
+
+    #[test]
     #[should_panic(expected = "double free of frame 0x1000")]
     fn double_free_panics() {
         let mut bits = [0u64; 1];

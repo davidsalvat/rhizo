@@ -190,10 +190,24 @@ mod tests {
     use std::alloc::{alloc, dealloc};
 
     /// Page source backed by the host allocator, with an optional limit.
+    /// The heap keeps size-class pages forever (by design), so the double
+    /// returns whatever is still lent out when it is dropped.
     #[derive(Default)]
     struct HostPages {
         outstanding: usize,
         limit: Option<usize>,
+        lent: Vec<(NonNull<u8>, usize)>,
+    }
+
+    impl Drop for HostPages {
+        fn drop(&mut self) {
+            for (ptr, count) in self.lent.drain(..) {
+                let layout = Layout::from_size_align(count * PAGE_SIZE, PAGE_SIZE).unwrap();
+                // SAFETY: every entry came from `alloc` with this layout and was
+                // not freed yet (freed entries are removed in `free_pages`).
+                unsafe { dealloc(ptr.as_ptr(), layout) };
+            }
+        }
     }
 
     impl PageSource for HostPages {
@@ -204,11 +218,14 @@ mod tests {
             self.outstanding += count;
             let layout = Layout::from_size_align(count * PAGE_SIZE, PAGE_SIZE).unwrap();
             // SAFETY: non-zero size.
-            NonNull::new(unsafe { alloc(layout) })
+            let ptr = NonNull::new(unsafe { alloc(layout) })?;
+            self.lent.push((ptr, count));
+            Some(ptr)
         }
 
         unsafe fn free_pages(&mut self, ptr: NonNull<u8>, count: usize) {
             self.outstanding -= count;
+            self.lent.retain(|&(p, _)| p != ptr);
             let layout = Layout::from_size_align(count * PAGE_SIZE, PAGE_SIZE).unwrap();
             // SAFETY: same layout as the allocation.
             unsafe { dealloc(ptr.as_ptr(), layout) };
@@ -290,6 +307,7 @@ mod tests {
         let mut heap = Heap::new(HostPages {
             outstanding: 0,
             limit: Some(2),
+            lent: Vec::new(),
         });
         assert!(heap.alloc(layout(3 * PAGE_SIZE, 8)).is_null());
         let l = layout(2048, 8);

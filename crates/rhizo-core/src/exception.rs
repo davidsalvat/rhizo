@@ -171,6 +171,39 @@ mod tests {
     }
 
     #[test]
+    fn architectural_vectors_have_their_names() {
+        let expected = [
+            (0, "divide error"),
+            (1, "debug"),
+            (2, "non-maskable interrupt"),
+            (3, "breakpoint"),
+            (4, "overflow"),
+            (5, "bound range exceeded"),
+            (6, "invalid opcode"),
+            (7, "device not available"),
+            (8, "double fault"),
+            (9, "coprocessor segment overrun"),
+            (10, "invalid TSS"),
+            (11, "segment not present"),
+            (12, "stack-segment fault"),
+            (13, "general protection fault"),
+            (14, "page fault"),
+            (16, "x87 floating-point error"),
+            (17, "alignment check"),
+            (18, "machine check"),
+            (19, "SIMD floating-point error"),
+            (20, "virtualization exception"),
+            (21, "control protection exception"),
+            (28, "hypervisor injection exception"),
+            (29, "VMM communication exception"),
+            (30, "security exception"),
+        ];
+        for (vector, text) in expected {
+            assert_eq!(name(vector), text, "vector {vector}");
+        }
+    }
+
+    #[test]
     fn every_vector_has_a_name() {
         assert_eq!(name(DOUBLE_FAULT), "double fault");
         assert_eq!(name(15), "reserved exception");
