@@ -9,7 +9,16 @@
       "boot.time_to_ready_ms/rhizo/firecracker": 5.487035499999999,
       "boot.time_to_ready_ms/rhizo/qemu-microvm": 41.9547345,
       "boot.time_to_ready_ms/rhizo/qemu-q35": 53.837299,
-      "image.size_bytes": 37264.0,
+      "cell.pt_frames": 7.0,
+      "cell.run_us/rhizo/cloud-hypervisor": 6.424,
+      "cell.run_us/rhizo/firecracker": 6.711,
+      "cell.run_us/rhizo/qemu-microvm": 6.708,
+      "cell.run_us/rhizo/qemu-q35": 6.796,
+      "cell.spawn_us/rhizo/cloud-hypervisor": 2.341,
+      "cell.spawn_us/rhizo/firecracker": 2.459,
+      "cell.spawn_us/rhizo/qemu-microvm": 2.452,
+      "cell.spawn_us/rhizo/qemu-q35": 2.448,
+      "image.size_bytes": 42376.0,
       "memory.kernel_pt_frames": 5.0
     },
     "dedicated": {}
