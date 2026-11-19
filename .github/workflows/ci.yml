@@ -54,13 +54,20 @@ jobs:
       - run: rustup toolchain install
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-machete,actionlint
+          # Versions verified locally; bump deliberately.
+          tool: cargo-deny@0.22.0,cargo-machete@0.9.1,actionlint
       - name: Licenses, advisories, sources (cargo-deny)
-        run: cargo deny check
+        run: cargo deny check 2>&1 | tee quality.log; exit "${PIPESTATUS[0]}"
       - name: Unused dependencies (cargo-machete)
-        run: cargo machete
+        run: cargo machete 2>&1 | tee -a quality.log; exit "${PIPESTATUS[0]}"
       - name: Crate dependency rules and workflow files
-        run: cargo xtask check
+        run: cargo xtask check 2>&1 | tee -a quality.log; exit "${PIPESTATUS[0]}"
+      - name: Report the failure as an annotation
+        if: failure()
+        run: |
+          if [ -f quality.log ]; then
+            echo "::error title=quality-log::$(tail -c 3000 quality.log | sed -e 's/%/%25/g' | tr '\n' '|')"
+          fi
 
   miri:
     name: Miri on the heap allocator
