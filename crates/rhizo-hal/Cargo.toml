@@ -1,0 +1,15 @@
+[package]
+name = "rhizo-hal"
+description = "Hardware interfaces for the Rhizo kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# In-memory test doubles. Requires `std`; only for host tests.
+testing = []
+
+[lints]
+workspace = true
