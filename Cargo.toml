@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "xtask"]
+members = ["kernel", "crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "crates/rhizo-cell", "crates/rhizo-abi", "xtask"]
 # The kernel only builds for the bare-metal target; plain `cargo` commands
 # (test, clippy, build) operate on the host-buildable crates. Use
 # `cargo xtask` for anything involving the kernel.
-default-members = ["crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "xtask"]
+default-members = ["crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "crates/rhizo-cell", "crates/rhizo-abi", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

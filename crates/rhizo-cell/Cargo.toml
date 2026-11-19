@@ -1,0 +1,24 @@
+[package]
+name = "rhizo-cell"
+description = "Agent cells for the Rhizo kernel: model, address space, ELF loading"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Not published to crates.io (workspace path dependencies only).
+publish = false
+
+[features]
+# Test doubles (`testing` module). Requires `std`; only for host tests.
+testing = ["rhizo-hal/testing"]
+
+[dependencies]
+rhizo-hal = { path = "../rhizo-hal" }
+rhizo-mm = { path = "../rhizo-mm" }
+
+[dev-dependencies]
+rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
+
+[lints]
+workspace = true
