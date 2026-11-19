@@ -1,13 +1,24 @@
 {
+  "environments": {
+    "ci": {
+      "boot.kernel_cycles/rhizo/cloud-hypervisor": 2161614.0,
+      "boot.kernel_cycles/rhizo/firecracker": 5207189.0,
+      "boot.kernel_cycles/rhizo/qemu-microvm": 4192188.0,
+      "boot.kernel_cycles/rhizo/qemu-q35": 3356808.0,
+      "boot.time_to_ready_ms/rhizo/cloud-hypervisor": 8.140670499999999,
+      "boot.time_to_ready_ms/rhizo/firecracker": 5.487035499999999,
+      "boot.time_to_ready_ms/rhizo/qemu-microvm": 41.9547345,
+      "boot.time_to_ready_ms/rhizo/qemu-q35": 53.837299,
+      "image.size_bytes": 36896.0,
+      "memory.kernel_pt_frames": 5.0
+    },
+    "dedicated": {}
+  },
   "thresholds_pct": {
     "deterministic": 1,
     "timing": {
       "ci": 50,
       "dedicated": 5
     }
-  },
-  "environments": {
-    "ci": {},
-    "dedicated": {}
   }
 }

@@ -5,6 +5,12 @@ virtual machine monitor available on the host (QEMU `microvm`, QEMU `q35`,
 Firecracker, Cloud Hypervisor), next to a reference Linux guest booted the same
 way. Firecracker and Cloud Hypervisor need KVM.
 
+## Known issues
+
+- The reference Linux guest is not measured on QEMU `microvm`: it resets right
+  after KASLR setup, before `/init`, both with and without KVM. It is measured
+  on QEMU `q35`, Firecracker and Cloud Hypervisor.
+
 ## Metrics
 
 | Metric | Kind | Meaning |
