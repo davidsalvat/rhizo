@@ -80,6 +80,15 @@ Layout and where code belongs:
 - `kernel/src/tests.rs`: in-kernel tests (run inside QEMU).
 - `xtask/`: developer tooling.
 
+Memory layout (see `openspec/specs/virtual-memory`):
+
+- Lower half (`0x0000_…`): empty, reserved for cells.
+- `0xffff_8000_0000_0000 + phys`: direct map of RAM (RW, NX). Access physical
+  memory only through `PhysicalMemory` (kernel: `memory::DirectMap`).
+- `0xffff_ffff_8000_0000 + phys`: kernel image with W^X; the page under the
+  kernel stack is an unmapped guard page.
+- Kernel globals use `sync::Global` (single CPU, panics on reentrance).
+
 The kernel crate only builds for `x86_64-unknown-none`; plain `cargo` commands
 skip it (it is not a default workspace member). Use `cargo xtask` for it.
 

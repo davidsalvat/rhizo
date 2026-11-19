@@ -49,11 +49,38 @@ pub trait CycleCounter {
     fn cycles(&self) -> u64;
 }
 
+/// Access to physical memory by physical address.
+///
+/// The kernel implements this through its direct map; host tests use
+/// [`testing::FakePhysicalMemory`]. Addresses passed to `read_u64` and
+/// `write_u64` must be 8-byte aligned.
+pub trait PhysicalMemory {
+    /// Reads the 64-bit value stored at physical address `phys`.
+    fn read_u64(&self, phys: u64) -> u64;
+
+    /// Writes `value` at physical address `phys`.
+    fn write_u64(&mut self, phys: u64, value: u64);
+
+    /// Fills the 4 KiB frame starting at `frame` with zeros.
+    fn zero_frame(&mut self, frame: u64) {
+        for offset in (0..4096).step_by(8) {
+            self.write_u64(frame + offset, 0);
+        }
+    }
+}
+
+/// The processor's cache of address translations.
+pub trait Tlb {
+    /// Invalidates any cached translation for the page containing `virt`.
+    fn flush_page(&mut self, virt: u64);
+}
+
 /// In-memory test doubles for host tests.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use super::{Console, CycleCounter};
+    use super::{Console, CycleCounter, PhysicalMemory, Tlb};
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::string::String;
     use std::vec::Vec;
 
@@ -111,11 +138,58 @@ pub mod testing {
             self.now.get()
         }
     }
+
+    /// Sparse physical memory: every address reads as zero until written.
+    #[derive(Debug, Default)]
+    pub struct FakePhysicalMemory {
+        words: BTreeMap<u64, u64>,
+    }
+
+    impl FakePhysicalMemory {
+        /// Creates an empty (all-zero) physical memory.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Number of 64-bit words holding a non-zero value.
+        pub fn nonzero_words(&self) -> usize {
+            self.words.values().filter(|&&v| v != 0).count()
+        }
+    }
+
+    impl PhysicalMemory for FakePhysicalMemory {
+        fn read_u64(&self, phys: u64) -> u64 {
+            assert_eq!(phys % 8, 0, "unaligned physical read at {phys:#x}");
+            self.words.get(&phys).copied().unwrap_or(0)
+        }
+
+        fn write_u64(&mut self, phys: u64, value: u64) {
+            assert_eq!(phys % 8, 0, "unaligned physical write at {phys:#x}");
+            if value == 0 {
+                self.words.remove(&phys);
+            } else {
+                self.words.insert(phys, value);
+            }
+        }
+    }
+
+    /// A TLB that records every flushed page.
+    #[derive(Debug, Default)]
+    pub struct RecordingTlb {
+        /// Pages flushed so far, in order.
+        pub flushed: Vec<u64>,
+    }
+
+    impl Tlb for RecordingTlb {
+        fn flush_page(&mut self, virt: u64) {
+            self.flushed.push(virt);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{ManualCycleCounter, RecordingConsole};
+    use super::testing::{FakePhysicalMemory, ManualCycleCounter, RecordingConsole, RecordingTlb};
     use super::*;
     use core::fmt::Write;
 
@@ -132,6 +206,27 @@ mod tests {
         let mut console = RecordingConsole::new();
         write!(ConsoleWriter(&mut console), "{}-{:x}", 42, 255).unwrap();
         assert_eq!(console.text(), "42-ff");
+    }
+
+    #[test]
+    fn fake_physical_memory_reads_back_and_zeroes_frames() {
+        let mut mem = FakePhysicalMemory::new();
+        assert_eq!(mem.read_u64(0x1000), 0);
+        mem.write_u64(0x1008, 0xdead_beef);
+        mem.write_u64(0x2000, 7);
+        assert_eq!(mem.read_u64(0x1008), 0xdead_beef);
+        mem.zero_frame(0x1000);
+        assert_eq!(mem.read_u64(0x1008), 0);
+        assert_eq!(mem.read_u64(0x2000), 7);
+        assert_eq!(mem.nonzero_words(), 1);
+    }
+
+    #[test]
+    fn recording_tlb_records_flushes() {
+        let mut tlb = RecordingTlb::default();
+        tlb.flush_page(0x4000);
+        tlb.flush_page(0x8000);
+        assert_eq!(tlb.flushed, vec![0x4000, 0x8000]);
     }
 
     #[test]
