@@ -32,6 +32,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("ballast", "filled\nchecked\n", Ending::Exit(0)),
     ("forkme", "ready\nown ok\n", Ending::Exit(0)),
     ("diary", "ready\nown ok\n", Ending::Exit(0)),
+    ("filer", "files ok\n", Ending::Exit(0)),
     (
         "libc_hello",
         "hello from libc, 1 argument, first libc_hello\n\

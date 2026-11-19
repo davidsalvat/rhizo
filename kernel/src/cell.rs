@@ -811,16 +811,14 @@ pub fn bench(console: &mut impl Console) {
         spawn_ns.push(timer::cycles_to_ns(t1 - t0).unwrap_or(0));
         run_ns.push(timer::cycles_to_ns(t2 - t0).unwrap_or(0));
     }
-    spawn_ns.sort_unstable();
-    run_ns.sort_unstable();
     let tagged = switch_ns(Host::new());
     let untagged = switch_ns(Host::new_untagged());
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
         "rhizo-cell spawn_ns={} run_ns={} pt_frames={tables} switch_ns={tagged} \
          switch_untagged_ns={untagged}",
-        spawn_ns[RUNS / 2],
-        run_ns[RUNS / 2]
+        robust(&mut spawn_ns),
+        robust(&mut run_ns)
     );
     let f = fork_and_templates();
     let _ = writeln!(
@@ -835,6 +833,11 @@ pub fn bench(console: &mut impl Console) {
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
         "rhizo-workload cold_ns={cold} warm_ns={warm}"
+    );
+    let (write_read, fork_files) = files();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-files write_read_ns={write_read} fork_ns={fork_files}"
     );
     let s = suspend_resume();
     let _ = writeln!(
@@ -949,8 +952,65 @@ fn fork_and_templates() -> [u64; 4] {
         median(&mut fork),
         median(&mut touch),
         frames,
-        median(&mut template),
+        robust(&mut template),
     ]
+}
+
+/// Rounds of a repeated measure (design D4 of `add-cell-files`).
+#[cfg(feature = "bench-cell")]
+const ROUNDS: usize = 5;
+
+/// The minimum over [`ROUNDS`] consecutive rounds of each round's median:
+/// the operation's cost, not the noise of its slowest moment.
+#[cfg(feature = "bench-cell")]
+fn robust(samples: &mut [u64]) -> u64 {
+    let per = (samples.len() / ROUNDS).max(1);
+    samples
+        .chunks_mut(per)
+        .take(ROUNDS)
+        .map(|round| {
+            round.sort_unstable();
+            round[round.len() / 2]
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// Robust figures (see [`robust`]): `filer` creating, writing and reading
+/// back 1 MiB of file data, spawn to exit; and forking a cell (frozen as a
+/// template) that holds a 16 MiB file.
+#[cfg(feature = "bench-cell")]
+fn files() -> (u64, u64) {
+    const RUNS: usize = 5 * ROUNDS;
+    let image = test_image("filer");
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let mut write_read = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host.spawn(image, &[b"filer"], true, false).expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        write_read.push(ns(t0, Counter.cycles()));
+        let done = host.finished(id).expect("ended");
+        assert_eq!(done.ending, Ending::Exit(0), "filer exits with 0");
+        assert_eq!(done.output, b"files ok\n");
+    }
+    let holder = host
+        .spawn(image, &[b"filer", b"16"], true, false)
+        .expect("spawn");
+    while host.output(holder) != Some(b"files ok\n") {
+        host.step();
+    }
+    assert!(host.freeze(holder));
+    let mut fork = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let t0 = Counter.cycles();
+        let child = host.spawn_from_template(holder, true, false).expect("fork");
+        fork.push(ns(t0, Counter.cycles()));
+        assert!(host.kill(child));
+    }
+    (robust(&mut write_read), robust(&mut fork))
 }
 
 /// Medians over 7 rounds, for the `ballast` cell (8 MiB written): suspend,
