@@ -1,0 +1,47 @@
+# --- Build output ---
+/target/
+**/*.rs.bk
+*.iso
+*.img
+
+# --- Editors and OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- AI tool-specific files ---
+# AGENTS.md is the single shared instruction file (open standard).
+# Everything below is generated or tool-specific and stays local.
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+QWEN.md
+.claude/
+.cursor/
+.cursorrules
+.gemini/
+.codex/
+.windsurf/
+.devin/
+.cline/
+.clinerules
+.roo/
+.kilocode/
+.continue/
+.qwen/
+.opencode/
+.amazonq/
+.kiro/
+.augment/
+.junie/
+.zed/
+.trae/
+.crush/
+.factory/
+.aider*
+.github/prompts/
+.github/agents/
+.github/copilot-instructions.md
+.github/skills/
+.agents/
