@@ -13,6 +13,23 @@ use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::PageFlags;
 
+/// Builds a harness self-check: one passing case, then the case the harness
+/// must catch. A self-check proves the harness, not the suite (which runs on
+/// its own), so it stays short however long the suite grows.
+#[cfg(any(
+    feature = "ktest-should-panic",
+    feature = "ktest-hang",
+    feature = "ktest-page-fault",
+    feature = "ktest-stack-overflow",
+    feature = "ktest-invalid-opcode",
+    feature = "ktest-oom",
+))]
+macro_rules! self_check {
+    ($extra:path) => {
+        &[ktest_case!(console_output_works), ktest_case!($extra)]
+    };
+}
+
 /// Builds the suite: the regular tests, followed by any extra cases.
 macro_rules! suite {
     ($($extra:path),* $(,)?) => {
@@ -46,6 +63,12 @@ macro_rules! suite {
             ktest_case!(cell_cannot_touch_another_cells_mapping),
             ktest_case!(fault_does_not_disturb_other_cells),
             ktest_case!(many_cells_in_sequence_stay_isolated),
+            ktest_case!(suspend_resume_after_every_step_is_invisible_eager),
+            ktest_case!(suspend_resume_after_every_step_is_invisible_lazy),
+            ktest_case!(suspend_returns_all_memory),
+            ktest_case!(lazy_resume_restores_only_touched_pages),
+            ktest_case!(suspended_cells_hold_no_kernel_resources),
+            ktest_case!(snapshot_of_another_architecture_is_rejected),
             $(ktest_case!($extra),)*
         ]
     };
@@ -62,29 +85,42 @@ macro_rules! suite {
 /// Every in-kernel test case, in execution order.
 pub static ALL: &[TestCase] = suite!();
 
-/// Harness self-check: the regular suite plus a test that panics.
-#[cfg(feature = "ktest-should-panic")]
-pub static ALL: &[TestCase] = suite!(deliberate_panic);
+/// In self-check builds the regular suite is compiled but not run (it runs
+/// in the `ktest` build): referenced here so it keeps compiling everywhere.
+#[cfg(any(
+    feature = "ktest-should-panic",
+    feature = "ktest-hang",
+    feature = "ktest-page-fault",
+    feature = "ktest-stack-overflow",
+    feature = "ktest-invalid-opcode",
+    feature = "ktest-oom",
+))]
+#[allow(dead_code, reason = "the suite runs in the regular `ktest` build")]
+static SUITE: &[TestCase] = suite!();
 
-/// Harness self-check: the regular suite plus a test that never finishes.
+/// Harness self-check: a test that panics.
+#[cfg(feature = "ktest-should-panic")]
+pub static ALL: &[TestCase] = self_check!(deliberate_panic);
+
+/// Harness self-check: a test that never finishes.
 #[cfg(feature = "ktest-hang")]
-pub static ALL: &[TestCase] = suite!(hang_forever);
+pub static ALL: &[TestCase] = self_check!(hang_forever);
 
 /// Self-check: a write to address 0 must be reported as a page fault.
 #[cfg(feature = "ktest-page-fault")]
-pub static ALL: &[TestCase] = suite!(write_to_null);
+pub static ALL: &[TestCase] = self_check!(write_to_null);
 
 /// Self-check: stack exhaustion must be reported as a double fault.
 #[cfg(feature = "ktest-stack-overflow")]
-pub static ALL: &[TestCase] = suite!(overflow_the_stack);
+pub static ALL: &[TestCase] = self_check!(overflow_the_stack);
 
 /// Self-check: an invalid instruction must be reported.
 #[cfg(feature = "ktest-invalid-opcode")]
-pub static ALL: &[TestCase] = suite!(execute_invalid_opcode);
+pub static ALL: &[TestCase] = self_check!(execute_invalid_opcode);
 
 /// Self-check: an impossible allocation must panic with its size.
 #[cfg(feature = "ktest-oom")]
-pub static ALL: &[TestCase] = suite!(allocate_too_much);
+pub static ALL: &[TestCase] = self_check!(allocate_too_much);
 
 // --- H0 tests ---------------------------------------------------------------
 
@@ -525,4 +561,142 @@ fn many_cells_in_sequence_stay_isolated() {
         pair();
     }
     assert_eq!(memory::free_bytes(), before);
+}
+
+use crate::cell::Resume;
+use rhizo_snapshot::{FormatError, Snapshot};
+
+/// Runs `counter` to its end, suspending it after every scheduling step and
+/// resuming it from the snapshot's bytes; its whole output must be the one
+/// in `cells/expected.rs` (also Linux's, by the differential check).
+fn suspend_resume_after_every_step(mode: Resume) {
+    let expected = expected::PROGRAMS
+        .iter()
+        .find(|p| p.0 == "counter")
+        .expect("counter")
+        .1;
+    let mut host = Host::new();
+    let mut id = spawn(&mut host, "counter", &[]);
+    let mut output = Vec::new();
+    let mut resumes = 0;
+    loop {
+        host.step();
+        if let Some(done) = host.finished(id) {
+            assert_eq!(done.ending, Ending::Exit(0));
+            output.extend_from_slice(&done.output);
+            break;
+        }
+        let snapshot = host.suspend(id).expect("the counter is live");
+        output.extend_from_slice(&host.finished(id).expect("suspended").output);
+        let bytes = snapshot.into_bytes();
+        let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+        id = host.resume(snapshot, mode, true, false).expect("resume");
+        resumes += 1;
+    }
+    assert!(
+        resumes >= 40,
+        "suspended {resumes} times: at each of the 40 steps at least"
+    );
+    assert_eq!(alloc::string::String::from_utf8_lossy(&output), expected);
+}
+
+fn suspend_resume_after_every_step_is_invisible_eager() {
+    suspend_resume_after_every_step(Resume::Eager);
+}
+
+fn suspend_resume_after_every_step_is_invisible_lazy() {
+    suspend_resume_after_every_step(Resume::Lazy);
+}
+
+fn suspend_returns_all_memory() {
+    fn cycle() -> Snapshot {
+        let mut host = Host::new();
+        let id = spawn(&mut host, "ballast", &[]);
+        while host.output(id) != Some(b"filled\n") {
+            host.step();
+        }
+        let snapshot = host.suspend(id).expect("live");
+        assert_eq!(host.live(), 0);
+        snapshot
+    }
+    drop(cycle()); // warm the heap up for the host's small allocations
+    let before = memory::free_bytes();
+    let snapshot = cycle();
+    assert!(
+        snapshot.as_bytes().len() > 8 << 20,
+        "8 MiB of pages captured"
+    );
+    drop(snapshot);
+    assert_eq!(
+        memory::free_bytes(),
+        before,
+        "the suspended cell held nothing but its snapshot"
+    );
+}
+
+fn lazy_resume_restores_only_touched_pages() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "ballast", &[b"one"]);
+    while host.output(id) != Some(b"filled\n") {
+        host.step();
+    }
+    let snapshot = host.suspend(id).expect("live");
+    let pages = snapshot.pages();
+    let id = host
+        .resume(snapshot, Resume::Lazy, true, false)
+        .expect("resume");
+    assert_eq!(
+        host.pending_pages(id),
+        Some(pages),
+        "nothing restored before it runs"
+    );
+    while host.output(id) != Some(b"checked\n") {
+        host.step();
+    }
+    let left = host.pending_pages(id).expect("still live");
+    assert!(
+        left > 0 && left < pages,
+        "{left} of {pages} pages still in the snapshot"
+    );
+    host.run(|_| false);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "checked\n".into()));
+}
+
+fn suspended_cells_hold_no_kernel_resources() {
+    let mut host = Host::new();
+    let ids: Vec<u32> = (0..32).map(|_| spawn(&mut host, "chatter", &[])).collect();
+    host.step();
+    let snapshots: Vec<Snapshot> = ids
+        .iter()
+        .map(|&id| host.suspend(id).expect("live"))
+        .collect();
+    assert_eq!(
+        host.live(),
+        0,
+        "no live cell, so no table, frame or tag held"
+    );
+    let resumed: Vec<u32> = snapshots
+        .into_iter()
+        .map(|s| host.resume(s, Resume::Lazy, true, false).expect("resume"))
+        .collect();
+    host.run(|_| false);
+    for id in resumed {
+        assert_eq!(host.finished(id).expect("ended").ending, Ending::Exit(0));
+    }
+}
+
+fn snapshot_of_another_architecture_is_rejected() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "chatter", &[]);
+    let mut bytes = host.suspend(id).expect("live").into_bytes();
+    let other: u16 = if crate::arch::user::MACHINE as u16 == 183 {
+        62
+    } else {
+        183
+    };
+    bytes[12..14].copy_from_slice(&other.to_le_bytes());
+    assert!(matches!(
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE),
+        Err(FormatError::Machine { .. })
+    ));
 }

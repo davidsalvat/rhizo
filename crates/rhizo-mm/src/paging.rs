@@ -453,6 +453,43 @@ impl<F: EntryFormat> PageTable<F> {
         }
     }
 
+    /// Calls `f(virt, phys, size, flags)` for every page mapped in the lower
+    /// (user) half, in ascending address order.
+    pub fn for_each_lower_leaf(
+        &self,
+        mem: &impl PhysicalMemory,
+        f: &mut impl FnMut(u64, u64, PageSize, PageFlags),
+    ) {
+        fn walk<F: EntryFormat>(
+            mem: &impl PhysicalMemory,
+            table: u64,
+            level: u32,
+            base: u64,
+            range: core::ops::Range<u64>,
+            f: &mut impl FnMut(u64, u64, PageSize, PageFlags),
+        ) {
+            for i in range {
+                let entry = mem.read_u64(table + i * 8);
+                if !F::is_valid(entry) {
+                    continue;
+                }
+                let virt = base + (i << (12 + 9 * level));
+                if F::is_leaf(entry, level) {
+                    let size = PageSize::from_leaf_level(level);
+                    f(
+                        virt,
+                        F::address(entry) & !(size.bytes() - 1),
+                        size,
+                        F::flags(entry),
+                    );
+                } else {
+                    walk::<F>(mem, F::address(entry), level - 1, virt, 0..ENTRIES, f);
+                }
+            }
+        }
+        walk::<F>(mem, self.root, 3, 0, 0..ENTRIES / 2, f);
+    }
+
     /// Number of table frames used by the lower (user) half, root included.
     pub fn lower_half_tables(&self, mem: &impl PhysicalMemory) -> usize {
         fn walk<F: EntryFormat>(
@@ -835,6 +872,16 @@ mod tests {
                     // Root + three levels for the 4 KiB page + two for the 2 MiB
                     // one; the shared kernel half does not count.
                     assert_eq!(cell.lower_half_tables(&mem), 6);
+                    let mut leaves = Vec::new();
+                    cell.for_each_lower_leaf(&mem, &mut |v, p, s, f| leaves.push((v, p, s, f)));
+                    assert_eq!(
+                        leaves,
+                        [
+                            (0x40_0000, 0x900_0000, PageSize::Small, user),
+                            (0x4000_0000_0000, 0xa00_0000, PageSize::Large, user),
+                        ],
+                        "user pages in address order, kernel half skipped"
+                    );
 
                     let mut freed = Vec::new();
                     cell.destroy_lower_half(&mut mem, &mut |phys, size| freed.push((phys, size)));

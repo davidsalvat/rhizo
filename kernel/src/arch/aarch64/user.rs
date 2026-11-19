@@ -37,6 +37,14 @@ pub enum Trap {
 pub struct UserFault(Aarch64Exception);
 
 impl UserFault {
+    /// The address of an access to a page that is not mapped (translation
+    /// fault, data or instruction abort from EL0), if that is what it was.
+    pub fn missing_page(&self) -> Option<u64> {
+        let ec = (self.0.esr >> 26) & 0x3f;
+        let translation = (self.0.esr & 0x3f) >> 2 == 0b0001;
+        (matches!(ec, 0x20 | 0x24) && translation).then_some(self.0.far)
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_aarch64(console, cell, &self.0);

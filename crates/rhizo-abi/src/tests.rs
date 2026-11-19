@@ -94,6 +94,7 @@ impl World {
             tlb: &mut self.tlb,
             frames: &mut self.frames,
             services: &mut self.services,
+            pager: &mut NoPager,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
         (self.cell.regs.gpr[0] as i64, out)

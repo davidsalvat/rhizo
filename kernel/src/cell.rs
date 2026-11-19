@@ -14,11 +14,13 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
 use rhizo_cell::Cell;
 use rhizo_cell::elf::{ElfError, Image};
+use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_hal::{Console, CycleCounter};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{PageSize, PageTable};
 use rhizo_sched::{SLICE_NS, Scheduler, TagPool};
+use rhizo_snapshot::Snapshot;
 
 /// How a cell ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +31,8 @@ pub enum Ending {
     Fault,
     /// The kernel ended it (`Host::kill`).
     Killed,
+    /// It was suspended into a snapshot (`Host::suspend`).
+    Suspended,
 }
 
 /// The kernel's frame allocator, as cells see it.
@@ -117,6 +121,78 @@ struct Live {
     output: Option<Vec<u8>>,
     echo: bool,
     random: u64,
+    /// Pages still to restore, for a lazily resumed cell.
+    lazy: Option<Lazy>,
+}
+
+/// The snapshot of a lazily resumed cell and which of its pages are still
+/// only in the snapshot.
+#[derive(Debug)]
+struct Lazy {
+    snapshot: Snapshot,
+    pending: Vec<bool>,
+    left: usize,
+}
+
+impl Lazy {
+    fn new(snapshot: Snapshot) -> Self {
+        let pages = snapshot.pages();
+        Self {
+            snapshot,
+            pending: alloc::vec![true; pages],
+            left: pages,
+        }
+    }
+
+    /// Restores the page containing `addr` if it is still pending.
+    fn page_in(&mut self, pt: &PageTable<Format>, addr: u64) -> bool {
+        let Some(i) = self.snapshot.find(addr).filter(|&i| self.pending[i]) else {
+            return false;
+        };
+        if self
+            .snapshot
+            .restore_page(i, pt, &mut DirectMap, &mut KernelFrames)
+            .is_err()
+        {
+            return false;
+        }
+        let page = self.snapshot.page(i);
+        if page.flags.is_executable()
+            && let Some(t) = pt.translate(&DirectMap, page.virt)
+        {
+            user::sync_code(DirectMap::virt(t.phys), page.size.bytes());
+        }
+        self.pending[i] = false;
+        self.left -= 1;
+        true
+    }
+
+    /// Restores every page still pending.
+    fn finish(&mut self, pt: &PageTable<Format>) {
+        for i in 0..self.pending.len() {
+            if self.pending[i] {
+                self.page_in(pt, self.snapshot.page(i).virt);
+            }
+        }
+    }
+}
+
+/// The pager of system calls: a lazily resumed cell's pending pages.
+struct LazyPager<'a>(&'a mut Option<Lazy>);
+
+impl Pager<Format, DirectMap> for LazyPager<'_> {
+    fn page_in(&mut self, pt: &PageTable<Format>, _: &mut DirectMap, addr: u64, _: bool) -> bool {
+        self.0.as_mut().is_some_and(|lazy| lazy.page_in(pt, addr))
+    }
+}
+
+/// How [`Host::resume`] restores memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    /// Every page before the cell runs.
+    Eager,
+    /// Each page the first time it is touched.
+    Lazy,
 }
 
 /// A cell that ended, with its captured output.
@@ -198,8 +274,60 @@ impl Host {
             output: capture.then(Vec::new),
             echo,
             random: services.random,
+            lazy: None,
         });
         Ok(id)
+    }
+
+    /// Suspends live cell `id` into a snapshot and frees all its memory
+    /// (spec `snapshots`). Its captured output stays with the host.
+    pub fn suspend(&mut self, id: u32) -> Option<Snapshot> {
+        let (mut live, wake) = self.sched.remove_with_wake(|l| l.cell.id == id)?;
+        let pt = PageTable::<Format>::from_root(live.cell.root);
+        if let Some(lazy) = live.lazy.as_mut() {
+            lazy.finish(&pt);
+        }
+        let remaining = wake.map_or(0, |w| w.saturating_sub(now_ns()).max(1));
+        let snapshot =
+            Snapshot::capture::<Format>(user::MACHINE, &live.cell, remaining, &DirectMap);
+        self.end(live, Ending::Suspended);
+        Some(snapshot)
+    }
+
+    /// Resumes `snapshot` as a new live cell (new identifier and tag) that
+    /// continues exactly where the snapshot was taken.
+    pub fn resume(
+        &mut self,
+        snapshot: Snapshot,
+        mode: Resume,
+        capture: bool,
+        echo: bool,
+    ) -> Option<u32> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let pt = PageTable::<Format>::new(&mut DirectMap, &mut || KernelFrames.alloc()).ok()?;
+        if user::CELL_ROOT_HAS_KERNEL_HALF {
+            pt.share_upper_half(&mut DirectMap, &memory::kernel_tables());
+        }
+        let cell = snapshot.cell(id, pt.root());
+        let sleep = snapshot.state().sleep_remaining_ns;
+        let mut lazy = Lazy::new(snapshot);
+        if mode == Resume::Eager {
+            lazy.finish(&pt);
+        }
+        let live = Live {
+            cell,
+            tag: self.tags.alloc().unwrap_or(0),
+            abi: Abi::new(user::ABI),
+            output: capture.then(Vec::new),
+            echo,
+            random: Counter.cycles() | 1,
+            lazy: (lazy.left > 0).then_some(lazy),
+        };
+        match sleep {
+            0 => self.sched.add(live),
+            ns => self.sched.sleep(live, now_ns() + ns),
+        }
+        Some(id)
     }
 
     /// Page-table frames of the own half of live cell `id`.
@@ -234,6 +362,16 @@ impl Host {
     )]
     pub fn output(&self, id: u32) -> Option<&[u8]> {
         self.sched.find(|l| l.cell.id == id)?.output.as_deref()
+    }
+
+    /// Pages of live cell `id` still waiting in its snapshot (lazy resume).
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn pending_pages(&self, id: u32) -> Option<usize> {
+        let live = self.sched.find(|l| l.cell.id == id)?;
+        Some(live.lazy.as_ref().map_or(0, |l| l.left))
     }
 
     /// Runs cells until none is left or `stop` holds (checked whenever a cell
@@ -274,6 +412,7 @@ impl Host {
                         tlb: &mut CpuTlb,
                         frames: &mut KernelFrames,
                         services: &mut services,
+                        pager: &mut LazyPager(&mut live.lazy),
                     };
                     let outcome = live.abi.handle(&mut live.cell, &mut cx);
                     live.random = services.random;
@@ -290,6 +429,16 @@ impl Host {
                         continue;
                     }
                     self.sched.add(take(live));
+                }
+                Trap::Fault(fault)
+                    if fault.missing_page().is_some_and(|addr| {
+                        live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr))
+                    }) =>
+                {
+                    if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
+                        live.lazy = None; // fully restored: drop the snapshot
+                    }
+                    continue;
                 }
                 Trap::Fault(fault) => {
                     let mut services = KernelServices {
@@ -369,6 +518,7 @@ fn take(live: &mut Live) -> Live {
         output: live.output.take(),
         echo: live.echo,
         random: live.random,
+        lazy: live.lazy.take(),
     }
 }
 
@@ -444,6 +594,62 @@ pub fn bench(console: &mut impl Console) {
         spawn_ns[RUNS / 2],
         run_ns[RUNS / 2]
     );
+    let s = suspend_resume();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-snapshot suspend_ns={} resume_ns={} resume_eager_ns={} resume_touch_ns={} bytes={}",
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+        s[4]
+    );
+}
+
+/// Medians over 7 rounds, for the `ballast` cell (8 MiB written): suspend,
+/// lazy resume until runnable, eager resume, lazy resume plus touching every
+/// page to the cell's exit; and the snapshot size.
+#[cfg(feature = "bench-cell")]
+fn suspend_resume() -> [u64; 5] {
+    const ROUNDS: usize = 7;
+    let image = test_image("ballast");
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut samples: [Vec<u64>; 4] = Default::default();
+    let mut bytes = 0;
+    let mut host = Host::new();
+    for _ in 0..ROUNDS {
+        for (eager, slot) in [(false, 1), (true, 2)] {
+            let id = host
+                .spawn(image, &[b"ballast"], true, false)
+                .expect("spawn ballast");
+            while host.output(id) != Some(b"filled\n") {
+                host.step();
+            }
+            let t0 = Counter.cycles();
+            let snapshot = host.suspend(id).expect("live");
+            let t1 = Counter.cycles();
+            bytes = snapshot.as_bytes().len();
+            let mode = if eager { Resume::Eager } else { Resume::Lazy };
+            let t2 = Counter.cycles();
+            let id = host.resume(snapshot, mode, true, false).expect("resume");
+            let t3 = Counter.cycles();
+            host.run(|h| h.finished(id).is_some());
+            let t4 = Counter.cycles();
+            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+            samples[0].push(ns(t0, t1));
+            samples[slot].push(ns(t2, t3));
+            if !eager {
+                samples[3].push(ns(t2, t4));
+            }
+        }
+    }
+    let mut out = [0u64; 5];
+    for (o, s) in out.iter_mut().zip(&mut samples) {
+        s.sort_unstable();
+        *o = s[s.len() / 2];
+    }
+    out[4] = bytes as u64;
+    out
 }
 
 /// Median over 5 rounds of the time per switch between two cells that

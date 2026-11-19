@@ -66,12 +66,22 @@ impl<T> Scheduler<T> {
 
     /// Removes and returns the first entry (runnable or sleeping) matching
     /// `pred`.
-    pub fn remove(&mut self, mut pred: impl FnMut(&T) -> bool) -> Option<T> {
+    pub fn remove(&mut self, pred: impl FnMut(&T) -> bool) -> Option<T> {
+        self.remove_with_wake(pred).map(|(entry, _)| entry)
+    }
+
+    /// Like [`remove`](Self::remove), also returning the wake time if the
+    /// entry was sleeping.
+    pub fn remove_with_wake(
+        &mut self,
+        mut pred: impl FnMut(&T) -> bool,
+    ) -> Option<(T, Option<u64>)> {
         if let Some(i) = self.runnable.iter().position(&mut pred) {
-            return self.runnable.remove(i);
+            return self.runnable.remove(i).map(|e| (e, None));
         }
         let i = self.sleeping.iter().position(|(_, e)| pred(e))?;
-        Some(self.sleeping.remove(i).1)
+        let (wake, entry) = self.sleeping.remove(i);
+        Some((entry, Some(wake)))
     }
 
     /// The first entry (runnable or sleeping) matching `pred`.
@@ -199,7 +209,7 @@ mod tests {
         s.sleep(2, 10);
         assert_eq!(s.len(), 2);
         assert_eq!(s.find(|&e| e == 2), Some(&2));
-        assert_eq!(s.remove(|&e| e == 2), Some(2));
+        assert_eq!(s.remove_with_wake(|&e| e == 2), Some((2, Some(10))));
         assert_eq!(s.remove(|&e| e == 9), None);
         assert_eq!(s.remove(|&e| e == 1), Some(1));
         assert!(s.is_empty());
