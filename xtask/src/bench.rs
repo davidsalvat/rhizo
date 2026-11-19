@@ -450,6 +450,15 @@ fn load_baseline() -> Result<Value> {
     serde_json::from_str(&text).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
 }
 
+/// Whether `metric` is gated in `env`. Metrics listed under `ungated.<env>`
+/// are recorded but never fail the gate (for example, TSC cycles on shared CI
+/// runners, whose hosts run at different TSC frequencies).
+fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
+    !baseline["ungated"][env]
+        .as_array()
+        .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(metric)))
+}
+
 /// Allowed regression, in percent, for `metric` in `env`.
 fn threshold_pct(baseline: &Value, env: &str, metric: &str) -> f64 {
     let t = &baseline["thresholds_pct"];
@@ -479,7 +488,11 @@ impl Regression {
 pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regression> {
     let stored = &baseline["environments"][env];
     let mut out = Vec::new();
-    for m in results.metrics.iter().filter(|m| m.guest == "rhizo") {
+    for m in results
+        .metrics
+        .iter()
+        .filter(|m| m.guest == "rhizo" && is_gated(baseline, env, &m.name))
+    {
         let Some(base) = stored[m.key()].as_f64() else {
             continue;
         };
@@ -703,6 +716,31 @@ mod tests {
                 "boot.time_to_ready_ms/rhizo/qemu-microvm",
                 "image.size_bytes"
             ]
+        );
+    }
+
+    #[test]
+    fn ungated_metrics_never_fail_the_gate() {
+        let baseline = json!({
+            "thresholds_pct": {"deterministic": 1, "timing": {"ci": 100}},
+            "ungated": {"ci": ["boot.kernel_cycles"]},
+            "environments": {"ci": {
+                "boot.kernel_cycles/rhizo/qemu-q35": 100.0,
+                "boot.time_to_ready_ms/rhizo/qemu-q35": 10.0
+            }}
+        });
+        let r = results(vec![
+            metric("boot.kernel_cycles", "rhizo", Some("qemu-q35"), 1000.0),
+            metric("boot.time_to_ready_ms", "rhizo", Some("qemu-q35"), 20.5),
+        ]);
+        let keys: Vec<_> = regressions(&baseline, "ci", &r)
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["boot.time_to_ready_ms/rhizo/qemu-q35"]);
+        assert!(
+            regressions(&baseline, "dedicated", &r).is_empty(),
+            "no baseline there"
         );
     }
 

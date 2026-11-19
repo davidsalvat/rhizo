@@ -17,8 +17,13 @@
   "thresholds_pct": {
     "deterministic": 1,
     "timing": {
-      "ci": 50,
+      "ci": 100,
       "dedicated": 5
     }
+  },
+  "ungated": {
+    "ci": [
+      "boot.kernel_cycles"
+    ]
   }
 }

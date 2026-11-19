@@ -22,13 +22,13 @@ const FIRECRACKER_VERSION: &str = "v1.15.1";
 const FIRECRACKER: Artifact = Artifact {
     file: "firecracker-v1.15.1-x86_64.tgz",
     url: "https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-x86_64.tgz",
-    sha256: "",
+    sha256: "d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a",
 };
 
 const CLOUD_HYPERVISOR: Artifact = Artifact {
     file: "cloud-hypervisor-v54.0",
     url: "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static",
-    sha256: "",
+    sha256: "4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b",
 };
 
 /// Firecracker's published CI guest kernel (Linux 6.1, PVH and initrd enabled).
