@@ -37,6 +37,7 @@ rhizo-cell = { path = "../crates/rhizo-cell" }
 rhizo-abi = { path = "../crates/rhizo-abi" }
 rhizo-sched = { path = "../crates/rhizo-sched" }
 rhizo-snapshot = { path = "../crates/rhizo-snapshot" }
+rhizo-fs = { path = "../crates/rhizo-fs" }
 
 [lints]
 workspace = true

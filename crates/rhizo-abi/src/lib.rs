@@ -7,6 +7,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+mod files;
+
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
 use rhizo_cell::space::{self, Frames};
@@ -76,6 +80,35 @@ enum Sys {
     Futex,
     Fstat,
     Newfstatat,
+    Stat,
+    Lstat,
+    Openat,
+    Open,
+    Close,
+    Read,
+    Pread,
+    Pwrite,
+    Lseek,
+    Getdents64,
+    Mkdirat,
+    Mkdir,
+    Unlinkat,
+    Unlink,
+    Rmdir,
+    Renameat,
+    Renameat2,
+    Rename,
+    Getcwd,
+    Chdir,
+    Ftruncate,
+    Fsync,
+    Dup,
+    Dup2,
+    Dup3,
+    Fcntl,
+    Faccessat,
+    Faccessat2,
+    Access,
 }
 
 impl Arch {
@@ -117,6 +150,36 @@ impl Arch {
             (Arch::Aarch64, 101) | (Arch::X86_64, 35) => Nanosleep,
             (Arch::Aarch64, 115) | (Arch::X86_64, 230) => ClockNanosleep,
             (Arch::X86_64, 158) => ArchPrctl,
+            (Arch::X86_64, 4) => Stat,
+            (Arch::X86_64, 6) => Lstat,
+            (Arch::Aarch64, 56) | (Arch::X86_64, 257) => Openat,
+            (Arch::X86_64, 2) => Open,
+            (Arch::Aarch64, 57) | (Arch::X86_64, 3) => Close,
+            (Arch::Aarch64, 63) | (Arch::X86_64, 0) => Read,
+            (Arch::Aarch64, 67) | (Arch::X86_64, 17) => Pread,
+            (Arch::Aarch64, 68) | (Arch::X86_64, 18) => Pwrite,
+            (Arch::Aarch64, 62) | (Arch::X86_64, 8) => Lseek,
+            (Arch::Aarch64, 61) | (Arch::X86_64, 217) => Getdents64,
+            (Arch::Aarch64, 34) | (Arch::X86_64, 258) => Mkdirat,
+            (Arch::X86_64, 83) => Mkdir,
+            (Arch::Aarch64, 35) | (Arch::X86_64, 263) => Unlinkat,
+            (Arch::X86_64, 87) => Unlink,
+            (Arch::X86_64, 84) => Rmdir,
+            (Arch::Aarch64, 38) | (Arch::X86_64, 264) => Renameat,
+            (Arch::Aarch64, 276) | (Arch::X86_64, 316) => Renameat2,
+            (Arch::X86_64, 82) => Rename,
+            (Arch::Aarch64, 17) | (Arch::X86_64, 79) => Getcwd,
+            (Arch::Aarch64, 49) | (Arch::X86_64, 80) => Chdir,
+            (Arch::Aarch64, 46) | (Arch::X86_64, 77) => Ftruncate,
+            // fsync, fdatasync
+            (Arch::Aarch64, 82 | 83) | (Arch::X86_64, 74 | 75) => Fsync,
+            (Arch::Aarch64, 23) | (Arch::X86_64, 32) => Dup,
+            (Arch::X86_64, 33) => Dup2,
+            (Arch::Aarch64, 24) | (Arch::X86_64, 292) => Dup3,
+            (Arch::Aarch64, 25) | (Arch::X86_64, 72) => Fcntl,
+            (Arch::Aarch64, 48) | (Arch::X86_64, 269) => Faccessat,
+            (Arch::Aarch64, 439) | (Arch::X86_64, 439) => Faccessat2,
+            (Arch::X86_64, 21) => Access,
             _ => return None,
         })
     }
@@ -174,6 +237,8 @@ pub struct Context<'a, F, M, T, A, S> {
     pub tlb: &'a mut T,
     pub frames: &'a mut A,
     pub services: &'a mut S,
+    /// The cell's files and descriptors.
+    pub fs: &'a mut rhizo_fs::Fs,
     /// Brings in pages that are not mapped yet (lazy resume); [`NoPager`]
     /// otherwise.
     pub pager: &'a mut dyn Pager<F, M>,
@@ -206,6 +271,8 @@ pub struct Abi {
     reported: [u64; 16],
 }
 
+/// `AT_FDCWD` as a system-call argument.
+const AT_FDCWD: u64 = -100i64 as u64;
 /// Bytes copied per step when moving data between a cell and the kernel.
 const CHUNK: usize = 256;
 /// Lowest address the stack region (with its guard page) may reach.
@@ -246,7 +313,7 @@ impl Abi {
                 cell.exit_status = Some(status);
                 return Outcome::Exit(status);
             }
-            Some(Sys::Write) => write(cx, a[0], &[(a[1], a[2])]),
+            Some(Sys::Write) => files::write(cx, a[0], a[1], a[2], None),
             Some(Sys::Writev) => writev(cx, a[0], a[1], a[2]),
             Some(Sys::Brk) => brk(cell, cx, a[0]),
             Some(Sys::Mmap) => mmap(cell, cx, a),
@@ -268,14 +335,53 @@ impl Abi {
             Some(Sys::Rseq) => -ENOSYS,
             Some(Sys::Prlimit64) => rlimit(cx, a[1], a[3]),
             Some(Sys::Getrlimit) => rlimit(cx, a[0], a[1]),
-            // No file system yet: no link exists.
+            // No symbolic links exist.
             Some(Sys::Readlink | Sys::Readlinkat) => -ENOENT,
             // Cells run as root of their own world: uid, gid 0; no parent.
             Some(Sys::Ids | Sys::Getppid) => 0,
             Some(Sys::Sigaltstack | Sys::Madvise) => 0,
             Some(Sys::Futex) => futex(a[1]),
-            Some(Sys::Fstat) => fstat(cx, self.arch, a[0], a[1]),
-            Some(Sys::Newfstatat) => newfstatat(cx, self.arch, a[0], a[1], a[2], a[3]),
+            Some(Sys::Fstat) => files::fstat(cx, self.arch, a[0], a[1]),
+            Some(Sys::Newfstatat) => files::newfstatat(cx, self.arch, a[0], a[1], a[2], a[3]),
+            Some(Sys::Stat | Sys::Lstat) => {
+                files::newfstatat(cx, self.arch, AT_FDCWD, a[0], a[1], 0)
+            }
+            Some(Sys::Openat) => files::openat(cx, self.arch, a[0], a[1], a[2]),
+            Some(Sys::Open) => files::openat(cx, self.arch, AT_FDCWD, a[0], a[1]),
+            Some(Sys::Close) => files::close(cx, a[0]),
+            Some(Sys::Read) => files::read(cx, a[0], a[1], a[2], None),
+            Some(Sys::Pread) => match a[3] as i64 {
+                at if at < 0 => -EINVAL,
+                at => files::read(cx, a[0], a[1], a[2], Some(at as u64)),
+            },
+            Some(Sys::Pwrite) => match a[3] as i64 {
+                at if at < 0 => -EINVAL,
+                at => files::write(cx, a[0], a[1], a[2], Some(at as u64)),
+            },
+            Some(Sys::Lseek) => files::lseek(cx, a[0], a[1], a[2]),
+            Some(Sys::Getdents64) => files::getdents64(cx, a[0], a[1], a[2]),
+            Some(Sys::Mkdirat) => files::mkdirat(cx, a[0], a[1]),
+            Some(Sys::Mkdir) => files::mkdirat(cx, AT_FDCWD, a[0]),
+            Some(Sys::Unlinkat) => files::unlinkat(cx, a[0], a[1], a[2]),
+            Some(Sys::Unlink) => files::unlinkat(cx, AT_FDCWD, a[0], 0),
+            Some(Sys::Rmdir) => files::unlinkat(cx, AT_FDCWD, a[0], 0x200),
+            Some(Sys::Renameat) => files::renameat(cx, a, 0),
+            Some(Sys::Renameat2) => files::renameat(cx, a, a[4]),
+            Some(Sys::Rename) => files::renameat(cx, [AT_FDCWD, a[0], AT_FDCWD, a[1], 0, 0], 0),
+            Some(Sys::Getcwd) => files::getcwd(cx, a[0], a[1]),
+            Some(Sys::Chdir) => files::chdir(cx, a[0]),
+            Some(Sys::Ftruncate) => files::ftruncate(cx, a[0], a[1]),
+            Some(Sys::Fsync) => files::fsync(cx, a[0]),
+            Some(Sys::Dup) => files::dup(cx, a[0], 0, false, false),
+            Some(Sys::Dup2) => match cx.fs.kind(a[0] as u32) {
+                Ok(_) if a[0] == a[1] => a[1] as i64,
+                _ => files::dup(cx, a[0], a[1], true, false),
+            },
+            Some(Sys::Dup3) => files::dup3(cx, a[0], a[1], a[2]),
+            Some(Sys::Fcntl) => files::fcntl(cx, a[0], a[1], a[2]),
+            Some(Sys::Faccessat) => files::faccessat(cx, a[0], a[1], a[2]),
+            Some(Sys::Faccessat2) => files::faccessat(cx, a[0], a[1], a[2]),
+            Some(Sys::Access) => files::faccessat(cx, AT_FDCWD, a[0], a[1]),
             Some(Sys::SchedYield) => {
                 cell.regs.gpr[0] = 0;
                 return Outcome::Yield;
@@ -315,31 +421,6 @@ impl Abi {
     }
 }
 
-fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
-    cx: &mut Context<'_, F, M, T, A, S>,
-    fd: u64,
-    iov: &[(u64, u64)],
-) -> i64 {
-    if fd != 1 && fd != 2 {
-        return -EBADF;
-    }
-    let mut done = 0u64;
-    for &(base, len) in iov {
-        let mut off = 0;
-        while off < len {
-            let n = (len - off).min(CHUNK as u64) as usize;
-            let mut buf = [0u8; CHUNK];
-            if cx.read(base.wrapping_add(off), &mut buf[..n]).is_err() {
-                return if done == 0 { -EFAULT } else { done as i64 };
-            }
-            cx.services.write_bytes(&buf[..n]);
-            off += n as u64;
-            done += n as u64;
-        }
-    }
-    done as i64
-}
-
 fn writev<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
@@ -357,7 +438,7 @@ fn writev<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         }
         let base = u64::from_le_bytes(entry[..8].try_into().unwrap_or_default());
         let len = u64::from_le_bytes(entry[8..].try_into().unwrap_or_default());
-        let n = write(cx, fd, &[(base, len)]);
+        let n = files::write(cx, fd, base, len, None);
         if n < 0 {
             return if total == 0 { n } else { total };
         }
@@ -656,60 +737,6 @@ fn futex(op: u64) -> i64 {
         FUTEX_WAKE => 0,
         _ => -EAGAIN,
     }
-}
-
-/// `struct stat` of a character device (the console) for the standard
-/// descriptors, in each architecture's layout.
-fn fstat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
-    cx: &mut Context<'_, F, M, T, A, S>,
-    arch: Arch,
-    fd: u64,
-    addr: u64,
-) -> i64 {
-    if fd > 2 {
-        return -EBADF;
-    }
-    const S_IFCHR: u64 = 0o020_000;
-    let mode = S_IFCHR | 0o620;
-    let mut st = [0u8; 144];
-    let mut set =
-        |at: usize, v: u64, n: usize| st[at..at + n].copy_from_slice(&v.to_le_bytes()[..n]);
-    let len = match arch {
-        // st_dev, st_ino, st_nlink (8), st_mode (4), ..., st_blksize at 56
-        Arch::X86_64 => {
-            set(16, 1, 8);
-            set(24, mode, 4);
-            set(56, 1024, 8);
-            144
-        }
-        // st_dev, st_ino, st_mode (4) at 16, st_nlink (4), ..., st_blksize (4) at 56
-        Arch::Aarch64 => {
-            set(16, mode, 4);
-            set(20, 1, 4);
-            set(56, 1024, 4);
-            128
-        }
-    };
-    put(cx, addr, &st[..len])
-}
-
-fn newfstatat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
-    cx: &mut Context<'_, F, M, T, A, S>,
-    arch: Arch,
-    dirfd: u64,
-    path: u64,
-    addr: u64,
-    flags: u64,
-) -> i64 {
-    const AT_EMPTY_PATH: u64 = 0x1000;
-    let mut first = [0u8; 1];
-    if cx.read(path, &mut first).is_err() {
-        return -EFAULT;
-    }
-    if flags & AT_EMPTY_PATH != 0 && first[0] == 0 {
-        return fstat(cx, arch, dirfd, addr);
-    }
-    -ENOENT // no file system yet
 }
 
 fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(

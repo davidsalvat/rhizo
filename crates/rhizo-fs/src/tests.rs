@@ -187,6 +187,34 @@ fn unlink_rmdir_and_open_files() {
 }
 
 #[test]
+fn file_data_is_limited_per_cell() {
+    let mut fs = Fs::new();
+    let fd = fs.open(None, b"/f", RW, 2).unwrap();
+    assert_eq!(fs.write(fd, b"x", Some(DATA_MAX)), Err(Error::TooBig));
+    assert_eq!(fs.truncate(fd, DATA_MAX + 1), Err(Error::TooBig));
+    let chunk = vec![1u8; 1 << 20];
+    for i in 0..DATA_MAX / (1 << 20) {
+        assert_eq!(fs.write(fd, &chunk, Some(i << 20)), Ok(chunk.len()));
+    }
+    assert_eq!(fs.data_bytes(), DATA_MAX);
+    let other = fs.open(None, b"/g", RW, 2).unwrap();
+    assert_eq!(fs.write(other, b"y", None), Err(Error::NoSpace));
+    fs.truncate(fd, 4096).unwrap();
+    assert_eq!(fs.data_bytes(), 4096);
+    assert_eq!(fs.write(other, b"y", None), Ok(1));
+    fs.close(fd).unwrap();
+    fs.unlink(None, b"/f", false).unwrap();
+    assert_eq!(fs.data_bytes(), 4096);
+    let trunc = OpenFlags {
+        truncate: true,
+        ..RW
+    };
+    let g = fs.open(None, b"/g", trunc, 2).unwrap();
+    fs.close(g).unwrap();
+    assert_eq!(fs.data_bytes(), 0);
+}
+
+#[test]
 fn rename_replaces_and_refuses_cycles() {
     let mut fs = Fs::new();
     fs.put_file(b"/a", b"A").unwrap();
@@ -423,6 +451,9 @@ proptest! {
                 }
             }
             for (fs, model) in &mut cells {
+                let mut bytes = Vec::new();
+                fs.encode(&mut bytes);
+                prop_assert_eq!(Fs::decode(&bytes).unwrap().data_bytes(), fs.data_bytes());
                 for file in 0..4 {
                     let got = read_all(fs, &path(file)).ok();
                     prop_assert_eq!(got.as_ref(), model.get(&file));

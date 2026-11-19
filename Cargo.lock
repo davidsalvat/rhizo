@@ -291,6 +291,7 @@ name = "rhizo-abi"
 version = "0.1.0"
 dependencies = [
  "rhizo-cell",
+ "rhizo-fs",
  "rhizo-hal",
  "rhizo-mm",
 ]
@@ -332,6 +333,7 @@ dependencies = [
  "rhizo-abi",
  "rhizo-cell",
  "rhizo-core",
+ "rhizo-fs",
  "rhizo-hal",
  "rhizo-mm",
  "rhizo-sched",
@@ -358,6 +360,7 @@ name = "rhizo-snapshot"
 version = "0.1.0"
 dependencies = [
  "rhizo-cell",
+ "rhizo-fs",
  "rhizo-hal",
  "rhizo-mm",
 ]

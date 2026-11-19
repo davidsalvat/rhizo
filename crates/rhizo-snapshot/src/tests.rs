@@ -30,10 +30,10 @@ fn cell<F: EntryFormat>(mem: &mut FakePhysicalMemory, frames: &mut CountingFrame
 fn round_trip<F: EntryFormat>() {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let original = cell::<F>(&mut mem, &mut frames);
-    let snap = Snapshot::capture::<F>(Machine::Aarch64, &original, 77, &mem);
+    let snap = Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), 77, &mem);
     assert_eq!(
         snap,
-        Snapshot::capture::<F>(Machine::Aarch64, &original, 77, &mem),
+        Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), 77, &mem),
         "deterministic"
     );
     let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
@@ -60,7 +60,13 @@ fn round_trip<F: EntryFormat>() {
     assert_eq!(&buf[..4], b"data");
     assert_eq!(pt.translate(&mem, 0x40_0000).unwrap().flags, RX);
     // The restored cell captures to the same bytes (same state, same memory).
-    let again = Snapshot::capture::<F>(Machine::Aarch64, &Cell { id: 9, ..restored }, 77, &mem);
+    let again = Snapshot::capture::<F>(
+        Machine::Aarch64,
+        &Cell { id: 9, ..restored },
+        &Fs::new(),
+        77,
+        &mem,
+    );
     assert_eq!(again.as_bytes(), snap.as_bytes());
 }
 
@@ -74,10 +80,32 @@ fn round_trip_x86_64() {
     round_trip::<X86_64>();
 }
 
+#[test]
+fn files_travel_with_the_snapshot() {
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let c = cell::<Aarch64>(&mut mem, &mut frames);
+    let mut fs = Fs::new();
+    fs.put_file(b"/in/data.txt", b"input").unwrap();
+    fs.chdir(b"/in").unwrap();
+    let snap = Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &fs, 0, &mem);
+    let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
+    let back = snap.files();
+    assert_eq!(back.getcwd(), b"/in");
+    assert_eq!(back.stat(None, b"data.txt").unwrap().size, 5);
+    // A files section that does not decode is refused.
+    let mut bytes = snap.into_bytes();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    assert_eq!(
+        Snapshot::from_bytes(bytes, Machine::Aarch64),
+        Err(FormatError::BadFiles)
+    );
+}
+
 fn sample() -> Vec<u8> {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let c = cell::<Aarch64>(&mut mem, &mut frames);
-    Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, 0, &mem).into_bytes()
+    Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &Fs::new(), 0, &mem).into_bytes()
 }
 
 #[test]

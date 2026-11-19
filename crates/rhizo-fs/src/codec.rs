@@ -176,7 +176,7 @@ impl Fs {
                             None
                         });
                     }
-                    if blocks.len() as u64 > size.div_ceil(BLOCK as u64) {
+                    if size > DATA_MAX || blocks.len() as u64 > size.div_ceil(BLOCK as u64) {
                         return Err(DecodeError::Corrupt);
                     }
                     Node::File(File { size, blocks })
@@ -213,11 +213,20 @@ impl Fs {
         if !r.0.is_empty() {
             return Err(DecodeError::Truncated);
         }
+        let used = inodes
+            .iter()
+            .flatten()
+            .map(|i| match &i.node {
+                Node::File(f) => f.held(),
+                Node::Dir { .. } => 0,
+            })
+            .sum();
         let fs = Fs {
             inodes,
             descs,
             fds,
             cwd,
+            used,
         };
         if fs.consistent() {
             Ok(fs)
@@ -234,7 +243,11 @@ impl Fs {
                 Some(Some(i)) if matches!(i.node, Node::Dir { .. })
             )
         };
-        if !is_dir(ROOT) || !is_dir(self.cwd) || self.fds.len() > FD_MAX {
+        if !is_dir(ROOT)
+            || !is_dir(self.cwd)
+            || self.fds.len() > FD_MAX
+            || self.used > DATA_MAX / BLOCK as u64
+        {
             return false;
         }
         // Names: each directory other than the root has exactly one, in its

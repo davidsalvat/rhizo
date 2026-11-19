@@ -17,6 +17,7 @@ use rhizo_cell::Cell;
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
+use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{PageSize, PageTable};
@@ -158,6 +159,8 @@ struct Live {
     random: u64,
     /// Pages still to restore, for a lazily resumed cell.
     lazy: Option<Lazy>,
+    /// Its files and open descriptors (spec `files`).
+    fs: Fs,
 }
 
 /// The snapshot of a lazily resumed cell and which of its pages are still
@@ -281,8 +284,9 @@ pub struct Host {
     sched: Scheduler<Live>,
     tags: TagPool,
     finished: Vec<Finished>,
-    /// Frozen cells: never run, only forked (spec `fork`, templates).
-    templates: Vec<Cell>,
+    /// Frozen cells and their files: never run, only forked (spec `fork`,
+    /// templates).
+    templates: Vec<(Cell, Fs)>,
     /// Cell whose FP/SIMD state is in the registers (0: none). The kernel
     /// never uses them, so they are saved only when another cell runs.
     fp_owner: u32,
@@ -323,6 +327,19 @@ impl Host {
         capture: bool,
         echo: bool,
     ) -> Result<u32, ElfError> {
+        self.spawn_with_files(image, argv, Fs::new(), capture, echo)
+    }
+
+    /// [`spawn`](Self::spawn) with `files` as the cell's file system (spec
+    /// `files`, initial files).
+    pub fn spawn_with_files(
+        &mut self,
+        image: &[u8],
+        argv: &[&[u8]],
+        files: Fs,
+        capture: bool,
+        echo: bool,
+    ) -> Result<u32, ElfError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut services = KernelServices {
             capture: None,
@@ -354,6 +371,7 @@ impl Host {
             echo,
             random: services.random,
             lazy: None,
+            fs: files,
         });
         Ok(id)
     }
@@ -380,7 +398,7 @@ impl Host {
         self.sync_fp(&mut live, true);
         let remaining = wake.map_or(0, |w| w.saturating_sub(now_ns()).max(1));
         let snapshot =
-            Snapshot::capture::<Format>(user::MACHINE, &live.cell, remaining, &DirectMap);
+            Snapshot::capture::<Format>(user::MACHINE, &live.cell, &live.fs, remaining, &DirectMap);
         self.end(live, Ending::Suspended);
         Some(snapshot)
     }
@@ -401,6 +419,7 @@ impl Host {
         }
         let cell = snapshot.cell(id, pt.root());
         let sleep = snapshot.state().sleep_remaining_ns;
+        let fs = snapshot.files();
         let mut lazy = Lazy::new(snapshot);
         if mode == Resume::Eager {
             lazy.finish(&pt);
@@ -414,6 +433,7 @@ impl Host {
             echo,
             random: Counter.cycles() | 1,
             lazy: (lazy.left > 0).then_some(lazy),
+            fs,
         };
         match sleep {
             0 => self.sched.add(live),
@@ -471,20 +491,20 @@ impl Host {
     pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
         while !stop(self) {
             let now = now_ns();
-            let Some(mut live) = self.sched.next(now) else {
+            let Some(live) = self.sched.next(now) else {
                 match self.sched.next_wake() {
                     Some(wake) => idle_until(wake),
                     None => return,
                 }
                 continue;
             };
-            self.run_slice(&mut live);
+            self.run_slice(live);
         }
     }
 
     /// Runs `live` until it ends, sleeps, yields or is preempted, and files it
     /// accordingly.
-    fn run_slice(&mut self, live: &mut Live) {
+    fn run_slice(&mut self, mut live: Live) {
         // FP/SIMD state moves only if this cell actually uses it (design D1).
         user::fp_trap(self.fp_owner != live.cell.id);
         let pt = PageTable::<Format>::from_root(live.cell.root);
@@ -511,15 +531,16 @@ impl Host {
                         tlb: &mut CpuTlb,
                         frames: &mut KernelFrames,
                         services: &mut services,
+                        fs: &mut live.fs,
                         pager: &mut CellPager(&mut live.lazy),
                     };
                     let outcome = live.abi.handle(&mut live.cell, &mut cx);
                     live.random = services.random;
                     match outcome {
                         Outcome::Resume => continue,
-                        Outcome::Yield => self.sched.add(take(live)),
-                        Outcome::Sleep(until) => self.sched.sleep(take(live), until),
-                        Outcome::Exit(status) => self.end(take(live), Ending::Exit(status)),
+                        Outcome::Yield => self.sched.add(live),
+                        Outcome::Sleep(until) => self.sched.sleep(live, until),
+                        Outcome::Exit(status) => self.end(live, Ending::Exit(status)),
                     }
                 }
                 Trap::FpUnavailable => {
@@ -537,7 +558,7 @@ impl Host {
                     if ticks < 2 {
                         continue;
                     }
-                    self.sched.add(take(live));
+                    self.sched.add(live);
                 }
                 Trap::Fault(fault)
                     if fault.missing_page().is_some_and(|addr| {
@@ -563,7 +584,7 @@ impl Host {
                         random: 0,
                     };
                     fault.report(&mut services, live.cell.id);
-                    self.end(take(live), Ending::Fault);
+                    self.end(live, Ending::Fault);
                 }
             }
             return;
@@ -587,8 +608,12 @@ impl Host {
         self.sync_fp(&mut parent, false);
         let mut children = Vec::with_capacity(n);
         for _ in 0..n {
-            let Some(child) = self.child_of(&parent.cell, parent.output.is_some(), parent.echo)
-            else {
+            let Some(child) = self.child_of(
+                &parent.cell,
+                &parent.fs,
+                parent.output.is_some(),
+                parent.echo,
+            ) else {
                 break;
             };
             children.push(child.cell.id);
@@ -602,7 +627,7 @@ impl Host {
     }
 
     /// A new live cell sharing `cell`'s memory copy-on-write.
-    fn child_of(&mut self, cell: &Cell, capture: bool, echo: bool) -> Option<Live> {
+    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Live> {
         let pt = PageTable::<Format>::from_root(cell.root);
         let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
         Some(Live {
@@ -618,6 +643,7 @@ impl Host {
             echo,
             random: Counter.cycles() | 1,
             lazy: None,
+            fs: fs.clone(),
         })
     }
 
@@ -644,14 +670,16 @@ impl Host {
         if live.tag != 0 {
             self.tags.free(live.tag);
         }
-        self.templates.push(live.cell);
+        self.templates.push((live.cell, live.fs));
         true
     }
 
     /// Starts a new cell from template `id`: a fork of the frozen cell.
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
-        let template = *self.templates.iter().find(|c| c.id == id)?;
-        let child = self.child_of(&template, capture, echo)?;
+        let index = self.templates.iter().position(|(c, _)| c.id == id)?;
+        let (cell, fs) = &self.templates[index];
+        let (cell, fs) = (*cell, fs.clone());
+        let child = self.child_of(&cell, &fs, capture, echo)?;
         let child_id = child.cell.id;
         self.sched.add(child);
         Some(child_id)
@@ -712,27 +740,13 @@ impl Drop for Host {
         while let Some(live) = self.sched.remove(|_| true) {
             self.end(live, Ending::Killed);
         }
-        for template in self.templates.drain(..) {
+        for (template, _) in self.templates.drain(..) {
             space::destroy(
                 PageTable::<Format>::from_root(template.root),
                 &mut DirectMap,
                 &mut KernelFrames,
             );
         }
-    }
-}
-
-/// Moves a live cell out of a `&mut` slot (the slot is not used again).
-fn take(live: &mut Live) -> Live {
-    Live {
-        cell: live.cell,
-        tag: live.tag,
-        fresh: live.fresh,
-        abi: core::mem::replace(&mut live.abi, Abi::new(user::ABI)),
-        output: live.output.take(),
-        echo: live.echo,
-        random: live.random,
-        lazy: live.lazy.take(),
     }
 }
 

@@ -13,6 +13,7 @@ publish = false
 rhizo-hal = { path = "../rhizo-hal" }
 rhizo-mm = { path = "../rhizo-mm" }
 rhizo-cell = { path = "../rhizo-cell" }
+rhizo-fs = { path = "../rhizo-fs" }
 
 [dev-dependencies]
 rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }

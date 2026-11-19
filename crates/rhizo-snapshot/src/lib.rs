@@ -14,6 +14,8 @@
 //!          1 = 2 MiB), permissions u8 (1 W, 2 USER, 4 NX), 6 zero bytes
 //!                                                     (24 bytes each)
 //! data     page contents, in record order
+//! files    length u64, then the cell's file system as `rhizo_fs` encodes
+//!          it (tree, open descriptions and descriptors, working directory)
 //! ```
 //!
 //! Every value is little endian; records are sorted by address.
@@ -26,12 +28,13 @@ use alloc::vec::Vec;
 use rhizo_cell::elf::Machine;
 use rhizo_cell::space::Frames;
 use rhizo_cell::{Cell, Registers};
+use rhizo_fs::Fs;
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 const HEADER: usize = 24;
 const STATE: usize = (39 + 66) * 8;
 const RECORD: usize = 24;
@@ -52,6 +55,8 @@ pub enum FormatError {
     /// Record `index` is malformed: size, permissions, address, alignment,
     /// order or data offset.
     BadPage { index: usize },
+    /// The files section does not decode to a consistent file system.
+    BadFiles,
 }
 
 /// The plain state of a suspended cell besides its memory.
@@ -115,6 +120,7 @@ impl Snapshot {
     pub fn capture<F: EntryFormat>(
         machine: Machine,
         cell: &Cell,
+        files: &Fs,
         sleep_remaining_ns: u64,
         mem: &impl PhysicalMemory,
     ) -> Self {
@@ -164,6 +170,11 @@ impl Snapshot {
             mem.read_bytes(phys, &mut b[at..at + n]);
             at += n;
         });
+        let len_at = b.len();
+        b.extend_from_slice(&[0; 8]);
+        files.encode(&mut b);
+        let files_len = (b.len() - len_at - 8) as u64;
+        b[len_at..len_at + 8].copy_from_slice(&files_len.to_le_bytes());
         Self { bytes: b }
     }
 
@@ -221,9 +232,12 @@ impl Snapshot {
             prev_end = virt + size.bytes();
             expected_offset += size.bytes();
         }
-        if snapshot.bytes.len() as u64 != data_start as u64 + expected_offset {
+        let files_at = data_start as u64 + expected_offset;
+        let len = snapshot.bytes.len() as u64;
+        if len < files_at + 8 || len - files_at - 8 != u64_at(&snapshot.bytes, files_at as usize) {
             return Err(FormatError::Truncated);
         }
+        Fs::decode(snapshot.files_bytes()).map_err(|_| FormatError::BadFiles)?;
         Ok(snapshot)
     }
 
@@ -271,6 +285,24 @@ impl Snapshot {
             mmap_next: w(37),
             sleep_remaining_ns: w(38),
         }
+    }
+
+    /// The encoded file system (after the page data and its length).
+    fn files_bytes(&self) -> &[u8] {
+        let pages = self.page_count();
+        let data_start = HEADER + STATE + pages * RECORD;
+        // Pages are stored in record order: the data ends after the last.
+        let data_len = pages.checked_sub(1).map_or(0, |last| {
+            let page = self.page(last);
+            u64_at(&self.bytes, HEADER + STATE + last * RECORD + 8) + page.size.bytes()
+        });
+        &self.bytes[data_start + data_len as usize + 8..]
+    }
+
+    /// The cell's file system, open descriptors and working directory.
+    pub fn files(&self) -> Fs {
+        // Validated by `from_bytes` or written by `capture`.
+        Fs::decode(self.files_bytes()).unwrap_or_default()
     }
 
     /// Number of pages.

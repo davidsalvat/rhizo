@@ -31,6 +31,8 @@ pub const BLOCK: usize = 4096;
 pub const NAME_MAX: usize = 255;
 /// Most descriptors a cell may have open.
 pub const FD_MAX: usize = 1024;
+/// Most file data a cell may hold, and the largest file size (bytes).
+pub const DATA_MAX: u64 = 64 << 20;
 const ROOT: Ino = 0;
 
 /// Why an operation failed, with its Linux error number.
@@ -46,6 +48,10 @@ pub enum Error {
     NameTooLong,
     TooManyFiles,
     Busy,
+    /// The cell holds [`DATA_MAX`] bytes of file data.
+    NoSpace,
+    /// Past the largest file size.
+    TooBig,
 }
 
 impl Error {
@@ -60,6 +66,8 @@ impl Error {
             Error::IsDir => 21,
             Error::Invalid => 22,
             Error::TooManyFiles => 24,
+            Error::TooBig => 27,
+            Error::NoSpace => 28,
             Error::NameTooLong => 36,
             Error::NotEmpty => 39,
         }
@@ -76,6 +84,13 @@ type Block = [u8; BLOCK];
 struct File {
     size: u64,
     blocks: Vec<Option<Arc<Block>>>,
+}
+
+impl File {
+    /// Blocks written (holes excluded).
+    fn held(&self) -> u64 {
+        self.blocks.iter().filter(|b| b.is_some()).count() as u64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +177,8 @@ pub struct Fs {
     /// Descriptor → description index, and the close-on-exec flag.
     fds: Vec<Option<(u32, bool)>>,
     cwd: Ino,
+    /// File blocks held (shared ones included), at most `DATA_MAX / BLOCK`.
+    used: u64,
 }
 
 impl Default for Fs {
@@ -191,6 +208,7 @@ impl Fs {
             descs: vec![Some(console)],
             fds: vec![Some((0, false)); 3],
             cwd: ROOT,
+            used: 0,
         }
     }
 
@@ -226,6 +244,9 @@ impl Fs {
     fn maybe_free(&mut self, ino: Ino) {
         let open = self.descs.iter().flatten().any(|d| d.target == Some(ino));
         if self.inode(ino).links == 0 && !open {
+            if let Node::File(f) = &self.inode(ino).node {
+                self.used -= f.held();
+            }
             self.inodes[ino as usize] = None;
         }
     }
@@ -409,7 +430,9 @@ impl Fs {
             && flags.write
             && let Node::File(f) = &mut self.inode_mut(ino).node
         {
+            let held = f.held();
             *f = File::default();
+            self.used -= held;
         }
         let desc = self.new_desc(Some(ino), access);
         self.new_fd(desc, 0, false)
@@ -530,10 +553,10 @@ impl Fs {
     /// Writes `data` at `offset` (or at the description's offset, or at the
     /// end with `O_APPEND`); returns bytes written.
     pub fn write(&mut self, fd: Fd, data: &[u8], offset: Option<u64>) -> Result<usize> {
-        let (ino, file, desc) = self.file_of(fd)?;
-        if desc.flags & 3 == 0 {
-            return Err(Error::BadFd); // O_RDONLY
+        if self.desc(fd)?.flags & 3 == 0 {
+            return Err(Error::BadFd); // O_RDONLY (directories included)
         }
+        let (ino, file, desc) = self.file_of(fd)?;
         let at = match offset {
             Some(at) => at,
             None if desc.flags & O_APPEND_FLAG != 0 => file.size,
@@ -542,11 +565,21 @@ impl Fs {
         if data.is_empty() {
             return Ok(0);
         }
-        let end = at.checked_add(data.len() as u64).ok_or(Error::Invalid)?;
+        let end = at
+            .checked_add(data.len() as u64)
+            .filter(|&end| end <= DATA_MAX)
+            .ok_or(Error::TooBig)?;
+        let (first, blocks) = (at as usize / BLOCK, (end as usize).div_ceil(BLOCK));
+        let new = (first..blocks)
+            .filter(|&b| file.blocks.get(b).is_none_or(Option::is_none))
+            .count() as u64;
+        if self.used + new > DATA_MAX / BLOCK as u64 {
+            return Err(Error::NoSpace);
+        }
+        self.used += new;
         let Node::File(file) = &mut self.inode_mut(ino).node else {
             return Err(Error::IsDir);
         };
-        let blocks = (end as usize).div_ceil(BLOCK);
         if file.blocks.len() < blocks {
             file.blocks.resize(blocks, None);
         }
@@ -595,10 +628,17 @@ impl Fs {
         if desc.flags & 3 == 0 {
             return Err(Error::Invalid);
         }
+        if size > DATA_MAX {
+            return Err(Error::TooBig);
+        }
         let Node::File(file) = &mut self.inode_mut(ino).node else {
             return Err(Error::IsDir);
         };
         let blocks = (size as usize).div_ceil(BLOCK);
+        let dropped = file
+            .blocks
+            .get(blocks..)
+            .map_or(0, |cut| cut.iter().filter(|b| b.is_some()).count() as u64);
         file.blocks.truncate(blocks);
         // Bytes past the new end of its last block must read as zero later.
         let keep = size as usize % BLOCK;
@@ -610,6 +650,7 @@ impl Fs {
             Arc::make_mut(last)[keep..].fill(0);
         }
         file.size = size;
+        self.used -= dropped;
         Ok(())
     }
 
@@ -868,17 +909,10 @@ impl Fs {
         written.map(|_| ())
     }
 
-    /// Bytes of file data this cell holds (blocks it does not share count
-    /// fully; shared ones too: a bound, for accounting and tests).
+    /// Bytes of file data this cell holds, blocks it shares with a fork
+    /// included (what [`DATA_MAX`] limits).
     pub fn data_bytes(&self) -> u64 {
-        self.inodes
-            .iter()
-            .flatten()
-            .map(|i| match &i.node {
-                Node::File(f) => f.blocks.iter().flatten().count() as u64 * BLOCK as u64,
-                Node::Dir { .. } => 0,
-            })
-            .sum()
+        self.used * BLOCK as u64
     }
 }
 
