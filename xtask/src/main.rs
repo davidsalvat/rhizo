@@ -7,6 +7,7 @@
 mod arch;
 mod bench;
 mod deps;
+mod differential;
 mod refguest;
 mod report;
 mod tools;
@@ -20,6 +21,8 @@ use std::time::{Duration, Instant};
 use vmm::{Accel, Guest, RunOptions, VmResult, VmRun, Vmm};
 
 const KERNEL_PACKAGE: &str = "rhizo-kernel";
+/// Test programs run as cells (bare-metal targets only).
+const CELLS_PACKAGE: &str = "rhizo-cells";
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
 /// Timeout for the self-check that expects a hanging kernel.
 const HANG_CHECK_TIMEOUT_SECS: u64 = 5;
@@ -298,7 +301,7 @@ fn report_timing(vmm: Vmm, run: &VmRun) {
 
 /// Names accepted by `test --only`.
 fn test_steps() -> Vec<&'static str> {
-    let mut steps = vec!["host", "boot", "ktest"];
+    let mut steps = vec!["host", "differential", "boot", "ktest"];
     steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
     steps
 }
@@ -306,7 +309,22 @@ fn test_steps() -> Vec<&'static str> {
 fn cmd_test(args: &RunArgs) -> Result {
     if args.wants("host") {
         step("host tests");
-        cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
+        cargo(&[
+            "test",
+            "--workspace",
+            "--exclude",
+            KERNEL_PACKAGE,
+            "--exclude",
+            CELLS_PACKAGE,
+        ])?;
+    }
+
+    if args.wants("differential") {
+        step("cells on the host (differential check against Linux)");
+        match differential::unavailable_reason() {
+            Some(reason) => report::text(&format!("skipped: {reason}")),
+            None => differential::check(&build_cells()?)?,
+        }
     }
 
     let timeout = test_timeout()?;
@@ -476,12 +494,25 @@ fn cmd_check() -> Result {
         "--workspace",
         "--exclude",
         KERNEL_PACKAGE,
+        "--exclude",
+        CELLS_PACKAGE,
         "--all-targets",
         "--",
         "-D",
         "warnings",
     ])?;
     for arch in [arch::Arch::Aarch64, arch::Arch::X86_64] {
+        step(&format!("clippy (cells, {})", arch.id()));
+        cargo(&[
+            "clippy",
+            "-p",
+            CELLS_PACKAGE,
+            "--target",
+            arch.target(),
+            "--",
+            "-D",
+            "warnings",
+        ])?;
         step(&format!("clippy (kernel, {})", arch.id()));
         cargo(&[
             "clippy",
@@ -497,7 +528,14 @@ fn cmd_check() -> Result {
         ])?;
     }
     step("host tests");
-    cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
+    cargo(&[
+        "test",
+        "--workspace",
+        "--exclude",
+        KERNEL_PACKAGE,
+        "--exclude",
+        CELLS_PACKAGE,
+    ])?;
     step("crate dependency rules");
     deps::check()?;
     step("workflow files (actionlint)");
@@ -521,6 +559,8 @@ fn cmd_ci() -> Result {
         "--workspace",
         "--exclude",
         KERNEL_PACKAGE,
+        "--exclude",
+        CELLS_PACKAGE,
         "--all-targets",
         "--",
         "-D",
@@ -529,8 +569,19 @@ fn cmd_ci() -> Result {
 
     let features = [""]
         .into_iter()
-        .chain(["ktest"])
+        .chain(["ktest", "bench-cell"])
         .chain(SELF_CHECKS.iter().map(|c| c.feature));
+    step("clippy (cells)");
+    cargo(&[
+        "clippy",
+        "-p",
+        CELLS_PACKAGE,
+        "--target",
+        arch::current().target(),
+        "--",
+        "-D",
+        "warnings",
+    ])?;
     for features in features {
         step(&format!("clippy (kernel, features: `{features}`)"));
         let target = arch::current().target();
@@ -668,6 +719,7 @@ const SELF_CHECKS: &[SelfCheck] = &[
 /// VMMs boot (the ELF on x86_64, a flat arm64 Image on AArch64).
 pub(crate) fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBuf> {
     let target = arch::current().target();
+    let cells = build_cells()?;
     let mut args = vec!["build", "-p", KERNEL_PACKAGE, "--target", target];
     if profile == Profile::Release {
         args.push("--release");
@@ -676,8 +728,28 @@ pub(crate) fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBu
     if !features.is_empty() {
         args.extend(["--features", &joined]);
     }
-    cargo(&args)?;
+    cargo_env(&args, &[("RHIZO_CELLS_DIR", cells.as_os_str())])?;
     arch::current().bootable_image(&kernel_elf(profile))
+}
+
+/// Builds the test cells (`cells/`, static Linux executables for the selected
+/// architecture) and returns the directory holding them. They have their own
+/// target directory so their link flags never invalidate the kernel build.
+pub(crate) fn build_cells() -> Result<PathBuf> {
+    let target = arch::current().target();
+    let dir = target_dir().join("cells");
+    let dir_str = dir.to_string_lossy().into_owned();
+    cargo(&[
+        "build",
+        "-p",
+        "rhizo-cells",
+        "--target",
+        target,
+        "--release",
+        "--target-dir",
+        &dir_str,
+    ])?;
+    Ok(dir.join(target).join("release"))
 }
 
 /// The linked kernel ELF (with symbols) for the selected architecture.
@@ -689,9 +761,14 @@ fn kernel_elf(profile: Profile) -> PathBuf {
 }
 
 fn cargo(args: &[&str]) -> Result {
+    cargo_env(args, &[])
+}
+
+fn cargo_env(args: &[&str], vars: &[(&str, &std::ffi::OsStr)]) -> Result {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(&cargo)
         .args(args)
+        .envs(vars.iter().copied())
         .current_dir(workspace_root())
         .stdout(report::child_stdout())
         .status()

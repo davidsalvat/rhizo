@@ -16,7 +16,11 @@ const README_END: &str = "<!-- bench:end -->";
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Metrics whose value does not depend on machine noise.
-const DETERMINISTIC: [&str; 2] = ["image.size_bytes", "memory.kernel_pt_frames"];
+const DETERMINISTIC: [&str; 3] = [
+    "image.size_bytes",
+    "memory.kernel_pt_frames",
+    "cell.pt_frames",
+];
 
 /// Options for `cargo xtask bench`.
 #[derive(Debug)]
@@ -308,12 +312,109 @@ fn measure(opts: &Options) -> Result<Results> {
             frames as f64,
         ));
     }
+    measure_cells(opts, &mut metrics, &mut skipped)?;
     Ok(Results {
         environment: opts.env.clone(),
         date: today(),
         kvm: vmm::kvm_available(),
         metrics,
         skipped,
+    })
+}
+
+/// Cell metrics: a `bench-cell` kernel spawns and runs the hello cell many
+/// times per boot and prints medians; each VMM boots it a few times.
+fn measure_cells(
+    opts: &Options,
+    metrics: &mut Vec<Metric>,
+    skipped: &mut Vec<(String, String)>,
+) -> Result {
+    let kernel = build_kernel(Profile::Release, &["bench-cell"])?;
+    let guest = Guest::Rhizo(kernel);
+    let run_opts = RunOptions {
+        stop_at_ready: false,
+        timeout: RUN_TIMEOUT,
+        echo: false,
+        accel: opts.accel,
+        gdb: false,
+    };
+    let mut pt_frames = None;
+    for &vmm in &opts.vmms {
+        if vmm.unavailable_reason(opts.accel).is_some() {
+            continue; // already reported by the boot benchmark
+        }
+        report::text(&format!("cells on {}", vmm.id()));
+        let (mut spawn, mut run) = (Vec::new(), Vec::new());
+        for _ in 0..opts.runs.clamp(1, 5) {
+            let out = vmm::run(vmm, &guest, run_opts)?;
+            match parse_cell_line(&out.output) {
+                Some(c) if c.spawn_ns == 0 => {
+                    skipped.push((
+                        format!("cells/{}", vmm.id()),
+                        "the kernel cannot convert cycles to time here (no TSC frequency: \
+                         no KVM clock, CPUID leaf or PIT)"
+                            .into(),
+                    ));
+                    break;
+                }
+                Some(c) if out.result != VmResult::Failed => {
+                    spawn.push(c.spawn_ns as f64 / 1000.0);
+                    run.push(c.run_ns as f64 / 1000.0);
+                    pt_frames = Some(c.pt_frames);
+                }
+                _ => {
+                    skipped.push((
+                        format!("cells/{}", vmm.id()),
+                        format!(
+                            "no `rhizo-cell` line ({:?}); output:\n{}",
+                            out.result, out.output
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        for (name, values) in [("cell.spawn_us", &mut spawn), ("cell.run_us", &mut run)] {
+            if !values.is_empty() {
+                let (median, p90) = summarize(values);
+                metrics.push(Metric {
+                    name: name.into(),
+                    guest: "rhizo".into(),
+                    vmm: Some(vmm.id().into()),
+                    unit: "us".into(),
+                    median,
+                    p90,
+                    runs: values.len(),
+                });
+            }
+        }
+    }
+    if let Some(frames) = pt_frames {
+        metrics.push(deterministic("cell.pt_frames", "frames", frames as f64));
+    }
+    Ok(())
+}
+
+/// Figures printed by a `bench-cell` kernel.
+#[derive(Debug, PartialEq, Eq)]
+struct CellLine {
+    spawn_ns: u64,
+    run_ns: u64,
+    pt_frames: u64,
+}
+
+fn parse_cell_line(output: &str) -> Option<CellLine> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-cell "))?;
+    let field = |key: &str| {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some(CellLine {
+        spawn_ns: field("spawn_ns")?,
+        run_ns: field("run_ns")?,
+        pt_frames: field("pt_frames")?,
     })
 }
 
@@ -957,5 +1058,19 @@ mod tests {
         assert_eq!(o.vmms, vec![Vmm::QemuQ35, Vmm::Firecracker]);
         assert!(o.check && o.env == "ci");
         assert!(Options::parse(&["--runs".to_string(), "0".to_string()]).is_err());
+    }
+
+    #[test]
+    fn cell_line_is_parsed() {
+        let out = "rhizo-ready cycles=1\nrhizo-cell spawn_ns=12000 run_ns=30000 pt_frames=7\n";
+        assert_eq!(
+            parse_cell_line(out),
+            Some(CellLine {
+                spawn_ns: 12000,
+                run_ns: 30000,
+                pt_frames: 7
+            })
+        );
+        assert_eq!(parse_cell_line("rhizo-cell spawn_ns=x"), None);
     }
 }

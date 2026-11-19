@@ -116,13 +116,15 @@ The feedback loop, fastest first:
 | `crates/rhizo-hal` | Hardware interfaces (traits) and host test doubles | — |
 | `crates/rhizo-core` | Boot reports, boot options, device-tree reader, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
 | `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), kernel heap | `rhizo-hal` |
-| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm` |
+| `crates/rhizo-cell` | Cells as plain data, static ELF loader and initial stack, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
+| `crates/rhizo-abi` | Linux system calls of cells (both conventions), `EFAULT`/`ENOSYS` | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |
+| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; running cells (`src/cell.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi` |
+| `cells` | Test programs run as cells: `no_std` static Linux executables, expectations in `cells/expected.rs` (also checked natively on a Linux host) | — |
 | `xtask` | Developer tooling (host only) | — |
 
 Planned, created by the milestone that adds their code (not before):
-`rhizo-cell` (H2: cells, address spaces, serializable state), `rhizo-abi`
-(H2: Linux syscalls), `rhizo-sched` (H3), `rhizo-snapshot` (H4–H5: suspend,
-resume, fork, copy-on-write, templates).
+`rhizo-sched` (H3), `rhizo-snapshot` (H4–H5: suspend, resume, fork,
+copy-on-write, templates).
 
 Rules, checked by `cargo xtask check` (`xtask/src/deps.rs`): no cycles;
 `rhizo-hal` depends on nothing; only `kernel` contains platform code
@@ -133,7 +135,8 @@ tested on the host.
 
 The `arch` interface (`kernel/src/arch/mod.rs` lists it) is the only thing
 shared kernel code may use: `boot`, `platform`, `console`, `power`, `cpu`,
-`timer`, `tests`. Anything instruction-set specific (assembly, system
+`timer`, `tests`, and `user` (entering and leaving cell code; compiled only in
+builds that run cells). Anything instruction-set specific (assembly, system
 registers, ports, MMIO registers, entry encodings) goes behind it. New arch
 hooks are written for AArch64 first and must reach x86_64 in the same
 milestone. Tests that need architecture details go in `arch/<cpu>/tests.rs`.
@@ -141,7 +144,9 @@ milestone. Tests that need architecture details go in `arch/<cpu>/tests.rs`.
 Memory layout, the same on both architectures (see
 `openspec/specs/virtual-memory`):
 
-- Lower half (`0x0000_…`): empty, reserved for cells.
+- Lower half (`0x0000_…`): the running cell (image at its link address,
+  anonymous mappings from `0x0000_4000_0000_0000`, stack below
+  `0x0000_7fff_ffff_f000`); empty while no cell runs.
 - `0xffff_8000_0000_0000 + phys`: direct map of RAM (RW, NX). Access physical
   memory only through `PhysicalMemory` (kernel: `memory::DirectMap`).
 - `0xffff_ffff_8000_0000 + phys`: kernel image with W^X; the page under the

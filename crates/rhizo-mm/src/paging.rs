@@ -445,6 +445,66 @@ impl<F: EntryFormat> PageTable<F> {
         Ok((F::address(entry) & !(size.bytes() - 1), size))
     }
 
+    /// Copies the root entries of the upper (kernel) half from `kernel`, so
+    /// this hierarchy shares the kernel's mappings (x86_64 cells).
+    pub fn share_upper_half(&self, mem: &mut impl PhysicalMemory, kernel: &PageTable<F>) {
+        for i in ENTRIES / 2..ENTRIES {
+            mem.write_u64(self.root + i * 8, mem.read_u64(kernel.root + i * 8));
+        }
+    }
+
+    /// Number of table frames used by the lower (user) half, root included.
+    pub fn lower_half_tables(&self, mem: &impl PhysicalMemory) -> usize {
+        fn walk<F: EntryFormat>(
+            mem: &impl PhysicalMemory,
+            table: u64,
+            level: u32,
+            range: core::ops::Range<u64>,
+        ) -> usize {
+            range
+                .map(|i| mem.read_u64(table + i * 8))
+                .filter(|&e| F::is_valid(e) && !F::is_leaf(e, level))
+                .map(|e| 1 + walk::<F>(mem, F::address(e), level - 1, 0..ENTRIES))
+                .sum()
+        }
+        1 + walk::<F>(mem, self.root, 3, 0..ENTRIES / 2)
+    }
+
+    /// Frees everything mapped in the lower (user) half and every table frame
+    /// it used, then the root: `free(phys, size)` is called once per mapped
+    /// page and once per table frame (as `PageSize::Small`). The upper half is
+    /// left alone (it is shared with the kernel).
+    pub fn destroy_lower_half(
+        self,
+        mem: &mut impl PhysicalMemory,
+        free: &mut impl FnMut(u64, PageSize),
+    ) {
+        fn walk<F: EntryFormat>(
+            mem: &mut impl PhysicalMemory,
+            table: u64,
+            level: u32,
+            range: core::ops::Range<u64>,
+            free: &mut impl FnMut(u64, PageSize),
+        ) {
+            for i in range {
+                let entry = mem.read_u64(table + i * 8);
+                if !F::is_valid(entry) {
+                    continue;
+                }
+                if F::is_leaf(entry, level) {
+                    let size = PageSize::from_leaf_level(level);
+                    free(F::address(entry) & !(size.bytes() - 1), size);
+                } else {
+                    let next = F::address(entry);
+                    walk::<F>(mem, next, level - 1, 0..ENTRIES, free);
+                    free(next, PageSize::Small);
+                }
+            }
+        }
+        walk::<F>(mem, self.root, 3, 0..ENTRIES / 2, free);
+        free(self.root, PageSize::Small);
+    }
+
     /// Walks to the valid leaf entry for `virt`: (slot address, entry, level).
     fn leaf_slot(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<(u64, u64, u32)> {
         if !is_canonical(virt) {
@@ -730,6 +790,66 @@ mod tests {
                     }
                     // root + PDPT + PD + PT, regardless of how many pages share them.
                     assert_eq!(count, 4);
+                }
+
+                #[test]
+                fn destroying_the_lower_half_frees_every_frame_once() {
+                    let mut mem = FakePhysicalMemory::new();
+                    let mut alloc = frames();
+                    let kernel = PT::new(&mut mem, &mut alloc).unwrap();
+                    kernel
+                        .map(
+                            &mut mem,
+                            &mut alloc,
+                            0xffff_8000_0000_0000,
+                            0,
+                            PageSize::Huge,
+                            RW_NX,
+                        )
+                        .unwrap();
+                    let cell = PT::new(&mut mem, &mut alloc).unwrap();
+                    cell.share_upper_half(&mut mem, &kernel);
+                    let user = PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+                    cell.map(
+                        &mut mem,
+                        &mut alloc,
+                        0x40_0000,
+                        0x900_0000,
+                        PageSize::Small,
+                        user,
+                    )
+                    .unwrap();
+                    cell.map(
+                        &mut mem,
+                        &mut alloc,
+                        0x4000_0000_0000,
+                        0xa00_0000,
+                        PageSize::Large,
+                        user,
+                    )
+                    .unwrap();
+                    assert!(
+                        cell.translate(&mem, 0xffff_8000_0000_1000).is_some(),
+                        "kernel half shared"
+                    );
+                    // Root + three levels for the 4 KiB page + two for the 2 MiB
+                    // one; the shared kernel half does not count.
+                    assert_eq!(cell.lower_half_tables(&mem), 6);
+
+                    let mut freed = Vec::new();
+                    cell.destroy_lower_half(&mut mem, &mut |phys, size| freed.push((phys, size)));
+                    // Both user pages, every table frame of the cell, then its root.
+                    assert!(freed.contains(&(0x900_0000, PageSize::Small)));
+                    assert!(freed.contains(&(0xa00_0000, PageSize::Large)));
+                    assert_eq!(freed.last(), Some(&(cell.root(), PageSize::Small)));
+                    let mut seen = std::collections::HashSet::new();
+                    assert!(
+                        freed.iter().all(|f| seen.insert(f.0)),
+                        "nothing freed twice"
+                    );
+                    // The kernel's tables are untouched.
+                    assert!(!freed.iter().any(|&(p, _)| p == kernel.root()));
+                    assert!(kernel.translate(&mem, 0xffff_8000_0000_1000).is_some());
                 }
 
                 #[test]

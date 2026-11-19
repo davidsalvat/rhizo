@@ -4,12 +4,21 @@ use super::console::BootConsole;
 use super::power::Machine;
 use crate::memory::DirectMap;
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use rhizo_core::exception::{self, Aarch64Exception};
 use rhizo_hal::{ExitStatus, PhysicalMemory, Power, Tlb};
 
-// Sixteen vectors of 0x80 bytes in a 2 KiB-aligned table. Each records its
-// index in x3 and joins a common path that reports the exception. Exceptions
-// taken to EL1 run on SP_EL1, the dedicated exception stack.
+// Sixteen vectors of 0x80 bytes in a 2 KiB-aligned table. Exceptions taken
+// to EL1 run on SP_EL1.
+//
+// - From the kernel (vectors 0-7, and 12-15 which never happen because cells
+//   cannot run AArch32): record the index in x3 and report the exception.
+// - From a cell (vectors 8-11): SP_EL1 points at the cell's `Registers`
+//   (`enter_user` put it there), so the vector saves the user state in place,
+//   restores the kernel stacks and returns from `rhizo_enter_cell` with the
+//   vector index (design decision D3, option B).
+//
+// `Registers` layout: pc 0, sp 8, x0-x30 at 16 + 8n, tls 264, flags 272.
 core::arch::global_asm!(
     r#"
     .macro RHIZO_VECTOR n
@@ -18,11 +27,24 @@ core::arch::global_asm!(
     b       rhizo_vector_common
     .endm
 
+    .macro RHIZO_EL0_VECTOR n
+    .balign 0x80
+    stp     x0, x1, [sp, #16]
+    mov     x0, #\n
+    b       rhizo_el0_trap
+    .endm
+
     .text
     .balign 2048
     .global rhizo_vectors
 rhizo_vectors:
-    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    .irp n, 0,1,2,3,4,5,6,7
+    RHIZO_VECTOR \n
+    .endr
+    .irp n, 8,9,10,11
+    RHIZO_EL0_VECTOR \n
+    .endr
+    .irp n, 12,13,14,15
     RHIZO_VECTOR \n
     .endr
 
@@ -33,8 +55,90 @@ rhizo_vector_common:
     bl      rhizo_exception_handler
 1:  wfe
     b       1b
+
+rhizo_el0_trap:
+    stp     x2, x3, [sp, #32]
+    stp     x4, x5, [sp, #48]
+    stp     x6, x7, [sp, #64]
+    stp     x8, x9, [sp, #80]
+    stp     x10, x11, [sp, #96]
+    stp     x12, x13, [sp, #112]
+    stp     x14, x15, [sp, #128]
+    stp     x16, x17, [sp, #144]
+    stp     x18, x19, [sp, #160]
+    stp     x20, x21, [sp, #176]
+    stp     x22, x23, [sp, #192]
+    stp     x24, x25, [sp, #208]
+    stp     x26, x27, [sp, #224]
+    stp     x28, x29, [sp, #240]
+    str     x30, [sp, #256]
+    mrs     x1, elr_el1
+    mrs     x2, sp_el0
+    stp     x1, x2, [sp, #0]
+    mrs     x1, tpidr_el0
+    mrs     x2, spsr_el1
+    stp     x1, x2, [sp, #264]
+    ldr     x1, =rhizo_exception_stack_top
+    mov     sp, x1
+    msr     spsel, #0
+    ldr     x1, =rhizo_kernel_sp
+    ldr     x1, [x1]
+    mov     sp, x1
+    ldp     x19, x20, [sp, #16]
+    ldp     x21, x22, [sp, #32]
+    ldp     x23, x24, [sp, #48]
+    ldp     x25, x26, [sp, #64]
+    ldp     x27, x28, [sp, #80]
+    ldp     x29, x30, [sp], #96
+    ret
+
+    // u64 rhizo_enter_cell(Registers *regs): runs the cell until it traps.
+    .global rhizo_enter_cell
+rhizo_enter_cell:
+    stp     x29, x30, [sp, #-96]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    stp     x27, x28, [sp, #80]
+    ldr     x1, =rhizo_kernel_sp
+    mov     x2, sp
+    str     x2, [x1]
+    msr     spsel, #1
+    mov     sp, x0
+    ldp     x1, x2, [sp, #0]
+    msr     elr_el1, x1
+    msr     sp_el0, x2
+    ldp     x1, x2, [sp, #264]
+    msr     tpidr_el0, x1
+    and     x2, x2, #0xf0000000     // only NZCV: EL0t, AArch64, unmasked
+    msr     spsr_el1, x2
+    ldp     x0, x1, [sp, #16]
+    ldp     x2, x3, [sp, #32]
+    ldp     x4, x5, [sp, #48]
+    ldp     x6, x7, [sp, #64]
+    ldp     x8, x9, [sp, #80]
+    ldp     x10, x11, [sp, #96]
+    ldp     x12, x13, [sp, #112]
+    ldp     x14, x15, [sp, #128]
+    ldp     x16, x17, [sp, #144]
+    ldp     x18, x19, [sp, #160]
+    ldp     x20, x21, [sp, #176]
+    ldp     x22, x23, [sp, #192]
+    ldp     x24, x25, [sp, #208]
+    ldp     x26, x27, [sp, #224]
+    ldp     x28, x29, [sp, #240]
+    ldr     x30, [sp, #256]
+    eret
+
+    .ltorg
     "#
 );
+
+/// Lower-half table loaded in `TTBR0_EL1`: the empty one, or a cell's
+/// (managed by [`super::user`]).
+pub(super) static USER_ROOT: AtomicU64 = AtomicU64::new(0);
+pub(super) static EMPTY_ROOT: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 extern "C" fn rhizo_exception_handler(esr: u64, far: u64, elr: u64, _vector: u64) -> ! {
@@ -68,6 +172,8 @@ pub fn supports_1gib_pages() -> bool {
 pub unsafe fn activate(root: u64, alloc: &mut impl FnMut() -> Option<u64>) {
     let empty = alloc().expect("a frame for the empty lower-half table");
     DirectMap.zero_frame(empty);
+    EMPTY_ROOT.store(empty, Ordering::Relaxed);
+    USER_ROOT.store(empty, Ordering::Relaxed);
     // SAFETY: guaranteed by the caller; the barriers make the table writes
     // visible to the walker before the switch and drop stale translations.
     unsafe {

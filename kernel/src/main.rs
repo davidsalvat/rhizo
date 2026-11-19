@@ -10,6 +10,8 @@
 extern crate alloc;
 
 mod arch;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod cell;
 mod heap;
 mod memory;
 mod sync;
@@ -56,6 +58,9 @@ pub extern "C" fn kernel_main(boot_arg: u64, entry_cycles: u64) -> ! {
 
     #[cfg(feature = "ktest")]
     let status = rhizo_core::ktest::run(&mut console, &[tests::ALL, arch::tests::ALL]);
+
+    #[cfg(feature = "bench-cell")]
+    cell::bench(&mut console);
 
     #[cfg(not(feature = "ktest"))]
     let status = {

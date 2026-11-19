@@ -14,7 +14,19 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
     ("rhizo-hal", &[]),
     ("rhizo-core", &["rhizo-hal"]),
     ("rhizo-mm", &["rhizo-hal"]),
-    ("rhizo-kernel", &["rhizo-hal", "rhizo-core", "rhizo-mm"]),
+    ("rhizo-cell", &["rhizo-hal", "rhizo-mm"]),
+    ("rhizo-abi", &["rhizo-hal", "rhizo-mm", "rhizo-cell"]),
+    (
+        "rhizo-kernel",
+        &[
+            "rhizo-hal",
+            "rhizo-core",
+            "rhizo-mm",
+            "rhizo-cell",
+            "rhizo-abi",
+        ],
+    ),
+    ("rhizo-cells", &[]),
     ("xtask", &[]),
 ];
 
@@ -145,9 +157,9 @@ mod tests {
 
     #[test]
     fn unknown_crate_must_be_added_to_the_table() {
-        let v = violations(&strings(&["rhizo-cell"]), &[]);
+        let v = violations(&strings(&["rhizo-unlisted"]), &[]);
         assert_eq!(v.len(), 1);
-        assert!(v[0].what.contains("rhizo-cell"));
+        assert!(v[0].what.contains("rhizo-unlisted"));
     }
 
     #[test]

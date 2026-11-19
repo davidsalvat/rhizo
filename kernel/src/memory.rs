@@ -167,7 +167,8 @@ fn build_kernel_tables(
     Ok(pt)
 }
 
-fn kernel_tables() -> PageTable<Format> {
+/// The kernel's page tables.
+pub fn kernel_tables() -> PageTable<Format> {
     let root = KERNEL_ROOT.load(Ordering::Acquire);
     assert!(root != 0, "memory not initialized");
     PageTable::from_root(root)

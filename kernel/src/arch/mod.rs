@@ -8,6 +8,8 @@
 //! - `console`: `init`, `BootConsole`; `power`: `init`, `Machine`
 //! - `cpu`: `init`, `supports_1gib_pages`, `activate`, `CpuTlb`
 //! - `timer`: `Counter`, `cycles_to_ns`
+//! - `user` (cell builds only): `enter_user`, `Trap`, `release_user`,
+//!   `sync_code`; `platform::{MACHINE, ABI, CELL_ROOT_HAS_KERNEL_HALF}`
 //! - `tests::ALL` (in-kernel tests specific to the architecture)
 
 #[cfg(target_arch = "aarch64")]

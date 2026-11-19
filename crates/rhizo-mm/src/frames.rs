@@ -109,6 +109,27 @@ impl<'a> FrameAllocator<'a> {
         Some(start as u64 * FRAME_SIZE)
     }
 
+    /// Allocates 512 contiguous frames aligned to 2 MiB (one large page) and
+    /// returns the address of the first. Each candidate block is eight whole
+    /// bitmap words, so the search compares words, not bits.
+    pub fn alloc_large(&mut self) -> Option<u64> {
+        const WORDS: usize = (crate::LARGE_PAGE_SIZE / FRAME_SIZE) as usize / BITS;
+        let blocks = self.frames / (WORDS * BITS);
+        if blocks == 0 || self.free < WORDS * BITS {
+            return None;
+        }
+        let start = (self.hint / (WORDS * BITS)).min(blocks);
+        let block = (start..blocks).chain(0..start).find(|&b| {
+            self.bitmap[b * WORDS..(b + 1) * WORDS]
+                .iter()
+                .all(|&w| w == u64::MAX)
+        })?;
+        self.bitmap[block * WORDS..(block + 1) * WORDS].fill(0);
+        self.free -= WORDS * BITS;
+        self.hint = (block + 1) * WORDS * BITS;
+        Some((block * WORDS * BITS) as u64 * FRAME_SIZE)
+    }
+
     /// Frees one frame previously returned by [`alloc`](Self::alloc).
     ///
     /// # Panics
@@ -274,6 +295,24 @@ mod tests {
         assert_eq!(fa.alloc_contiguous(200), None);
         fa.free_contiguous(run, 4);
         assert!(!fa.is_allocated(run));
+    }
+
+    #[test]
+    fn large_blocks_are_aligned_whole_and_freed_as_runs() {
+        let mut bits = [0u64; 64]; // 16 MiB
+        let mut fa = allocator(&mut bits, 4096);
+        fa.add_free_region(MIB, 7 * MIB); // whole 2 MiB blocks: [2, 4) and [4, 6)
+        fa.reserve(4 * MIB + 5 * FRAME_SIZE, 4 * MIB + 6 * FRAME_SIZE);
+        let free = fa.free_frames();
+        let a = fa.alloc_large().unwrap();
+        assert_eq!(a, 2 * MIB, "[4, 6) has a reserved frame");
+        assert_eq!(fa.free_frames(), free - 512);
+        assert_eq!(fa.alloc_large(), None);
+        // Single frames still come from the partial blocks around it.
+        let one = fa.alloc().unwrap();
+        assert!(!(2 * MIB..4 * MIB).contains(&one));
+        fa.free_contiguous(a, 512);
+        assert_eq!(fa.alloc_large(), Some(2 * MIB));
     }
 
     #[test]
