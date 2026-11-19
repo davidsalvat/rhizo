@@ -41,3 +41,16 @@ A frozen cell SHALL not run, and spawning from it SHALL fork it.
 #### Scenario: Spawn from template
 - **WHEN** a cell is spawned from a template of the `hello` program
 - **THEN** it prints the same output as a cell spawned from the executable
+
+### Requirement: Files are forked copy-on-write
+A forked cell SHALL start with its parent's files, descriptors and working
+directory; afterwards each SHALL see only its own changes, and a fork SHALL
+NOT copy file contents.
+
+#### Scenario: Diverging files
+- **WHEN** a parent and its child each write different contents to the same file after a fork
+- **THEN** each reads its own contents
+
+#### Scenario: Template files
+- **WHEN** cells are spawned from a template that has files
+- **THEN** each starts with those files
