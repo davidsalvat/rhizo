@@ -21,6 +21,8 @@ fn cell<F: EntryFormat>(mem: &mut FakePhysicalMemory, frames: &mut CountingFrame
     let mut c = Cell::new(9, pt.root(), 0x40_0123, 0x7fff_0000, 0x61_0000);
     c.regs.gpr[30] = 0xfeed;
     c.regs.tls = 0x1234;
+    c.regs.fp.0[5] = 0x4009_21fb_5444_2d18; // pi, in V2 / XMM
+    c.regs.fp.0[65] = 0x10; // FPSR
     c.mmap_next = 0x4000_0020_0000;
     c
 }
@@ -89,8 +91,8 @@ fn rejects_what_it_cannot_resume() {
     b[0] = b'X';
     check(b, FormatError::BadMagic);
     let mut b = good.clone();
-    b[8] = 2;
-    check(b, FormatError::Version(2));
+    b[8] = (VERSION + 1) as u8; // a later format
+    check(b, FormatError::Version(VERSION + 1));
     assert_eq!(
         Snapshot::from_bytes(good.clone(), Machine::X86_64),
         Err(FormatError::Machine {

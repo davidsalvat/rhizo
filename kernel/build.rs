@@ -20,18 +20,23 @@ fn main() {
 fn embed_cells() {
     println!("cargo:rerun-if-env-changed=RHIZO_CELLS_DIR");
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
-    let bins = Path::new(&manifest).join("../cells/src/bin");
-    println!("cargo:rerun-if-changed={}", bins.display());
-    let mut names: Vec<String> = std::fs::read_dir(&bins)
-        .expect("cells/src/bin exists")
-        .filter_map(|e| {
-            e.ok()?
-                .file_name()
-                .to_str()?
-                .strip_suffix(".rs")
-                .map(String::from)
-        })
-        .collect();
+    // Rust cells (cells/src/bin/*.rs) and C cells (cells/c/*.c).
+    let mut names: Vec<String> = Vec::new();
+    for (dir, suffix) in [("../cells/src/bin", ".rs"), ("../cells/c", ".c")] {
+        let dir = Path::new(&manifest).join(dir);
+        println!("cargo:rerun-if-changed={}", dir.display());
+        names.extend(
+            std::fs::read_dir(&dir)
+                .expect("cells directory exists")
+                .filter_map(|e| {
+                    e.ok()?
+                        .file_name()
+                        .to_str()?
+                        .strip_suffix(suffix)
+                        .map(String::from)
+                }),
+        );
+    }
     names.sort();
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");

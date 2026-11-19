@@ -742,14 +742,80 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     cargo(&[
         "build",
         "-p",
-        "rhizo-cells",
+        CELLS_PACKAGE,
         "--target",
         target,
         "--release",
         "--target-dir",
         &dir_str,
     ])?;
-    Ok(dir.join(target).join("release"))
+    let out = dir.join(target).join("release");
+    build_c_cells(&out)?;
+    Ok(out)
+}
+
+/// C compiler producing static Linux executables for the selected
+/// architecture: the native one when the host matches, else the cross gcc.
+fn c_compiler() -> &'static str {
+    match (arch::current(), env::consts::ARCH) {
+        (arch::Arch::Aarch64, "aarch64") | (arch::Arch::X86_64, "x86_64") => "cc",
+        (arch::Arch::Aarch64, _) => "aarch64-linux-gnu-gcc",
+        (arch::Arch::X86_64, _) => "x86_64-linux-gnu-gcc",
+    }
+}
+
+/// Builds `cells/c/*.c`: real C programs linked statically with the system
+/// glibc (the real libc of H6), next to the Rust cells.
+fn build_c_cells(out: &Path) -> Result {
+    let src = workspace_root().join("cells").join("c");
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(&src)
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "c"))
+        .collect();
+    sources.sort();
+    let cc = c_compiler();
+    for source in sources {
+        let name = source
+            .file_stem()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        let target = out.join(&name);
+        let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if modified(&target).is_some() && modified(&target) >= modified(&source) {
+            continue;
+        }
+        let command = format!(
+            "{cc} -static -O2 -o {} {}",
+            target.display(),
+            source.display()
+        );
+        let status = Command::new(cc)
+            .args(["-static", "-O2", "-o"])
+            .arg(&target)
+            .arg(&source)
+            .status();
+        if !matches!(&status, Ok(s) if s.success()) {
+            return Err(
+                Failure::new("build", format!("cannot compile the C cell `{name}`"))
+                    .location(source.display().to_string())
+                    .expected("a static executable")
+                    .actual(match status {
+                        Ok(s) => s.to_string(),
+                        Err(e) => e.to_string(),
+                    })
+                    .hint(format!(
+                        "C cells need `{cc}` and a static libc (Debian/Ubuntu: `gcc` and \
+                         `libc6-dev`, or `gcc-aarch64-linux-gnu` / `gcc-x86-64-linux-gnu` to \
+                         cross-compile)"
+                    ))
+                    .reproduce(command)
+                    .into_error(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The linked kernel ELF (with symbols) for the selected architecture.
