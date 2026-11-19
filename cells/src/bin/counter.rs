@@ -30,7 +30,7 @@ fn main() -> i32 {
     let mut stack = [0u64; 64];
     let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
     for step in 0..STEPS {
-        for i in 0..64 {
+        for (i, slot) in stack.iter_mut().enumerate() {
             // SAFETY: the heap has 1024 words and the mapping BIG / 8; every
             // index stays inside them.
             unsafe {
@@ -39,8 +39,8 @@ fn main() -> i32 {
                 let v = digest ^ (step << 32 | i as u64);
                 h.write_volatile(h.read_volatile().wrapping_add(v));
                 b.write_volatile(b.read_volatile() ^ v.rotate_left(i as u32));
-                stack[i] = stack[i].wrapping_mul(31) ^ h.read_volatile() ^ b.read_volatile();
-                digest = (digest ^ stack[i]).wrapping_mul(0x100_0000_01b3);
+                *slot = slot.wrapping_mul(31) ^ h.read_volatile() ^ b.read_volatile();
+                digest = (digest ^ *slot).wrapping_mul(0x100_0000_01b3);
             }
         }
         if step % 8 == 7 {

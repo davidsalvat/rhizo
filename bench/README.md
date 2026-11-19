@@ -29,6 +29,11 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.run_us/rhizo/<vmm>` | timing | Median time from spawn to the cell's exit and teardown (every frame returned) |
 | `cell.pt_frames` | deterministic | Page-table frames of the `hello` cell's own half |
 | `cell.switch_ns/rhizo/<vmm>` | timing | Time per switch between two cells yielding to each other (system call in, scheduler, system call out), with address-space tags (ASID/PCID) |
+| `cell.suspend_us/rhizo/<vmm>` | timing | Suspending the `ballast` cell (8 MiB written) into a snapshot, all its memory freed |
+| `cell.resume_us/rhizo/<vmm>` | timing | Lazy resume of that snapshot until the cell can run (pages come back on first touch) |
+| `cell.resume_eager_us/rhizo/<vmm>` | timing | Eager resume: every page restored before the cell runs (the baseline lazy resume is measured against) |
+| `cell.resume_touch_us/rhizo/<vmm>` | timing | Lazy resume plus the cell reading every page and exiting |
+| `cell.snapshot_bytes` | deterministic | Size of that snapshot |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 
 Each timing is the median (and p90) of `--runs` boots after one discarded

@@ -7,5 +7,5 @@ A suspended cell SHALL hold no frames, page tables or address-space tag; its
 whole state SHALL be its snapshot.
 
 #### Scenario: Many suspended cells
-- **WHEN** more cells are suspended than could be live at once with their memory
-- **THEN** each can still be resumed and run to completion
+- **WHEN** 32 cells are suspended
+- **THEN** no cell is live (no page table, frame or tag is held) and each snapshot can be resumed and run to completion

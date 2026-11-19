@@ -118,13 +118,14 @@ The feedback loop, fastest first:
 | `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), kernel heap | `rhizo-hal` |
 | `crates/rhizo-cell` | Cells as plain data, static ELF loader and initial stack, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
 | `crates/rhizo-abi` | Linux system calls of cells (both conventions), `EFAULT`/`ENOSYS`, scheduling outcomes (yield, sleep, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |
+| `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |
 | `crates/rhizo-sched` | Run queue, sleep list and time slice (time passed in, never read); address-space tag pool | — |
-| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop (`src/cell.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched` |
+| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop (`src/cell.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot` |
 | `cells` | Test programs run as cells: `no_std` static Linux executables, expectations in `cells/expected.rs` (also checked natively on a Linux host) | — |
 | `xtask` | Developer tooling (host only) | — |
 
-Planned, created by the milestone that adds their code (not before):
-`rhizo-snapshot` (H4–H5: suspend, resume, fork, copy-on-write, templates).
+Planned crates are created by the milestone that adds their code, not
+before.
 
 Rules, checked by `cargo xtask check` (`xtask/src/deps.rs`): no cycles;
 `rhizo-hal` depends on nothing; only `kernel` contains platform code
