@@ -62,7 +62,7 @@ measure with KVM today (the ARM64 runners do not expose it), and the sandboxes
 Rhizo is compared with (Agent Substrate, Firecracker, E2B) run mostly on
 x86_64. Shared code is written once; only the thin `arch/` layer exists twice,
 and every spec is tested on both. The trade-offs are in
-[`openspec/changes/archive/*switch-to-arm64*/design.md`](openspec/changes/archive/).
+[`design.md` of the switch-to-arm64 change](openspec/changes/archive/2026-11-19-switch-to-arm64/design.md).
 
 ## Thesis
 
@@ -115,7 +115,7 @@ numbers (see [Benchmarks](#benchmarks)).
 | H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | — | Done |
 | H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | Word-level frame bitmap, zero-cost init | Done |
 | H1.5 | Fast boot and benchmarks: microvm, Firecracker, Cloud Hypervisor, fast console, release profile, CI gates | 1 GiB direct-map pages (`memory.kernel_pt_frames`, `boot.kernel_cycles`) | Done |
-| H1.6 | AArch64 as primary architecture (QEMU `virt`, Firecracker, Cloud Hypervisor), x86_64 kept as second | 1 GiB blocks for the direct map; broadcast TLB invalidation | In progress |
+| H1.6 | AArch64 as primary architecture (QEMU `virt`, Firecracker, Cloud Hypervisor), x86_64 kept as second | 1 GiB blocks for the direct map; broadcast TLB invalidation | Done |
 | H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | 2 MiB pages for cell memory where possible (`cell.spawn_us`, `cell.pt_frames`) | — |
 | H3 | Multiple cells, scheduler, isolation tests | ASIDs (PCID on x86_64): no TLB flush when switching cells (`cell.switch_ns`) | — |
 | H4 | Suspend / resume with snapshot-equivalence tests | Lazy restore: snapshot pages mapped on first touch, an in-kernel analogue of Firecracker + `userfaultfd` (`cell.resume_us`, `cell.resume_touch_us`) | — |

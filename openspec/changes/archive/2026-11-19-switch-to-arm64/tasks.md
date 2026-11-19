@@ -18,11 +18,11 @@
 
 - [x] 3.1 `xtask --arch` (default `aarch64`), ELF to flat Image, QEMU `virt`, per-architecture VMM command lines, self-check expectations and tool downloads; refuse unpinned downloads unless allowed; verify `cargo xtask test` for both architectures
 - [x] 3.2 arm64 reference guest (hand-assembled `/init`, Firecracker's arm64 CI kernel, measured on Firecracker only); verify unit tests decode the `adr`/`mov` encodings
-- [ ] 3.3 CI: AArch64 job on `ubuntu-24.04-arm` (emulated, reports whether `/dev/kvm` exists), x86_64 jobs run with `--arch x86_64`; verify both pass on the pull request
+- [x] 3.3 CI: AArch64 job on `ubuntu-24.04-arm` (emulated, reports whether `/dev/kvm` exists), x86_64 jobs run with `--arch x86_64`; verify both pass on the pull request
 
 ## 4. Documentation
 
-- [ ] 4.1 README: why ARM64, architecture decision, getting started on both architectures, roadmap; AGENTS.md: commands, `arch` interface, layout; CONTRIBUTING.md: prerequisites; bench/README.md: ARM64 dedicated hardware and known issues; verify `cargo xtask check`
+- [x] 4.1 README: why ARM64, architecture decision, getting started on both architectures, roadmap; AGENTS.md: commands, `arch` interface, layout; CONTRIBUTING.md: prerequisites; bench/README.md: ARM64 dedicated hardware and known issues; verify `cargo xtask check`
 
 ## Workflow follow-up
 
