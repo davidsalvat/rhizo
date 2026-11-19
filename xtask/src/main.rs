@@ -5,14 +5,17 @@
 //! and the reference guest are downloaded on demand.
 
 mod bench;
+mod deps;
 mod refguest;
+mod report;
 mod tools;
 mod vmm;
 
+use report::Failure;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vmm::{Accel, Guest, RunOptions, VmResult, VmRun, Vmm};
 
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -25,6 +28,8 @@ const HELP: &str = "\
 Usage: cargo xtask <command> [options]
 
 Commands:
+  check                      Fast loop (seconds, no VM): fmt, clippy, host
+                             tests, crate dependency rules
   build [--release]          Build the kernel image
   run [options]              Build and boot the kernel, console on stdout,
                              then report the time to ready
@@ -34,9 +39,11 @@ Commands:
       --machine <microvm|q35>  Shorthand for the QEMU VMMs
       --accel <auto|kvm|tcg> QEMU acceleration (default auto: KVM if usable)
       --gdb                  QEMU only: wait for a debugger on localhost:1234
-  test [--vmm <name>] [--accel <a>]
+  test [--vmm <name>] [--accel <a>] [--only <step>]
                              Host tests, boot check, in-kernel tests and
-                             harness self-checks
+                             harness self-checks; --only runs one step:
+                             host, boot, ktest or a self-check name
+                             (e.g. ktest-page-fault)
   bench [options]            Release-build boot benchmarks on every VMM
       --runs <n>             Boots per VMM (default 20)
       --vmm <a,b,...>        Restrict the VMMs
@@ -48,7 +55,13 @@ Commands:
       --readme               Regenerate the README benchmark section
       --no-reference         Skip the reference Linux guest
   ci                         Everything CI runs: fmt, clippy, test
+  mutants                    Mutation testing of rhizo-mm and rhizo-core
+                             (needs cargo-mutants; slow, runs weekly in CI)
   help                       Show this message
+
+Global options:
+  --json                     One JSON object per line on stdout (step,
+                             failure, data, summary); other output on stderr
 
 Environment:
   RHIZO_TEST_TIMEOUT         Seconds before a test VM is killed (default 30)
@@ -58,9 +71,12 @@ Environment:
 ";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    report::set_json(args.iter().any(|a| a == "--json"));
+    args.retain(|a| a != "--json");
     let rest = args.get(1..).unwrap_or_default();
     let result = match args.first().map(String::as_str) {
+        Some("check") => cmd_check(),
         Some("build") => {
             build_kernel(Profile::from_args(rest), &[]).map(|path| println!("{}", path.display()))
         }
@@ -68,6 +84,7 @@ fn main() -> ExitCode {
         Some("test") => RunArgs::parse(rest).and_then(|a| cmd_test(&a)),
         Some("bench") => bench::Options::parse(rest).and_then(|o| bench::cmd(&o)),
         Some("ci") => cmd_ci(),
+        Some("mutants") => cmd_mutants(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{HELP}");
             Ok(())
@@ -75,9 +92,16 @@ fn main() -> ExitCode {
         Some(other) => Err(format!("unknown command `{other}`\n\n{HELP}")),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            report::summary(true, "all checks passed");
+            ExitCode::SUCCESS
+        }
         Err(message) => {
-            eprintln!("error: {message}");
+            if report::json() {
+                report::summary(false, &message);
+            } else {
+                eprintln!("\n{message}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -119,6 +143,8 @@ struct RunArgs {
     vmm: Vmm,
     accel: Accel,
     gdb: bool,
+    /// Run only this step of `test`.
+    only: Option<String>,
 }
 
 impl RunArgs {
@@ -128,6 +154,7 @@ impl RunArgs {
             vmm: Vmm::QemuMicrovm,
             accel: Accel::Auto,
             gdb: false,
+            only: None,
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -148,6 +175,16 @@ impl RunArgs {
                     }
                 }
                 "--accel" => parsed.accel = Accel::parse(&value("--accel")?)?,
+                "--only" => {
+                    let step = value("--only")?;
+                    if !test_steps().contains(&step.as_str()) {
+                        return Err(format!(
+                            "unknown step `{step}`; expected one of: {}",
+                            test_steps().join(", ")
+                        ));
+                    }
+                    parsed.only = Some(step);
+                }
                 other => return Err(format!("unknown option `{other}`")),
             }
         }
@@ -155,6 +192,19 @@ impl RunArgs {
             return Err("--gdb is only supported on the QEMU VMMs".into());
         }
         Ok(parsed)
+    }
+
+    fn wants(&self, step: &str) -> bool {
+        self.only.as_deref().is_none_or(|only| only == step)
+    }
+
+    /// Command that reruns `step` with the same VMM.
+    fn reproduce(&self, step: &str) -> String {
+        let mut cmd = format!("cargo xtask test --only {step}");
+        if self.vmm != Vmm::QemuMicrovm {
+            cmd += &format!(" --vmm {}", self.vmm.id());
+        }
+        cmd
     }
 
     fn run_options(&self, timeout: Duration) -> RunOptions {
@@ -171,7 +221,7 @@ impl RunArgs {
 fn cmd_run(args: &RunArgs) -> Result {
     let kernel = build_kernel(args.profile, &[])?;
     if args.gdb {
-        println!("QEMU is waiting for gdb on localhost:1234");
+        report::text("QEMU is waiting for gdb on localhost:1234");
     }
     let timeout = if args.gdb {
         Duration::from_secs(24 * 3600)
@@ -180,73 +230,115 @@ fn cmd_run(args: &RunArgs) -> Result {
     };
     let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), args.run_options(timeout))?;
     report_timing(args.vmm, &run);
-    match run.result {
-        VmResult::Passed => Ok(()),
-        other => Err(format!(
-            "kernel run on {} ended with {other:?}",
-            args.vmm.id()
-        )),
+    let mut cmd = format!("cargo xtask run --vmm {}", args.vmm.id());
+    if args.profile == Profile::Release {
+        cmd += " --release";
     }
+    check_vm(
+        run.result == VmResult::Passed,
+        VmCheck {
+            kind: "boot",
+            what: format!("kernel run on {} must succeed", args.vmm.id()),
+            expected: "Passed".into(),
+            reproduce: cmd,
+        },
+        &run,
+    )
 }
 
 /// Prints the host-measured time to ready and the kernel's own cycle count.
 fn report_timing(vmm: Vmm, run: &VmRun) {
     match run.time_to_ready {
-        Some(t) => println!(
-            "[xtask] {}: time to ready {:.2} ms (host), {} kernel cycles",
-            vmm.id(),
-            t.as_secs_f64() * 1000.0,
-            run.ready_cycles
-                .map_or_else(|| "unknown".to_string(), |c| c.to_string())
-        ),
-        None => println!("[xtask] {}: the ready marker never arrived", vmm.id()),
+        Some(t) => {
+            report::text(&format!(
+                "[xtask] {}: time to ready {:.2} ms (host), {} kernel cycles",
+                vmm.id(),
+                t.as_secs_f64() * 1000.0,
+                run.ready_cycles
+                    .map_or_else(|| "unknown".to_string(), |c| c.to_string())
+            ));
+            report::data(
+                "timing",
+                &serde_json::json!({
+                    "vmm": vmm.id(),
+                    "time_to_ready_ms": t.as_secs_f64() * 1000.0,
+                    "kernel_cycles": run.ready_cycles,
+                }),
+            );
+        }
+        None => report::text(&format!(
+            "[xtask] {}: the ready marker never arrived",
+            vmm.id()
+        )),
     }
 }
 
+/// Names accepted by `test --only`.
+fn test_steps() -> Vec<&'static str> {
+    let mut steps = vec!["host", "boot", "ktest"];
+    steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
+    steps
+}
+
 fn cmd_test(args: &RunArgs) -> Result {
-    step("host tests");
-    cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
+    if args.wants("host") {
+        step("host tests");
+        cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
+    }
 
     let timeout = test_timeout()?;
     let opts = args.run_options(timeout);
 
-    step(&format!("boot check on {}", args.vmm.id()));
-    let kernel = build_kernel(Profile::Debug, &[])?;
-    let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
-    report_timing(args.vmm, &run);
-    expect(
-        run.result == VmResult::Passed,
-        "boot must exit successfully",
-        &run,
-    )?;
-    for needle in [
-        "Rhizo ",
-        "\nmemory: ",
-        "\nrhizo-ready cycles=",
-        "boot complete",
-    ] {
-        expect(
-            run.output.contains(needle),
-            &format!("boot output must contain `{}`", needle.trim()),
+    if args.wants("boot") {
+        step(&format!("boot check on {}", args.vmm.id()));
+        let kernel = build_kernel(Profile::Debug, &[])?;
+        let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
+        report_timing(args.vmm, &run);
+        let check = |what: &str, expected: &str| VmCheck {
+            kind: "boot",
+            what: what.into(),
+            expected: expected.into(),
+            reproduce: args.reproduce("boot"),
+        };
+        check_vm(
+            run.result == VmResult::Passed,
+            check("boot must exit successfully", "Passed"),
+            &run,
+        )?;
+        for needle in [
+            "Rhizo ",
+            "\nmemory: ",
+            "\nrhizo-ready cycles=",
+            "boot complete",
+        ] {
+            check_vm(
+                run.output.contains(needle),
+                check(
+                    &format!("boot output must contain `{}`", needle.trim()),
+                    &format!("a line containing `{}`", needle.trim()),
+                ),
+                &run,
+            )?;
+        }
+    }
+
+    if args.wants("ktest") {
+        step("in-kernel tests");
+        let kernel = build_kernel(Profile::Debug, &["ktest"])?;
+        let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
+        check_vm(
+            run.result == VmResult::Passed && run.output.contains("test result: ok."),
+            VmCheck {
+                kind: "ktest",
+                what: "in-kernel tests must pass".into(),
+                expected: "Passed with `test result: ok.`".into(),
+                reproduce: args.reproduce("ktest"),
+            },
             &run,
         )?;
     }
 
-    step("in-kernel tests");
-    let kernel = build_kernel(Profile::Debug, &["ktest"])?;
-    let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
-    expect(
-        run.result == VmResult::Passed,
-        "in-kernel tests must pass",
-        &run,
-    )?;
-    expect(
-        run.output.contains("test result: ok."),
-        "in-kernel tests must report their result",
-        &run,
-    )?;
-
-    for check in SELF_CHECKS {
+    for check in SELF_CHECKS.iter().filter(|c| args.wants(c.feature)) {
         step(&format!("self-check: {}", check.description));
         let kernel = build_kernel(Profile::Debug, &[check.feature])?;
         let limit = check
@@ -261,21 +353,110 @@ fn cmd_test(args: &RunArgs) -> Result {
                 ..opts
             },
         )?;
-        expect(
+        let vm_check = |what: String, expected: String| VmCheck {
+            kind: "self-check",
+            what,
+            expected,
+            reproduce: args.reproduce(check.feature),
+        };
+        check_vm(
             run.result == check.expected,
-            &format!("{} must end with {:?}", check.feature, check.expected),
+            vm_check(
+                format!("{} must end with {:?}", check.feature, check.expected),
+                format!("{:?}", check.expected),
+            ),
             &run,
         )?;
         for needle in check.output {
-            expect(
+            check_vm(
                 run.output.contains(needle),
-                &format!("{} output must contain `{needle}`", check.feature),
+                vm_check(
+                    format!("{} output must contain `{needle}`", check.feature),
+                    format!("output containing `{needle}`"),
+                ),
                 &run,
             )?;
         }
     }
+    Ok(())
+}
 
-    println!("\nall checks passed");
+/// Mutation testing: every surviving mutant is a change no test notices.
+fn cmd_mutants() -> Result {
+    step("mutation testing (rhizo-mm, rhizo-core)");
+    let status = Command::new("cargo")
+        .args([
+            "mutants",
+            "--package",
+            "rhizo-mm",
+            "--package",
+            "rhizo-core",
+            "--timeout",
+            "120",
+        ])
+        .current_dir(workspace_root())
+        .stdout(report::child_stdout())
+        .status()
+        .map_err(|e| {
+            Failure::new("tool", format!("cannot run cargo-mutants: {e}"))
+                .hint("install it with `cargo install --locked cargo-mutants`")
+                .reproduce("cargo xtask mutants")
+                .into_error()
+        })?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "mutants",
+        "some mutants survived: tests did not detect these changes",
+    )
+    .location("mutants.out/missed.txt")
+    .expected("every mutant caught by a test")
+    .actual(status.to_string())
+    .hint("for each missed mutant, add a test that fails on that change (do not weaken the code)")
+    .reproduce("cargo xtask mutants")
+    .into_error())
+}
+
+/// The fast loop: no VM, no release build.
+fn cmd_check() -> Result {
+    let started = Instant::now();
+    step("format");
+    cargo(&["fmt", "--all", "--check"])?;
+    step("clippy (host crates)");
+    cargo(&[
+        "clippy",
+        "--workspace",
+        "--exclude",
+        KERNEL_PACKAGE,
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    step("clippy (kernel)");
+    cargo(&[
+        "clippy",
+        "-p",
+        KERNEL_PACKAGE,
+        "--target",
+        KERNEL_TARGET,
+        "--features",
+        "ktest",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    step("host tests");
+    cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
+    step("crate dependency rules");
+    deps::check()?;
+    let secs = started.elapsed().as_secs_f64();
+    report::text(&format!("[xtask] check took {secs:.1} s"));
+    report::data(
+        "duration",
+        &serde_json::json!({"command": "check", "seconds": secs}),
+    );
     Ok(())
 }
 
@@ -309,6 +490,9 @@ fn cmd_ci() -> Result {
         cargo(&args)?;
     }
 
+    step("crate dependency rules");
+    deps::check()?;
+
     cmd_test(&RunArgs::parse(&[])?)?;
 
     step("boot check on qemu-q35");
@@ -320,9 +504,14 @@ fn cmd_ci() -> Result {
         q35.run_options(test_timeout()?),
     )?;
     report_timing(Vmm::QemuQ35, &run);
-    expect(
+    check_vm(
         run.result == VmResult::Passed,
-        "q35 boot must exit successfully",
+        VmCheck {
+            kind: "boot",
+            what: "q35 boot must exit successfully".into(),
+            expected: "Passed".into(),
+            reproduce: "cargo xtask test --only boot --vmm qemu-q35".into(),
+        },
         &run,
     )
 }
@@ -417,13 +606,36 @@ fn cargo(args: &[&str]) -> Result {
     let status = Command::new(&cargo)
         .args(args)
         .current_dir(workspace_root())
+        .stdout(report::child_stdout())
         .status()
         .map_err(|e| format!("failed to run cargo: {e}"))?;
     if status.success() {
-        Ok(())
-    } else {
-        Err(format!("`cargo {}` failed", args.join(" ")))
+        return Ok(());
     }
+    let command = format!("cargo {}", args.join(" "));
+    let (kind, hint) = match args.first().copied() {
+        Some("fmt") => ("fmt", "run `cargo fmt --all` to apply the formatting"),
+        Some("clippy") => (
+            "clippy",
+            "fix each lint at the file:line clippy printed above; do not silence it without a reason",
+        ),
+        Some("test") => (
+            "host-test",
+            "the output above names the failing test, its file:line and left/right values; \
+             fix the code, not the test, unless the spec changed",
+        ),
+        _ => (
+            "build",
+            "the compiler output above shows the error and its file:line",
+        ),
+    };
+    Err(Failure::new(kind, format!("`{command}` failed"))
+        .location(&command)
+        .expected("exit status 0")
+        .actual(status.to_string())
+        .hint(hint)
+        .reproduce(&command)
+        .into_error())
 }
 
 pub(crate) fn workspace_root() -> PathBuf {
@@ -460,15 +672,52 @@ fn parse_timeout(value: &str) -> Result<Duration> {
 // ---------------------------------------------------------------------------
 
 fn step(name: &str) {
-    println!("\n==> {name}");
+    report::step(name);
 }
 
-fn expect(condition: bool, what: &str, run: &VmRun) -> Result {
-    if condition {
-        Ok(())
-    } else {
-        Err(format!("{what} (VM result: {:?})", run.result))
+/// A check on the outcome of a VM run.
+struct VmCheck {
+    kind: &'static str,
+    what: String,
+    expected: String,
+    reproduce: String,
+}
+
+/// Turns a failed VM check into an actionable failure report.
+fn check_vm(ok: bool, check: VmCheck, run: &VmRun) -> Result {
+    if ok {
+        return Ok(());
     }
+    let mut failure = Failure::new(check.kind, check.what)
+        .expected(check.expected)
+        .reproduce(check.reproduce);
+    let mut actual = format!("{:?}", run.result);
+    if let Some((location, message)) = report::panic_location(&run.output) {
+        failure = failure.location(location).hint(
+            "the kernel panicked at that location; read the assertion message and fix the \
+             code it checks",
+        );
+        actual += &format!(", panic: {message}");
+    } else if let Some((summary, rip)) = report::exception_location(&run.output) {
+        failure = failure.location(format!("rip {rip}")).hint(format!(
+            "map the address to source with: addr2line -f -e {} {rip}",
+            target_dir()
+                .join(KERNEL_TARGET)
+                .join("debug")
+                .join(KERNEL_PACKAGE)
+                .display()
+        ));
+        actual += &format!(", exception: {summary}");
+    } else if run.output.trim().is_empty() {
+        failure = failure.hint(
+            "the VMM produced no console output: check that it is installed and see the exact \
+             command with RHIZO_PRINT_VMM_COMMAND=1",
+        );
+    } else if run.result == VmResult::TimedOut {
+        failure =
+            failure.hint("the kernel stopped making progress; the last console line shows where");
+    }
+    Err(failure.actual(actual).into_error())
 }
 
 #[cfg(test)]
@@ -479,6 +728,14 @@ mod tests {
     fn run_args_parse_vmm_machine_and_accel() {
         let parse =
             |a: &[&str]| RunArgs::parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parse(&["--only", "ktest-page-fault"])
+                .unwrap()
+                .only
+                .as_deref(),
+            Some("ktest-page-fault")
+        );
+        assert!(parse(&["--only", "nope"]).is_err());
         let a = parse(&[]).unwrap();
         assert_eq!(
             (a.vmm, a.accel, a.profile),

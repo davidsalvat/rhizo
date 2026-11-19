@@ -1,0 +1,20 @@
+[package]
+name = "rhizo-mm"
+description = "Memory management for the Rhizo kernel: memory map, frames, page tables, heap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Not published to crates.io (workspace path dependencies only).
+publish = false
+
+[dependencies]
+rhizo-hal = { path = "../rhizo-hal" }
+
+[dev-dependencies]
+rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
+proptest = "1"
+
+[lints]
+workspace = true

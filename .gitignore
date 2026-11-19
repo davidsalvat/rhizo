@@ -44,4 +44,11 @@ QWEN.md
 .github/agents/
 .github/copilot-instructions.md
 .github/skills/
-.agents/
+# .agents/skills/ follows the open Agent Skills standard and is versioned;
+# anything else under .agents/ is tool-specific.
+.agents/*
+!.agents/skills/
+
+# --- Tool output ---
+mutants.out/
+mutants.out.old/

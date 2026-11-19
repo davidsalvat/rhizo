@@ -4,13 +4,11 @@ use crate::arch::boot::layout;
 use crate::arch::cpu::{self, CpuTlb};
 use crate::sync::Global;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use rhizo_core::memory::frames::FrameAllocator;
-use rhizo_core::memory::memmap::{BootInfo, RegionKind};
-use rhizo_core::memory::paging::{
-    MapError, PageFlags, PageSize, PageTable, Translation, UnmapError,
-};
-use rhizo_core::memory::{DIRECT_MAP_BASE, FRAME_SIZE, KERNEL_BASE, MAX_PHYS, align_up};
 use rhizo_hal::PhysicalMemory;
+use rhizo_mm::frames::FrameAllocator;
+use rhizo_mm::memmap::{BootInfo, RegionKind};
+use rhizo_mm::paging::{MapError, PageFlags, PageSize, PageTable, Translation, UnmapError};
+use rhizo_mm::{DIRECT_MAP_BASE, FRAME_SIZE, KERNEL_BASE, MAX_PHYS, align_up};
 
 const ONE_MIB: u64 = 1024 * 1024;
 const BITMAP_WORDS: usize = (MAX_PHYS / FRAME_SIZE / 64) as usize;

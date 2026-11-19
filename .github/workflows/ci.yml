@@ -45,6 +45,36 @@ jobs:
       - name: Run all checks
         run: cargo xtask ci
 
+  quality:
+    name: dependency policy, unused dependencies, dependency rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
+      - name: Licenses, advisories, sources (cargo-deny)
+        run: cargo deny check
+      - name: Unused dependencies (cargo-machete)
+        run: cargo machete
+      - name: Crate dependency rules
+        run: cargo xtask check
+
+  miri:
+    name: Miri on the heap allocator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with Miri (only for this job)
+        run: rustup toolchain install nightly --profile minimal --component miri
+      - name: Run heap tests under Miri
+        env:
+          PROPTEST_CASES: "8"
+        run: cargo +nightly miri test -p rhizo-mm -- heap::
+
   bench:
     name: VMM boots and benchmark gate
     runs-on: ubuntu-24.04

@@ -4,3 +4,9 @@ xtask = "run --package xtask --quiet --"
 [target.x86_64-unknown-none]
 # The kernel is loaded at a fixed physical address by the hypervisor.
 rustflags = ["-C", "relocation-model=static"]
+
+[env]
+# Property tests explore the same cases on every machine (reproducible
+# failures). Override with PROPTEST_RNG_SEED=<n>; the weekly job uses random
+# seeds and more cases.
+PROPTEST_RNG_SEED = "20261119"

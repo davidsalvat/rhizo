@@ -7,9 +7,9 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use rhizo_core::ktest::TestCase;
 use rhizo_core::ktest_case;
-use rhizo_core::memory::FRAME_SIZE;
-use rhizo_core::memory::paging::PageFlags;
 use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
+use rhizo_mm::FRAME_SIZE;
+use rhizo_mm::paging::PageFlags;
 
 /// Builds the suite: the regular tests, followed by any extra cases.
 macro_rules! suite {
@@ -143,7 +143,7 @@ fn stack_guard_page_is_unmapped() {
 }
 
 fn direct_map_uses_largest_pages() {
-    use rhizo_core::memory::paging::PageSize;
+    use rhizo_mm::paging::PageSize;
     let t = memory::translate(DirectMap::virt(0x20_1000)).expect("direct map present");
     assert_eq!(t.phys, 0x20_1000);
     let expected = if arch::cpu::supports_1gib_pages() {
@@ -210,7 +210,7 @@ fn map_use_and_unmap_a_page() {
 }
 
 fn double_mapping_is_rejected() {
-    use rhizo_core::memory::paging::MapError;
+    use rhizo_mm::paging::MapError;
     let frame = memory::with_frames(|f| f.alloc())
         .flatten()
         .expect("free frame");

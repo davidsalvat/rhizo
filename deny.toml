@@ -1,0 +1,33 @@
+# cargo-deny policy (https://github.com/EmbarkStudios/cargo-deny).
+# Enforces AGENTS.md rule 1 for dependencies: no copyleft (GPL, AGPL, LGPL).
+
+[graph]
+all-features = true
+
+[licenses]
+# Allow-list: anything not listed (including every GPL variant) is rejected.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[advisories]
+# Fail on known vulnerabilities and unmaintained crates in the dependency tree.
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates depend on each other by path only.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

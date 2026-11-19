@@ -16,7 +16,7 @@
 //!    `kernel_main(start_info_phys, entry_tsc)`.
 
 /// Magic value at offset 0 of `hvm_start_info`.
-pub const PVH_START_INFO_MAGIC: u32 = rhizo_core::memory::memmap::PVH_MAGIC;
+pub const PVH_START_INFO_MAGIC: u32 = rhizo_mm::memmap::PVH_MAGIC;
 
 /// Size of the kernel stack (the guard page below it is not included).
 pub const KERNEL_STACK_SIZE: usize = 64 * 1024;

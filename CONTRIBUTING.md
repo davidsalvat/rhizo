@@ -52,13 +52,38 @@ containing a single line:
 @AGENTS.md
 ```
 
+### Project skills
+
+`.agents/skills/` holds project skills in the open
+[Agent Skills](https://agentskills.io) format (`SKILL.md` with `name` and
+`description`), read by most coding agents. They are versioned because they
+are shared, tool-neutral project knowledge. Other files under `.agents/` stay
+local.
+
+Third-party skills or plugins are never required. If you install one locally,
+prefer those published by the tool vendor or a well-known maintainer, under an
+OSI license, that ask for no credentials. None is recommended by the project
+yet; when one is, it will be listed here with its license and maintainer.
+
+### Optional local tools
+
+| Tool | Use | Install |
+|---|---|---|
+| `cargo-deny` | Dependency licenses and advisories (CI runs it) | `cargo install --locked cargo-deny` |
+| `cargo-machete` | Unused dependencies (CI runs it) | `cargo install --locked cargo-machete` |
+| `cargo-mutants` | `cargo xtask mutants` | `cargo install --locked cargo-mutants` |
+| Miri | Undefined-behavior check of the heap (CI runs it) | `rustup toolchain install nightly --component miri`, then `cargo +nightly miri test -p rhizo-mm -- heap::` |
+| `cargo-nextest` | Faster, machine-readable host test runs | `cargo install --locked cargo-nextest` |
+| `cargo-bloat`, `cargo-show-asm` | Size and code-generation work | `cargo install --locked cargo-bloat cargo-show-asm` |
+
 ### Your responsibility
 
 You are responsible for everything you submit, whoever or whatever wrote it:
 
 - You must understand the code and be able to explain it in review.
 - It must not contain code copied from copyleft (GPL, AGPL, LGPL) sources.
-- Tests must pass locally before you open a pull request.
+- Tests must pass locally before you open a pull request (`cargo xtask ci`).
+- Tests are never weakened or deleted to make a change pass (AGENTS.md rule 9).
 
 ## Licensing of contributions
 

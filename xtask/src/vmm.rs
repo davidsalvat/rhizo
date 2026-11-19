@@ -4,7 +4,7 @@
 use crate::Result;
 use crate::tools;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -382,8 +382,7 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
                 let now = started.elapsed();
                 let chunk = &buf[..n];
                 if echo {
-                    let _ = io::stdout().write_all(chunk);
-                    let _ = io::stdout().flush();
+                    crate::report::raw(chunk);
                 }
                 let mut all = captured.lock().expect("capture lock");
                 let search_from = all.len().saturating_sub(READY_MARKER.len());
@@ -428,15 +427,19 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
 
     let output = String::from_utf8_lossy(&captured.lock().expect("capture lock")).into_owned();
     if result == VmResult::TimedOut && opts.echo {
-        println!(
+        crate::report::text(&format!(
             "\n[xtask] VM killed after {}s timeout",
             opts.timeout.as_secs()
-        );
+        ));
     }
     if matches!(result, VmResult::Abnormal(_) | VmResult::TimedOut)
         && !stderr_text.trim().is_empty()
     {
-        eprintln!("[xtask] {} stderr:\n{}", vmm.id(), stderr_text.trim_end());
+        crate::report::text(&format!(
+            "[xtask] {} stderr:\n{}",
+            vmm.id(),
+            stderr_text.trim_end()
+        ));
     }
     let time_to_ready = *ready_at.lock().expect("ready lock");
     Ok(VmRun {

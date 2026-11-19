@@ -1,4 +1,8 @@
-//! Memory management: memory map, physical frames, page tables and heap.
+//! Memory management for the Rhizo kernel: boot memory map, physical frames,
+//! page tables and the kernel heap. Hardware access goes through `rhizo-hal`
+//! only, so everything here is tested on the host.
+
+#![cfg_attr(not(test), no_std)]
 
 pub mod frames;
 pub mod heap;
