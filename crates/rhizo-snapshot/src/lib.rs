@@ -9,7 +9,7 @@
 //! header   "RHZSNAP1", version u32, machine u16, reserved u16, pages u32,
 //!          reserved u32                                      (24 bytes)
 //! state    pc, sp, gpr[31], tls, flags, brk_start, brk, mmap_next,
-//!          sleep_remaining_ns                         (39 x u64, 312 bytes)
+//!          sleep_remaining_ns, fp[66]                (105 x u64, 840 bytes)
 //! records  per page: virt u64, data offset u64, size u8 (0 = 4 KiB,
 //!          1 = 2 MiB), permissions u8 (1 W, 2 USER, 4 NX), 6 zero bytes
 //!                                                     (24 bytes each)
@@ -31,9 +31,9 @@ use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 const HEADER: usize = 24;
-const STATE: usize = 39 * 8;
+const STATE: usize = (39 + 66) * 8;
 const RECORD: usize = 24;
 /// Highest user address + 1.
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -133,14 +133,19 @@ impl Snapshot {
         b.extend_from_slice(&(pages as u32).to_le_bytes());
         b.extend_from_slice(&[0; 4]);
         let r = &cell.regs;
-        for v in [r.pc, r.sp].into_iter().chain(r.gpr).chain([
-            r.tls,
-            r.flags,
-            cell.brk_start,
-            cell.brk,
-            cell.mmap_next,
-            sleep_remaining_ns,
-        ]) {
+        for v in [r.pc, r.sp]
+            .into_iter()
+            .chain(r.gpr)
+            .chain([
+                r.tls,
+                r.flags,
+                cell.brk_start,
+                cell.brk,
+                cell.mmap_next,
+                sleep_remaining_ns,
+            ])
+            .chain(r.fp.0)
+        {
             b.extend_from_slice(&v.to_le_bytes());
         }
         let mut offset = 0u64;
@@ -248,6 +253,10 @@ impl Snapshot {
         for (i, g) in gpr.iter_mut().enumerate() {
             *g = w(2 + i);
         }
+        let mut fp = [0u64; 66];
+        for (i, f) in fp.iter_mut().enumerate() {
+            *f = w(39 + i);
+        }
         State {
             regs: Registers {
                 pc: w(0),
@@ -255,6 +264,7 @@ impl Snapshot {
                 gpr,
                 tls: w(33),
                 flags: w(34),
+                fp: rhizo_cell::FpState(fp),
             },
             brk_start: w(35),
             brk: w(36),

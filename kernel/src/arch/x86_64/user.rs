@@ -4,7 +4,7 @@
 use super::cpu::{read_cr2, wrmsr};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use rhizo_cell::Registers;
+use rhizo_cell::{FpState, Registers};
 use rhizo_core::exception::{self, ExceptionInfo};
 use rhizo_hal::Console;
 
@@ -75,9 +75,43 @@ static LAST_FS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// CR3 bit 63 with PCIDs on: keep the translations of the new PCID.
 const NO_FLUSH: u64 = 1 << 63;
 
-/// Enables PCIDs when the CPU has them and returns the highest tag cells may
-/// use (4095), or 0 without PCIDs (every switch flushes). Call once.
+/// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
+/// state of the cell that last ran).
+pub fn fp_save(state: &mut FpState) {
+    // SAFETY: `state` is 16-byte aligned and at least 512 bytes; SSE is
+    // enabled by `init_tags`.
+    unsafe { asm!("fxsave64 [{}]", in(reg) state, options(nostack)) };
+}
+
+/// Loads the FP/SIMD registers for the cell about to run.
+pub fn fp_load(state: &FpState) {
+    // SAFETY: as for `fp_save`; `FXRSTOR` only loads valid images (reserved
+    // MXCSR bits are cleared by the kernel's initial image and cannot be set
+    // by a cell without faulting in `LDMXCSR` first).
+    unsafe { asm!("fxrstor64 [{}]", in(reg) state, options(nostack)) };
+}
+
+/// Enables SSE for cells (and for the save and load above), and PCIDs when
+/// the CPU has them; returns the highest tag cells may use (4095), or 0
+/// without PCIDs (every switch flushes). Call once.
 pub fn init_tags() -> u16 {
+    // SAFETY: CR0.MP set, CR0.EM clear, CR4.OSFXSR and OSXMMEXCPT set: SSE
+    // works with FXSAVE support. The kernel is built without SSE.
+    unsafe {
+        asm!(
+            "mov {t}, cr0",
+            "and {t}, {em}",
+            "or {t}, 2",
+            "mov cr0, {t}",
+            "mov {t}, cr4",
+            "or {t}, {sse}",
+            "mov cr4, {t}",
+            t = out(reg) _,
+            em = const !(1u64 << 2),
+            sse = const (1u64 << 9) | (1u64 << 10),
+            options(nostack)
+        );
+    }
     if core::arch::x86_64::__cpuid(1).ecx & (1 << 17) == 0 {
         return 0;
     }

@@ -316,3 +316,33 @@ fn yield_and_sleep_become_scheduling_outcomes() {
     let mut x = World::new(Arch::X86_64);
     assert_eq!(x.call(24, &[]).1, Outcome::Yield);
 }
+
+#[test]
+fn libc_startup_calls() {
+    let mut w = World::new(Arch::Aarch64);
+    // mprotect: read-only, then W+X refused, unmapped range refused.
+    assert_eq!(w.call(226, &[DATA, 4096, 1]).0, 0);
+    assert!(!w.pt().translate(&w.mem, DATA).unwrap().flags.is_writable());
+    assert_eq!(w.call(226, &[DATA, 4096, 7]).0, -EACCES);
+    assert_eq!(w.call(226, &[0x7000_0000, 4096, 1]).0, -ENOMEM);
+    assert_eq!(w.call(226, &[DATA + 1, 4096, 1]).0, -EINVAL);
+    assert_eq!(w.call(226, &[DATA, 4096, 3]).0, 0, "writable again");
+    // prlimit64(0, RLIMIT_STACK, NULL, &old)
+    assert_eq!(w.call(261, &[0, 3, 0, DATA]).0, 0);
+    assert_eq!(w.peek(DATA, 8), (8u64 << 20).to_le_bytes());
+    assert_eq!(w.call(99, &[DATA, 24]).0, 0, "set_robust_list");
+    assert_eq!(w.call(293, &[]).0, -ENOSYS, "rseq declined");
+    assert_eq!(w.services.log, "", "declined calls are not reported");
+    assert_eq!(w.call(78, &[0, DATA, DATA, 64]).0, -ENOENT, "readlinkat");
+    assert_eq!(w.call(174, &[]).0, 0, "getuid");
+    // fstat(1) on AArch64: mode at 16 is a character device.
+    assert_eq!(w.call(80, &[1, DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 16, 4), (0o020_620u32).to_le_bytes());
+    assert_eq!(w.call(80, &[5, DATA]).0, -EBADF);
+    // newfstatat(1, "", &st, AT_EMPTY_PATH)
+    w.poke(DATA + 0x800, &[0]);
+    assert_eq!(w.call(79, &[1, DATA + 0x800, DATA, 0x1000]).0, 0);
+    let mut x = World::new(Arch::X86_64);
+    assert_eq!(x.call(5, &[2, DATA]).0, 0, "fstat on x86_64");
+    assert_eq!(x.peek(DATA + 24, 4), (0o020_620u32).to_le_bytes());
+}

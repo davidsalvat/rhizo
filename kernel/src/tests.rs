@@ -74,6 +74,9 @@ macro_rules! suite {
             ktest_case!(forks_of_forks),
             ktest_case!(fork_allocates_only_a_root),
             ktest_case!(spawn_from_template_runs_like_the_program),
+            ktest_case!(real_libc_programs_behave_as_on_linux),
+            ktest_case!(fp_state_is_private_to_each_cell),
+            ktest_case!(fp_state_survives_suspend_and_resume),
             $(ktest_case!($extra),)*
         ]
     };
@@ -768,7 +771,10 @@ fn fork_allocates_only_a_root() {
     while host.output(parent) != Some(b"filled\n") {
         host.step();
     }
-    host.fork(parent, 1).expect("warm up the host's queues");
+    // Warm up: the same fork once, ended again, so the host's queues already
+    // have room for the child and the heap does not grow during the measure.
+    let warm = host.fork(parent, 1).expect("fork")[0];
+    assert!(host.kill(warm));
     let before = memory::free_bytes();
     host.fork(parent, 1).expect("fork");
     assert_eq!(
@@ -796,4 +802,62 @@ fn spawn_from_template_runs_like_the_program() {
         );
     }
     assert!(host.finished(template).is_none(), "a template never runs");
+}
+
+/// Static glibc programs (cells/c): startup, stdio, the allocator, FP.
+fn real_libc_programs_behave_as_on_linux() {
+    for name in ["libc_hello", "libc_alloc", "libc_float"] {
+        run_expected(name);
+    }
+}
+
+/// Two FP programs holding values in FP/SIMD registers across yields, run
+/// together: each must find its own values (lazy FP switching).
+fn fp_state_is_private_to_each_cell() {
+    let mut host = Host::new();
+    let a = spawn(&mut host, "libc_float", &[b"1"]);
+    let b = spawn(&mut host, "libc_float", &[b"1000"]);
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, a),
+        (Ending::Exit(0), "fp ok: 20100.0\n".into())
+    );
+    assert_eq!(
+        ended(&host, b),
+        (Ending::Exit(0), "fp ok: 219900.0\n".into())
+    );
+}
+
+/// The FP state is part of the snapshot: suspended and resumed every few
+/// steps (eagerly and lazily), next to another FP cell, the program still
+/// gets its exact result.
+fn fp_state_survives_suspend_and_resume() {
+    for mode in [Resume::Eager, Resume::Lazy] {
+        let mut host = Host::new();
+        let other = spawn(&mut host, "libc_float", &[b"7"]);
+        let mut id = spawn(&mut host, "libc_float", &[b"3"]);
+        let mut output = Vec::new();
+        for step in 1.. {
+            host.step();
+            if let Some(done) = host.finished(id) {
+                assert_eq!(done.ending, Ending::Exit(0));
+                output.extend_from_slice(&done.output);
+                break;
+            }
+            if step % 9 == 0 {
+                let snapshot = host.suspend(id).expect("live");
+                output.extend_from_slice(&host.finished(id).expect("suspended").output);
+                id = host.resume(snapshot, mode, true, true).expect("resume");
+            }
+        }
+        assert_eq!(
+            alloc::string::String::from_utf8_lossy(&output),
+            "fp ok: 20500.0\n"
+        );
+        host.run(|_| false);
+        assert_eq!(
+            ended(&host, other),
+            (Ending::Exit(0), "fp ok: 21300.0\n".into())
+        );
+    }
 }

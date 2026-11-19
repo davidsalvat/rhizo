@@ -19,10 +19,36 @@ pub const STACK_PAGES: u64 = 16;
 /// First address used for anonymous mappings (`mmap`).
 pub const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
 
+/// Floating-point and SIMD registers, as plain data: on AArch64 `V0`–`V31`
+/// (words 0–63), then `FPCR` and `FPSR`; on x86_64 the 512-byte `FXSAVE`
+/// image. 16-byte aligned, as `FXSAVE` requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(16))]
+pub struct FpState(pub [u64; 66]);
+
+impl FpState {
+    /// The state a program starts with on `machine`: all zero, except the
+    /// x87 control word (`0x37f`) and `MXCSR` (`0x1f80`) on x86_64, as Linux.
+    pub fn initial(machine: elf::Machine) -> Self {
+        let mut words = [0u64; 66];
+        if machine == elf::Machine::X86_64 {
+            words[0] = 0x37f; // FCW, bytes 0-1
+            words[3] = 0x1f80; // MXCSR, bytes 24-27
+        }
+        Self(words)
+    }
+}
+
+impl Default for FpState {
+    fn default() -> Self {
+        Self([0; 66])
+    }
+}
+
 /// Everything needed to resume a cell's execution, as plain data on both
 /// architectures (design decision D2). The AArch64 entry code saves and
 /// restores it in place, so its layout is fixed: `pc` at 0, `sp` at 8, `gpr`
-/// at 16, `tls` at 264, `flags` at 272.
+/// at 16, `tls` at 264, `flags` at 272, `fp` at 288.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C, align(16))]
 pub struct Registers {
@@ -37,6 +63,8 @@ pub struct Registers {
     pub tls: u64,
     /// Processor flags (`SPSR_EL1` or `RFLAGS`).
     pub flags: u64,
+    /// Floating-point and SIMD state.
+    pub fp: FpState,
 }
 
 /// A cell: plain data, no pointers into kernel memory (spec `cells`).
@@ -102,7 +130,11 @@ pub fn spawn<F: EntryFormat>(
         elf::build_stack(&pt, mem, &mut || frames.alloc(), &image, argv, envp, random)
     });
     match built {
-        Ok(sp) => Ok(Cell::new(id, pt.root(), image.entry, sp, image.end())),
+        Ok(sp) => {
+            let mut cell = Cell::new(id, pt.root(), image.entry, sp, image.end());
+            cell.regs.fp = FpState::initial(machine);
+            Ok(cell)
+        }
         Err(e) => {
             space::destroy(pt, mem, frames);
             Err(e)
@@ -220,6 +252,7 @@ mod tests {
         assert_eq!(core::ptr::addr_of!(r.gpr) as usize - base, 16);
         assert_eq!(core::ptr::addr_of!(r.tls) as usize - base, 264);
         assert_eq!(core::ptr::addr_of!(r.flags) as usize - base, 272);
+        assert_eq!(core::ptr::addr_of!(r.fp) as usize - base, 288);
         assert_eq!(core::mem::align_of::<super::Registers>(), 16);
     }
 
