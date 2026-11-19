@@ -1,6 +1,6 @@
 //! CPU exception reports.
 
-use core::fmt::Write;
+use core::fmt::{self, Write};
 use rhizo_hal::{Console, ConsoleWriter};
 
 /// What the kernel knows about an exception when it reports it.
@@ -59,10 +59,20 @@ pub fn name(vector: u8) -> &'static str {
 ///   address 0x0: write, page not present, kernel mode
 /// ```
 pub fn report_exception(console: &mut impl Console, info: &ExceptionInfo) {
+    write_exception(console, format_args!("\nEXCEPTION: "), info);
+}
+
+/// Prints the report of an exception raised by cell `cell`, which ends that
+/// cell: the same details as [`report_exception`] after `cell N killed: `.
+pub fn report_cell_exception(console: &mut impl Console, cell: u32, info: &ExceptionInfo) {
+    write_exception(console, format_args!("cell {cell} killed: "), info);
+}
+
+fn write_exception(console: &mut impl Console, prefix: fmt::Arguments<'_>, info: &ExceptionInfo) {
     let mut out = ConsoleWriter(console);
     let _ = writeln!(
         out,
-        "\nEXCEPTION: {} (vector {}, error {:#x}) at rip {:#x}",
+        "{prefix}{} (vector {}, error {:#x}) at rip {:#x}",
         name(info.vector),
         info.vector,
         info.error_code,
@@ -130,11 +140,22 @@ pub fn aarch64_class_name(ec: u64) -> &'static str {
 ///   address 0x0: write, translation fault (level 0), kernel mode
 /// ```
 pub fn report_aarch64(console: &mut impl Console, info: &Aarch64Exception) {
+    write_aarch64(console, format_args!("\nEXCEPTION: "), info);
+}
+
+/// Prints the report of an AArch64 exception raised by cell `cell`, which
+/// ends that cell: the same details as [`report_aarch64`] after
+/// `cell N killed: `.
+pub fn report_cell_aarch64(console: &mut impl Console, cell: u32, info: &Aarch64Exception) {
+    write_aarch64(console, format_args!("cell {cell} killed: "), info);
+}
+
+fn write_aarch64(console: &mut impl Console, prefix: fmt::Arguments<'_>, info: &Aarch64Exception) {
     let mut out = ConsoleWriter(console);
     let ec = (info.esr >> 26) & 0x3f;
     let _ = writeln!(
         out,
-        "\nEXCEPTION: {} (class {:#x}, ESR {:#x}) at pc {:#x}",
+        "{prefix}{} (class {:#x}, ESR {:#x}) at pc {:#x}",
         aarch64_class_name(ec),
         ec,
         info.esr,
@@ -301,6 +322,38 @@ mod tests {
             console.text(),
             "\nEXCEPTION: data abort (class 0x25, ESR 0x96000044) at pc 0x1000\n  \
              address 0x0: write, translation fault (level 0), kernel mode\n"
+        );
+    }
+
+    #[test]
+    fn cell_faults_carry_the_cell_and_user_mode() {
+        let mut console = RecordingConsole::new();
+        // EC 0x24 (data abort from EL0), write, permission fault level 3.
+        let esr = (0x24 << 26) | (1 << 25) | (1 << 6) | 0b001111;
+        let info = Aarch64Exception {
+            esr,
+            far: 0xffff_8000_0000_0000,
+            elr: 0x40_0010,
+            stack_guard: (0, 0),
+        };
+        report_cell_aarch64(&mut console, 4, &info);
+        assert_eq!(
+            console.text(),
+            "cell 4 killed: data abort (class 0x24, ESR 0x9200004f) at pc 0x400010\n  \
+             address 0xffff800000000000: write, permission fault (level 3), user mode\n"
+        );
+        let mut console = RecordingConsole::new();
+        let info = ExceptionInfo {
+            vector: 14,
+            error_code: 0x6,
+            rip: 0x40_0010,
+            fault_address: Some(0),
+        };
+        report_cell_exception(&mut console, 9, &info);
+        assert_eq!(
+            console.text(),
+            "cell 9 killed: page fault (vector 14, error 0x6) at rip 0x400010\n  \
+             address 0x0: write, page not present, user mode\n"
         );
     }
 

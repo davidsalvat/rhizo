@@ -1,0 +1,18 @@
+[package]
+name = "rhizo-cells"
+description = "Test programs that run as Rhizo cells (static Linux executables)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Not published to crates.io (workspace path dependencies only).
+publish = false
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

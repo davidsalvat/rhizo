@@ -304,6 +304,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhizo-cells"
+version = "0.1.0"
+
+[[package]]
 name = "rhizo-core"
 version = "0.1.0"
 dependencies = [

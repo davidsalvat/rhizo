@@ -33,6 +33,12 @@ macro_rules! suite {
             ktest_case!(box_and_vec_work),
             ktest_case!(heap_alignment_is_honored),
             ktest_case!(heap_memory_is_reused),
+            ktest_case!(cell_says_hello),
+            ktest_case!(cell_exit_status_and_frames_return),
+            ktest_case!(cell_system_calls),
+            ktest_case!(cell_null_write_kills_only_the_cell),
+            ktest_case!(cell_cannot_read_kernel_memory),
+            ktest_case!(cell_rejects_bad_executables),
             $(ktest_case!($extra),)*
         ]
     };
@@ -298,4 +304,100 @@ fn execute_invalid_opcode() {
 fn allocate_too_much() {
     let v: Vec<u8> = Vec::with_capacity(1 << 40);
     core::hint::black_box(v);
+}
+
+mod expected {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../cells/expected.rs"));
+}
+
+/// Runs test cell `name` and checks its output and ending against
+/// `cells/expected.rs`; returns everything it printed.
+fn run_expected(name: &str) -> alloc::string::String {
+    let &(_, stdout, ending) = expected::PROGRAMS
+        .iter()
+        .find(|p| p.0 == name)
+        .unwrap_or_else(|| panic!("{name} is not in cells/expected.rs"));
+    let mut out = Vec::new();
+    let got = crate::cell::run(
+        crate::cell::test_image(name),
+        &[name.as_bytes()],
+        Some(&mut out),
+    )
+    .unwrap_or_else(|e| panic!("cannot spawn {name}: {e:?} (cells are built by `cargo xtask`)"));
+    let text = alloc::string::String::from_utf8(out).expect("cell output is UTF-8");
+    match ending {
+        expected::Ending::Exit(status) => {
+            assert_eq!(
+                got,
+                crate::cell::Ending::Exit(status),
+                "{name} output: {text:?}"
+            );
+            assert_eq!(text, stdout, "{name} output");
+        }
+        expected::Ending::Fault => {
+            assert_eq!(got, crate::cell::Ending::Fault, "{name} output: {text:?}");
+            assert!(text.starts_with(stdout), "{name} output: {text:?}");
+        }
+    }
+    text
+}
+
+fn cell_says_hello() {
+    run_expected("hello");
+}
+
+fn cell_exit_status_and_frames_return() {
+    let before = memory::free_bytes();
+    run_expected("exit3");
+    run_expected("hello");
+    assert_eq!(
+        memory::free_bytes(),
+        before,
+        "every frame of the cells is returned"
+    );
+}
+
+fn cell_system_calls() {
+    let before = memory::free_bytes();
+    run_expected("abi");
+    assert_eq!(
+        memory::free_bytes(),
+        before,
+        "brk and mmap memory is returned"
+    );
+}
+
+fn cell_null_write_kills_only_the_cell() {
+    let before = memory::free_bytes();
+    let report = run_expected("fault_null");
+    assert!(report.contains(" killed: "), "{report}");
+    assert!(report.contains("address 0x0: write"), "{report}");
+    assert!(report.contains("user mode"), "{report}");
+    assert_eq!(memory::free_bytes(), before);
+    // The kernel keeps running cells after a fault.
+    run_expected("hello");
+}
+
+fn cell_cannot_read_kernel_memory() {
+    let report = run_expected("fault_kernel");
+    assert!(
+        report.contains("address 0xffff800000000000: read"),
+        "{report}"
+    );
+}
+
+fn cell_rejects_bad_executables() {
+    use rhizo_cell::elf::ElfError;
+    let before = memory::free_bytes();
+    assert_eq!(
+        crate::cell::run(b"not an elf", &[], None),
+        Err(ElfError::NotElf)
+    );
+    let mut other = crate::cell::test_image("hello").to_vec();
+    other[18] ^= 1; // e_machine of another architecture
+    assert!(matches!(
+        crate::cell::run(&other, &[], None),
+        Err(ElfError::WrongMachine { .. })
+    ));
+    assert_eq!(memory::free_bytes(), before);
 }

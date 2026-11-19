@@ -233,12 +233,17 @@ rhizo_kernel_stack_guard:
 rhizo_kernel_stack_top:
     .balign 16
     .skip {exception_stack}
+    .global rhizo_exception_stack_top
 rhizo_exception_stack_top:
 
     .section .bss.boot_data, "aw", @nobits
     .balign 8
     .global rhizo_image_phys
 rhizo_image_phys:
+    .skip 8
+    // Kernel stack pointer saved while a cell runs (see `cpu::enter_user`).
+    .global rhizo_kernel_sp
+rhizo_kernel_sp:
     .skip 8
     .text
     "#,

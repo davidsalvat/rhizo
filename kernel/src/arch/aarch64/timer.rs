@@ -27,10 +27,6 @@ pub fn frequency() -> u64 {
 }
 
 /// Converts counter ticks to nanoseconds.
-#[cfg_attr(
-    feature = "ktest",
-    allow(dead_code, reason = "used by the boot report only")
-)]
 pub fn cycles_to_ns(cycles: u64) -> Option<u64> {
     let hz = frequency();
     (hz != 0).then(|| (cycles as u128 * 1_000_000_000 / hz as u128) as u64)

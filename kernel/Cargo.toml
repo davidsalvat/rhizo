@@ -30,6 +30,8 @@ ktest-oom = ["ktest"]
 rhizo-hal = { path = "../crates/rhizo-hal" }
 rhizo-core = { path = "../crates/rhizo-core" }
 rhizo-mm = { path = "../crates/rhizo-mm" }
+rhizo-cell = { path = "../crates/rhizo-cell" }
+rhizo-abi = { path = "../crates/rhizo-abi" }
 
 [lints]
 workspace = true

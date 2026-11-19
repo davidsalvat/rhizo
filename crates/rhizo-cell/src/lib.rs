@@ -20,9 +20,11 @@ pub const STACK_PAGES: u64 = 16;
 pub const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
 
 /// Everything needed to resume a cell's execution, as plain data on both
-/// architectures (design decision D2): the architecture layer converts it to
-/// and from its trap frame.
+/// architectures (design decision D2). The AArch64 entry code saves and
+/// restores it in place, so its layout is fixed: `pc` at 0, `sp` at 8, `gpr`
+/// at 16, `tls` at 264, `flags` at 272.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C, align(16))]
 pub struct Registers {
     /// Program counter.
     pub pc: u64,
@@ -188,6 +190,17 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn register_layout_matches_the_entry_code() {
+        let r = super::Registers::default();
+        let base = core::ptr::addr_of!(r) as usize;
+        assert_eq!(core::ptr::addr_of!(r.sp) as usize - base, 8);
+        assert_eq!(core::ptr::addr_of!(r.gpr) as usize - base, 16);
+        assert_eq!(core::ptr::addr_of!(r.tls) as usize - base, 264);
+        assert_eq!(core::ptr::addr_of!(r.flags) as usize - base, 272);
+        assert_eq!(core::mem::align_of::<super::Registers>(), 16);
+    }
+
     use super::*;
 
     use crate::testing::CountingFrames;

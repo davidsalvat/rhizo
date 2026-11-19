@@ -14,10 +14,6 @@ impl CycleCounter for Counter {
 }
 
 /// TSC frequency is not calibrated yet, so cycles cannot be converted.
-#[cfg_attr(
-    feature = "ktest",
-    allow(dead_code, reason = "used by the boot report only")
-)]
 pub fn cycles_to_ns(_cycles: u64) -> Option<u64> {
     None
 }

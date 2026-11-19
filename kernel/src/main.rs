@@ -10,6 +10,8 @@
 extern crate alloc;
 
 mod arch;
+#[cfg(feature = "ktest")]
+mod cell;
 mod heap;
 mod memory;
 mod sync;
