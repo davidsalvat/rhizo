@@ -272,3 +272,46 @@ fn clocks_uname_random_and_signals() {
     assert_eq!(w.call(135, &[0, 0, 0, 8]).0, 0, "rt_sigprocmask");
     assert_eq!(w.call(96, &[DATA]).0, 5, "set_tid_address returns the tid");
 }
+
+#[test]
+fn yield_and_sleep_become_scheduling_outcomes() {
+    let mut w = World::new(Arch::Aarch64);
+    w.services.clock = 1_000;
+    assert_eq!(w.call(124, &[]), (0, Outcome::Yield), "sched_yield");
+
+    let ts = |sec: i64, nsec: i64| [sec.to_le_bytes(), nsec.to_le_bytes()].concat();
+    w.poke(DATA, &ts(0, 20_000_000));
+    assert_eq!(
+        w.call(101, &[DATA, 0]),
+        (0, Outcome::Sleep(20_001_000)),
+        "nanosleep 20 ms"
+    );
+    w.poke(DATA, &ts(2, 0));
+    assert_eq!(
+        w.call(115, &[1, 1, DATA, 0]),
+        (0, Outcome::Sleep(2_000_000_000)),
+        "clock_nanosleep(MONOTONIC, TIMER_ABSTIME)"
+    );
+    // Realtime is monotonic + 1.7e18 in the fake: an absolute realtime
+    // deadline 5 ns after "now" sleeps 5 ns.
+    let deadline = 1_700_000_000_000_000_000i64 + 1_000 + 5;
+    w.poke(
+        DATA,
+        &ts(deadline / 1_000_000_000, deadline % 1_000_000_000),
+    );
+    assert_eq!(w.call(115, &[0, 1, DATA, 0]).1, Outcome::Sleep(1_005));
+
+    w.poke(DATA, &ts(0, 1_000_000_000));
+    assert_eq!(
+        w.call(101, &[DATA, 0]).0,
+        -EINVAL,
+        "nanoseconds out of range"
+    );
+    w.poke(DATA, &ts(-1, 0));
+    assert_eq!(w.call(101, &[DATA, 0]).0, -EINVAL, "negative seconds");
+    assert_eq!(w.call(101, &[0xdead_0000, 0]).0, -EFAULT);
+    assert_eq!(w.call(115, &[2, 0, DATA, 0]).0, -EINVAL, "CPU-time clocks");
+    // x86_64 numbers.
+    let mut x = World::new(Arch::X86_64);
+    assert_eq!(x.call(24, &[]).1, Outcome::Yield);
+}

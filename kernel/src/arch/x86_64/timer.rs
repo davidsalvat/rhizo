@@ -3,7 +3,8 @@
 //! The TSC frequency is found lazily, the first time a conversion is needed
 //! (never on the boot path): from KVM's paravirtual clock when running on
 //! KVM (QEMU with KVM, Firecracker, Cloud Hypervisor), else from CPUID leaves
-//! 0x15/0x16, else by timing the legacy PIT for 10 ms (QEMU without KVM).
+//! 0x15/0x16, else by timing the legacy PIT for 10 ms, else (in builds that
+//! run cells) against the local APIC timer.
 
 use super::boot::layout;
 use super::port::{inb, outb};
@@ -47,7 +48,21 @@ pub fn cycles_to_ns(cycles: u64) -> Option<u64> {
 }
 
 fn calibrate() -> Option<(u32, i8)> {
-    kvm_clock().or_else(|| cpuid_frequency().or_else(pit_frequency).map(from_hz))
+    kvm_clock().or_else(|| {
+        cpuid_frequency()
+            .or_else(pit_frequency)
+            .or_else(apic_frequency)
+            .map(from_hz)
+    })
+}
+
+/// In builds that run cells, the local APIC timer is set up and can serve as
+/// a reference.
+fn apic_frequency() -> Option<u64> {
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    return super::irq::tsc_hz();
+    #[cfg(not(any(feature = "ktest", feature = "bench-cell")))]
+    None
 }
 
 /// `(mul, shift)` for a frequency in Hz: the smallest shift that makes

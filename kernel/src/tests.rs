@@ -39,6 +39,13 @@ macro_rules! suite {
             ktest_case!(cell_null_write_kills_only_the_cell),
             ktest_case!(cell_cannot_read_kernel_memory),
             ktest_case!(cell_rejects_bad_executables),
+            ktest_case!(cells_interleave_and_all_finish),
+            ktest_case!(spinning_cell_does_not_starve_others),
+            ktest_case!(sleeping_cell_uses_no_cpu_and_wakes_on_time),
+            ktest_case!(same_address_is_private_to_each_cell),
+            ktest_case!(cell_cannot_touch_another_cells_mapping),
+            ktest_case!(fault_does_not_disturb_other_cells),
+            ktest_case!(many_cells_in_sequence_stay_isolated),
             $(ktest_case!($extra),)*
         ]
     };
@@ -317,13 +324,10 @@ fn run_expected(name: &str) -> alloc::string::String {
         .iter()
         .find(|p| p.0 == name)
         .unwrap_or_else(|| panic!("{name} is not in cells/expected.rs"));
-    let mut out = Vec::new();
-    let got = crate::cell::run(
-        crate::cell::test_image(name),
-        &[name.as_bytes()],
-        Some(&mut out),
-    )
-    .unwrap_or_else(|e| panic!("cannot spawn {name}: {e:?} (cells are built by `cargo xtask`)"));
+    let (got, out) = crate::cell::run(crate::cell::test_image(name), &[name.as_bytes()])
+        .unwrap_or_else(|e| {
+            panic!("cannot spawn {name}: {e:?} (cells are built by `cargo xtask`)")
+        });
     let text = alloc::string::String::from_utf8(out).expect("cell output is UTF-8");
     match ending {
         expected::Ending::Exit(status) => {
@@ -393,12 +397,132 @@ fn cell_rejects_bad_executables() {
     other[18] ^= 1; // e_machine of another architecture
     let before = memory::free_bytes();
     assert_eq!(
-        crate::cell::run(b"not an elf", &[], None),
+        crate::cell::run(b"not an elf", &[]).map(|r| r.0),
         Err(ElfError::NotElf)
     );
     assert!(matches!(
-        crate::cell::run(&other, &[], None),
+        crate::cell::run(&other, &[]).map(|r| r.0),
         Err(ElfError::WrongMachine { .. })
     ));
+    assert_eq!(memory::free_bytes(), before);
+}
+
+use crate::cell::{Ending, Host};
+
+fn spawn(host: &mut Host, name: &str, args: &[&[u8]]) -> u32 {
+    let mut argv = alloc::vec![name.as_bytes()];
+    argv.extend_from_slice(args);
+    host.spawn(crate::cell::test_image(name), &argv, true, true)
+        .unwrap_or_else(|e| panic!("cannot spawn {name}: {e:?}"))
+}
+
+fn ended(host: &Host, id: u32) -> (Ending, alloc::string::String) {
+    let f = host
+        .finished(id)
+        .unwrap_or_else(|| panic!("cell {id} has not ended"));
+    (
+        f.ending,
+        alloc::string::String::from_utf8_lossy(&f.output).into_owned(),
+    )
+}
+
+fn cells_interleave_and_all_finish() {
+    let mut host = Host::new();
+    let a = spawn(&mut host, "chatter", &[b"a"]);
+    let b = spawn(&mut host, "chatter", &[b"b"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, a), (Ending::Exit(0), "a\na\na\n".into()));
+    assert_eq!(ended(&host, b), (Ending::Exit(0), "b\nb\nb\n".into()));
+}
+
+fn spinning_cell_does_not_starve_others() {
+    let mut host = Host::new();
+    let spin = spawn(&mut host, "spin", &[]);
+    let hello = spawn(&mut host, "hello", &[]);
+    host.run(|h| h.finished(hello).is_some());
+    assert_eq!(
+        ended(&host, hello),
+        (Ending::Exit(0), "hello from a cell\n".into())
+    );
+    assert_eq!(host.live(), 1, "the spinning cell is still running");
+    assert!(host.kill(spin));
+    assert_eq!(ended(&host, spin).0, Ending::Killed);
+}
+
+fn sleeping_cell_uses_no_cpu_and_wakes_on_time() {
+    let mut host = Host::new();
+    let sleeper = spawn(&mut host, "sleeper", &[]);
+    let chatter = spawn(&mut host, "chatter", &[]);
+    host.run(|h| h.finished(chatter).is_some());
+    assert!(
+        host.finished(sleeper).is_none(),
+        "the sleeper waits while others run"
+    );
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, sleeper),
+        (Ending::Exit(0), "slept ok\n".into())
+    );
+}
+
+fn same_address_is_private_to_each_cell() {
+    let mut host = Host::new();
+    let tags: [&[u8]; 8] = [b"0", b"1", b"2", b"3", b"4", b"5", b"6", b"7"];
+    let ids: Vec<u32> = tags
+        .iter()
+        .map(|t| spawn(&mut host, "same_addr", &[t]))
+        .collect();
+    host.run(|_| false);
+    for id in ids {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "own value ok\n".into()));
+    }
+}
+
+fn cell_cannot_touch_another_cells_mapping() {
+    let mut host = Host::new();
+    let mapper = spawn(&mut host, "mapper", &[]);
+    while host.output(mapper) != Some(b"mapped\n") {
+        host.step();
+    }
+    let peek = spawn(&mut host, "peek", &[]);
+    host.run(|h| h.finished(peek).is_some());
+    let (ending, report) = ended(&host, peek);
+    assert_eq!(ending, Ending::Fault);
+    assert!(report.contains("address 0x400000000000: read"), "{report}");
+    assert!(host.kill(mapper), "the mapping cell is unaffected");
+    assert_eq!(ended(&host, mapper), (Ending::Killed, "mapped\n".into()));
+}
+
+fn fault_does_not_disturb_other_cells() {
+    let mut host = Host::new();
+    let chatter = spawn(&mut host, "chatter", &[b"c"]);
+    let fault = spawn(&mut host, "fault_null", &[]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, fault).0, Ending::Fault);
+    assert_eq!(ended(&host, chatter), (Ending::Exit(0), "c\nc\nc\n".into()));
+}
+
+/// More cells than 8-bit ASIDs, created and ended in pairs: identifiers are
+/// reused and each cell still sees only its own memory; no frame is lost.
+fn many_cells_in_sequence_stay_isolated() {
+    fn pair() {
+        let mut host = Host::new();
+        let image = crate::cell::test_image("same_addr");
+        let quiet = |host: &mut Host, tag: &[u8]| {
+            host.spawn(image, &[b"same_addr", tag], true, false)
+                .expect("spawn same_addr")
+        };
+        let a = quiet(&mut host, b"a");
+        let b = quiet(&mut host, b"b");
+        host.run(|_| false);
+        for id in [a, b] {
+            assert_eq!(ended(&host, id), (Ending::Exit(0), "own value ok\n".into()));
+        }
+    }
+    pair();
+    let before = memory::free_bytes();
+    for _ in 0..150 {
+        pair();
+    }
     assert_eq!(memory::free_bytes(), before);
 }

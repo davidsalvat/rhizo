@@ -189,14 +189,20 @@ rhizo_isr_\n:
     .irp n, 8,10,11,12,13,14,17,21,29,30
     RHIZO_ISR_ERR \n
     .endr
+    RHIZO_ISR_NOERR 32
+    RHIZO_ISR_NOERR 255
 
 rhizo_isr_common:
     testb $3, 24(%rsp)              // CS of the interrupted code: from a cell?
     jnz rhizo_user_trap
+    cmpq $32, (%rsp)                // a device interrupt in ring 0 can only
+    jae 3f                          // come from `irq::wait`: just return
     movq %rsp, %rdi
     andq $-16, %rsp
     call rhizo_exception_handler
     ud2
+3:  addq $16, %rsp
+    iretq
 
     .section .rodata
     .balign 8
@@ -205,6 +211,10 @@ rhizo_isr_table:
     .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     .quad rhizo_isr_\n
     .endr
+    .global rhizo_isr_device
+rhizo_isr_device:
+    .quad rhizo_isr_32
+    .quad rhizo_isr_255
 
     .text
     "#,
@@ -213,6 +223,7 @@ rhizo_isr_table:
 
 unsafe extern "C" {
     static rhizo_isr_table: [u64; 32];
+    static rhizo_isr_device: [u64; 2];
 }
 
 /// Stack layout built by the stubs and the CPU.
@@ -253,6 +264,10 @@ fn load_idt() {
             };
             idt[vector] = IdtEntry::interrupt_gate(stub, ist);
         }
+        // SAFETY: as above, two more stubs (timer and spurious vectors).
+        let [timer, spurious] = unsafe { *core::ptr::addr_of!(rhizo_isr_device) };
+        idt[32] = IdtEntry::interrupt_gate(timer, 0);
+        idt[255] = IdtEntry::interrupt_gate(spurious, 0);
         DescriptorPointer {
             limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: idt.as_ptr() as u64,
@@ -285,7 +300,7 @@ const SFMASK: u32 = 0xC000_0084;
 
 /// # Safety
 /// `msr` must exist on this CPU.
-unsafe fn rdmsr(msr: u32) -> u64 {
+pub(super) unsafe fn rdmsr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
     // SAFETY: guaranteed by the caller.
     unsafe {
@@ -331,7 +346,7 @@ rhizo_enter_cell:
     mov [rip + rhizo_cell_regs], rdi
     mov rax, [rdi + 272]
     and eax, 0xdd5                  // user flags only: CF PF AF ZF SF DF OF
-    or eax, 2                       // reserved bit; IF stays clear (no IRQs yet)
+    or eax, 0x202                   // reserved bit, IF: preemptible
     test rsi, rsi
     jz 2f
     mov r11, rax

@@ -295,6 +295,9 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
         (Vmm::QemuMicrovm, Guest::ReferenceLinux { .. }) => {
             cmd.args(["-M", "microvm,isa-serial=on"])
         }
+        // GICv3: the interrupt controller Firecracker and Cloud Hypervisor
+        // expose, and the only one Rhizo drives.
+        (Vmm::QemuVirt, Guest::Rhizo(_)) => cmd.args(["-M", "virt,gic-version=3"]),
         (Vmm::QemuVirt, _) => cmd.args(["-M", "virt"]),
         _ => cmd.args(["-M", "q35"]),
     };

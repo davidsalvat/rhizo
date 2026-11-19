@@ -28,6 +28,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.spawn_us/rhizo/<vmm>` | timing | Median time to create the `hello` cell (tables, image, stack), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
 | `cell.run_us/rhizo/<vmm>` | timing | Median time from spawn to the cell's exit and teardown (every frame returned) |
 | `cell.pt_frames` | deterministic | Page-table frames of the `hello` cell's own half |
+| `cell.switch_ns/rhizo/<vmm>` | timing | Time per switch between two cells yielding to each other (system call in, scheduler, system call out), with address-space tags (ASID/PCID) |
+| `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 
 Each timing is the median (and p90) of `--runs` boots after one discarded
 warm-up boot. Lower is better for every metric.

@@ -327,6 +327,7 @@ dependencies = [
  "rhizo-core",
  "rhizo-hal",
  "rhizo-mm",
+ "rhizo-sched",
 ]
 
 [[package]]
@@ -335,6 +336,13 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "rhizo-hal",
+]
+
+[[package]]
+name = "rhizo-sched"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

@@ -70,23 +70,42 @@ pub fn uart() -> Option<Uart> {
     None
 }
 
-/// Maps the UART page as device memory in the MMIO window, where the console
-/// already reaches it through the stage-1 tables.
+/// GICv3 distributor and CPU 0 redistributor (`RD_base` and `SGI_base`):
+/// `(physical base, bytes)`.
+pub fn gic_regions() -> Option<[(u64, u64); 2]> {
+    let dt = device_tree();
+    let d = dt.find_compatible_reg(b"arm,gic-v3", 0).ok()??;
+    let r = dt.find_compatible_reg(b"arm,gic-v3", 1).ok()??;
+    Some([(d.base, 0x1_0000), (r.base, 0x2_0000)])
+}
+
+/// Maps the devices the kernel keeps using as device memory in the MMIO
+/// window, where the console already reaches its UART through the stage-1
+/// tables: the UART page and the GIC (distributor, CPU 0 redistributor).
 pub fn map_devices(
     pt: &PageTable<Format>,
     alloc: &mut impl FnMut() -> Option<u64>,
 ) -> Result<(), MapError> {
-    let Some(Uart::Pl011(r) | Uart::Ns16550(r)) = uart() else {
-        return Ok(());
-    };
-    let page = r.base & !(FRAME_SIZE - 1);
     let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
-    pt.map(
-        &mut DirectMap,
-        alloc,
-        MMIO_BASE + page,
-        page,
-        PageSize::Small,
-        flags,
-    )
+    let mut map = |base: u64, len: u64| {
+        let first = base & !(FRAME_SIZE - 1);
+        for page in (first..base + len).step_by(FRAME_SIZE as usize) {
+            pt.map(
+                &mut DirectMap,
+                alloc,
+                MMIO_BASE + page,
+                page,
+                PageSize::Small,
+                flags,
+            )?;
+        }
+        Ok(())
+    };
+    if let Some(Uart::Pl011(r) | Uart::Ns16550(r)) = uart() {
+        map(r.base, 1)?;
+    }
+    for (base, len) in gic_regions().into_iter().flatten() {
+        map(base, len)?;
+    }
+    Ok(())
 }
