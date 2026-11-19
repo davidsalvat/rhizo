@@ -9,14 +9,6 @@ use rhizo_mm::paging::{MapError, PageFlags, PageSize, PageTable};
 /// Page-table entry format of this architecture.
 pub type Format = rhizo_mm::paging::Aarch64;
 
-/// ELF machine of cell executables.
-pub const MACHINE: rhizo_cell::elf::Machine = rhizo_cell::elf::Machine::Aarch64;
-/// System-call convention of cells.
-pub const ABI: rhizo_abi::Arch = rhizo_abi::Arch::Aarch64;
-/// Whether a cell's root table must carry the kernel half: no, the kernel
-/// lives in `TTBR1_EL1` and the cell's table goes in `TTBR0_EL1`.
-pub const CELL_ROOT_HAS_KERNEL_HALF: bool = false;
-
 /// The device tree passed at boot, read through the direct map.
 pub fn device_tree() -> Fdt<'static> {
     let phys = super::boot::boot_arg();

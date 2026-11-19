@@ -9,8 +9,13 @@ use rhizo_hal::{ExitStatus, Power, Tlb};
 
 const KERNEL_CODE: u16 = 0x08;
 const TSS_SELECTOR: u16 = 0x18;
+/// `STAR` base for `SYSRET`: user data = base + 8 (0x28), user code =
+/// base + 16 (0x30), both with RPL 3.
+const SYSRET_BASE: u64 = 0x20;
 const DOUBLE_FAULT_IST: u8 = 1;
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+/// Stack the CPU switches to (TSS `RSP0`) on an exception from a cell.
+const TRAP_STACK_SIZE: usize = 16 * 1024;
 
 // ---------------------------------------------------------------------------
 // GDT and TSS
@@ -32,6 +37,7 @@ struct TaskStateSegment {
 struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
 static DOUBLE_FAULT_STACK: Global<Stack> = Global::new(Stack([0; DOUBLE_FAULT_STACK_SIZE]));
+static TRAP_STACK: Global<Stack> = Global::new(Stack([0; TRAP_STACK_SIZE]));
 
 static TSS: Global<TaskStateSegment> = Global::new(TaskStateSegment {
     reserved0: 0,
@@ -43,8 +49,17 @@ static TSS: Global<TaskStateSegment> = Global::new(TaskStateSegment {
     iomap_base: size_of::<TaskStateSegment>() as u16,
 });
 
-/// null, kernel code (0x08), kernel data (0x10), TSS (0x18, two slots).
-static GDT: Global<[u64; 5]> = Global::new([0, 0x00af_9a00_0000_ffff, 0x00cf_9200_0000_ffff, 0, 0]);
+/// null, kernel code (0x08), kernel data (0x10), TSS (0x18, two slots),
+/// user data (0x28), user code (0x30): the order `SYSCALL`/`SYSRET` need.
+static GDT: Global<[u64; 7]> = Global::new([
+    0,
+    0x00af_9a00_0000_ffff,
+    0x00cf_9200_0000_ffff,
+    0,
+    0,
+    0x00cf_f200_0000_ffff,
+    0x00af_fa00_0000_ffff,
+]);
 
 #[repr(C, packed)]
 struct DescriptorPointer {
@@ -64,8 +79,10 @@ fn tss_descriptor(base: u64) -> [u64; 2] {
 
 fn load_gdt_and_tss() {
     let stack_top = DOUBLE_FAULT_STACK.with(|s| s.0.as_ptr_range().end as u64);
+    let trap_top = TRAP_STACK.with(|s| s.0.as_ptr_range().end as u64);
     let tss_base = TSS.with(|tss| {
         tss.ist[(DOUBLE_FAULT_IST - 1) as usize] = stack_top;
+        tss.rsp[0] = trap_top;
         tss as *const TaskStateSegment as u64
     });
     let pointer = GDT.with(|gdt| {
@@ -73,7 +90,7 @@ fn load_gdt_and_tss() {
         gdt[3] = low;
         gdt[4] = high;
         DescriptorPointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             base: gdt.as_ptr() as u64,
         }
     });
@@ -90,9 +107,12 @@ fn load_gdt_and_tss() {
             "retfq",
             "2:",
             "mov {tmp:x}, 0x10",
+            "mov ss, {tmp:x}",
+            // Null data segments: valid in 64-bit mode at any privilege, so
+            // returning to a cell never reloads them.
+            "xor {tmp:e}, {tmp:e}",
             "mov ds, {tmp:x}",
             "mov es, {tmp:x}",
-            "mov ss, {tmp:x}",
             "ltr {tss:x}",
             ptr = in(reg) &pointer,
             code = const KERNEL_CODE as u64,
@@ -171,6 +191,8 @@ rhizo_isr_\n:
     .endr
 
 rhizo_isr_common:
+    testb $3, 24(%rsp)              // CS of the interrupted code: from a cell?
+    jnz rhizo_user_trap
     movq %rsp, %rdi
     andq $-16, %rsp
     call rhizo_exception_handler
@@ -241,10 +263,196 @@ fn load_idt() {
     unsafe { asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack)) };
 }
 
-/// Installs the GDT, TSS and IDT. Call once, early in boot.
+/// Installs the GDT, TSS and IDT and enables `SYSCALL`. Call once, early in
+/// boot.
 pub fn init() {
     load_gdt_and_tss();
     load_idt();
+    // SAFETY: enabling SYSCALL and pointing it at the entry stub below; the
+    // selectors match the GDT, and SFMASK clears IF, DF, TF and AC on entry.
+    unsafe {
+        wrmsr(EFER, rdmsr(EFER) | 1);
+        wrmsr(STAR, (SYSRET_BASE << 48) | ((KERNEL_CODE as u64) << 32));
+        wrmsr(LSTAR, rhizo_syscall_entry as *const () as u64);
+        wrmsr(SFMASK, 0x4_7700);
+    }
+}
+
+const EFER: u32 = 0xC000_0080;
+const STAR: u32 = 0xC000_0081;
+const LSTAR: u32 = 0xC000_0082;
+const SFMASK: u32 = 0xC000_0084;
+
+/// # Safety
+/// `msr` must exist on this CPU.
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: guaranteed by the caller.
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack))
+    };
+    ((high as u64) << 32) | low as u64
+}
+
+/// # Safety
+/// Writing `value` to `msr` must be valid and keep the kernel running.
+pub(super) unsafe fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: guaranteed by the caller.
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nostack))
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Cells: ring 3 entry and exit (design decision D4)
+// ---------------------------------------------------------------------------
+//
+// `rhizo_enter_cell(regs, sysret)` saves the kernel's callee-saved registers
+// and stack pointer, loads the cell's registers and drops to ring 3 with
+// `SYSRETQ` (after a system call, when RCX/R11 hold nothing the cell needs)
+// or `IRETQ` (any other time). The cell comes back through `SYSCALL`
+// (returns 256) or an exception from ring 3 (returns the vector): both save
+// its registers into `regs` and resume the kernel where it called in.
+//
+// `Registers` layout: pc 0, sp 8, gpr 16 + 8n (rax rbx rcx rdx rsi rdi rbp
+// r8-r15), tls 264, flags 272.
+core::arch::global_asm!(
+    r#"
+    .text
+    .global rhizo_enter_cell
+rhizo_enter_cell:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rip + rhizo_kernel_rsp], rsp
+    mov [rip + rhizo_cell_regs], rdi
+    mov rax, [rdi + 272]
+    and eax, 0xdd5                  // user flags only: CF PF AF ZF SF DF OF
+    or eax, 2                       // reserved bit; IF stays clear (no IRQs yet)
+    test rsi, rsi
+    jz 2f
+    mov r11, rax
+    mov rcx, [rdi + 0]
+    mov rsp, [rdi + 8]
+    mov rax, [rdi + 16]
+    mov rbx, [rdi + 24]
+    mov rdx, [rdi + 40]
+    mov rsi, [rdi + 48]
+    mov rbp, [rdi + 64]
+    mov r8, [rdi + 72]
+    mov r9, [rdi + 80]
+    mov r10, [rdi + 88]
+    mov r12, [rdi + 104]
+    mov r13, [rdi + 112]
+    mov r14, [rdi + 120]
+    mov r15, [rdi + 128]
+    mov rdi, [rdi + 56]
+    sysretq
+2:  push 0x2b                       // user SS
+    push qword ptr [rdi + 8]
+    push rax
+    push 0x33                       // user CS
+    push qword ptr [rdi + 0]
+    mov rax, [rdi + 16]
+    mov rbx, [rdi + 24]
+    mov rcx, [rdi + 32]
+    mov rdx, [rdi + 40]
+    mov rsi, [rdi + 48]
+    mov rbp, [rdi + 64]
+    mov r8, [rdi + 72]
+    mov r9, [rdi + 80]
+    mov r10, [rdi + 88]
+    mov r11, [rdi + 96]
+    mov r12, [rdi + 104]
+    mov r13, [rdi + 112]
+    mov r14, [rdi + 120]
+    mov r15, [rdi + 128]
+    mov rdi, [rdi + 56]
+    iretq
+
+    // SYSCALL: RIP in RCX, RFLAGS in R11, still on the cell's stack.
+    .global rhizo_syscall_entry
+rhizo_syscall_entry:
+    mov [rip + rhizo_user_rsp], rsp
+    mov rsp, [rip + rhizo_cell_regs]
+    mov [rsp + 16], rax
+    mov [rsp + 24], rbx
+    mov [rsp + 32], rcx
+    mov [rsp + 40], rdx
+    mov [rsp + 48], rsi
+    mov [rsp + 56], rdi
+    mov [rsp + 64], rbp
+    mov [rsp + 72], r8
+    mov [rsp + 80], r9
+    mov [rsp + 88], r10
+    mov [rsp + 96], r11
+    mov [rsp + 104], r12
+    mov [rsp + 112], r13
+    mov [rsp + 120], r14
+    mov [rsp + 128], r15
+    mov [rsp + 0], rcx
+    mov [rsp + 272], r11
+    mov rax, [rip + rhizo_user_rsp]
+    mov [rsp + 8], rax
+    mov eax, 256
+    jmp rhizo_back_to_kernel
+
+    // Exception from ring 3, on the TSS RSP0 stack: vector, error code,
+    // RIP, CS, RFLAGS, RSP, SS (pushed by the stub and the CPU).
+rhizo_user_trap:
+    push rax
+    mov rax, [rip + rhizo_cell_regs]
+    mov [rax + 24], rbx
+    mov [rax + 32], rcx
+    mov [rax + 40], rdx
+    mov [rax + 48], rsi
+    mov [rax + 56], rdi
+    mov [rax + 64], rbp
+    mov [rax + 72], r8
+    mov [rax + 80], r9
+    mov [rax + 88], r10
+    mov [rax + 96], r11
+    mov [rax + 104], r12
+    mov [rax + 112], r13
+    mov [rax + 120], r14
+    mov [rax + 128], r15
+    mov rbx, [rsp]
+    mov [rax + 16], rbx
+    mov rbx, [rsp + 24]
+    mov [rax + 0], rbx
+    mov rbx, [rsp + 48]
+    mov [rax + 8], rbx
+    mov rbx, [rsp + 40]
+    mov [rax + 272], rbx
+    mov rbx, [rsp + 16]
+    mov [rip + rhizo_trap_error], rbx
+    mov rax, [rsp + 8]
+rhizo_back_to_kernel:
+    mov rsp, [rip + rhizo_kernel_rsp]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+    .section .bss.cells, "aw", @nobits
+    .balign 8
+rhizo_kernel_rsp: .skip 8
+rhizo_cell_regs: .skip 8
+rhizo_user_rsp: .skip 8
+    .global rhizo_trap_error
+rhizo_trap_error: .skip 8
+    .text
+    "#
+);
+
+unsafe extern "C" {
+    fn rhizo_syscall_entry();
 }
 
 // ---------------------------------------------------------------------------
@@ -283,10 +491,6 @@ pub unsafe fn activate(root: u64, _alloc: &mut impl FnMut() -> Option<u64>) {
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    allow(dead_code, reason = "used by in-kernel tests; cells use it from H2")
-)]
 /// The CPU's TLB, flushed one page at a time with `invlpg`.
 #[derive(Debug)]
 pub struct CpuTlb;

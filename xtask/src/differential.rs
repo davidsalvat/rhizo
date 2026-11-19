@@ -1,0 +1,73 @@
+//! Differential check: the test cells are static Linux executables, so on a
+//! Linux host of the same architecture they run natively. Their output and
+//! ending must match `cells/expected.rs`, the expectations the in-kernel
+//! tests hold Rhizo to (spec `linux-abi`: same binary, same behavior).
+
+use crate::Result;
+use crate::report::Failure;
+use std::path::Path;
+use std::process::Command;
+
+mod expected {
+    include!("../../cells/expected.rs");
+}
+use expected::{Ending, PROGRAMS};
+
+/// Why the check cannot run on this host, if it cannot.
+pub fn unavailable_reason() -> Option<String> {
+    let host = std::env::consts::ARCH;
+    let target = crate::arch::current().id();
+    if std::env::consts::OS != "linux" {
+        return Some("the host is not Linux".into());
+    }
+    (host != target).then(|| format!("the host is {host}, the cells are {target}"))
+}
+
+/// How a native run ended, in the same terms as the kernel's.
+fn ending(status: std::process::ExitStatus) -> Option<Ending> {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => Some(Ending::Exit(code)),
+        (None, Some(11)) => Some(Ending::Fault), // SIGSEGV
+        _ => None,
+    }
+}
+
+/// Runs every test cell in `dir` natively and compares with the expectations.
+pub fn check(dir: &Path) -> Result {
+    for &(name, stdout, expected) in PROGRAMS {
+        let path = dir.join(name);
+        let out = Command::new(&path)
+            .arg0(name)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", path.display()))?;
+        let got_text = String::from_utf8_lossy(&out.stdout);
+        let got = ending(out.status);
+        if got != Some(expected) || got_text != stdout {
+            let reproduce = path.display().to_string();
+            return Err(Failure::new(
+                "differential",
+                format!("`{name}` behaves differently on Linux"),
+            )
+            .location(format!("cells/src/bin/{name}.rs"))
+            .expected(format!(
+                "{expected:?}, stdout {stdout:?} (cells/expected.rs)"
+            ))
+            .actual(format!("{:?}, stdout {got_text:?}", out.status))
+            .hint("Linux is the reference: fix the cell or the expectation, then make Rhizo match")
+            .reproduce(&reproduce)
+            .into_error());
+        }
+    }
+    Ok(())
+}
+
+trait Arg0 {
+    fn arg0(&mut self, name: &str) -> &mut Self;
+}
+
+impl Arg0 for Command {
+    fn arg0(&mut self, name: &str) -> &mut Self {
+        std::os::unix::process::CommandExt::arg0(self, name)
+    }
+}

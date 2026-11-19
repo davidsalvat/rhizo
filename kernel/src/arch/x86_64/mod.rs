@@ -10,6 +10,8 @@ pub mod serial;
 #[cfg(feature = "ktest")]
 pub mod tests;
 pub mod timer;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod user;
 
 /// Stops the CPU forever with interrupts disabled.
 pub fn halt_forever() -> ! {

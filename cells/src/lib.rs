@@ -76,7 +76,9 @@ pub fn print(bytes: &[u8]) {
 /// Ends the program with `status`.
 pub fn exit(status: i32) -> ! {
     syscall(nr::EXIT_GROUP, [status as usize, 0, 0, 0, 0, 0]);
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Checks a condition; on failure prints `FAIL <what>` and exits with 1.

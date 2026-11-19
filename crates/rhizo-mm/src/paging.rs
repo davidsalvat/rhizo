@@ -453,6 +453,23 @@ impl<F: EntryFormat> PageTable<F> {
         }
     }
 
+    /// Number of table frames used by the lower (user) half, root included.
+    pub fn lower_half_tables(&self, mem: &impl PhysicalMemory) -> usize {
+        fn walk<F: EntryFormat>(
+            mem: &impl PhysicalMemory,
+            table: u64,
+            level: u32,
+            range: core::ops::Range<u64>,
+        ) -> usize {
+            range
+                .map(|i| mem.read_u64(table + i * 8))
+                .filter(|&e| F::is_valid(e) && !F::is_leaf(e, level))
+                .map(|e| 1 + walk::<F>(mem, F::address(e), level - 1, 0..ENTRIES))
+                .sum()
+        }
+        1 + walk::<F>(mem, self.root, 3, 0..ENTRIES / 2)
+    }
+
     /// Frees everything mapped in the lower (user) half and every table frame
     /// it used, then the root: `free(phys, size)` is called once per mapped
     /// page and once per table frame (as `PageSize::Small`). The upper half is
@@ -815,6 +832,9 @@ mod tests {
                         cell.translate(&mem, 0xffff_8000_0000_1000).is_some(),
                         "kernel half shared"
                     );
+                    // Root + three levels for the 4 KiB page + two for the 2 MiB
+                    // one; the shared kernel half does not count.
+                    assert_eq!(cell.lower_half_tables(&mem), 6);
 
                     let mut freed = Vec::new();
                     cell.destroy_lower_half(&mut mem, &mut |phys, size| freed.push((phys, size)));

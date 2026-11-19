@@ -346,30 +346,32 @@ fn cell_says_hello() {
     run_expected("hello");
 }
 
-fn cell_exit_status_and_frames_return() {
+/// Runs `name` once to warm the kernel heap (which keeps the frames it
+/// grows into), then checks that running it again leaves free memory
+/// unchanged: every frame of the cell came back.
+fn assert_no_leak(name: &str) -> alloc::string::String {
+    run_expected(name);
     let before = memory::free_bytes();
-    run_expected("exit3");
-    run_expected("hello");
+    let text = run_expected(name);
     assert_eq!(
         memory::free_bytes(),
         before,
-        "every frame of the cells is returned"
+        "{name}: every frame is returned"
     );
+    text
+}
+
+fn cell_exit_status_and_frames_return() {
+    assert_no_leak("exit3");
+    assert_no_leak("hello");
 }
 
 fn cell_system_calls() {
-    let before = memory::free_bytes();
-    run_expected("abi");
-    assert_eq!(
-        memory::free_bytes(),
-        before,
-        "brk and mmap memory is returned"
-    );
+    assert_no_leak("abi");
 }
 
 fn cell_null_write_kills_only_the_cell() {
-    let before = memory::free_bytes();
-    let report = run_expected("fault_null");
+    let report = assert_no_leak("fault_null");
     assert!(report.contains(" killed: "), "{report}");
     assert!(report.contains("address 0x0: write"), "{report}");
     assert!(report.contains("user mode"), "{report}");

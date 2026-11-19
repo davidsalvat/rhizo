@@ -8,6 +8,8 @@ pub mod power;
 #[cfg(feature = "ktest")]
 pub mod tests;
 pub mod timer;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod user;
 
 /// Virtual window where physical 0–4 GiB is mapped as device memory.
 pub const MMIO_BASE: u64 = 0xffff_c000_0000_0000;

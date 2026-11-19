@@ -25,6 +25,9 @@ ktest-page-fault = ["ktest"]
 ktest-stack-overflow = ["ktest"]
 ktest-invalid-opcode = ["ktest"]
 ktest-oom = ["ktest"]
+# Benchmark build: spawn and run the hello cell repeatedly and print
+# `rhizo-cell spawn_ns=<median>` (`cargo xtask bench`).
+bench-cell = []
 
 [dependencies]
 rhizo-hal = { path = "../crates/rhizo-hal" }

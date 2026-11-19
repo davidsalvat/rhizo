@@ -25,6 +25,9 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `boot.kernel_cycles/rhizo/<vmm>` | timing | TSC cycles from the first kernel instruction to ready |
 | `image.size_bytes` | deterministic | Size of the release kernel image |
 | `memory.kernel_pt_frames` | deterministic | Frames used by the kernel's page tables |
+| `cell.spawn_us/rhizo/<vmm>` | timing | Median time to create the `hello` cell (tables, image, stack), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
+| `cell.run_us/rhizo/<vmm>` | timing | Median time from spawn to the cell's exit and teardown (every frame returned) |
+| `cell.pt_frames` | deterministic | Page-table frames of the `hello` cell's own half |
 
 Each timing is the median (and p90) of `--runs` boots after one discarded
 warm-up boot. Lower is better for every metric.
