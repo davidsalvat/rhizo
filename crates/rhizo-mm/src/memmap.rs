@@ -221,6 +221,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn accepts_newer_versions_and_exactly_the_maximum_entries() {
+        let mut mem = FakePhysicalMemory::new();
+        write_boot_info(&mut mem, 0x6000, 0x7000, &[(0, 0x1000, 1)]);
+        mem.write_u64(0x6000, (2u64 << 32) | PVH_MAGIC as u64); // version 2
+        mem.write_u64(0x6000 + 48, MAX_ENTRIES as u64);
+        assert_eq!(BootInfo::read(&mem, 0x6000).unwrap().entries, MAX_ENTRIES);
+    }
+
+    #[test]
     fn caps_the_number_of_entries() {
         let mut mem = FakePhysicalMemory::new();
         write_boot_info(&mut mem, 0x6000, 0x7000, &[(0, 0x1000, 1)]);

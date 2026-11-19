@@ -42,6 +42,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn layout_constants() {
+        assert_eq!(MAX_PHYS, 1 << 32);
+        assert_eq!(LARGE_PAGE_SIZE, 512 * FRAME_SIZE);
+    }
+
+    #[test]
     fn alignment_helpers() {
         assert_eq!(align_down(4097, 4096), 4096);
         assert_eq!(align_up(4097, 4096), 8192);

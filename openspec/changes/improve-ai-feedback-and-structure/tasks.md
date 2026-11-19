@@ -19,8 +19,8 @@
 
 - [x] 3.1 Add the workspace lints (dbg_macro, todo, unimplemented, print_stdout/print_stderr outside xtask, redundant_clone, needless_pass_by_value, unused_self) and fix findings; verify `cargo xtask check` passes
 - [x] 3.2 Add `deny.toml` (no GPL/AGPL/LGPL, advisories) and `cargo-machete`, both in CI; verify they pass in CI (the license list is an allow-list, so any GPL/AGPL/LGPL license is rejected by construction)
-- [ ] 3.3 Run the heap tests under Miri in CI; verify the job passes
-- [ ] 3.4 Add `cargo xtask mutants` and a weekly workflow (plus random-seed proptest run); verify locally on `rhizo-mm` and record surviving mutants
+- [x] 3.3 Run the heap tests under Miri in CI; verify the job passes (Miri found that the test page source leaked the pages the heap keeps by design; fixed in the test double)
+- [x] 3.4 Add `cargo xtask mutants` and a weekly workflow (plus random-seed proptest run); verify locally on `rhizo-mm` and record surviving mutants (first run: 392 caught, 63 missed; targeted tests added; the 8 left in the touched files only move the next-fit search start, which does not change results)
 
 ## 4. Agent rules and tooling
 
