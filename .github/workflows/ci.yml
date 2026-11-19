@@ -43,7 +43,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run all checks
-        run: cargo xtask --arch x86_64 ci
+        run: cargo xtask --arch x86_64 ci 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
+
+      - name: Report the failure as an annotation
+        if: failure()
+        run: |
+          log=ci.log
+          [ -f "$log" ] || log=/dev/null
+          echo "::error title=ci-log::$(tail -c 3000 "$log" | sed -e 's/%/%25/g' | tr '\n' '|')"
 
   ci-arm64:
     name: AArch64 fmt, clippy, tests (QEMU virt)
@@ -67,12 +74,19 @@ jobs:
           fi
 
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
+        run: rustup toolchain install 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run all checks
-        run: cargo xtask --arch aarch64 ci
+        run: cargo xtask --arch aarch64 ci 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
+
+      - name: Report the failure as an annotation
+        if: failure()
+        run: |
+          log=ci.log
+          [ -f "$log" ] || log=/dev/null
+          echo "::error title=ci-log::$(tail -c 3000 "$log" | sed -e 's/%/%25/g' | tr '\n' '|')"
 
   quality:
     name: dependency policy, unused dependencies, dependency rules
