@@ -13,6 +13,23 @@ use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::PageFlags;
 
+/// Builds a harness self-check: one passing case, then the case the harness
+/// must catch. A self-check proves the harness, not the suite (which runs on
+/// its own), so it stays short however long the suite grows.
+#[cfg(any(
+    feature = "ktest-should-panic",
+    feature = "ktest-hang",
+    feature = "ktest-page-fault",
+    feature = "ktest-stack-overflow",
+    feature = "ktest-invalid-opcode",
+    feature = "ktest-oom",
+))]
+macro_rules! self_check {
+    ($extra:path) => {
+        &[ktest_case!(console_output_works), ktest_case!($extra)]
+    };
+}
+
 /// Builds the suite: the regular tests, followed by any extra cases.
 macro_rules! suite {
     ($($extra:path),* $(,)?) => {
@@ -68,29 +85,42 @@ macro_rules! suite {
 /// Every in-kernel test case, in execution order.
 pub static ALL: &[TestCase] = suite!();
 
-/// Harness self-check: the regular suite plus a test that panics.
-#[cfg(feature = "ktest-should-panic")]
-pub static ALL: &[TestCase] = suite!(deliberate_panic);
+/// In self-check builds the regular suite is compiled but not run (it runs
+/// in the `ktest` build): referenced here so it keeps compiling everywhere.
+#[cfg(any(
+    feature = "ktest-should-panic",
+    feature = "ktest-hang",
+    feature = "ktest-page-fault",
+    feature = "ktest-stack-overflow",
+    feature = "ktest-invalid-opcode",
+    feature = "ktest-oom",
+))]
+#[allow(dead_code, reason = "the suite runs in the regular `ktest` build")]
+static SUITE: &[TestCase] = suite!();
 
-/// Harness self-check: the regular suite plus a test that never finishes.
+/// Harness self-check: a test that panics.
+#[cfg(feature = "ktest-should-panic")]
+pub static ALL: &[TestCase] = self_check!(deliberate_panic);
+
+/// Harness self-check: a test that never finishes.
 #[cfg(feature = "ktest-hang")]
-pub static ALL: &[TestCase] = suite!(hang_forever);
+pub static ALL: &[TestCase] = self_check!(hang_forever);
 
 /// Self-check: a write to address 0 must be reported as a page fault.
 #[cfg(feature = "ktest-page-fault")]
-pub static ALL: &[TestCase] = suite!(write_to_null);
+pub static ALL: &[TestCase] = self_check!(write_to_null);
 
 /// Self-check: stack exhaustion must be reported as a double fault.
 #[cfg(feature = "ktest-stack-overflow")]
-pub static ALL: &[TestCase] = suite!(overflow_the_stack);
+pub static ALL: &[TestCase] = self_check!(overflow_the_stack);
 
 /// Self-check: an invalid instruction must be reported.
 #[cfg(feature = "ktest-invalid-opcode")]
-pub static ALL: &[TestCase] = suite!(execute_invalid_opcode);
+pub static ALL: &[TestCase] = self_check!(execute_invalid_opcode);
 
 /// Self-check: an impossible allocation must panic with its size.
 #[cfg(feature = "ktest-oom")]
-pub static ALL: &[TestCase] = suite!(allocate_too_much);
+pub static ALL: &[TestCase] = self_check!(allocate_too_much);
 
 // --- H0 tests ---------------------------------------------------------------
 
