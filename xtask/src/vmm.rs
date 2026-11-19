@@ -269,7 +269,7 @@ fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result
 /// `microvm`, where Linux otherwise registers no serial console and `/init`
 /// output is lost. On AArch64 the console is the PL011 (`ttyAMA0`) except on
 /// Firecracker, which emulates a 16550 (`ttyS0`).
-fn linux_cmdline(vmm: Vmm) -> &'static str {
+pub(crate) fn linux_cmdline(vmm: Vmm) -> &'static str {
     match (arch::current(), vmm) {
         (Arch::X86_64, _) => {
             "console=ttyS0 earlyprintk=ttyS0 quiet loglevel=0 panic=-1 reboot=k pci=off \
