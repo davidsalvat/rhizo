@@ -59,6 +59,11 @@ impl Console for KernelServices<'_> {
 }
 
 impl Services for KernelServices<'_> {
+    fn log(&mut self, message: core::fmt::Arguments<'_>) {
+        use core::fmt::Write;
+        let _ = writeln!(rhizo_hal::ConsoleWriter(&mut BootConsole), "{message}");
+    }
+
     fn monotonic_ns(&mut self) -> u64 {
         timer::cycles_to_ns(Counter.cycles()).unwrap_or(0)
     }

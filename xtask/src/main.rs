@@ -668,6 +668,7 @@ const SELF_CHECKS: &[SelfCheck] = &[
 /// VMMs boot (the ELF on x86_64, a flat arm64 Image on AArch64).
 pub(crate) fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBuf> {
     let target = arch::current().target();
+    let cells = build_cells()?;
     let mut args = vec!["build", "-p", KERNEL_PACKAGE, "--target", target];
     if profile == Profile::Release {
         args.push("--release");
@@ -676,8 +677,28 @@ pub(crate) fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBu
     if !features.is_empty() {
         args.extend(["--features", &joined]);
     }
-    cargo(&args)?;
+    cargo_env(&args, &[("RHIZO_CELLS_DIR", cells.as_os_str())])?;
     arch::current().bootable_image(&kernel_elf(profile))
+}
+
+/// Builds the test cells (`cells/`, static Linux executables for the selected
+/// architecture) and returns the directory holding them. They have their own
+/// target directory so their link flags never invalidate the kernel build.
+pub(crate) fn build_cells() -> Result<PathBuf> {
+    let target = arch::current().target();
+    let dir = target_dir().join("cells");
+    let dir_str = dir.to_string_lossy().into_owned();
+    cargo(&[
+        "build",
+        "-p",
+        "rhizo-cells",
+        "--target",
+        target,
+        "--release",
+        "--target-dir",
+        &dir_str,
+    ])?;
+    Ok(dir.join(target).join("release"))
 }
 
 /// The linked kernel ELF (with symbols) for the selected architecture.
@@ -689,9 +710,14 @@ fn kernel_elf(profile: Profile) -> PathBuf {
 }
 
 fn cargo(args: &[&str]) -> Result {
+    cargo_env(args, &[])
+}
+
+fn cargo_env(args: &[&str], vars: &[(&str, &std::ffi::OsStr)]) -> Result {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(&cargo)
         .args(args)
+        .envs(vars.iter().copied())
         .current_dir(workspace_root())
         .stdout(report::child_stdout())
         .status()

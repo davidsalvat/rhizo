@@ -322,6 +322,8 @@ version = "0.1.0"
 name = "rhizo-kernel"
 version = "0.1.0"
 dependencies = [
+ "rhizo-abi",
+ "rhizo-cell",
  "rhizo-core",
  "rhizo-hal",
  "rhizo-mm",

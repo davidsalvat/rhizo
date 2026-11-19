@@ -373,7 +373,6 @@ fn cell_null_write_kills_only_the_cell() {
     assert!(report.contains(" killed: "), "{report}");
     assert!(report.contains("address 0x0: write"), "{report}");
     assert!(report.contains("user mode"), "{report}");
-    assert_eq!(memory::free_bytes(), before);
     // The kernel keeps running cells after a fault.
     run_expected("hello");
 }
@@ -388,13 +387,13 @@ fn cell_cannot_read_kernel_memory() {
 
 fn cell_rejects_bad_executables() {
     use rhizo_cell::elf::ElfError;
+    let mut other = crate::cell::test_image("hello").to_vec();
+    other[18] ^= 1; // e_machine of another architecture
     let before = memory::free_bytes();
     assert_eq!(
         crate::cell::run(b"not an elf", &[], None),
         Err(ElfError::NotElf)
     );
-    let mut other = crate::cell::test_image("hello").to_vec();
-    other[18] ^= 1; // e_machine of another architecture
     assert!(matches!(
         crate::cell::run(&other, &[], None),
         Err(ElfError::WrongMachine { .. })

@@ -7,10 +7,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use core::fmt::Write;
+use core::fmt;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::{Cell, MMAP_BASE, STACK_PAGES, STACK_TOP, memory};
-use rhizo_hal::{Console, ConsoleWriter, PhysicalMemory, Tlb};
+use rhizo_hal::{Console, PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
 
@@ -101,8 +101,11 @@ impl Arch {
     }
 }
 
-/// What the kernel provides to system calls besides memory.
+/// What the kernel provides to system calls besides memory. Its `Console`
+/// is the cell's standard output and error.
 pub trait Services: Console {
+    /// Prints a kernel message about the cell (not part of its output).
+    fn log(&mut self, message: fmt::Arguments<'_>);
     /// Nanoseconds since boot.
     fn monotonic_ns(&mut self) -> u64;
     /// Nanoseconds since the Unix epoch.
@@ -203,17 +206,14 @@ impl Abi {
         Outcome::Resume
     }
 
-    fn report_unimplemented(&mut self, cell: u32, nr: u64, out: &mut impl Console) {
+    fn report_unimplemented(&mut self, cell: u32, nr: u64, out: &mut impl Services) {
         if let Some(word) = self.reported.get_mut((nr / 64) as usize) {
             if *word & (1 << (nr % 64)) != 0 {
                 return;
             }
             *word |= 1 << (nr % 64);
         }
-        let _ = writeln!(
-            ConsoleWriter(out),
-            "cell {cell}: unimplemented syscall {nr}"
-        );
+        out.log(format_args!("cell {cell}: unimplemented syscall {nr}"));
     }
 }
 

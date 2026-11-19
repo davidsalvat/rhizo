@@ -9,6 +9,7 @@ use rhizo_mm::paging::{Aarch64, PageSize};
 #[derive(Default)]
 struct FakeServices {
     console: RecordingConsole,
+    log: String,
     clock: u64,
 }
 
@@ -19,6 +20,9 @@ impl Console for FakeServices {
 }
 
 impl Services for FakeServices {
+    fn log(&mut self, message: core::fmt::Arguments<'_>) {
+        self.log.push_str(&format!("{message}\n"));
+    }
     fn monotonic_ns(&mut self) -> u64 {
         self.clock
     }
@@ -216,8 +220,13 @@ fn unknown_calls_return_enosys_and_are_reported_once() {
     assert_eq!(w.call(999, &[]).0, -ENOSYS);
     assert_eq!(w.call(1 << 40, &[]).0, -ENOSYS);
     assert_eq!(
-        w.services.console.text(),
+        w.services.log,
         "cell 5: unimplemented syscall 999\ncell 5: unimplemented syscall 1099511627776\n"
+    );
+    assert_eq!(
+        w.services.console.text(),
+        "",
+        "kernel messages are not cell output"
     );
 }
 
