@@ -1,0 +1,44 @@
+name: weekly
+
+# Slow checks that do not belong on every pull request (see
+# openspec/specs/code-quality-gates and developer-feedback).
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: Mutation testing (rhizo-mm, rhizo-core)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Run mutation testing
+        run: cargo xtask mutants
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants.out
+
+  proptest-random:
+    name: Property tests with random seeds and more cases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - name: Run with a random seed
+        run: |
+          seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+          echo "PROPTEST_RNG_SEED=$seed (rerun a failure with this value)"
+          PROPTEST_RNG_SEED=$seed PROPTEST_CASES=4096 cargo test -p rhizo-mm

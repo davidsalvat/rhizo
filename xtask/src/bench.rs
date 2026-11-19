@@ -1,6 +1,7 @@
 //! `cargo xtask bench`: boot benchmarks, baseline gate and README chart
 //! (design decisions D7 and D8).
 
+use crate::report::{self, Failure};
 use crate::vmm::{self, Accel, Guest, RunOptions, VmResult, Vmm};
 use crate::{Profile, Result, build_kernel, refguest, tools, workspace_root};
 use serde_json::{Map, Value, json};
@@ -217,7 +218,7 @@ pub fn cmd(opts: &Options) -> Result {
         let text = serde_json::to_string_pretty(&results.to_json()).expect("serializable");
         fs::write(path, text + "\n")
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        println!("results written to {}", path.display());
+        report::text(&format!("results written to {}", path.display()));
     }
     if opts.update_baseline {
         update_baseline(&opts.env, &results)?;
@@ -255,7 +256,7 @@ fn measure(opts: &Options) -> Result<Results> {
 
     for &vmm in &opts.vmms {
         if let Some(reason) = vmm.unavailable_reason(opts.accel) {
-            println!("skipping {}: {reason}", vmm.id());
+            report::text(&format!("skipping {}: {reason}", vmm.id()));
             skipped.push((vmm.id().into(), reason));
             continue;
         }
@@ -352,7 +353,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         Guest::Rhizo(_) => "rhizo",
         Guest::ReferenceLinux { .. } => "linux",
     };
-    print!("{name} on {}: ", vmm.id());
+    report::text(&format!("{name} on {}: {runs} boots", vmm.id()));
     let opts = RunOptions {
         stop_at_ready: true,
         timeout: RUN_TIMEOUT,
@@ -368,7 +369,6 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
     for i in 0..=runs {
         let run = vmm::run(vmm, guest, opts)?;
         let Some(ready) = run.time_to_ready else {
-            println!("failed");
             return Err(format!(
                 "{name} on {} never printed the ready marker ({:?}); output:\n{}",
                 vmm.id(),
@@ -387,11 +387,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         if let Some(c) = run.ready_cycles {
             samples.cycles.push(c as f64);
         }
-        print!(".");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
     }
-    println!(" done");
     Ok(samples)
 }
 
@@ -411,27 +407,28 @@ fn today() -> String {
 }
 
 fn print_table(results: &Results) {
-    println!(
+    report::data("bench-results", &results.to_json());
+    report::text(&format!(
         "\nbenchmark results (environment `{}`, {}, KVM: {})",
         results.environment,
         results.date,
         if results.kvm { "yes" } else { "no" }
-    );
-    println!(
+    ));
+    report::text(&format!(
         "{:<44} {:>14} {:>14} {:>5}",
         "metric", "median", "p90", "runs"
-    );
+    ));
     for m in &results.metrics {
-        println!(
+        report::text(&format!(
             "{:<44} {:>14} {:>14} {:>5}",
             m.key(),
             format!("{:.3} {}", m.median, m.unit),
             format!("{:.3}", m.p90),
             m.runs
-        );
+        ));
     }
     for (vmm, reason) in &results.skipped {
-        println!("skipped {vmm}: {reason}");
+        report::text(&format!("skipped {vmm}: {reason}"));
     }
 }
 
@@ -515,28 +512,39 @@ fn check_baseline(env: &str, results: &Results) -> Result {
         .as_object()
         .is_none_or(Map::is_empty)
     {
-        println!("no baseline stored for environment `{env}`; nothing to compare");
+        report::text(&format!(
+            "no baseline stored for environment `{env}`; nothing to compare"
+        ));
         return Ok(());
     }
     let found = regressions(&baseline, env, results);
     if found.is_empty() {
-        println!("benchmark gate: every metric is within its threshold for `{env}`");
+        report::text(&format!(
+            "benchmark gate: every metric is within its threshold for `{env}`"
+        ));
         return Ok(());
     }
-    let mut message = format!("benchmark regression in environment `{env}`:\n");
-    for r in &found {
-        message += &format!(
-            "  {}: {:.3} -> {:.3} (+{:.1}%, allowed +{:.0}%)\n",
-            r.key,
-            r.baseline,
-            r.current,
-            r.worse_pct(),
-            r.allowed_pct
-        );
-    }
-    message += "If the regression is intended, justify it in the pull request and run\n";
-    message += &format!("  cargo xtask bench --env {env} --update-baseline");
-    Err(message)
+    let errors: Vec<String> = found
+        .iter()
+        .map(|r| {
+            Failure::new("bench", format!("benchmark regression: {}", r.key))
+                .location(format!("{BASELINE} (environment `{env}`)"))
+                .expected(format!(
+                    "at most {:.3} (baseline {:.3} + {:.0}%)",
+                    r.baseline * (1.0 + r.allowed_pct / 100.0),
+                    r.baseline,
+                    r.allowed_pct
+                ))
+                .actual(format!("{:.3} (+{:.1}%)", r.current, r.worse_pct()))
+                .hint(format!(
+                    "find what made it slower; if the regression is intended, justify it in the \
+                     pull request and run `cargo xtask bench --env {env} --update-baseline`"
+                ))
+                .reproduce(format!("cargo xtask bench --env {env} --check"))
+                .into_error()
+        })
+        .collect();
+    Err(errors.join("\n"))
 }
 
 fn update_baseline(env: &str, results: &Results) -> Result {
@@ -551,7 +559,7 @@ fn update_baseline(env: &str, results: &Results) -> Result {
     }
     let text = serde_json::to_string_pretty(&baseline).expect("serializable");
     fs::write(baseline_path(), text + "\n").map_err(|e| format!("cannot write baseline: {e}"))?;
-    println!("baseline for `{env}` updated in {BASELINE}");
+    report::text(&format!("baseline for `{env}` updated in {BASELINE}"));
     Ok(())
 }
 
@@ -567,6 +575,122 @@ fn vmm_label(id: &str) -> &str {
         "cloud-hypervisor" => "Cloud Hypervisor",
         other => other,
     }
+}
+
+/// Path of the generated chart, relative to the workspace root.
+const CHART: &str = "bench/boot-time.svg";
+
+/// Order in which VMMs appear in the chart.
+const CHART_VMMS: [&str; 4] = [
+    "firecracker",
+    "cloud-hypervisor",
+    "qemu-microvm",
+    "qemu-q35",
+];
+
+fn median_of<'a>(ready: &[&'a Metric], guest: &str, vmm: &str) -> Option<&'a Metric> {
+    ready
+        .iter()
+        .copied()
+        .find(|m| m.guest == guest && m.vmm.as_deref() == Some(vmm))
+}
+
+/// Horizontal grouped bar chart (one group per VMM, Rhizo vs Linux), as SVG.
+/// Colors and grey text read well on both light and dark backgrounds.
+pub fn chart_svg(results: &Results) -> String {
+    const WIDTH: f64 = 760.0;
+    const LABEL_W: f64 = 150.0;
+    const RIGHT_W: f64 = 150.0;
+    const BAR_H: f64 = 16.0;
+    const GROUP_H: f64 = 56.0;
+    const TOP: f64 = 70.0;
+    const RHIZO: &str = "#2563eb";
+    const LINUX: &str = "#f97316";
+    const TEXT: &str = "#8b949e";
+
+    let ready: Vec<&Metric> = results
+        .metrics
+        .iter()
+        .filter(|m| m.name == "boot.time_to_ready_ms")
+        .collect();
+    let vmms: Vec<&str> = CHART_VMMS
+        .iter()
+        .copied()
+        .filter(|v| {
+            median_of(&ready, "rhizo", v).is_some() || median_of(&ready, "linux", v).is_some()
+        })
+        .collect();
+    let max = ready.iter().map(|m| m.median).fold(1.0, f64::max);
+    let plot_w = WIDTH - LABEL_W - RIGHT_W;
+    let height = TOP + GROUP_H * vmms.len() as f64 + 40.0;
+
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{WIDTH}\" height=\"{height}\" \
+         viewBox=\"0 0 {WIDTH} {height}\" font-family=\"-apple-system, Segoe UI, Helvetica, Arial, sans-serif\" \
+         font-size=\"13\" fill=\"{TEXT}\">\n"
+    );
+    svg += "  <text x=\"0\" y=\"22\" font-size=\"16\" font-weight=\"600\">Time from VMM launch to guest ready \
+         (median, lower is better)</text>\n";
+    for (i, (label, color)) in [("Rhizo", RHIZO), ("Linux (reference guest)", LINUX)]
+        .iter()
+        .enumerate()
+    {
+        let x = i as f64 * 120.0;
+        svg += &format!(
+            "  <rect x=\"{x}\" y=\"36\" width=\"12\" height=\"12\" rx=\"2\" fill=\"{color}\"/>\n  \
+             <text x=\"{}\" y=\"47\">{label}</text>\n",
+            x + 18.0
+        );
+    }
+    for (row, vmm) in vmms.iter().enumerate() {
+        let y0 = TOP + row as f64 * GROUP_H;
+        svg += &format!(
+            "  <text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-weight=\"600\">{}</text>\n",
+            LABEL_W - 12.0,
+            y0 + BAR_H + 4.0,
+            vmm_label(vmm)
+        );
+        let rhizo = median_of(&ready, "rhizo", vmm);
+        let linux = median_of(&ready, "linux", vmm);
+        for (k, (metric, color)) in [(rhizo, RHIZO), (linux, LINUX)].into_iter().enumerate() {
+            let y = y0 + k as f64 * (BAR_H + 4.0);
+            match metric {
+                Some(m) => {
+                    let w = (m.median / max * plot_w).max(2.0);
+                    svg += &format!(
+                        "  <rect x=\"{LABEL_W}\" y=\"{y}\" width=\"{w:.1}\" height=\"{BAR_H}\" rx=\"3\" fill=\"{color}\"/>\n  \
+                         <text x=\"{:.1}\" y=\"{:.1}\">{:.1} ms</text>\n",
+                        LABEL_W + w + 6.0,
+                        y + BAR_H - 3.0,
+                        m.median
+                    );
+                }
+                None => {
+                    svg += &format!(
+                        "  <text x=\"{LABEL_W}\" y=\"{:.1}\" font-style=\"italic\">not measured</text>\n",
+                        y + BAR_H - 3.0
+                    );
+                }
+            }
+        }
+        if let (Some(r), Some(l)) = (rhizo, linux) {
+            svg += &format!(
+                "  <text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-weight=\"600\" fill=\"{RHIZO}\">{:.0}× faster</text>\n",
+                WIDTH - 4.0,
+                y0 + BAR_H + 4.0,
+                l.median / r.median
+            );
+        }
+    }
+    svg += &format!(
+        "  <text x=\"0\" y=\"{}\" font-size=\"12\">Environment: {}, KVM: {}, {}. \
+         Generated by cargo xtask bench --readme.</text>\n</svg>\n",
+        height - 10.0,
+        results.environment,
+        if results.kvm { "yes" } else { "no" },
+        results.date
+    );
+    svg
 }
 
 /// Markdown for the README benchmark section.
@@ -585,36 +709,29 @@ pub fn readme_section(results: &Results) -> String {
         s += "_No timing results yet._\n";
         return s;
     }
-    let labels: Vec<String> = ready
-        .iter()
-        .map(|m| {
-            let guest = if m.guest == "rhizo" { "Rhizo" } else { "Linux" };
-            format!(
-                "\"{} · {}\"",
-                guest,
-                vmm_label(m.vmm.as_deref().unwrap_or("?"))
-            )
-        })
-        .collect();
-    let values: Vec<String> = ready.iter().map(|m| format!("{:.1}", m.median)).collect();
-    s += "```mermaid\nxychart-beta\n";
-    s += "    title \"Time to ready (ms, median, lower is better)\"\n";
-    s += &format!("    x-axis [{}]\n", labels.join(", "));
-    s += "    y-axis \"milliseconds\"\n";
-    s += &format!("    bar [{}]\n```\n\n", values.join(", "));
-    s += "| Guest | VMM | Median (ms) | p90 (ms) | Runs |\n|---|---|---:|---:|---:|\n";
-    for m in &ready {
+    s += &format!("![Boot time: Rhizo vs a reference Linux guest]({CHART})\n\n");
+    s += "| VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |\n";
+    s += "|---|---:|---:|---:|---:|---:|\n";
+    let cell = |m: Option<&Metric>, p90: bool| {
+        m.map_or_else(
+            || "—".to_string(),
+            |m| format!("{:.1}", if p90 { m.p90 } else { m.median }),
+        )
+    };
+    for vmm in CHART_VMMS {
+        let rhizo = median_of(&ready, "rhizo", vmm);
+        let linux = median_of(&ready, "linux", vmm);
+        if rhizo.is_none() && linux.is_none() {
+            continue;
+        }
         s += &format!(
-            "| {} | {} | {:.1} | {:.1} | {} |\n",
-            if m.guest == "rhizo" {
-                "Rhizo"
-            } else {
-                "Linux (reference)"
-            },
-            vmm_label(m.vmm.as_deref().unwrap_or("?")),
-            m.median,
-            m.p90,
-            m.runs
+            "| {} | {} | {} | {} | {} | {} |\n",
+            vmm_label(vmm),
+            cell(rhizo, false),
+            cell(rhizo, true),
+            cell(linux, false),
+            cell(linux, true),
+            rhizo.or(linux).map_or(0, |m| m.runs)
         );
     }
     s += &format!(
@@ -631,7 +748,10 @@ fn update_readme(results: &Results) -> Result {
     let text = fs::read_to_string(&path).map_err(|e| format!("cannot read README.md: {e}"))?;
     let new = replace_section(&text, &readme_section(results))?;
     fs::write(&path, new).map_err(|e| format!("cannot write README.md: {e}"))?;
-    println!("README.md benchmark section updated");
+    let chart = workspace_root().join(CHART);
+    fs::write(&chart, chart_svg(results))
+        .map_err(|e| format!("cannot write {}: {e}", chart.display()))?;
+    report::text("README.md benchmark section updated");
     Ok(())
 }
 
@@ -761,13 +881,38 @@ mod tests {
         let r = results(vec![
             metric("boot.time_to_ready_ms", "rhizo", Some("firecracker"), 4.2),
             metric("boot.time_to_ready_ms", "linux", Some("firecracker"), 130.0),
+            metric("boot.time_to_ready_ms", "rhizo", Some("qemu-microvm"), 40.0),
         ]);
         let s = readme_section(&r);
-        assert!(s.contains("xychart-beta"));
-        assert!(s.contains("\"Rhizo · Firecracker\", \"Linux · Firecracker\""));
-        assert!(s.contains("bar [4.2, 130.0]"));
-        assert!(s.contains("| Linux (reference) | Firecracker | 130.0 |"));
+        assert!(s.contains("![Boot time: Rhizo vs a reference Linux guest](bench/boot-time.svg)"));
+        assert!(s.contains("| Firecracker | 4.2 | 4.2 | 130.0 | 130.0 | 5 |"));
+        assert!(s.contains("| QEMU microvm | 40.0 | 40.0 | — | — | 5 |"));
         assert!(s.contains("Environment: `ci`, KVM: yes, measured 2026-11-19"));
+    }
+
+    #[test]
+    fn chart_has_two_colors_legend_values_and_speedup() {
+        let r = results(vec![
+            metric("boot.time_to_ready_ms", "rhizo", Some("firecracker"), 4.0),
+            metric("boot.time_to_ready_ms", "linux", Some("firecracker"), 120.0),
+            metric("boot.time_to_ready_ms", "rhizo", Some("qemu-microvm"), 40.0),
+        ]);
+        let svg = chart_svg(&r);
+        assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains("#2563eb") && svg.contains("#f97316"));
+        assert!(svg.contains(">Rhizo</text>") && svg.contains(">Linux (reference guest)</text>"));
+        assert!(svg.contains(">4.0 ms</text>") && svg.contains(">120.0 ms</text>"));
+        assert!(svg.contains(">30× faster</text>"));
+        assert!(
+            svg.contains("not measured"),
+            "missing Linux on microvm is labelled"
+        );
+        // One label per VMM row, never squeezed under the bars.
+        assert_eq!(
+            svg.matches("text-anchor=\"end\" font-weight=\"600\">")
+                .count(),
+            2
+        );
     }
 
     #[test]

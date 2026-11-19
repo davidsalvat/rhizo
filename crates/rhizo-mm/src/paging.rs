@@ -4,7 +4,7 @@
 //! invalidation through [`Tlb`], so the same code runs in the kernel and in
 //! host tests.
 
-use super::{FRAME_SIZE, LARGE_PAGE_SIZE};
+use crate::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_hal::{PhysicalMemory, Tlb};
 
 /// Page-table entry flags (subset used by Rhizo).

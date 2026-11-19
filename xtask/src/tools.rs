@@ -90,7 +90,7 @@ pub fn reference_kernel() -> Result<PathBuf> {
 fn fetch(artifact: &Artifact) -> Result<PathBuf> {
     let path = dir()?.join(artifact.file);
     if !path.exists() {
-        println!("[xtask] downloading {}", artifact.url);
+        crate::report::text(&format!("[xtask] downloading {}", artifact.url));
         let partial = path.with_extension("partial");
         run(Command::new("curl")
             .args([
@@ -106,10 +106,10 @@ fn fetch(artifact: &Artifact) -> Result<PathBuf> {
     }
     let actual = sha256(&path)?;
     if artifact.sha256.is_empty() {
-        println!(
+        crate::report::text(&format!(
             "[xtask] {} is not pinned yet; sha256 = {actual} (add it to xtask/src/tools.rs)",
             artifact.file
-        );
+        ));
         if env::var_os("GITHUB_ACTIONS").is_some() {
             println!("::notice title=unpinned-sha256::{} {actual}", artifact.file);
         }

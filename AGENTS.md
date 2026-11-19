@@ -55,6 +55,15 @@ This repository uses spec-driven development with
 8. **No silent regressions.** No pull request may make a benchmark metric
    worse without a written justification in the pull request; updating
    `bench/baseline.json` is an explicit, justified change.
+9. **Tests check behavior, and tests are not weakened.** Tests assert
+   observable behavior through public interfaces, not internal details.
+   Never weaken, skip, `#[ignore]` or delete a test, or loosen an assertion,
+   to make it pass. If the expected behavior really changed, change the spec
+   first and justify the test change in the pull request.
+10. **Minimal code.** Write the smallest solution that meets the spec: no
+    speculative abstractions, no generality nobody uses yet, no new
+    dependency without a justification in the design (license included).
+    Delete dead code instead of commenting it out.
 
 ## Conventions
 
@@ -69,27 +78,52 @@ This repository uses spec-driven development with
 
 Requires the Rust toolchain (via rustup) and `qemu-system-x86_64`.
 
-- `cargo xtask build` / `cargo xtask run`: build / boot the kernel in QEMU.
-- `cargo test`: host tests only (no QEMU).
-- `cargo xtask test`: host tests, boot check, in-kernel tests in QEMU and
-  harness self-checks.
-- `cargo xtask ci`: formatting, clippy (host crates and every kernel feature
-  set) and all tests. **Run this before proposing any change.**
-- `cargo xtask bench`: release-build boot benchmarks per VMM; add
-  `--env ci --check` to compare with the stored baseline.
+The feedback loop, fastest first:
+
+| Command | Time | What |
+|---|---|---|
+| `cargo test -p <crate> <name>` | < 1 s | One host test |
+| `cargo xtask check` | seconds | fmt, clippy (all crates), host tests, crate dependency rules. **Run after every edit.** |
+| `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, or a self-check such as `ktest-page-fault` |
+| `cargo xtask test` | ~1 min | Host tests, boot check, in-kernel tests, all self-checks |
+| `cargo xtask ci` | minutes | Everything CI runs. **Run before pushing.** |
+| `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates) |
+| `cargo xtask mutants` | long | Mutation testing (weekly in CI) |
+
+- Add `--json` to `check`, `test`, `ci` or `bench` for one JSON object per
+  line on stdout (`step`, `failure`, `data`, `summary`).
+- Every failure prints `FAILED <kind>` with `where`, `expected`, `actual`,
+  `hint` and an exact `reproduce` command. Start from `reproduce`.
+- Property tests use a fixed seed (`.cargo/config.toml`); override with
+  `PROPTEST_RNG_SEED`. Commit any `proptest-regressions/` file a failure
+  creates.
 - VMMs: `--vmm qemu-microvm` (default), `qemu-q35`, `firecracker`,
   `cloud-hypervisor` (the last two need KVM). The kernel reads `console=` and
   `exit=` from the PVH command line; `xtask` passes the right values.
+- Project skills (open Agent Skills format) live in `.agents/skills/`:
+  `openspec-change`, `kernel-test`, `benchmarks`, `boot-debugging`.
 
-Layout and where code belongs:
+## Code map
 
-- `crates/rhizo-hal/`: hardware interfaces (traits) and host test doubles.
-- `crates/rhizo-core/`: hardware-independent logic. Prefer putting logic here
-  so it can be unit-tested on the host.
-- `kernel/src/arch/`: the only place for assembly, port I/O and other direct
-  hardware access.
-- `kernel/src/tests.rs`: in-kernel tests (run inside QEMU).
-- `xtask/`: developer tooling.
+| Crate | Owns | May depend on (workspace) |
+|---|---|---|
+| `crates/rhizo-hal` | Hardware interfaces (traits) and host test doubles | — |
+| `crates/rhizo-core` | Boot reports, boot options, exception reports, in-kernel test runner | `rhizo-hal` |
+| `crates/rhizo-mm` | Memory map, frame allocator, page tables, kernel heap | `rhizo-hal` |
+| `kernel` | Platform code (`src/arch/`) and wiring; in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm` |
+| `xtask` | Developer tooling (host only) | — |
+
+Planned, created by the milestone that adds their code (not before):
+`rhizo-cell` (H2: cells, address spaces, serializable state), `rhizo-abi`
+(H2: Linux syscalls), `rhizo-sched` (H3), `rhizo-snapshot` (H4–H5: suspend,
+resume, fork, copy-on-write, templates).
+
+Rules, checked by `cargo xtask check` (`xtask/src/deps.rs`): no cycles;
+`rhizo-hal` depends on nothing; only `kernel` contains platform code
+(assembly, ports, control registers); library crates never depend on
+`kernel`. A new crate adds its row to `xtask/src/deps.rs` and to this table in
+the same pull request. Prefer putting logic in a library crate so it is
+tested on the host.
 
 Memory layout (see `openspec/specs/virtual-memory`):
 

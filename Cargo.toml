@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "crates/rhizo-hal", "crates/rhizo-core", "xtask"]
+members = ["kernel", "crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "xtask"]
 # The kernel only builds for the bare-metal target; plain `cargo` commands
 # (test, clippy, build) operate on the host-buildable crates. Use
 # `cargo xtask` for anything involving the kernel.
-default-members = ["crates/rhizo-hal", "crates/rhizo-core", "xtask"]
+default-members = ["crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +19,17 @@ missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
+# Leftover debugging and placeholder code.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# Libraries report through interfaces, never by printing (xtask opts out).
+print_stdout = "warn"
+print_stderr = "warn"
+# Small, honest code.
+redundant_clone = "warn"
+needless_pass_by_value = "warn"
+unused_self = "warn"
 
 # Benchmarks always use this profile (see openspec/specs/boot-performance).
 [profile.release]

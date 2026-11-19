@@ -8,7 +8,7 @@
 //! 64-bit words. The search order depends only on the calls made, so
 //! allocation is deterministic.
 
-use super::{FRAME_SIZE, align_down, align_up};
+use crate::{FRAME_SIZE, align_down, align_up};
 
 const BITS: usize = 64;
 

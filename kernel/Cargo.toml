@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Not published to crates.io (workspace path dependencies only).
+publish = false
 
 [[bin]]
 name = "rhizo-kernel"
@@ -27,6 +29,7 @@ ktest-oom = ["ktest"]
 [dependencies]
 rhizo-hal = { path = "../crates/rhizo-hal" }
 rhizo-core = { path = "../crates/rhizo-core" }
+rhizo-mm = { path = "../crates/rhizo-mm" }
 
 [lints]
 workspace = true

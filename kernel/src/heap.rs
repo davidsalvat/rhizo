@@ -4,8 +4,8 @@ use crate::memory::{DirectMap, with_frames};
 use crate::sync::Global;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use rhizo_core::memory::DIRECT_MAP_BASE;
-use rhizo_core::memory::heap::{Heap, PageSource};
+use rhizo_mm::DIRECT_MAP_BASE;
+use rhizo_mm::heap::{Heap, PageSource};
 
 /// Pages for the heap: contiguous frames, used through the direct map.
 #[derive(Debug)]
