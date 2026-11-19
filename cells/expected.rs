@@ -31,6 +31,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("yielder", "", Ending::Exit(0)),
     ("ballast", "filled\nchecked\n", Ending::Exit(0)),
     ("forkme", "ready\nown ok\n", Ending::Exit(0)),
+    ("diary", "ready\nown ok\n", Ending::Exit(0)),
     (
         "libc_hello",
         "hello from libc, 1 argument, first libc_hello\n\
@@ -41,6 +42,27 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ),
     ("libc_alloc", "allocator checksum 154285459\n", Ending::Exit(0)),
     ("libc_float", "fp ok: 20100.0\n", Ending::Exit(0)),
+    (
+        "libc_files",
+        "cwd ends in /work\n\
+         notes: 100 lines, 2200 bytes, digest 716f37cd630517f4, regular 1\n\
+         pread: f2 XYZ 0e\n\
+         hole: 0 0 !, size 30001\n\
+         dup offset: 2\n\
+         truncated to 10\n\
+         appended to 14\n\
+         exclusive: -1 errno 17\n\
+         missing: -1 errno 2\n\
+         not a dir: -1 errno 20\n\
+         access: 0, x -1 errno 13\n\
+         .: data.bin sub\n\
+         sub: moved.txt\n\
+         rmdir non-empty: -1 errno 39\n\
+         after unlink: \"line 000\", stat -1 errno 2\n\
+         .:\n\
+         files ok\n",
+        Ending::Exit(0),
+    ),
     (
         "libc_warm",
         "warm\nprimes below 2000000: 148933, below 1000: 168\n",

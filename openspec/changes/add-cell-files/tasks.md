@@ -7,9 +7,9 @@
 
 ## 2. System calls and kernel
 
-- [ ] 2.1 `rhizo-abi`: the file calls of `linux-abi` through the cell's file system; host tests
-- [ ] 2.2 Kernel: a file system per cell; fork, freeze/templates, suspend/resume (snapshot format version 3) carry it; initial files at spawn
-- [ ] 2.3 Test cells (`libc_files` C program, differential on Linux) and in-kernel tests: Linux behavior, privacy, suspend/resume with an open file, fork divergence, template files, memory returned
+- [x] 2.1 `rhizo-abi`: the file calls of `linux-abi` through the cell's file system; host tests
+- [x] 2.2 Kernel: a file system per cell; fork, freeze/templates, suspend/resume (snapshot format version 3) carry it; initial files at spawn
+- [x] 2.3 Test cells (`libc_files` C program, differential on Linux) and in-kernel tests: Linux behavior, privacy, suspend/resume with an open file, fork divergence, template files, memory returned
 
 ## 3. Benchmarks and documentation
 
