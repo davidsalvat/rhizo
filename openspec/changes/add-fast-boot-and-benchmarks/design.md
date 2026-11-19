@@ -107,8 +107,11 @@ cycles for the kernel address space.
 - `bench/baseline.json`: `{ env: { metric/vmm: { value, threshold_pct } } }`.
   Medians are compared; a metric fails when it is worse by more than its
   threshold.
-- Thresholds: deterministic metrics 1 %; `ci` timings 50 % (shared runners
-  vary widely); `dedicated` timings 5 %.
+- Thresholds: deterministic metrics 1 %; `ci` time to ready 100 % (two runs
+  of identical code on hosted runners differed by up to 41 %); `ci` TSC cycle
+  counts are recorded but not gated (`ungated` in the baseline), because
+  hosted runners land on hosts with different TSC frequencies; `dedicated`
+  timings, cycles included, 5 %.
 - CI: a `bench` job runs `cargo xtask bench --env ci --check` on every pull
   request. A second workflow runs `--env dedicated --check` on a self-hosted
   runner labelled `rhizo-bench` (bare-metal or a pinned VM with KVM and CPU

@@ -31,11 +31,14 @@ baseline by more than its threshold:
 
 | Environment | Where | Timing threshold | Deterministic threshold |
 |---|---|---|---|
-| `ci` | GitHub-hosted runners (shared, noisy) | +50 % | +1 % |
+| `ci` | GitHub-hosted runners (shared, noisy) | +100 % on time to ready; TSC cycles recorded but not gated | +1 % |
 | `dedicated` | A self-hosted runner labelled `rhizo-bench`: bare metal or a pinned VM with KVM, fixed CPU frequency, nothing else running | +5 % | +1 % |
 
-The `ci` gate only catches gross regressions; the `dedicated` run is the
-precise one. It runs from the `bench-dedicated` workflow, started manually
+Why so wide: two CI runs of identical code differed by up to +41 % in time to
+ready and +53 % in kernel cycles. Hosted runners land on different physical
+machines whose TSC frequencies differ, so cycle counts are not comparable
+between runs there. The `ci` gate therefore only catches gross regressions
+(for example, a boot that doubles); the `dedicated` run is the precise one. It runs from the `bench-dedicated` workflow, started manually
 (Actions → bench-dedicated → Run workflow) once such a runner is registered.
 
 ## Updating a baseline
