@@ -71,7 +71,7 @@ Initial targets (hypotheses to be validated, not promises):
 
 | Milestone | Goal | Status |
 |---|---|---|
-| H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | In progress |
+| H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | Done |
 | H1 | Physical memory, paging, kernel heap | — |
 | H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | — |
 | H3 | Multiple cells, scheduler, isolation tests | — |
