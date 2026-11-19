@@ -9,5 +9,5 @@
 
 ## 2. Benchmarks and gate
 
-- [ ] 2.1 `cell.file_write_read_us` measured faster in CI with no other metric worse; numbers in the pull request
-- [ ] 2.2 File metrics added to the `ci` baseline (D3); `cargo xtask ci` on both architectures
+- [x] 2.1 `cell.file_write_read_us` measured faster in CI with no other metric worse; numbers in the pull request
+- [x] 2.2 File metrics added to the `ci` baseline (D3); `cargo xtask ci` on both architectures
