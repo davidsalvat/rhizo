@@ -85,6 +85,59 @@ impl<T> Scheduler<T> {
     }
 }
 
+/// Address-space tags (ASIDs, PCIDs) for live cells: `1..=max`, tag 0 being
+/// the kernel's. A tag is reused only after `free` (design decision D6).
+#[derive(Debug, Clone)]
+pub struct TagPool {
+    /// One bit per tag; set = in use.
+    used: Vec<u64>,
+    max: u16,
+    /// Next-fit hint, so a freed tag is not handed out again at once.
+    next: u16,
+}
+
+impl TagPool {
+    /// Tags `1..=max` (`max` = 0: no tags, every cell gets 0).
+    pub fn new(max: u16) -> Self {
+        Self {
+            used: alloc::vec![0; max as usize / 64 + 1],
+            max,
+            next: 1,
+        }
+    }
+
+    /// A free tag, or `None` when all are in use (the caller then runs the
+    /// cell untagged, flushing on every switch).
+    pub fn alloc(&mut self) -> Option<u16> {
+        if self.max == 0 {
+            return None;
+        }
+        let tags = (self.next..=self.max).chain(1..self.next);
+        for tag in tags {
+            let (word, bit) = (tag as usize / 64, tag % 64);
+            if self.used[word] & (1 << bit) == 0 {
+                self.used[word] |= 1 << bit;
+                self.next = if tag == self.max { 1 } else { tag + 1 };
+                return Some(tag);
+            }
+        }
+        None
+    }
+
+    /// Returns `tag` to the pool.
+    ///
+    /// # Panics
+    /// If `tag` is not in use.
+    pub fn free(&mut self, tag: u16) {
+        let (word, bit) = (tag as usize / 64, tag % 64);
+        assert!(
+            tag != 0 && tag <= self.max && self.used[word] & (1 << bit) != 0,
+            "freeing tag {tag} that is not in use"
+        );
+        self.used[word] &= !(1 << bit);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +194,32 @@ mod tests {
         assert_eq!(s.remove(|&e| e == 9), None);
         assert_eq!(s.remove(|&e| e == 1), Some(1));
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn tags_are_unique_until_freed_and_reused_late() {
+        let mut pool = TagPool::new(3);
+        assert_eq!(
+            [pool.alloc(), pool.alloc(), pool.alloc()],
+            [Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(pool.alloc(), None, "all in use");
+        pool.free(2);
+        assert_eq!(pool.alloc(), Some(2));
+        pool.free(1);
+        pool.free(3);
+        assert_eq!(
+            pool.alloc(),
+            Some(3),
+            "next fit: the search goes on after the last tag handed out"
+        );
+        assert_eq!(TagPool::new(0).alloc(), None, "no tags at all");
+    }
+
+    #[test]
+    #[should_panic(expected = "not in use")]
+    fn freeing_a_free_tag_panics() {
+        TagPool::new(4).free(2);
     }
 
     proptest! {

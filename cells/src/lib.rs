@@ -113,7 +113,7 @@ pub fn sleep_ns(ns: u64) {
 }
 
 /// Address of `argc` on the initial stack, saved by `_start`.
-static mut STACK: *const usize = core::ptr::null();
+static mut STACK: usize = 0;
 
 /// Command-line argument `n` (0 is the program name).
 pub fn arg(n: usize) -> Option<&'static [u8]> {
@@ -121,7 +121,7 @@ pub fn arg(n: usize) -> Option<&'static [u8]> {
     // the kernel (or Linux) put argc, then argc NUL-terminated strings there,
     // and nothing writes to them.
     unsafe {
-        let sp = core::ptr::addr_of!(STACK).read();
+        let sp = core::ptr::addr_of!(STACK).read() as *const usize;
         if sp.is_null() || n >= *sp {
             return None;
         }
@@ -135,7 +135,7 @@ pub fn arg(n: usize) -> Option<&'static [u8]> {
 }
 
 #[doc(hidden)]
-pub fn start(sp: *const usize, main: fn() -> i32) -> ! {
+pub fn start(sp: usize, main: fn() -> i32) -> ! {
     // SAFETY: single-threaded program; written once, before any reader.
     unsafe { core::ptr::addr_of_mut!(STACK).write(sp) };
     exit(main())
@@ -146,7 +146,7 @@ pub fn start(sp: *const usize, main: fn() -> i32) -> ! {
 macro_rules! entry {
     ($main:path) => {
         #[unsafe(no_mangle)]
-        extern "C" fn rhizo_cell_main(sp: *const usize) -> ! {
+        extern "C" fn rhizo_cell_main(sp: usize) -> ! {
             $crate::start(sp, $main)
         }
 

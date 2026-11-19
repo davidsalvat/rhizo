@@ -10,7 +10,7 @@ use crate::arch::timer::{self, Counter};
 use crate::arch::user::{self, Trap};
 use crate::memory::{self, DirectMap};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
 use rhizo_cell::Cell;
 use rhizo_cell::elf::{ElfError, Image};
@@ -18,7 +18,7 @@ use rhizo_cell::space::{self, Frames};
 use rhizo_hal::{Console, CycleCounter};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{PageSize, PageTable};
-use rhizo_sched::{SLICE_NS, Scheduler};
+use rhizo_sched::{SLICE_NS, Scheduler, TagPool};
 
 /// How a cell ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +98,8 @@ impl Services for KernelServices<'_> {
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 static IRQ_READY: AtomicBool = AtomicBool::new(false);
+/// Highest address-space tag of this CPU (set with `IRQ_READY`).
+static MAX_TAG: AtomicU16 = AtomicU16::new(0);
 
 /// Monotonic time in nanoseconds since boot (0 if the counter frequency is
 /// unknown).
@@ -109,6 +111,8 @@ fn now_ns() -> u64 {
 #[derive(Debug)]
 struct Live {
     cell: Cell,
+    /// Address-space tag (ASID/PCID), 0 if none was free.
+    tag: u16,
     abi: Abi,
     output: Option<Vec<u8>>,
     echo: bool,
@@ -128,6 +132,7 @@ pub struct Finished {
 #[derive(Debug)]
 pub struct Host {
     sched: Scheduler<Live>,
+    tags: TagPool,
     finished: Vec<Finished>,
 }
 
@@ -136,11 +141,22 @@ impl Host {
     pub fn new() -> Self {
         if !IRQ_READY.swap(true, Ordering::Relaxed) {
             irq::init();
+            MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
         }
         Self {
             sched: Scheduler::new(),
+            tags: TagPool::new(MAX_TAG.load(Ordering::Relaxed)),
             finished: Vec::new(),
         }
+    }
+
+    /// A host whose cells get no address-space tag: every switch flushes the
+    /// TLB, as before tags (the `bench-cell` baseline for `cell.switch_ns`).
+    #[cfg(feature = "bench-cell")]
+    fn new_untagged() -> Self {
+        let mut host = Self::new();
+        host.tags = TagPool::new(0);
+        host
     }
 
     /// Creates a cell from the static executable `image` with `argv` and
@@ -177,6 +193,7 @@ impl Host {
         sync_code(&PageTable::<Format>::from_root(cell.root), image);
         self.sched.add(Live {
             cell,
+            tag: self.tags.alloc().unwrap_or(0),
             abi: Abi::new(user::ABI),
             output: capture.then(Vec::new),
             echo,
@@ -221,7 +238,7 @@ impl Host {
     fn run_slice(&mut self, live: &mut Live) {
         let pt = PageTable::<Format>::from_root(live.cell.root);
         loop {
-            match user::enter_user(live.cell.root, &mut live.cell.regs) {
+            match user::enter_user(live.cell.root, live.tag, &mut live.cell.regs) {
                 Trap::Syscall => {
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
@@ -289,7 +306,10 @@ impl Host {
     }
 
     fn end(&mut self, live: Live, ending: Ending) {
-        user::release_user();
+        user::release_user(live.cell.root, live.tag);
+        if live.tag != 0 {
+            self.tags.free(live.tag);
+        }
         space::destroy(
             PageTable::<Format>::from_root(live.cell.root),
             &mut DirectMap,
@@ -315,6 +335,7 @@ impl Drop for Host {
 fn take(live: &mut Live) -> Live {
     Live {
         cell: live.cell,
+        tag: live.tag,
         abi: core::mem::replace(&mut live.abi, Abi::new(user::ABI)),
         output: live.output.take(),
         echo: live.echo,
@@ -386,12 +407,39 @@ pub fn bench(console: &mut impl Console) {
     }
     spawn_ns.sort_unstable();
     run_ns.sort_unstable();
+    let tagged = switch_ns(Host::new());
+    let untagged = switch_ns(Host::new_untagged());
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
-        "rhizo-cell spawn_ns={} run_ns={} pt_frames={tables}",
+        "rhizo-cell spawn_ns={} run_ns={} pt_frames={tables} switch_ns={tagged} \
+         switch_untagged_ns={untagged}",
         spawn_ns[RUNS / 2],
         run_ns[RUNS / 2]
     );
+}
+
+/// Median over 5 rounds of the time per switch between two cells that
+/// yield to each other 2000 times each (system call in, scheduler, system
+/// call out to the other cell).
+#[cfg(feature = "bench-cell")]
+fn switch_ns(mut host: Host) -> u64 {
+    const YIELDS: u64 = 2000;
+    let image = test_image("yielder");
+    let mut rounds = [0u64; 5];
+    for round in &mut rounds {
+        let a = host
+            .spawn(image, &[b"yielder"], false, false)
+            .expect("spawn yielder");
+        let b = host
+            .spawn(image, &[b"yielder"], false, false)
+            .expect("spawn yielder");
+        let t0 = Counter.cycles();
+        host.run(|h| h.finished(a).is_some() && h.finished(b).is_some());
+        let t1 = Counter.cycles();
+        *round = timer::cycles_to_ns(t1 - t0).unwrap_or(0) / (2 * YIELDS);
+    }
+    rounds.sort_unstable();
+    rounds[2]
 }
 
 /// Makes the executable pages just written through the direct map visible to
@@ -410,27 +458,4 @@ fn sync_code(pt: &PageTable<Format>, image: &[u8]) {
     }
 }
 
-/// The test cells built by `cargo xtask` and embedded at build time.
-pub fn test_image(name: &str) -> &'static [u8] {
-    macro_rules! cells {
-        ($($name:literal),*) => {
-            match name {
-                $($name => include_bytes!(concat!(env!("OUT_DIR"), "/cells/", $name)),)*
-                _ => panic!("no test cell named {name}"),
-            }
-        };
-    }
-    cells!(
-        "hello",
-        "exit3",
-        "abi",
-        "fault_null",
-        "fault_kernel",
-        "chatter",
-        "spin",
-        "sleeper",
-        "same_addr",
-        "mapper",
-        "peek"
-    )
-}
+include!(concat!(env!("OUT_DIR"), "/cells.rs"));

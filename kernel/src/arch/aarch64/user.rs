@@ -43,30 +43,56 @@ impl UserFault {
     }
 }
 
-fn set_user_root(root: u64) {
-    if USER_ROOT.swap(root, Ordering::Relaxed) != root {
-        // SAFETY: TTBR0 maps only the lower half, which the kernel never
-        // uses; cell pages are non-global (ASID 0), so dropping ASID 0 removes
-        // every stale cell translation and keeps the kernel's global ones.
-        unsafe {
-            asm!(
-                "dsb ishst",
-                "msr ttbr0_el1, {root}",
-                "isb",
-                "tlbi aside1, xzr",
-                "dsb ish",
-                "isb",
-                root = in(reg) root,
-                options(nostack)
-            );
+/// Enables 16-bit ASIDs when the CPU has them and returns the highest tag
+/// cells may use (65535, or 255 with 8-bit ASIDs). Call once.
+pub fn init_tags() -> u16 {
+    let mmfr0: u64;
+    // SAFETY: reading an ID register has no side effects.
+    unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack)) };
+    if (mmfr0 >> 4) & 0xf != 0b0010 {
+        return 255;
+    }
+    // SAFETY: TCR_EL1.AS selects 16-bit ASIDs; no cell translation is cached
+    // yet (only ASID 0 was ever used, and it is flushed with everything).
+    unsafe {
+        asm!(
+            "mrs {t}, tcr_el1",
+            "orr {t}, {t}, #(1 << 36)",
+            "msr tcr_el1, {t}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            t = out(reg) _,
+            options(nostack)
+        );
+    }
+    u16::MAX
+}
+
+/// Loads `root` with ASID `tag` in `TTBR0_EL1`. A tagged switch needs no
+/// TLB maintenance (design D6); tag 0 is shared by the empty table and
+/// untagged cells, so switching to it drops what ASID 0 had cached.
+fn set_user_root(root: u64, tag: u16) {
+    let ttbr = root | ((tag as u64) << 48);
+    if USER_ROOT.swap(ttbr, Ordering::Relaxed) == ttbr {
+        return;
+    }
+    // SAFETY: TTBR0 maps only the lower half, which the kernel never uses;
+    // cell pages are non-global, so their translations are tagged.
+    unsafe {
+        asm!("dsb ishst", "msr ttbr0_el1, {}", "isb", in(reg) ttbr, options(nostack));
+        if tag == 0 {
+            asm!("tlbi aside1, xzr", "dsb ish", "isb", options(nostack));
         }
     }
 }
 
-/// Runs the cell whose lower-half table is `root` from `regs` until it makes
-/// a system call or faults; `regs` then holds its state at that point.
-pub fn enter_user(root: u64, regs: &mut Registers) -> Trap {
-    set_user_root(root);
+/// Runs the cell whose lower-half table is `root`, tagged `tag` (0 =
+/// untagged), from `regs` until it makes a system call, is interrupted or
+/// faults; `regs` then holds its state at that point.
+pub fn enter_user(root: u64, tag: u16, regs: &mut Registers) -> Trap {
+    set_user_root(root, tag);
     // SAFETY: `regs` is a valid, 16-byte aligned frame that lives across the
     // call; the entry code drops to EL0 with only the NZCV flags of the
     // saved state, and the EL0 vectors restore the kernel stacks and
@@ -92,10 +118,23 @@ pub fn enter_user(root: u64, regs: &mut Registers) -> Trap {
     }))
 }
 
-/// Points `TTBR0_EL1` back at the empty table: call before freeing the
-/// tables of the cell that last ran.
-pub fn release_user() {
-    set_user_root(EMPTY_ROOT.load(Ordering::Relaxed));
+/// Points `TTBR0_EL1` back at the empty table and drops every translation
+/// of the cell tagged `tag`: call before freeing its tables and its tag.
+pub fn release_user(_root: u64, tag: u16) {
+    set_user_root(EMPTY_ROOT.load(Ordering::Relaxed), 0);
+    if tag != 0 {
+        // SAFETY: invalidating one ASID only drops cached translations.
+        unsafe {
+            asm!(
+                "dsb ishst",
+                "tlbi aside1is, {}",
+                "dsb ish",
+                "isb",
+                in(reg) (tag as u64) << 48,
+                options(nostack)
+            );
+        }
+    }
 }
 
 /// Makes code written through the data side (a loaded cell image at the

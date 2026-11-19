@@ -13,30 +13,36 @@ fn main() {
 }
 
 /// Copies the test cells built by `cargo xtask` (`RHIZO_CELLS_DIR`) next to
-/// the build output, where `include_bytes!` finds them. Without it (a plain
-/// `cargo clippy`), empty files stand in and spawning them fails with
-/// `NotElf`, which the in-kernel tests report.
-/// Every program in `cells/src/bin`.
-const CELLS: &[&str] = &[
-    "hello",
-    "exit3",
-    "abi",
-    "fault_null",
-    "fault_kernel",
-    "chatter",
-    "spin",
-    "sleeper",
-    "same_addr",
-    "mapper",
-    "peek",
-];
-
+/// the build output and generates `cells.rs`, a `test_image(name)` lookup
+/// with one `include_bytes!` per program in `cells/src/bin`. Without
+/// `RHIZO_CELLS_DIR` (a plain `cargo clippy`), empty files stand in and
+/// spawning them fails with `NotElf`, which the in-kernel tests report.
 fn embed_cells() {
     println!("cargo:rerun-if-env-changed=RHIZO_CELLS_DIR");
-    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("cells");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
+    let bins = Path::new(&manifest).join("../cells/src/bin");
+    println!("cargo:rerun-if-changed={}", bins.display());
+    let mut names: Vec<String> = std::fs::read_dir(&bins)
+        .expect("cells/src/bin exists")
+        .filter_map(|e| {
+            e.ok()?
+                .file_name()
+                .to_str()?
+                .strip_suffix(".rs")
+                .map(String::from)
+        })
+        .collect();
+    names.sort();
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
+    let out = Path::new(&out_dir).join("cells");
     std::fs::create_dir_all(&out).expect("create OUT_DIR/cells");
     let from = std::env::var("RHIZO_CELLS_DIR").ok();
-    for name in CELLS {
+    let mut lookup = String::from(
+        "/// The test cells built by `cargo xtask` and embedded at build time.\n\
+         pub fn test_image(name: &str) -> &'static [u8] {\n    match name {\n",
+    );
+    for name in &names {
         let data = match &from {
             Some(dir) => {
                 let path = Path::new(dir).join(name);
@@ -46,5 +52,10 @@ fn embed_cells() {
             None => Vec::new(),
         };
         std::fs::write(out.join(name), data).expect("write embedded cell");
+        lookup += &format!(
+            "        {name:?} => include_bytes!(concat!(env!(\"OUT_DIR\"), \"/cells/{name}\")),\n"
+        );
     }
+    lookup += "        _ => panic!(\"no test cell named {name}\"),\n    }\n}\n";
+    std::fs::write(Path::new(&out_dir).join("cells.rs"), lookup).expect("write cells.rs");
 }

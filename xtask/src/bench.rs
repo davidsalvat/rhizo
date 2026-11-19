@@ -345,6 +345,7 @@ fn measure_cells(
         }
         report::text(&format!("cells on {}", vmm.id()));
         let (mut spawn, mut run) = (Vec::new(), Vec::new());
+        let (mut switch, mut untagged) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -360,6 +361,8 @@ fn measure_cells(
                 Some(c) if out.result != VmResult::Failed => {
                     spawn.push(c.spawn_ns as f64 / 1000.0);
                     run.push(c.run_ns as f64 / 1000.0);
+                    switch.push(c.switch_ns as f64);
+                    untagged.push(c.switch_untagged_ns as f64);
                     pt_frames = Some(c.pt_frames);
                 }
                 _ => {
@@ -374,14 +377,19 @@ fn measure_cells(
                 }
             }
         }
-        for (name, values) in [("cell.spawn_us", &mut spawn), ("cell.run_us", &mut run)] {
+        for (name, unit, values) in [
+            ("cell.spawn_us", "us", &mut spawn),
+            ("cell.run_us", "us", &mut run),
+            ("cell.switch_ns", "ns", &mut switch),
+            ("cell.switch_untagged_ns", "ns", &mut untagged),
+        ] {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
                 metrics.push(Metric {
                     name: name.into(),
                     guest: "rhizo".into(),
                     vmm: Some(vmm.id().into()),
-                    unit: "us".into(),
+                    unit: unit.into(),
                     median,
                     p90,
                     runs: values.len(),
@@ -401,6 +409,8 @@ struct CellLine {
     spawn_ns: u64,
     run_ns: u64,
     pt_frames: u64,
+    switch_ns: u64,
+    switch_untagged_ns: u64,
 }
 
 fn parse_cell_line(output: &str) -> Option<CellLine> {
@@ -415,6 +425,8 @@ fn parse_cell_line(output: &str) -> Option<CellLine> {
         spawn_ns: field("spawn_ns")?,
         run_ns: field("run_ns")?,
         pt_frames: field("pt_frames")?,
+        switch_ns: field("switch_ns")?,
+        switch_untagged_ns: field("switch_untagged_ns")?,
     })
 }
 
@@ -1062,13 +1074,16 @@ mod tests {
 
     #[test]
     fn cell_line_is_parsed() {
-        let out = "rhizo-ready cycles=1\nrhizo-cell spawn_ns=12000 run_ns=30000 pt_frames=7\n";
+        let out = "rhizo-ready cycles=1\nrhizo-cell spawn_ns=12000 run_ns=30000 pt_frames=7 \
+                   switch_ns=300 switch_untagged_ns=900\n";
         assert_eq!(
             parse_cell_line(out),
             Some(CellLine {
                 spawn_ns: 12000,
                 run_ns: 30000,
-                pt_frames: 7
+                pt_frames: 7,
+                switch_ns: 300,
+                switch_untagged_ns: 900,
             })
         );
         assert_eq!(parse_cell_line("rhizo-cell spawn_ns=x"), None);

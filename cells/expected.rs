@@ -28,6 +28,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("sleeper", "slept ok\n", Ending::Exit(0)),
     ("same_addr", "own value ok\n", Ending::Exit(0)),
     ("peek", "", Ending::Fault),
+    ("yielder", "", Ending::Exit(0)),
 ];
 
 /// Test cells that never end on their own (they are killed by the tests):
