@@ -45,6 +45,28 @@ way. Firecracker and Cloud Hypervisor need KVM.
 Each timing is the median (and p90) of `--runs` boots after one discarded
 warm-up boot. Lower is better for every metric.
 
+## Comparisons with existing mechanisms
+
+Measured in the same `cargo xtask bench` run, on the same machine and with the
+same clock as the cells (spec `comparisons`):
+
+| Metric | What |
+|---|---|
+| `snapshot.restore_ms/linux/firecracker` | A Linux guest snapshotted through Firecracker's API (`Full`), restored by a new Firecracker process until the VM runs again: how Firecracker-based sandboxes resume and clone. First restore (cold page cache) dropped |
+| `snapshot.restore_api_ms/linux/firecracker` | The `PUT /snapshot/load` request alone |
+| `process.fork_us/linux-process/host` | `fork` of a host process holding 50 MiB written, child exits, parent waits (`bench/host/linux_process.c`) |
+| `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
+
+Firecracker needs KVM for the guest's architecture; elsewhere it is listed as
+skipped with the reason. Process baselines need a Linux host of the target
+architecture. The README table puts each cell operation next to these figures;
+a column not measured in that run shows "—", never a quoted number.
+
+Rhizo's cell figures in that table are the ones measured with Rhizo itself
+running in Firecracker, so both sides pay the same virtualization. GitHub's
+runners are shared virtual machines (nested virtualization: every VM exit is
+expensive), so publishable numbers come from the `dedicated` environment below.
+
 ## Environments and thresholds
 
 `baseline.json` stores, per environment, the median of each Rhizo metric.

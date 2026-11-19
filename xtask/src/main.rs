@@ -6,6 +6,7 @@
 
 mod arch;
 mod bench;
+mod compare;
 mod deps;
 mod differential;
 mod refguest;
