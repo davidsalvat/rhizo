@@ -9,7 +9,7 @@
       "boot.time_to_ready_ms/rhizo/firecracker": 5.487035499999999,
       "boot.time_to_ready_ms/rhizo/qemu-microvm": 41.9547345,
       "boot.time_to_ready_ms/rhizo/qemu-q35": 53.837299,
-      "image.size_bytes": 36896.0,
+      "image.size_bytes": 37264.0,
       "memory.kernel_pt_frames": 5.0
     },
     "dedicated": {}
