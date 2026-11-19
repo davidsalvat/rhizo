@@ -9,6 +9,7 @@ pub mod boot;
 pub mod exception;
 pub mod ktest;
 pub mod memory;
+pub mod options;
 pub mod panic;
 
 /// The kernel version, taken from the workspace version.

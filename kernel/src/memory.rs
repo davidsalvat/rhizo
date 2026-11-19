@@ -9,9 +9,7 @@ use rhizo_core::memory::memmap::{BootInfo, RegionKind};
 use rhizo_core::memory::paging::{
     MapError, PageFlags, PageSize, PageTable, Translation, UnmapError,
 };
-use rhizo_core::memory::{
-    DIRECT_MAP_BASE, FRAME_SIZE, KERNEL_BASE, LARGE_PAGE_SIZE, MAX_PHYS, align_up,
-};
+use rhizo_core::memory::{DIRECT_MAP_BASE, FRAME_SIZE, KERNEL_BASE, MAX_PHYS, align_up};
 use rhizo_hal::PhysicalMemory;
 
 const ONE_MIB: u64 = 1024 * 1024;
@@ -60,6 +58,8 @@ pub struct Summary {
     pub usable: u64,
     /// Bytes still free after boot setup.
     pub free: u64,
+    /// Frames used by the kernel's page tables.
+    pub page_table_frames: u64,
 }
 
 fn take_bitmap() -> &'static mut [u64] {
@@ -97,8 +97,10 @@ pub fn init(start_info: u64) -> Summary {
     }
     let usable = frames.usable_frames() as u64 * FRAME_SIZE;
 
+    let before = frames.free_frames();
     let root = build_kernel_tables(&mut mem, &mut frames, top)
         .unwrap_or_else(|e| panic!("cannot build kernel page tables: {e:?}"));
+    let page_table_frames = (before - frames.free_frames()) as u64;
     // SAFETY: the new tables map the kernel image (code, data, stack) at the
     // same virtual addresses and the direct map at the same offset.
     unsafe { cpu::write_cr3(root.root()) };
@@ -108,6 +110,7 @@ pub fn init(start_info: u64) -> Summary {
     Summary {
         usable,
         free: free_bytes(),
+        page_table_frames,
     }
 }
 
@@ -119,17 +122,16 @@ fn build_kernel_tables(
     let mut alloc = || frames.alloc();
     let pt = PageTable::new(mem, &mut alloc)?;
 
-    // Direct map of physical memory: 2 MiB pages, read/write, never executable.
+    // Direct map of physical memory: the largest pages the CPU supports
+    // (fewest table frames and TLB entries), read/write, never executable.
     let rw_nx = PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-    for phys in (0..align_up(top, LARGE_PAGE_SIZE)).step_by(LARGE_PAGE_SIZE as usize) {
-        pt.map(
-            mem,
-            &mut alloc,
-            DirectMap::virt(phys),
-            phys,
-            PageSize::Large,
-            rw_nx,
-        )?;
+    let page = if cpu::supports_1gib_pages() {
+        PageSize::Huge
+    } else {
+        PageSize::Large
+    };
+    for phys in (0..align_up(top, page.bytes())).step_by(page.bytes() as usize) {
+        pt.map(mem, &mut alloc, DirectMap::virt(phys), phys, page, rw_nx)?;
     }
 
     // Kernel image with W^X: code RX, read-only data R, data RW (no guard page).

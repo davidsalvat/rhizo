@@ -44,3 +44,50 @@ jobs:
 
       - name: Run all checks
         run: cargo xtask ci
+
+  bench:
+    name: VMM boots and benchmark gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache downloaded VMMs and reference guest
+        uses: actions/cache@v4
+        with:
+          path: target/tools
+          key: tools-${{ hashFiles('xtask/src/tools.rs') }}
+
+      - name: Boot on Firecracker
+        run: cargo xtask run --release --vmm firecracker
+
+      - name: Boot on Cloud Hypervisor
+        run: cargo xtask run --release --vmm cloud-hypervisor
+
+      - name: Benchmarks and regression gate
+        run: cargo xtask bench --env ci --check --output bench-results.json
+
+      - name: Publish results
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            echo "::notice title=bench-results::$(tr -d '\n' < bench-results.json)"
+          fi

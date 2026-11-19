@@ -1,0 +1,532 @@
+//! Virtual machine monitors: launching a kernel, reading its console,
+//! timing it from the host, and deciding how the run ended.
+
+use crate::Result;
+use crate::tools;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// QEMU exit status produced by the kernel writing 0x10 to `isa-debug-exit`.
+const QEMU_SUCCESS: i32 = (0x10 << 1) | 1;
+/// QEMU exit status produced by the kernel writing 0x11 to `isa-debug-exit`.
+const QEMU_FAILURE: i32 = (0x11 << 1) | 1;
+
+/// Line printed by the kernel (and the reference guest) when it is ready.
+pub const READY_MARKER: &str = "rhizo-ready";
+
+/// A supported virtual machine monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vmm {
+    /// QEMU `microvm` machine (default).
+    QemuMicrovm,
+    /// QEMU `q35` machine.
+    QemuQ35,
+    /// Firecracker.
+    Firecracker,
+    /// Cloud Hypervisor.
+    CloudHypervisor,
+}
+
+impl Vmm {
+    /// Every VMM, in the order benchmarks report them.
+    pub const ALL: [Vmm; 4] = [
+        Vmm::QemuMicrovm,
+        Vmm::QemuQ35,
+        Vmm::Firecracker,
+        Vmm::CloudHypervisor,
+    ];
+
+    /// Stable identifier used on the command line and in results.
+    pub fn id(self) -> &'static str {
+        match self {
+            Vmm::QemuMicrovm => "qemu-microvm",
+            Vmm::QemuQ35 => "qemu-q35",
+            Vmm::Firecracker => "firecracker",
+            Vmm::CloudHypervisor => "cloud-hypervisor",
+        }
+    }
+
+    /// Parses an identifier (also accepts `microvm` and `q35`).
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "qemu-microvm" | "microvm" | "qemu" => Ok(Vmm::QemuMicrovm),
+            "qemu-q35" | "q35" => Ok(Vmm::QemuQ35),
+            "firecracker" | "fc" => Ok(Vmm::Firecracker),
+            "cloud-hypervisor" | "ch" => Ok(Vmm::CloudHypervisor),
+            other => Err(format!(
+                "unknown VMM `{other}` (expected qemu-microvm, qemu-q35, firecracker or cloud-hypervisor)"
+            )),
+        }
+    }
+
+    /// Whether the VMM needs KVM (QEMU can emulate instead).
+    pub fn requires_kvm(self) -> bool {
+        matches!(self, Vmm::Firecracker | Vmm::CloudHypervisor)
+    }
+
+    /// Whether the VMM reports the kernel's success/failure as its exit status.
+    fn has_exit_device(self) -> bool {
+        matches!(self, Vmm::QemuMicrovm | Vmm::QemuQ35)
+    }
+
+    /// Command-line options telling the Rhizo kernel how to talk to this VMM.
+    fn rhizo_cmdline(self) -> &'static str {
+        match self {
+            Vmm::QemuMicrovm | Vmm::QemuQ35 => "console=e9 exit=debug-exit",
+            Vmm::Firecracker => "console=serial exit=i8042",
+            Vmm::CloudHypervisor => "console=e9 exit=ch-acpi",
+        }
+    }
+
+    /// Why this VMM cannot run here, if it cannot.
+    pub fn unavailable_reason(self, accel: Accel) -> Option<String> {
+        if self.requires_kvm() && !kvm_available() {
+            return Some("needs KVM (/dev/kvm is not usable here)".into());
+        }
+        if !self.requires_kvm() && accel == Accel::Kvm && !kvm_available() {
+            return Some("--accel kvm requested but /dev/kvm is not usable".into());
+        }
+        None
+    }
+}
+
+/// CPU acceleration for QEMU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accel {
+    /// KVM when usable, otherwise emulation.
+    Auto,
+    /// Require KVM.
+    Kvm,
+    /// Always emulate (TCG).
+    Tcg,
+}
+
+impl Accel {
+    /// Parses `auto`, `kvm` or `tcg`.
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "auto" => Ok(Accel::Auto),
+            "kvm" => Ok(Accel::Kvm),
+            "tcg" => Ok(Accel::Tcg),
+            other => Err(format!(
+                "unknown accelerator `{other}` (expected auto, kvm or tcg)"
+            )),
+        }
+    }
+
+    fn uses_kvm(self) -> bool {
+        match self {
+            Accel::Auto => kvm_available(),
+            Accel::Kvm => true,
+            Accel::Tcg => false,
+        }
+    }
+}
+
+/// Whether `/dev/kvm` can be opened for reading and writing.
+pub fn kvm_available() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
+/// What to boot.
+#[derive(Debug, Clone)]
+pub enum Guest {
+    /// The Rhizo kernel image.
+    Rhizo(PathBuf),
+    /// The reference Linux guest: kernel image and initramfs.
+    ReferenceLinux { kernel: PathBuf, initramfs: PathBuf },
+}
+
+/// How a VM run ended, as seen by the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmResult {
+    /// The kernel reported success.
+    Passed,
+    /// The kernel reported failure (exit status, panic or exception report).
+    Failed,
+    /// The VMM ended without a success or failure report.
+    Abnormal(Option<i32>),
+    /// The VM did not finish before the time limit and was killed.
+    TimedOut,
+    /// The run was stopped by the host right after the ready marker.
+    StoppedAtReady,
+}
+
+/// Maps QEMU's process exit code to a [`VmResult`] (QEMU exit device).
+pub fn interpret_exit(code: Option<i32>) -> VmResult {
+    match code {
+        Some(QEMU_SUCCESS) => VmResult::Passed,
+        Some(QEMU_FAILURE) => VmResult::Failed,
+        other => VmResult::Abnormal(other),
+    }
+}
+
+/// Decides the result from the console for VMMs without an exit device.
+pub fn interpret_console(output: &str, code: Option<i32>) -> VmResult {
+    if output.contains("\nPANIC at") || output.contains("\nEXCEPTION:") {
+        VmResult::Failed
+    } else if output.contains("boot complete") || output.contains("test result: ok.") {
+        VmResult::Passed
+    } else {
+        VmResult::Abnormal(code)
+    }
+}
+
+/// Everything learned from one VM run.
+#[derive(Debug)]
+pub struct VmRun {
+    /// How the run ended.
+    pub result: VmResult,
+    /// Console output.
+    pub output: String,
+    /// Host time from launching the VMM to receiving the ready marker.
+    pub time_to_ready: Option<Duration>,
+    /// Cycles reported in the ready marker (Rhizo only).
+    pub ready_cycles: Option<u64>,
+}
+
+/// Options for one run.
+#[derive(Debug, Clone, Copy)]
+pub struct RunOptions {
+    /// Kill the VM once the ready marker arrives (benchmarks).
+    pub stop_at_ready: bool,
+    /// Kill the VM after this long.
+    pub timeout: Duration,
+    /// Echo console output to the terminal.
+    pub echo: bool,
+    /// QEMU acceleration.
+    pub accel: Accel,
+    /// Wait for gdb (QEMU only).
+    pub gdb: bool,
+}
+
+/// Parses `rhizo-ready cycles=<n>` from console output.
+pub fn parse_ready_cycles(output: &str) -> Option<u64> {
+    let line = output.lines().find(|l| l.starts_with(READY_MARKER))?;
+    let value = line.split("cycles=").nth(1)?;
+    value.split_whitespace().next()?.parse().ok()
+}
+
+/// Builds the command that launches `guest` on `vmm`.
+fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
+    match vmm {
+        Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
+        Vmm::Firecracker => firecracker_command(guest, scratch),
+        Vmm::CloudHypervisor => cloud_hypervisor_command(guest),
+    }
+}
+
+/// Reference guest command line. `earlyprintk` is needed on QEMU `microvm`,
+/// where Linux otherwise registers no serial console and `/init` output is lost.
+const LINUX_CMDLINE: &str = "console=ttyS0 earlyprintk=ttyS0 quiet loglevel=0 panic=-1 \
+                             reboot=k pci=off nomodule rdinit=/init";
+
+fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
+    let qemu = std::env::var("RHIZO_QEMU").unwrap_or_else(|_| "qemu-system-x86_64".into());
+    let mut cmd = Command::new(qemu);
+    // The microvm option ROM must stay enabled: it implements PVH boot for
+    // -kernel. Each guest gets the smallest machine it needs: Rhizo needs no
+    // legacy timers or interrupt controller; Linux needs them to calibrate its
+    // clock when KVM's paravirtual clock is not available.
+    match (vmm, guest) {
+        (Vmm::QemuMicrovm, Guest::Rhizo(_)) => {
+            cmd.args(["-M", "microvm,rtc=off,pit=off,pic=off,isa-serial=on"])
+        }
+        (Vmm::QemuMicrovm, Guest::ReferenceLinux { .. }) => {
+            cmd.args(["-M", "microvm,isa-serial=on"])
+        }
+        _ => cmd.args(["-M", "q35"]),
+    };
+    cmd.args([
+        "-cpu",
+        "max",
+        "-m",
+        "128M",
+        "-nodefaults",
+        "-no-user-config",
+    ])
+    .args(["-display", "none", "-no-reboot"])
+    .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+    .args(["-accel", if opts.accel.uses_kvm() { "kvm" } else { "tcg" }]);
+    match guest {
+        Guest::Rhizo(kernel) => {
+            cmd.args(["-debugcon", "stdio", "-serial", "none"])
+                .arg("-kernel")
+                .arg(kernel)
+                .args(["-append", vmm.rhizo_cmdline()]);
+        }
+        Guest::ReferenceLinux { kernel, initramfs } => {
+            cmd.args(["-serial", "stdio"])
+                .arg("-kernel")
+                .arg(kernel)
+                .arg("-initrd")
+                .arg(initramfs)
+                .args(["-append", LINUX_CMDLINE]);
+        }
+    }
+    if opts.gdb {
+        cmd.args(["-s", "-S"]);
+    }
+    cmd
+}
+
+fn firecracker_command(guest: &Guest, scratch: &Path) -> Result<Command> {
+    let binary = tools::firecracker()?;
+    let (kernel, initrd, args) = match guest {
+        Guest::Rhizo(kernel) => (kernel.clone(), None, Vmm::Firecracker.rhizo_cmdline()),
+        Guest::ReferenceLinux { kernel, initramfs } => {
+            (kernel.clone(), Some(initramfs.clone()), LINUX_CMDLINE)
+        }
+    };
+    let initrd_json = match &initrd {
+        Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
+        None => String::new(),
+    };
+    let config = format!(
+        "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}{initrd_json}}}, \
+         \"drives\": [], \
+         \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": 128}}}}",
+        kernel.display().to_string(),
+        args
+    );
+    let path = scratch.join(format!("firecracker-{}.json", std::process::id()));
+    fs::write(&path, config).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let mut cmd = Command::new(binary);
+    cmd.arg("--no-api")
+        .arg("--config-file")
+        .arg(&path)
+        .args(["--level", "Error"]);
+    Ok(cmd)
+}
+
+fn cloud_hypervisor_command(guest: &Guest) -> Result<Command> {
+    let binary = tools::cloud_hypervisor()?;
+    let mut cmd = Command::new(binary);
+    cmd.args([
+        "--cpus",
+        "boot=1",
+        "--memory",
+        "size=128M",
+        "--console",
+        "off",
+    ]);
+    match guest {
+        Guest::Rhizo(kernel) => {
+            cmd.arg("--kernel")
+                .arg(kernel)
+                .args(["--cmdline", Vmm::CloudHypervisor.rhizo_cmdline()])
+                .args(["--serial", "off", "--debug-console", "tty"]);
+        }
+        Guest::ReferenceLinux { kernel, initramfs } => {
+            cmd.arg("--kernel")
+                .arg(kernel)
+                .arg("--initramfs")
+                .arg(initramfs)
+                .args(["--cmdline", LINUX_CMDLINE])
+                .args(["--serial", "tty"]);
+        }
+    }
+    Ok(cmd)
+}
+
+/// Boots `guest` on `vmm`, streams and captures its console, and measures
+/// the time from launching the VMM to the ready marker.
+pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
+    if let Some(reason) = vmm.unavailable_reason(opts.accel) {
+        return Err(format!("{} is not available: {reason}", vmm.id()));
+    }
+    let scratch = tools::dir()?;
+    let mut cmd = command(vmm, guest, &opts, &scratch)?;
+    cmd.stdin(if opts.gdb {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    if std::env::var_os("RHIZO_PRINT_VMM_COMMAND").is_some() {
+        eprintln!("[xtask] {cmd:?}");
+    }
+    let started = Instant::now();
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start {} (is it installed?): {e}", vmm.id()))?;
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let ready_at: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+    let ready_flag = Arc::new(AtomicBool::new(false));
+
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let reader = {
+        let captured = Arc::clone(&captured);
+        let ready_at = Arc::clone(&ready_at);
+        let ready_flag = Arc::clone(&ready_flag);
+        let echo = opts.echo;
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let now = started.elapsed();
+                let chunk = &buf[..n];
+                if echo {
+                    let _ = io::stdout().write_all(chunk);
+                    let _ = io::stdout().flush();
+                }
+                let mut all = captured.lock().expect("capture lock");
+                let search_from = all.len().saturating_sub(READY_MARKER.len());
+                all.extend_from_slice(chunk);
+                if !ready_flag.load(Ordering::Relaxed)
+                    && contains(&all[search_from..], READY_MARKER.as_bytes())
+                {
+                    *ready_at.lock().expect("ready lock") = Some(now);
+                    ready_flag.store(true, Ordering::Release);
+                }
+            }
+        })
+    };
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let stderr_reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let result = loop {
+        if opts.stop_at_ready && ready_flag.load(Ordering::Acquire) {
+            // Give the line a moment to complete, then stop the VM.
+            thread::sleep(Duration::from_millis(2));
+            let _ = child.kill();
+            let _ = child.wait();
+            break VmResult::StoppedAtReady;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break finish(vmm, status.code(), &captured),
+            Ok(None) if started.elapsed() >= opts.timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break VmResult::TimedOut;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(e) => return Err(format!("failed to wait for {}: {e}", vmm.id())),
+        }
+    };
+    let _ = reader.join();
+    let stderr_text = stderr_reader.join().unwrap_or_default();
+
+    let output = String::from_utf8_lossy(&captured.lock().expect("capture lock")).into_owned();
+    if result == VmResult::TimedOut && opts.echo {
+        println!(
+            "\n[xtask] VM killed after {}s timeout",
+            opts.timeout.as_secs()
+        );
+    }
+    if matches!(result, VmResult::Abnormal(_) | VmResult::TimedOut)
+        && !stderr_text.trim().is_empty()
+    {
+        eprintln!("[xtask] {} stderr:\n{}", vmm.id(), stderr_text.trim_end());
+    }
+    let time_to_ready = *ready_at.lock().expect("ready lock");
+    Ok(VmRun {
+        result: match result {
+            // A VMM without an exit device that we stopped is judged by output.
+            VmResult::StoppedAtReady => VmResult::StoppedAtReady,
+            other => other,
+        },
+        ready_cycles: parse_ready_cycles(&output),
+        time_to_ready,
+        output,
+    })
+}
+
+fn finish(vmm: Vmm, code: Option<i32>, captured: &Mutex<Vec<u8>>) -> VmResult {
+    if vmm.has_exit_device() {
+        interpret_exit(code)
+    } else {
+        let output = String::from_utf8_lossy(&captured.lock().expect("capture lock")).into_owned();
+        interpret_console(&output, code)
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_map_to_results() {
+        assert_eq!(interpret_exit(Some(33)), VmResult::Passed);
+        assert_eq!(interpret_exit(Some(35)), VmResult::Failed);
+        assert_eq!(interpret_exit(Some(0)), VmResult::Abnormal(Some(0)));
+        assert_eq!(interpret_exit(None), VmResult::Abnormal(None));
+    }
+
+    #[test]
+    fn console_decides_for_vmms_without_exit_device() {
+        assert_eq!(
+            interpret_console("x\nboot complete\n", Some(0)),
+            VmResult::Passed
+        );
+        assert_eq!(
+            interpret_console("test result: ok. 3 passed", Some(0)),
+            VmResult::Passed
+        );
+        assert_eq!(
+            interpret_console("boot complete\nPANIC at a.rs:1:1: x", Some(0)),
+            VmResult::Failed
+        );
+        assert_eq!(
+            interpret_console("\nEXCEPTION: page fault", None),
+            VmResult::Failed
+        );
+        assert_eq!(
+            interpret_console("Rhizo 0.1.0\n", Some(1)),
+            VmResult::Abnormal(Some(1))
+        );
+    }
+
+    #[test]
+    fn ready_cycles_are_parsed() {
+        assert_eq!(
+            parse_ready_cycles("Rhizo\nrhizo-ready cycles=1234\nboot"),
+            Some(1234)
+        );
+        assert_eq!(parse_ready_cycles("rhizo-ready linux\n"), None);
+        assert_eq!(parse_ready_cycles("nothing"), None);
+    }
+
+    #[test]
+    fn vmm_names_round_trip() {
+        for vmm in Vmm::ALL {
+            assert_eq!(Vmm::parse(vmm.id()), Ok(vmm));
+        }
+        assert_eq!(Vmm::parse("q35"), Ok(Vmm::QemuQ35));
+        assert!(Vmm::parse("xen").is_err());
+    }
+
+    #[test]
+    fn rhizo_cmdlines_pick_console_and_exit() {
+        assert!(Vmm::Firecracker.rhizo_cmdline().contains("console=serial"));
+        assert!(
+            Vmm::CloudHypervisor
+                .rhizo_cmdline()
+                .contains("exit=ch-acpi")
+        );
+        assert!(Vmm::QemuMicrovm.rhizo_cmdline().contains("console=e9"));
+    }
+}

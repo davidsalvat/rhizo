@@ -1,16 +1,19 @@
 //! Developer tasks for Rhizo.
 //!
 //! Run `cargo xtask help` for the list of commands. Only the Rust toolchain
-//! and QEMU (`qemu-system-x86_64`) are required.
+//! and QEMU (`qemu-system-x86_64`) are required; Firecracker, Cloud Hypervisor
+//! and the reference guest are downloaded on demand.
+
+mod bench;
+mod refguest;
+mod tools;
+mod vmm;
 
 use std::env;
-use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, ExitCode};
+use std::time::Duration;
+use vmm::{Accel, Guest, RunOptions, VmResult, VmRun, Vmm};
 
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const KERNEL_PACKAGE: &str = "rhizo-kernel";
@@ -18,41 +21,52 @@ const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
 /// Timeout for the self-check that expects a hanging kernel.
 const HANG_CHECK_TIMEOUT_SECS: u64 = 5;
 
-/// QEMU exit status produced by the kernel writing 0x10 to `isa-debug-exit`.
-const QEMU_SUCCESS: i32 = (0x10 << 1) | 1;
-/// QEMU exit status produced by the kernel writing 0x11 to `isa-debug-exit`.
-const QEMU_FAILURE: i32 = (0x11 << 1) | 1;
-
 const HELP: &str = "\
 Usage: cargo xtask <command> [options]
 
 Commands:
   build [--release]          Build the kernel image
-  run [--release] [--gdb]    Build and boot the kernel in QEMU (serial on stdout)
-                             --gdb waits for a debugger on localhost:1234
-  test                       Host tests, boot check, in-kernel tests in QEMU,
-                             and harness self-checks
+  run [options]              Build and boot the kernel, console on stdout,
+                             then report the time to ready
+      --release              Optimized build
+      --vmm <name>           qemu-microvm (default), qemu-q35, firecracker,
+                             cloud-hypervisor
+      --machine <microvm|q35>  Shorthand for the QEMU VMMs
+      --accel <auto|kvm|tcg> QEMU acceleration (default auto: KVM if usable)
+      --gdb                  QEMU only: wait for a debugger on localhost:1234
+  test [--vmm <name>] [--accel <a>]
+                             Host tests, boot check, in-kernel tests and
+                             harness self-checks
+  bench [options]            Release-build boot benchmarks on every VMM
+      --runs <n>             Boots per VMM (default 20)
+      --vmm <a,b,...>        Restrict the VMMs
+      --env <name>           Environment label / baseline (ci, dedicated, local)
+      --output <file>        Write results as JSON
+      --from <file>          Use stored results instead of measuring
+      --check                Fail if a metric regressed beyond its threshold
+      --update-baseline      Store the results as the baseline for --env
+      --readme               Regenerate the README benchmark section
+      --no-reference         Skip the reference Linux guest
   ci                         Everything CI runs: fmt, clippy, test
   help                       Show this message
 
 Environment:
   RHIZO_TEST_TIMEOUT         Seconds before a test VM is killed (default 30)
   RHIZO_QEMU                 QEMU binary (default qemu-system-x86_64)
+  RHIZO_FIRECRACKER, RHIZO_CLOUD_HYPERVISOR, RHIZO_REFERENCE_KERNEL
+                             Use local files instead of downloading
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    let rest = args.get(1..).unwrap_or_default();
     let result = match args.first().map(String::as_str) {
         Some("build") => {
-            let profile = Profile::from_args(&args[1..]);
-            build_kernel(profile, &[]).map(|path| println!("{}", path.display()))
+            build_kernel(Profile::from_args(rest), &[]).map(|path| println!("{}", path.display()))
         }
-        Some("run") => {
-            let profile = Profile::from_args(&args[1..]);
-            let gdb = args.iter().any(|a| a == "--gdb");
-            cmd_run(profile, gdb)
-        }
-        Some("test") => cmd_test(),
+        Some("run") => RunArgs::parse(rest).and_then(|a| cmd_run(&a)),
+        Some("test") => RunArgs::parse(rest).and_then(|a| cmd_test(&a)),
+        Some("bench") => bench::Options::parse(rest).and_then(|o| bench::cmd(&o)),
         Some("ci") => cmd_ci(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{HELP}");
@@ -69,10 +83,10 @@ fn main() -> ExitCode {
     }
 }
 
-type Result<T = ()> = std::result::Result<T, String>;
+pub(crate) type Result<T = ()> = std::result::Result<T, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Profile {
+pub(crate) enum Profile {
     Debug,
     Release,
 }
@@ -98,48 +112,129 @@ impl Profile {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_run(profile: Profile, gdb: bool) -> Result {
-    let kernel = build_kernel(profile, &[])?;
-    let mut qemu = qemu_command(&kernel);
-    if gdb {
-        qemu.args(["-s", "-S"]);
-        println!("QEMU is waiting for gdb on localhost:1234");
+/// Options shared by `run` and `test`.
+#[derive(Debug)]
+struct RunArgs {
+    profile: Profile,
+    vmm: Vmm,
+    accel: Accel,
+    gdb: bool,
+}
+
+impl RunArgs {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut parsed = Self {
+            profile: Profile::from_args(args),
+            vmm: Vmm::QemuMicrovm,
+            accel: Accel::Auto,
+            gdb: false,
+        };
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
+            let mut value = |name: &str| {
+                it.next()
+                    .cloned()
+                    .ok_or_else(|| format!("{name} needs a value"))
+            };
+            match arg.as_str() {
+                "--release" => {}
+                "--gdb" => parsed.gdb = true,
+                "--vmm" => parsed.vmm = Vmm::parse(&value("--vmm")?)?,
+                "--machine" => {
+                    parsed.vmm = match value("--machine")?.as_str() {
+                        "microvm" => Vmm::QemuMicrovm,
+                        "q35" => Vmm::QemuQ35,
+                        other => return Err(format!("unknown machine `{other}` (microvm or q35)")),
+                    }
+                }
+                "--accel" => parsed.accel = Accel::parse(&value("--accel")?)?,
+                other => return Err(format!("unknown option `{other}`")),
+            }
+        }
+        if parsed.gdb && parsed.vmm.requires_kvm() {
+            return Err("--gdb is only supported on the QEMU VMMs".into());
+        }
+        Ok(parsed)
     }
-    let status = qemu
-        .stdin(Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to start QEMU: {e}"))?;
-    match interpret_exit(status.code()) {
-        VmResult::Passed => Ok(()),
-        other => Err(format!("kernel run ended with {other:?}")),
+
+    fn run_options(&self, timeout: Duration) -> RunOptions {
+        RunOptions {
+            stop_at_ready: false,
+            timeout,
+            echo: true,
+            accel: self.accel,
+            gdb: self.gdb,
+        }
     }
 }
 
-fn cmd_test() -> Result {
+fn cmd_run(args: &RunArgs) -> Result {
+    let kernel = build_kernel(args.profile, &[])?;
+    if args.gdb {
+        println!("QEMU is waiting for gdb on localhost:1234");
+    }
+    let timeout = if args.gdb {
+        Duration::from_secs(24 * 3600)
+    } else {
+        test_timeout()?
+    };
+    let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), args.run_options(timeout))?;
+    report_timing(args.vmm, &run);
+    match run.result {
+        VmResult::Passed => Ok(()),
+        other => Err(format!(
+            "kernel run on {} ended with {other:?}",
+            args.vmm.id()
+        )),
+    }
+}
+
+/// Prints the host-measured time to ready and the kernel's own cycle count.
+fn report_timing(vmm: Vmm, run: &VmRun) {
+    match run.time_to_ready {
+        Some(t) => println!(
+            "[xtask] {}: time to ready {:.2} ms (host), {} kernel cycles",
+            vmm.id(),
+            t.as_secs_f64() * 1000.0,
+            run.ready_cycles
+                .map_or_else(|| "unknown".to_string(), |c| c.to_string())
+        ),
+        None => println!("[xtask] {}: the ready marker never arrived", vmm.id()),
+    }
+}
+
+fn cmd_test(args: &RunArgs) -> Result {
     step("host tests");
     cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
 
     let timeout = test_timeout()?;
+    let opts = args.run_options(timeout);
 
-    step("boot check");
+    step(&format!("boot check on {}", args.vmm.id()));
     let kernel = build_kernel(Profile::Debug, &[])?;
-    let run = run_vm(&kernel, timeout)?;
+    let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
+    report_timing(args.vmm, &run);
     expect(
         run.result == VmResult::Passed,
         "boot must exit successfully",
         &run,
     )?;
-    expect(
-        run.output.contains("Rhizo ")
-            && run.output.contains("\nmemory: ")
-            && run.output.contains("boot complete"),
-        "boot must print the banner, the memory line and `boot complete`",
-        &run,
-    )?;
+    for needle in [
+        "Rhizo ",
+        "\nmemory: ",
+        "\nrhizo-ready cycles=",
+        "boot complete",
+    ] {
+        expect(
+            run.output.contains(needle),
+            &format!("boot output must contain `{}`", needle.trim()),
+            &run,
+        )?;
+    }
 
     step("in-kernel tests");
     let kernel = build_kernel(Profile::Debug, &["ktest"])?;
-    let run = run_vm(&kernel, timeout)?;
+    let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
     expect(
         run.result == VmResult::Passed,
         "in-kernel tests must pass",
@@ -158,7 +253,14 @@ fn cmd_test() -> Result {
             .timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(timeout);
-        let run = run_vm(&kernel, limit)?;
+        let run = vmm::run(
+            args.vmm,
+            &Guest::Rhizo(kernel),
+            RunOptions {
+                timeout: limit,
+                ..opts
+            },
+        )?;
         expect(
             run.result == check.expected,
             &format!("{} must end with {:?}", check.feature, check.expected),
@@ -207,7 +309,22 @@ fn cmd_ci() -> Result {
         cargo(&args)?;
     }
 
-    cmd_test()
+    cmd_test(&RunArgs::parse(&[])?)?;
+
+    step("boot check on qemu-q35");
+    let kernel = build_kernel(Profile::Debug, &[])?;
+    let q35 = RunArgs::parse(&["--machine".into(), "q35".into()])?;
+    let run = vmm::run(
+        Vmm::QemuQ35,
+        &Guest::Rhizo(kernel),
+        q35.run_options(test_timeout()?),
+    )?;
+    report_timing(Vmm::QemuQ35, &run);
+    expect(
+        run.result == VmResult::Passed,
+        "q35 boot must exit successfully",
+        &run,
+    )
 }
 
 /// A kernel build that must fail in a specific, detectable way.
@@ -279,7 +396,7 @@ const SELF_CHECKS: &[SelfCheck] = &[
 // Building
 // ---------------------------------------------------------------------------
 
-fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBuf> {
+pub(crate) fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBuf> {
     let mut args = vec!["build", "-p", KERNEL_PACKAGE, "--target", KERNEL_TARGET];
     if profile == Profile::Release {
         args.push("--release");
@@ -309,115 +426,17 @@ fn cargo(args: &[&str]) -> Result {
     }
 }
 
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives inside the workspace")
         .to_path_buf()
 }
 
-fn target_dir() -> PathBuf {
+pub(crate) fn target_dir() -> PathBuf {
     env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"))
-}
-
-// ---------------------------------------------------------------------------
-// Running QEMU
-// ---------------------------------------------------------------------------
-
-/// How a VM run ended, as seen by the host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VmResult {
-    /// The kernel reported success through the exit device.
-    Passed,
-    /// The kernel reported failure through the exit device.
-    Failed,
-    /// QEMU ended any other way: crash, triple fault (with -no-reboot), error.
-    Abnormal(Option<i32>),
-    /// The VM did not exit before the time limit and was killed.
-    TimedOut,
-}
-
-/// Maps QEMU's process exit code to a [`VmResult`] (design decision D6).
-fn interpret_exit(code: Option<i32>) -> VmResult {
-    match code {
-        Some(QEMU_SUCCESS) => VmResult::Passed,
-        Some(QEMU_FAILURE) => VmResult::Failed,
-        other => VmResult::Abnormal(other),
-    }
-}
-
-#[derive(Debug)]
-struct VmRun {
-    result: VmResult,
-    output: String,
-}
-
-fn qemu_command(kernel: &Path) -> Command {
-    let qemu = env::var("RHIZO_QEMU").unwrap_or_else(|_| "qemu-system-x86_64".into());
-    let mut cmd = Command::new(qemu);
-    cmd.args(["-machine", "q35", "-cpu", "max", "-m", "128M"])
-        .args(["-display", "none", "-serial", "stdio", "-no-reboot"])
-        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-        .args(["-accel", if kvm_available() { "kvm" } else { "tcg" }])
-        .arg("-kernel")
-        .arg(kernel);
-    cmd
-}
-
-fn kvm_available() -> bool {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
-}
-
-/// Boots `kernel`, streams its serial output to stdout and captures it.
-fn run_vm(kernel: &Path, timeout: Duration) -> Result<VmRun> {
-    let mut child = qemu_command(kernel)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to start QEMU (is it installed?): {e}"))?;
-
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let sink = Arc::clone(&captured);
-    let reader = thread::spawn(move || {
-        let mut buf = [0u8; 1024];
-        while let Ok(n) = stdout.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let chunk = &buf[..n];
-            let _ = io::stdout().write_all(chunk);
-            let _ = io::stdout().flush();
-            sink.lock().expect("capture lock").extend_from_slice(chunk);
-        }
-    });
-
-    let started = Instant::now();
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break interpret_exit(status.code()),
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break VmResult::TimedOut;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(format!("failed to wait for QEMU: {e}")),
-        }
-    };
-    let _ = reader.join();
-
-    if result == VmResult::TimedOut {
-        println!("\n[xtask] VM killed after {}s timeout", timeout.as_secs());
-    }
-    let output = String::from_utf8_lossy(&captured.lock().expect("capture lock")).into_owned();
-    Ok(VmRun { result, output })
 }
 
 fn test_timeout() -> Result<Duration> {
@@ -457,12 +476,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exit_codes_map_to_results() {
-        assert_eq!(interpret_exit(Some(33)), VmResult::Passed);
-        assert_eq!(interpret_exit(Some(35)), VmResult::Failed);
-        assert_eq!(interpret_exit(Some(0)), VmResult::Abnormal(Some(0)));
-        assert_eq!(interpret_exit(Some(1)), VmResult::Abnormal(Some(1)));
-        assert_eq!(interpret_exit(None), VmResult::Abnormal(None));
+    fn run_args_parse_vmm_machine_and_accel() {
+        let parse =
+            |a: &[&str]| RunArgs::parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let a = parse(&[]).unwrap();
+        assert_eq!(
+            (a.vmm, a.accel, a.profile),
+            (Vmm::QemuMicrovm, Accel::Auto, Profile::Debug)
+        );
+        assert_eq!(parse(&["--machine", "q35"]).unwrap().vmm, Vmm::QemuQ35);
+        assert_eq!(
+            parse(&["--vmm", "firecracker"]).unwrap().vmm,
+            Vmm::Firecracker
+        );
+        assert_eq!(parse(&["--accel", "tcg"]).unwrap().accel, Accel::Tcg);
+        assert!(parse(&["--machine", "pc"]).is_err());
+        assert!(parse(&["--vmm", "firecracker", "--gdb"]).is_err());
+        assert!(parse(&["--bogus"]).is_err());
     }
 
     #[test]

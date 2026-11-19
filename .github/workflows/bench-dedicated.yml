@@ -1,0 +1,26 @@
+name: bench-dedicated
+
+# Precise benchmark gate on a dedicated self-hosted runner (see bench/README.md).
+# Manual only: it needs a runner labelled `rhizo-bench`.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: [self-hosted, rhizo-bench]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Benchmarks and regression gate
+        run: cargo xtask bench --env dedicated --check --runs 50 --output bench-results.json
+      - name: Publish results
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            echo "::notice title=bench-results::$(tr -d '\n' < bench-results.json)"
+          fi

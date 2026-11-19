@@ -15,8 +15,10 @@ mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
 
-use arch::qemu::QemuExit;
-use arch::serial::Serial;
+use arch::console::BootConsole;
+use arch::power::Machine;
+use memory::DirectMap;
+use rhizo_core::options::{BootOptions, read_cmdline};
 use rhizo_core::panic::SourceLocation;
 use rhizo_hal::{ExitStatus, Power};
 
@@ -27,38 +29,52 @@ use rhizo_hal::{ExitStatus, Power};
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(start_info: u64, entry_tsc: u64) -> ! {
     arch::boot::record(start_info, entry_tsc);
-    let mut console = Serial::com1();
-    console.init();
+    // Stage-1 tables map physical memory below 4 GiB at the direct map, so the
+    // command line can be read before memory setup.
+    let mut cmdline = [0u8; 256];
+    let options = BootOptions::parse(read_cmdline(&DirectMap, start_info, &mut cmdline));
+    arch::console::init(options.console);
+    arch::power::init(options.exit);
+    let mut console = BootConsole;
     rhizo_core::boot::print_banner(&mut console);
 
     arch::cpu::init();
     let summary = memory::init(start_info);
-    rhizo_core::boot::report_memory(&mut console, summary.usable, summary.free);
+    rhizo_core::boot::report_memory(
+        &mut console,
+        summary.usable,
+        summary.free,
+        summary.page_table_frames,
+    );
+
+    let ready = {
+        use rhizo_hal::CycleCounter;
+        arch::tsc::Tsc.cycles()
+    };
+    rhizo_core::boot::report_ready(&mut console, entry_tsc, ready);
 
     #[cfg(feature = "ktest")]
     let status = rhizo_core::ktest::run(&mut console, tests::ALL);
 
     #[cfg(not(feature = "ktest"))]
     let status = {
-        use rhizo_hal::CycleCounter;
-        let end = arch::tsc::Tsc.cycles();
-        rhizo_core::boot::report_boot_complete(&mut console, entry_tsc, end);
+        rhizo_core::boot::report_boot_complete(&mut console, entry_tsc, ready);
         ExitStatus::Success
     };
 
-    QemuExit.exit(status)
+    Machine.exit(status)
 }
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    // A fresh handle is safe here: the serial port is stateless after init and
+    // A fresh handle is safe here: the console is stateless after init and
     // the kernel runs on a single CPU with interrupts disabled.
-    let mut console = Serial::com1();
+    let mut console = BootConsole;
     let location = info.location().map(|loc| SourceLocation {
         file: loc.file(),
         line: loc.line(),
         column: loc.column(),
     });
     rhizo_core::panic::report_panic(&mut console, info.message(), location);
-    QemuExit.exit(ExitStatus::Failure)
+    Machine.exit(ExitStatus::Failure)
 }
