@@ -72,7 +72,7 @@ Initial targets (hypotheses to be validated, not promises):
 | Milestone | Goal | Status |
 |---|---|---|
 | H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | Done |
-| H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | In progress |
+| H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | Done |
 | H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | — |
 | H3 | Multiple cells, scheduler, isolation tests | — |
 | H4 | Suspend / resume with snapshot-equivalence tests | — |
