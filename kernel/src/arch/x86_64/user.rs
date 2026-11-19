@@ -213,16 +213,26 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     }))
 }
 
-/// Switches CR3 back to the kernel's tables and drops every translation of
-/// the cell (`root`, `tag`): call before freeing its tables and its tag.
-pub fn release_user(root: u64, tag: u16) {
+/// Switches CR3 back to the kernel's tables: call before freeing the tables
+/// and the tag of the cell (`root`, `tag`).
+pub fn release_user(_root: u64, _tag: u16) {
+    // The tag's translations are dropped when its next cell first loads it
+    // (`enter_user` with `fresh`): one CR3 load here, not two (under nested
+    // virtualization each load can cost a VM exit).
+    let pcid = PCID.load(Ordering::Relaxed);
+    let kernel = crate::memory::kernel_tables().root();
+    USER_CR3.store(kernel, Ordering::Relaxed);
+    load_cr3(if pcid { kernel | NO_FLUSH } else { kernel });
+}
+
+/// Drops the translations of a cell that keeps running (its permissions
+/// shrank, as after a fork); the next entry reloads its tables.
+pub fn flush_user(root: u64, tag: u16) {
     let pcid = PCID.load(Ordering::Relaxed);
     if pcid && tag != 0 {
         load_cr3(root | tag as u64); // without bit 63: flushes this PCID
     }
-    let kernel = crate::memory::kernel_tables().root();
-    USER_CR3.store(kernel, Ordering::Relaxed);
-    load_cr3(if pcid { kernel | NO_FLUSH } else { kernel });
+    release_user(root, tag);
 }
 
 /// Nothing to do on x86_64: instruction fetch sees data writes.

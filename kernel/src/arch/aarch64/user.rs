@@ -276,6 +276,12 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     }))
 }
 
+/// Drops the translations of a cell that keeps running (its permissions
+/// shrank, as after a fork).
+pub fn flush_user(root: u64, tag: u16) {
+    release_user(root, tag);
+}
+
 /// Points `TTBR0_EL1` back at the empty table and drops every translation
 /// of the cell tagged `tag`: call before freeing its tables and its tag.
 pub fn release_user(_root: u64, tag: u16) {

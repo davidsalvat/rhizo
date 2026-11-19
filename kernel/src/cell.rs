@@ -596,7 +596,7 @@ impl Host {
         }
         // The parent lost write access to everything it shares: drop what its
         // TLB still caches.
-        user::release_user(parent.cell.root, parent.tag);
+        user::flush_user(parent.cell.root, parent.tag);
         self.requeue(parent, wake);
         (children.len() == n).then_some(children)
     }
