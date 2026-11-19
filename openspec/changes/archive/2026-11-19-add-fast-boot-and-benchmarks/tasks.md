@@ -12,18 +12,18 @@
 
 - [x] 2.1 Introduce the `Vmm` abstraction with QEMU `microvm` as default and `q35` selectable, KVM when usable; verify `cargo xtask test` passes on both machines
 - [x] 2.2 Measure time to ready on the host and print it with the kernel cycles after each run; verify `cargo xtask run` prints both
-- [ ] 2.3 Download pinned Firecracker and Cloud Hypervisor binaries into `target/tools/` and boot the kernel on both; verify in CI (KVM) that both reach the ready marker, and locally that missing KVM gives a clear skip message
+- [x] 2.3 Download pinned Firecracker and Cloud Hypervisor binaries into `target/tools/` and boot the kernel on both; verify in CI (KVM) that both reach the ready marker, and locally that missing KVM gives a clear skip message
 
 ## 3. Benchmarks
 
-- [ ] 3.1 Implement `cargo xtask bench` (release build, N runs per VMM, median/p90, JSON output, deterministic metrics); verify output on the CI runner
+- [x] 3.1 Implement `cargo xtask bench` (release build, N runs per VMM, median/p90, JSON output, deterministic metrics); verify output on the CI runner
 - [x] 3.2 Add `bench/baseline.json` with `ci` and `dedicated` environments and `--check` / `--update-baseline`; verify `--check` fails on an artificially tightened threshold and passes otherwise
-- [ ] 3.3 Add the reference Linux guest (pinned kernel and static init) and `--readme` chart generation; verify the README section is regenerated with values, environment and date
-- [ ] 3.4 Add the CI `bench` job (`--env ci --check`) and the optional self-hosted `dedicated` workflow; verify the job passes on the pull request
+- [x] 3.3 Add the reference Linux guest (pinned kernel and static init) and `--readme` chart generation; verify the README section is regenerated with values, environment and date
+- [x] 3.4 Add the CI `bench` job (`--env ci --check`) and the optional self-hosted `dedicated` workflow; verify the job passes on the pull request
 
 ## 4. Documentation and rules
 
-- [ ] 4.1 README: numeric targets against Firecracker, Unikraft and Hyperlight as hypotheses with sources, optimization roadmap per milestone with benchmarks, benchmark chart section; verify links and the chart render on GitHub
+- [x] 4.1 README: numeric targets against Firecracker, Unikraft and Hyperlight as hypotheses with sources, optimization roadmap per milestone with benchmarks, benchmark chart section; verify links and the chart render on GitHub
 - [x] 4.2 AGENTS.md: optimizations must ship a benchmark; no pull request may worsen a metric without written justification; `bench/README.md` explains environments and baselines; verify `cargo xtask ci` passes
 
 ## Workflow follow-up
