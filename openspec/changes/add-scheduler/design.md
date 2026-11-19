@@ -47,8 +47,12 @@ locking appears.
 
 ### D4. Time slice: a periodic tick
 
-The timer is a periodic tick every 10 ms, armed once; a cell runs until the
-next tick. It is not re-armed when cells switch.
+The timer is a periodic tick every 10 ms, armed once and never re-armed when
+cells switch. A cell is preempted at the second tick after it was picked:
+the first may have been pending since before it started (the kernel runs
+with interrupts masked, for example while suspending a large cell), and
+preempting on it could keep a cell from ever making progress. A slice is
+therefore between one and two periods.
 
 | Option | For | Against |
 |---|---|---|

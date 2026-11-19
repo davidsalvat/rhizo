@@ -256,6 +256,10 @@ impl Host {
     /// accordingly.
     fn run_slice(&mut self, live: &mut Live) {
         let pt = PageTable::<Format>::from_root(live.cell.root);
+        // Ticks seen in this slice: the first may have been pending since
+        // before the cell was picked, so a cell is preempted at the second,
+        // and always makes progress (design D4).
+        let mut ticks = 0;
         loop {
             match user::enter_user(live.cell.root, live.tag, &mut live.cell.regs) {
                 Trap::Syscall => {
@@ -280,7 +284,13 @@ impl Host {
                         Outcome::Exit(status) => self.end(take(live), Ending::Exit(status)),
                     }
                 }
-                Trap::Interrupt => self.sched.add(take(live)),
+                Trap::Interrupt => {
+                    ticks += 1;
+                    if ticks < 2 {
+                        continue;
+                    }
+                    self.sched.add(take(live));
+                }
                 Trap::Fault(fault) => {
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
