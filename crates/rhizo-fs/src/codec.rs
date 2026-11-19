@@ -65,6 +65,27 @@ impl Reader<'_> {
 }
 
 impl Fs {
+    /// Decodes a file system encoded by [`Tables::encode`]; `bytes` must
+    /// hold exactly one. Refuses anything that would break an invariant.
+    pub fn decode(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
+        let tables = Tables::decode(bytes)?;
+        if tables.consistent() {
+            Ok(Fs(Arc::new(tables)))
+        } else {
+            Err(DecodeError::Corrupt)
+        }
+    }
+
+    /// [`Fs::decode`] without the consistency check, for bytes `decode`
+    /// already accepted (a validated snapshot): resuming a cell skips the
+    /// second check. Bytes that were never checked may give a file system
+    /// whose operations panic.
+    pub fn decode_trusted(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
+        Ok(Fs(Arc::new(Tables::decode(bytes)?)))
+    }
+}
+
+impl Tables {
     /// Appends the encoding of this file system to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.cwd.to_le_bytes());
@@ -129,13 +150,12 @@ impl Fs {
         }
     }
 
-    /// Decodes a file system encoded by [`Fs::encode`]; `bytes` must hold
-    /// exactly one. Refuses anything that would break an invariant.
-    pub fn decode(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
+    fn decode(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
         let mut r = Reader(bytes);
         let cwd = r.u32()?;
-        let mut inodes = Vec::new();
-        for _ in 0..r.count()? {
+        let count = r.count()?;
+        let mut inodes = Vec::with_capacity(count);
+        for _ in 0..count {
             if !r.flag()? {
                 inodes.push(None);
                 continue;
@@ -185,8 +205,9 @@ impl Fs {
             };
             inodes.push(Some(Arc::new(Inode { links, node })));
         }
-        let mut descs = Vec::new();
-        for _ in 0..r.count()? {
+        let count = r.count()?;
+        let mut descs = Vec::with_capacity(count);
+        for _ in 0..count {
             if !r.flag()? {
                 descs.push(None);
                 continue;
@@ -202,8 +223,9 @@ impl Fs {
                 refs: r.u32()?,
             }));
         }
-        let mut fds = Vec::new();
-        for _ in 0..r.count()? {
+        let count = r.count()?;
+        let mut fds = Vec::with_capacity(count);
+        for _ in 0..count {
             fds.push(if r.flag()? {
                 Some((r.u32()?, r.flag()?))
             } else {
@@ -221,18 +243,13 @@ impl Fs {
                 Node::Dir { .. } => 0,
             })
             .sum();
-        let fs = Fs {
+        Ok(Tables {
             inodes,
             descs,
             fds,
             cwd,
             used,
-        };
-        if fs.consistent() {
-            Ok(fs)
-        } else {
-            Err(DecodeError::Corrupt)
-        }
+        })
     }
 
     /// Whether the tables satisfy every invariant the operations rely on.

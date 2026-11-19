@@ -131,7 +131,10 @@ impl Snapshot {
             data_len += size.bytes() as usize;
         });
         let data_start = HEADER + STATE + pages * RECORD;
-        let mut b = Vec::with_capacity(data_start + data_len);
+        let mut encoded = Vec::new();
+        files.encode(&mut encoded);
+        // Sized once: growing past the pages would copy them all again.
+        let mut b = Vec::with_capacity(data_start + data_len + 8 + encoded.len());
         b.extend_from_slice(MAGIC);
         b.extend_from_slice(&VERSION.to_le_bytes());
         b.extend_from_slice(&(machine as u16).to_le_bytes());
@@ -170,11 +173,8 @@ impl Snapshot {
             mem.read_bytes(phys, &mut b[at..at + n]);
             at += n;
         });
-        let len_at = b.len();
-        b.extend_from_slice(&[0; 8]);
-        files.encode(&mut b);
-        let files_len = (b.len() - len_at - 8) as u64;
-        b[len_at..len_at + 8].copy_from_slice(&files_len.to_le_bytes());
+        b.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        b.extend_from_slice(&encoded);
         Self { bytes: b }
     }
 
@@ -288,7 +288,7 @@ impl Snapshot {
     }
 
     /// The encoded file system (after the page data and its length).
-    fn files_bytes(&self) -> &[u8] {
+    pub fn files_bytes(&self) -> &[u8] {
         let pages = self.page_count();
         let data_start = HEADER + STATE + pages * RECORD;
         // Pages are stored in record order: the data ends after the last.
@@ -302,7 +302,7 @@ impl Snapshot {
     /// The cell's file system, open descriptors and working directory.
     pub fn files(&self) -> Fs {
         // Validated by `from_bytes` or written by `capture`.
-        Fs::decode(self.files_bytes()).unwrap_or_default()
+        Fs::decode_trusted(self.files_bytes()).unwrap_or_default()
     }
 
     /// Number of pages.

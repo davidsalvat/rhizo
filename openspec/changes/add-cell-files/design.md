@@ -12,6 +12,12 @@ private only what it touches (`Arc::make_mut`): the inode, its block list and
 the written block. `Arc` rather than `Rc` because kernel globals hold cells
 and must be `Send`; on one CPU its atomic counts are uncontended.
 
+The tables themselves (inode table, descriptions, descriptors, working
+directory) sit behind one more `Arc`, copied on the first change: a fork is
+one count, and every cell spawned or resumed without files shares a single
+empty file system built once, so neither path builds a table (the lazy
+resume benchmark showed the cost of building one).
+
 | Option | Fork cost | Write after fork |
 |---|---|---|
 | **Shared inodes and blocks (chosen)** | one count per inode | copy one inode, its block list, one block |

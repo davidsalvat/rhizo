@@ -259,19 +259,11 @@ fn forks_share_blocks_until_written() {
     let mut parent = Fs::new();
     parent.put_file(b"/big", &vec![3u8; 64 * BLOCK]).unwrap();
     let mut child = parent.clone();
-    let Some(Some(inode)) = parent.inodes.get(1) else {
-        panic!("the file is inode 1")
-    };
-    let Node::File(f) = &inode.node else { panic!() };
-    assert_eq!(
-        Arc::strong_count(f.blocks[0].as_ref().unwrap()),
-        1,
-        "inode shared, not blocks"
-    );
-    assert_eq!(Arc::strong_count(inode), 2);
+    assert!(child.shares_with(&parent), "a fork copies no table");
     let fd = child.open(None, b"/big", RW, 2).unwrap();
     child.write(fd, b"x", Some(5)).unwrap();
-    // The child copied the inode table entry and one block only.
+    // The child copied the tables, the file's inode and one block only.
+    assert!(!child.shares_with(&parent));
     let (Some(Some(p)), Some(Some(c))) = (parent.inodes.get(1), child.inodes.get(1)) else {
         panic!()
     };

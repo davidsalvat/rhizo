@@ -169,9 +169,50 @@ pub enum Whence {
 /// File status flags kept for `fcntl(F_GETFL)` (append is applied).
 pub const O_APPEND_FLAG: u32 = 0x400;
 
-/// The file system and open descriptors of one cell.
+/// The file system and open descriptors of one cell: its [`Tables`], shared
+/// with the cell's forks (and with every cell spawned without files) until
+/// one of them changes something. A clone costs one reference count; the
+/// first change after it copies the tables (not the file data).
 #[derive(Debug, Clone)]
-pub struct Fs {
+pub struct Fs(Arc<Tables>);
+
+impl Fs {
+    /// An empty tree (`/`) with descriptors 0–2 on the console.
+    pub fn new() -> Self {
+        Self(Arc::new(Tables::new()))
+    }
+
+    /// Whether `self` and `other` share their tables (nothing changed since
+    /// one was cloned from the other).
+    pub fn shares_with(&self, other: &Fs) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Default for Fs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::ops::Deref for Fs {
+    type Target = Tables;
+    fn deref(&self) -> &Tables {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Fs {
+    /// Changes go to this cell's own copy of the tables.
+    fn deref_mut(&mut self) -> &mut Tables {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+/// The tables of a file system: inodes, open descriptions, descriptors and
+/// the working directory. Reached through an [`Fs`].
+#[derive(Debug, Clone)]
+pub struct Tables {
     inodes: Vec<Option<Arc<Inode>>>,
     descs: Vec<Option<Desc>>,
     /// Descriptor → description index, and the close-on-exec flag.
@@ -181,15 +222,9 @@ pub struct Fs {
     used: u64,
 }
 
-impl Default for Fs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Fs {
+impl Tables {
     /// An empty tree (`/`) with descriptors 0–2 on the console.
-    pub fn new() -> Self {
+    fn new() -> Self {
         let root = Inode {
             links: 1,
             node: Node::Dir {

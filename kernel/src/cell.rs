@@ -46,6 +46,30 @@ struct KernelFrames;
 /// that never fork cost nothing.
 static SHARED: Global<Vec<u16>> = Global::new(Vec::new());
 
+/// The file system of a cell given no files, and its encoding: built once,
+/// then shared copy-on-write by every such cell, so spawning or resuming one
+/// builds no table.
+static NO_FILES: Global<Option<(Fs, Vec<u8>)>> = Global::new(None);
+
+fn with_no_files<R>(f: impl FnOnce(&Fs, &[u8]) -> R) -> R {
+    NO_FILES.with(|slot| {
+        let (fs, bytes) = slot.get_or_insert_with(|| {
+            let fs = Fs::new();
+            let mut bytes = Vec::new();
+            fs.encode(&mut bytes);
+            (fs, bytes)
+        });
+        f(fs, bytes)
+    })
+}
+
+/// The file system a snapshot holds, shared with [`NO_FILES`] when it has
+/// no files.
+fn files_of(snapshot: &Snapshot) -> Fs {
+    with_no_files(|fs, bytes| (snapshot.files_bytes() == bytes).then(|| fs.clone()))
+        .unwrap_or_else(|| snapshot.files())
+}
+
 impl Frames for KernelFrames {
     fn alloc(&mut self) -> Option<u64> {
         memory::with_frames(|f| f.alloc()).flatten()
@@ -327,7 +351,8 @@ impl Host {
         capture: bool,
         echo: bool,
     ) -> Result<u32, ElfError> {
-        self.spawn_with_files(image, argv, Fs::new(), capture, echo)
+        let files = with_no_files(|fs, _| fs.clone());
+        self.spawn_with_files(image, argv, files, capture, echo)
     }
 
     /// [`spawn`](Self::spawn) with `files` as the cell's file system (spec
@@ -419,7 +444,7 @@ impl Host {
         }
         let cell = snapshot.cell(id, pt.root());
         let sleep = snapshot.state().sleep_remaining_ns;
-        let fs = snapshot.files();
+        let fs = files_of(&snapshot);
         let mut lazy = Lazy::new(snapshot);
         if mode == Resume::Eager {
             lazy.finish(&pt);
