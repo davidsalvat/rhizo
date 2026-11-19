@@ -48,25 +48,21 @@ jobs:
   quality:
     name: dependency policy, unused dependencies, dependency rules
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny,cargo-machete,actionlint
+      - uses: Swatinem/rust-cache@v2
       - name: Licenses, advisories, sources (cargo-deny)
-        run: cargo deny check 2>&1 | tee quality.log; exit "${PIPESTATUS[0]}"
-      - name: Unused dependencies (cargo-machete)
-        run: cargo machete 2>&1 | tee -a quality.log; exit "${PIPESTATUS[0]}"
-      - name: Crate dependency rules and workflow files
-        run: cargo xtask check 2>&1 | tee -a quality.log; exit "${PIPESTATUS[0]}"
-      - name: Report the failure as an annotation
-        if: failure()
+        uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Install cargo-machete and actionlint
         run: |
-          if [ -f quality.log ]; then
-            echo "::error title=quality-log::$(tail -c 3000 quality.log | sed -e 's/%/%25/g' | tr '\n' '|')"
-          fi
+          cargo install --locked cargo-machete@0.9.1
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7 "$HOME/.cargo/bin"
+      - name: Unused dependencies (cargo-machete)
+        run: cargo machete
+      - name: Crate dependency rules and workflow files
+        run: cargo xtask check
 
   miri:
     name: Miri on the heap allocator
