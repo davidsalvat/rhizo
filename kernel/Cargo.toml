@@ -1,0 +1,28 @@
+[package]
+name = "rhizo-kernel"
+description = "The Rhizo kernel image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rhizo-kernel"
+test = false
+bench = false
+
+[features]
+# Test build: run the in-kernel test suite instead of the normal boot path.
+ktest = []
+# Harness self-checks used by `cargo xtask test`: a suite that panics and a
+# suite that hangs, to prove failures and timeouts are detected.
+ktest-should-panic = ["ktest"]
+ktest-hang = ["ktest"]
+
+[dependencies]
+rhizo-hal = { path = "../crates/rhizo-hal" }
+rhizo-core = { path = "../crates/rhizo-core" }
+
+[lints]
+workspace = true

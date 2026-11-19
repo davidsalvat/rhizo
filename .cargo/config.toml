@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --package xtask --quiet --"
+
+[target.x86_64-unknown-none]
+# The kernel is loaded at a fixed physical address by the hypervisor.
+rustflags = ["-C", "relocation-model=static"]

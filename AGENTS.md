@@ -53,16 +53,35 @@ This repository uses spec-driven development with
 ## Conventions
 
 - Language for code, comments, specs and commits: **English**.
-- Rust edition 2024, stable toolchain (pinned in `rust-toolchain.toml` once it
-  exists). Format with `rustfmt`; code must pass `clippy` without warnings.
+- Rust edition 2024, stable toolchain pinned in `rust-toolchain.toml`.
+  Format with `rustfmt`; code must pass `clippy` without warnings.
 - Commit messages: imperative mood, short summary line, explain *why* in the
   body. Reference the OpenSpec change id when relevant.
 - Keep pull requests scoped to a single change.
 
 ## Build and test
 
-Commands will be defined by change `add-kernel-boot-skeleton` (milestone H0).
-Until then there is nothing to build.
+Requires the Rust toolchain (via rustup) and `qemu-system-x86_64`.
+
+- `cargo xtask build` / `cargo xtask run`: build / boot the kernel in QEMU.
+- `cargo test`: host tests only (no QEMU).
+- `cargo xtask test`: host tests, boot check, in-kernel tests in QEMU and
+  harness self-checks.
+- `cargo xtask ci`: formatting, clippy (host crates and every kernel feature
+  set) and all tests. **Run this before proposing any change.**
+
+Layout and where code belongs:
+
+- `crates/rhizo-hal/`: hardware interfaces (traits) and host test doubles.
+- `crates/rhizo-core/`: hardware-independent logic. Prefer putting logic here
+  so it can be unit-tested on the host.
+- `kernel/src/arch/`: the only place for assembly, port I/O and other direct
+  hardware access.
+- `kernel/src/tests.rs`: in-kernel tests (run inside QEMU).
+- `xtask/`: developer tooling.
+
+The kernel crate only builds for `x86_64-unknown-none`; plain `cargo` commands
+skip it (it is not a default workspace member). Use `cargo xtask` for it.
 
 ## Tool-specific files
 

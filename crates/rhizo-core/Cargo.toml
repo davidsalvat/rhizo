@@ -1,0 +1,17 @@
+[package]
+name = "rhizo-core"
+description = "Hardware-independent logic of the Rhizo kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rhizo-hal = { path = "../rhizo-hal" }
+
+[dev-dependencies]
+rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
+
+[lints]
+workspace = true

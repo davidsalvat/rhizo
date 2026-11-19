@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["kernel", "crates/rhizo-hal", "crates/rhizo-core", "xtask"]
+# The kernel only builds for the bare-metal target; plain `cargo` commands
+# (test, clippy, build) operate on the host-buildable crates. Use
+# `cargo xtask` for anything involving the kernel.
+default-members = ["crates/rhizo-hal", "crates/rhizo-core", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/davidsalvat/rhizo"
+rust-version = "1.97"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
