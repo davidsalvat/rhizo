@@ -67,6 +67,25 @@ pub trait PhysicalMemory {
             self.write_u64(frame + offset, 0);
         }
     }
+
+    /// Copies `out.len()` bytes starting at physical address `phys` (any
+    /// alignment) into `out`.
+    fn read_bytes(&self, phys: u64, out: &mut [u8]) {
+        for (i, byte) in out.iter_mut().enumerate() {
+            let p = phys + i as u64;
+            *byte = (self.read_u64(p & !7) >> ((p & 7) * 8)) as u8;
+        }
+    }
+
+    /// Copies `data` to physical address `phys` (any alignment).
+    fn write_bytes(&mut self, phys: u64, data: &[u8]) {
+        for (i, &byte) in data.iter().enumerate() {
+            let p = phys + i as u64;
+            let shift = (p & 7) * 8;
+            let word = self.read_u64(p & !7);
+            self.write_u64(p & !7, (word & !(0xff << shift)) | ((byte as u64) << shift));
+        }
+    }
 }
 
 /// The processor's cache of address translations.
@@ -192,6 +211,19 @@ mod tests {
     use super::testing::{FakePhysicalMemory, ManualCycleCounter, RecordingConsole, RecordingTlb};
     use super::*;
     use core::fmt::Write;
+
+    #[test]
+    fn byte_copies_work_at_any_alignment() {
+        let mut mem = FakePhysicalMemory::new();
+        mem.write_bytes(0x1003, b"rhizo cells!");
+        let mut back = [0u8; 12];
+        mem.read_bytes(0x1003, &mut back);
+        assert_eq!(&back, b"rhizo cells!");
+        assert_eq!(
+            mem.read_u64(0x1000) >> 24,
+            u64::from_le_bytes(*b"rhizo\0\0\0")
+        );
+    }
 
     #[test]
     fn recording_console_reads_back_exact_bytes() {

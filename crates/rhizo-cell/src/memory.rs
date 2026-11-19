@@ -92,31 +92,63 @@ pub fn copy_to<F: EntryFormat>(
     })
 }
 
-/// Writes `data` at a physical address through 64-bit accesses (whole words
-/// directly, partial words by read-modify-write).
-pub fn write_bytes(mem: &mut impl PhysicalMemory, phys: u64, data: &[u8]) {
-    let mut i = 0;
-    while i < data.len() {
-        let p = phys + i as u64;
-        if p.is_multiple_of(8) && data.len() - i >= 8 {
-            let word: [u8; 8] = data[i..i + 8].try_into().unwrap_or([0; 8]);
-            mem.write_u64(p, u64::from_le_bytes(word));
-            i += 8;
-        } else {
-            write_byte(mem, p, data[i]);
-            i += 1;
-        }
+/// Makes user addresses accessible on demand: pages of a lazily resumed cell
+/// (H4) or copy-on-write pages (H5).
+pub trait Pager<F: EntryFormat, M: PhysicalMemory> {
+    /// Tries to make the page containing `addr` accessible (writable when
+    /// `write`); returns whether it did.
+    fn page_in(&mut self, pt: &PageTable<F>, mem: &mut M, addr: u64, write: bool) -> bool;
+}
+
+/// No paging: what is not mapped stays a fault.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPager;
+
+impl<F: EntryFormat, M: PhysicalMemory> Pager<F, M> for NoPager {
+    fn page_in(&mut self, _: &PageTable<F>, _: &mut M, _: u64, _: bool) -> bool {
+        false
     }
 }
 
-/// Writes one byte at a physical address through 64-bit accesses.
-fn write_byte(mem: &mut impl PhysicalMemory, phys: u64, byte: u8) {
-    let word = mem.read_u64(phys & !7);
-    let shift = (phys & 7) * 8;
-    mem.write_u64(
-        phys & !7,
-        (word & !(0xff << shift)) | ((byte as u64) << shift),
-    );
+/// Like [`copy_from`], paging in what is missing through `pager`.
+pub fn read<F: EntryFormat, M: PhysicalMemory>(
+    pt: &PageTable<F>,
+    mem: &mut M,
+    pager: &mut dyn Pager<F, M>,
+    addr: u64,
+    out: &mut [u8],
+) -> Result<(), Fault> {
+    // Each successful page-in makes progress; a pager that claims success
+    // without mapping anything cannot loop forever.
+    for _ in 0..=out.len() / 4096 + 2 {
+        match copy_from(pt, mem, addr, out) {
+            Err(Fault(at)) if pager.page_in(pt, mem, at, false) => {}
+            done => return done,
+        }
+    }
+    copy_from(pt, mem, addr, out)
+}
+
+/// Like [`copy_to`], paging in what is missing through `pager`.
+pub fn write<F: EntryFormat, M: PhysicalMemory>(
+    pt: &PageTable<F>,
+    mem: &mut M,
+    pager: &mut dyn Pager<F, M>,
+    addr: u64,
+    data: &[u8],
+) -> Result<(), Fault> {
+    for _ in 0..=data.len() / 4096 + 2 {
+        match copy_to(pt, mem, addr, data) {
+            Err(Fault(at)) if pager.page_in(pt, mem, at, true) => {}
+            done => return done,
+        }
+    }
+    copy_to(pt, mem, addr, data)
+}
+
+/// Writes `data` at a physical address.
+pub fn write_bytes(mem: &mut impl PhysicalMemory, phys: u64, data: &[u8]) {
+    mem.write_bytes(phys, data);
 }
 
 #[cfg(test)]
@@ -165,6 +197,51 @@ mod tests {
         let mut back = [0u8; 5];
         copy_from(&pt, &mem, 0x1ff9, &mut back).unwrap();
         assert_eq!(&back, b"rhizo");
+    }
+
+    /// Maps a zeroed user page on demand, as a lazily resumed cell would.
+    struct MapOnDemand(u64);
+
+    impl Pager<Aarch64, FakePhysicalMemory> for MapOnDemand {
+        fn page_in(
+            &mut self,
+            pt: &PageTable<Aarch64>,
+            mem: &mut FakePhysicalMemory,
+            addr: u64,
+            _: bool,
+        ) -> bool {
+            self.0 += 0x1000;
+            let rw = PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+            let mut next = 0x70_0000 + self.0 * 2;
+            let mut alloc = || {
+                next += 0x1000;
+                Some(next)
+            };
+            pt.map(
+                mem,
+                &mut alloc,
+                addr & !0xfff,
+                0x60_0000 + self.0,
+                PageSize::Small,
+                rw,
+            )
+            .is_ok()
+        }
+    }
+
+    #[test]
+    fn the_pager_brings_in_missing_pages() {
+        let (pt, mut mem) = setup();
+        let mut pager = MapOnDemand(0);
+        write(&pt, &mut mem, &mut pager, 0x8ffc, b"across").unwrap();
+        let mut back = [0u8; 6];
+        read(&pt, &mut mem, &mut pager, 0x8ffc, &mut back).unwrap();
+        assert_eq!(&back, b"across");
+        assert_eq!(pager.0, 0x2000, "two pages brought in, once each");
+        assert_eq!(
+            read(&pt, &mut mem, &mut NoPager, 0xa000, &mut back),
+            Err(Fault(0xa000))
+        );
     }
 
     #[test]

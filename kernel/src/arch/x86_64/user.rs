@@ -39,6 +39,15 @@ pub enum Trap {
 pub struct UserFault(ExceptionInfo);
 
 impl UserFault {
+    /// The address of an access to a page that is not mapped (a page fault
+    /// with the present bit clear), if that is what it was.
+    pub fn missing_page(&self) -> Option<u64> {
+        let info = &self.0;
+        (info.vector == exception::PAGE_FAULT && info.error_code & 1 == 0)
+            .then_some(info.fault_address)
+            .flatten()
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_exception(console, cell, &self.0);

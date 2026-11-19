@@ -8,8 +8,9 @@
 #![cfg_attr(not(test), no_std)]
 
 use core::fmt;
+use rhizo_cell::memory::{self, Pager};
 use rhizo_cell::space::{self, Frames};
-use rhizo_cell::{Cell, MMAP_BASE, STACK_PAGES, STACK_TOP, memory};
+use rhizo_cell::{Cell, MMAP_BASE, STACK_PAGES, STACK_TOP};
 use rhizo_hal::{Console, PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
@@ -133,14 +134,36 @@ pub enum Outcome {
     Exit(i32),
 }
 
+pub use rhizo_cell::memory::NoPager;
+
 /// Everything a call needs to reach the cell's memory and the kernel.
-#[derive(Debug)]
 pub struct Context<'a, F, M, T, A, S> {
     pub pt: PageTable<F>,
     pub mem: &'a mut M,
     pub tlb: &'a mut T,
     pub frames: &'a mut A,
     pub services: &'a mut S,
+    /// Brings in pages that are not mapped yet (lazy resume); [`NoPager`]
+    /// otherwise.
+    pub pager: &'a mut dyn Pager<F, M>,
+}
+
+impl<F, M, T, A, S> fmt::Debug for Context<'_, F, M, T, A, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Context").finish_non_exhaustive()
+    }
+}
+
+impl<F: EntryFormat, M: PhysicalMemory, T, A, S> Context<'_, F, M, T, A, S> {
+    /// Copies cell memory at `addr` into `out`.
+    fn read(&mut self, addr: u64, out: &mut [u8]) -> Result<(), memory::Fault> {
+        memory::read(&self.pt, self.mem, self.pager, addr, out)
+    }
+
+    /// Copies `data` to cell memory at `addr`.
+    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), memory::Fault> {
+        memory::write(&self.pt, self.mem, self.pager, addr, data)
+    }
 }
 
 /// The system-call handler.
@@ -259,7 +282,7 @@ fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         while off < len {
             let n = (len - off).min(CHUNK as u64) as usize;
             let mut buf = [0u8; CHUNK];
-            if memory::copy_from(&cx.pt, cx.mem, base.wrapping_add(off), &mut buf[..n]).is_err() {
+            if cx.read(base.wrapping_add(off), &mut buf[..n]).is_err() {
                 return if done == 0 { -EFAULT } else { done as i64 };
             }
             cx.services.write_bytes(&buf[..n]);
@@ -282,7 +305,7 @@ fn writev<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     let mut total = 0;
     for i in 0..count {
         let mut entry = [0u8; 16];
-        if memory::copy_from(&cx.pt, cx.mem, iov.wrapping_add(i * 16), &mut entry).is_err() {
+        if cx.read(iov.wrapping_add(i * 16), &mut entry).is_err() {
             return if total == 0 { -EFAULT } else { total };
         }
         let base = u64::from_le_bytes(entry[..8].try_into().unwrap_or_default());
@@ -406,7 +429,7 @@ fn put<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     addr: u64,
     data: &[u8],
 ) -> i64 {
-    match memory::copy_to(&cx.pt, cx.mem, addr, data) {
+    match cx.write(addr, data) {
         Ok(()) => 0,
         Err(_) => -EFAULT,
     }
@@ -470,7 +493,7 @@ fn getrandom<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         let n = (len - done).min(CHUNK as u64) as usize;
         let mut buf = [0u8; CHUNK];
         cx.services.random(&mut buf[..n]);
-        if memory::copy_to(&cx.pt, cx.mem, addr.wrapping_add(done), &buf[..n]).is_err() {
+        if cx.write(addr.wrapping_add(done), &buf[..n]).is_err() {
             return if done == 0 { -EFAULT } else { done as i64 };
         }
         done += n as u64;
@@ -488,7 +511,7 @@ fn sleep_until<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 ) -> Result<u64, i64> {
     const TIMER_ABSTIME: u64 = 1;
     let mut ts = [0u8; 16];
-    memory::copy_from(&cx.pt, cx.mem, addr, &mut ts).map_err(|_| -EFAULT)?;
+    cx.read(addr, &mut ts).map_err(|_| -EFAULT)?;
     let sec = i64::from_le_bytes(ts[..8].try_into().unwrap_or_default());
     let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap_or_default());
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {

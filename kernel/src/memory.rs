@@ -41,6 +41,26 @@ impl PhysicalMemory for DirectMap {
         // by the caller.
         unsafe { core::ptr::write_bytes(Self::virt(frame) as *mut u8, 0, FRAME_SIZE as usize) }
     }
+
+    fn read_bytes(&self, phys: u64, out: &mut [u8]) {
+        // SAFETY: as for `read_u64`; the range is RAM owned by the caller and
+        // does not overlap `out` (kernel heap or stack).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                Self::virt(phys) as *const u8,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn write_bytes(&mut self, phys: u64, data: &[u8]) {
+        // SAFETY: as for `write_u64`; the range is RAM owned by the caller and
+        // does not overlap `data`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), Self::virt(phys) as *mut u8, data.len())
+        }
+    }
 }
 
 static BITMAP: Global<[u64; BITMAP_WORDS]> = Global::new([0; BITMAP_WORDS]);
