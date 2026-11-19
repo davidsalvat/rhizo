@@ -376,6 +376,7 @@ fn measure_cells(
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
+        let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -402,6 +403,10 @@ fn measure_cells(
                         fork_touch.push(f.fork_touch_ns as f64 / 1000.0);
                         template.push(f.spawn_from_template_ns as f64 / 1000.0);
                         fork_pt_frames = Some(f.fork_pt_frames);
+                    }
+                    if let Some((w, f)) = parse_files_line(&out.output) {
+                        file_write_read.push(w as f64 / 1000.0);
+                        fork_files.push(f as f64 / 1000.0);
                     }
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
@@ -438,6 +443,8 @@ fn measure_cells(
             ("cell.spawn_from_template_us", "us", &mut template),
             ("workload.cold_us", "us", &mut cold),
             ("workload.warm_us", "us", &mut warm),
+            ("cell.file_write_read_us", "us", &mut file_write_read),
+            ("cell.fork_with_files_us", "us", &mut fork_files),
         ] {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -467,6 +474,18 @@ fn measure_cells(
         ));
     }
     Ok(())
+}
+
+/// `(write_read_ns, fork_ns)` of the files line of a `bench-cell` kernel.
+fn parse_files_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-files "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("write_read_ns")?, field("fork_ns")?))
 }
 
 /// `(cold_ns, warm_ns)` of the real-workload line of a `bench-cell` kernel.
@@ -1312,6 +1331,15 @@ mod tests {
             parse_workload_line("x\nrhizo-workload cold_ns=900 warm_ns=30\n"),
             Some((900, 30))
         );
+    }
+
+    #[test]
+    fn files_line_is_parsed() {
+        assert_eq!(
+            parse_files_line("rhizo-files write_read_ns=120000 fork_ns=1500\n"),
+            Some((120_000, 1500))
+        );
+        assert_eq!(parse_files_line("rhizo-files write_read_ns=1\n"), None);
     }
 
     #[test]

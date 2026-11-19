@@ -43,6 +43,7 @@ struct World {
     tlb: RecordingTlb,
     frames: CountingFrames,
     services: FakeServices,
+    fs: rhizo_fs::Fs,
 }
 
 const DATA: u64 = 0x10_0000;
@@ -66,6 +67,7 @@ impl World {
             tlb,
             frames,
             services: FakeServices::default(),
+            fs: rhizo_fs::Fs::new(),
         }
     }
 
@@ -94,6 +96,7 @@ impl World {
             tlb: &mut self.tlb,
             frames: &mut self.frames,
             services: &mut self.services,
+            fs: &mut self.fs,
             pager: &mut NoPager,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
@@ -345,4 +348,210 @@ fn libc_startup_calls() {
     let mut x = World::new(Arch::X86_64);
     assert_eq!(x.call(5, &[2, DATA]).0, 0, "fstat on x86_64");
     assert_eq!(x.peek(DATA + 24, 4), (0o020_620u32).to_le_bytes());
+}
+
+// File calls (AArch64 numbers).
+const OPENAT: u64 = 56;
+const CLOSE: u64 = 57;
+const READ: u64 = 63;
+const LSEEK: u64 = 62;
+const AT_FDCWD: u64 = -100i64 as u64;
+const ENOTEMPTY: i64 = 39;
+const EEXIST: i64 = 17;
+
+/// Puts a NUL-terminated path at `DATA + 0x800` and returns its address.
+fn name(w: &mut World, path: &str) -> u64 {
+    let mut bytes = path.as_bytes().to_vec();
+    bytes.push(0);
+    w.poke(DATA + 0x800, &bytes);
+    DATA + 0x800
+}
+
+#[test]
+fn open_write_read_and_close_a_file() {
+    let mut w = World::new(Arch::Aarch64);
+    let p = name(&mut w, "/notes.txt");
+    assert_eq!(w.call(OPENAT, &[AT_FDCWD, p, 0]).0, -ENOENT);
+    let fd = w
+        .call(OPENAT, &[AT_FDCWD, p, 0x42 /* O_CREAT|O_RDWR */, 0o644])
+        .0;
+    assert_eq!(fd, 3);
+    assert_eq!(
+        w.call(OPENAT, &[AT_FDCWD, p, 0xc2 /* |O_EXCL */]).0,
+        -EEXIST
+    );
+    w.poke(DATA, b"some file text");
+    assert_eq!(w.call(WRITE, &[3, DATA, 14]).0, 14);
+    assert_eq!(w.call(LSEEK, &[3, 5, 0]).0, 5);
+    assert_eq!(w.call(READ, &[3, DATA + 0x100, 100]).0, 9);
+    assert_eq!(w.peek(DATA + 0x100, 9), b"file text");
+    assert_eq!(w.call(READ, &[3, DATA + 0x100, 100]).0, 0, "end of file");
+    assert_eq!(w.call(67 /* pread64 */, &[3, DATA + 0x100, 4, 0]).0, 4);
+    assert_eq!(w.peek(DATA + 0x100, 4), b"some");
+    assert_eq!(
+        w.call(READ, &[3, RO, 4]).0,
+        0,
+        "at the end nothing is copied"
+    );
+    assert_eq!(w.call(LSEEK, &[3, 0, 0]).0, 0);
+    assert_eq!(
+        w.call(READ, &[3, RO, 4]).0,
+        -EFAULT,
+        "into a read-only page"
+    );
+    assert_eq!(w.call(LSEEK, &[1, 0, 0]).0, -29, "ESPIPE on the console");
+    assert_eq!(w.call(READ, &[0, DATA, 4]).0, 0, "empty standard input");
+    assert_eq!(w.call(CLOSE, &[3]).0, 0);
+    assert_eq!(w.call(CLOSE, &[3]).0, -EBADF);
+    assert_eq!(w.call(READ, &[3, DATA, 4]).0, -EBADF);
+}
+
+#[test]
+fn large_reads_and_writes_cross_pages() {
+    let mut w = World::new(Arch::Aarch64);
+    let anon = MAP_ANONYMOUS | MAP_PRIVATE;
+    let buf = w.call(MMAP, &[0, 3 * FRAME_SIZE, 3, anon, u64::MAX, 0]).0 as u64;
+    let data: Vec<u8> = (0..3 * FRAME_SIZE as usize - 100)
+        .map(|i| i as u8)
+        .collect();
+    w.poke(buf + 50, &data);
+    let p = name(&mut w, "big");
+    let fd = w.call(OPENAT, &[AT_FDCWD, p, 0x42]).0 as u64;
+    assert_eq!(
+        w.call(WRITE, &[fd, buf + 50, data.len() as u64]).0,
+        data.len() as i64
+    );
+    w.poke(buf, &vec![0; 3 * FRAME_SIZE as usize]);
+    assert_eq!(
+        w.call(67, &[fd, buf + 7, data.len() as u64 + 99, 0]).0,
+        data.len() as i64
+    );
+    assert_eq!(w.peek(buf + 7, data.len()), data);
+}
+
+#[test]
+fn directories_names_and_metadata() {
+    let mut w = World::new(Arch::Aarch64);
+    let d = name(&mut w, "/work");
+    assert_eq!(w.call(34 /* mkdirat */, &[AT_FDCWD, d, 0o755]).0, 0);
+    assert_eq!(w.call(49 /* chdir */, &[d]).0, 0);
+    assert_eq!(w.call(17 /* getcwd */, &[DATA, 64]).0, 6);
+    assert_eq!(w.peek(DATA, 6), b"/work\0");
+    assert_eq!(w.call(17, &[DATA, 3]).0, -34, "ERANGE");
+    let f = name(&mut w, "a");
+    let fd = w.call(OPENAT, &[AT_FDCWD, f, 0x42]).0 as u64;
+    w.poke(DATA, b"12345");
+    w.call(WRITE, &[fd, DATA, 5]);
+    // fstat and newfstatat: regular file of 5 bytes (AArch64 layout).
+    assert_eq!(w.call(80, &[fd, DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 16, 4), (0o100_644u32).to_le_bytes());
+    assert_eq!(w.peek(DATA + 48, 8), 5u64.to_le_bytes());
+    let full = name(&mut w, "/work/a");
+    assert_eq!(w.call(79, &[AT_FDCWD, full, DATA, 0]).0, 0);
+    assert_eq!(w.peek(DATA + 48, 8), 5u64.to_le_bytes());
+    // faccessat: exists, but cannot be executed.
+    assert_eq!(w.call(48, &[AT_FDCWD, full, 4]).0, 0);
+    assert_eq!(w.call(48, &[AT_FDCWD, full, 1]).0, -EACCES);
+    // getdents64 lists ".", ".." and "a".
+    let dot = name(&mut w, ".");
+    let dir = w.call(OPENAT, &[AT_FDCWD, dot, 0x4000 /* O_DIRECTORY */]).0 as u64;
+    let n = w.call(61, &[dir, DATA, 512]).0;
+    assert_eq!(n, 72, "three 24-byte records");
+    let rec = w.peek(DATA, n as usize);
+    assert_eq!(&rec[48 + 19..48 + 21], b"a\0");
+    assert_eq!(rec[48 + 18], 8, "DT_REG");
+    assert_eq!(w.call(61, &[dir, DATA, 512]).0, 0, "end of directory");
+    assert_eq!(w.call(61, &[fd, DATA, 512]).0, -20, "ENOTDIR");
+    // rename, then rmdir refuses a non-empty directory.
+    let b = name(&mut w, "/work/b");
+    let a = DATA + 0x900;
+    w.poke(a, b"/work/a\0");
+    assert_eq!(w.call(38 /* renameat */, &[AT_FDCWD, a, AT_FDCWD, b]).0, 0);
+    assert_eq!(w.call(79, &[AT_FDCWD, a, DATA, 0]).0, -ENOENT);
+    let root = name(&mut w, "/work");
+    assert_eq!(
+        w.call(35 /* unlinkat */, &[AT_FDCWD, root, 0x200]).0,
+        -ENOTEMPTY
+    );
+    let b = name(&mut w, "b");
+    assert_eq!(w.call(35, &[AT_FDCWD, b, 0]).0, 0);
+    let up = name(&mut w, "/");
+    assert_eq!(w.call(49, &[up]).0, 0);
+    let root = name(&mut w, "work");
+    assert_eq!(w.call(35, &[AT_FDCWD, root, 0x200]).0, 0);
+    assert_eq!(
+        w.call(276 /* renameat2 */, &[AT_FDCWD, up, AT_FDCWD, up, 1])
+            .0,
+        -EINVAL
+    );
+}
+
+#[test]
+fn descriptors_dup_and_fcntl() {
+    let mut w = World::new(Arch::Aarch64);
+    let p = name(&mut w, "/f");
+    let fd = w.call(OPENAT, &[AT_FDCWD, p, 0x42]).0 as u64;
+    w.poke(DATA, b"abcdef");
+    w.call(WRITE, &[fd, DATA, 6]);
+    w.call(LSEEK, &[fd, 0, 0]);
+    let copy = w.call(23 /* dup */, &[fd]).0 as u64;
+    assert_eq!(copy, 4);
+    assert_eq!(w.call(READ, &[fd, DATA, 2]).0, 2);
+    assert_eq!(w.call(READ, &[copy, DATA, 2]).0, 2);
+    assert_eq!(w.peek(DATA, 2), b"cd", "the offset is shared");
+    assert_eq!(w.call(24 /* dup3 */, &[fd, fd, 0]).0, -EINVAL);
+    assert_eq!(w.call(24, &[fd, 1, 0x8_0000]).0, 1, "dup3 over stdout");
+    assert_eq!(w.call(25 /* fcntl */, &[1, 1 /* F_GETFD */]).0, 1);
+    assert_eq!(w.call(WRITE, &[1, DATA, 2]).0, 2);
+    assert_eq!(w.services.console.text(), "", "stdout now goes to the file");
+    assert_eq!(w.call(25, &[fd, 3 /* F_GETFL */]).0, 2, "O_RDWR");
+    assert_eq!(w.call(25, &[fd, 4 /* F_SETFL */, 0x400]).0, 0);
+    assert_eq!(w.call(25, &[fd, 3]).0, 0x402);
+    assert_eq!(w.call(25, &[fd, 0 /* F_DUPFD */, 10]).0, 10);
+    assert_eq!(w.call(25, &[fd, 99]).0, -EINVAL);
+    assert_eq!(w.call(25, &[77, 3]).0, -EBADF);
+    assert_eq!(w.call(46 /* ftruncate */, &[fd, 2]).0, 0);
+    assert_eq!(w.call(80, &[fd, DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 48, 8), 2u64.to_le_bytes());
+    assert_eq!(w.call(46, &[0, 2]).0, -EINVAL, "not a file");
+    assert_eq!(w.call(82 /* fsync */, &[fd]).0, 0);
+    assert_eq!(w.call(82, &[77]).0, -EBADF);
+}
+
+#[test]
+fn x86_64_path_calls() {
+    let mut w = World::new(Arch::X86_64);
+    let p = name(&mut w, "/x");
+    let fd = w
+        .call(2 /* open */, &[p, 0x41 /* O_CREAT|O_WRONLY */, 0o644])
+        .0;
+    assert_eq!(fd, 3);
+    w.poke(DATA, b"xyz");
+    assert_eq!(w.call(1, &[3, DATA, 3]).0, 3);
+    assert_eq!(w.call(0 /* read */, &[3, DATA, 3]).0, -EBADF, "write-only");
+    assert_eq!(w.call(4 /* stat */, &[p, DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 24, 4), (0o100_644u32).to_le_bytes());
+    assert_eq!(w.peek(DATA + 48, 8), 3u64.to_le_bytes());
+    assert_eq!(w.call(33 /* dup2 */, &[3, 3]).0, 3);
+    assert_eq!(w.call(33, &[9, 3]).0, -EBADF);
+    let d = name(&mut w, "/d");
+    assert_eq!(w.call(83 /* mkdir */, &[d, 0o755]).0, 0);
+    assert_eq!(w.call(83, &[d, 0o755]).0, -EEXIST);
+    let dir = w.call(2, &[d, 0x1_0000 /* O_DIRECTORY */]).0;
+    assert_eq!(dir, 4);
+    assert_eq!(
+        w.call(1, &[4, DATA, 3]).0,
+        -EBADF,
+        "a directory is read-only"
+    );
+    assert_eq!(w.call(84 /* rmdir */, &[d]).0, 0);
+    let (from, to) = (DATA + 0xa00, DATA + 0x900);
+    w.poke(from, b"/x\0");
+    w.poke(to, b"/y\0");
+    assert_eq!(w.call(82 /* rename */, &[from, to]).0, 0);
+    assert_eq!(w.call(21 /* access */, &[to, 0]).0, 0);
+    assert_eq!(w.call(87 /* unlink */, &[to]).0, 0);
+    assert_eq!(w.call(21, &[to, 0]).0, -ENOENT);
+    // A path that never ends faults.
+    assert_eq!(w.call(2, &[0xdead_0000, 0]).0, -EFAULT);
 }

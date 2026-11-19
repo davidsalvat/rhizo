@@ -25,7 +25,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `boot.kernel_cycles/rhizo/<vmm>` | timing | TSC cycles from the first kernel instruction to ready |
 | `image.size_bytes` | deterministic | Size of the release kernel image |
 | `memory.kernel_pt_frames` | deterministic | Frames used by the kernel's page tables |
-| `cell.spawn_us/rhizo/<vmm>` | timing | Median time to create the `hello` cell (tables, image, stack), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
+| `cell.spawn_us/rhizo/<vmm>` | timing | Time to create the `hello` cell (tables, image, stack), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
 | `cell.run_us/rhizo/<vmm>` | timing | Median time from spawn to the cell's exit and teardown (every frame returned) |
 | `cell.pt_frames` | deterministic | Page-table frames of the `hello` cell's own half |
 | `cell.switch_ns/rhizo/<vmm>` | timing | Time per switch between two cells yielding to each other (system call in, scheduler, system call out), with address-space tags (ASID/PCID) |
@@ -41,6 +41,13 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.cold_us/rhizo/<vmm>` | timing | A real static glibc program (`libc_warm`: prime sieve warm-up, then one answer) started from its executable and run to its exit |
 | `workload.warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off a template frozen after the warm-up |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
+| `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
+| `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
+
+Figures the kernel repeats a hundred times or more (`cell.spawn_us`,
+`cell.run_us`, `cell.spawn_from_template_us`, the two file metrics) are the
+minimum over five consecutive rounds of each round's median, so one noisy
+moment of the host does not decide them.
 
 Each timing is the median (and p90) of `--runs` boots after one discarded
 warm-up boot. Lower is better for every metric.

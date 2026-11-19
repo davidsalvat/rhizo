@@ -33,14 +33,22 @@ fn ending(status: std::process::ExitStatus) -> Option<Ending> {
     }
 }
 
-/// Runs every test cell in `dir` natively and compares with the expectations.
+/// Runs every test cell in `dir` natively, each in a new empty directory
+/// (a cell starts with an empty file system), and compares with the
+/// expectations.
 pub fn check(dir: &Path) -> Result {
+    let scratch = crate::target_dir().join(format!("differential-{}", std::process::id()));
     for &(name, stdout, expected) in PROGRAMS {
         let path = dir.join(name);
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch)
+            .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
         let out = Command::new(&path)
             .arg0(name)
+            .current_dir(&scratch)
             .output()
             .map_err(|e| format!("cannot run {}: {e}", path.display()))?;
+        let _ = std::fs::remove_dir_all(&scratch);
         let got_text = String::from_utf8_lossy(&out.stdout);
         let got = ending(out.status);
         if got != Some(expected) || got_text != stdout {

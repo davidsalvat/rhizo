@@ -18,6 +18,10 @@ pub mod nr {
     pub const GETPID: usize = 172;
     pub const SCHED_YIELD: usize = 124;
     pub const NANOSLEEP: usize = 101;
+    pub const OPENAT: usize = 56;
+    pub const CLOSE: usize = 57;
+    pub const READ: usize = 63;
+    pub const PREAD64: usize = 67;
 }
 
 /// Linux system-call numbers for the target architecture.
@@ -34,6 +38,10 @@ pub mod nr {
     pub const GETPID: usize = 39;
     pub const SCHED_YIELD: usize = 24;
     pub const NANOSLEEP: usize = 35;
+    pub const OPENAT: usize = 257;
+    pub const CLOSE: usize = 3;
+    pub const READ: usize = 0;
+    pub const PREAD64: usize = 17;
 }
 
 /// Raw system call with up to six arguments; returns the kernel's value

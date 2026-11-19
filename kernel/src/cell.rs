@@ -17,6 +17,7 @@ use rhizo_cell::Cell;
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
+use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{PageSize, PageTable};
@@ -44,6 +45,30 @@ struct KernelFrames;
 /// number, value = references beyond the first. Grown on demand, so cells
 /// that never fork cost nothing.
 static SHARED: Global<Vec<u16>> = Global::new(Vec::new());
+
+/// The file system of a cell given no files, and its encoding: built once,
+/// then shared copy-on-write by every such cell, so spawning or resuming one
+/// builds no table.
+static NO_FILES: Global<Option<(Fs, Vec<u8>)>> = Global::new(None);
+
+fn with_no_files<R>(f: impl FnOnce(&Fs, &[u8]) -> R) -> R {
+    NO_FILES.with(|slot| {
+        let (fs, bytes) = slot.get_or_insert_with(|| {
+            let fs = Fs::new();
+            let mut bytes = Vec::new();
+            fs.encode(&mut bytes);
+            (fs, bytes)
+        });
+        f(fs, bytes)
+    })
+}
+
+/// The file system a snapshot holds, shared with [`NO_FILES`] when it has
+/// no files.
+fn files_of(snapshot: &Snapshot) -> Fs {
+    with_no_files(|fs, bytes| (snapshot.files_bytes() == bytes).then(|| fs.clone()))
+        .unwrap_or_else(|| snapshot.files())
+}
 
 impl Frames for KernelFrames {
     fn alloc(&mut self) -> Option<u64> {
@@ -158,6 +183,8 @@ struct Live {
     random: u64,
     /// Pages still to restore, for a lazily resumed cell.
     lazy: Option<Lazy>,
+    /// Its files and open descriptors (spec `files`).
+    fs: Fs,
 }
 
 /// The snapshot of a lazily resumed cell and which of its pages are still
@@ -281,8 +308,9 @@ pub struct Host {
     sched: Scheduler<Live>,
     tags: TagPool,
     finished: Vec<Finished>,
-    /// Frozen cells: never run, only forked (spec `fork`, templates).
-    templates: Vec<Cell>,
+    /// Frozen cells and their files: never run, only forked (spec `fork`,
+    /// templates).
+    templates: Vec<(Cell, Fs)>,
     /// Cell whose FP/SIMD state is in the registers (0: none). The kernel
     /// never uses them, so they are saved only when another cell runs.
     fp_owner: u32,
@@ -323,6 +351,20 @@ impl Host {
         capture: bool,
         echo: bool,
     ) -> Result<u32, ElfError> {
+        let files = with_no_files(|fs, _| fs.clone());
+        self.spawn_with_files(image, argv, files, capture, echo)
+    }
+
+    /// [`spawn`](Self::spawn) with `files` as the cell's file system (spec
+    /// `files`, initial files).
+    pub fn spawn_with_files(
+        &mut self,
+        image: &[u8],
+        argv: &[&[u8]],
+        files: Fs,
+        capture: bool,
+        echo: bool,
+    ) -> Result<u32, ElfError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut services = KernelServices {
             capture: None,
@@ -354,6 +396,7 @@ impl Host {
             echo,
             random: services.random,
             lazy: None,
+            fs: files,
         });
         Ok(id)
     }
@@ -380,7 +423,7 @@ impl Host {
         self.sync_fp(&mut live, true);
         let remaining = wake.map_or(0, |w| w.saturating_sub(now_ns()).max(1));
         let snapshot =
-            Snapshot::capture::<Format>(user::MACHINE, &live.cell, remaining, &DirectMap);
+            Snapshot::capture::<Format>(user::MACHINE, &live.cell, &live.fs, remaining, &DirectMap);
         self.end(live, Ending::Suspended);
         Some(snapshot)
     }
@@ -401,6 +444,7 @@ impl Host {
         }
         let cell = snapshot.cell(id, pt.root());
         let sleep = snapshot.state().sleep_remaining_ns;
+        let fs = files_of(&snapshot);
         let mut lazy = Lazy::new(snapshot);
         if mode == Resume::Eager {
             lazy.finish(&pt);
@@ -414,6 +458,7 @@ impl Host {
             echo,
             random: Counter.cycles() | 1,
             lazy: (lazy.left > 0).then_some(lazy),
+            fs,
         };
         match sleep {
             0 => self.sched.add(live),
@@ -471,20 +516,20 @@ impl Host {
     pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
         while !stop(self) {
             let now = now_ns();
-            let Some(mut live) = self.sched.next(now) else {
+            let Some(live) = self.sched.next(now) else {
                 match self.sched.next_wake() {
                     Some(wake) => idle_until(wake),
                     None => return,
                 }
                 continue;
             };
-            self.run_slice(&mut live);
+            self.run_slice(live);
         }
     }
 
     /// Runs `live` until it ends, sleeps, yields or is preempted, and files it
     /// accordingly.
-    fn run_slice(&mut self, live: &mut Live) {
+    fn run_slice(&mut self, mut live: Live) {
         // FP/SIMD state moves only if this cell actually uses it (design D1).
         user::fp_trap(self.fp_owner != live.cell.id);
         let pt = PageTable::<Format>::from_root(live.cell.root);
@@ -511,15 +556,16 @@ impl Host {
                         tlb: &mut CpuTlb,
                         frames: &mut KernelFrames,
                         services: &mut services,
+                        fs: &mut live.fs,
                         pager: &mut CellPager(&mut live.lazy),
                     };
                     let outcome = live.abi.handle(&mut live.cell, &mut cx);
                     live.random = services.random;
                     match outcome {
                         Outcome::Resume => continue,
-                        Outcome::Yield => self.sched.add(take(live)),
-                        Outcome::Sleep(until) => self.sched.sleep(take(live), until),
-                        Outcome::Exit(status) => self.end(take(live), Ending::Exit(status)),
+                        Outcome::Yield => self.sched.add(live),
+                        Outcome::Sleep(until) => self.sched.sleep(live, until),
+                        Outcome::Exit(status) => self.end(live, Ending::Exit(status)),
                     }
                 }
                 Trap::FpUnavailable => {
@@ -537,7 +583,7 @@ impl Host {
                     if ticks < 2 {
                         continue;
                     }
-                    self.sched.add(take(live));
+                    self.sched.add(live);
                 }
                 Trap::Fault(fault)
                     if fault.missing_page().is_some_and(|addr| {
@@ -563,7 +609,7 @@ impl Host {
                         random: 0,
                     };
                     fault.report(&mut services, live.cell.id);
-                    self.end(take(live), Ending::Fault);
+                    self.end(live, Ending::Fault);
                 }
             }
             return;
@@ -587,8 +633,12 @@ impl Host {
         self.sync_fp(&mut parent, false);
         let mut children = Vec::with_capacity(n);
         for _ in 0..n {
-            let Some(child) = self.child_of(&parent.cell, parent.output.is_some(), parent.echo)
-            else {
+            let Some(child) = self.child_of(
+                &parent.cell,
+                &parent.fs,
+                parent.output.is_some(),
+                parent.echo,
+            ) else {
                 break;
             };
             children.push(child.cell.id);
@@ -602,7 +652,7 @@ impl Host {
     }
 
     /// A new live cell sharing `cell`'s memory copy-on-write.
-    fn child_of(&mut self, cell: &Cell, capture: bool, echo: bool) -> Option<Live> {
+    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Live> {
         let pt = PageTable::<Format>::from_root(cell.root);
         let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
         Some(Live {
@@ -618,6 +668,7 @@ impl Host {
             echo,
             random: Counter.cycles() | 1,
             lazy: None,
+            fs: fs.clone(),
         })
     }
 
@@ -644,14 +695,16 @@ impl Host {
         if live.tag != 0 {
             self.tags.free(live.tag);
         }
-        self.templates.push(live.cell);
+        self.templates.push((live.cell, live.fs));
         true
     }
 
     /// Starts a new cell from template `id`: a fork of the frozen cell.
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
-        let template = *self.templates.iter().find(|c| c.id == id)?;
-        let child = self.child_of(&template, capture, echo)?;
+        let index = self.templates.iter().position(|(c, _)| c.id == id)?;
+        let (cell, fs) = &self.templates[index];
+        let (cell, fs) = (*cell, fs.clone());
+        let child = self.child_of(&cell, &fs, capture, echo)?;
         let child_id = child.cell.id;
         self.sched.add(child);
         Some(child_id)
@@ -712,27 +765,13 @@ impl Drop for Host {
         while let Some(live) = self.sched.remove(|_| true) {
             self.end(live, Ending::Killed);
         }
-        for template in self.templates.drain(..) {
+        for (template, _) in self.templates.drain(..) {
             space::destroy(
                 PageTable::<Format>::from_root(template.root),
                 &mut DirectMap,
                 &mut KernelFrames,
             );
         }
-    }
-}
-
-/// Moves a live cell out of a `&mut` slot (the slot is not used again).
-fn take(live: &mut Live) -> Live {
-    Live {
-        cell: live.cell,
-        tag: live.tag,
-        fresh: live.fresh,
-        abi: core::mem::replace(&mut live.abi, Abi::new(user::ABI)),
-        output: live.output.take(),
-        echo: live.echo,
-        random: live.random,
-        lazy: live.lazy.take(),
     }
 }
 
@@ -797,16 +836,14 @@ pub fn bench(console: &mut impl Console) {
         spawn_ns.push(timer::cycles_to_ns(t1 - t0).unwrap_or(0));
         run_ns.push(timer::cycles_to_ns(t2 - t0).unwrap_or(0));
     }
-    spawn_ns.sort_unstable();
-    run_ns.sort_unstable();
     let tagged = switch_ns(Host::new());
     let untagged = switch_ns(Host::new_untagged());
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
         "rhizo-cell spawn_ns={} run_ns={} pt_frames={tables} switch_ns={tagged} \
          switch_untagged_ns={untagged}",
-        spawn_ns[RUNS / 2],
-        run_ns[RUNS / 2]
+        robust(&mut spawn_ns),
+        robust(&mut run_ns)
     );
     let f = fork_and_templates();
     let _ = writeln!(
@@ -821,6 +858,11 @@ pub fn bench(console: &mut impl Console) {
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
         "rhizo-workload cold_ns={cold} warm_ns={warm}"
+    );
+    let (write_read, fork_files) = files();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-files write_read_ns={write_read} fork_ns={fork_files}"
     );
     let s = suspend_resume();
     let _ = writeln!(
@@ -935,8 +977,65 @@ fn fork_and_templates() -> [u64; 4] {
         median(&mut fork),
         median(&mut touch),
         frames,
-        median(&mut template),
+        robust(&mut template),
     ]
+}
+
+/// Rounds of a repeated measure (design D4 of `add-cell-files`).
+#[cfg(feature = "bench-cell")]
+const ROUNDS: usize = 5;
+
+/// The minimum over [`ROUNDS`] consecutive rounds of each round's median:
+/// the operation's cost, not the noise of its slowest moment.
+#[cfg(feature = "bench-cell")]
+fn robust(samples: &mut [u64]) -> u64 {
+    let per = (samples.len() / ROUNDS).max(1);
+    samples
+        .chunks_mut(per)
+        .take(ROUNDS)
+        .map(|round| {
+            round.sort_unstable();
+            round[round.len() / 2]
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// Robust figures (see [`robust`]): `filer` creating, writing and reading
+/// back 1 MiB of file data, spawn to exit; and forking a cell (frozen as a
+/// template) that holds a 16 MiB file.
+#[cfg(feature = "bench-cell")]
+fn files() -> (u64, u64) {
+    const RUNS: usize = 5 * ROUNDS;
+    let image = test_image("filer");
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let mut write_read = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host.spawn(image, &[b"filer"], true, false).expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        write_read.push(ns(t0, Counter.cycles()));
+        let done = host.finished(id).expect("ended");
+        assert_eq!(done.ending, Ending::Exit(0), "filer exits with 0");
+        assert_eq!(done.output, b"files ok\n");
+    }
+    let holder = host
+        .spawn(image, &[b"filer", b"16"], true, false)
+        .expect("spawn");
+    while host.output(holder) != Some(b"files ok\n") {
+        host.step();
+    }
+    assert!(host.freeze(holder));
+    let mut fork = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let t0 = Counter.cycles();
+        let child = host.spawn_from_template(holder, true, false).expect("fork");
+        fork.push(ns(t0, Counter.cycles()));
+        assert!(host.kill(child));
+    }
+    (robust(&mut write_read), robust(&mut fork))
 }
 
 /// Medians over 7 rounds, for the `ballast` cell (8 MiB written): suspend,
