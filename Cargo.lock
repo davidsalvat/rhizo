@@ -315,6 +315,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhizo-fs"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "rhizo-hal"
 version = "0.1.0"
 
