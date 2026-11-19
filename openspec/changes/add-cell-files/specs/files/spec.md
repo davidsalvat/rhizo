@@ -27,6 +27,14 @@ A cell SHALL NOT see or change another cell's files.
 - **WHEN** two cells write different contents to the same path
 - **THEN** each reads its own contents
 
+### Requirement: Bounded file data
+A cell SHALL hold at most 64 MiB of file data; a write past that bound
+SHALL fail with `ENOSPC`, and a file SHALL NOT grow past 64 MiB (`EFBIG`).
+
+#### Scenario: Out of file space
+- **WHEN** a cell holding 64 MiB of file data writes a new block
+- **THEN** the write fails with `ENOSPC` and the kernel keeps running
+
 ### Requirement: Initial files
 The kernel SHALL let the host give a cell files when it spawns it.
 

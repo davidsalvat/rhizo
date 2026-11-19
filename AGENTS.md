@@ -119,10 +119,11 @@ The feedback loop, fastest first:
 | `crates/rhizo-core` | Boot reports, boot options, device-tree reader, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
 | `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, write resolution), kernel heap | `rhizo-hal` |
 | `crates/rhizo-cell` | Cells as plain data, static ELF loader and initial stack, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
-| `crates/rhizo-abi` | Linux system calls of cells (both conventions), `EFAULT`/`ENOSYS`, scheduling outcomes (yield, sleep, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |
-| `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell` |
+| `crates/rhizo-fs` | A cell's in-memory file system: tree, file blocks shared copy-on-write between forks, descriptors, encoding for snapshots | — |
+| `crates/rhizo-abi` | Linux system calls of cells (both conventions), files through the cell's `rhizo-fs`, `EFAULT`/`ENOSYS`, scheduling outcomes (yield, sleep, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs` |
+| `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian, files section), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs` |
 | `crates/rhizo-sched` | Run queue, sleep list and time slice (time passed in, never read); address-space tag pool | — |
-| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop (`src/cell.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot` |
+| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop (`src/cell.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs` |
 | `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
 | `xtask` | Developer tooling (host only) | — |
 

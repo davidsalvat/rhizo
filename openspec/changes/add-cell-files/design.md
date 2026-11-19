@@ -5,11 +5,12 @@
 ### D1. A persistent tree, shared by reference counting
 
 The file system of a cell is an inode table whose entries are
-reference-counted inodes (`Rc`); a directory maps names to inode numbers, a
+reference-counted inodes (`Arc`); a directory maps names to inode numbers, a
 regular file is a size and a list of reference-counted 4 KiB blocks. Cloning
 the table for a fork costs one count per inode, not per byte; a write makes
-private only what it touches (`Rc::make_mut`): the inode, its block list and
-the written block. The kernel runs on one CPU, so `Rc` needs no atomics.
+private only what it touches (`Arc::make_mut`): the inode, its block list and
+the written block. `Arc` rather than `Rc` because kernel globals hold cells
+and must be `Send`; on one CPU its atomic counts are uncontended.
 
 | Option | Fork cost | Write after fork |
 |---|---|---|
@@ -33,12 +34,24 @@ The encoded file system follows the page data: a length, then the inode
 table (kind, link count, directory entries or file bytes), the open
 descriptions and descriptors, and the working directory, all little endian.
 Decoding validates every reference (inode numbers, descriptions) and fails
-with the snapshot's `BadFiles` error. `rhizo-snapshot` treats the section as
-opaque bytes; `rhizo-fs` encodes and decodes it.
+with the snapshot's `BadFiles` error. `rhizo-fs` encodes and decodes the
+section; `rhizo-snapshot` depends on it so that `from_bytes` refuses a
+snapshot whose files do not decode, as it refuses a bad page record.
 
 ### D4. Robust cell figures
 
-Each cell figure printed by a `bench-cell` kernel becomes the minimum over
-five rounds of the median of its round, instead of one median: the
-operation's cost, not the noise of the slowest moment. Thresholds and
-baselines are unchanged.
+Each cell figure the `bench-cell` kernel repeats a hundred times or more
+(`cell.spawn_us`, `cell.run_us`, `cell.spawn_from_template_us`) and the new
+file figures become the minimum over five consecutive rounds of the median
+of each round, instead of one median: the operation's cost, not the noise
+of the slowest moment. Figures of seven repetitions (large forks, suspend,
+resume, workloads) stay medians: five rounds of one or two samples would be
+a minimum, not a median. Thresholds and baselines are unchanged.
+
+### D5. Bounded file data
+
+A cell holds at most 64 MiB of file data (`ENOSPC` beyond, `EFBIG` for a
+file larger than that). File blocks live in the kernel heap, which panics
+when memory runs out, so the bound keeps one cell from exhausting it. Many
+cells together can still exceed memory; accounting against free frames is
+left to a later change.

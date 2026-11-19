@@ -122,6 +122,7 @@ numbers (see [Benchmarks](#benchmarks)).
 | H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`, `cell.fork_touch_us`); pre-warmed cell templates (`cell.spawn_from_template_us` vs `cell.spawn_us`) | Done |
 | H6 | Real workloads with differential tests against Linux: static glibc programs, FP/SIMD per cell (MicroPython pending: its build needs maintainer approval in the development environment) | Template of a warm real program (`workload.warm_us` vs `workload.cold_us`); lazy FP/SIMD switching | Done (glibc) |
 | H7 | Reproducible benchmarks against existing sandboxes: Firecracker snapshot restore and Linux processes, same machine and run | Dedicated KVM machine with tight thresholds (job ready, needs a registered runner) | Done |
+| H8 | Files inside each cell (Linux file calls, glibc stdio), carried by snapshots, forks and templates; initial files from the host | File data shared copy-on-write between forks, block by block (`cell.fork_with_files_us`, `cell.file_write_read_us`); cell figures as the minimum of per-round medians | Done |
 
 Out of scope for the proof of concept: networking, multicore, real disks,
 hardware other than virtio/QEMU, full CPython, SDKs.
