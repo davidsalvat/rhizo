@@ -191,7 +191,7 @@ impl Tables {
                     for _ in 0..r.count()? {
                         blocks.push(if r.flag()? {
                             let data: &Block = r.take(BLOCK)?.try_into().unwrap();
-                            Some(Arc::new(*data))
+                            Some(Arc::new(Box::new(*data)))
                         } else {
                             None
                         });

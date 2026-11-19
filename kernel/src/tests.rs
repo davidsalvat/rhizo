@@ -84,6 +84,7 @@ macro_rules! suite {
             ktest_case!(open_file_survives_suspend_and_resume),
             ktest_case!(forked_cells_have_their_own_files),
             ktest_case!(template_files_are_inherited),
+            ktest_case!(file_data_takes_its_own_size),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1007,4 +1008,21 @@ fn template_files_are_inherited() {
     for id in ids {
         assert_eq!(ended(&host, id), (Ending::Exit(0), "own ok\n".into()));
     }
+}
+
+/// A cell holding a 16 MiB file uses less than 17 MiB, its own memory
+/// included: a 4 KiB block takes one page, not two.
+fn file_data_takes_its_own_size() {
+    let mut host = Host::new();
+    let warm = spawn(&mut host, "filer", &[]);
+    host.run(|h| h.finished(warm).is_some()); // the heap grows its classes once
+    let before = memory::free_bytes();
+    let id = spawn(&mut host, "filer", &[b"16"]);
+    while host.output(id) != Some(b"files ok\n") {
+        host.step();
+    }
+    let used = before - memory::free_bytes();
+    assert!(used >= 16 << 20, "the file is held: {used} bytes");
+    assert!(used < 17 << 20, "{used} bytes for 16 MiB of file data");
+    host.run(|_| false);
 }
