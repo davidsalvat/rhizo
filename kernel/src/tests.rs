@@ -77,6 +77,7 @@ macro_rules! suite {
             ktest_case!(real_libc_programs_behave_as_on_linux),
             ktest_case!(fp_state_is_private_to_each_cell),
             ktest_case!(fp_state_survives_suspend_and_resume),
+            ktest_case!(warm_template_of_a_real_program),
             $(ktest_case!($extra),)*
         ]
     };
@@ -858,6 +859,31 @@ fn fp_state_survives_suspend_and_resume() {
         assert_eq!(
             ended(&host, other),
             (Ending::Exit(0), "fp ok: 21300.0\n".into())
+        );
+    }
+}
+
+/// A real program frozen after its warm-up: every cell forked from it
+/// answers without repeating the warm-up.
+fn warm_template_of_a_real_program() {
+    run_expected("libc_warm");
+    let mut host = Host::new();
+    let warm = spawn(&mut host, "libc_warm", &[]);
+    while host.output(warm) != Some(b"warm\n") {
+        host.step();
+    }
+    assert!(host.freeze(warm));
+    let ids: Vec<u32> = (0..3)
+        .map(|_| host.spawn_from_template(warm, true, true).expect("spawn"))
+        .collect();
+    host.run(|_| false);
+    for id in ids {
+        assert_eq!(
+            ended(&host, id),
+            (
+                Ending::Exit(0),
+                "primes below 2000000: 148933, below 1000: 168\n".into()
+            )
         );
     }
 }

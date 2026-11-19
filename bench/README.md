@@ -38,6 +38,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.fork_touch_us/rhizo/<vmm>` | timing | That fork plus the child writing every page (copy-on-write of all 50 MiB) until it exits |
 | `cell.fork_pt_frames` | deterministic | Frames a fork allocates (the child's root only) |
 | `cell.spawn_from_template_us/rhizo/<vmm>` | timing | Starting `hello` from a frozen template (a fork) and running it to its exit, against `cell.run_us` from the executable |
+| `workload.cold_us/rhizo/<vmm>` | timing | A real static glibc program (`libc_warm`: prime sieve warm-up, then one answer) started from its executable and run to its exit |
+| `workload.warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off a template frozen after the warm-up |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 
 Each timing is the median (and p90) of `--runs` boots after one discarded

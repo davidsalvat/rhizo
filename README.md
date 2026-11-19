@@ -120,7 +120,7 @@ numbers (see [Benchmarks](#benchmarks)).
 | H3 | Multiple cells, scheduler, isolation tests | ASIDs (PCID on x86_64): no TLB flush when switching cells (`cell.switch_ns` vs `cell.switch_untagged_ns`) | Done |
 | H4 | Suspend / resume with snapshot-equivalence tests | Lazy restore: snapshot pages mapped on first touch, an in-kernel analogue of Firecracker + `userfaultfd` (`cell.resume_us` vs `cell.resume_eager_us`, `cell.resume_touch_us`) | Done |
 | H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`, `cell.fork_touch_us`); pre-warmed cell templates (`cell.spawn_from_template_us` vs `cell.spawn_us`) | Done |
-| H6 | Real workload (MicroPython) with differential tests against Linux | Template of a warm interpreter cell (`cell.spawn_from_template_us`) | — |
+| H6 | Real workloads with differential tests against Linux: static glibc programs, FP/SIMD per cell (MicroPython pending: its build needs maintainer approval in the development environment) | Template of a warm real program (`workload.warm_us` vs `workload.cold_us`); lazy FP/SIMD switching | Done (glibc) |
 | H7 | Reproducible benchmarks against existing sandboxes | Dedicated KVM machine with tight thresholds | — |
 
 Out of scope for the proof of concept: networking, multicore, real disks,

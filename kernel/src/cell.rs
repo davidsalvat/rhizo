@@ -801,6 +801,11 @@ pub fn bench(console: &mut impl Console) {
         f[2],
         f[3]
     );
+    let (cold, warm) = workload();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-workload cold_ns={cold} warm_ns={warm}"
+    );
     let s = suspend_resume();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -811,6 +816,45 @@ pub fn bench(console: &mut impl Console) {
         s[3],
         s[4]
     );
+}
+
+/// A real program (`libc_warm`, static glibc) answering one request: started
+/// cold from its executable (warm-up included), and forked from a template
+/// frozen after its warm-up. Medians over 7 rounds.
+#[cfg(feature = "bench-cell")]
+fn workload() -> (u64, u64) {
+    const ROUNDS: usize = 7;
+    let image = test_image("libc_warm");
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let (mut cold, mut warm) = (Vec::new(), Vec::new());
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn(image, &[b"libc_warm"], true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        cold.push(ns(t0, Counter.cycles()));
+    }
+    let template = host
+        .spawn(image, &[b"libc_warm"], true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"warm\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    cold.sort_unstable();
+    warm.sort_unstable();
+    (cold[ROUNDS / 2], warm[ROUNDS / 2])
 }
 
 /// Medians over several rounds: forking a 50 MiB cell (frozen as a template,
