@@ -26,7 +26,7 @@
 
 ## 5. Continuous integration and documentation
 
-- [ ] 5.1 Add the GitHub Actions workflow (fmt, clippy with warnings denied for host crates and the kernel target, `cargo xtask test`); verify it passes on the pull request
+- [x] 5.1 Add the GitHub Actions workflow (fmt, clippy with warnings denied for host crates and the kernel target, `cargo xtask test`); verify it passes on the pull request
 - [x] 5.2 Document prerequisites and the build, run and test commands in `README.md` and `AGENTS.md`; verify the documented commands run as written on a fresh checkout, and record the QEMU version used by CI
 
 ## Workflow follow-up
