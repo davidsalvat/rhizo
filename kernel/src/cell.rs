@@ -9,6 +9,7 @@ use crate::arch::platform::Format;
 use crate::arch::timer::{self, Counter};
 use crate::arch::user::{self, Trap};
 use crate::memory::{self, DirectMap};
+use crate::sync::Global;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
@@ -16,7 +17,7 @@ use rhizo_cell::Cell;
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
-use rhizo_hal::{Console, CycleCounter};
+use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{PageSize, PageTable};
 use rhizo_sched::{SLICE_NS, Scheduler, TagPool};
@@ -39,6 +40,11 @@ pub enum Ending {
 #[derive(Debug)]
 struct KernelFrames;
 
+/// Extra references per frame (design D1 of `add-fork`): index = frame
+/// number, value = references beyond the first. Grown on demand, so cells
+/// that never fork cost nothing.
+static SHARED: Global<Vec<u16>> = Global::new(Vec::new());
+
 impl Frames for KernelFrames {
     fn alloc(&mut self) -> Option<u64> {
         memory::with_frames(|f| f.alloc()).flatten()
@@ -49,8 +55,34 @@ impl Frames for KernelFrames {
     }
 
     fn free(&mut self, phys: u64, size: PageSize) {
-        let frames = (size.bytes() / FRAME_SIZE) as usize;
-        memory::with_frames(|f| f.free_contiguous(phys, frames));
+        let index = (phys / FRAME_SIZE) as usize;
+        let shared = SHARED.with(|s| match s.get_mut(index) {
+            Some(extra) if *extra > 0 => {
+                *extra -= 1;
+                true
+            }
+            _ => false,
+        });
+        if !shared {
+            let frames = (size.bytes() / FRAME_SIZE) as usize;
+            memory::with_frames(|f| f.free_contiguous(phys, frames));
+        }
+    }
+
+    fn share(&mut self, phys: u64) {
+        let index = (phys / FRAME_SIZE) as usize;
+        SHARED.with(|s| {
+            if s.len() <= index {
+                s.resize(index + 1, 0);
+            }
+            s[index] = s[index]
+                .checked_add(1)
+                .expect("more than 65535 cells share a frame");
+        });
+    }
+
+    fn is_shared(&self, phys: u64) -> bool {
+        SHARED.with(|s| s.get((phys / FRAME_SIZE) as usize).is_some_and(|&e| e > 0))
     }
 }
 
@@ -117,6 +149,9 @@ struct Live {
     cell: Cell,
     /// Address-space tag (ASID/PCID), 0 if none was free.
     tag: u16,
+    /// Not run yet with this tag: its first entry drops the tag's old
+    /// translations.
+    fresh: bool,
     abi: Abi,
     output: Option<Vec<u8>>,
     echo: bool,
@@ -177,13 +212,32 @@ impl Lazy {
     }
 }
 
-/// The pager of system calls: a lazily resumed cell's pending pages.
-struct LazyPager<'a>(&'a mut Option<Lazy>);
+/// The pager of system calls: a lazily resumed cell's pending pages, and
+/// copy-on-write pages shared after a fork.
+struct CellPager<'a>(&'a mut Option<Lazy>);
 
-impl Pager<Format, DirectMap> for LazyPager<'_> {
-    fn page_in(&mut self, pt: &PageTable<Format>, _: &mut DirectMap, addr: u64, _: bool) -> bool {
-        self.0.as_mut().is_some_and(|lazy| lazy.page_in(pt, addr))
+impl Pager<Format, DirectMap> for CellPager<'_> {
+    fn page_in(
+        &mut self,
+        pt: &PageTable<Format>,
+        _: &mut DirectMap,
+        addr: u64,
+        write: bool,
+    ) -> bool {
+        if self.0.as_mut().is_some_and(|lazy| lazy.page_in(pt, addr)) {
+            return true;
+        }
+        write && resolve_write(pt, addr)
     }
+}
+
+/// Resolves a write refused because the page is shared (copy-on-write).
+fn resolve_write(pt: &PageTable<Format>, addr: u64) -> bool {
+    let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, addr) == Ok(true);
+    if resolved {
+        CpuTlb.flush_page(addr);
+    }
+    resolved
 }
 
 /// How [`Host::resume`] restores memory.
@@ -210,6 +264,8 @@ pub struct Host {
     sched: Scheduler<Live>,
     tags: TagPool,
     finished: Vec<Finished>,
+    /// Frozen cells: never run, only forked (spec `fork`, templates).
+    templates: Vec<Cell>,
 }
 
 impl Host {
@@ -223,6 +279,7 @@ impl Host {
             sched: Scheduler::new(),
             tags: TagPool::new(MAX_TAG.load(Ordering::Relaxed)),
             finished: Vec::new(),
+            templates: Vec::new(),
         }
     }
 
@@ -270,6 +327,7 @@ impl Host {
         self.sched.add(Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
+            fresh: true,
             abi: Abi::new(user::ABI),
             output: capture.then(Vec::new),
             echo,
@@ -317,6 +375,7 @@ impl Host {
         let live = Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
+            fresh: true,
             abi: Abi::new(user::ABI),
             output: capture.then(Vec::new),
             echo,
@@ -399,7 +458,12 @@ impl Host {
         // and always makes progress (design D4).
         let mut ticks = 0;
         loop {
-            match user::enter_user(live.cell.root, live.tag, &mut live.cell.regs) {
+            match user::enter_user(
+                live.cell.root,
+                live.tag,
+                core::mem::replace(&mut live.fresh, false),
+                &mut live.cell.regs,
+            ) {
                 Trap::Syscall => {
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
@@ -412,7 +476,7 @@ impl Host {
                         tlb: &mut CpuTlb,
                         frames: &mut KernelFrames,
                         services: &mut services,
-                        pager: &mut LazyPager(&mut live.lazy),
+                        pager: &mut CellPager(&mut live.lazy),
                     };
                     let outcome = live.abi.handle(&mut live.cell, &mut cx);
                     live.random = services.random;
@@ -440,6 +504,13 @@ impl Host {
                     }
                     continue;
                 }
+                Trap::Fault(fault)
+                    if fault
+                        .write_denied()
+                        .is_some_and(|addr| resolve_write(&pt, addr)) =>
+                {
+                    continue;
+                }
                 Trap::Fault(fault) => {
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
@@ -452,6 +523,91 @@ impl Host {
             }
             return;
         }
+    }
+
+    /// Forks live cell `id` into `n` children that share its memory
+    /// copy-on-write (spec `fork`); returns their identifiers. A child has
+    /// the cell's state, a new identifier and tag, and its own output.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn fork(&mut self, id: u32, n: usize) -> Option<Vec<u32>> {
+        let (mut parent, wake) = self.sched.remove_with_wake(|l| l.cell.id == id)?;
+        let pt = PageTable::<Format>::from_root(parent.cell.root);
+        if let Some(lazy) = parent.lazy.as_mut() {
+            lazy.finish(&pt);
+        }
+        parent.lazy = None;
+        let mut children = Vec::with_capacity(n);
+        for _ in 0..n {
+            let Some(child) = self.child_of(&parent.cell, parent.output.is_some(), parent.echo)
+            else {
+                break;
+            };
+            children.push(child.cell.id);
+            self.requeue(child, wake);
+        }
+        // The parent lost write access to everything it shares: drop what its
+        // TLB still caches.
+        user::release_user(parent.cell.root, parent.tag);
+        self.requeue(parent, wake);
+        (children.len() == n).then_some(children)
+    }
+
+    /// A new live cell sharing `cell`'s memory copy-on-write.
+    fn child_of(&mut self, cell: &Cell, capture: bool, echo: bool) -> Option<Live> {
+        let pt = PageTable::<Format>::from_root(cell.root);
+        let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
+        Some(Live {
+            cell: Cell {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                root: child.root(),
+                ..*cell
+            },
+            tag: self.tags.alloc().unwrap_or(0),
+            fresh: true,
+            abi: Abi::new(user::ABI),
+            output: capture.then(Vec::new),
+            echo,
+            random: Counter.cycles() | 1,
+            lazy: None,
+        })
+    }
+
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "used by `fork`"))]
+    fn requeue(&mut self, live: Live, wake: Option<u64>) {
+        match wake {
+            Some(at) => self.sched.sleep(live, at),
+            None => self.sched.add(live),
+        }
+    }
+
+    /// Freezes live cell `id` into a template: it never runs again, and
+    /// [`spawn_from_template`](Self::spawn_from_template) forks it.
+    pub fn freeze(&mut self, id: u32) -> bool {
+        let Some(mut live) = self.sched.remove(|l| l.cell.id == id) else {
+            return false;
+        };
+        let pt = PageTable::<Format>::from_root(live.cell.root);
+        if let Some(lazy) = live.lazy.as_mut() {
+            lazy.finish(&pt);
+        }
+        user::release_user(live.cell.root, live.tag);
+        if live.tag != 0 {
+            self.tags.free(live.tag);
+        }
+        self.templates.push(live.cell);
+        true
+    }
+
+    /// Starts a new cell from template `id`: a fork of the frozen cell.
+    pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
+        let template = *self.templates.iter().find(|c| c.id == id)?;
+        let child = self.child_of(&template, capture, echo)?;
+        let child_id = child.cell.id;
+        self.sched.add(child);
+        Some(child_id)
     }
 
     /// Ends live cell `id` if it exists; returns whether it did.
@@ -506,6 +662,13 @@ impl Drop for Host {
         while let Some(live) = self.sched.remove(|_| true) {
             self.end(live, Ending::Killed);
         }
+        for template in self.templates.drain(..) {
+            space::destroy(
+                PageTable::<Format>::from_root(template.root),
+                &mut DirectMap,
+                &mut KernelFrames,
+            );
+        }
     }
 }
 
@@ -514,6 +677,7 @@ fn take(live: &mut Live) -> Live {
     Live {
         cell: live.cell,
         tag: live.tag,
+        fresh: live.fresh,
         abi: core::mem::replace(&mut live.abi, Abi::new(user::ABI)),
         output: live.output.take(),
         echo: live.echo,
@@ -594,6 +758,15 @@ pub fn bench(console: &mut impl Console) {
         spawn_ns[RUNS / 2],
         run_ns[RUNS / 2]
     );
+    let f = fork_and_templates();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-fork fork_ns={} fork_touch_ns={} fork_pt_frames={} spawn_from_template_ns={}",
+        f[0],
+        f[1],
+        f[2],
+        f[3]
+    );
     let s = suspend_resume();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -604,6 +777,72 @@ pub fn bench(console: &mut impl Console) {
         s[3],
         s[4]
     );
+}
+
+/// Medians over several rounds: forking a 50 MiB cell (frozen as a template,
+/// so the child's writes copy everything), the fork plus the child writing
+/// every page until it exits, the page-table frames a fork allocates, and
+/// spawning `hello` from a template.
+#[cfg(feature = "bench-cell")]
+fn fork_and_templates() -> [u64; 4] {
+    const ROUNDS: usize = 7;
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let big = host
+        .spawn(
+            test_image("ballast"),
+            &[b"ballast", b"write", b"50"],
+            true,
+            false,
+        )
+        .expect("spawn ballast");
+    while host.output(big) != Some(b"filled\n") {
+        host.step();
+    }
+    assert!(host.freeze(big));
+    let (mut fork, mut touch) = (Vec::new(), Vec::new());
+    let mut frames = 0;
+    for _ in 0..ROUNDS {
+        let before = memory::free_bytes();
+        let t0 = Counter.cycles();
+        let child = host.spawn_from_template(big, true, false).expect("fork");
+        let t1 = Counter.cycles();
+        frames = (before - memory::free_bytes()) / FRAME_SIZE;
+        host.run(|h| h.finished(child).is_some());
+        let t2 = Counter.cycles();
+        assert_eq!(
+            host.finished(child).map(|f| f.ending),
+            Some(Ending::Exit(0))
+        );
+        fork.push(ns(t0, t1));
+        touch.push(ns(t0, t2));
+    }
+    drop(host);
+    let mut host = Host::new();
+    let hello = host
+        .spawn(test_image("hello"), &[b"hello"], true, false)
+        .expect("spawn");
+    assert!(host.freeze(hello));
+    let mut template = Vec::new();
+    for _ in 0..101 {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(hello, true, false)
+            .expect("spawn from template");
+        let t1 = Counter.cycles();
+        host.run(|h| h.finished(id).is_some());
+        template.push(ns(t0, t1));
+    }
+    let median = |v: &mut Vec<u64>| {
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    [
+        median(&mut fork),
+        median(&mut touch),
+        frames,
+        median(&mut template),
+    ]
 }
 
 /// Medians over 7 rounds, for the `ballast` cell (8 MiB written): suspend,

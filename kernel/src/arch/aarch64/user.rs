@@ -45,6 +45,16 @@ impl UserFault {
         (matches!(ec, 0x20 | 0x24) && translation).then_some(self.0.far)
     }
 
+    /// The address of a write refused by permissions (a data abort from EL0
+    /// with a permission fault on a write), if that is what it was: possibly
+    /// a copy-on-write page.
+    pub fn write_denied(&self) -> Option<u64> {
+        let esr = self.0.esr;
+        let permission = (esr & 0x3f) >> 2 == 0b0011;
+        let write = esr & (1 << 6) != 0;
+        ((esr >> 26) & 0x3f == 0x24 && permission && write).then_some(self.0.far)
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_aarch64(console, cell, &self.0);
@@ -99,7 +109,26 @@ fn set_user_root(root: u64, tag: u16) {
 /// Runs the cell whose lower-half table is `root`, tagged `tag` (0 =
 /// untagged), from `regs` until it makes a system call, is interrupted or
 /// faults; `regs` then holds its state at that point.
-pub fn enter_user(root: u64, tag: u16, regs: &mut Registers) -> Trap {
+///
+/// `fresh` marks the first entry of a cell into its tag: the tag's
+/// translations are dropped before its tables are loaded, so nothing a
+/// previous holder of the tag left can be used (design D6 of
+/// `add-scheduler`).
+pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Trap {
+    if fresh && tag != 0 {
+        // SAFETY: invalidating one ASID only drops cached translations; the
+        // tag is not loaded in TTBR0 (its previous holder ended).
+        unsafe {
+            asm!(
+                "dsb ishst",
+                "tlbi aside1is, {}",
+                "dsb ish",
+                "isb",
+                in(reg) (tag as u64) << 48,
+                options(nostack)
+            );
+        }
+    }
     set_user_root(root, tag);
     // SAFETY: `regs` is a valid, 16-byte aligned frame that lives across the
     // call; the entry code drops to EL0 with only the NZCV flags of the

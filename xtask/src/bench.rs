@@ -340,6 +340,7 @@ fn measure_cells(
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
+    let mut fork_pt_frames = None;
     for &vmm in &opts.vmms {
         if vmm.unavailable_reason(opts.accel).is_some() {
             continue; // already reported by the boot benchmark
@@ -349,6 +350,7 @@ fn measure_cells(
         let (mut switch, mut untagged) = (Vec::new(), Vec::new());
         let (mut suspend, mut resume, mut eager, mut touch) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -366,6 +368,12 @@ fn measure_cells(
                     run.push(c.run_ns as f64 / 1000.0);
                     switch.push(c.switch_ns as f64);
                     untagged.push(c.switch_untagged_ns as f64);
+                    if let Some(f) = parse_fork_line(&out.output) {
+                        fork.push(f.fork_ns as f64 / 1000.0);
+                        fork_touch.push(f.fork_touch_ns as f64 / 1000.0);
+                        template.push(f.spawn_from_template_ns as f64 / 1000.0);
+                        fork_pt_frames = Some(f.fork_pt_frames);
+                    }
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
                         resume.push(snap.resume_ns as f64 / 1000.0);
@@ -396,6 +404,9 @@ fn measure_cells(
             ("cell.resume_us", "us", &mut resume),
             ("cell.resume_eager_us", "us", &mut eager),
             ("cell.resume_touch_us", "us", &mut touch),
+            ("cell.fork_us", "us", &mut fork),
+            ("cell.fork_touch_us", "us", &mut fork_touch),
+            ("cell.spawn_from_template_us", "us", &mut template),
         ] {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -417,7 +428,39 @@ fn measure_cells(
     if let Some(bytes) = snapshot_bytes {
         metrics.push(deterministic("cell.snapshot_bytes", "bytes", bytes as f64));
     }
+    if let Some(frames) = fork_pt_frames {
+        metrics.push(deterministic(
+            "cell.fork_pt_frames",
+            "frames",
+            frames as f64,
+        ));
+    }
     Ok(())
+}
+
+/// Fork and template figures printed by a `bench-cell` kernel.
+#[derive(Debug, PartialEq, Eq)]
+struct ForkLine {
+    fork_ns: u64,
+    fork_touch_ns: u64,
+    fork_pt_frames: u64,
+    spawn_from_template_ns: u64,
+}
+
+fn parse_fork_line(output: &str) -> Option<ForkLine> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-fork "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some(ForkLine {
+        fork_ns: field("fork_ns")?,
+        fork_touch_ns: field("fork_touch_ns")?,
+        fork_pt_frames: field("fork_pt_frames")?,
+        spawn_from_template_ns: field("spawn_from_template_ns")?,
+    })
 }
 
 /// Suspend/resume figures printed by a `bench-cell` kernel.
@@ -1114,6 +1157,20 @@ mod tests {
         assert_eq!(o.vmms, vec![Vmm::QemuQ35, Vmm::Firecracker]);
         assert!(o.check && o.env == "ci");
         assert!(Options::parse(&["--runs".to_string(), "0".to_string()]).is_err());
+    }
+
+    #[test]
+    fn fork_line_is_parsed() {
+        let out = "rhizo-fork fork_ns=1 fork_touch_ns=2 fork_pt_frames=1 spawn_from_template_ns=4";
+        assert_eq!(
+            parse_fork_line(out),
+            Some(ForkLine {
+                fork_ns: 1,
+                fork_touch_ns: 2,
+                fork_pt_frames: 1,
+                spawn_from_template_ns: 4,
+            })
+        );
     }
 
     #[test]

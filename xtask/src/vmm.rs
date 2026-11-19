@@ -238,7 +238,8 @@ pub struct VmRun {
 pub struct RunOptions {
     /// Kill the VM once the ready marker arrives (benchmarks).
     pub stop_at_ready: bool,
-    /// Kill the VM after this long.
+    /// Kill the VM after this long without console output: a hang, not a
+    /// long run that keeps making progress.
     pub timeout: Duration,
     /// Echo console output to the terminal.
     pub echo: bool,
@@ -431,6 +432,8 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
         .map_err(|e| format!("failed to start {} (is it installed?): {e}", vmm.id()))?;
 
     let captured = Arc::new(Mutex::new(Vec::new()));
+    // Milliseconds since `started` of the last console output.
+    let last_output = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ready_at: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
     let ready_flag = Arc::new(AtomicBool::new(false));
 
@@ -439,6 +442,7 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
         let captured = Arc::clone(&captured);
         let ready_at = Arc::clone(&ready_at);
         let ready_flag = Arc::clone(&ready_flag);
+        let last_output = Arc::clone(&last_output);
         let echo = opts.echo;
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -447,6 +451,7 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
                     break;
                 }
                 let now = started.elapsed();
+                last_output.store(now.as_millis() as u64, Ordering::Relaxed);
                 let chunk = &buf[..n];
                 if echo {
                     crate::report::raw(chunk);
@@ -480,7 +485,11 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
         }
         match child.try_wait() {
             Ok(Some(status)) => break finish(vmm, opts.accel.uses_kvm(), status.code(), &captured),
-            Ok(None) if started.elapsed() >= opts.timeout => {
+            Ok(None)
+                if started.elapsed()
+                    >= Duration::from_millis(last_output.load(Ordering::Relaxed))
+                        + opts.timeout =>
+            {
                 let _ = child.kill();
                 let _ = child.wait();
                 break VmResult::TimedOut;
@@ -495,7 +504,7 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
     let output = String::from_utf8_lossy(&captured.lock().expect("capture lock")).into_owned();
     if result == VmResult::TimedOut && opts.echo {
         crate::report::text(&format!(
-            "\n[xtask] VM killed after {}s timeout",
+            "\n[xtask] VM killed after {}s without output",
             opts.timeout.as_secs()
         ));
     }

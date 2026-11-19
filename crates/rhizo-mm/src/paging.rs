@@ -28,6 +28,9 @@ impl PageFlags {
     pub const NO_EXECUTE: Self = Self(1 << 2);
     /// Device memory (uncached, no speculation), for MMIO.
     pub const DEVICE: Self = Self(1 << 3);
+    /// Read-only only because the page is shared after a fork: a write makes
+    /// a private copy (reported by `flags`, never passed to `map`).
+    pub const COPY_ON_WRITE: Self = Self(1 << 4);
 
     /// Read-only, executable, kernel-only, normal memory.
     pub const fn empty() -> Self {
@@ -116,8 +119,20 @@ pub trait EntryFormat {
     fn is_leaf(entry: u64, level: u32) -> bool;
     /// Output address of an entry (table frame or mapped memory).
     fn address(entry: u64) -> u64;
-    /// Permissions of a leaf entry.
+    /// Permissions of a leaf entry (with [`PageFlags::COPY_ON_WRITE`] when
+    /// it carries the copy-on-write mark).
     fn flags(entry: u64) -> PageFlags;
+    /// The entry pointing at `address` instead, other bits unchanged.
+    fn with_address(entry: u64, address: u64) -> u64;
+    /// Whether a table entry lets the levels below it allow writes.
+    fn table_writable(entry: u64) -> bool;
+    /// A table entry that allows (or forbids) writes below it.
+    fn with_table_writable(entry: u64, writable: bool) -> u64;
+    /// A leaf entry that allows (or forbids) writes.
+    fn with_leaf_writable(entry: u64, writable: bool) -> u64;
+    /// A leaf entry with the copy-on-write mark set or cleared (a bit the
+    /// hardware ignores).
+    fn with_cow(entry: u64, cow: bool) -> u64;
 }
 
 /// x86_64 4-level paging entries.
@@ -132,6 +147,8 @@ mod x86 {
     pub const CACHE_DISABLE: u64 = 1 << 4;
     pub const HUGE: u64 = 1 << 7;
     pub const NO_EXECUTE: u64 = 1 << 63;
+    /// Available to software: the copy-on-write mark.
+    pub const COW: u64 = 1 << 9;
     pub const ADDR: u64 = 0x000f_ffff_ffff_f000;
 }
 
@@ -187,7 +204,38 @@ impl EntryFormat for X86_64 {
         if entry & x86::CACHE_DISABLE != 0 {
             f = f | PageFlags::DEVICE;
         }
+        if entry & x86::COW != 0 {
+            f = f | PageFlags::COPY_ON_WRITE;
+        }
         f
+    }
+
+    fn with_address(entry: u64, address: u64) -> u64 {
+        (entry & !x86::ADDR) | address
+    }
+
+    fn table_writable(entry: u64) -> bool {
+        entry & x86::WRITABLE != 0
+    }
+
+    fn with_table_writable(entry: u64, writable: bool) -> u64 {
+        Self::with_leaf_writable(entry, writable)
+    }
+
+    fn with_leaf_writable(entry: u64, writable: bool) -> u64 {
+        if writable {
+            entry | x86::WRITABLE
+        } else {
+            entry & !x86::WRITABLE
+        }
+    }
+
+    fn with_cow(entry: u64, cow: bool) -> u64 {
+        if cow {
+            entry | x86::COW
+        } else {
+            entry & !x86::COW
+        }
     }
 }
 
@@ -216,6 +264,10 @@ mod a64 {
     pub const PXN: u64 = 1 << 53;
     /// Unprivileged (EL0) execute-never.
     pub const UXN: u64 = 1 << 54;
+    /// Reserved for software in leaf descriptors: the copy-on-write mark.
+    pub const COW: u64 = 1 << 55;
+    /// Table descriptors: `APTable[1]`, no writes at the levels below.
+    pub const AP_TABLE_READ_ONLY: u64 = 1 << 62;
     pub const ADDR: u64 = 0x0000_ffff_ffff_f000;
 }
 
@@ -284,7 +336,42 @@ impl EntryFormat for Aarch64 {
         if entry & a64::ATTR_MASK == a64::ATTR_DEVICE {
             f = f | PageFlags::DEVICE;
         }
+        if entry & a64::COW != 0 {
+            f = f | PageFlags::COPY_ON_WRITE;
+        }
         f
+    }
+
+    fn with_address(entry: u64, address: u64) -> u64 {
+        (entry & !a64::ADDR) | address
+    }
+
+    fn table_writable(entry: u64) -> bool {
+        entry & a64::AP_TABLE_READ_ONLY == 0
+    }
+
+    fn with_table_writable(entry: u64, writable: bool) -> u64 {
+        if writable {
+            entry & !a64::AP_TABLE_READ_ONLY
+        } else {
+            entry | a64::AP_TABLE_READ_ONLY
+        }
+    }
+
+    fn with_leaf_writable(entry: u64, writable: bool) -> u64 {
+        if writable {
+            entry & !a64::AP_READ_ONLY
+        } else {
+            entry | a64::AP_READ_ONLY
+        }
+    }
+
+    fn with_cow(entry: u64, cow: bool) -> u64 {
+        if cow {
+            entry | a64::COW
+        } else {
+            entry & !a64::COW
+        }
     }
 }
 
@@ -416,16 +503,37 @@ impl<F: EntryFormat> PageTable<F> {
     }
 
     /// Returns the physical address and flags `virt` maps to, if any.
+    ///
+    /// The flags are the effective ones: a page is writable only if its entry
+    /// and every table entry above it allow writes (spec `virtual-memory`).
     pub fn translate(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<Translation> {
         let (_, entry, level) = self.leaf_slot(mem, virt)?;
         let size = PageSize::from_leaf_level(level);
         let offset = virt & (size.bytes() - 1);
         let base = F::address(entry) & !(size.bytes() - 1);
+        let mut flags = F::flags(entry);
+        if !self.path_writable(mem, virt, level) {
+            flags = PageFlags(flags.0 & !PageFlags::WRITABLE.0);
+        }
         Some(Translation {
             phys: base + offset,
-            flags: F::flags(entry),
+            flags,
             size,
         })
+    }
+
+    /// Whether every table entry on the way to the leaf at `leaf_level` for
+    /// `virt` allows writes.
+    fn path_writable(&self, mem: &impl PhysicalMemory, virt: u64, leaf_level: u32) -> bool {
+        let mut table = self.root;
+        for level in (leaf_level + 1..=3).rev() {
+            let entry = mem.read_u64(table + index(virt, level) * 8);
+            if !F::table_writable(entry) {
+                return false;
+            }
+            table = F::address(entry);
+        }
+        true
     }
 
     /// Removes the mapping of the page containing `virt`, invalidates its TLB
@@ -507,41 +615,6 @@ impl<F: EntryFormat> PageTable<F> {
         1 + walk::<F>(mem, self.root, 3, 0..ENTRIES / 2)
     }
 
-    /// Frees everything mapped in the lower (user) half and every table frame
-    /// it used, then the root: `free(phys, size)` is called once per mapped
-    /// page and once per table frame (as `PageSize::Small`). The upper half is
-    /// left alone (it is shared with the kernel).
-    pub fn destroy_lower_half(
-        self,
-        mem: &mut impl PhysicalMemory,
-        free: &mut impl FnMut(u64, PageSize),
-    ) {
-        fn walk<F: EntryFormat>(
-            mem: &mut impl PhysicalMemory,
-            table: u64,
-            level: u32,
-            range: core::ops::Range<u64>,
-            free: &mut impl FnMut(u64, PageSize),
-        ) {
-            for i in range {
-                let entry = mem.read_u64(table + i * 8);
-                if !F::is_valid(entry) {
-                    continue;
-                }
-                if F::is_leaf(entry, level) {
-                    let size = PageSize::from_leaf_level(level);
-                    free(F::address(entry) & !(size.bytes() - 1), size);
-                } else {
-                    let next = F::address(entry);
-                    walk::<F>(mem, next, level - 1, 0..ENTRIES, free);
-                    free(next, PageSize::Small);
-                }
-            }
-        }
-        walk::<F>(mem, self.root, 3, 0..ENTRIES / 2, free);
-        free(self.root, PageSize::Small);
-    }
-
     /// Walks to the valid leaf entry for `virt`: (slot address, entry, level).
     fn leaf_slot(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<(u64, u64, u32)> {
         if !is_canonical(virt) {
@@ -567,6 +640,25 @@ impl<F: EntryFormat> PageTable<F> {
 mod tests {
     use super::*;
     use rhizo_hal::testing::{FakePhysicalMemory, RecordingTlb};
+
+    /// Records frees; nothing is shared.
+    struct FreeRecorder(Vec<(u64, PageSize)>);
+
+    impl crate::cow::Frames for FreeRecorder {
+        fn alloc(&mut self) -> Option<u64> {
+            None
+        }
+        fn alloc_large(&mut self) -> Option<u64> {
+            None
+        }
+        fn free(&mut self, phys: u64, size: PageSize) {
+            self.0.push((phys, size));
+        }
+        fn share(&mut self, _: u64) {}
+        fn is_shared(&self, _: u64) -> bool {
+            false
+        }
+    }
 
     /// Hands out frames from 16 MiB upwards.
     fn frames() -> impl FnMut() -> Option<u64> {
@@ -883,8 +975,9 @@ mod tests {
                         "user pages in address order, kernel half skipped"
                     );
 
-                    let mut freed = Vec::new();
-                    cell.destroy_lower_half(&mut mem, &mut |phys, size| freed.push((phys, size)));
+                    let mut recorder = FreeRecorder(Vec::new());
+                    cell.destroy_lower_half(&mut mem, &mut recorder);
+                    let freed = recorder.0;
                     // Both user pages, every table frame of the cell, then its root.
                     assert!(freed.contains(&(0x900_0000, PageSize::Small)));
                     assert!(freed.contains(&(0xa00_0000, PageSize::Large)));

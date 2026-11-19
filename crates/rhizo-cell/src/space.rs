@@ -5,21 +5,15 @@ use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 
-/// Where a cell's frames come from and go back to.
-pub trait Frames {
-    /// One 4 KiB frame (contents undefined).
-    fn alloc(&mut self) -> Option<u64>;
-    /// 512 contiguous frames aligned to 2 MiB (contents undefined).
-    fn alloc_large(&mut self) -> Option<u64>;
-    /// Returns a page obtained from `alloc` (`Small`) or `alloc_large` (`Large`).
-    fn free(&mut self, phys: u64, size: PageSize);
-}
+pub use rhizo_mm::cow::Frames;
 
 /// Why a range cannot be unmapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnmapError {
     /// The range covers only part of a 2 MiB page (splitting is not supported).
     PartialLargePage(u64),
+    /// No memory to make a shared page table private.
+    OutOfMemory,
 }
 
 /// Maps `len` bytes at `addr` (both 4 KiB aligned) to fresh zeroed memory with
@@ -57,6 +51,11 @@ pub fn map_anonymous<F: EntryFormat>(
         };
         for frame in (phys..phys + size.bytes()).step_by(FRAME_SIZE as usize) {
             mem.zero_frame(frame);
+        }
+        // The tables on the way may be shared with a forked cell.
+        if let Err(e) = pt.unshare_path(mem, frames, at) {
+            frames.free(phys, size);
+            break Err(e);
         }
         if let Err(e) = pt.map(mem, &mut || frames.alloc(), at, phys, size, flags) {
             frames.free(phys, size);
@@ -98,6 +97,10 @@ pub fn unmap<F: EntryFormat>(
     }
     let mut at = addr;
     while at < end {
+        // Unmapping changes a table, which must not be shared.
+        if pt.unshare_path(mem, frames, at).is_err() {
+            return Err(UnmapError::OutOfMemory);
+        }
         match pt.unmap(mem, tlb, at) {
             Ok((phys, size)) => {
                 frames.free(phys, size);
@@ -109,14 +112,14 @@ pub fn unmap<F: EntryFormat>(
     Ok(())
 }
 
-/// Frees the whole user half of `pt`: every mapped page, every table, and
-/// the root.
+/// Frees the whole user half of `pt`: drops its reference to every mapped
+/// page and table (freeing what no other cell shares), and the root.
 pub fn destroy<F: EntryFormat>(
     pt: PageTable<F>,
     mem: &mut impl PhysicalMemory,
     frames: &mut impl Frames,
 ) {
-    pt.destroy_lower_half(mem, &mut |phys, size| frames.free(phys, size));
+    pt.destroy_lower_half(mem, frames);
 }
 
 #[cfg(test)]

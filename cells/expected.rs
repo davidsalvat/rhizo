@@ -30,6 +30,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("peek", "", Ending::Fault),
     ("yielder", "", Ending::Exit(0)),
     ("ballast", "filled\nchecked\n", Ending::Exit(0)),
+    ("forkme", "ready\nown ok\n", Ending::Exit(0)),
     (
         "counter",
         "step 07 digest 6b4e24cdafe14e6b\nstep 15 digest c93f1c055e5410cf\nstep 23 digest 65632246df41d107\nstep 31 digest a7c1ff878b0627df\nstep 39 digest 9a1ea881edd8f792\n",
