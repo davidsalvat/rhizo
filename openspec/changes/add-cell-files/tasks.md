@@ -13,5 +13,5 @@
 
 ## 3. Benchmarks and documentation
 
-- [ ] 3.1 `cell.file_write_read_us`, `cell.fork_with_files_us`; cell figures as the minimum of per-round medians (D4)
-- [ ] 3.2 README roadmap (H8), AGENTS.md code map, `bench/README.md`, `cargo xtask ci` on both architectures
+- [x] 3.1 `cell.file_write_read_us`, `cell.fork_with_files_us`; cell figures as the minimum of per-round medians (D4)
+- [x] 3.2 README roadmap (H8), AGENTS.md code map, `bench/README.md`, `cargo xtask ci` on both architectures
