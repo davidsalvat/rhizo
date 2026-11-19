@@ -2,19 +2,20 @@
 
 ## Decisions
 
-### D1. FP/SIMD state: lazy switching
+### D1. FP/SIMD state: switched on first use
 
 The kernel is built without FP/SIMD, so the registers always hold the state
-of the last cell that ran. The host remembers which cell owns them and saves
-and loads them only when a different cell is about to run, and before a
-suspend, fork or freeze of the owner. A cell that yields to the kernel and
-comes back pays nothing.
+of the cell that last used them (the owner). A cell that is not the owner
+runs with FP/SIMD disabled for it (`CPACR_EL1.FPEN = 0b01`, which traps EL0
+only; `CR0.TS` on x86_64); its first FP/SIMD instruction traps, and only
+then is the owner's state saved and the cell's loaded. The owner is synced
+before a suspend, fork or freeze.
 
 | Option | For | Against |
 |---|---|---|
-| **Lazy, owner tracked by the host (chosen)** | No cost on system calls or when one cell runs alone | One owner field to keep right |
+| **Trap on first use (chosen)** | Cells that never use FP never pay; an FP cell pays once per switch-in | A trap path per architecture |
+| Swap whenever a different cell runs (first version) | No trap path | Measured in CI with KVM: `cell.switch_ns` 303 → 572 ns, `cell.run_us` 7.2 → 12.4 µs, for cells that never touch FP |
 | Save/restore on every entry and exit | Simplest | ~1 KB copied twice per system call |
-| Trap on first use (`CPACR`/`CR0.TS`) | Cells that never use FP never pay | Extra trap path; glibc uses SIMD in `memcpy`, so nearly every cell uses FP |
 
 State layout: 66 words (`V0`–`V31`, `FPCR`, `FPSR` / the `FXSAVE` image),
 16-byte aligned, at a fixed offset in `Registers`. Initial state as Linux:

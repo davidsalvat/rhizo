@@ -485,14 +485,8 @@ impl Host {
     /// Runs `live` until it ends, sleeps, yields or is preempted, and files it
     /// accordingly.
     fn run_slice(&mut self, live: &mut Live) {
-        if self.fp_owner != live.cell.id {
-            let owner = self.fp_owner;
-            if let Some(previous) = self.sched.find_mut(|l| l.cell.id == owner) {
-                user::fp_save(&mut previous.cell.regs.fp);
-            }
-            user::fp_load(&live.cell.regs.fp);
-            self.fp_owner = live.cell.id;
-        }
+        // FP/SIMD state moves only if this cell actually uses it (design D1).
+        user::fp_trap(self.fp_owner != live.cell.id);
         let pt = PageTable::<Format>::from_root(live.cell.root);
         // Ticks seen in this slice: the first may have been pending since
         // before the cell was picked, so a cell is preempted at the second,
@@ -527,6 +521,16 @@ impl Host {
                         Outcome::Sleep(until) => self.sched.sleep(take(live), until),
                         Outcome::Exit(status) => self.end(take(live), Ending::Exit(status)),
                     }
+                }
+                Trap::FpUnavailable => {
+                    let owner = self.fp_owner;
+                    if let Some(previous) = self.sched.find_mut(|l| l.cell.id == owner) {
+                        user::fp_save(&mut previous.cell.regs.fp);
+                    }
+                    user::fp_load(&live.cell.regs.fp);
+                    user::fp_trap(false);
+                    self.fp_owner = live.cell.id;
+                    continue;
                 }
                 Trap::Interrupt => {
                     ticks += 1;

@@ -28,6 +28,9 @@ pub enum Trap {
     Syscall,
     /// An interrupt (the end of its time slice): the cell can be resumed.
     Interrupt,
+    /// A first FP/SIMD instruction while the registers belong to another
+    /// cell (see [`fp_trap`]): swap the state and resume.
+    FpUnavailable,
     /// Any other exception: the cell cannot continue.
     Fault(UserFault),
 }
@@ -120,6 +123,33 @@ rhizo_fp_load:
 unsafe extern "C" {
     fn rhizo_fp_save(state: *mut FpState);
     fn rhizo_fp_load(state: *const FpState);
+}
+
+/// Whether FP/SIMD use by cell code traps (`CPACR_EL1.FPEN` = 0b01: EL0
+/// traps, EL1 does not, so the kernel can still save and load).
+static FP_TRAPS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Makes FP/SIMD use by cell code trap (`true`) or not, writing `CPACR_EL1`
+/// only when that changes.
+pub fn fp_trap(enable: bool) {
+    if FP_TRAPS.swap(enable, Ordering::Relaxed) == enable {
+        return;
+    }
+    let fpen: u64 = if enable { 0b01 } else { 0b11 };
+    // SAFETY: CPACR_EL1.FPEN only decides whether FP/SIMD traps; EL1 access
+    // stays enabled either way.
+    unsafe {
+        asm!(
+            "mrs {t}, cpacr_el1",
+            "bic {t}, {t}, #(3 << 20)",
+            "orr {t}, {t}, {f}",
+            "msr cpacr_el1, {t}",
+            "isb",
+            t = out(reg) _,
+            f = in(reg) fpen << 20,
+            options(nostack)
+        );
+    }
 }
 
 /// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
@@ -230,6 +260,9 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     }
     if vector == 8 && (esr >> 26) & 0x3f == 0x15 {
         return Trap::Syscall;
+    }
+    if vector == 8 && (esr >> 26) & 0x3f == 0x07 {
+        return Trap::FpUnavailable;
     }
     if vector == 9 {
         super::irq::acknowledge();

@@ -30,6 +30,9 @@ pub enum Trap {
     Syscall,
     /// An interrupt (the end of its time slice): the cell can be resumed.
     Interrupt,
+    /// A first FP/SIMD instruction while the registers belong to another
+    /// cell (`#NM`, see [`fp_trap`]): swap the state and resume.
+    FpUnavailable,
     /// An exception: the cell cannot continue.
     Fault(UserFault),
 }
@@ -75,9 +78,30 @@ static LAST_FS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// CR3 bit 63 with PCIDs on: keep the translations of the new PCID.
 const NO_FLUSH: u64 = 1 << 63;
 
+/// Whether `CR0.TS` is set: the next FP/SIMD instruction raises `#NM`.
+static FP_TRAPS: AtomicBool = AtomicBool::new(false);
+
+/// Makes FP/SIMD use trap (`CR0.TS`, `#NM`) or not, writing CR0 only when
+/// that changes.
+pub fn fp_trap(enable: bool) {
+    if FP_TRAPS.swap(enable, Ordering::Relaxed) == enable {
+        return;
+    }
+    // SAFETY: CR0.TS only makes FP/SIMD instructions raise #NM; the kernel
+    // uses none except `fp_save`/`fp_load`, which clear it first.
+    unsafe {
+        if enable {
+            asm!("mov {t}, cr0", "or {t}, 8", "mov cr0, {t}", t = out(reg) _, options(nostack));
+        } else {
+            asm!("clts", options(nostack));
+        }
+    }
+}
+
 /// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
 /// state of the cell that last ran).
 pub fn fp_save(state: &mut FpState) {
+    fp_trap(false);
     // SAFETY: `state` is 16-byte aligned and at least 512 bytes; SSE is
     // enabled by `init_tags`.
     unsafe { asm!("fxsave64 [{}]", in(reg) state, options(nostack)) };
@@ -85,6 +109,7 @@ pub fn fp_save(state: &mut FpState) {
 
 /// Loads the FP/SIMD registers for the cell about to run.
 pub fn fp_load(state: &FpState) {
+    fp_trap(false);
     // SAFETY: as for `fp_save`; `FXRSTOR` only loads valid images (reserved
     // MXCSR bits are cleared by the kernel's initial image and cannot be set
     // by a cell without faulting in `LDMXCSR` first).
@@ -169,6 +194,9 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
         return Trap::Syscall;
     }
     let vector = vector as u8;
+    if vector == 7 {
+        return Trap::FpUnavailable;
+    }
     if vector == super::irq::TIMER_VECTOR {
         super::irq::acknowledge();
         return Trap::Interrupt;
