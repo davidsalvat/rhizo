@@ -553,6 +553,32 @@ impl<F: EntryFormat> PageTable<F> {
         Ok((F::address(entry) & !(size.bytes() - 1), size))
     }
 
+    /// Changes the permissions of the page containing `virt` to `flags`,
+    /// keeping its frame, invalidates its TLB entry and returns its size. A
+    /// copy-on-write page made writable stays copy-on-write (read-only until
+    /// written).
+    pub fn protect(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        tlb: &mut impl Tlb,
+        virt: u64,
+        flags: PageFlags,
+    ) -> Result<PageSize, UnmapError> {
+        let (slot, entry, level) = self
+            .leaf_slot(mem, virt)
+            .ok_or(UnmapError::NotMapped(virt))?;
+        let size = PageSize::from_leaf_level(level);
+        let phys = F::address(entry) & !(size.bytes() - 1);
+        let plain = PageFlags(flags.0 & !PageFlags::COPY_ON_WRITE.0);
+        let mut new = F::leaf(phys, size, plain);
+        if F::flags(entry).contains(PageFlags::COPY_ON_WRITE) && plain.is_writable() {
+            new = F::with_cow(F::with_leaf_writable(new, false), true);
+        }
+        mem.write_u64(slot, new);
+        tlb.flush_page(virt & !(size.bytes() - 1));
+        Ok(size)
+    }
+
     /// Copies the root entries of the upper (kernel) half from `kernel`, so
     /// this hierarchy shares the kernel's mappings (x86_64 cells).
     pub fn share_upper_half(&self, mem: &mut impl PhysicalMemory, kernel: &PageTable<F>) {
@@ -990,6 +1016,29 @@ mod tests {
                     // The kernel's tables are untouched.
                     assert!(!freed.iter().any(|&(p, _)| p == kernel.root()));
                     assert!(kernel.translate(&mem, 0xffff_8000_0000_1000).is_some());
+                }
+
+                #[test]
+                fn protect_changes_permissions_and_keeps_the_frame() {
+                    let mut mem = FakePhysicalMemory::new();
+                    let mut alloc = frames();
+                    let mut tlb = RecordingTlb::default();
+                    let pt = PT::new(&mut mem, &mut alloc).unwrap();
+                    let rw = PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+                    let ro = PageFlags::USER | PageFlags::NO_EXECUTE;
+                    pt.map(&mut mem, &mut alloc, 0x5000, 0x77_7000, PageSize::Small, rw)
+                        .unwrap();
+                    assert_eq!(
+                        pt.protect(&mut mem, &mut tlb, 0x5123, ro),
+                        Ok(PageSize::Small)
+                    );
+                    let t = pt.translate(&mem, 0x5000).unwrap();
+                    assert_eq!((t.phys, t.flags), (0x77_7000, ro));
+                    assert_eq!(tlb.flushed.last(), Some(&0x5000));
+                    assert_eq!(
+                        pt.protect(&mut mem, &mut tlb, 0x9000, ro),
+                        Err(UnmapError::NotMapped(0x9000))
+                    );
                 }
 
                 #[test]

@@ -92,6 +92,14 @@ impl<T> Scheduler<T> {
             .or_else(|| self.sleeping.iter().map(|(_, e)| e).find(|e| pred(e)))
     }
 
+    /// The first entry (runnable or sleeping) matching `pred`, mutably.
+    pub fn find_mut(&mut self, mut pred: impl FnMut(&T) -> bool) -> Option<&mut T> {
+        match self.runnable.iter().position(&mut pred) {
+            Some(i) => self.runnable.get_mut(i),
+            None => self.sleeping.iter_mut().map(|(_, e)| e).find(|e| pred(e)),
+        }
+    }
+
     /// Number of entries, runnable and sleeping.
     pub fn len(&self) -> usize {
         self.runnable.len() + self.sleeping.len()
@@ -209,6 +217,9 @@ mod tests {
         s.sleep(2, 10);
         assert_eq!(s.len(), 2);
         assert_eq!(s.find(|&e| e == 2), Some(&2));
+        *s.find_mut(|&e| e == 1).unwrap() = 3;
+        assert_eq!(s.find(|&e| e == 3), Some(&3));
+        *s.find_mut(|&e| e == 3).unwrap() = 1;
         assert_eq!(s.remove_with_wake(|&e| e == 2), Some((2, Some(10))));
         assert_eq!(s.remove(|&e| e == 9), None);
         assert_eq!(s.remove(|&e| e == 1), Some(1));

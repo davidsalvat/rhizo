@@ -32,6 +32,16 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("ballast", "filled\nchecked\n", Ending::Exit(0)),
     ("forkme", "ready\nown ok\n", Ending::Exit(0)),
     (
+        "libc_hello",
+        "hello from libc, 1 argument, first libc_hello\n\
+         sorted: min 0 max 1008 weighted sum 336699270\n\
+         strtod 3.141593, scaled 3.142e+10, 0.448799\n\
+         0314.159|rhizo |beef (20 chars)\n",
+        Ending::Exit(0),
+    ),
+    ("libc_alloc", "allocator checksum 154285459\n", Ending::Exit(0)),
+    ("libc_float", "fp ok: 20100.0\n", Ending::Exit(0)),
+    (
         "counter",
         "step 07 digest 6b4e24cdafe14e6b\nstep 15 digest c93f1c055e5410cf\nstep 23 digest 65632246df41d107\nstep 31 digest a7c1ff878b0627df\nstep 39 digest 9a1ea881edd8f792\n",
         Ending::Exit(0),
