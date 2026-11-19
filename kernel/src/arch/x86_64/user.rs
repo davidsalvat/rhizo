@@ -51,6 +51,8 @@ impl UserFault {
 static USER_CR3: AtomicU64 = AtomicU64::new(0);
 static AT_SYSCALL: AtomicBool = AtomicBool::new(false);
 static PCID: AtomicBool = AtomicBool::new(false);
+/// FS base last written (skipping the write when it does not change).
+static LAST_FS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// CR3 bit 63 with PCIDs on: keep the translations of the new PCID.
 const NO_FLUSH: u64 = 1 << 63;
 
@@ -94,9 +96,11 @@ pub fn enter_user(root: u64, tag: u16, regs: &mut Registers) -> Trap {
     }
     // SYSRETQ needs a canonical lower-half RIP (else it faults in ring 0).
     let sysret = AT_SYSCALL.load(Ordering::Relaxed) && regs.pc < 0x0000_8000_0000_0000;
-    // SAFETY: the FS base is the cell's thread pointer; the kernel does not
-    // use FS.
-    unsafe { wrmsr(FS_BASE, regs.tls) };
+    if LAST_FS.swap(regs.tls, Ordering::Relaxed) != regs.tls {
+        // SAFETY: the FS base is the cell's thread pointer; the kernel does
+        // not use FS.
+        unsafe { wrmsr(FS_BASE, regs.tls) };
+    }
     // SAFETY: `regs` lives across the call; the entry code returns to ring 3
     // with user selectors and only the user flags, and comes back through
     // the SYSCALL entry or a ring-3 exception, which restore the kernel

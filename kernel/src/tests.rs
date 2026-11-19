@@ -481,6 +481,9 @@ fn same_address_is_private_to_each_cell() {
 fn cell_cannot_touch_another_cells_mapping() {
     let mut host = Host::new();
     let mapper = spawn(&mut host, "mapper", &[]);
+    while host.output(mapper) != Some(b"mapped\n") {
+        host.step();
+    }
     let peek = spawn(&mut host, "peek", &[]);
     host.run(|h| h.finished(peek).is_some());
     let (ending, report) = ended(&host, peek);

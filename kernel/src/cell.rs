@@ -140,7 +140,7 @@ impl Host {
     /// An empty host; sets up the timer interrupt the first time.
     pub fn new() -> Self {
         if !IRQ_READY.swap(true, Ordering::Relaxed) {
-            irq::init();
+            irq::init(SLICE_NS);
             MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
         }
         Self {
@@ -214,6 +214,28 @@ impl Host {
         Some(frames)
     }
 
+    /// Runs one scheduling step: the next runnable cell for one slice (until
+    /// it ends, yields, sleeps or is preempted), waiting first if every cell
+    /// sleeps. Returns `false` when no cell is left.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn step(&mut self) -> bool {
+        let mut stepped = false;
+        self.run(|_| core::mem::replace(&mut stepped, true));
+        self.live() > 0
+    }
+
+    /// What live cell `id` has printed so far (when captured).
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn output(&self, id: u32) -> Option<&[u8]> {
+        self.sched.find(|l| l.cell.id == id)?.output.as_deref()
+    }
+
     /// Runs cells until none is left or `stop` holds (checked whenever a cell
     /// ends or gives up the CPU).
     pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
@@ -226,9 +248,6 @@ impl Host {
                 }
                 continue;
             };
-            if irq::available() {
-                irq::arm_after_ns(SLICE_NS);
-            }
             self.run_slice(&mut live);
         }
     }
@@ -350,8 +369,7 @@ fn idle_until(wake: u64) {
         return;
     }
     if irq::available() {
-        irq::arm_after_ns(wake - now);
-        irq::wait();
+        irq::wait_ns(wake - now);
     } else {
         while now_ns() < wake {
             core::hint::spin_loop();

@@ -45,13 +45,22 @@ locking appears.
   has them, else the xAPIC page (mapped as device memory). The legacy PIC is
   masked. Vector 32.
 
-### D4. Time slice
+### D4. Time slice: a periodic tick
 
-10 ms. On AArch64 the counter frequency is known (`CNTFRQ`); on x86_64 the
-slice uses the TSC-deadline mode when available (TSC frequency from the
-H2 calibration), otherwise a fixed APIC count, which bounds the slice but
-does not fix its length. The spec only requires that a running cell is
-preempted, not an exact slice.
+The timer is a periodic tick every 10 ms, armed once; a cell runs until the
+next tick. It is not re-armed when cells switch.
+
+| Option | For | Against |
+|---|---|---|
+| **Periodic tick (chosen)** | Switching cells touches no timer register | A cell switched in just before a tick gets a short first slice |
+| Re-arm a full slice at every switch | Exact slices | One timer write per switch: under virtualization a VM exit each (measured in CI: switches took ~8 µs, `cell.run_us` doubled) |
+
+Waiting for a sleeper's deadline while idle programs a one-shot for that
+deadline and restores the tick afterwards. On AArch64 the counter frequency
+is known (`CNTFRQ`). On x86_64 the APIC timer of KVM and QEMU counts at
+1 GHz; on other hardware the period would differ, but cells are still
+preempted. The spec only requires that a running cell is preempted, not an
+exact slice.
 
 ### D5. Sleeping and idling
 

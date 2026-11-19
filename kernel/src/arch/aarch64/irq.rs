@@ -17,6 +17,8 @@ const SPURIOUS: u64 = 1023;
 /// redistributor (`RD_base`; `SGI_base` follows 64 KiB later).
 static GICD: AtomicU64 = AtomicU64::new(0);
 static GICR: AtomicU64 = AtomicU64::new(0);
+/// Counter ticks between two timer interrupts (the periodic tick).
+static TICK: AtomicU64 = AtomicU64::new(0);
 
 fn write32(addr: u64, value: u32) {
     // SAFETY: `addr` is a GIC register in the MMIO window, mapped as device
@@ -29,9 +31,11 @@ fn read32(addr: u64) -> u32 {
     unsafe { (addr as *const u32).read_volatile() }
 }
 
-/// Sets up the GIC for the timer interrupt. Without a GICv3 in the device
-/// tree, cells are not preempted (there is no interrupt to do it).
-pub fn init() {
+/// Sets up the GIC and starts the timer as a periodic tick every `tick_ns`
+/// (design D4: re-armed only when it fires, so switching cells never
+/// reprograms it). Without a GICv3 in the device tree, cells are not
+/// preempted (there is no interrupt to do it).
+pub fn init(tick_ns: u64) {
     let Some([(d, _), (r, _)]) = gic_regions() else {
         return;
     };
@@ -70,6 +74,13 @@ pub fn init() {
     }
     GICD.store(gicd, Ordering::Relaxed);
     GICR.store(gicr, Ordering::Relaxed);
+    TICK.store(ns_to_ticks(tick_ns), Ordering::Relaxed);
+    arm(ns_to_ticks(tick_ns));
+}
+
+fn ns_to_ticks(ns: u64) -> u64 {
+    let ticks = ns as u128 * super::timer::frequency() as u128 / 1_000_000_000;
+    (ticks as u64).clamp(1, u32::MAX as u64)
 }
 
 /// Whether preemption is available (a GICv3 was found).
@@ -77,31 +88,30 @@ pub fn available() -> bool {
     GICR.load(Ordering::Relaxed) != 0
 }
 
-/// Arms the timer to fire after `ns` nanoseconds.
-pub fn arm_after_ns(ns: u64) {
-    let ticks = (ns as u128 * super::timer::frequency() as u128 / 1_000_000_000) as u64;
+/// Arms the timer to fire after `ticks` counter ticks.
+fn arm(ticks: u64) {
     // SAFETY: programming this CPU's virtual timer only.
     unsafe {
         asm!(
             "msr cntv_tval_el0, {t}",
             "msr cntv_ctl_el0, {on}",
             "isb",
-            t = in(reg) ticks.clamp(1, u32::MAX as u64),
+            t = in(reg) ticks,
             on = in(reg) 1u64,
             options(nostack)
         );
     }
 }
 
-/// Acknowledges a pending interrupt (if any) and silences the timer until it
-/// is armed again.
+/// Acknowledges a pending interrupt (if any); a timer interrupt re-arms the
+/// periodic tick.
 pub fn acknowledge() {
     let intid: u64;
     // SAFETY: reading IAR1 acknowledges the highest-priority pending group 1
-    // interrupt; masking the timer stops it from asserting again.
-    unsafe {
-        asm!("mrs {}, S3_0_C12_C12_0", out(reg) intid, options(nostack));
-        asm!("msr cntv_ctl_el0, {}", "isb", in(reg) 0b11u64, options(nostack));
+    // interrupt.
+    unsafe { asm!("mrs {}, S3_0_C12_C12_0", out(reg) intid, options(nostack)) };
+    if intid == TIMER_PPI as u64 {
+        arm(TICK.load(Ordering::Relaxed));
     }
     if intid != SPURIOUS {
         // SAFETY: ends the interrupt acknowledged above.
@@ -109,9 +119,11 @@ pub fn acknowledge() {
     }
 }
 
-/// Waits until an interrupt is pending (with interrupts masked, `wfi` still
-/// wakes up), then acknowledges it.
-pub fn wait() {
+/// Waits about `ns` nanoseconds (or until any interrupt): with interrupts
+/// masked, `wfi` still wakes up when one is pending. Acknowledging it
+/// restarts the periodic tick.
+pub fn wait_ns(ns: u64) {
+    arm(ns_to_ticks(ns));
     // SAFETY: waiting for an interrupt has no other effect.
     unsafe { asm!("dsb sy", "wfi", options(nostack)) };
     acknowledge();

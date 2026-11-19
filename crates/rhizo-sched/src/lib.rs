@@ -74,6 +74,14 @@ impl<T> Scheduler<T> {
         Some(self.sleeping.remove(i).1)
     }
 
+    /// The first entry (runnable or sleeping) matching `pred`.
+    pub fn find(&self, mut pred: impl FnMut(&T) -> bool) -> Option<&T> {
+        self.runnable
+            .iter()
+            .find(|e| pred(e))
+            .or_else(|| self.sleeping.iter().map(|(_, e)| e).find(|e| pred(e)))
+    }
+
     /// Number of entries, runnable and sleeping.
     pub fn len(&self) -> usize {
         self.runnable.len() + self.sleeping.len()
@@ -190,6 +198,7 @@ mod tests {
         s.add(1);
         s.sleep(2, 10);
         assert_eq!(s.len(), 2);
+        assert_eq!(s.find(|&e| e == 2), Some(&2));
         assert_eq!(s.remove(|&e| e == 2), Some(2));
         assert_eq!(s.remove(|&e| e == 9), None);
         assert_eq!(s.remove(|&e| e == 1), Some(1));

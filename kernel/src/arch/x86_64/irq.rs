@@ -26,6 +26,10 @@ const INITIAL_COUNT: u32 = 0x380;
 const CURRENT_COUNT: u32 = 0x390;
 const DIVIDE: u32 = 0x3e0;
 const NS_PER_COUNT: u64 = 16;
+const PERIODIC: u32 = 1 << 17;
+
+/// Initial count of the periodic tick (0 before `init`).
+static TICK: AtomicU64 = AtomicU64::new(0);
 
 /// 1 when using x2APIC MSRs, else the virtual address of the xAPIC page
 /// (0 before `init`).
@@ -69,16 +73,24 @@ pub fn tsc_hz() -> Option<u64> {
         c1 = read(CURRENT_COUNT);
     }
     let t1 = tsc.cycles();
-    write(INITIAL_COUNT, 0);
     write(DIVIDE, 0b0011);
-    write(LVT_TIMER, TIMER_VECTOR as u32);
+    tick();
     let counts = (c0 - c1) as u64;
     (counts > 0).then(|| ((t1 - t0) as u128 * 1_000_000_000 / counts as u128) as u64)
 }
 
-/// Masks the legacy PIC and enables the local APIC with its timer on
-/// [`TIMER_VECTOR`], one-shot, divided by 16.
-pub fn init() {
+/// (Re)starts the periodic tick.
+fn tick() {
+    let count = TICK.load(Ordering::Relaxed) as u32;
+    write(LVT_TIMER, PERIODIC | TIMER_VECTOR as u32);
+    write(INITIAL_COUNT, count);
+}
+
+/// Masks the legacy PIC, enables the local APIC and starts its timer as a
+/// periodic tick every `tick_ns` on [`TIMER_VECTOR`] (design D4: armed once,
+/// so switching cells never reprograms it; under virtualization every
+/// reprogramming is a VM exit).
+pub fn init(tick_ns: u64) {
     // SAFETY: masking every line of both legacy PICs (writes to absent
     // ports, as on QEMU microvm without a PIC, are ignored).
     unsafe {
@@ -106,7 +118,11 @@ pub fn init() {
     }
     write(SVR, 0x100 | SPURIOUS_VECTOR as u32);
     write(DIVIDE, 0b0011);
-    write(LVT_TIMER, TIMER_VECTOR as u32);
+    TICK.store(
+        (tick_ns / NS_PER_COUNT).clamp(1, u32::MAX as u64),
+        Ordering::Relaxed,
+    );
+    tick();
 }
 
 /// Whether preemption is available (always, once `init` ran).
@@ -114,28 +130,24 @@ pub fn available() -> bool {
     APIC.load(Ordering::Relaxed) != 0
 }
 
-/// Arms the timer to fire after about `ns` nanoseconds.
-pub fn arm_after_ns(ns: u64) {
+/// Ends the interrupt being handled (the periodic tick re-arms itself).
+pub fn acknowledge() {
+    write(EOI, 0);
+}
+
+/// Waits about `ns` nanoseconds (or until any interrupt), with interrupts
+/// enabled for the length of `hlt` only, then goes back to the periodic
+/// tick. The IDT stub returns at once for an interrupt taken in ring 0.
+pub fn wait_ns(ns: u64) {
+    write(LVT_TIMER, TIMER_VECTOR as u32); // one-shot for the wait
     write(
         INITIAL_COUNT,
         (ns / NS_PER_COUNT).clamp(1, u32::MAX as u64) as u32,
     );
-}
-
-/// Ends the interrupt being handled and stops the timer until it is armed
-/// again.
-pub fn acknowledge() {
-    write(INITIAL_COUNT, 0);
-    write(EOI, 0);
-}
-
-/// Waits for an interrupt with interrupts enabled for the length of `hlt`
-/// only, then acknowledges it. The IDT stub returns at once for an
-/// interrupt taken in ring 0.
-pub fn wait() {
     // SAFETY: `sti; hlt` enables interrupts only for the halt (the
     // instruction after `sti` runs before any interrupt), and the stub for
     // vectors 32 and 255 in ring 0 just returns.
     unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
     acknowledge();
+    tick();
 }
