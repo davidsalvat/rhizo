@@ -106,10 +106,15 @@ fn load_cr3(value: u64) {
 /// Runs the cell whose root table is `root`, tagged `tag` (PCID; 0 =
 /// untagged), from `regs` until it makes a system call, is interrupted or
 /// faults; `regs` then holds its state at that point.
-pub fn enter_user(root: u64, tag: u16, regs: &mut Registers) -> Trap {
+///
+/// `fresh` marks the first entry of a cell into its tag: the tag's
+/// translations are then dropped as the cell's tables are loaded, so nothing
+/// a previous holder of the tag left (or that was cached again while it was
+/// being released) can be used (design D6 of `add-scheduler`).
+pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Trap {
     let cr3 = root | tag as u64;
-    if USER_CR3.swap(cr3, Ordering::Relaxed) != cr3 {
-        let keep = PCID.load(Ordering::Relaxed) && tag != 0;
+    if USER_CR3.swap(cr3, Ordering::Relaxed) != cr3 || fresh {
+        let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !fresh;
         load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
         AT_SYSCALL.store(false, Ordering::Relaxed);
     }

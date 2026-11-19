@@ -149,6 +149,9 @@ struct Live {
     cell: Cell,
     /// Address-space tag (ASID/PCID), 0 if none was free.
     tag: u16,
+    /// Not run yet with this tag: its first entry drops the tag's old
+    /// translations.
+    fresh: bool,
     abi: Abi,
     output: Option<Vec<u8>>,
     echo: bool,
@@ -324,6 +327,7 @@ impl Host {
         self.sched.add(Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
+            fresh: true,
             abi: Abi::new(user::ABI),
             output: capture.then(Vec::new),
             echo,
@@ -371,6 +375,7 @@ impl Host {
         let live = Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
+            fresh: true,
             abi: Abi::new(user::ABI),
             output: capture.then(Vec::new),
             echo,
@@ -453,7 +458,12 @@ impl Host {
         // and always makes progress (design D4).
         let mut ticks = 0;
         loop {
-            match user::enter_user(live.cell.root, live.tag, &mut live.cell.regs) {
+            match user::enter_user(
+                live.cell.root,
+                live.tag,
+                core::mem::replace(&mut live.fresh, false),
+                &mut live.cell.regs,
+            ) {
                 Trap::Syscall => {
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
@@ -556,6 +566,7 @@ impl Host {
                 ..*cell
             },
             tag: self.tags.alloc().unwrap_or(0),
+            fresh: true,
             abi: Abi::new(user::ABI),
             output: capture.then(Vec::new),
             echo,
@@ -666,6 +677,7 @@ fn take(live: &mut Live) -> Live {
     Live {
         cell: live.cell,
         tag: live.tag,
+        fresh: live.fresh,
         abi: core::mem::replace(&mut live.abi, Abi::new(user::ABI)),
         output: live.output.take(),
         echo: live.echo,
