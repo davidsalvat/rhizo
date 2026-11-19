@@ -381,6 +381,30 @@ fn cmd_test(args: &RunArgs) -> Result {
     Ok(())
 }
 
+/// Validates `.github/workflows` with actionlint when it is installed.
+fn check_workflows() -> Result {
+    let status = Command::new("actionlint")
+        .current_dir(workspace_root())
+        .stdout(report::child_stdout())
+        .status();
+    match status {
+        Err(_) => {
+            report::text("[xtask] actionlint is not installed; skipped (CI runs it)");
+            Ok(())
+        }
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(
+            Failure::new("workflows", "GitHub Actions workflow files are invalid")
+                .location(".github/workflows/")
+                .expected("no actionlint findings")
+                .actual(s.to_string())
+                .hint("fix each finding at the file:line actionlint printed above")
+                .reproduce("actionlint")
+                .into_error(),
+        ),
+    }
+}
+
 /// Mutation testing: every surviving mutant is a change no test notices.
 fn cmd_mutants() -> Result {
     step("mutation testing (rhizo-mm, rhizo-core)");
@@ -451,6 +475,8 @@ fn cmd_check() -> Result {
     cargo(&["test", "--workspace", "--exclude", KERNEL_PACKAGE])?;
     step("crate dependency rules");
     deps::check()?;
+    step("workflow files (actionlint)");
+    check_workflows()?;
     let secs = started.elapsed().as_secs_f64();
     report::text(&format!("[xtask] check took {secs:.1} s"));
     report::data(

@@ -54,12 +54,12 @@ jobs:
       - run: rustup toolchain install
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-machete
+          tool: cargo-deny,cargo-machete,actionlint
       - name: Licenses, advisories, sources (cargo-deny)
         run: cargo deny check
       - name: Unused dependencies (cargo-machete)
         run: cargo machete
-      - name: Crate dependency rules
+      - name: Crate dependency rules and workflow files
         run: cargo xtask check
 
   miri:
@@ -73,7 +73,7 @@ jobs:
       - name: Run heap tests under Miri
         env:
           PROPTEST_CASES: "8"
-        run: cargo +nightly miri test -p rhizo-mm -- heap::
+        run: "cargo +nightly miri test -p rhizo-mm -- heap::"
 
   bench:
     name: VMM boots and benchmark gate
