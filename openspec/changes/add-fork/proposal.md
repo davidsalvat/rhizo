@@ -47,6 +47,8 @@ per cell, multicore TLB shootdowns (one CPU).
 
 - `virtual-memory`: reference-counted frames, shared tables, effective
   permissions.
+- `kernel-testing`: the test VM time limit counts from the last output, so
+  the growing suite does not hit it on slow (emulated) runners.
 - `benchmarks`: fork and template metrics.
 
 ## Impact
