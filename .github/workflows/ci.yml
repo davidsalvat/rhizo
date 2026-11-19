@@ -168,5 +168,9 @@ jobs:
           if [ -f bench-results.json ]; then
             # Annotations are cut at 4 KB: medians first, one per metric.
             echo "::notice title=bench-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results.json | tr '\n' ' ')"
-            echo "::notice title=bench-results::$(tr -d '\n' < bench-results.json)"
+            # The full results, in numbered pieces that each fit an annotation.
+            tr -d '\n' < bench-results.json | fold -w 3000 | nl -nln -w1 -s' ' |
+              while IFS= read -r line; do
+                echo "::notice title=bench-results-${line%% *}::${line#* }"
+              done
           fi

@@ -313,6 +313,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    measure_comparisons(opts, &mut metrics, &mut skipped)?;
     Ok(Results {
         environment: opts.env.clone(),
         date: today(),
@@ -320,6 +321,29 @@ fn measure(opts: &Options) -> Result<Results> {
         metrics,
         skipped,
     })
+}
+
+/// The same operations with existing mechanisms on this machine (spec
+/// `comparisons`): Linux processes, and Firecracker snapshot restore. A
+/// comparison that cannot run here is skipped with its reason.
+fn measure_comparisons(
+    opts: &Options,
+    metrics: &mut Vec<Metric>,
+    skipped: &mut Vec<(String, String)>,
+) -> Result {
+    let scratch = crate::compare::scratch_dir();
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    match crate::compare::linux_process(&crate::build_cells()?, &scratch) {
+        Ok(m) => metrics.extend(m),
+        Err(e) => skipped.push(("linux-process".into(), e)),
+    }
+    if opts.reference {
+        match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
+        }
+    }
+    Ok(())
 }
 
 /// Cell metrics: a `bench-cell` kernel spawns and runs the hello cell many
@@ -965,12 +989,84 @@ pub fn readme_section(results: &Results) -> String {
             rhizo.or(linux).map_or(0, |m| m.runs)
         );
     }
+    s += &comparison_table(results);
     s += &format!(
         "\nEnvironment: `{}`, KVM: {}, measured {}. Regenerate with\n`cargo xtask bench --readme`.\n",
         results.environment,
         if results.kvm { "yes" } else { "no (emulated)" },
         results.date
     );
+    s
+}
+
+/// Rhizo cells against existing mechanisms on the same machine (spec
+/// `comparisons`): cell figures measured with Rhizo running in Firecracker,
+/// next to a Linux guest in Firecracker and Linux processes on the host.
+pub fn comparison_table(results: &Results) -> String {
+    let find = |name: &str, guest: &str, vmm: &str| {
+        results
+            .metrics
+            .iter()
+            .find(|m| m.name == name && m.guest == guest && m.vmm.as_deref() == Some(vmm))
+    };
+    let time = |m: Option<&Metric>| match m {
+        None => "—".to_string(),
+        Some(m) => {
+            let us = match m.unit.as_str() {
+                "ms" => m.median * 1000.0,
+                "ns" => m.median / 1000.0,
+                _ => m.median,
+            };
+            if us >= 1000.0 {
+                format!("{:.2} ms", us / 1000.0)
+            } else {
+                format!("{us:.1} µs")
+            }
+        }
+    };
+    let cell = |name: &str| time(find(name, "rhizo", "firecracker"));
+    let restore = time(find("snapshot.restore_ms", "linux", "firecracker"));
+    let rows = [
+        (
+            "Start a program and run it to its exit (`hello`)",
+            cell("cell.run_us"),
+            time(find("boot.time_to_ready_ms", "linux", "firecracker")),
+            time(find("process.spawn_us", "linux-process", "host")),
+        ),
+        (
+            "Resume a suspended environment until it runs",
+            cell("cell.resume_us"),
+            restore.clone(),
+            "—".into(),
+        ),
+        (
+            "Fork an environment holding 50 MiB",
+            cell("cell.fork_us"),
+            restore.clone(),
+            time(find("process.fork_us", "linux-process", "host")),
+        ),
+        (
+            "Serve a request from a warm template",
+            cell("workload.warm_us"),
+            restore,
+            "—".into(),
+        ),
+    ];
+    if rows.iter().all(|r| r.1 == "—") {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n### Cells against existing mechanisms\n\n\
+         Same machine, same run. Rhizo runs inside Firecracker; the sandbox column is a \
+         Linux guest in Firecracker (boot to its first output, or a snapshot restored \
+         by a new Firecracker process until the VM runs: the way such sandboxes \
+         resume and clone); the last column is plain Linux processes on the host, which \
+         isolate far less.\n\n\
+         | Operation | Rhizo cell | Firecracker microVM | Linux process |\n|---|---:|---:|---:|\n",
+    );
+    for (what, rhizo, firecracker, process) in rows {
+        s += &format!("| {what} | {rhizo} | {firecracker} | {process} |\n");
+    }
     s
 }
 
@@ -1003,6 +1099,38 @@ fn replace_section(text: &str, body: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_table_puts_each_mechanism_in_its_column() {
+        let mut fork = metric("cell.fork_us", "rhizo", Some("firecracker"), 1.5);
+        fork.unit = "us".into();
+        let mut process = metric("process.fork_us", "linux-process", Some("host"), 1700.0);
+        process.unit = "us".into();
+        let results = Results {
+            environment: "ci".into(),
+            date: "today".into(),
+            kvm: true,
+            metrics: vec![
+                fork,
+                process,
+                metric("snapshot.restore_ms", "linux", Some("firecracker"), 12.5),
+            ],
+            skipped: Vec::new(),
+        };
+        let table = comparison_table(&results);
+        assert!(
+            table.contains("| Fork an environment holding 50 MiB | 1.5 µs | 12.50 ms | 1.70 ms |"),
+            "{table}"
+        );
+        assert!(
+            table.contains("| Resume a suspended environment until it runs | — | 12.50 ms | — |")
+        );
+        let empty = Results {
+            metrics: Vec::new(),
+            ..results
+        };
+        assert_eq!(comparison_table(&empty), "", "no cell figures, no table");
+    }
 
     fn metric(name: &str, guest: &str, vmm: Option<&str>, median: f64) -> Metric {
         Metric {

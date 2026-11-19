@@ -80,12 +80,12 @@ different measurement methods, so they are orders of magnitude to aim at, not
 a like-for-like comparison. `cargo xtask bench` produces the like-for-like
 numbers (see [Benchmarks](#benchmarks)).
 
-| Metric | Rhizo target | Firecracker | Unikraft | Hyperlight |
-|---|---|---|---|---|
-| Boot: VMM launch → guest ready (KVM) | **≤ 10 ms** (kernel part ≤ 1 ms) | < 125 ms to a Linux guest accepting API calls[^fc] | < 1 ms guest boot, ~3 ms including the Firecracker VMM[^uk] | sub-millisecond partition creation, no guest OS (reported)[^hl] |
-| Resume a suspended cell / VM | **< 100 µs** (in-kernel, no VMM) | 4–28 ms snapshot restore reported[^fcr] | — | ~0.9 ms snapshot restore (hyperlight-unikraft v0.16)[^hlu] |
-| Fork a 50 MiB cell | **< 1 ms** (stretch: < 200 µs with lazy copy-on-write) | no native fork (snapshot + restore of a copy) | no native fork in the open-source core | no native fork |
-| Idle cell overhead | **a few KiB** plus its own pages | a microVM per sandbox (MiBs) | a microVM per app | a micro-VM per sandbox |
+| Metric | Rhizo target | Measured (CI, KVM, see [Benchmarks](#benchmarks)) | Firecracker | Unikraft | Hyperlight |
+|---|---|---|---|---|---|
+| Boot: VMM launch → guest ready (KVM) | **≤ 10 ms** (kernel part ≤ 1 ms) | 6–10 ms on Firecracker / Cloud Hypervisor | < 125 ms to a Linux guest accepting API calls[^fc] | < 1 ms guest boot, ~3 ms including the Firecracker VMM[^uk] | sub-millisecond partition creation, no guest OS (reported)[^hl] |
+| Resume a suspended cell / VM | **< 100 µs** (in-kernel, no VMM) | **1.5 µs** lazy, 8 MiB cell (Firecracker restore, same machine: 3.75 ms) | 4–28 ms snapshot restore reported[^fcr] | — | ~0.9 ms snapshot restore (hyperlight-unikraft v0.16)[^hlu] |
+| Fork a 50 MiB cell | **< 1 ms** (stretch: < 200 µs with lazy copy-on-write) | **1.4 µs**, one page-table frame (Linux `fork`, same machine: 1.66 ms) | no native fork (snapshot + restore of a copy) | no native fork in the open-source core | no native fork |
+| Idle cell overhead | **a few KiB** plus its own pages | suspended: its snapshot only (no frame, table or tag); running `hello`: 7 page-table frames | a microVM per sandbox (MiBs) | a microVM per app | a micro-VM per sandbox |
 
 [^fc]: Agache et al., *Firecracker: Lightweight Virtualization for Serverless Applications*, NSDI 2020.
 [^uk]: [Unikraft performance documentation](https://unikraft.org/docs/concepts/performance).
@@ -121,7 +121,7 @@ numbers (see [Benchmarks](#benchmarks)).
 | H4 | Suspend / resume with snapshot-equivalence tests | Lazy restore: snapshot pages mapped on first touch, an in-kernel analogue of Firecracker + `userfaultfd` (`cell.resume_us` vs `cell.resume_eager_us`, `cell.resume_touch_us`) | Done |
 | H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`, `cell.fork_touch_us`); pre-warmed cell templates (`cell.spawn_from_template_us` vs `cell.spawn_us`) | Done |
 | H6 | Real workloads with differential tests against Linux: static glibc programs, FP/SIMD per cell (MicroPython pending: its build needs maintainer approval in the development environment) | Template of a warm real program (`workload.warm_us` vs `workload.cold_us`); lazy FP/SIMD switching | Done (glibc) |
-| H7 | Reproducible benchmarks against existing sandboxes | Dedicated KVM machine with tight thresholds | — |
+| H7 | Reproducible benchmarks against existing sandboxes: Firecracker snapshot restore and Linux processes, same machine and run | Dedicated KVM machine with tight thresholds (job ready, needs a registered runner) | Done |
 
 Out of scope for the proof of concept: networking, multicore, real disks,
 hardware other than virtio/QEMU, full CPython, SDKs.
@@ -138,10 +138,21 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 8.0 | 9.3 | 196.3 | 197.3 | 20 |
-| Cloud Hypervisor | 11.7 | 20.5 | 105.0 | 109.0 | 20 |
-| QEMU microvm | 42.5 | 44.1 | — | — | 20 |
-| QEMU q35 | 61.9 | 64.2 | 181.4 | 186.7 | 20 |
+| Firecracker | 9.7 | 10.6 | 200.1 | 201.5 | 20 |
+| Cloud Hypervisor | 7.6 | 14.9 | 112.7 | 115.3 | 20 |
+| QEMU microvm | 46.3 | 49.2 | — | — | 20 |
+| QEMU q35 | 65.6 | 68.4 | 182.4 | 190.5 | 20 |
+
+### Cells against existing mechanisms
+
+Same machine, same run. Rhizo runs inside Firecracker; the sandbox column is a Linux guest in Firecracker (boot to its first output, or a snapshot restored by a new Firecracker process until the VM runs: the way such sandboxes resume and clone); the last column is plain Linux processes on the host, which isolate far less.
+
+| Operation | Rhizo cell | Firecracker microVM | Linux process |
+|---|---:|---:|---:|
+| Start a program and run it to its exit (`hello`) | 7.2 µs | 200.10 ms | 104.4 µs |
+| Resume a suspended environment until it runs | 1.5 µs | 3.75 ms | — |
+| Fork an environment holding 50 MiB | 1.4 µs | 3.75 ms | 1.66 ms |
+| Serve a request from a warm template | 16.2 µs | 3.75 ms | — |
 
 Environment: `ci`, KVM: yes, measured 2026-11-19. Regenerate with
 `cargo xtask bench --readme`.
