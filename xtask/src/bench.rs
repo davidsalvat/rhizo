@@ -13,14 +13,25 @@ use std::time::Duration;
 const BASELINE: &str = "bench/baseline.json";
 const README_START: &str = "<!-- bench:start -->";
 const README_END: &str = "<!-- bench:end -->";
-const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Metrics whose value does not depend on machine noise.
-const DETERMINISTIC: [&str; 3] = [
+const DETERMINISTIC: [&str; 4] = [
     "image.size_bytes",
     "memory.kernel_pt_frames",
     "cell.pt_frames",
+    "density.cells",
 ];
+
+/// Metrics for which higher is better (every other metric: lower is).
+const HIGHER_IS_BETTER: [&str; 3] = ["density.cells", "density.ops_per_s", "density.oom_cells"];
+
+/// A reference workload measured alone (`--workload`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Only {
+    Laptop,
+    Server,
+}
 
 /// Options for `cargo xtask bench`.
 #[derive(Debug)]
@@ -35,6 +46,14 @@ pub struct Options {
     pub update_baseline: bool,
     pub readme: bool,
     pub reference: bool,
+    /// Measure only this reference workload.
+    pub workload: Option<Only>,
+    /// The long versions of the workloads (the weekly soak).
+    pub soak: bool,
+    /// How long the fake model server waits before it answers.
+    pub llm_delay_ms: u32,
+    /// Cells the server workload aims for.
+    pub cells: u16,
 }
 
 impl Default for Options {
@@ -50,6 +69,10 @@ impl Default for Options {
             update_baseline: false,
             readme: false,
             reference: true,
+            workload: None,
+            soak: false,
+            llm_delay_ms: 0,
+            cells: 10_000,
         }
     }
 }
@@ -88,6 +111,30 @@ impl Options {
                 "--update-baseline" => o.update_baseline = true,
                 "--readme" => o.readme = true,
                 "--no-reference" => o.reference = false,
+                "--workload" => {
+                    o.workload = Some(match value("--workload")?.as_str() {
+                        "laptop" => Only::Laptop,
+                        "server" => Only::Server,
+                        other => {
+                            return Err(format!(
+                                "unknown workload `{other}` (expected laptop or server)"
+                            ));
+                        }
+                    });
+                }
+                "--soak" => o.soak = true,
+                "--llm-delay-ms" => {
+                    o.llm_delay_ms = value("--llm-delay-ms")?
+                        .parse()
+                        .map_err(|_| "--llm-delay-ms needs a number".to_string())?;
+                }
+                "--cells" => {
+                    o.cells = value("--cells")?
+                        .parse()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or("--cells needs a number from 1 to 65535")?;
+                }
                 other => return Err(format!("unknown bench option `{other}`")),
             }
         }
@@ -237,6 +284,17 @@ pub fn cmd(opts: &Options) -> Result {
 }
 
 fn measure(opts: &Options) -> Result<Results> {
+    if opts.workload.is_some() {
+        let (mut metrics, mut skipped) = (Vec::new(), Vec::new());
+        crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
+        return Ok(Results {
+            environment: opts.env.clone(),
+            date: today(),
+            kvm: vmm::kvm_available(),
+            metrics,
+            skipped,
+        });
+    }
     let kernel = build_kernel(Profile::Release, &[])?;
     let size = fs::metadata(&kernel)
         .map_err(|e| format!("cannot stat {}: {e}", kernel.display()))?
@@ -313,6 +371,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
     measure_comparisons(opts, &mut metrics, &mut skipped)?;
     Ok(Results {
         environment: opts.env.clone(),
@@ -380,6 +439,8 @@ fn measure_cells(
         network: true,
         pci_card: false,
         cpus: 1,
+        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        bench: None,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -397,10 +458,11 @@ fn measure_cells(
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
-        let (mut pipe_rtt, mut loopback_rtt) = (Vec::new(), Vec::new());
+        let (mut pipe_rtt, mut loopback_rtt, mut tcp_resume) = (Vec::new(), Vec::new(), Vec::new());
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
+        let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         let (mut syscall, mut syscall_kpti) = (Vec::new(), Vec::new());
         let (mut switch_kpti, mut run_kpti) = (Vec::new(), Vec::new());
@@ -439,6 +501,10 @@ fn measure_cells(
                         cpy_cold.push(c as f64 / 1000.0);
                         cpy_warm.push(w as f64 / 1000.0);
                     }
+                    if let Some((r, t)) = parse_dynamic_line(&out.output) {
+                        dyn_run.push(r as f64 / 1000.0);
+                        dyn_template.push(t as f64 / 1000.0);
+                    }
                     if let Some(d) = parse_density_line(&out.output) {
                         density = Some(d);
                     }
@@ -446,9 +512,10 @@ fn measure_cells(
                         file_write_read.push(w as f64 / 1000.0);
                         fork_files.push(f as f64 / 1000.0);
                     }
-                    if let Some((p, l)) = parse_net_line(&out.output) {
+                    if let Some((p, l, r)) = parse_net_line(&out.output) {
                         pipe_rtt.push(p as f64);
                         loopback_rtt.push(l as f64 / 1000.0);
+                        tcp_resume.push(r as f64 / 1000.0);
                     }
                     match parse_wire_line(&out.output) {
                         Some(Ok(rtt)) => wire_rtt.push(rtt as f64 / 1000.0),
@@ -487,6 +554,7 @@ fn measure_cells(
             }
         }
         let (mut parallel, mut scaling, mut ipi_wake) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut thread_scaling, mut shootdown) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 3) {
             let smp = RunOptions {
                 cpus: crate::SMP_CPUS,
@@ -499,6 +567,11 @@ fn measure_cells(
                     parallel.push(s.parallel_ns as f64 / cells / 1000.0);
                     scaling.push(100.0 * s.parallel_ns as f64 * s.cpus as f64 / s.serial_ns as f64);
                     ipi_wake.push(s.ipi_wake_ns as f64 / 1000.0);
+                    if s.threads1_ns > 0 {
+                        thread_scaling
+                            .push(100.0 * s.threads4_ns as f64 * 4.0 / s.threads1_ns as f64);
+                    }
+                    shootdown.push(s.shootdown_ns as f64 / 1000.0);
                 }
                 _ => {
                     skipped.push((
@@ -530,11 +603,14 @@ fn measure_cells(
             ("cell.fork_with_files_us", "us", &mut fork_files),
             ("cell.pipe_rtt_ns", "ns", &mut pipe_rtt),
             ("cell.loopback_rtt_us", "us", &mut loopback_rtt),
+            ("cell.tcp_resume_us", "us", &mut tcp_resume),
             ("net.tcp_rtt_us", "us", &mut wire_rtt),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
             ("workload.cpython_cold_us", "us", &mut cpy_cold),
             ("workload.cpython_warm_us", "us", &mut cpy_warm),
+            ("workload.dynamic_run_us", "us", &mut dyn_run),
+            ("workload.dynamic_template_us", "us", &mut dyn_template),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
             ("cell.syscall_ns", "ns", &mut syscall),
@@ -544,6 +620,8 @@ fn measure_cells(
             ("cell.parallel_us", "us", &mut parallel),
             ("cell.scaling_pct", "%", &mut scaling),
             ("cell.ipi_wake_us", "us", &mut ipi_wake),
+            ("cell.thread_scaling_pct", "%", &mut thread_scaling),
+            ("cell.shootdown_us", "us", &mut shootdown),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
                 let why = match crate::hostnet::for_vmm(vmm) {
@@ -618,6 +696,19 @@ fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
     Some((field("cold_ns")?, field("warm_ns")?))
 }
 
+/// `(run_ns, template_ns)` of the dynamic linking line of a `bench-cell`
+/// kernel (absent when the dynamic programs were not packed).
+fn parse_dynamic_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-dynamic "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("run_ns")?, field("template_ns")?))
+}
+
 /// `(idle_bytes, suspended_bytes)` of the density line of a `bench-cell`
 /// kernel.
 fn parse_density_line(output: &str) -> Option<(u64, u64)> {
@@ -642,9 +733,9 @@ fn parse_wire_line(output: &str) -> Option<std::result::Result<u64, String>> {
     Some(value.trim().parse().map_err(|_| line.to_string()))
 }
 
-/// `(pipe_rtt_ns, loopback_rtt_ns)` of the network line of a `bench-cell`
-/// kernel.
-fn parse_net_line(output: &str) -> Option<(u64, u64)> {
+/// `(pipe_rtt_ns, loopback_rtt_ns, tcp_resume_ns)` of the network line of
+/// a `bench-cell` kernel.
+fn parse_net_line(output: &str) -> Option<(u64, u64, u64)> {
     let line = output.lines().find(|l| l.starts_with("rhizo-net "))?;
     let field = |key: &str| -> Option<u64> {
         line.split_whitespace()
@@ -652,7 +743,11 @@ fn parse_net_line(output: &str) -> Option<(u64, u64)> {
             .parse()
             .ok()
     };
-    Some((field("pipe_rtt_ns")?, field("loopback_rtt_ns")?))
+    Some((
+        field("pipe_rtt_ns")?,
+        field("loopback_rtt_ns")?,
+        field("tcp_resume_ns")?,
+    ))
 }
 
 /// The multi-core line of a `bench-cell` kernel booted with several CPUs.
@@ -662,6 +757,11 @@ struct SmpLine {
     serial_ns: u64,
     parallel_ns: u64,
     ipi_wake_ns: u64,
+    /// `parsum` with 1 and with 4 threads, and one `munmap` while the
+    /// cell's other threads run (design D9 of `add-parallel-threads`).
+    threads1_ns: u64,
+    threads4_ns: u64,
+    shootdown_ns: u64,
 }
 
 fn parse_smp_line(output: &str) -> Option<SmpLine> {
@@ -677,6 +777,9 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         serial_ns: field("serial_ns")?,
         parallel_ns: field("parallel_ns")?,
         ipi_wake_ns: field("ipi_wake_ns")?,
+        threads1_ns: field("threads1_ns")?,
+        threads4_ns: field("threads4_ns")?,
+        shootdown_ns: field("shootdown_ns")?,
     })
 }
 
@@ -814,7 +917,7 @@ fn parse_cell_line(output: &str) -> Option<CellLine> {
     })
 }
 
-fn deterministic(name: &str, unit: &str, value: f64) -> Metric {
+pub(crate) fn deterministic(name: &str, unit: &str, value: f64) -> Metric {
     Metric {
         name: name.into(),
         guest: "rhizo".into(),
@@ -871,6 +974,8 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         network: false,
         pci_card: false,
         cpus: 1,
+        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        bench: None,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),
@@ -984,15 +1089,32 @@ pub struct Regression {
     pub baseline: f64,
     pub current: f64,
     pub allowed_pct: f64,
+    /// The metric is better when higher ([`HIGHER_IS_BETTER`]).
+    pub higher_is_better: bool,
 }
 
 impl Regression {
     fn worse_pct(&self) -> f64 {
-        (self.current / self.baseline - 1.0) * 100.0
+        if self.higher_is_better {
+            (self.baseline / self.current - 1.0) * 100.0
+        } else {
+            (self.current / self.baseline - 1.0) * 100.0
+        }
+    }
+
+    /// The worst value the threshold allows.
+    fn limit(&self) -> f64 {
+        if self.higher_is_better {
+            self.baseline / (1.0 + self.allowed_pct / 100.0)
+        } else {
+            self.baseline * (1.0 + self.allowed_pct / 100.0)
+        }
     }
 }
 
-/// Compares `results` with the stored values for `env` (lower is better).
+/// Compares `results` with the stored values for `env` (lower is better,
+/// but for [`HIGHER_IS_BETTER`], where worse by X % means the baseline is
+/// X % above the value).
 pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regression> {
     let stored = &baseline["environments"][env];
     let mut out = Vec::new();
@@ -1004,14 +1126,20 @@ pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regres
         let Some(base) = stored[m.key()].as_f64() else {
             continue;
         };
-        let allowed = threshold_pct(baseline, env, &m.name);
-        if m.median > base * (1.0 + allowed / 100.0) {
-            out.push(Regression {
-                key: m.key(),
-                baseline: base,
-                current: m.median,
-                allowed_pct: allowed,
-            });
+        let r = Regression {
+            key: m.key(),
+            baseline: base,
+            current: m.median,
+            allowed_pct: threshold_pct(baseline, env, &m.name),
+            higher_is_better: HIGHER_IS_BETTER.contains(&m.name.as_str()),
+        };
+        let worse = if r.higher_is_better {
+            r.current < r.limit()
+        } else {
+            r.current > r.limit()
+        };
+        if worse {
+            out.push(r);
         }
     }
     out
@@ -1041,12 +1169,17 @@ fn check_baseline(env: &str, results: &Results) -> Result {
             Failure::new("bench", format!("benchmark regression: {}", r.key))
                 .location(format!("{BASELINE} (environment `{env}`)"))
                 .expected(format!(
-                    "at most {:.3} (baseline {:.3} + {:.0}%)",
-                    r.baseline * (1.0 + r.allowed_pct / 100.0),
+                    "{} {:.3} (baseline {:.3}, {:.0}% worse at most)",
+                    if r.higher_is_better {
+                        "at least"
+                    } else {
+                        "at most"
+                    },
+                    r.limit(),
                     r.baseline,
                     r.allowed_pct
                 ))
-                .actual(format!("{:.3} (+{:.1}%)", r.current, r.worse_pct()))
+                .actual(format!("{:.3} ({:.1}% worse)", r.current, r.worse_pct()))
                 .hint(format!(
                     "find what made it slower; if the regression is intended, justify it in the \
                      pull request and run `cargo xtask bench --env {env} --update-baseline`"
@@ -1572,6 +1705,36 @@ mod tests {
     }
 
     #[test]
+    fn higher_is_better_metrics_fail_when_they_drop() {
+        let baseline = json!({
+            "thresholds_pct": {"deterministic": 1, "timing": {"ci": 100}},
+            "environments": {"ci": {
+                "density.ops_per_s/rhizo/firecracker": 1000.0,
+                "density.cells/rhizo/firecracker": 10000.0
+            }}
+        });
+        let keys = |ops: f64, cells: f64| -> Vec<String> {
+            let r = results(vec![
+                metric("density.ops_per_s", "rhizo", Some("firecracker"), ops),
+                metric("density.cells", "rhizo", Some("firecracker"), cells),
+            ]);
+            regressions(&baseline, "ci", &r)
+                .into_iter()
+                .map(|r| r.key)
+                .collect()
+        };
+        assert!(keys(5000.0, 10000.0).is_empty(), "more is better");
+        assert!(keys(501.0, 9901.0).is_empty(), "within the thresholds");
+        assert_eq!(
+            keys(499.0, 9899.0),
+            [
+                "density.ops_per_s/rhizo/firecracker",
+                "density.cells/rhizo/firecracker"
+            ]
+        );
+    }
+
+    #[test]
     fn ungated_metrics_never_fail_the_gate() {
         let baseline = json!({
             "thresholds_pct": {"deterministic": 1, "timing": {"ci": 100}},
@@ -1680,6 +1843,26 @@ mod tests {
         assert_eq!(o.vmms, vec![Vmm::QemuQ35, Vmm::Firecracker]);
         assert!(o.check && o.env == "ci");
         assert!(Options::parse(&["--runs".to_string(), "0".to_string()]).is_err());
+        let args: Vec<String> = [
+            "--workload",
+            "server",
+            "--soak",
+            "--cells",
+            "500",
+            "--llm-delay-ms",
+            "250",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let o = Options::parse(&args).unwrap();
+        assert_eq!(o.workload, Some(Only::Server));
+        assert!(o.soak);
+        assert_eq!((o.cells, o.llm_delay_ms), (500, 250));
+        for bad in [["--workload", "phone"], ["--cells", "0"]] {
+            let bad: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(Options::parse(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1761,6 +1944,14 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_line_is_parsed() {
+        let out =
+            "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-dynamic run_ns=812000 template_ns=95000\n";
+        assert_eq!(parse_dynamic_line(out), Some((812_000, 95_000)));
+        assert_eq!(parse_dynamic_line("rhizo-dynamic run_ns=1"), None);
+    }
+
+    #[test]
     fn density_line_is_parsed() {
         assert_eq!(
             parse_density_line("rhizo-density idle_bytes=20480 suspended_bytes=40000\n"),
@@ -1794,8 +1985,14 @@ mod tests {
     #[test]
     fn net_line_is_parsed() {
         assert_eq!(
-            parse_net_line("x\nrhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200\n"),
-            Some((310, 4200))
+            parse_net_line(
+                "x\nrhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200 tcp_resume_ns=31000\n"
+            ),
+            Some((310, 4200, 31000))
+        );
+        assert_eq!(
+            parse_net_line("rhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200\n"),
+            None
         );
         assert_eq!(parse_net_line("rhizo-net pipe_rtt_ns=1\n"), None);
     }
@@ -1825,13 +2022,17 @@ mod tests {
     fn smp_line_is_parsed() {
         assert_eq!(
             parse_smp_line(
-                "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000\n"
+                "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000 \
+                 threads1_ns=400 threads4_ns=110 shootdown_ns=3000\n"
             ),
             Some(SmpLine {
                 cpus: 4,
                 serial_ns: 800,
                 parallel_ns: 220,
-                ipi_wake_ns: 9000
+                ipi_wake_ns: 9000,
+                threads1_ns: 400,
+                threads4_ns: 110,
+                shootdown_ns: 3000,
             })
         );
         assert_eq!(parse_smp_line("rhizo-smp cpus=4 serial_ns=1\n"), None);

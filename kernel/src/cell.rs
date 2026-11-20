@@ -1,32 +1,35 @@
-//! Running cells: spawn from static executables, schedule them on this CPU
-//! until they exit, fault or are killed, then return every frame (specs
-//! `cells`, `linux-abi`, `scheduling` and `threads`).
+//! Running cells: spawn from static executables, schedule them on every CPU
+//! (the threads of one cell on several CPUs at once: [`Gang`]) until they
+//! exit, fault or are killed, then return every frame (specs `cells`,
+//! `linux-abi`, `scheduling`, `threads` and `multi-core`).
 
 use crate::arch::console::BootConsole;
 use crate::arch::cpu::CpuTlb;
 use crate::arch::irq;
 use crate::arch::platform::Format;
 use crate::arch::timer::{self, Counter};
-use crate::arch::user::{self, Trap};
+use crate::arch::user::{self, Trap, UserFault};
 use crate::memory::{self, DirectMap};
+use crate::prof::{self, Count, Ready};
 use crate::sync::Global;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use rhizo_abi::{Abi, Context, Outcome, Services};
+use rhizo_abi::{Abi, Context, ExecError, FilePages, Outcome, PageCache, Services};
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::images::{self, Images};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
-use rhizo_cell::{Cell, FpState};
+use rhizo_cell::{Cell, FpState, Registers};
 use rhizo_core::smp::MAX_CPUS;
 use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::paging::{PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_net::Net;
-use rhizo_sched::{SLICE_NS, Scheduler, TagPool};
+use rhizo_sched::{Gangs, SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::Snapshot;
 
 /// How a cell ended.
@@ -98,6 +101,20 @@ pub fn open_sockets() -> usize {
     NET.with(|net| net.open())
 }
 
+/// Closes the connections parked for `snapshot`, which the host drops
+/// without resuming it (spec `networking`, design D3 of
+/// `keep-tcp-across-suspend`); resumed later, it finds them reset.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn close_parked(snapshot: &Snapshot) {
+    let records = snapshot.sockets();
+    if !records.is_empty() {
+        NET.with(|net| records.iter().for_each(|r| net.unpark(r)));
+    }
+}
+
 /// Releases the sockets `fs` holds (its cell ended or was suspended).
 fn release_sockets(fs: &Fs) {
     if fs.sockets().next().is_some() {
@@ -106,7 +123,8 @@ fn release_sockets(fs: &Fs) {
 }
 
 /// `fs` with its sockets replaced by indices into the records returned, for
-/// a snapshot.
+/// a snapshot; its connections are parked in the kernel (design D1 of
+/// `keep-tcp-across-suspend`).
 fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     let mut records = Vec::new();
     if fs.sockets().next().is_none() {
@@ -121,6 +139,7 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
                 state: rhizo_net::Saved::Reset,
                 local: None,
                 opts: rhizo_net::Options::default(),
+                parked: None,
             });
             records.push(record);
             (records.len() - 1) as u32
@@ -129,8 +148,9 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     (out, records)
 }
 
-/// Makes the sockets of a resumed cell from its snapshot's records, and
-/// points its descriptors and Unix socket names at them. A socket that
+/// Makes the sockets of a resumed cell from its snapshot's records (its
+/// parked connections come back), and points its descriptors and Unix
+/// socket names at them. A socket that
 /// cannot be made at all is left out: its descriptor reads as reset.
 fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
     if records.is_empty() {
@@ -143,6 +163,7 @@ fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
             let reset = rhizo_net::Record {
                 state: rhizo_net::Saved::Reset,
                 local: None,
+                parked: None,
                 ..r.clone()
             };
             let made = net.import(r).or_else(|_| net.import(&reset));
@@ -168,14 +189,48 @@ const KEPT_IMAGES: usize = 4;
 /// reserve) and given back before any cell is refused memory (D4).
 static IMAGES: Global<Images<KEPT_IMAGES>> = Global::new(Images::new());
 
-/// Drops every image kept loaded; returns whether there was one. Pages that
-/// cells still share stay theirs.
+/// Most file pages kept (design D1 of `add-dynamic-linking`): 64 MiB.
+const KEPT_PAGES: usize = 16384;
+
+/// Pages of files mapped into cells, kept by content (spec `cells`, file
+/// pages shared between cells): one read-only frame for every mapping of the
+/// same bytes. Its frames are taken and given back like those of
+/// [`IMAGES`].
+static PAGES: Global<PageCache> = Global::new(PageCache::new(KEPT_PAGES));
+
+/// The frames of mapped file pages, from [`PAGES`]; a page written now is
+/// made visible to instruction fetch.
+struct KernelPages;
+
+impl FilePages<DirectMap, KernelFrames> for KernelPages {
+    fn frame(
+        &mut self,
+        page: &rhizo_fs::Page,
+        _: &mut DirectMap,
+        _: &mut KernelFrames,
+    ) -> Option<u64> {
+        // Short of frames, what is kept goes first (outside the lock).
+        let get = || PAGES.with(|pages| pages.get(page, &mut DirectMap, &mut ImageFrames));
+        let (phys, fresh) = get().or_else(|| drop_images().then(get).flatten())?;
+        if fresh {
+            self.code(phys);
+        }
+        Some(phys)
+    }
+
+    fn code(&mut self, phys: u64) {
+        user::sync_code(DirectMap::virt(phys), FRAME_SIZE);
+    }
+}
+
+/// Drops every image kept loaded and every file page kept; returns whether
+/// there was one. Pages that cells still share stay theirs.
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "also used by in-kernel tests")
 )]
 pub fn drop_images() -> bool {
-    IMAGES.with(|images| {
+    let any = IMAGES.with(|images| {
         let mut any = false;
         while let Some(root) = images.pop() {
             space::destroy(
@@ -186,7 +241,8 @@ pub fn drop_images() -> bool {
             any = true;
         }
         any
-    })
+    });
+    PAGES.with(|pages| pages.clear(&mut ImageFrames)) || any
 }
 
 /// Whether cells may take `bytes` more, dropping the images kept loaded if
@@ -370,6 +426,13 @@ impl Services for KernelServices<'_> {
         cells_may_take(bytes)
     }
 
+    fn memory(&mut self) -> (u64, u64) {
+        memory::with_frames(|f| (f.usable_frames() as u64, f.free_frames() as u64))
+            .map_or((0, 0), |(total, free)| {
+                (total * FRAME_SIZE, free * FRAME_SIZE)
+            })
+    }
+
     fn save_fp(&mut self, fp: &mut FpState) {
         if self.fp_in_cpu {
             user::fp_save(fp);
@@ -386,6 +449,28 @@ impl Services for KernelServices<'_> {
             *byte = (self.random.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 56) as u8;
         }
     }
+}
+
+/// The 16 random bytes of a new cell's stack (`AT_RANDOM`) and the seed of
+/// its random numbers after them.
+fn start_random() -> ([u8; 16], u64) {
+    let mut services = KernelServices {
+        capture: None,
+        echo: false,
+        random: Counter.cycles() | 1,
+        fp_in_cpu: false,
+    };
+    let mut random = [0u8; 16];
+    services.random(&mut random);
+    (random, services.random)
+}
+
+/// The TLB of a hierarchy no CPU has used yet: nothing to flush (its tag's
+/// old translations go on its first entry on each CPU).
+struct NewSpace;
+
+impl Tlb for NewSpace {
+    fn flush_page(&mut self, _: u64) {}
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -472,6 +557,14 @@ struct Live {
     /// descriptors: a cell filed to wait on them after a later change runs
     /// again at once (another CPU may have woken the waiters in between).
     io_seen: u64,
+    /// Since when it can run, for the workloads' latencies ([`prof`]).
+    ready: Ready,
+    /// The thread chosen last while it ran on several CPUs: turns go on
+    /// from there the next time (design D5 of `add-parallel-threads`).
+    last: u32,
+    /// Most CPUs that ran its threads at the same time (design D5 of
+    /// `add-parallel-threads`).
+    peak: u32,
 }
 
 impl Live {
@@ -554,21 +647,39 @@ impl Lazy {
 }
 
 /// The TLB as a cell sees it: [`CpuTlb`], noting that the cell's
-/// translations shrank.
-struct CellTlb(bool);
+/// translations shrank, and keeping the other CPUs that run the cell's
+/// code out of it until the change is complete (design D7 of
+/// `add-parallel-threads`).
+struct CellTlb<'a> {
+    shrank: bool,
+    /// The gang this CPU runs, and the CPU's number.
+    gang: Option<(&'a Gang, usize)>,
+}
 
-impl Tlb for CellTlb {
+impl<'a> CellTlb<'a> {
+    fn new(gang: Option<(&'a Gang, usize)>) -> Self {
+        Self {
+            shrank: false,
+            gang,
+        }
+    }
+}
+
+impl Tlb for CellTlb<'_> {
     fn flush_page(&mut self, virt: u64) {
+        if let Some((gang, cpu)) = self.gang {
+            gang.hold_others(cpu);
+        }
         CpuTlb.flush_page(virt);
-        self.0 = true;
+        self.shrank = true;
     }
 }
 
 /// The pager of system calls: a lazily resumed cell's pending pages, and
 /// copy-on-write pages shared after a fork (resolved through the TLB given).
-struct CellPager<'a>(&'a mut Option<Lazy>, &'a mut CellTlb);
+struct CellPager<'a, 'g>(&'a mut Option<Lazy>, &'a mut CellTlb<'g>);
 
-impl Pager<Format, DirectMap> for CellPager<'_> {
+impl Pager<Format, DirectMap> for CellPager<'_, '_> {
     fn page_in(
         &mut self,
         pt: &PageTable<Format>,
@@ -597,8 +708,8 @@ fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
-fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb, addr: u64) -> bool {
-    let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, addr) == Ok(true);
+fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bool {
+    let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, tlb, addr) == Ok(true);
     if resolved {
         tlb.flush_page(addr);
     }
@@ -623,6 +734,9 @@ pub struct Finished {
     /// The CPUs it ran on (bit `n` for CPU `n`).
     #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "in-kernel tests"))]
     pub cpus: u32,
+    /// Most CPUs that ran its threads at the same time.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "in-kernel tests"))]
+    pub peak: u32,
 }
 
 /// What the CPUs running a host's cells share (design D3 of
@@ -645,6 +759,9 @@ struct Shared {
     stopping: bool,
     /// [`Net::changes`] when waiting cells were last woken.
     net_seen: u64,
+    /// Cells taken out whose threads run on several CPUs (design D1 of
+    /// `add-parallel-threads`).
+    gangs: Gangs<GangPtr>,
 }
 
 /// The cells of the machine: the live ones in the shared scheduler (or on
@@ -671,6 +788,8 @@ pub struct Host {
 enum Take {
     /// Run this cell, picked at this time.
     Run(Box<Live>, u64),
+    /// Run a thread of this running cell.
+    Join(GangPtr),
     /// Wait for work until this time (or a wake-up, or for ever).
     Wait(Option<u64>),
     /// Cells ended that the boot CPU has not looked at: look first (its
@@ -691,12 +810,16 @@ enum Back {
     File,
     /// It ended.
     End(Ending),
+    /// Its thread made another: other CPUs may run them (design D2 of
+    /// `add-parallel-threads`).
+    Share,
 }
 
 /// Takes the next cell for `cpu`: the first of its queue or one stolen
 /// (`oldest`: the one that has waited longest anywhere, for a single CPU
 /// stepping through every cell).
 fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
+    let _timed = prof::Timed::new(Count::SchedCycles);
     shared.with(|s| {
         if s.stopping {
             s.idle &= !(1 << cpu);
@@ -712,20 +835,37 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
                 s.net_seen = changes;
                 s.sched.wake_waiting(cpu, |live| {
                     live.cell.threads.wake_io();
+                    live.ready = live.ready.net_change(now);
                 });
             }
+        }
+        if prof::on() {
+            // When each due cell joins a queue, for its latency.
+            let q = if oldest { 0 } else { cpu };
+            s.sched
+                .wake_due(q, now, |live| live.ready = live.ready.due(now));
         }
         let next = if oldest {
             s.sched.next_oldest(now)
         } else {
             s.sched.next(cpu, now)
         };
-        if let Some(live) = next {
+        if let Some(mut live) = next {
+            live.ready.ran(now);
+            live.ready = Ready::default();
             s.running += 1;
             s.idle &= !(1 << cpu);
             return Take::Run(live, now);
         }
-        let wake = s.sched.next_wake().filter(|&t| t != u64::MAX);
+        if !oldest && let Some(gang) = s.gangs.join(cpu, now) {
+            s.idle &= !(1 << cpu);
+            return Take::Join(gang);
+        }
+        let wake = match (s.sched.next_wake(), s.gangs.next_wake()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .filter(|&t| t != u64::MAX);
         if s.running == 0 && wake.is_none() {
             // Only parked cells are left: nothing will wake them.
             return Take::Done;
@@ -747,21 +887,23 @@ fn wait(wake: Option<u64>) {
         // cell may happen on another CPU (a safety net; wake-ups are sent).
         Some(at) if crate::smp::count() > 1 => idle_until(at.min(now_ns() + SLICE_NS)),
         Some(at) => idle_until(at),
-        None => crate::smp::idle(),
+        None => prof::idle(crate::smp::idle),
     }
 }
 
 /// Puts `live`, back from a slice on `cpu`, where `how` says, and wakes an
 /// idle CPU that has something to do because of it: another runnable cell
 /// to take, or the boot CPU to see a cell end or the last one stop.
-fn give_back(shared: &Global<Shared>, cpu: usize, live: Box<Live>, how: Back) {
+fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, how: Back) {
+    let _timed = prof::Timed::new(Count::SchedCycles);
     let ended = match how {
         Back::End(ending) => Some(end(live, ending)),
         Back::Requeue => {
+            live.ready = ready_now();
             shared.with(|s| s.sched.requeue(cpu, live));
             None
         }
-        Back::File => {
+        Back::File | Back::Share => {
             shared.with(|s| file(&mut s.sched, Some(cpu), live));
             None
         }
@@ -795,8 +937,9 @@ fn give_back(shared: &Global<Shared>, cpu: usize, live: Box<Live>, how: Back) {
 /// can run (back on `cpu`'s queue, or on the shortest for a cell new to the
 /// scheduler), else asleep until its earliest deadline, or parked for good
 /// when none of its threads has one (design D2 of `add-threads`).
-fn file(sched: &mut Scheduler<Box<Live>>, cpu: Option<usize>, live: Box<Live>) {
+fn file(sched: &mut Scheduler<Box<Live>>, cpu: Option<usize>, mut live: Box<Live>) {
     if live.cell.threads.is_runnable() {
+        live.ready = ready_now();
         match cpu {
             Some(cpu) => sched.requeue(cpu, live),
             None => sched.place(live),
@@ -804,8 +947,8 @@ fn file(sched: &mut Scheduler<Box<Live>>, cpu: Option<usize>, live: Box<Live>) {
     } else if live.cell.threads.waits_on_io() {
         if NET.with(|net| net.changes()) != live.io_seen {
             // A socket changed since it looked: it looks again.
-            let mut live = live;
             live.cell.threads.wake_io();
+            live.ready = ready_now();
             match cpu {
                 Some(cpu) => sched.requeue(cpu, live),
                 None => sched.place(live),
@@ -814,10 +957,22 @@ fn file(sched: &mut Scheduler<Box<Live>>, cpu: Option<usize>, live: Box<Live>) {
         }
         // Woken by a socket change or its earliest deadline.
         let wake = live.cell.threads.wake_at();
+        live.ready = Ready::event(wake.unwrap_or(0));
         sched.wait(live, wake);
     } else {
         let wake = live.cell.threads.wake_at().unwrap_or(u64::MAX);
+        live.ready = Ready::event(if wake == u64::MAX { 0 } else { wake });
         sched.sleep(live, wake);
+    }
+}
+
+/// Runnable since now, for the workloads' latencies (nothing while they
+/// are not measured: no clock read).
+fn ready_now() -> Ready {
+    if prof::on() {
+        Ready::queued(now_ns())
+    } else {
+        Ready::default()
     }
 }
 
@@ -843,6 +998,7 @@ fn end(live: Box<Live>, ending: Ending) -> (Finished, u16) {
         ending,
         output: live.output.unwrap_or_default(),
         cpus: live.cpus,
+        peak: live.peak,
     };
     (finished, live.tag)
 }
@@ -858,7 +1014,8 @@ fn run_cpu(shared: u64) -> u64 {
     irq::start_tick();
     loop {
         match take(shared, cpu, false) {
-            Take::Run(live, now) => run_slice(shared, cpu, live, now),
+            Take::Run(live, now) => run_slice(shared, cpu, live, now, true),
+            Take::Join(gang) => join_gang(shared, cpu, gang),
             Take::Wait(wake) => wait(wake),
             Take::Done | Take::Look => wait(None),
             Take::Stop => break,
@@ -899,9 +1056,74 @@ fn flushed_by_kernel_on(cpu: usize) -> u32 {
     }
 }
 
+/// Runs the system call of `live`'s current thread, whose FP/SIMD state is
+/// in this CPU's registers when `fp_in_cpu`, through the TLB of `gang` when
+/// other CPUs may run the cell's code. Returns what the thread does next
+/// and whether the cell's translations shrank. Inlined: it is the hot path
+/// of `run_slice`, as it was before it was shared with gangs.
+#[inline(always)]
+fn syscall(
+    live: &mut Live,
+    pt: PageTable<Format>,
+    fp_in_cpu: bool,
+    gang: Option<(&Gang, usize)>,
+) -> (Outcome, bool) {
+    let tid = live.cell.threads.current().tid;
+    let deadline = live.take_deadline(tid);
+    let mut services = KernelServices {
+        capture: live.output.as_mut(),
+        echo: live.echo,
+        random: live.random,
+        fp_in_cpu,
+    };
+    let (mut tlb, mut pager_tlb) = (CellTlb::new(gang), CellTlb::new(gang));
+    let t0 = prof::syscall_start();
+    // Lock order: the cell's (when shared), `SHARING`, then the sockets.
+    let (outcome, deadline) = sharing(live.shares, || {
+        NET.with(|net| {
+            let changes = net.changes();
+            let mut cx = Context {
+                pt,
+                mem: &mut DirectMap,
+                tlb: &mut tlb,
+                frames: &mut KernelFrames,
+                services: &mut services,
+                fs: &mut live.fs,
+                net,
+                deadline,
+                pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
+                pages: &mut KernelPages,
+            };
+            let outcome = live.abi.handle(&mut live.cell, &mut cx);
+            let deadline = cx.deadline;
+            live.io_seen = cx.net.changes();
+            if live.io_seen != changes && prof::on() {
+                prof::net_changed(now_ns());
+            }
+            (outcome, deadline)
+        })
+    });
+    prof::syscall_end(t0);
+    live.random = services.random;
+    // A call waiting on descriptors keeps its deadline for when it is made
+    // again (design D3 of `add-sockets-and-poll`).
+    if let Wait::Io { until: Some(_) } = live.cell.threads.current().wait
+        && let Some(at) = deadline
+    {
+        live.deadlines.push((tid, at));
+    }
+    (outcome, tlb.shrank || pager_tlb.shrank)
+}
+
 /// Runs `live`'s threads on `cpu` until the cell ends, yields, has no
-/// thread that can run, or is preempted, and gives it back.
-fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64) {
+/// thread that can run, or is preempted, and gives it back. With `share`
+/// (several CPUs, not stepping), a cell with several threads runs as a
+/// [`Gang`] instead, which other CPUs may join.
+fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64, share: bool) {
+    if share && live.cell.threads.len() > 1 {
+        start_gang(shared, cpu, live, false);
+        return;
+    }
     if !live.cell.threads.next(now) {
         give_back(shared, cpu, live, Back::File); // nothing due yet after all
         return;
@@ -924,48 +1146,16 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
             live.clean |= flushed_on(cpu);
             match trap {
                 Trap::Syscall => {
-                    let tid = live.cell.threads.current().tid;
-                    let deadline = live.take_deadline(tid);
-                    let mut services = KernelServices {
-                        capture: live.output.as_mut(),
-                        echo: live.echo,
-                        random: live.random,
-                        fp_in_cpu: fp_owner() == key,
-                    };
-                    let (mut tlb, mut pager_tlb) = (CellTlb(false), CellTlb(false));
-                    // Lock order: `SHARING`, then the sockets.
-                    let (outcome, deadline) = sharing(live.shares, || {
-                        NET.with(|net| {
-                            let mut cx = Context {
-                                pt,
-                                mem: &mut DirectMap,
-                                tlb: &mut tlb,
-                                frames: &mut KernelFrames,
-                                services: &mut services,
-                                fs: &mut live.fs,
-                                net,
-                                deadline,
-                                pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
-                            };
-                            let outcome = live.abi.handle(&mut live.cell, &mut cx);
-                            let deadline = cx.deadline;
-                            live.io_seen = cx.net.changes();
-                            (outcome, deadline)
-                        })
-                    });
-                    live.random = services.random;
-                    // A call waiting on descriptors keeps its deadline for
-                    // when it is made again (design D3 of
-                    // `add-sockets-and-poll`).
-                    if let Wait::Io { until: Some(_) } = live.cell.threads.current().wait
-                        && let Some(at) = deadline
-                    {
-                        live.deadlines.push((tid, at));
-                    }
-                    if tlb.0 || pager_tlb.0 {
+                    let (outcome, shrank) = syscall(&mut live, pt, fp_owner() == key, None);
+                    if shrank {
                         live.clean = flushed_by_kernel_on(cpu);
                     }
                     match outcome {
+                        // A new thread: other CPUs may run it (design D2 of
+                        // `add-parallel-threads`).
+                        Outcome::Resume if share && live.cell.threads.len() > 1 => {
+                            break 'thread Back::Share;
+                        }
                         Outcome::Resume => continue,
                         Outcome::Yield => break 'thread Back::Requeue,
                         // Another thread of the cell runs at once, in this
@@ -983,6 +1173,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
                     continue;
                 }
                 Trap::Interrupt => {
+                    prof::add(Count::Interrupts, 1);
                     ticks += 1;
                     if ticks < 2 {
                         continue;
@@ -994,6 +1185,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
                         live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr))
                     }) =>
                 {
+                    prof::add(Count::LazyFaults, 1);
                     if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
                         live.lazy = None; // fully restored: drop the snapshot
                     }
@@ -1009,10 +1201,11 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
                 Trap::Fault(fault)
                     if fault.write_denied().is_some_and(|addr| {
                         sharing(live.shares, || {
-                            resolve_write(&pt, &mut CellTlb(false), addr)
+                            resolve_write(&pt, &mut CellTlb::new(None), addr)
                         })
                     }) =>
                 {
+                    prof::add(Count::CowFaults, 1);
                     live.clean = flushed_by_kernel_on(cpu);
                     continue;
                 }
@@ -1029,6 +1222,13 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
             }
         }
     };
+    if let Back::Share = back {
+        // Every thread's FP/SIMD state goes to memory: another CPU may run
+        // it next.
+        sync_fp(&mut live, true);
+        start_gang(shared, cpu, live, true);
+        return;
+    }
     if crate::smp::count() > 1 && !matches!(back, Back::End(_)) {
         // Another CPU may take the cell next: its FP/SIMD state goes to
         // memory, and this CPU lets go of its tables (design D4).
@@ -1038,6 +1238,457 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
         user::leave_user();
     }
     give_back(shared, cpu, live, back);
+}
+
+/// A cell whose threads run on several CPUs at once (design D3 of
+/// `add-parallel-threads`): the cell behind its own lock, and what the CPUs
+/// running it read without that lock.
+struct Gang {
+    /// The cell, its threads and where they run: locked around system
+    /// calls, faults that change its tables, and choosing threads.
+    cell: Global<GangCell>,
+    id: u32,
+    root: u64,
+    tag: u16,
+    /// [`Live::clean`], read as CPUs enter the cell's code.
+    clean: AtomicU32,
+    /// The cell ended: the CPUs running its threads leave (design D6).
+    ending: AtomicBool,
+    /// Its translations are shrinking: the other CPUs keep out of its code
+    /// (design D7; x86_64 only).
+    hold: AtomicBool,
+}
+
+/// What a gang's lock protects.
+struct GangCell {
+    live: Box<Live>,
+    /// The thread each CPU runs (0: none).
+    busy: [u32; MAX_CPUS],
+    /// How the cell ended, once it has.
+    ending: Option<Ending>,
+    /// What it offers to other CPUs in [`Shared::gangs`]: runnable threads
+    /// no CPU runs, and the earliest deadline of its waiting threads.
+    offer: (u32, Option<u64>),
+}
+
+/// A running [`Gang`], as `Shared::gangs` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GangPtr(NonNull<Gang>);
+
+// SAFETY: the pointer is a handle that CPUs pass under the host's lock; the
+// gang behind it is shared through its own lock and atomics only.
+unsafe impl Send for GangPtr {}
+
+/// The cell whose code each CPU runs and a sequence number, odd while it
+/// runs it (`id << 32 | sequence`; design D7, x86_64 only).
+static IN_CELL: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// What a CPU does after a section under a gang's lock.
+enum After {
+    /// Its thread runs on.
+    Resume,
+    /// Its thread stopped and was put back: this one (whose registers the
+    /// CPU now holds) runs next, or the CPU leaves.
+    Switch(Option<u32>),
+    /// It leaves the cell (its thread was put back, or the cell ended).
+    Leave,
+}
+
+impl Gang {
+    /// Runs `f` under the cell's lock, then offers what the cell has for
+    /// other CPUs and lets them back into its code.
+    fn locked<R>(
+        &self,
+        shared: &Global<Shared>,
+        ptr: GangPtr,
+        f: impl FnOnce(&mut GangCell) -> R,
+    ) -> R {
+        self.cell.with(|cell| {
+            let result = f(cell);
+            cell.offer(shared, ptr);
+            if self.hold.load(Ordering::Relaxed) {
+                self.hold.store(false, Ordering::Release);
+            }
+            result
+        })
+    }
+
+    /// Keeps every other CPU out of the cell's code until the end of the
+    /// section under the cell's lock (design D7): marks them stale,
+    /// interrupts those that run its code, and waits until they left it.
+    /// Nothing to do where TLB invalidations are broadcast.
+    fn hold_others(&self, cpu: usize) {
+        if user::TLB_FLUSH_IS_BROADCAST || self.hold.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.clean
+            .store(flushed_by_kernel_on(cpu), Ordering::SeqCst);
+        let mut seen = [0u64; MAX_CPUS];
+        for (other, word) in seen.iter_mut().enumerate().take(crate::smp::count()) {
+            let now = IN_CELL[other].load(Ordering::SeqCst);
+            if other != cpu && now >> 32 == self.id as u64 && now & 1 == 1 {
+                *word = now;
+                crate::smp::wake(other);
+            }
+        }
+        for (other, &word) in seen.iter().enumerate() {
+            while word != 0 && IN_CELL[other].load(Ordering::Acquire) == word {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Runs thread code of the cell on `cpu` from `regs`; `None` when the
+    /// cell ended. Where flushes are per CPU, publishes that this CPU runs
+    /// the cell's code, and stays out while another CPU holds it out
+    /// (design D7: either this CPU sees the hold, or the holder sees it here
+    /// and interrupts it).
+    fn enter(&self, cpu: usize, regs: &mut Registers) -> Option<Trap> {
+        // This CPU's word while it runs the cell's code, and after.
+        let (mut inside, mut outside) = (0, 0);
+        if !user::TLB_FLUSH_IS_BROADCAST {
+            loop {
+                let sequence = (IN_CELL[cpu].load(Ordering::Relaxed) as u32).wrapping_add(1) | 1;
+                inside = (self.id as u64) << 32 | sequence as u64;
+                outside = (self.id as u64) << 32 | sequence.wrapping_add(1) as u64;
+                IN_CELL[cpu].store(inside, Ordering::SeqCst);
+                if !self.hold.load(Ordering::SeqCst) {
+                    break;
+                }
+                IN_CELL[cpu].store(outside, Ordering::SeqCst);
+                self.cell.with(|_| ()); // until the holder's section ends
+            }
+        }
+        let trap = if self.ending.load(Ordering::Acquire) {
+            None
+        } else {
+            let flush = self.clean.load(Ordering::SeqCst) & (1 << cpu) == 0;
+            if flush {
+                self.clean.fetch_or(flushed_on(cpu), Ordering::SeqCst);
+            }
+            Some(user::enter_user(self.root, self.tag, flush, regs))
+        };
+        if inside != 0 {
+            IN_CELL[cpu].store(outside, Ordering::Release);
+        }
+        trap
+    }
+}
+
+impl GangCell {
+    /// Records how many CPUs run the cell's threads now, if that is the
+    /// most so far: each holds its thread from the moment it is chosen until
+    /// it is put back, so those stints overlap.
+    fn count_busy(&mut self) {
+        let busy = self.busy.iter().filter(|&&tid| tid != 0).count() as u32;
+        self.live.peak = self.live.peak.max(busy);
+    }
+
+    /// Chooses the next thread for `cpu` (turns by identifier, skipping the
+    /// threads other CPUs run; design D5) and copies its registers into
+    /// `regs`, the CPU's; `None` if there is none.
+    fn choose(&mut self, cpu: usize, now: u64, regs: &mut Registers) -> Option<u32> {
+        if self.ending.is_some() {
+            return None;
+        }
+        let busy = self.busy;
+        let threads = &mut self.live.cell.threads;
+        let tid = threads.pick(now, self.live.last, |t| busy.contains(&t))?;
+        *regs = threads.get(tid)?.regs;
+        self.busy[cpu] = tid;
+        self.live.last = tid;
+        self.count_busy();
+        self.live.cpus |= 1 << cpu;
+        Some(tid)
+    }
+
+    /// Puts back thread `tid`, which `cpu` stops running: its registers
+    /// `regs` (unless the table holds them already), and its FP/SIMD state
+    /// if this CPU's registers hold it, before another CPU can choose it.
+    fn put_back(&mut self, cpu: usize, tid: u32, regs: Option<&Registers>) {
+        self.busy[cpu] = 0;
+        let key = fp_key(self.live.cell.id, tid);
+        let thread = self.live.cell.threads.get_mut(tid);
+        if let Some(thread) = thread {
+            if let Some(regs) = regs {
+                thread.regs = *regs;
+            }
+            if fp_owner() == key {
+                user::fp_save(&mut thread.regs.fp);
+            }
+        }
+        if fp_owner() == key {
+            set_fp_owner(0);
+        }
+    }
+
+    /// Ends the cell: records how, and interrupts the other CPUs running its
+    /// threads so they leave (design D6).
+    fn end(&mut self, gang: &Gang, cpu: usize, ending: Ending) {
+        self.ending.get_or_insert(ending);
+        gang.ending.store(true, Ordering::Release);
+        self.busy[cpu] = 0;
+        for (other, &tid) in self.busy.iter().enumerate() {
+            if tid != 0 {
+                crate::smp::wake(other);
+            }
+        }
+    }
+
+    /// The system call of thread `tid`, whose registers are `regs`, running
+    /// on `cpu` (design D4: it becomes the current thread for the call).
+    fn syscall(&mut self, gang: &Gang, cpu: usize, tid: u32, regs: &mut Registers) -> After {
+        if self.ending.is_some() {
+            return After::Leave; // nothing takes effect after the end
+        }
+        let threads = &mut self.live.cell.threads;
+        threads.make_current(tid);
+        threads.current_mut().regs = *regs;
+        let pt = PageTable::<Format>::from_root(gang.root);
+        let fp_in_cpu = fp_owner() == fp_key(gang.id, tid);
+        let (outcome, _) = syscall(&mut self.live, pt, fp_in_cpu, Some((gang, cpu)));
+        match outcome {
+            Outcome::Resume => {
+                *regs = *self.live.cell.regs();
+                After::Resume
+            }
+            Outcome::Yield => {
+                self.put_back(cpu, tid, None);
+                After::Leave
+            }
+            Outcome::Block => {
+                self.put_back(cpu, tid, None);
+                After::Switch(self.choose(cpu, now_ns(), regs))
+            }
+            Outcome::Exit(status) => {
+                self.end(gang, cpu, Ending::Exit(status));
+                After::Leave
+            }
+        }
+    }
+
+    /// A fault of thread code on `cpu`: resolved (a page brought in, the
+    /// stack grown, a copy-on-write page copied, or a page another CPU
+    /// mapped meanwhile), or the cell ends. Returns whether the thread runs
+    /// on.
+    fn fault(&mut self, gang: &Gang, cpu: usize, fault: &UserFault) -> bool {
+        if self.ending.is_some() {
+            return false;
+        }
+        let live = &mut *self.live;
+        let pt = PageTable::<Format>::from_root(gang.root);
+        if let Some(addr) = fault.missing_page() {
+            if live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr)) {
+                if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
+                    live.lazy = None;
+                }
+                return true;
+            }
+            if grow_stack(&pt, addr) {
+                return true;
+            }
+            if pt.translate(&DirectMap, addr).is_some() {
+                CpuTlb.flush_page(addr & !(FRAME_SIZE - 1));
+                return true;
+            }
+        }
+        if let Some(addr) = fault.write_denied()
+            && sharing(live.shares, || {
+                resolve_write(&pt, &mut CellTlb::new(Some((gang, cpu))), addr)
+            })
+        {
+            return true;
+        }
+        let mut services = KernelServices {
+            capture: live.output.as_mut(),
+            echo: live.echo,
+            random: 0,
+            fp_in_cpu: false,
+        };
+        fault.report(&mut services, live.cell.id);
+        self.end(gang, cpu, Ending::Fault);
+        false
+    }
+
+    /// Records in `Shared::gangs` what the cell offers other CPUs, if that
+    /// changed, and wakes idle CPUs for it (design D5).
+    fn offer(&mut self, shared: &Global<Shared>, ptr: GangPtr) {
+        let offer = if self.ending.is_some() {
+            (0, None)
+        } else {
+            let busy = &self.busy;
+            let threads = &self.live.cell.threads;
+            let spare = threads
+                .iter()
+                .filter(|t| t.wait == Wait::Ready && !busy.contains(&t.tid))
+                .count() as u32;
+            (spare, threads.wake_at())
+        };
+        if offer == self.offer {
+            return;
+        }
+        let new_deadline = offer.1.is_some() && offer.1 != self.offer.1;
+        self.offer = offer;
+        let wake = shared.with(|s| {
+            s.gangs.offer(ptr, offer.0, offer.1);
+            // As many idle CPUs as threads offered; one for a new deadline,
+            // so that it waits no longer than that.
+            let wanted = if offer.0 > 0 {
+                offer.0
+            } else {
+                new_deadline as u32
+            };
+            let (mut idle, mut wake) = (s.idle, 0u32);
+            for _ in 0..wanted {
+                let lowest = idle & idle.wrapping_neg();
+                wake |= lowest;
+                idle &= !lowest;
+            }
+            wake
+        });
+        for other in 0..crate::smp::count() {
+            if wake & (1 << other) != 0 {
+                crate::smp::wake(other);
+            }
+        }
+    }
+}
+
+/// Turns `live`, taken by `cpu`, into a gang that other CPUs may join, and
+/// runs its threads; `keep` keeps its current thread on this CPU (it just
+/// made another).
+fn start_gang(shared: &Global<Shared>, cpu: usize, live: Box<Live>, keep: bool) {
+    let gang = Box::new(Gang {
+        id: live.cell.id,
+        root: live.cell.root,
+        tag: live.tag,
+        clean: AtomicU32::new(live.clean),
+        ending: AtomicBool::new(false),
+        hold: AtomicBool::new(false),
+        cell: Global::new(GangCell {
+            live,
+            busy: [0; MAX_CPUS],
+            ending: None,
+            offer: (0, None),
+        }),
+    });
+    let ptr = GangPtr(NonNull::from(Box::leak(gang)));
+    shared.with(|s| s.gangs.start(cpu, ptr));
+    // SAFETY: just made from a box; only the last CPU to leave frees it.
+    let gang = unsafe { ptr.0.as_ref() };
+    let mut regs = Registers::default();
+    let first = gang.locked(shared, ptr, |cell| {
+        if !keep {
+            return cell.choose(cpu, now_ns(), &mut regs);
+        }
+        let current = cell.live.cell.threads.current();
+        let tid = current.tid;
+        regs = current.regs;
+        cell.busy[cpu] = tid;
+        cell.live.last = tid;
+        cell.count_busy();
+        Some(tid)
+    });
+    run_gang(shared, cpu, ptr, first, regs);
+}
+
+/// Runs a thread of `ptr`, which `cpu` just joined (design D5): the one it
+/// offered, unless another CPU took it meanwhile.
+fn join_gang(shared: &Global<Shared>, cpu: usize, ptr: GangPtr) {
+    // SAFETY: `cpu` is counted in `Shared::gangs` for this gang (it just
+    // joined), so the gang stays alive until it leaves.
+    let gang = unsafe { ptr.0.as_ref() };
+    let mut regs = Registers::default();
+    let first = gang.locked(shared, ptr, |cell| {
+        // `Gangs::join` took one offered thread (or the deadline).
+        match &mut cell.offer {
+            (spare @ 1.., _) => *spare -= 1,
+            (_, wake) => *wake = None,
+        }
+        cell.choose(cpu, now_ns(), &mut regs)
+    });
+    run_gang(shared, cpu, ptr, first, regs);
+}
+
+/// Runs threads of the gang `ptr` on `cpu`, `first` (whose registers are
+/// `regs`) first, until this CPU leaves the cell: its thread blocks and no
+/// other is left for it, yields, or its slice ends, or the cell ends
+/// (design D1 of `add-parallel-threads`).
+fn run_gang(
+    shared: &Global<Shared>,
+    cpu: usize,
+    ptr: GangPtr,
+    first: Option<u32>,
+    mut regs: Registers,
+) {
+    // SAFETY: `cpu` is counted in `Shared::gangs` for this gang until
+    // `leave_gang` below, and only the last CPU to leave frees it.
+    let gang = unsafe { ptr.0.as_ref() };
+    // As in `run_slice`: the first tick may predate the slice.
+    let mut ticks = 0;
+    let mut next = first;
+    while let Some(tid) = next.take() {
+        let key = fp_key(gang.id, tid);
+        user::fp_trap(fp_owner() != key);
+        next = loop {
+            let Some(trap) = gang.enter(cpu, &mut regs) else {
+                break None;
+            };
+            match trap {
+                Trap::Syscall => {
+                    match gang.locked(shared, ptr, |cell| cell.syscall(gang, cpu, tid, &mut regs)) {
+                        After::Resume => continue,
+                        After::Switch(next) => break next,
+                        After::Leave => break None,
+                    }
+                }
+                Trap::FpUnavailable => {
+                    user::fp_load(&regs.fp);
+                    user::fp_trap(false);
+                    set_fp_owner(key);
+                }
+                Trap::Interrupt => {
+                    ticks += 1;
+                    if ticks >= 2 && !gang.ending.load(Ordering::Acquire) {
+                        // The end of this CPU's slice: it looks at the run
+                        // queues again (a waiting cell goes first).
+                        gang.locked(shared, ptr, |cell| cell.put_back(cpu, tid, Some(&regs)));
+                        break None;
+                    }
+                }
+                Trap::Fault(fault) => {
+                    if !gang.locked(shared, ptr, |cell| cell.fault(gang, cpu, &fault)) {
+                        break None;
+                    }
+                }
+            }
+        };
+    }
+    leave_gang(shared, cpu, ptr);
+}
+
+/// `cpu` stops running the gang `ptr`; the last CPU to leave turns it back
+/// into a cell and gives it back (filed as its threads say, or ended).
+fn leave_gang(shared: &Global<Shared>, cpu: usize, ptr: GangPtr) {
+    // SAFETY: as in `run_gang`, `cpu` has not left yet.
+    let id = unsafe { ptr.0.as_ref() }.id;
+    if fp_owner() >> 32 == id as u64 {
+        set_fp_owner(0); // the cell ended: its FP/SIMD state is moot
+    }
+    user::leave_user();
+    if !shared.with(|s| s.gangs.leave(cpu, ptr)) {
+        return;
+    }
+    // SAFETY: `ptr` came from `Box::leak` in `start_gang`, and this was the
+    // last CPU counted in `Shared::gangs` for it: removed from there under
+    // the lock, no other CPU can reach it any more.
+    let gang = unsafe { Box::from_raw(ptr.0.as_ptr()) };
+    let Gang { cell, clean, .. } = *gang;
+    let GangCell {
+        mut live, ending, ..
+    } = cell.into_inner();
+    live.clean = clean.into_inner();
+    give_back(shared, cpu, live, ending.map_or(Back::File, Back::End));
 }
 
 /// Saves the CPU's FP/SIMD registers into the thread that owns them,
@@ -1082,7 +1733,12 @@ impl Host {
     /// An empty host for every CPU online.
     pub fn new() -> Self {
         if !WIRE_READY.swap(true, Ordering::Relaxed) {
-            NET.with(|net| crate::wire::init(net, now_ns(), Counter.cycles()));
+            NET.with(|net| {
+                // Parked connections re-attach only in this boot (design D2
+                // of `keep-tcp-across-suspend`).
+                net.set_boot(Counter.cycles());
+                crate::wire::init(net, now_ns(), Counter.cycles());
+            });
         }
         Self {
             shared: Global::new(Shared {
@@ -1093,6 +1749,7 @@ impl Host {
                 idle: 0,
                 stopping: false,
                 net_seen: 0,
+                gangs: Gangs::new(),
             }),
             finished: Vec::new(),
             templates: Vec::new(),
@@ -1125,9 +1782,13 @@ impl Host {
 
     /// A new live cell's record: its tag, nothing flushed yet.
     fn new_live(&mut self, cell: Cell, output: bool, echo: bool, random: u64, fs: Fs) -> Box<Live> {
+        let tag = self.state().tags.alloc();
+        if tag.is_none() {
+            prof::add(Count::Untagged, 1);
+        }
         Box::new(Live {
             cell,
-            tag: self.state().tags.alloc().unwrap_or(0),
+            tag: tag.unwrap_or(0),
             clean: 0,
             cpus: 0,
             shares: false,
@@ -1139,6 +1800,9 @@ impl Host {
             fs,
             deadlines: Vec::new(),
             io_seen: 0,
+            ready: Ready::default(),
+            last: 0,
+            peak: 1,
         })
     }
 
@@ -1169,14 +1833,7 @@ impl Host {
         echo: bool,
     ) -> Result<u32, ElfError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let mut services = KernelServices {
-            capture: None,
-            echo: false,
-            random: Counter.cycles() | 1,
-            fp_in_cpu: false,
-        };
-        let mut random = [0u8; 16];
-        services.random(&mut random);
+        let (random, seed) = start_random();
         let kernel = user::cell_kernel_half();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
         let parsed = Image::parse(image, user::MACHINE)?;
@@ -1192,7 +1849,49 @@ impl Host {
             &[],
             random,
         )?;
-        let live = self.new_live(cell, capture, echo, services.random, files);
+        let live = self.new_live(cell, capture, echo, seed, files);
+        self.state().sched.place(live);
+        Ok(id)
+    }
+
+    /// Creates a cell running the executable at `path` in `files`, its
+    /// file system, with `argv` and `envp` (spec `cells`, dynamically
+    /// linked executables): the executable and its interpreter are mapped
+    /// from the files' pages, which every cell mapping the same bytes shares
+    /// (design D1 of `add-dynamic-linking`). Output as for
+    /// [`spawn`](Self::spawn).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn spawn_file(
+        &mut self,
+        files: Fs,
+        path: &[u8],
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        capture: bool,
+        echo: bool,
+    ) -> Result<u32, ExecError> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (random, seed) = start_random();
+        let kernel = user::cell_kernel_half();
+        let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
+        let cell = rhizo_abi::exec::<Format, _, _>(
+            id,
+            user::MACHINE,
+            &files,
+            path,
+            kernel_half,
+            &mut DirectMap,
+            &mut NewSpace,
+            &mut KernelFrames,
+            &mut KernelPages,
+            argv,
+            envp,
+            random,
+        )?;
+        let live = self.new_live(cell, capture, echo, seed, files);
         self.state().sched.place(live);
         Ok(id)
     }
@@ -1294,7 +1993,8 @@ impl Host {
     pub fn step(&mut self) -> bool {
         self.poll_wire(now_ns());
         match take(&self.shared, 0, true) {
-            Take::Run(live, now) => run_slice(&self.shared, 0, live, now),
+            Take::Run(live, now) => run_slice(&self.shared, 0, live, now, false),
+            Take::Join(gang) => join_gang(&self.shared, 0, gang),
             Take::Wait(wake) => {
                 self.wait_or_poll(wake);
             }
@@ -1347,7 +2047,8 @@ impl Host {
         loop {
             self.poll_wire(now_ns());
             match take(&self.shared, 0, false) {
-                Take::Run(live, now) => run_slice(&self.shared, 0, live, now),
+                Take::Run(live, now) => run_slice(&self.shared, 0, live, now, cpus > 1),
+                Take::Join(gang) => join_gang(&self.shared, 0, gang),
                 Take::Wait(wake) => {
                     self.wait_or_poll(wake);
                 }
@@ -1375,6 +2076,7 @@ impl Host {
             let state = self.state();
             state.stopping = false;
             state.idle = 0;
+            debug_assert!(state.gangs.is_empty(), "every CPU left every cell");
         }
         self.collect();
     }
@@ -1580,6 +2282,23 @@ impl Host {
         Some(child_id)
     }
 
+    /// Ends the sleeps of live cell `id`'s threads and times out their timed
+    /// waits, as an event from outside would (the benchmark host's stand-in
+    /// for a user's message, design D1 of `add-reference-workloads`);
+    /// returns whether the cell exists.
+    #[cfg_attr(
+        not(feature = "bench-cell"),
+        allow(dead_code, reason = "used by the reference workloads")
+    )]
+    pub fn wake(&mut self, id: u32) -> bool {
+        let Some(mut live) = self.state().sched.remove(|l| l.cell.id == id) else {
+            return false;
+        };
+        live.cell.threads.expire_timers();
+        file(&mut self.state().sched, None, live);
+        true
+    }
+
     /// Ends live cell `id` if it exists; returns whether it did.
     #[cfg_attr(
         not(feature = "ktest"),
@@ -1598,6 +2317,15 @@ impl Host {
     /// How cell `id` ended, if it has.
     pub fn finished(&self, id: u32) -> Option<&Finished> {
         self.finished.iter().find(|f| f.id == id)
+    }
+
+    /// Takes the record of every cell that ended so far.
+    #[cfg_attr(
+        not(feature = "bench-cell"),
+        allow(dead_code, reason = "used by the reference workloads")
+    )]
+    pub fn take_finished(&mut self) -> Vec<Finished> {
+        core::mem::take(&mut self.finished)
     }
 
     /// Number of live cells waiting on descriptors.
@@ -1651,7 +2379,7 @@ fn idle_until(wake: u64) {
         return;
     }
     if irq::available() {
-        irq::wait_ns(wake - now);
+        prof::idle(|| irq::wait_ns(wake - now));
     } else {
         while now_ns() < wake {
             core::hint::spin_loop();
@@ -1683,11 +2411,17 @@ pub fn run(image: &'static [u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), El
 #[cfg(feature = "bench-cell")]
 pub fn bench(console: &mut impl Console) {
     use core::fmt::Write;
+    if let Some(workload) = crate::wire::options().bench {
+        crate::workloads::run(console, workload);
+        return;
+    }
     if crate::smp::count() > 1 {
         let (serial, parallel, wake) = multi_core();
+        let (one, four, shootdown) = parallel_threads();
         let _ = writeln!(
             rhizo_hal::ConsoleWriter(console),
-            "rhizo-smp cpus={} serial_ns={serial} parallel_ns={parallel} ipi_wake_ns={wake}",
+            "rhizo-smp cpus={} serial_ns={serial} parallel_ns={parallel} ipi_wake_ns={wake} \
+             threads1_ns={one} threads4_ns={four} shootdown_ns={shootdown}",
             crate::smp::count()
         );
         return; // the other metrics are measured with one CPU
@@ -1759,10 +2493,10 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-files write_read_ns={write_read} fork_ns={fork_files}"
     );
-    let (pipe, loopback) = net();
+    let (pipe, loopback, tcp_resume) = net();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
-        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback}"
+        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback} tcp_resume_ns={tcp_resume}"
     );
     match wire_rtt() {
         Ok(rtt) => {
@@ -1788,6 +2522,61 @@ pub fn bench(console: &mut impl Console) {
         s[3],
         s[4]
     );
+    // Last: its files stay decoded in the kernel heap.
+    if let Some((run, template)) = dynamic() {
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-dynamic run_ns={run} template_ns={template}"
+        );
+    }
+}
+
+/// The dynamically linked `hello` (design D8 of `add-dynamic-linking`):
+/// started from the cell's files and run to its exit, its interpreter
+/// mapping `libc` and relocating, after a first run that keeps the file
+/// pages; and forked from a template frozen once it printed `ready`, the
+/// relocations done. Robust figures over 25 runs; `None` when the files
+/// were not packed.
+#[cfg(feature = "bench-cell")]
+fn dynamic() -> Option<(u64, u64)> {
+    const RUNS: usize = 25;
+    const PATH: &[u8] = b"/usr/bin/hello";
+    let files = dynamic_files()?;
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let mut run = Vec::with_capacity(RUNS);
+    for i in 0..=RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_file(files.clone(), PATH, &[b"hello"], &[], true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        let t = ns(t0, Counter.cycles());
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        if i > 0 {
+            run.push(t);
+        }
+    }
+    let template = host
+        .spawn_file(files, PATH, &[b"hello", b"wait"], &[], true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"ready\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let mut warm = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    Some((robust(&mut run), robust(&mut warm)))
 }
 
 /// A real program (`libc_warm`, static glibc) answering one request: started
@@ -1975,6 +2764,50 @@ pub fn cpython_files() -> Option<Fs> {
     }))
 }
 
+/// The files of the dynamically linked `hello` (`dynamic-files`, packed by
+/// `xtask` with its interpreter and libraries; change
+/// `add-dynamic-linking`), decoded once and then shared copy-on-write by
+/// every cell given them; `None` when they were not packed.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+pub fn dynamic_files() -> Option<Fs> {
+    static FILES: Global<Option<Fs>> = Global::new(None);
+    decoded(&FILES, "dynamic-files")
+}
+
+/// The files of the distribution's programs (`distro-files`: `ls`, `sort`,
+/// `python3`, their interpreter, libraries and data), as
+/// [`dynamic_files`]; packed natively only, and embedded in test kernels
+/// only.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn distro_files() -> Option<Fs> {
+    static FILES: Global<Option<Fs>> = Global::new(None);
+    decoded(&FILES, "distro-files")
+}
+
+/// The file system packed as test image `name`, decoded into `slot` the
+/// first time; `None` when it was not packed.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+fn decoded(slot: &Global<Option<Fs>>, name: &str) -> Option<Fs> {
+    let bytes = test_image(name);
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(slot.with(|files| {
+        files
+            .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
+            .clone()
+    }))
+}
+
 /// CPython answering one tool call (`cells/python/agent_demo.py`, design D3
 /// of `add-cpython`): started cold from its executable (interpreter start,
 /// imports, warm-up) with the standard library in its files, and forked from
@@ -2135,6 +2968,39 @@ fn multi_core() -> (u64, u64, u64) {
     (serial[ROUNDS / 2], parallel[ROUNDS / 2], robust(&mut wake))
 }
 
+/// With several CPUs (design D9 of `add-parallel-threads`): `parsum` with 1
+/// and with 4 threads, alone on every CPU (the time it reports, medians
+/// over 3 rounds), and the median `munmap` of `shootdown bench` while its
+/// other threads run on the other CPUs.
+#[cfg(feature = "bench-cell")]
+fn parallel_threads() -> (u64, u64, u64) {
+    const ROUNDS: usize = 3;
+    // Both print the figure last: `ns <n>`, `shootdown_ns=<n>`.
+    let run = |argv: &[&[u8]]| -> u64 {
+        let name = core::str::from_utf8(argv[0]).unwrap_or("");
+        let mut host = Host::new();
+        let id = host
+            .spawn(test_image(name), argv, true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        let done = host.finished(id).expect("ended");
+        assert_eq!(done.ending, Ending::Exit(0), "{name}");
+        let text = core::str::from_utf8(&done.output).unwrap_or("");
+        let last = text.trim_end().rsplit([' ', '=']).next();
+        last.and_then(|v| v.parse().ok()).unwrap_or(0)
+    };
+    let median = |threads: &[u8]| {
+        let mut ns: Vec<u64> = (0..ROUNDS)
+            .map(|_| run(&[b"parsum", threads, b"24", b"time"]))
+            .collect();
+        ns.sort_unstable();
+        ns[ROUNDS / 2]
+    };
+    let (one, four) = (median(b"1"), median(b"4"));
+    let shootdown = run(&[b"shootdown", b"bench", b"200"]);
+    (one, four, shootdown)
+}
+
 /// Rounds of a repeated measure (design D4 of `add-cell-files`).
 #[cfg(feature = "bench-cell")]
 const ROUNDS: usize = 5;
@@ -2195,9 +3061,11 @@ fn files() -> (u64, u64) {
 /// Robust figures (see [`robust`]) of the time per round trip: `piper`
 /// writing one byte into a pipe and reading it back, and two `loopback`
 /// cells exchanging a 64-byte message over TCP on 127.0.0.1 (design D7 of
-/// `add-sockets-and-poll`).
+/// `add-sockets-and-poll`); and of the time to resume a `loopback twice`
+/// client suspended with its connection established until it has made one
+/// more round trip and exited (design D5 of `keep-tcp-across-suspend`).
 #[cfg(feature = "bench-cell")]
-fn net() -> (u64, u64) {
+fn net() -> (u64, u64, u64) {
     const RUNS: usize = 3 * ROUNDS;
     const PIPE_TRIPS: u64 = 2000;
     const NET_TRIPS: u64 = 200;
@@ -2237,7 +3105,36 @@ fn net() -> (u64, u64) {
             assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
         }
     }
-    (robust(&mut pipe), robust(&mut loopback))
+    let mut resume = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let server = host
+            .spawn(image, &[b"loopback", b"serve", b"7401", b"2"], true, false)
+            .expect("spawn server");
+        host.step(); // listening, waiting in `accept`
+        let client = host
+            .spawn(image, &[b"loopback", b"twice", b"7401"], true, false)
+            .expect("spawn client");
+        while host.output(client) != Some(b"once\n") {
+            host.step();
+        }
+        let snapshot = host.suspend(client).expect("live");
+        let t0 = Counter.cycles();
+        let client = host
+            .resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume");
+        host.run(|h| h.finished(client).is_some());
+        resume.push(ns(t0, Counter.cycles()));
+        host.run(|h| h.finished(server).is_some());
+        for id in [server, client] {
+            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        }
+    }
+    (
+        robust(&mut pipe),
+        robust(&mut loopback),
+        robust(&mut resume),
+    )
 }
 
 /// A robust figure (see [`robust`]) of the round trip of a 64-byte message

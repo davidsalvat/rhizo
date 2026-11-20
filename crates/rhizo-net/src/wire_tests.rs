@@ -263,13 +263,57 @@ fn binding_takes_the_card_s_address_only() {
 }
 
 #[test]
-fn wire_connections_reset_on_fork_and_snapshot() {
+fn wire_connections_reset_on_fork() {
     let mut w = World::new();
     let s = w.connect(80);
-    assert_eq!(w.net.export(s).unwrap().state, Saved::Reset);
     let child = w.net.fork(s).unwrap();
     assert_eq!(drain(&mut w.net, child), Err(Error::ConnReset));
+    assert_eq!(drain(&mut w.net, child).unwrap(), b"");
+    assert_eq!(w.net.send(child, b"x", None), Err(Error::Pipe));
     assert_eq!(w.net.send(s, b"still", None), Ok(5), "the parent keeps it");
+    w.run(20);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"still");
+}
+
+#[test]
+fn wire_connections_stay_up_while_parked() {
+    let mut w = World::new();
+    let s = w.connect(80);
+    assert_eq!(w.net.send(s, b"lost once", None), Ok(9));
+    // The segment leaves, and the wire loses it.
+    w.net.poll_wire(&mut w.link, w.now);
+    assert!(!w.link.sent.is_empty());
+    w.link.sent.clear();
+    let r = w.net.export(s).unwrap();
+    assert!(r.parked.is_some());
+    w.net.release(s);
+    assert!(w.net.wire_busy(), "the card is still polled for it");
+    // Suspended for 3 s: `smoltcp` retransmits, the echo comes back and
+    // is acknowledged into the parked socket's buffer.
+    w.run(3000);
+    let peer = w.peer.sockets.get::<tcp::Socket>(w.peer.tcp);
+    assert_eq!(peer.state(), tcp::State::Established);
+    assert_eq!(peer.send_queue(), 0, "the peer's echo was acknowledged");
+    let (s2, _) = w.net.import(&r).unwrap();
+    assert_eq!(s2, s);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"lost once");
+    assert_eq!(w.net.send(s, b"after", None), Ok(5));
+    w.run(20);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"after");
+}
+
+#[test]
+fn a_reset_while_parked_is_reported_after() {
+    let mut w = World::new();
+    let s = w.connect(80);
+    let r = w.net.export(s).unwrap();
+    w.net.release(s);
+    let peer = w.peer.tcp;
+    w.peer.sockets.get_mut::<tcp::Socket>(peer).abort();
+    w.run(20);
+    let (s, _) = w.net.import(&r).unwrap();
+    assert_eq!(drain(&mut w.net, s), Err(Error::ConnReset));
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"");
 }
 
 #[test]
