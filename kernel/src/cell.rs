@@ -2374,15 +2374,19 @@ fn benchmarks(console: &mut impl Console) {
         robust(&mut spawn_ns),
         robust(&mut run_ns)
     );
-    let f = fork_and_templates();
-    let _ = writeln!(
-        rhizo_hal::ConsoleWriter(console),
-        "rhizo-fork fork_ns={} fork_touch_ns={} fork_pt_frames={} spawn_from_template_ns={}",
-        f[0],
-        f[1],
-        f[2],
-        f[3]
-    );
+    // The first pass only: forking 50 MiB and writing it needs most of
+    // the memory, which the kernel heap grown by the first pass keeps.
+    if CLOCK.load(Ordering::Relaxed) == CLOCK_TIME {
+        let f = fork_and_templates();
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-fork fork_ns={} fork_touch_ns={} fork_pt_frames={} spawn_from_template_ns={}",
+            f[0],
+            f[1],
+            f[2],
+            f[3]
+        );
+    }
     let (cold, warm) = workload();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),

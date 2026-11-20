@@ -306,9 +306,19 @@ jobs:
           if [ -f bench-results.json ]; then
             # Annotations are cut at 4 KB: medians first, one per metric.
             echo "::notice title=bench-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results.json | tr '\n' ' ')"
-            # The full results, in numbered pieces that each fit an annotation.
-            tr -d '\n' < bench-results.json | fold -w 3000 | nl -nln -w1 -s' ' |
-              while IFS= read -r line; do
-                echo "::notice title=bench-results-${line%% *}::${line#* }"
-              done
           fi
+
+      # The full results, compact, in numbered pieces that each fit an
+      # annotation (bench-results-1 to -36); a step shows at most 10 notices.
+      - name: Publish full results (1 to 9)
+        if: always()
+        run: bash .github/publish-bench.sh 1
+      - name: Publish full results (10 to 18)
+        if: always()
+        run: bash .github/publish-bench.sh 10
+      - name: Publish full results (19 to 27)
+        if: always()
+        run: bash .github/publish-bench.sh 19
+      - name: Publish full results (28 to 36)
+        if: always()
+        run: bash .github/publish-bench.sh 28

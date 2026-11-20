@@ -93,6 +93,10 @@ inlined into its only caller) and the timed figures got 2 to 3 % slower
 under `-icount`. Reusing the code avoids that, and gives every metric, not
 six, a count. Reading a counter under KVM is a VM exit, which costs time but
 not guest instructions, so the passes never run while time is measured.
+The passes skip the fork benchmarks (`cell.fork`, `fork_touch`,
+`spawn_from_template`): forking 50 MiB and writing it needs most of the
+guest's memory, and the heap the first pass grew keeps some (seen in CI:
+the child faulted for want of frames). `-icount` counts those.
 
 ## D6. `-icount` as the deterministic instruction counter in CI
 
