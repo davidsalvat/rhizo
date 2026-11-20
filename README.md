@@ -174,6 +174,13 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 ### A real interpreter
 
+CPython (static, 3.13.18) answering one agent tool call (`cells/python/agent_demo.py`: JSON, regular expressions, dates; the standard library it imports compiled in the cell's own files), in a cell and as a Linux process in the same Firecracker VM:
+
+| Started | Rhizo cell | Linux process |
+|---|---:|---:|
+| Cold, from its executable (interpreter start, imports, warm-up) | 19.93 ms | 18.60 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.67 ms (5.4× faster) | 5.55 ms |
+
 MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
 
 | Started | Time |

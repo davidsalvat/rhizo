@@ -9,6 +9,8 @@ publish = false
 [dependencies]
 # JSON for benchmark results and the stored baseline (bench/baseline.json).
 serde_json = "1"
+# The cell file system, to encode the files a CPython cell starts with.
+rhizo-fs = { path = "../crates/rhizo-fs" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

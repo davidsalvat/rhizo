@@ -7,6 +7,7 @@
 mod arch;
 mod bench;
 mod compare;
+mod cpython;
 mod deps;
 mod differential;
 mod hostnet;
@@ -762,6 +763,7 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     let out = dir.join(target).join("release");
     build_c_cells(&out)?;
     build_micropython(&out)?;
+    cpython::build(&out)?;
     Ok(out)
 }
 

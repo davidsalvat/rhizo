@@ -88,10 +88,12 @@ fn main() -> i32 {
     );
     print(b"huge ranges ok\n");
 
-    // Only the first three: with 5-level paging, Linux takes the last two
-    // as user addresses.
+    // Only the bases above the lower half on any x86_64 Linux: with 5-level
+    // paging Linux accepts thread pointers up to 2^56, so the last two
+    // addresses of `BAD` are valid there (the kernel refuses them all).
     #[cfg(target_arch = "x86_64")]
-    for &p in &BAD[..3] {
+    for p in &BAD[..3] {
+        let p = *p;
         const ARCH_SET_FS: usize = 0x1002;
         check(
             syscall(call::ARCH_PRCTL, [ARCH_SET_FS, p, 0, 0, 0, 0]) == EPERM,

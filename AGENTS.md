@@ -136,7 +136,7 @@ The feedback loop, fastest first:
 | `crates/rhizo-sched` | Run queue, sleep list, waiting set and time slice (time passed in, never read); address-space tag pool | — |
 | `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio` |
 | `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
-| `xtask` | Developer tooling (host only) | — |
+| `xtask` | Developer tooling (host only); builds the static CPython cell and encodes its files (`cpython.rs`) | `rhizo-fs` |
 
 Planned crates are created by the milestone that adds their code, not
 before.
