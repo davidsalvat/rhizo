@@ -20,6 +20,8 @@ struct Peer {
     link: QueueLink,
     tcp: SocketHandle,
     udp: SocketHandle,
+    /// Whether it closes its side once the client closed its own.
+    closes: bool,
 }
 
 impl Peer {
@@ -51,6 +53,7 @@ impl Peer {
             iface,
             sockets,
             link,
+            closes: true,
         }
     }
 
@@ -67,7 +70,7 @@ impl Peer {
             let n = t.recv_slice(&mut buf).unwrap();
             t.send_slice(&buf[..n]).unwrap();
         }
-        if t.state() == tcp::State::CloseWait {
+        if self.closes && t.state() == tcp::State::CloseWait {
             t.close(); // the client is done: so is the echo
         }
         let u = self.sockets.get_mut::<udp::Socket>(self.udp);
@@ -172,6 +175,18 @@ fn tcp_to_a_host_outside() {
     w.net.release(s);
     w.run(50);
     assert!(!w.net.wire_busy(), "closed connections leave smoltcp");
+}
+
+#[test]
+fn a_peer_that_never_closes_is_given_up() {
+    let mut w = World::new();
+    let s = w.connect(80);
+    w.peer.closes = false;
+    w.net.release(s);
+    w.run(20);
+    assert!(w.net.wire_busy(), "waiting for the peer's FIN");
+    w.run(61_000);
+    assert!(!w.net.wire_busy(), "aborted after the linger time");
 }
 
 #[test]

@@ -22,6 +22,9 @@ const UDP_PACKETS: usize = 16;
 const UDP_BYTES: usize = 64 << 10;
 /// A connection that gets no answer gives up after this long.
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// A closed connection whose peer does not close is aborted after this
+/// long (as Linux's FIN_WAIT_2 timeout does).
+const LINGER: Duration = Duration::from_secs(60);
 
 /// How the card gets its address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +45,9 @@ pub(crate) struct Wire {
     sockets: SocketSet<'static>,
     dhcp: Option<SocketHandle>,
     addr: Option<[u8; 4]>,
-    /// Connections closed by the cells, dropped from `smoltcp` once done.
-    closing: Vec<SocketHandle>,
+    /// Connections closed by the cells, dropped from `smoltcp` once done,
+    /// or aborted at the time given (a peer that never closes its side).
+    closing: Vec<(SocketHandle, Option<Instant>)>,
 }
 
 impl core::fmt::Debug for Wire {
@@ -256,13 +260,15 @@ impl Net {
         let Wire {
             sockets, closing, ..
         } = wire;
-        closing.retain(|&h| {
-            let done = matches!(
-                sockets.get_mut::<tcp::Socket>(h).state(),
-                tcp::State::Closed | tcp::State::TimeWait
-            );
+        closing.retain_mut(|(h, give_up)| {
+            let give_up = *give_up.get_or_insert(now + LINGER);
+            let socket = sockets.get_mut::<tcp::Socket>(*h);
+            if now >= give_up {
+                socket.abort();
+            }
+            let done = matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait);
             if done {
-                sockets.remove(h);
+                sockets.remove(*h);
             }
             !done
         });
@@ -416,7 +422,7 @@ impl Net {
     pub(crate) fn wire_close(&mut self, handle: SocketHandle) {
         if let Some(wire) = self.wire.as_mut() {
             wire.tcp(handle).close();
-            wire.closing.push(handle);
+            wire.closing.push((handle, None));
         }
     }
 
