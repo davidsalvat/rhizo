@@ -79,11 +79,12 @@ None.
 - `workloads`: a real agent end to end.
 - `benchmarks`: agent metrics.
 - `linux-abi`: descriptor `ioctl`s.
+- `networking`: `TCP_NODELAY` set after connecting applies on the card.
 - `comparisons`: the agent as a Linux process in the same VM.
 
 ## Impact
 
-`crates/rhizo-abi` (`ioctl`), `crates/rhizo-snapshot` (2 MiB pages restored
+`crates/rhizo-abi` (`ioctl`), `crates/rhizo-net` (`TCP_NODELAY`), `crates/rhizo-snapshot` (2 MiB pages restored
 without a 2 MiB run), `AGENTS.md` (`zlib1g-dev`),
 `.github/workflows/ci.yml` (results published compact, in a step of their
 own: they outgrew one step's ten annotations), `cells/python/agent_loop.py` (new), `cells/python/pack_stdlib.py` (several

@@ -41,14 +41,9 @@ whose host name CPython encodes with the `idna` codec (`unicodedata`). A
 socket with a timeout is put in non-blocking mode with `ioctl(FIONBIO)`,
 which the kernel now implements with `FIOCLEX` and `FIONCLEX`
 (`os.set_inheritable`) instead of refusing every `ioctl` with `ENOTTY`.
-The agent itself uses no timeout (the default of `requests` and
-`http.client`; the kernel bounds the run): with one, CPython waits for the
-answer in `poll` with a deadline, and a cell waiting so is woken by the
-card's polling period, not by the answer: in CI a turn took 2.4 ms on
-QEMU and 41 ms on Firecracker and Cloud Hypervisor instead of 0.2 ms, the
-same polling problem `add-reference-workloads` found (turns of 1 s). Its
-fix is a change of its own; this one measures the path that does not hit
-it. Its tool hashes its notes with `hashlib`, so the hash modules
+The agent itself uses no timeout, the default of `requests` and
+`http.client` (a real model on a CPU may think for minutes; the kernel
+bounds the run). Its tool hashes its notes with `hashlib`, so the hash modules
 `hashlib` imports are built in too (`_md5`, `_sha1`, `_sha2`, `_sha3`,
 `_blake2`: HACL* and BLAKE2 code in CPython's tree, no OpenSSL); without
 them `hashlib` prints an error for every algorithm at import. Its HTTP/1.1 client is twenty lines in the script
@@ -211,3 +206,10 @@ request) is a product change, not this proof of concept's.
   the benchmark kernel panicked before printing any cell figure, on every
   VMM, and the gate, which does not fail on missing metrics, passed. The
   cell metrics are now measured in a 256 MiB VM.
+- **`TCP_NODELAY` set after connecting was ignored on the card.** The
+  kernel gave a connection through the network card its Nagle setting when
+  it connected only; CPython (like `http.client`) sets `TCP_NODELAY` once
+  connected, so a request larger than a segment waited for the host's
+  delayed acknowledgment: in CI a turn took 2.4 ms on QEMU and 41 ms on
+  Firecracker and Cloud Hypervisor instead of 0.2 ms. The option now
+  applies at once (host test in `rhizo-net`).

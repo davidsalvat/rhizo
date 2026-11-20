@@ -28,3 +28,4 @@
 - [x] 5.1 `rhizo-snapshot`: a 2 MiB page restored as 4 KiB pages without a free 2 MiB run; kernel syncs code per page; verify `cargo test -p rhizo-snapshot` and the agent's in-kernel test after merging `add-large-image-pages`
 - [x] 5.2 The agent's test waits for the card's connections to close; verify `cargo xtask test --only ktest` (the dynamic linking test after it counts the heap)
 - [x] 5.3 The cell metrics in a 256 MiB VM; verify `cargo xtask bench --runs 1 --vmm qemu-microvm --no-reference` prints every cell figure, and the CI benchmark job
+- [x] 5.4 `rhizo-net`: `TCP_NODELAY` set on a connection through the card applies at once; verify `cargo test -p rhizo-net no_delay` (fails without the fix) and the CI benchmark job's agent turns
