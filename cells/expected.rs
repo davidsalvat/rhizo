@@ -127,6 +127,9 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
         "step 07 digest 6b4e24cdafe14e6b\nstep 15 digest c93f1c055e5410cf\nstep 23 digest 65632246df41d107\nstep 31 digest a7c1ff878b0627df\nstep 39 digest 9a1ea881edd8f792\n",
         Ending::Exit(0),
     ),
+    // Threads on several CPUs at once (spec `threads`, `multi-core`).
+    ("parsum", "sum 15df5a63211010ed\n", Ending::Exit(0)),
+    ("shootdown", "", Ending::Fault),
     // Hostile cells (spec `isolation`) whose answers Linux gives too.
     (
         "hostile_ptrs",

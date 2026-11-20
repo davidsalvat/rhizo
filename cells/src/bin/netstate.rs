@@ -2,8 +2,9 @@
 //! and `fork`): it writes into a pipe, listens on 127.0.0.1:PORT (the first
 //! argument, a free port by default) and connects to itself, prints `ready` and
 //! sleeps 20 ms (where a host suspends, resumes or forks it). Then it
-//! reports the pipe's bytes, whether its connection is still open or was
-//! reset, and whether its listener still accepts a new connection.
+//! reports the pipe's bytes, whether its connection is still open (and
+//! carries bytes) or was reset (`ECONNRESET`, then end of stream and
+//! `EPIPE`), and whether its listener still accepts a new connection.
 #![no_std]
 #![no_main]
 
@@ -13,7 +14,9 @@ use rhizo_cells::{
 };
 
 const SOCK_NONBLOCK: usize = 0x800;
+const MSG_NOSIGNAL: usize = 0x4000;
 const EAGAIN: isize = -11;
+const EPIPE: isize = -32;
 const ECONNRESET: isize = -104;
 
 fn main() -> i32 {
@@ -39,6 +42,7 @@ fn main() -> i32 {
     check(r == 0 || r == -115, "connect"); // or EINPROGRESS
     let s = syscall(nr::ACCEPT4, [l as usize, 0, 0, 0, 0, 0]);
     check(s >= 0, "accept");
+    let (c, s) = (c as usize, s as usize);
     print(b"ready\n");
     sleep_ns(20_000_000);
 
@@ -49,12 +53,27 @@ fn main() -> i32 {
     );
     check(n == 4 && &buf[..4] == b"kept", "pipe");
     print(b"pipe kept\n");
-    match syscall(
-        nr::READ,
-        [c as usize, buf.as_mut_ptr() as usize, 8, 0, 0, 0],
-    ) {
-        EAGAIN => print(b"connection open\n"),
-        ECONNRESET => print(b"connection reset\n"),
+    let read = |fd: usize, buf: &mut [u8]| {
+        syscall(
+            nr::READ,
+            [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0],
+        )
+    };
+    let send = |fd: usize, bytes: &[u8]| {
+        let a = [fd, bytes.as_ptr() as usize, bytes.len(), MSG_NOSIGNAL, 0, 0];
+        syscall(nr::SENDTO, a)
+    };
+    match read(c, &mut buf) {
+        EAGAIN => {
+            check(send(c, b"on") == 2 && read(s, &mut buf) == 2, "carry");
+            check(&buf[..2] == b"on", "carried bytes");
+            print(b"connection open\n");
+        }
+        ECONNRESET => {
+            check(read(c, &mut buf) == 0, "end of stream after a reset");
+            check(send(c, b"x") == EPIPE, "EPIPE after a reset");
+            print(b"connection reset\n");
+        }
         _ => check(false, "connection state"),
     }
     let again = tcp_socket(0);

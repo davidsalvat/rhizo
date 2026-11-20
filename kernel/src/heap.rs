@@ -54,8 +54,8 @@ pub mod window {
     use rhizo_mm::paging::PageFlags;
 
     /// The window: one top-level entry (512 GiB) of the kernel half.
-    const BASE: u64 = 0xffff_9000_0000_0000;
-    const END: u64 = BASE + (512 << 30);
+    pub const BASE: u64 = 0xffff_9000_0000_0000;
+    pub const END: u64 = BASE + (512 << 30);
     /// Next address handed out.
     static NEXT: AtomicU64 = AtomicU64::new(BASE);
 
