@@ -247,6 +247,8 @@ pub struct RunOptions {
     pub accel: Accel,
     /// Wait for gdb (QEMU only).
     pub gdb: bool,
+    /// Virtual CPUs of the VM.
+    pub cpus: u32,
 }
 
 /// Parses `rhizo-ready cycles=<n>` from console output.
@@ -260,8 +262,8 @@ pub fn parse_ready_cycles(output: &str) -> Option<u64> {
 fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
     match vmm {
         Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
-        Vmm::Firecracker => firecracker_command(guest, scratch),
-        Vmm::CloudHypervisor => cloud_hypervisor_command(guest),
+        Vmm::Firecracker => firecracker_command(guest, scratch, opts.cpus),
+        Vmm::CloudHypervisor => cloud_hypervisor_command(guest, opts.cpus),
     }
 }
 
@@ -308,6 +310,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
         "max"
     };
     cmd.args(["-cpu", cpu, "-m", "128M", "-nodefaults", "-no-user-config"])
+        .args(["-smp", &opts.cpus.to_string()])
         .args(["-display", "none", "-no-reboot"])
         .args(["-accel", if kvm { "kvm" } else { "tcg" }]);
     if vmm != Vmm::QemuVirt {
@@ -342,7 +345,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
     cmd
 }
 
-fn firecracker_command(guest: &Guest, scratch: &Path) -> Result<Command> {
+fn firecracker_command(guest: &Guest, scratch: &Path, cpus: u32) -> Result<Command> {
     let binary = tools::firecracker()?;
     let (kernel, initrd, args) = match guest {
         Guest::Rhizo(kernel) => (kernel.clone(), None, Vmm::Firecracker.rhizo_cmdline(true)),
@@ -359,7 +362,7 @@ fn firecracker_command(guest: &Guest, scratch: &Path) -> Result<Command> {
     let config = format!(
         "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}{initrd_json}}}, \
          \"drives\": [], \
-         \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": 128}}}}",
+         \"machine-config\": {{\"vcpu_count\": {cpus}, \"mem_size_mib\": 128}}}}",
         kernel.display().to_string(),
         args
     );
@@ -373,12 +376,10 @@ fn firecracker_command(guest: &Guest, scratch: &Path) -> Result<Command> {
     Ok(cmd)
 }
 
-fn cloud_hypervisor_command(guest: &Guest) -> Result<Command> {
+fn cloud_hypervisor_command(guest: &Guest, cpus: u32) -> Result<Command> {
     let binary = tools::cloud_hypervisor()?;
     let mut cmd = Command::new(binary);
-    cmd.args([
-        "--cpus",
-        "boot=1",
+    cmd.args(["--cpus", &format!("boot={cpus}")]).args([
         "--memory",
         "size=128M",
         "--console",

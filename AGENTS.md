@@ -96,7 +96,7 @@ The feedback loop, fastest first:
 |---|---|---|
 | `cargo test -p <crate> <name>` | < 1 s | One host test |
 | `cargo xtask check` | seconds | fmt, clippy (all crates), host tests, crate dependency rules. **Run after every edit.** |
-| `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, or a self-check such as `ktest-page-fault` |
+| `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, `ktest-smp` (4 vCPUs), or a self-check such as `ktest-page-fault` |
 | `cargo xtask test` | ~1 min | Host tests, boot check, in-kernel tests, all self-checks |
 | `cargo xtask ci` | minutes | Everything CI runs. **Run before pushing.** |
 | `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates) |
@@ -122,14 +122,14 @@ The feedback loop, fastest first:
 | Crate | Owns | May depend on (workspace) |
 |---|---|---|
 | `crates/rhizo-hal` | Hardware interfaces (traits) and host test doubles | — |
-| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
+| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
 | `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, write resolution), kernel heap | `rhizo-hal` |
 | `crates/rhizo-cell` | Cells as plain data (their threads: registers, identifiers, futex and sleep waits), static ELF loader and initial stack, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
 | `crates/rhizo-fs` | A cell's in-memory file system: tree, file blocks shared copy-on-write between forks, descriptors, encoding for snapshots | — |
 | `crates/rhizo-abi` | Linux system calls of cells (both conventions), files through the cell's `rhizo-fs`, threads (`clone`, `clone3`, futexes), `EFAULT`/`ENOSYS`, scheduling outcomes (yield, block, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs` |
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian, threads and files sections), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs` |
 | `crates/rhizo-sched` | Run queue, sleep list and time slice (time passed in, never read); address-space tag pool | — |
-| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice (`src/cell.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs` |
+| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice (`src/cell.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs` |
 | `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
 | `xtask` | Developer tooling (host only) | — |
 
@@ -146,8 +146,11 @@ tested on the host.
 The `arch` interface (`kernel/src/arch/mod.rs` lists it) is the only thing
 shared kernel code may use: `boot`, `platform`, `console`, `power`, `cpu`,
 `timer`, `tests`, and, compiled only in builds that run cells, `user`
-(entering and leaving cell code, address-space tags) and `irq` (the
-preemption timer; interrupts arrive only while cell code runs). Anything instruction-set specific (assembly, system
+(entering and leaving cell code, address-space tags), `irq` (the
+preemption timer and the wake-up between CPUs; interrupts arrive only
+while cell code runs or a CPU idles) and `smp` (starting the other CPUs,
+waking them, idling). `cpu::index()` is the running CPU's number (0 for the
+boot CPU). Anything instruction-set specific (assembly, system
 registers, ports, MMIO registers, entry encodings) goes behind it. New arch
 hooks are written for AArch64 first and must reach x86_64 in the same
 milestone. Tests that need architecture details go in `arch/<cpu>/tests.rs`.
@@ -162,10 +165,15 @@ Memory layout, the same on both architectures (see
   memory only through `PhysicalMemory` (kernel: `memory::DirectMap`).
 - `0xffff_ffff_8000_0000 + phys`: kernel image with W^X; the page under the
   kernel stack is an unmapped guard page.
+- `0xffff_ffff_c000_0000 + n * 128 KiB`: stacks of secondary CPU `n`
+  (kernel, exception, double fault), each above an unmapped guard page.
 - AArch64 only: `0xffff_c000_0000_0000 + phys` is a device-memory window
   for MMIO (the UART); the kernel half lives in `TTBR1_EL1`, and `TTBR0_EL1`
   (cells) is an empty table.
-- Kernel globals use `sync::Global` (single CPU, panics on reentrance).
+- Kernel globals use `sync::Global`: a spinlock across CPUs (the kernel
+  runs with interrupts masked); the same CPU taking it twice panics.
+- Per-CPU data: `TPIDR_EL1` on AArch64; the kernel GS base on x86_64,
+  swapped with `SWAPGS` around cell code (never load GS in the kernel).
 
 The kernel crate only builds for `aarch64-unknown-none-softfloat` and
 `x86_64-unknown-none`; plain `cargo` commands skip it (it is not a default

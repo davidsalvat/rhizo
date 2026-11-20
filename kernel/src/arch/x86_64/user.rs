@@ -20,7 +20,6 @@ pub const CELL_ROOT_HAS_KERNEL_HALF: bool = true;
 
 unsafe extern "C" {
     fn rhizo_enter_cell(regs: *mut Registers, sysret: u64) -> u64;
-    static rhizo_trap_error: u64;
 }
 
 /// Why a cell stopped running.
@@ -199,7 +198,7 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     if vector == 7 {
         return Trap::FpUnavailable;
     }
-    if vector == super::irq::TIMER_VECTOR {
+    if vector == super::irq::TIMER_VECTOR || vector == super::irq::WAKE_VECTOR {
         super::irq::acknowledge();
         return Trap::Interrupt;
     }
@@ -208,8 +207,8 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     }
     Trap::Fault(UserFault(ExceptionInfo {
         vector,
-        // SAFETY: written by the trap path just before returning.
-        error_code: unsafe { core::ptr::addr_of!(rhizo_trap_error).read() },
+        // Written by the trap path just before returning.
+        error_code: super::cpu::trap_error(),
         rip: regs.pc,
         fault_address: (vector == exception::PAGE_FAULT).then(read_cr2),
     }))

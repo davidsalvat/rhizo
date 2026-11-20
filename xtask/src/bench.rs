@@ -373,6 +373,7 @@ fn measure_cells(
         echo: false,
         accel: opts.accel,
         gdb: false,
+        cpus: 1,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -710,6 +711,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         echo: false,
         accel,
         gdb: false,
+        cpus: 1,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),

@@ -1,5 +1,6 @@
 //! Interrupts for preemption (design decisions D2–D5 of `add-scheduler`):
-//! the virtual timer (`CNTV_*`, PPI 27) through a GICv3.
+//! the virtual timer (`CNTV_*`, PPI 27) through a GICv3; and the wake-up
+//! between CPUs (SGI 0, spec `multi-core`).
 //!
 //! Interrupts are taken only from cell code (EL0); the kernel runs with them
 //! masked. Idling waits with `wfi`, which wakes on a pending interrupt even
@@ -7,28 +8,98 @@
 
 use super::MMIO_BASE;
 use super::platform::gic_regions;
+use crate::memory;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
+use rhizo_core::smp::MAX_CPUS;
+use rhizo_mm::FRAME_SIZE;
+use rhizo_mm::paging::PageFlags;
 
 const TIMER_PPI: u32 = 27;
+/// Software-generated interrupt that wakes an idle CPU.
+const WAKE_SGI: u32 = 0;
 const SPURIOUS: u64 = 1023;
+/// `GICR_TYPER`: affinity in bits 63:32, `Last` (bit 4), `VLPIS` (bit 1).
+const GICR_TYPER: u64 = 0x8;
+/// Bytes per redistributor: `RD_base` and `SGI_base` frames, plus two
+/// more with virtual LPIs (GICv4).
+const REDIST: u64 = 0x2_0000;
 
-/// Virtual addresses (MMIO window) of the distributor and of CPU 0's
-/// redistributor (`RD_base`; `SGI_base` follows 64 KiB later).
-static GICD: AtomicU64 = AtomicU64::new(0);
-static GICR: AtomicU64 = AtomicU64::new(0);
+/// Physical base of the redistributors.
+static GICR_BASE: AtomicU64 = AtomicU64::new(0);
+/// Virtual address (MMIO window) of each CPU's redistributor (`RD_base`;
+/// `SGI_base` follows 64 KiB later), by CPU number; 0 before its `init`.
+static GICR: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Counter ticks between two timer interrupts (the periodic tick).
 static TICK: AtomicU64 = AtomicU64::new(0);
 
 fn write32(addr: u64, value: u32) {
     // SAFETY: `addr` is a GIC register in the MMIO window, mapped as device
-    // memory by `platform::map_devices`.
+    // memory by `platform::map_devices` or `map_redistributors`.
     unsafe { (addr as *mut u32).write_volatile(value) }
 }
 
 fn read32(addr: u64) -> u32 {
     // SAFETY: as for `write32`.
     unsafe { (addr as *const u32).read_volatile() }
+}
+
+fn read64(addr: u64) -> u64 {
+    // SAFETY: as for `write32`.
+    unsafe { (addr as *const u64).read_volatile() }
+}
+
+/// This CPU's affinity (`MPIDR_EL1` Aff3..Aff0), as the device tree and
+/// `GICR_TYPER` write it.
+pub fn mpidr() -> u64 {
+    let mpidr: u64;
+    // SAFETY: reading an ID register has no side effects.
+    unsafe { asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags)) };
+    mpidr & 0xff_00ff_ffff
+}
+
+/// Distance between two redistributors (the first one's `VLPIS` decides).
+fn redist_stride() -> u64 {
+    let first = MMIO_BASE + GICR_BASE.load(Ordering::Relaxed);
+    if read64(first + GICR_TYPER) & 2 != 0 {
+        2 * REDIST
+    } else {
+        REDIST
+    }
+}
+
+/// The redistributor (virtual `RD_base`) whose affinity is `mpidr`.
+fn redistributor(mpidr: u64) -> Option<u64> {
+    let (aff3, low) = (mpidr >> 32, mpidr & 0xff_ffff);
+    let affinity = (aff3 << 24) | low;
+    let stride = redist_stride();
+    let mut rd = MMIO_BASE + GICR_BASE.load(Ordering::Relaxed);
+    for _ in 0..MAX_CPUS {
+        let typer = read64(rd + GICR_TYPER);
+        if typer >> 32 == affinity {
+            return Some(rd);
+        }
+        if typer & (1 << 4) != 0 {
+            return None;
+        }
+        rd += stride;
+    }
+    None
+}
+
+/// Maps the redistributors of `cpus` CPUs (the first one is mapped at
+/// boot), so each secondary CPU finds its own.
+pub fn map_redistributors(cpus: usize) {
+    let Some([_, (base, size)]) = gic_regions() else {
+        return;
+    };
+    let len = (cpus as u64 * redist_stride()).min(size);
+    let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
+    for page in (base..base + len).step_by(FRAME_SIZE as usize) {
+        if memory::translate(MMIO_BASE + page).is_none() {
+            memory::map_page(MMIO_BASE + page, page, flags).expect("map a GIC redistributor");
+        }
+    }
 }
 
 /// Sets up the GIC and starts the timer as a periodic tick every `tick_ns`
@@ -39,21 +110,40 @@ pub fn init(tick_ns: u64) {
     let Some([(d, _), (r, _)]) = gic_regions() else {
         return;
     };
-    let (gicd, gicr) = (MMIO_BASE + d, MMIO_BASE + r);
+    let gicd = MMIO_BASE + d;
     // Distributor: affinity routing and group 1 enabled (bits valid in both
     // the single- and two-security-state views).
     write32(gicd, (1 << 4) | (1 << 1) | 1);
     while read32(gicd) & (1 << 31) != 0 {}
+    GICR_BASE.store(r, Ordering::Relaxed);
+    init_cpu();
+    TICK.store(ns_to_ticks(tick_ns), Ordering::Relaxed);
+    arm(ns_to_ticks(tick_ns));
+}
+
+/// Sets up this CPU's redistributor and CPU interface: the timer PPI and
+/// the wake-up SGI enabled, interrupts left masked in PSTATE. The timer
+/// stays off until armed.
+pub fn init_cpu() {
+    if GICR_BASE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let Some(gicr) = redistributor(mpidr()) else {
+        return;
+    };
     // Redistributor: wake it up.
     let waker = gicr + 0x14;
     write32(waker, read32(waker) & !(1 << 1));
     while read32(waker) & (1 << 2) != 0 {}
-    // The timer PPI: group 1, middle priority, enabled.
+    // The timer PPI and the wake-up SGI: group 1, middle priority, enabled.
     let sgi = gicr + 0x1_0000;
-    write32(sgi + 0x80, read32(sgi + 0x80) | (1 << TIMER_PPI));
-    // SAFETY: byte access to the priority register of the PPI.
-    unsafe { ((sgi + 0x400 + TIMER_PPI as u64) as *mut u8).write_volatile(0x80) };
-    write32(sgi + 0x100, 1 << TIMER_PPI);
+    let bits = (1 << TIMER_PPI) | (1 << WAKE_SGI);
+    write32(sgi + 0x80, read32(sgi + 0x80) | bits);
+    for intid in [TIMER_PPI, WAKE_SGI] {
+        // SAFETY: byte access to the priority register of the interrupt.
+        unsafe { ((sgi + 0x400 + intid as u64) as *mut u8).write_volatile(0x80) };
+    }
+    write32(sgi + 0x100, bits);
     // CPU interface through system registers: priority mask open, group 1 on.
     // SAFETY: enabling the system-register interface and group 1 interrupts
     // of this CPU; interrupts stay masked in PSTATE while the kernel runs.
@@ -72,10 +162,7 @@ pub fn init(tick_ns: u64) {
             options(nostack)
         );
     }
-    GICD.store(gicd, Ordering::Relaxed);
-    GICR.store(gicr, Ordering::Relaxed);
-    TICK.store(ns_to_ticks(tick_ns), Ordering::Relaxed);
-    arm(ns_to_ticks(tick_ns));
+    GICR[crate::arch::cpu::index()].store(gicr, Ordering::Relaxed);
 }
 
 fn ns_to_ticks(ns: u64) -> u64 {
@@ -85,7 +172,7 @@ fn ns_to_ticks(ns: u64) -> u64 {
 
 /// Whether preemption is available (a GICv3 was found).
 pub fn available() -> bool {
-    GICR.load(Ordering::Relaxed) != 0
+    GICR[0].load(Ordering::Relaxed) != 0
 }
 
 /// Arms the timer to fire after `ticks` counter ticks.
@@ -127,4 +214,33 @@ pub fn wait_ns(ns: u64) {
     // SAFETY: waiting for an interrupt has no other effect.
     unsafe { asm!("dsb sy", "wfi", options(nostack)) };
     acknowledge();
+}
+
+/// Waits for an interrupt (a wake-up), with the timer left as it is.
+pub fn wait() {
+    // SAFETY: waiting for an interrupt has no other effect.
+    unsafe { asm!("dsb sy", "wfi", options(nostack)) };
+    acknowledge();
+}
+
+/// Sends the wake-up SGI to the CPU whose affinity is `mpidr`, after the
+/// stores made so far are visible to it.
+pub fn wake(mpidr: u64) {
+    let (aff0, aff1, aff2, aff3) = (
+        mpidr & 0xff,
+        (mpidr >> 8) & 0xff,
+        (mpidr >> 16) & 0xff,
+        mpidr >> 32,
+    );
+    // ICC_SGI1R_EL1: Aff3, range selector (Aff0 / 16), Aff2, INTID, Aff1,
+    // target list (bit Aff0 % 16).
+    let value = (aff3 << 48)
+        | ((aff0 >> 4) << 44)
+        | (aff2 << 32)
+        | ((WAKE_SGI as u64) << 24)
+        | (aff1 << 16)
+        | (1 << (aff0 & 0xf));
+    // SAFETY: generating an SGI only interrupts the target CPU; the barrier
+    // orders the caller's stores before it.
+    unsafe { asm!("dsb ishst", "msr S3_0_C12_C11_5, {}", "isb", in(reg) value, options(nostack)) };
 }

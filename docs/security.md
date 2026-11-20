@@ -78,6 +78,12 @@ What makes the boundary hold:
 - **Per-cell state.** Registers, FP/SIMD state (switched lazily, trapped on
   first use), files and descriptors (`rhizo_fs::Fs`, private copy-on-write)
   and the system-call handler (`Abi`) belong to one cell.
+- **Per-CPU kernel data** (`add-smp-boot`). The entry code finds the
+  kernel stack and the running cell's registers through per-CPU data that
+  cell code cannot redirect: `TPIDR_EL1` on AArch64 (not accessible at
+  EL0), and on x86_64 the kernel GS base, which is swapped out with
+  `SWAPGS` before every return to a cell and back in at every entry, so a
+  cell loading GS or changing its own GS base only changes its copy.
 - **Zeroed memory.** Every frame a cell is given is zeroed or fully
   written first: anonymous mappings and the heap (`map_anonymous`), ELF
   pages and the stack (`zero_frame` before copying), page tables, private

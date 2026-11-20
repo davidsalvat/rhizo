@@ -213,6 +213,12 @@ jobs:
       - name: Boot on Cloud Hypervisor
         run: cargo xtask --arch x86_64 run --release --vmm cloud-hypervisor
 
+      - name: In-kernel tests on 4 CPUs on Firecracker
+        run: cargo xtask --arch x86_64 test --only ktest-smp --vmm firecracker
+
+      - name: In-kernel tests on 4 CPUs on Cloud Hypervisor
+        run: cargo xtask --arch x86_64 test --only ktest-smp --vmm cloud-hypervisor
+
       - name: Benchmarks and regression gate
         run: cargo xtask --arch x86_64 bench --env ci --check --output bench-results.json
 

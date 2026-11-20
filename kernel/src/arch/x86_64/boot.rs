@@ -139,7 +139,15 @@ pvh_start32:
     movw %ax, %fs
     movw %ax, %gs
 
-    /* 6. Arguments, higher-half stack, then jump to the higher half. */
+    /* 6. GS base: CPU 0's per-CPU data (index 0). The GS selector is never
+       loaded again, so the base stays. */
+    movabsq $rhizo_percpu, %rax
+    movq %rax, %rdx
+    shrq $32, %rdx
+    movl $0xC0000101, %ecx
+    wrmsr
+
+    /* Arguments, higher-half stack, then jump to the higher half. */
     movl rhizo_boot_start_info, %edi
     movq rhizo_boot_tsc, %rsi
     movabsq $rhizo_kernel_stack_top, %rsp

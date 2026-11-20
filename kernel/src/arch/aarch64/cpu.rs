@@ -6,6 +6,7 @@ use crate::memory::DirectMap;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rhizo_core::exception::{self, Aarch64Exception};
+use rhizo_core::smp::MAX_CPUS;
 use rhizo_hal::{ExitStatus, PhysicalMemory, Power, Tlb};
 
 // Sixteen vectors of 0x80 bytes in a 2 KiB-aligned table. Exceptions taken
@@ -16,9 +17,11 @@ use rhizo_hal::{ExitStatus, PhysicalMemory, Power, Tlb};
 // - From a cell (vectors 8-11): SP_EL1 points at the cell's `Registers`
 //   (`enter_user` put it there), so the vector saves the user state in place,
 //   restores the kernel stacks and returns from `rhizo_enter_cell` with the
-//   vector index (design decision D3, option B).
+//   vector index (design decision D3, option B). The kernel stacks are
+//   this CPU's: `TPIDR_EL1` points at its `PerCpu`.
 //
 // `Registers` layout: pc 0, sp 8, x0-x30 at 16 + 8n, tls 264, flags 272.
+// `PerCpu` layout: index 0, kernel sp 8, exception stack top 16.
 core::arch::global_asm!(
     r#"
     .macro RHIZO_VECTOR n
@@ -78,12 +81,12 @@ rhizo_el0_trap:
     mrs     x1, tpidr_el0
     mrs     x2, spsr_el1
     stp     x1, x2, [sp, #264]
-    ldr     x1, =rhizo_exception_stack_top
-    mov     sp, x1
+    mrs     x1, tpidr_el1
+    ldr     x2, [x1, #16]
+    mov     sp, x2
     msr     spsel, #0
-    ldr     x1, =rhizo_kernel_sp
-    ldr     x1, [x1]
-    mov     sp, x1
+    ldr     x2, [x1, #8]
+    mov     sp, x2
     ldp     x19, x20, [sp, #16]
     ldp     x21, x22, [sp, #32]
     ldp     x23, x24, [sp, #48]
@@ -101,9 +104,9 @@ rhizo_enter_cell:
     stp     x23, x24, [sp, #48]
     stp     x25, x26, [sp, #64]
     stp     x27, x28, [sp, #80]
-    ldr     x1, =rhizo_kernel_sp
+    mrs     x1, tpidr_el1
     mov     x2, sp
-    str     x2, [x1]
+    str     x2, [x1, #8]
     msr     spsel, #1
     mov     sp, x0
     ldp     x1, x2, [sp, #0]
@@ -135,6 +138,49 @@ rhizo_enter_cell:
     "#
 );
 
+/// What each CPU keeps for itself, found through `TPIDR_EL1` (set by the
+/// entry code before any Rust code runs on the CPU).
+#[repr(C)]
+#[derive(Debug)]
+pub struct PerCpu {
+    /// The CPU's number: 0 for the boot CPU (spec `multi-core`).
+    index: AtomicU64,
+    /// Kernel stack pointer saved while a cell runs on this CPU.
+    kernel_sp: AtomicU64,
+    /// Top of this CPU's exception stack (`SP_EL1` when no cell runs).
+    exception_stack: AtomicU64,
+}
+
+/// Per-CPU data of every CPU, by number.
+#[unsafe(export_name = "rhizo_percpu")]
+static PERCPU: [PerCpu; MAX_CPUS] = [const {
+    PerCpu {
+        index: AtomicU64::new(0),
+        kernel_sp: AtomicU64::new(0),
+        exception_stack: AtomicU64::new(0),
+    }
+}; MAX_CPUS];
+
+/// The number of the CPU running this code.
+pub fn index() -> usize {
+    let percpu: *const PerCpu;
+    // SAFETY: reading TPIDR_EL1 has no side effects.
+    unsafe { asm!("mrs {}, tpidr_el1", out(reg) percpu, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: the entry code points TPIDR_EL1 at this CPU's entry of
+    // `PERCPU` before any Rust code runs, and never changes it.
+    unsafe { (*percpu).index.load(Ordering::Relaxed) as usize }
+}
+
+/// Prepares the per-CPU data of secondary CPU `cpu`, whose exception stack
+/// tops at `exception_stack`; returns its address (for `TPIDR_EL1`).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub(super) fn percpu(cpu: usize, exception_stack: u64) -> u64 {
+    let p = &PERCPU[cpu];
+    p.index.store(cpu as u64, Ordering::Relaxed);
+    p.exception_stack.store(exception_stack, Ordering::Relaxed);
+    p as *const PerCpu as u64
+}
+
 /// Lower-half table loaded in `TTBR0_EL1`: the empty one, or a cell's
 /// (managed by [`super::user`]).
 pub(super) static USER_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -142,6 +188,9 @@ pub(super) static EMPTY_ROOT: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 extern "C" fn rhizo_exception_handler(esr: u64, far: u64, elr: u64, _vector: u64) -> ! {
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    let guard = crate::smp::stack_guard(index());
+    #[cfg(not(any(feature = "ktest", feature = "bench-cell")))]
     let guard = super::boot::layout::stack_guard();
     exception::report_aarch64(
         &mut BootConsole,

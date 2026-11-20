@@ -199,6 +199,9 @@ rhizo_high_entry:
     ldr     x0, =rhizo_exception_stack_top
     mov     sp, x0
     msr     spsel, #0
+    ldr     x1, =rhizo_percpu       // CPU 0's per-CPU data (index 0)
+    str     x0, [x1, #16]
+    msr     tpidr_el1, x1
     ldr     x0, =rhizo_kernel_stack_top
     mov     sp, x0
     ldr     x0, =rhizo_vectors
@@ -216,6 +219,7 @@ rhizo_high_entry:
 
     .section .bss.boot_tables, "aw", @nobits
     .balign 4096
+    .global rhizo_l0_low
 rhizo_l0_low:     .skip 4096
 rhizo_l0_high:    .skip 4096
 rhizo_l1_ram:     .skip 4096
@@ -240,10 +244,6 @@ rhizo_exception_stack_top:
     .balign 8
     .global rhizo_image_phys
 rhizo_image_phys:
-    .skip 8
-    // Kernel stack pointer saved while a cell runs (see `cpu::enter_user`).
-    .global rhizo_kernel_sp
-rhizo_kernel_sp:
     .skip 8
     .text
     "#,

@@ -11,7 +11,7 @@ use crate::arch::user::{self, Trap};
 use crate::memory::{self, DirectMap};
 use crate::sync::Global;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::memory::Pager;
@@ -179,9 +179,17 @@ impl Services for KernelServices<'_> {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-static IRQ_READY: AtomicBool = AtomicBool::new(false);
-/// Highest address-space tag of this CPU (set with `IRQ_READY`).
+/// Highest address-space tag (set by [`init`]).
 static MAX_TAG: AtomicU16 = AtomicU16::new(0);
+
+/// Sets up preemption and address-space tags on the boot CPU, then starts
+/// the other CPUs, at most `smp` in all (spec `multi-core`); returns how
+/// many are online. Call once, before any [`Host`].
+pub fn init(smp: Option<u16>) -> usize {
+    irq::init(SLICE_NS);
+    MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
+    crate::smp::start(smp)
+}
 
 /// Monotonic time in nanoseconds since boot (0 if the counter frequency is
 /// unknown).
@@ -354,12 +362,8 @@ pub struct Host {
 }
 
 impl Host {
-    /// An empty host; sets up the timer interrupt the first time.
+    /// An empty host.
     pub fn new() -> Self {
-        if !IRQ_READY.swap(true, Ordering::Relaxed) {
-            irq::init(SLICE_NS);
-            MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
-        }
         Self {
             sched: Scheduler::new(),
             tags: TagPool::new(MAX_TAG.load(Ordering::Relaxed)),

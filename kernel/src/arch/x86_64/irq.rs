@@ -15,11 +15,20 @@ use rhizo_mm::paging::PageFlags;
 
 /// Vector of the timer interrupt.
 pub const TIMER_VECTOR: u8 = 32;
+/// Vector of the wake-up between CPUs (spec `multi-core`).
+pub const WAKE_VECTOR: u8 = 33;
 /// Vector of spurious APIC interrupts (no EOI).
 pub const SPURIOUS_VECTOR: u8 = 255;
 
 const IA32_APIC_BASE: u32 = 0x1b;
+const ID: u32 = 0x20;
 const SVR: u32 = 0xf0;
+const ICR_LOW: u32 = 0x300;
+const ICR_HIGH: u32 = 0x310;
+/// ICR: level assert, and the INIT and STARTUP delivery modes.
+const ASSERT: u32 = 1 << 14;
+const INIT: u32 = 0b101 << 8;
+const STARTUP: u32 = 0b110 << 8;
 const EOI: u32 = 0xb0;
 const LVT_TIMER: u32 = 0x320;
 const INITIAL_COUNT: u32 = 0x380;
@@ -86,6 +95,17 @@ fn tick() {
     write(INITIAL_COUNT, count);
 }
 
+/// Enables this CPU's local APIC, in x2APIC mode when `x2apic`.
+fn enable(x2apic: bool) {
+    // SAFETY: IA32_APIC_BASE exists on every x86_64 CPU; setting EN (and
+    // EXTD for x2APIC) enables the local APIC.
+    unsafe {
+        let base = rdmsr(IA32_APIC_BASE);
+        let extd = if x2apic { 1 << 10 } else { 0 };
+        wrmsr(IA32_APIC_BASE, base | (1 << 11) | extd);
+    }
+}
+
 /// Masks the legacy PIC, enables the local APIC and starts its timer as a
 /// periodic tick every `tick_ns` on [`TIMER_VECTOR`] (design D4: armed once,
 /// so switching cells never reprograms it; under virtualization every
@@ -102,8 +122,7 @@ pub fn init(tick_ns: u64) {
     // EXTD for x2APIC) enables the local APIC.
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
     if x2apic {
-        // SAFETY: as above.
-        unsafe { wrmsr(IA32_APIC_BASE, base | (1 << 11) | (1 << 10)) };
+        enable(true);
         APIC.store(1, Ordering::Relaxed);
     } else {
         let phys = base & 0xf_ffff_f000;
@@ -112,8 +131,7 @@ pub fn init(tick_ns: u64) {
             let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
             memory::map_page(virt, phys, flags).expect("map the local APIC page");
         }
-        // SAFETY: as above.
-        unsafe { wrmsr(IA32_APIC_BASE, base | (1 << 11)) };
+        enable(false);
         APIC.store(virt, Ordering::Relaxed);
     }
     write(SVR, 0x100 | SPURIOUS_VECTOR as u32);
@@ -123,6 +141,66 @@ pub fn init(tick_ns: u64) {
         Ordering::Relaxed,
     );
     tick();
+}
+
+/// Enables a secondary CPU's local APIC like the boot CPU's, its timer
+/// masked (an idle CPU takes no ticks).
+pub fn init_cpu() {
+    enable(APIC.load(Ordering::Relaxed) == 1);
+    write(SVR, 0x100 | SPURIOUS_VECTOR as u32);
+    write(LVT_TIMER, (1 << 16) | TIMER_VECTOR as u32);
+}
+
+/// This CPU's local APIC identifier (the boot CPU's before `init`).
+pub fn apic_id() -> u32 {
+    match APIC.load(Ordering::Relaxed) {
+        0 => core::arch::x86_64::__cpuid(1).ebx >> 24,
+        1 => read(ID),
+        _ => read(ID) >> 24,
+    }
+}
+
+/// Sends an interrupt command to the CPU with APIC identifier `dest`.
+fn command(dest: u32, low: u32) {
+    match APIC.load(Ordering::Relaxed) {
+        0 => {}
+        // SAFETY: the x2APIC ICR is MSR 0x830; WRMSR to it is not
+        // serializing, so the fence first makes earlier stores visible.
+        1 => unsafe {
+            asm!("mfence", options(nostack, preserves_flags));
+            wrmsr(0x830, ((dest as u64) << 32) | low as u64);
+        },
+        _ => {
+            write(ICR_HIGH, dest << 24);
+            write(ICR_LOW, low);
+            while read(ICR_LOW) & (1 << 12) != 0 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Sends INIT to the CPU `dest` (it waits for a STARTUP IPI).
+pub fn send_init(dest: u32) {
+    command(dest, INIT | ASSERT);
+}
+
+/// Sends STARTUP to the CPU `dest`: it starts in real mode at page `page`.
+pub fn send_startup(dest: u32, page: u8) {
+    command(dest, STARTUP | ASSERT | page as u32);
+}
+
+/// Sends the wake-up interrupt to the CPU `dest`.
+pub fn wake(dest: u32) {
+    command(dest, ASSERT | WAKE_VECTOR as u32);
+}
+
+/// Waits for an interrupt (a wake-up), with interrupts enabled for the
+/// length of `hlt` only.
+pub fn wait() {
+    // SAFETY: as in `wait_ns`.
+    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+    acknowledge();
 }
 
 /// Whether preemption is available (always, once `init` ran).

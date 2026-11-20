@@ -1,8 +1,8 @@
 //! Minimal flattened device tree (FDT / DTB) reader.
 //!
 //! Reads only what the kernel needs at boot: memory regions, the command line
-//! (`/chosen/bootargs`), the PSCI conduit (`/psci/method`) and the first
-//! device with a given `compatible` string. No allocation; every query is a
+//! (`/chosen/bootargs`), the PSCI conduit (`/psci/method`), the CPUs
+//! (`/cpus`) and the first device with a given `compatible` string. No allocation; every query is a
 //! walk over the structure block. Format: Devicetree Specification v0.4, §5.
 
 const MAGIC: u32 = 0xd00d_feed;
@@ -32,6 +32,15 @@ pub enum FdtError {
 pub struct Region {
     pub base: u64,
     pub size: u64,
+}
+
+/// A CPU node of `/cpus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuNode {
+    /// Its `reg`: the affinity fields of `MPIDR_EL1` on AArch64.
+    pub id: u64,
+    /// Whether PSCI starts it (`enable-method = "psci"`).
+    pub psci: bool,
 }
 
 /// A parsed device tree.
@@ -227,6 +236,46 @@ impl<'a> Fdt<'a> {
         Ok(self.top_level_prop(b"psci", b"method")?.map(string))
     }
 
+    /// Calls `f` with every available CPU of `/cpus`, in tree order (nodes
+    /// with `device_type = "cpu"` and a `reg`, skipping `status` other than
+    /// `okay`).
+    pub fn cpus(&self, mut f: impl FnMut(CpuNode)) -> Result<(), FdtError> {
+        let mut in_cpus = false;
+        let mut address = DEFAULT_CELLS.address;
+        // The CPU node being read: reg, psci, is a CPU, available.
+        let mut node = (None, false, false, true);
+        self.walk(|event| {
+            match event {
+                Event::Begin { depth: 1, name } => in_cpus = name == b"cpus",
+                Event::End { depth: 1 } => in_cpus = false,
+                Event::Prop {
+                    depth: 2,
+                    name: b"#address-cells",
+                    value,
+                } if in_cpus => address = read_cells(value, 1).unwrap_or(2) as u32,
+                Event::Begin { depth: 2, .. } if in_cpus => node = (None, false, false, true),
+                Event::Prop {
+                    depth: 3,
+                    name,
+                    value,
+                } if in_cpus => match name {
+                    b"reg" => node.0 = read_cells(value, address),
+                    b"enable-method" => node.1 = list_contains(value, b"psci"),
+                    b"device_type" => node.2 = string(value) == b"cpu",
+                    b"status" => node.3 = matches!(string(value), b"okay" | b"ok"),
+                    _ => {}
+                },
+                Event::End { depth: 2 } if in_cpus => {
+                    if let (Some(id), psci, true, true) = node {
+                        f(CpuNode { id, psci });
+                    }
+                }
+                _ => {}
+            }
+            true
+        })
+    }
+
     /// Calls `f` with every RAM region (`reg` of `memory` nodes).
     pub fn memory_regions(&self, mut f: impl FnMut(Region)) -> Result<(), FdtError> {
         let mut root = DEFAULT_CELLS;
@@ -355,6 +404,37 @@ mod tests {
         assert_eq!(reg(2), None);
     }
 
+    /// `-M virt,gic-version=3 -smp 4`.
+    const QEMU_VIRT_SMP4: &[u8] = include_bytes!("../fixtures/qemu-virt-smp4.dtb");
+
+    #[test]
+    fn lists_the_cpus() {
+        let cpus = |blob| {
+            let mut v = Vec::new();
+            Fdt::new(blob).unwrap().cpus(|c| v.push(c)).unwrap();
+            v
+        };
+        let psci = |id| CpuNode { id, psci: true };
+        assert_eq!(cpus(QEMU_VIRT_SMP4), [psci(0), psci(1), psci(2), psci(3)]);
+        assert_eq!(
+            cpus(QEMU_VIRT_GICV3),
+            [CpuNode { id: 0, psci: false }],
+            "a single CPU has no enable method"
+        );
+        let (plain, with_cpus) = (handmade(false), handmade(true));
+        assert_eq!(cpus(&plain), [], "no /cpus node");
+        assert_eq!(
+            cpus(&with_cpus),
+            [
+                CpuNode {
+                    id: 0x100,
+                    psci: false
+                },
+                psci(0x1_0000_0002)
+            ]
+        );
+    }
+
     #[test]
     fn reads_qemu_virt() {
         let fdt = Fdt::new(QEMU_VIRT).unwrap();
@@ -404,8 +484,8 @@ mod tests {
 
     /// Builds a tiny device tree by hand: root with 1-cell addresses and
     /// sizes, two memory banks in one `reg`, a 16550 UART under `/soc`
-    /// (2-cell addresses), and no `/chosen`.
-    fn handmade() -> Vec<u8> {
+    /// (2-cell addresses), no `/chosen`, and `/cpus` when `with_cpus`.
+    fn handmade(with_cpus: bool) -> Vec<u8> {
         let mut strings = Vec::new();
         let mut name = |s: &str| {
             let off = strings.len() as u32;
@@ -420,6 +500,8 @@ mod tests {
             name("compatible"),
             name("method"),
         );
+        let (device_type, enable, status) =
+            (name("device_type"), name("enable-method"), name("status"));
         let mut s = Vec::new();
         let begin = |s: &mut Vec<u8>, n: &str| {
             s.extend(BEGIN_NODE.to_be_bytes());
@@ -460,6 +542,32 @@ mod tests {
         begin(&mut s, "psci");
         prop(&mut s, method, b"smc\0");
         s.extend(END_NODE.to_be_bytes());
+        if with_cpus {
+            // Two-cell CPU identifiers; one CPU without PSCI, one disabled,
+            // and a node that is not a CPU.
+            begin(&mut s, "cpus");
+            prop(&mut s, ac, &cells(&[2]));
+            prop(&mut s, sc, &cells(&[0]));
+            for (n, id, psci, state) in [
+                ("cpu@100", [0, 0x100], false, None),
+                ("cpu@101", [0, 0x101], true, Some(&b"disabled\0"[..])),
+                ("cpu@100000002", [1, 2], true, Some(b"okay\0")),
+            ] {
+                begin(&mut s, n);
+                prop(&mut s, device_type, b"cpu\0");
+                prop(&mut s, reg, &cells(&id));
+                if psci {
+                    prop(&mut s, enable, b"psci\0");
+                }
+                if let Some(state) = state {
+                    prop(&mut s, status, state);
+                }
+                s.extend(END_NODE.to_be_bytes());
+            }
+            begin(&mut s, "cpu-map");
+            s.extend(END_NODE.to_be_bytes());
+            s.extend(END_NODE.to_be_bytes());
+        }
         s.extend(END_NODE.to_be_bytes());
         s.extend(END.to_be_bytes());
 
@@ -488,7 +596,7 @@ mod tests {
 
     #[test]
     fn honors_cell_sizes_and_multiple_banks() {
-        let blob = handmade();
+        let blob = handmade(true);
         let fdt = Fdt::new(&blob).unwrap();
         let mut memory = Vec::new();
         fdt.memory_regions(|r| memory.push(r)).unwrap();

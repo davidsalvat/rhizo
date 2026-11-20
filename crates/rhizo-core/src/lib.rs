@@ -5,12 +5,15 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod acpi;
 pub mod boot;
 pub mod exception;
 pub mod fdt;
 pub mod ktest;
 pub mod options;
 pub mod panic;
+pub mod smp;
+pub mod sync;
 
 /// The kernel version, taken from the workspace version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
