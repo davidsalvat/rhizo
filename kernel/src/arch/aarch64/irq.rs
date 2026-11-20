@@ -211,6 +211,7 @@ pub fn set_tick_ns(ns: u64) {
 
 /// Enables private peripheral interrupt `intid` (16–31) on this CPU, like
 /// the timer's; returns whether there is a GIC to do it.
+#[cfg(feature = "sampling")]
 pub fn enable_ppi(intid: u32) -> bool {
     let gicr = GICR[crate::arch::cpu::index()].load(Ordering::Relaxed);
     if gicr == 0 || !(16..32).contains(&intid) {

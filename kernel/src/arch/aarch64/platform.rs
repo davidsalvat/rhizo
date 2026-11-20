@@ -132,7 +132,7 @@ pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
 
 /// The performance monitors' overflow interrupt (INTID) from the device
 /// tree, if it lists one.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "sampling")]
 pub fn pmu_interrupt() -> Option<u32> {
     device_tree().pmu_interrupt().ok().flatten()
 }
