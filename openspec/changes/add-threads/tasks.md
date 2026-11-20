@@ -27,5 +27,5 @@
 
 ## 6. Benchmarks and documentation
 
-- [ ] 6.1 `cell.thread_create_us` and `cell.futex_wake_ns` (D10): `bench` mode of `threads`, `bench-cell` line, parsing in `xtask/src/bench.rs` with a unit test, `bench/README.md`; verify `cargo xtask bench --runs 1` locally and the CI bench gate
-- [ ] 6.2 `AGENTS.md` code map; `cargo xtask ci` on both architectures; CI green
+- [x] 6.1 `cell.thread_create_us` and `cell.futex_wake_ns` (D10): `bench` mode of `threads`, `bench-cell` line, parsing in `xtask/src/bench.rs` with a unit test, `bench/README.md`; verify `cargo xtask bench --runs 1` locally and the CI bench gate
+- [x] 6.2 `AGENTS.md` code map; `cargo xtask ci` on both architectures; CI green
