@@ -21,7 +21,10 @@ pub struct FrameAllocator<'a> {
     /// Frames made available by `add_free_region` (net of reservations).
     usable: usize,
     free: usize,
-    /// Next-fit hint: frame index where the next search starts.
+    /// Frame index where the next search starts: just past the last frame
+    /// handed out, or the lowest frame freed since, so freed frames are
+    /// reused before frames never handed out (design D1 of
+    /// `reuse-freed-frames`).
     hint: usize,
 }
 
@@ -159,6 +162,7 @@ impl<'a> FrameAllocator<'a> {
         }
         self.update_range(first, first + count, true);
         self.free += count;
+        self.hint = self.hint.min(first);
     }
 
     /// Returns whether the frame at `addr` is currently in use (or reserved).
@@ -333,6 +337,31 @@ mod tests {
         fa.free(130 * FRAME_SIZE);
         fa.free(131 * FRAME_SIZE);
         assert_eq!(fa.alloc_contiguous(2), Some(130 * FRAME_SIZE));
+    }
+
+    #[test]
+    fn freed_frames_are_reused_before_untouched_ones() {
+        let mut bits = [0u64; 8];
+        let mut fa = allocator(&mut bits, 512);
+        fa.add_free_region(0, 512 * FRAME_SIZE);
+        for _ in 0..100 {
+            fa.alloc().unwrap();
+        }
+        fa.free(40 * FRAME_SIZE);
+        fa.free(7 * FRAME_SIZE);
+        assert_eq!(
+            fa.alloc(),
+            Some(7 * FRAME_SIZE),
+            "the lowest freed frame first"
+        );
+        assert_eq!(fa.alloc(), Some(40 * FRAME_SIZE));
+        assert_eq!(
+            fa.alloc(),
+            Some(100 * FRAME_SIZE),
+            "then frames never handed out"
+        );
+        fa.free_contiguous(10 * FRAME_SIZE, 3);
+        assert_eq!(fa.alloc_contiguous(3), Some(10 * FRAME_SIZE));
     }
 
     #[test]
