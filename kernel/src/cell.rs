@@ -780,8 +780,26 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
         user::fp_trap(fp_owner() != key);
         loop {
             let flush = live.clean & (1 << cpu) == 0;
+            let u0 = Counter.cycles();
             let trap = user::enter_user(live.cell.root, live.tag, flush, live.cell.regs_mut());
+            let u1 = Counter.cycles();
+            prof::add(&prof::USER, u1 - u0);
             live.clean |= flushed_on(cpu);
+            let is_fault = matches!(trap, Trap::Fault(_));
+            if is_fault {
+                prof::add(&prof::FAULTS, 1);
+            }
+            let nr = (match user::ABI {
+                rhizo_abi::Arch::Aarch64 => live.cell.regs().gpr[8],
+                _ => live.cell.regs().gpr[0],
+            } as usize)
+                & 511;
+            let _prof = Prof {
+                start: u1,
+                nr,
+                is_sys: matches!(trap, Trap::Syscall),
+                is_fault,
+            };
             match trap {
                 Trap::Syscall => {
                     let tid = live.cell.threads.current().tid;
@@ -1037,6 +1055,7 @@ impl Host {
         services.random(&mut random);
         let kernel = memory::kernel_tables();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
+        let p0 = Counter.cycles();
         let cell = rhizo_cell::spawn::<Format>(
             id,
             image,
@@ -1049,6 +1068,7 @@ impl Host {
             random,
         )?;
         sync_code(&PageTable::<Format>::from_root(cell.root), image);
+        prof::add(&prof::SPAWN, Counter.cycles() - p0);
         let live = self.new_live(cell, capture, echo, services.random, files);
         self.state().sched.place(live);
         Ok(id)
@@ -1819,6 +1839,49 @@ fn python() -> Option<(u64, u64)> {
     Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
 }
 
+struct Prof {
+    start: u64,
+    nr: usize,
+    is_sys: bool,
+    is_fault: bool,
+}
+
+impl Drop for Prof {
+    fn drop(&mut self) {
+        let d = Counter.cycles() - self.start;
+        if self.is_sys {
+            prof::add(&prof::SYS_N[self.nr], 1);
+            prof::add(&prof::SYS_CY[self.nr], d);
+        } else if self.is_fault {
+            prof::add(&prof::FAULT_CY, d);
+        }
+    }
+}
+
+/// Temporary profile of the CPython cold start (diagnostic branch only).
+pub mod prof {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static SPAWN: AtomicU64 = AtomicU64::new(0);
+    pub static USER: AtomicU64 = AtomicU64::new(0);
+    pub static FAULTS: AtomicU64 = AtomicU64::new(0);
+    pub static FAULT_CY: AtomicU64 = AtomicU64::new(0);
+    pub static SYS_N: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+    pub static SYS_CY: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+    #[allow(dead_code)]
+    pub fn reset() {
+        for a in [&SPAWN, &USER, &FAULTS, &FAULT_CY] {
+            a.store(0, Relaxed);
+        }
+        for i in 0..512 {
+            SYS_N[i].store(0, Relaxed);
+            SYS_CY[i].store(0, Relaxed);
+        }
+    }
+    pub fn add(a: &AtomicU64, v: u64) {
+        a.fetch_add(v, Relaxed);
+    }
+}
+
 /// The files a CPython cell starts with (`cpython-files`, packed by `xtask`:
 /// the standard library under `/usr/lib/python3.13` and `/app/agent_demo.py`;
 /// design D2 of `add-cpython`), decoded once and then shared copy-on-write
@@ -1862,6 +1925,43 @@ fn cpython() -> Option<(u64, u64)> {
         host.run(|h| h.finished(id).is_some());
         cold.push(ns(t0, Counter.cycles()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    {
+        use core::fmt::Write;
+        use core::sync::atomic::Ordering::Relaxed;
+        let n = |c: u64| timer::cycles_to_ns(c).unwrap_or(0) / 1000;
+        prof::reset();
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_with_files(image, &ARGV, files.clone(), true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        let total = Counter.cycles() - t0;
+        let mut sys_total = 0;
+        let mut rows: Vec<(u64, usize, u64)> = Vec::new();
+        for i in 0..512 {
+            let c = prof::SYS_CY[i].load(Relaxed);
+            sys_total += c;
+            if c > 0 {
+                rows.push((c, i, prof::SYS_N[i].load(Relaxed)));
+            }
+        }
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let mut w = rhizo_hal::ConsoleWriter(&mut BootConsole);
+        let _ = write!(
+            w,
+            "rhizo-prof total_us={} spawn_us={} user_us={} sys_us={} faults={} fault_us={}",
+            n(total),
+            n(prof::SPAWN.load(Relaxed)),
+            n(prof::USER.load(Relaxed)),
+            n(sys_total),
+            prof::FAULTS.load(Relaxed),
+            n(prof::FAULT_CY.load(Relaxed)),
+        );
+        for (c, i, k) in rows.iter().take(14) {
+            let _ = write!(w, " sys{i}={}us/{k}", n(*c));
+        }
+        let _ = writeln!(w);
     }
     let template = host
         .spawn_with_files(image, &ARGV, files, true, false)
