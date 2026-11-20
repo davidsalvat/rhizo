@@ -14,6 +14,8 @@ mod arch;
 mod cell;
 #[cfg(feature = "control")]
 mod control;
+#[cfg(feature = "cells")]
+mod cost;
 mod heap;
 mod memory;
 #[cfg(feature = "cells")]

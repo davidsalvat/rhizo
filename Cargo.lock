@@ -417,6 +417,7 @@ dependencies = [
  "rhizo-hal",
  "rhizo-mm",
  "rhizo-net",
+ "rhizo-prof",
  "rhizo-sched",
  "rhizo-snapshot",
  "rhizo-virtio",
@@ -437,6 +438,13 @@ dependencies = [
  "proptest",
  "rhizo-hal",
  "smoltcp",
+]
+
+[[package]]
+name = "rhizo-prof"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

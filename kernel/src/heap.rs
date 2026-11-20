@@ -139,6 +139,12 @@ static ALLOCATOR: KernelAllocator = KernelAllocator {
     heap: Global::new(Heap::new(FramePages)),
 };
 
+/// How often CPUs waited for the kernel heap (spec `profiling`).
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+pub fn contention() -> rhizo_core::sync::Contention {
+    ALLOCATOR.heap.contention()
+}
+
 /// Pages the kernel heap holds and its live allocations.
 #[cfg_attr(
     not(feature = "ktest"),

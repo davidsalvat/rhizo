@@ -18,8 +18,9 @@ bench = false
 # Builds that run cells (set by `ktest`, `bench-cell` and `control`, never
 # alone): the cell host, preemption, the other CPUs and the network card.
 cells = []
-# Test build: run the in-kernel test suite instead of the normal boot path.
-ktest = ["cells"]
+# Test build: run the in-kernel test suite instead of the normal boot path
+# (with cost accounting built in, which it tests).
+ktest = ["cells", "profile"]
 # Harness self-checks used by `cargo xtask test`: each adds one failing test
 # to prove panics, hangs, exceptions and out-of-memory are detected.
 ktest-should-panic = ["ktest"]
@@ -35,6 +36,10 @@ bench-cell = ["cells"]
 # cells) on the serial line instead of exiting (`rhizo up`, change
 # `add-control-plane`).
 control = ["cells"]
+# Cost accounting (spec `profiling`): the kernel's hooks, compiled out
+# otherwise; with `bench-cell`, print the breakdowns of the workloads
+# instead of the benchmarks.
+profile = []
 
 [dependencies]
 rhizo-hal = { path = "../crates/rhizo-hal" }
@@ -48,6 +53,7 @@ rhizo-fs = { path = "../crates/rhizo-fs" }
 rhizo-net = { path = "../crates/rhizo-net" }
 rhizo-virtio = { path = "../crates/rhizo-virtio" }
 rhizo-control = { path = "../crates/rhizo-control" }
+rhizo-prof = { path = "../crates/rhizo-prof" }
 
 [lints]
 workspace = true
