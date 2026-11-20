@@ -10,6 +10,8 @@ struct Counted {
     next: u64,
     refs: BTreeMap<u64, (u32, PageSize)>,
     recycled: Vec<u64>,
+    /// No large frame is free (fragmented memory).
+    no_large: bool,
 }
 
 impl Counted {
@@ -39,7 +41,7 @@ impl Frames for Counted {
         Some(self.take(PageSize::Small))
     }
     fn alloc_large(&mut self) -> Option<u64> {
-        Some(self.take(PageSize::Large))
+        (!self.no_large).then(|| self.take(PageSize::Large))
     }
     fn free(&mut self, phys: u64, size: PageSize) {
         let (count, s) = self
@@ -126,7 +128,12 @@ impl<F: EntryFormat> World<F> {
         let t = pt.translate(&self.mem, virt).unwrap();
         if !t.flags.is_writable()
             && !pt
-                .resolve_write(&mut self.mem, &mut self.frames, virt)
+                .resolve_write(
+                    &mut self.mem,
+                    &mut self.frames,
+                    &mut RecordingTlb::default(),
+                    virt,
+                )
                 .unwrap()
         {
             return false;
@@ -209,16 +216,63 @@ fn mapping_in_a_child_is_not_seen_by_the_parent<F: EntryFormat>() {
     assert_eq!(w.frames.live(), 0);
 }
 
+/// With no 2 MiB block free, a write to a shared large page copies it into
+/// small pages: the writer sees all of its data and its write, the other
+/// sharer sees neither change, and every frame comes back.
+fn large_page_copied_into_small_pages_without_large_frames<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let parent = w.table();
+    let base = 0x4000_0000_0000;
+    w.map(&parent, base, PageSize::Large, RW);
+    for i in 0..512 {
+        w.write(&parent, base + i * FRAME_SIZE + 8, i);
+    }
+    let child = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    w.frames.no_large = true;
+    let mut tlb = RecordingTlb::default();
+    assert_eq!(
+        child.resolve_write(&mut w.mem, &mut w.frames, &mut tlb, base + 0x5008),
+        Ok(true)
+    );
+    assert!(
+        tlb.flushed.contains(&(base + 0x5008)),
+        "the entry is flushed"
+    );
+    let t = child.translate(&w.mem, base + 0x5008).unwrap();
+    assert_eq!(t.size, PageSize::Small);
+    assert!(t.flags.is_writable());
+    w.write(&child, base + 0x5008, 99);
+    for i in 0..512 {
+        let expected = if i == 5 { 99 } else { i };
+        assert_eq!(w.read(&child, base + i * FRAME_SIZE + 8), expected);
+        assert_eq!(
+            w.read(&parent, base + i * FRAME_SIZE + 8),
+            i,
+            "parent unchanged"
+        );
+    }
+    assert_eq!(
+        parent.translate(&w.mem, base).unwrap().size,
+        PageSize::Large
+    );
+    for pt in [parent, child] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0, "every frame returned once");
+}
+
 #[test]
 fn fork_aarch64() {
     fork_shares_everything_and_writes_stay_private::<Aarch64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<Aarch64>();
+    large_page_copied_into_small_pages_without_large_frames::<Aarch64>();
 }
 
 #[test]
 fn fork_x86_64() {
     fork_shares_everything_and_writes_stay_private::<X86_64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<X86_64>();
+    large_page_copied_into_small_pages_without_large_frames::<X86_64>();
 }
 
 /// Addresses spread over different tables at every level.
@@ -334,7 +388,12 @@ fn kernel_half_is_never_made_writable_or_private() {
         0xffff_8000_0001_0000,
     ] {
         assert_eq!(
-            cell.resolve_write(&mut w.mem, &mut w.frames, virt),
+            cell.resolve_write(
+                &mut w.mem,
+                &mut w.frames,
+                &mut RecordingTlb::default(),
+                virt
+            ),
             Ok(false)
         );
         cell.unshare_path(&mut w.mem, &mut w.frames, virt).unwrap();

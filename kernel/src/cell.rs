@@ -358,11 +358,7 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
 
 /// Resolves a write refused because the page is shared (copy-on-write).
 fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb, addr: u64) -> bool {
-    let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, addr) == Ok(true);
-    if resolved {
-        tlb.flush_page(addr);
-    }
-    resolved
+    pt.resolve_write(&mut DirectMap, &mut KernelFrames, tlb, addr) == Ok(true)
 }
 
 /// How [`Host::resume`] restores memory.

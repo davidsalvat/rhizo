@@ -15,7 +15,7 @@
 - [x] 2.4 x86_64 bring-up: MADT, trampoline, INIT/STARTUP, local APIC per CPU, wake-up vector (D3, D6); verify `cargo xtask --arch x86_64 test --only ktest-smp` on microvm and q35
 - [x] 2.5 In-kernel tests: every CPU's number and stack, globals and heap from all CPUs at once; verify `cargo xtask test --only ktest-smp` on both architectures
 
-- [x] 2.6 Heap pages from the top of memory and boxed run-queue entries (D8): `FrameAllocator::alloc_high`, host unit and property tests; verify `cargo test -p rhizo-mm frames` and `cargo xtask test --only ktest-smp` on both architectures
+- [x] 2.6 Heap pages from the top of memory, boxed run-queue entries, copy-on-write of a large page into small pages when no large frame is free (D8): `FrameAllocator::alloc_high`, `resolve_write` fallback, host unit and property tests; verify `cargo test -p rhizo-mm frames` and `cargo xtask test --only ktest-smp` on both architectures
 
 ## 3. Tooling and documentation
 
