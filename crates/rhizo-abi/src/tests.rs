@@ -1101,3 +1101,20 @@ fn reserved_mappings_are_backed_by_mprotect() {
     assert_eq!(w.call(MUNMAP, &[big, 8 << 20]).0, 0);
     assert!(w.frames.outstanding() < before, "frames returned");
 }
+
+#[test]
+fn time_returns_and_stores_epoch_seconds() {
+    let mut w = World::new(Arch::X86_64);
+    w.services.clock = 2_500_000_000;
+    let expected = 1_700_000_002;
+    assert_eq!(w.call(201, &[0]), (expected, Outcome::Resume));
+    assert_eq!(w.call(201, &[DATA]), (expected, Outcome::Resume));
+    assert_eq!(w.peek(DATA, 8), (expected as u64).to_le_bytes());
+    assert_eq!(w.call(201, &[RO]).0, -EFAULT);
+}
+
+#[test]
+fn time_does_not_exist_on_aarch64() {
+    let mut w = World::new(Arch::Aarch64);
+    assert_eq!(w.call(201, &[0]).0, -ENOSYS, "201 is not `time` on AArch64");
+}

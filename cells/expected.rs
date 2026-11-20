@@ -74,6 +74,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
         "tids ok\nfutex ok\nmutex ok\nping-pong ok\nregs ok\n",
         Ending::Exit(0),
     ),
+    ("libc_deep_stack", "deep 130560\nbuffer ok\n", Ending::Exit(0)),
     (
         "libc_threads",
         "ready\n\
@@ -126,3 +127,18 @@ pub const PYTHON_COMMAND: &str =
 pub const PYTHON_STDOUT: &str = "warm\n\
      primes below 10000: 1229, last 9973; top words: agent=70, kernel=69, fork=67\n\
      python ok\n";
+
+/// CPython (`cells/python/agent_demo.py`, built only when its source is
+/// given): its command line, in a cell holding the files `xtask` packs
+/// (`/usr/lib/python3.13`, `/app`) and on Linux in a directory laid out the same
+/// way, and what it prints. The script pauses after `warm`, where a host may
+/// freeze it as a template.
+#[allow(dead_code)]
+pub const CPYTHON_ARGV: [&str; 2] = ["/usr/bin/python3", "/app/agent_demo.py"];
+#[allow(dead_code)]
+pub const CPYTHON_STDOUT: &str = "warm\n\
+     {\"contacts\": 24, \"counts\": [82, 71, 71], \"dates_since\": 24, \
+     \"digest\": \"fa17d1e499110000\", \"first_contact\": \"Agent@Team0\", \
+     \"gap_spread\": 7.62, \"last_date\": \"22 Dec 2026\", \"mean_gap_days\": 8.6087, \
+     \"tool\": \"summarize\", \"top_words\": [\"KERNEL\", \"FORK\", \"PAGE\"]}\n\
+     cpython ok\n";

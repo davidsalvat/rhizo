@@ -42,6 +42,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off a template frozen after the warm-up |
 | `workload.python_cold_us/rhizo/<vmm>` | timing | MicroPython (static, pinned v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's files) started from its executable: interpreter start, imports, warm-up, answer. Measured only where MicroPython is built (`RHIZO_MICROPYTHON_SRC`, set in CI) |
 | `workload.python_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off MicroPython frozen after its warm-up |
+| `workload.cpython_cold_us/rhizo/<vmm>` | timing | CPython (static, pinned 3.13.18) answering one agent tool call (`cells/python/agent_demo.py`: JSON, regular expressions, dates, a CRC) started from its executable, with the standard library it imports as compiled modules in the cell's files: interpreter start, imports, warm-up, answer, exit. Measured only where CPython is built (`RHIZO_CPYTHON_SRC`, set in CI) |
+| `workload.cpython_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off CPython frozen after its warm-up |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
@@ -72,6 +74,8 @@ same clock as the cells (spec `comparisons`):
 | `process.fork_touch_us/linux-process/<host or firecracker>` | `fork`, the child writes every page of the 50 MiB and exits, the parent waits (pairs with `cell.fork_touch_us`) |
 | `process.<metric>/linux-process/firecracker` | The same program as the `/init` of a Linux guest in Firecracker: the VM the cell figures come from, so both sides pay the same virtualization (spec `comparisons`) |
 | `snapshot.restore_ms/criu/host` | `criu restore -d` of a dumped process holding 8 MiB written (`bench/host/criu_target.c`), as long as CRIU's log says it took (from its start to "Restore finished"). First restore dropped |
+| `workload.cpython_cold_us/linux-process/firecracker` | The same static CPython, files and script in a Linux guest in Firecracker: `fork` and `execve` of `python3 /app/agent_demo.py`, output read from a pipe, until it exits (`bench/host/linux_cpython.c` as `/init`). Pairs with `workload.cpython_cold_us/rhizo/firecracker` |
+| `workload.cpython_warm_us/linux-process/firecracker` | In the same guest, a CPython process that imported and warmed up the script forks one child per request; the child answers and exits normally, the parent waits (`bench/host/cpython_forkserver.py`, the pre-fork pattern). Pairs with `workload.cpython_warm_us/rhizo/firecracker` |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
 | `sandbox.run_ms/gvisor/runsc` | `runsc run` of a gVisor sandbox (systrap platform, no network) running the same static `hello`, until it exits. First run dropped |
 | `snapshot.restore_ms/gvisor/runsc` | `runsc restore --detach` of a checkpointed sandbox running the idle cell program, until `runsc state` reports it running. First restore dropped |

@@ -123,16 +123,31 @@ pub fn initramfs() -> Vec<u8> {
 }
 
 /// An initramfs with `/dev/console`, `init` as `/init`, and `files`
-/// (executables, at the root).
+/// (executables, at their relative paths; a name ending in `/` is an empty
+/// directory). Each file's directories come before it.
 pub fn initramfs_with(init: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     cpio_entry(&mut out, 1, "dev", 0o040755, (0, 0), &[]);
     cpio_entry(&mut out, 2, "dev/console", 0o020600, (5, 1), &[]);
     cpio_entry(&mut out, 3, "init", 0o100755, (0, 0), init);
-    for (ino, (name, data)) in (4..).zip(files) {
-        cpio_entry(&mut out, ino, name, 0o100755, (0, 0), data);
+    let mut ino = 4;
+    let mut dirs: Vec<&str> = vec!["dev"];
+    for &(name, data) in files {
+        let path = name.trim_end_matches('/');
+        let file = (path.len() == name.len()).then_some(path);
+        let parents = path.match_indices('/').map(|(at, _)| &path[..at]);
+        for dir in parents.chain(file.is_none().then_some(path)) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+                cpio_entry(&mut out, ino, dir, 0o040755, (0, 0), &[]);
+                ino += 1;
+            }
+        }
+        if let Some(file) = file {
+            cpio_entry(&mut out, ino, file, 0o100755, (0, 0), data);
+            ino += 1;
+        }
     }
-    let ino = 4 + files.len() as u32;
     cpio_entry(&mut out, ino, "TRAILER!!!", 0, (0, 0), &[]);
     out
 }
@@ -202,5 +217,29 @@ mod tests {
         let header = hello - 110;
         assert_eq!(&text[header + 14..header + 22], "000081ed");
         assert!(text.find("TRAILER!!!").unwrap() > hello);
+    }
+
+    #[test]
+    fn initramfs_makes_directories_before_their_files() {
+        let cpio = initramfs_with(
+            b"INIT",
+            &[
+                ("lib/py/os.pyc", b"OS"),
+                ("lib/py/json/", b""),
+                ("app/a.py", b"A"),
+            ],
+        );
+        let text = String::from_utf8_lossy(&cpio);
+        let at = |name: &str| {
+            text.find(&format!("{name}\0"))
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let mode = |name: &str| text[at(name) - 110 + 14..at(name) - 110 + 22].to_string();
+        for dir in ["lib", "lib/py", "lib/py/json", "app"] {
+            assert_eq!(mode(dir), "000041ed", "{dir} is a directory");
+        }
+        assert!(at("lib") < at("lib/py") && at("lib/py") < at("lib/py/os.pyc"));
+        assert_eq!(mode("lib/py/os.pyc"), "000081ed");
+        assert_eq!(text.matches("lib/py\0").count(), 1, "each directory once");
     }
 }

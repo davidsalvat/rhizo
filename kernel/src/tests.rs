@@ -96,6 +96,8 @@ macro_rules! suite {
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
             ktest_case!(micropython_in_a_cell),
+            ktest_case!(stack_grows_on_touch_and_returns_its_frames),
+            ktest_case!(cpython_in_a_cell),
             ktest_case!(threads_behave_as_on_linux_and_return_memory),
             ktest_case!(spinning_thread_does_not_starve_its_siblings),
             ktest_case!(thread_count_does_not_buy_cpu_time),
@@ -1339,6 +1341,59 @@ fn micropython_in_a_cell() {
     }
     assert!(host.freeze(template));
     let answer = expected::PYTHON_STDOUT
+        .strip_prefix("warm\n")
+        .expect("warm first");
+    let ids: Vec<u32> = (0..3)
+        .map(|_| {
+            host.spawn_from_template(template, true, true)
+                .expect("fork")
+        })
+        .collect();
+    host.run(|_| false);
+    for id in ids {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), answer.into()));
+    }
+}
+
+// --- CPython ---------------------------------------------------------------
+
+/// A program using 4 MiB of stack, and a system call writing into stack it
+/// never touched, run as on Linux: the stack grows a page at a time up to
+/// its 8 MiB limit, and every page comes back when the cell ends (design D5
+/// of `add-cpython`).
+fn stack_grows_on_touch_and_returns_its_frames() {
+    assert_no_leak("libc_deep_stack");
+}
+
+/// CPython running `cells/python/agent_demo.py` with its standard library
+/// in the cell's files prints what it prints on Linux; frozen after its
+/// warm-up as a template, every cell forked from it answers without warming
+/// up again. Built only when its source is given (`RHIZO_CPYTHON_SRC`, set
+/// in CI); otherwise the test says it did not run.
+fn cpython_in_a_cell() {
+    let image = crate::cell::test_image("cpython");
+    let Some(files) = crate::cell::cpython_files() else {
+        arch::console::BootConsole.write_bytes(b"(CPython not built: not run) ");
+        return;
+    };
+    let argv = expected::CPYTHON_ARGV.map(str::as_bytes);
+    let mut host = Host::new();
+    let id = host
+        .spawn_with_files(image, &argv, files.clone(), true, true)
+        .expect("spawn");
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::CPYTHON_STDOUT.into())
+    );
+    let template = host
+        .spawn_with_files(image, &argv, files, true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"warm\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let answer = expected::CPYTHON_STDOUT
         .strip_prefix("warm\n")
         .expect("warm first");
     let ids: Vec<u32> = (0..3)
