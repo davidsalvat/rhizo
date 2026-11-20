@@ -60,6 +60,11 @@ impl<T> SpinLock<T> {
         self.holder.store(0, Ordering::Release);
         result
     }
+
+    /// The value, without locking: `&mut self` proves nobody else has it.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +104,13 @@ mod tests {
     fn reentrance_on_the_same_cpu_panics() {
         let lock = SpinLock::new(0);
         lock.with(3, |_| lock.with(3, |_| ()));
+    }
+
+    #[test]
+    fn exclusive_owner_needs_no_lock() {
+        let mut lock = SpinLock::new(1);
+        *lock.get_mut() += 1;
+        assert_eq!(lock.with(0, |v| *v), 2);
     }
 
     #[test]

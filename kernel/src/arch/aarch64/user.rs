@@ -2,11 +2,12 @@
 //! the lower-half table switch (design decision D3). The vectors and the
 //! entry code are in `cpu.rs`.
 
-use super::cpu::{EMPTY_ROOT, USER_ROOT};
+use super::cpu::{EMPTY_ROOT, USER_ROOT, index};
 use core::arch::asm;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use rhizo_cell::{FpState, Registers};
 use rhizo_core::exception::{self, Aarch64Exception};
+use rhizo_core::smp::MAX_CPUS;
 use rhizo_hal::Console;
 
 /// ELF machine of cell executables.
@@ -16,6 +17,9 @@ pub const ABI: rhizo_abi::Arch = rhizo_abi::Arch::Aarch64;
 /// Whether a cell's root table must carry the kernel half: no, the kernel
 /// lives in `TTBR1_EL1` and the cell's table goes in `TTBR0_EL1`.
 pub const CELL_ROOT_HAS_KERNEL_HALF: bool = false;
+/// Whether a TLB flush reaches every CPU: yes, the kernel only uses the
+/// inner-shareable (broadcast) `TLBI` forms for cell translations.
+pub const TLB_FLUSH_IS_BROADCAST: bool = true;
 
 unsafe extern "C" {
     fn rhizo_enter_cell(regs: *mut Registers) -> u64;
@@ -125,14 +129,14 @@ unsafe extern "C" {
     fn rhizo_fp_load(state: *const FpState);
 }
 
-/// Whether FP/SIMD use by cell code traps (`CPACR_EL1.FPEN` = 0b01: EL0
-/// traps, EL1 does not, so the kernel can still save and load).
-static FP_TRAPS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Whether FP/SIMD use by cell code traps on each CPU (`CPACR_EL1.FPEN` =
+/// 0b01: EL0 traps, EL1 does not, so the kernel can still save and load).
+static FP_TRAPS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
-/// Makes FP/SIMD use by cell code trap (`true`) or not, writing `CPACR_EL1`
-/// only when that changes.
+/// Makes FP/SIMD use by cell code trap (`true`) or not on this CPU, writing
+/// `CPACR_EL1` only when that changes.
 pub fn fp_trap(enable: bool) {
-    if FP_TRAPS.swap(enable, Ordering::Relaxed) == enable {
+    if FP_TRAPS[index()].swap(enable, Ordering::Relaxed) == enable {
         return;
     }
     let fpen: u64 = if enable { 0b01 } else { 0b11 };
@@ -165,10 +169,10 @@ pub fn fp_load(state: &FpState) {
     unsafe { rhizo_fp_load(state) }
 }
 
-/// Enables FP/SIMD for cells (and for the save and load above), and 16-bit
-/// ASIDs when the CPU has them; returns the highest tag cells may use
-/// (65535, or 255 with 8-bit ASIDs). Call once.
-pub fn init_tags() -> u16 {
+/// Enables FP/SIMD on this CPU for cells (and for the save and load
+/// above). The boot CPU calls it through [`init_tags`]; the others once at
+/// bring-up, with the boot CPU's `TCR_EL1` (ASID size) already copied.
+pub fn init_cpu() {
     // SAFETY: CPACR_EL1.FPEN = 0b11 stops trapping FP/SIMD at EL0 and EL1;
     // the kernel is built without FP instructions, so only cells and the
     // explicit save/load use them.
@@ -182,6 +186,15 @@ pub fn init_tags() -> u16 {
             options(nostack)
         );
     }
+    USER_ROOT[index()].store(EMPTY_ROOT.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// Enables FP/SIMD for cells (and for the save and load above), and 16-bit
+/// ASIDs when the CPU has them; returns the highest tag cells may use
+/// (65535, or 255 with 8-bit ASIDs). Call once, on the boot CPU, before the
+/// others start.
+pub fn init_tags() -> u16 {
+    init_cpu();
     let mmfr0: u64;
     // SAFETY: reading an ID register has no side effects.
     unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack)) };
@@ -206,12 +219,12 @@ pub fn init_tags() -> u16 {
     u16::MAX
 }
 
-/// Loads `root` with ASID `tag` in `TTBR0_EL1`. A tagged switch needs no
-/// TLB maintenance (design D6); tag 0 is shared by the empty table and
-/// untagged cells, so switching to it drops what ASID 0 had cached.
+/// Loads `root` with ASID `tag` in this CPU's `TTBR0_EL1`. A tagged switch
+/// needs no TLB maintenance (design D6); tag 0 is shared by the empty table
+/// and untagged cells, so switching to it drops what ASID 0 had cached.
 fn set_user_root(root: u64, tag: u16) {
     let ttbr = root | ((tag as u64) << 48);
-    if USER_ROOT.swap(ttbr, Ordering::Relaxed) == ttbr {
+    if USER_ROOT[index()].swap(ttbr, Ordering::Relaxed) == ttbr {
         return;
     }
     // SAFETY: TTBR0 maps only the lower half, which the kernel never uses;
@@ -228,12 +241,11 @@ fn set_user_root(root: u64, tag: u16) {
 /// untagged), from `regs` until it makes a system call, is interrupted or
 /// faults; `regs` then holds its state at that point.
 ///
-/// `fresh` marks the first entry of a cell into its tag: the tag's
-/// translations are dropped before its tables are loaded, so nothing a
-/// previous holder of the tag left can be used (design D6 of
-/// `add-scheduler`).
-pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Trap {
-    if fresh && tag != 0 {
+/// `flush` drops the tag's translations before its tables are loaded (on
+/// every CPU: the flush is broadcast), so nothing a previous holder of the
+/// tag left can be used (design D6 of `add-scheduler`).
+pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Trap {
+    if flush && tag != 0 {
         // SAFETY: invalidating one ASID only drops cached translations; the
         // tag is not loaded in TTBR0 (its previous holder ended).
         unsafe {
@@ -280,6 +292,19 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
 /// shrank, as after a fork).
 pub fn flush_user(root: u64, tag: u16) {
     release_user(root, tag);
+}
+
+/// Points this CPU's `TTBR0_EL1` back at the empty table, keeping the
+/// cell's translations (another CPU may run it next; design D4 of
+/// `add-smp-scheduling`). Nothing is flushed: the empty table maps nothing,
+/// and entering an untagged cell drops ASID 0 anyway.
+pub fn leave_user() {
+    let empty = EMPTY_ROOT.load(Ordering::Relaxed);
+    if USER_ROOT[index()].swap(empty, Ordering::Relaxed) != empty {
+        // SAFETY: TTBR0 maps only the lower half, which the kernel never
+        // uses; the empty table maps nothing.
+        unsafe { asm!("msr ttbr0_el1, {}", "isb", in(reg) empty, options(nostack)) };
+    }
 }
 
 /// Points `TTBR0_EL1` back at the empty table and drops every translation

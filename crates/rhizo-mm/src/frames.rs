@@ -26,6 +26,9 @@ pub struct FrameAllocator<'a> {
     /// reused before frames never handed out (design D1 of
     /// `reuse-freed-frames`).
     hint: usize,
+    /// Bitmap words above this one hold no free frame (where
+    /// [`alloc_high`](Self::alloc_high) starts looking).
+    top: usize,
 }
 
 impl<'a> FrameAllocator<'a> {
@@ -51,6 +54,7 @@ impl<'a> FrameAllocator<'a> {
             usable: 0,
             free: 0,
             hint: 0,
+            top: 0,
         }
     }
 
@@ -61,6 +65,9 @@ impl<'a> FrameAllocator<'a> {
         let changed = self.update_range(first, last, true);
         self.usable += changed;
         self.free += changed;
+        if first < last {
+            self.top = self.top.max((last - 1) / BITS);
+        }
     }
 
     /// Marks every frame touching `[start, end)` as permanently in use.
@@ -89,6 +96,32 @@ impl<'a> FrameAllocator<'a> {
                     self.hint = frame + 1;
                     return Some(frame as u64 * FRAME_SIZE);
                 }
+            }
+        }
+        None
+    }
+
+    /// Allocates the highest free frame. The kernel heap takes its pages
+    /// here, so the pages it keeps cluster at the top of memory instead of
+    /// splitting the free runs that large allocations need (design D7 of
+    /// `add-smp-scheduling`).
+    pub fn alloc_high(&mut self) -> Option<u64> {
+        if self.free == 0 {
+            return None;
+        }
+        for i in (0..=self.top.min(self.bitmap.len() - 1)).rev() {
+            let mut word = self.bitmap[i];
+            // Bits past the last managed frame are never set; skip them anyway.
+            while word != 0 {
+                let bit = BITS - 1 - word.leading_zeros() as usize;
+                let frame = i * BITS + bit;
+                if frame < self.frames {
+                    self.bitmap[i] &= !(1 << bit);
+                    self.free -= 1;
+                    self.top = i;
+                    return Some(frame as u64 * FRAME_SIZE);
+                }
+                word &= !(1 << bit);
             }
         }
         None
@@ -163,6 +196,7 @@ impl<'a> FrameAllocator<'a> {
         self.update_range(first, first + count, true);
         self.free += count;
         self.hint = self.hint.min(first);
+        self.top = self.top.max((first + count - 1) / BITS);
     }
 
     /// Returns whether the frame at `addr` is currently in use (or reserved).
@@ -272,6 +306,23 @@ mod tests {
         let b = fa.alloc().unwrap();
         assert_eq!((a, b), (FRAME_SIZE, 4 * FRAME_SIZE));
         assert_eq!(fa.alloc(), None);
+    }
+
+    #[test]
+    fn high_frames_come_from_the_top_and_leave_runs_whole() {
+        let mut bits = [0u64; 4];
+        let mut fa = allocator(&mut bits, 200);
+        fa.add_free_region(FRAME_SIZE, 190 * FRAME_SIZE); // frames 1..190
+        assert_eq!(fa.alloc_high(), Some(189 * FRAME_SIZE));
+        assert_eq!(fa.alloc_high(), Some(188 * FRAME_SIZE));
+        let low = fa.alloc().unwrap();
+        assert_eq!(low, FRAME_SIZE, "single frames still come from the bottom");
+        fa.free(189 * FRAME_SIZE);
+        assert_eq!(fa.alloc_high(), Some(189 * FRAME_SIZE), "freed top reused");
+        // Everything between stays one run.
+        assert_eq!(fa.alloc_contiguous(186), Some(2 * FRAME_SIZE));
+        assert_eq!(fa.alloc_high(), None);
+        assert_eq!(fa.free_frames(), 0);
     }
 
     #[test]
@@ -434,6 +485,7 @@ mod tests {
     #[derive(Debug, Clone)]
     enum Op {
         Alloc(usize),
+        High,
         Free(usize),
     }
 
@@ -443,6 +495,7 @@ mod tests {
             ops in proptest::collection::vec(
                 prop_oneof![
                     (1usize..8).prop_map(Op::Alloc),
+                    Just(Op::High),
                     (0usize..64).prop_map(Op::Free),
                 ],
                 1..200,
@@ -471,6 +524,14 @@ mod tests {
                             live.push((addr, n));
                         }
                     }
+                    Op::High => match fa.alloc_high() {
+                        Some(addr) => {
+                            prop_assert!(!reserved.contains(&(addr / FRAME_SIZE)));
+                            prop_assert!(owned.insert(addr), "duplicate frame");
+                            live.push((addr, 1));
+                        }
+                        None => prop_assert_eq!(fa.free_frames(), 0),
+                    },
                     Op::Free(i) if !live.is_empty() => {
                         let (addr, n) = live.swap_remove(i % live.len());
                         fa.free_contiguous(addr, n);

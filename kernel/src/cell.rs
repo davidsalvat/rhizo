@@ -10,13 +10,16 @@ use crate::arch::timer::{self, Counter};
 use crate::arch::user::{self, Trap};
 use crate::memory::{self, DirectMap};
 use crate::sync::Global;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::{Cell, FpState};
+use rhizo_core::smp::MAX_CPUS;
 use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::paging::{PageSize, PageTable};
@@ -204,15 +207,38 @@ fn fp_key(cell: u32, tid: u32) -> u64 {
     ((cell as u64) << 32) | tid as u64
 }
 
+/// Held while page tables and frames that cells may share change: a fork's
+/// copy-on-write tables are resolved, unmapped or freed by one CPU at a
+/// time (design D6 of `add-smp-scheduling`). Cells that share nothing never
+/// take it.
+static SHARING: Global<()> = Global::new(());
+
+/// Runs `f`, under [`SHARING`] when `live` may share frames with another
+/// cell.
+fn sharing<R>(shares: bool, f: impl FnOnce() -> R) -> R {
+    if shares { SHARING.with(|()| f()) } else { f() }
+}
+
+/// The owner ([`fp_key`]) of each CPU's FP/SIMD registers, by CPU number.
+static FP_OWNER: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
 /// A live cell and what the kernel keeps for it.
 #[derive(Debug)]
 struct Live {
     cell: Cell,
     /// Address-space tag (ASID/PCID), 0 if none was free.
     tag: u16,
-    /// Not run yet with this tag: its first entry drops the tag's old
-    /// translations.
-    fresh: bool,
+    /// CPUs whose TLB holds nothing stale for this cell (bit `n` for CPU
+    /// `n`): none for a cell new to its tag, which drops the tag's old
+    /// translations on its first entry on each CPU, and only the CPU that
+    /// flushed after the cell's translations shrank, where flushes are not
+    /// broadcast (design D5 of `add-smp-scheduling`).
+    clean: u32,
+    /// CPUs it ran on (bit `n` for CPU `n`).
+    cpus: u32,
+    /// Its memory may be shared with another cell, copy-on-write: it was
+    /// forked, or is a fork.
+    shares: bool,
     abi: Abi,
     output: Option<Vec<u8>>,
     echo: bool,
@@ -294,9 +320,20 @@ impl Lazy {
     }
 }
 
+/// The TLB as a cell sees it: [`CpuTlb`], noting that the cell's
+/// translations shrank.
+struct CellTlb(bool);
+
+impl Tlb for CellTlb {
+    fn flush_page(&mut self, virt: u64) {
+        CpuTlb.flush_page(virt);
+        self.0 = true;
+    }
+}
+
 /// The pager of system calls: a lazily resumed cell's pending pages, and
-/// copy-on-write pages shared after a fork.
-struct CellPager<'a>(&'a mut Option<Lazy>);
+/// copy-on-write pages shared after a fork (resolved through the TLB given).
+struct CellPager<'a>(&'a mut Option<Lazy>, &'a mut CellTlb);
 
 impl Pager<Format, DirectMap> for CellPager<'_> {
     fn page_in(
@@ -309,7 +346,7 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
         if self.0.as_mut().is_some_and(|lazy| lazy.page_in(pt, addr)) {
             return true;
         }
-        write && resolve_write(pt, addr)
+        write && resolve_write(pt, self.1, addr)
     }
 
     fn discard(&mut self, addr: u64, len: u64) {
@@ -320,10 +357,10 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
-fn resolve_write(pt: &PageTable<Format>, addr: u64) -> bool {
+fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb, addr: u64) -> bool {
     let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, addr) == Ok(true);
     if resolved {
-        CpuTlb.flush_page(addr);
+        tlb.flush_page(addr);
     }
     resolved
 }
@@ -343,33 +380,399 @@ pub struct Finished {
     pub id: u32,
     pub ending: Ending,
     pub output: Vec<u8>,
+    /// The CPUs it ran on (bit `n` for CPU `n`).
+    pub cpus: u32,
 }
 
-/// The cells of this CPU: the scheduler holds the live ones (spec
-/// `scheduling`); ended ones are kept until the caller looks at them.
+/// What the CPUs running a host's cells share (design D3 of
+/// `add-smp-scheduling`), behind one lock taken only to take a cell, give
+/// one back, or change the set of cells between runs. A cell taken out runs
+/// on one CPU, which owns it until it gives it back.
+#[derive(Debug)]
+struct Shared {
+    /// The live cells that are not running: one run queue per CPU, and the
+    /// sleepers (spec `scheduling`).
+    sched: Scheduler<Box<Live>>,
+    tags: TagPool,
+    /// Cells that ended since the host last looked ([`Host::collect`]).
+    ended: Vec<Finished>,
+    /// Cells taken out of `sched`, running on a CPU.
+    running: usize,
+    /// CPUs waiting for work in the current run (bit `n` for CPU `n`).
+    idle: u32,
+    /// The current run is over: CPUs give their cells back and stop.
+    stopping: bool,
+}
+
+/// The cells of the machine: the live ones in the shared scheduler (or on
+/// the CPU running them), ended ones kept until the caller looks at them.
+/// [`run`](Self::run) uses every CPU; between runs no cell runs, so every
+/// other operation sees all of a cell's threads stopped.
 #[derive(Debug)]
 pub struct Host {
-    sched: Scheduler<Live>,
-    tags: TagPool,
+    shared: Global<Shared>,
     finished: Vec<Finished>,
     /// Frozen cells and their files: never run, only forked (spec `fork`,
     /// templates).
     templates: Vec<(Cell, Fs)>,
-    /// Thread whose FP/SIMD state is in the registers ([`fp_key`]). The
-    /// kernel never uses them, so they are saved only when another thread
-    /// uses them.
-    fp_owner: u64,
+}
+
+/// What a CPU does next ([`take`]).
+enum Take {
+    /// Run this cell, picked at this time.
+    Run(Box<Live>, u64),
+    /// Wait for work until this time (or a wake-up, or for ever).
+    Wait(Option<u64>),
+    /// Cells ended that the boot CPU has not looked at: look first (its
+    /// stop condition may hold now).
+    Look,
+    /// No cell can ever run again in this run.
+    Done,
+    /// The run is over.
+    Stop,
+}
+
+/// How a cell comes back from its slice ([`give_back`]).
+#[derive(Clone, Copy)]
+enum Back {
+    /// Preempted or yielding: runnable again.
+    Requeue,
+    /// Its threads block: runnable or asleep, as they say.
+    File,
+    /// It ended.
+    End(Ending),
+}
+
+/// Takes the next cell for `cpu`: the first of its queue or one stolen
+/// (`oldest`: the one that has waited longest anywhere, for a single CPU
+/// stepping through every cell).
+fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
+    shared.with(|s| {
+        if s.stopping {
+            s.idle &= !(1 << cpu);
+            return Take::Stop;
+        }
+        let now = now_ns();
+        let next = if oldest {
+            s.sched.next_oldest(now)
+        } else {
+            s.sched.next(cpu, now)
+        };
+        if let Some(live) = next {
+            s.running += 1;
+            s.idle &= !(1 << cpu);
+            return Take::Run(live, now);
+        }
+        let wake = s.sched.next_wake().filter(|&t| t != u64::MAX);
+        if s.running == 0 && wake.is_none() {
+            // Only parked cells are left: nothing will wake them.
+            return Take::Done;
+        }
+        if cpu == 0 && !s.ended.is_empty() {
+            return Take::Look;
+        }
+        // Under the lock: a CPU giving a cell back sees this bit and wakes
+        // this one, so no wake-up is lost between here and the wait.
+        s.idle |= 1 << cpu;
+        Take::Wait(wake)
+    })
+}
+
+/// Waits for work: until `wake`, or a wake-up interrupt.
+fn wait(wake: Option<u64>) {
+    match wake {
+        Some(at) => idle_until(at),
+        None => crate::smp::idle(),
+    }
+}
+
+/// Puts `live`, back from a slice on `cpu`, where `how` says, and wakes an
+/// idle CPU that has something to do because of it: another runnable cell
+/// to take, or the boot CPU to see a cell end or the last one stop.
+fn give_back(shared: &Global<Shared>, cpu: usize, live: Box<Live>, how: Back) {
+    let ended = match how {
+        Back::End(ending) => Some(end(live, ending)),
+        Back::Requeue => {
+            shared.with(|s| s.sched.requeue(cpu, live));
+            None
+        }
+        Back::File => {
+            shared.with(|s| file(&mut s.sched, Some(cpu), live));
+            None
+        }
+    };
+    let was_end = ended.is_some();
+    let wake = shared.with(|s| {
+        s.running -= 1;
+        if let Some((finished, tag)) = ended {
+            if tag != 0 {
+                s.tags.free(tag);
+            }
+            s.ended.push(finished);
+        }
+        let others = s.idle & !(1 << cpu);
+        if s.sched.runnable() > 1 && others != 0 {
+            others & others.wrapping_neg() // the lowest idle CPU
+        } else if was_end || (s.running == 0 && s.sched.runnable() == 0) {
+            others & 1 // the boot CPU checks whether the run is over
+        } else {
+            0
+        }
+    });
+    for other in 0..crate::smp::count() {
+        if wake & (1 << other) != 0 {
+            crate::smp::wake(other);
+        }
+    }
+}
+
+/// Files a cell whose threads may all wait: runnable if one of its threads
+/// can run (back on `cpu`'s queue, or on the shortest for a cell new to the
+/// scheduler), else asleep until its earliest deadline, or parked for good
+/// when none of its threads has one (design D2 of `add-threads`).
+fn file(sched: &mut Scheduler<Box<Live>>, cpu: Option<usize>, live: Box<Live>) {
+    if live.cell.threads.is_runnable() {
+        match cpu {
+            Some(cpu) => sched.requeue(cpu, live),
+            None => sched.place(live),
+        };
+    } else {
+        let wake = live.cell.threads.wake_at().unwrap_or(u64::MAX);
+        sched.sleep(live, wake);
+    }
+}
+
+/// Ends `live`: drops the CPU's hold on its address space and FP/SIMD
+/// state, frees its memory, and returns what the host keeps of it and the
+/// tag to free.
+fn end(live: Box<Live>, ending: Ending) -> (Finished, u16) {
+    let live = *live;
+    if fp_owner() >> 32 == live.cell.id as u64 {
+        set_fp_owner(0);
+    }
+    user::release_user(live.cell.root, live.tag);
+    sharing(live.shares, || {
+        space::destroy(
+            PageTable::<Format>::from_root(live.cell.root),
+            &mut DirectMap,
+            &mut KernelFrames,
+        )
+    });
+    let finished = Finished {
+        id: live.cell.id,
+        ending,
+        output: live.output.unwrap_or_default(),
+        cpus: live.cpus,
+    };
+    (finished, live.tag)
+}
+
+/// What a secondary CPU runs during [`Host::run`]: cells from the shared
+/// scheduler until the run stops, with its preemption tick on.
+fn run_cpu(shared: u64) -> u64 {
+    // SAFETY: `Host::run` passes the address of its `shared`, and waits for
+    // this function to return before it returns itself, so the reference is
+    // valid for the whole call; `Global` serializes access.
+    let shared = unsafe { &*(shared as *const Global<Shared>) };
+    let cpu = crate::arch::cpu::index();
+    irq::start_tick();
+    loop {
+        match take(shared, cpu, false) {
+            Take::Run(live, now) => run_slice(shared, cpu, live, now),
+            Take::Wait(wake) => wait(wake),
+            Take::Done | Take::Look => wait(None),
+            Take::Stop => break,
+        }
+    }
+    irq::stop_tick();
+    0
+}
+
+/// The CPU's FP/SIMD owner ([`fp_key`]).
+fn fp_owner() -> u64 {
+    FP_OWNER[crate::arch::cpu::index()].load(Ordering::Relaxed)
+}
+
+fn set_fp_owner(key: u64) {
+    FP_OWNER[crate::arch::cpu::index()].store(key, Ordering::Relaxed);
+}
+
+/// The CPUs whose TLB holds nothing stale for a cell once this CPU has
+/// flushed (all of them when flushes are broadcast, design D5).
+fn flushed_on(cpu: usize) -> u32 {
+    if user::TLB_FLUSH_IS_BROADCAST {
+        u32::MAX
+    } else {
+        1 << cpu
+    }
+}
+
+/// Runs `live`'s threads on `cpu` until the cell ends, yields, has no
+/// thread that can run, or is preempted, and gives it back.
+fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64) {
+    if !live.cell.threads.next(now) {
+        give_back(shared, cpu, live, Back::File); // nothing due yet after all
+        return;
+    }
+    live.cpus |= 1 << cpu;
+    let pt = PageTable::<Format>::from_root(live.cell.root);
+    // Ticks seen in this slice: the first may have been pending since
+    // before the cell was picked, so a cell is preempted at the second,
+    // and always makes progress (design D4).
+    let mut ticks = 0;
+    // Each thread that runs in the slice (design D2 of `add-threads`).
+    let back = 'thread: loop {
+        let key = fp_key(live.cell.id, live.cell.threads.current().tid);
+        // FP/SIMD state moves only if this thread actually uses it
+        // (design D1).
+        user::fp_trap(fp_owner() != key);
+        loop {
+            let flush = live.clean & (1 << cpu) == 0;
+            let trap = user::enter_user(live.cell.root, live.tag, flush, live.cell.regs_mut());
+            live.clean |= flushed_on(cpu);
+            match trap {
+                Trap::Syscall => {
+                    let mut services = KernelServices {
+                        capture: live.output.as_mut(),
+                        echo: live.echo,
+                        random: live.random,
+                        fp_in_cpu: fp_owner() == key,
+                    };
+                    let (mut tlb, mut pager_tlb) = (CellTlb(false), CellTlb(false));
+                    let mut cx = Context {
+                        pt,
+                        mem: &mut DirectMap,
+                        tlb: &mut tlb,
+                        frames: &mut KernelFrames,
+                        services: &mut services,
+                        fs: &mut live.fs,
+                        pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
+                    };
+                    let outcome = sharing(live.shares, || live.abi.handle(&mut live.cell, &mut cx));
+                    live.random = services.random;
+                    if tlb.0 || pager_tlb.0 {
+                        live.clean = flushed_on(cpu);
+                    }
+                    match outcome {
+                        Outcome::Resume => continue,
+                        Outcome::Yield => break 'thread Back::Requeue,
+                        // Another thread of the cell runs at once, in this
+                        // slice, without changing address space.
+                        Outcome::Block if live.cell.threads.next(now_ns()) => continue 'thread,
+                        Outcome::Block => break 'thread Back::File,
+                        Outcome::Exit(status) => break 'thread Back::End(Ending::Exit(status)),
+                    }
+                }
+                Trap::FpUnavailable => {
+                    save_fp_owner(shared, &mut live);
+                    user::fp_load(&live.cell.regs().fp);
+                    user::fp_trap(false);
+                    set_fp_owner(key);
+                    continue;
+                }
+                Trap::Interrupt => {
+                    ticks += 1;
+                    if ticks < 2 {
+                        continue;
+                    }
+                    break 'thread Back::Requeue;
+                }
+                Trap::Fault(fault)
+                    if fault.missing_page().is_some_and(|addr| {
+                        live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr))
+                    }) =>
+                {
+                    if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
+                        live.lazy = None; // fully restored: drop the snapshot
+                    }
+                    continue;
+                }
+                Trap::Fault(fault)
+                    if fault.write_denied().is_some_and(|addr| {
+                        sharing(live.shares, || {
+                            resolve_write(&pt, &mut CellTlb(false), addr)
+                        })
+                    }) =>
+                {
+                    live.clean = flushed_on(cpu);
+                    continue;
+                }
+                Trap::Fault(fault) => {
+                    let mut services = KernelServices {
+                        capture: live.output.as_mut(),
+                        echo: live.echo,
+                        random: 0,
+                        fp_in_cpu: false,
+                    };
+                    fault.report(&mut services, live.cell.id);
+                    break 'thread Back::End(Ending::Fault);
+                }
+            }
+        }
+    };
+    if crate::smp::count() > 1 && !matches!(back, Back::End(_)) {
+        // Another CPU may take the cell next: its FP/SIMD state goes to
+        // memory, and this CPU lets go of its tables (design D4).
+        if fp_owner() >> 32 == live.cell.id as u64 {
+            sync_fp(&mut live, true);
+        }
+        user::leave_user();
+    }
+    give_back(shared, cpu, live, back);
+}
+
+/// Saves the CPU's FP/SIMD registers into the thread that owns them,
+/// which may be a thread of `running` or, with one CPU, of a cell waiting
+/// its turn (with several, a cell's state leaves the CPU with the cell).
+fn save_fp_owner(shared: &Global<Shared>, running: &mut Live) {
+    let owner = fp_owner();
+    let (cell, tid) = ((owner >> 32) as u32, owner as u32);
+    if cell == running.cell.id {
+        if let Some(thread) = running.cell.threads.get_mut(tid) {
+            user::fp_save(&mut thread.regs.fp);
+        }
+    } else if cell != 0 {
+        shared.with(|s| {
+            if let Some(thread) = s
+                .sched
+                .find_mut(|l| l.cell.id == cell)
+                .and_then(|l| l.cell.threads.get_mut(tid))
+            {
+                user::fp_save(&mut thread.regs.fp);
+            }
+        });
+    }
+}
+
+/// Brings the FP/SIMD state of `live`'s threads up to date in their
+/// registers, if one of them has it in this CPU; with `leaving`, the
+/// CPU's copy stops belonging to it.
+fn sync_fp(live: &mut Live, leaving: bool) {
+    let owner = fp_owner();
+    if owner >> 32 == live.cell.id as u64 {
+        if let Some(thread) = live.cell.threads.get_mut(owner as u32) {
+            user::fp_save(&mut thread.regs.fp);
+        }
+        if leaving {
+            set_fp_owner(0);
+        }
+    }
 }
 
 impl Host {
-    /// An empty host.
+    /// An empty host for every CPU online.
     pub fn new() -> Self {
         Self {
-            sched: Scheduler::new(),
-            tags: TagPool::new(MAX_TAG.load(Ordering::Relaxed)),
+            shared: Global::new(Shared {
+                sched: Scheduler::new(crate::smp::count()),
+                tags: TagPool::new(MAX_TAG.load(Ordering::Relaxed)),
+                ended: Vec::new(),
+                running: 0,
+                idle: 0,
+                stopping: false,
+            }),
             finished: Vec::new(),
             templates: Vec::new(),
-            fp_owner: 0,
         }
     }
 
@@ -378,8 +781,37 @@ impl Host {
     #[cfg(feature = "bench-cell")]
     fn new_untagged() -> Self {
         let mut host = Self::new();
-        host.tags = TagPool::new(0);
+        host.shared.get_mut().tags = TagPool::new(0);
         host
+    }
+
+    /// The shared state, between runs only (no other CPU uses it then).
+    fn state(&mut self) -> &mut Shared {
+        self.shared.get_mut()
+    }
+
+    /// Moves the cells that ended into [`finished`](Self::finished) (other
+    /// CPUs may be adding to them).
+    fn collect(&mut self) {
+        let ended = self.shared.with(|s| core::mem::take(&mut s.ended));
+        self.finished.extend(ended);
+    }
+
+    /// A new live cell's record: its tag, nothing flushed yet.
+    fn new_live(&mut self, cell: Cell, output: bool, echo: bool, random: u64, fs: Fs) -> Box<Live> {
+        Box::new(Live {
+            cell,
+            tag: self.state().tags.alloc().unwrap_or(0),
+            clean: 0,
+            cpus: 0,
+            shares: false,
+            abi: Abi::new(user::ABI),
+            output: output.then(Vec::new),
+            echo,
+            random,
+            lazy: None,
+            fs,
+        })
     }
 
     /// Creates a cell from the static executable `image` with `argv` and
@@ -429,61 +861,9 @@ impl Host {
             random,
         )?;
         sync_code(&PageTable::<Format>::from_root(cell.root), image);
-        self.sched.add(Live {
-            cell,
-            tag: self.tags.alloc().unwrap_or(0),
-            fresh: true,
-            abi: Abi::new(user::ABI),
-            output: capture.then(Vec::new),
-            echo,
-            random: services.random,
-            lazy: None,
-            fs: files,
-        });
+        let live = self.new_live(cell, capture, echo, services.random, files);
+        self.state().sched.place(live);
         Ok(id)
-    }
-
-    /// Brings the FP/SIMD state of `live`'s threads up to date in their
-    /// registers, if one of them has it in the CPU; with `leaving`, the
-    /// CPU's copy stops belonging to it.
-    fn sync_fp(&mut self, live: &mut Live, leaving: bool) {
-        if self.fp_owner >> 32 == live.cell.id as u64 {
-            if let Some(thread) = live.cell.threads.get_mut(self.fp_owner as u32) {
-                user::fp_save(&mut thread.regs.fp);
-            }
-            if leaving {
-                self.fp_owner = 0;
-            }
-        }
-    }
-
-    /// Saves the CPU's FP/SIMD registers into the thread that owns them,
-    /// which may be a thread of `running` (not in the scheduler while it
-    /// runs) or of a cell waiting its turn.
-    fn save_fp_owner(&mut self, running: &mut Live) {
-        let (cell, tid) = ((self.fp_owner >> 32) as u32, self.fp_owner as u32);
-        let owner = if cell == running.cell.id {
-            running.cell.threads.get_mut(tid)
-        } else {
-            self.sched
-                .find_mut(|l| l.cell.id == cell)
-                .and_then(|l| l.cell.threads.get_mut(tid))
-        };
-        if let Some(thread) = owner {
-            user::fp_save(&mut thread.regs.fp);
-        }
-    }
-
-    /// Puts `live` back in the scheduler: runnable if one of its threads can
-    /// run, else asleep until its earliest deadline, or parked for good
-    /// when none of its threads has one (design D2 of `add-threads`).
-    fn file(&mut self, live: Live) {
-        if live.cell.threads.is_runnable() {
-            self.sched.add(live);
-        } else {
-            let wake = live.cell.threads.wake_at().unwrap_or(u64::MAX);
-            self.sched.sleep(live, wake);
-        }
     }
 
     /// Suspends live cell `id` into a snapshot and frees all its memory
@@ -492,7 +872,7 @@ impl Host {
         // The snapshot lives in the kernel heap, and pages still pending from
         // a lazy resume need frames first: refuse what would not fit
         // (design D2 of `add-memory-accounting`); the cell keeps running.
-        let live = self.sched.find(|l| l.cell.id == id)?;
+        let live = self.state().sched.find(|l| l.cell.id == id)?;
         let mut bytes = 0;
         PageTable::<Format>::from_root(live.cell.root)
             .for_each_lower_leaf(&DirectMap, &mut |_, _, size, _| bytes += size.bytes());
@@ -502,12 +882,12 @@ impl Host {
         if !memory::cells_may_take(bytes) {
             return None;
         }
-        let mut live = self.sched.remove(|l| l.cell.id == id)?;
+        let mut live = self.state().sched.remove(|l| l.cell.id == id)?;
         let pt = PageTable::<Format>::from_root(live.cell.root);
         if let Some(lazy) = live.lazy.as_mut() {
             lazy.finish(&pt);
         }
-        self.sync_fp(&mut live, true);
+        sync_fp(&mut live, true);
         let snapshot =
             Snapshot::capture::<Format>(user::MACHINE, &live.cell, &live.fs, now_ns(), &DirectMap);
         self.end(live, Ending::Suspended);
@@ -545,18 +925,9 @@ impl Host {
         if mode == Resume::Eager {
             lazy.finish(&pt);
         }
-        let live = Live {
-            cell,
-            tag: self.tags.alloc().unwrap_or(0),
-            fresh: true,
-            abi: Abi::new(user::ABI),
-            output: capture.then(Vec::new),
-            echo,
-            random: Counter.cycles() | 1,
-            lazy: (lazy.left > 0).then_some(lazy),
-            fs,
-        };
-        self.file(live);
+        let mut live = self.new_live(cell, capture, echo, Counter.cycles() | 1, fs);
+        live.lazy = (lazy.left > 0).then_some(lazy);
+        file(&mut self.state().sched, None, live);
         Ok(id)
     }
 
@@ -566,22 +937,28 @@ impl Host {
         allow(dead_code, reason = "benchmark metric")
     )]
     pub fn table_frames(&mut self, id: u32) -> Option<usize> {
-        let live = self.sched.remove(|l| l.cell.id == id)?;
+        let sched = &mut self.state().sched;
+        let live = sched.remove(|l| l.cell.id == id)?;
         let frames = PageTable::<Format>::from_root(live.cell.root).lower_half_tables(&DirectMap);
-        self.sched.add(live);
+        sched.place(live);
         Some(frames)
     }
 
-    /// Runs one scheduling step: the next runnable cell for one slice (until
-    /// it ends, yields, sleeps or is preempted), waiting first if every cell
-    /// sleeps. Returns `false` when no cell is left.
+    /// Runs one scheduling step on this CPU alone: the cell that has waited
+    /// longest for one slice (until it ends, yields, sleeps or is
+    /// preempted), or, if every cell sleeps, a wait for the first to wake.
+    /// Returns `false` when no cell is left.
     #[cfg_attr(
         not(feature = "ktest"),
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn step(&mut self) -> bool {
-        let mut stepped = false;
-        self.run(|_| core::mem::replace(&mut stepped, true));
+        match take(&self.shared, 0, true) {
+            Take::Run(live, now) => run_slice(&self.shared, 0, live, now),
+            Take::Wait(wake) => wait(wake),
+            Take::Done | Take::Stop | Take::Look => {}
+        }
+        self.collect();
         self.live() > 0
     }
 
@@ -590,8 +967,12 @@ impl Host {
         not(feature = "ktest"),
         allow(dead_code, reason = "used by in-kernel tests")
     )]
-    pub fn output(&self, id: u32) -> Option<&[u8]> {
-        self.sched.find(|l| l.cell.id == id)?.output.as_deref()
+    pub fn output(&mut self, id: u32) -> Option<&[u8]> {
+        self.state()
+            .sched
+            .find(|l| l.cell.id == id)?
+            .output
+            .as_deref()
     }
 
     /// Pages of live cell `id` still waiting in its snapshot (lazy resume).
@@ -599,126 +980,50 @@ impl Host {
         not(feature = "ktest"),
         allow(dead_code, reason = "used by in-kernel tests")
     )]
-    pub fn pending_pages(&self, id: u32) -> Option<usize> {
-        let live = self.sched.find(|l| l.cell.id == id)?;
+    pub fn pending_pages(&mut self, id: u32) -> Option<usize> {
+        let live = self.state().sched.find(|l| l.cell.id == id)?;
         Some(live.lazy.as_ref().map_or(0, |l| l.left))
     }
 
-    /// Runs cells until none is left that can ever run or `stop` holds
-    /// (checked whenever a cell ends or gives up the CPU).
+    /// Runs cells on every CPU until none is left that can ever run or
+    /// `stop` holds (checked on this CPU whenever it gives up a cell or a
+    /// cell ends), then waits for the other CPUs to give back theirs.
     pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
-        while !stop(self) {
-            let now = now_ns();
-            let Some(live) = self.sched.next(now) else {
-                match self.sched.next_wake() {
-                    // Only parked cells are left: nothing will wake them.
-                    Some(u64::MAX) | None => return,
-                    Some(wake) => idle_until(wake),
-                }
-                continue;
-            };
-            self.run_slice(live, now);
-        }
-    }
-
-    /// Runs `live`'s threads until the cell ends, yields, has no thread that
-    /// can run, or is preempted, and files it accordingly.
-    fn run_slice(&mut self, mut live: Live, now: u64) {
-        if !live.cell.threads.next(now) {
-            self.file(live); // nothing due yet after all
+        if stop(self) {
             return;
         }
-        let pt = PageTable::<Format>::from_root(live.cell.root);
-        // Ticks seen in this slice: the first may have been pending since
-        // before the cell was picked, so a cell is preempted at the second,
-        // and always makes progress (design D4).
-        let mut ticks = 0;
-        // Each thread that runs in the slice (design D2 of `add-threads`).
-        'thread: loop {
-            let key = fp_key(live.cell.id, live.cell.threads.current().tid);
-            // FP/SIMD state moves only if this thread actually uses it
-            // (design D1).
-            user::fp_trap(self.fp_owner != key);
-            loop {
-                match user::enter_user(
-                    live.cell.root,
-                    live.tag,
-                    core::mem::replace(&mut live.fresh, false),
-                    live.cell.regs_mut(),
-                ) {
-                    Trap::Syscall => {
-                        let mut services = KernelServices {
-                            capture: live.output.as_mut(),
-                            echo: live.echo,
-                            random: live.random,
-                            fp_in_cpu: self.fp_owner == key,
-                        };
-                        let mut cx = Context {
-                            pt,
-                            mem: &mut DirectMap,
-                            tlb: &mut CpuTlb,
-                            frames: &mut KernelFrames,
-                            services: &mut services,
-                            fs: &mut live.fs,
-                            pager: &mut CellPager(&mut live.lazy),
-                        };
-                        let outcome = live.abi.handle(&mut live.cell, &mut cx);
-                        live.random = services.random;
-                        match outcome {
-                            Outcome::Resume => continue,
-                            Outcome::Yield => self.sched.add(live),
-                            // Another thread of the cell runs at once, in this
-                            // slice, without changing address space.
-                            Outcome::Block if live.cell.threads.next(now_ns()) => continue 'thread,
-                            Outcome::Block => self.file(live),
-                            Outcome::Exit(status) => self.end(live, Ending::Exit(status)),
-                        }
-                    }
-                    Trap::FpUnavailable => {
-                        self.save_fp_owner(&mut live);
-                        user::fp_load(&live.cell.regs().fp);
-                        user::fp_trap(false);
-                        self.fp_owner = key;
-                        continue;
-                    }
-                    Trap::Interrupt => {
-                        ticks += 1;
-                        if ticks < 2 {
-                            continue;
-                        }
-                        self.sched.add(live);
-                    }
-                    Trap::Fault(fault)
-                        if fault.missing_page().is_some_and(|addr| {
-                            live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr))
-                        }) =>
-                    {
-                        if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
-                            live.lazy = None; // fully restored: drop the snapshot
-                        }
-                        continue;
-                    }
-                    Trap::Fault(fault)
-                        if fault
-                            .write_denied()
-                            .is_some_and(|addr| resolve_write(&pt, addr)) =>
-                    {
-                        continue;
-                    }
-                    Trap::Fault(fault) => {
-                        let mut services = KernelServices {
-                            capture: live.output.as_mut(),
-                            echo: live.echo,
-                            random: 0,
-                            fp_in_cpu: false,
-                        };
-                        fault.report(&mut services, live.cell.id);
-                        self.end(live, Ending::Fault);
-                    }
-                }
-                return;
+        let cpus = crate::smp::count();
+        if cpus > 1 {
+            let shared = &self.shared as *const Global<Shared> as u64;
+            for cpu in 1..cpus {
+                crate::smp::post(cpu, run_cpu, shared);
             }
         }
+        loop {
+            match take(&self.shared, 0, false) {
+                Take::Run(live, now) => run_slice(&self.shared, 0, live, now),
+                Take::Wait(wake) => wait(wake),
+                Take::Look => {}
+                Take::Done | Take::Stop => break,
+            }
+            self.collect();
+            if stop(self) {
+                break;
+            }
+        }
+        if cpus > 1 {
+            self.shared.with(|s| s.stopping = true);
+            for cpu in 1..cpus {
+                crate::smp::wake(cpu);
+            }
+            for cpu in 1..cpus {
+                crate::smp::join(cpu);
+            }
+            let state = self.state();
+            state.stopping = false;
+            state.idle = 0;
+        }
+        self.collect();
     }
 
     /// Forks live cell `id` into `n` children that share its memory
@@ -729,13 +1034,13 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn fork(&mut self, id: u32, n: usize) -> Option<Vec<u32>> {
-        let (mut parent, wake) = self.sched.remove_with_wake(|l| l.cell.id == id)?;
+        let (mut parent, wake) = self.state().sched.remove_with_wake(|l| l.cell.id == id)?;
         let pt = PageTable::<Format>::from_root(parent.cell.root);
         if let Some(lazy) = parent.lazy.as_mut() {
             lazy.finish(&pt);
         }
         parent.lazy = None;
-        self.sync_fp(&mut parent, false);
+        sync_fp(&mut parent, false);
         let mut children = Vec::with_capacity(n);
         for _ in 0..n {
             let Some(child) = self.child_of(
@@ -749,8 +1054,10 @@ impl Host {
             children.push(child);
         }
         // The parent lost write access to everything it shares: drop what its
-        // TLB still caches.
+        // TLB still caches (on other CPUs, when it next runs there).
         user::flush_user(parent.cell.root, parent.tag);
+        parent.clean = flushed_on(crate::arch::cpu::index());
+        parent.shares = true;
         self.requeue(parent, wake);
         if children.len() < n {
             // All or nothing: the children made so far never ran.
@@ -770,7 +1077,7 @@ impl Host {
     /// (no [`Finished`]); the caller drops it.
     fn discard(&mut self, live: &Live) {
         if live.tag != 0 {
-            self.tags.free(live.tag);
+            self.state().tags.free(live.tag);
         }
         space::destroy(
             PageTable::<Format>::from_root(live.cell.root),
@@ -780,50 +1087,47 @@ impl Host {
     }
 
     /// A new live cell sharing `cell`'s memory copy-on-write.
-    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Live> {
+    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Box<Live>> {
         let pt = PageTable::<Format>::from_root(cell.root);
         let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
-        Some(Live {
-            cell: Cell {
-                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                root: child.root(),
-                ..cell.clone()
-            },
-            tag: self.tags.alloc().unwrap_or(0),
-            fresh: true,
-            abi: Abi::new(user::ABI),
-            output: capture.then(Vec::new),
-            echo,
-            random: Counter.cycles() | 1,
-            lazy: None,
-            fs: fs.clone(),
-        })
+        let cell = Cell {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            root: child.root(),
+            ..cell.clone()
+        };
+        let mut live = self.new_live(cell, capture, echo, Counter.cycles() | 1, fs.clone());
+        live.shares = true;
+        Some(live)
     }
 
     #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "used by `fork`"))]
-    fn requeue(&mut self, live: Live, wake: Option<u64>) {
+    fn requeue(&mut self, live: Box<Live>, wake: Option<u64>) {
+        let sched = &mut self.state().sched;
         match wake {
-            Some(at) => self.sched.sleep(live, at),
-            None => self.sched.add(live),
+            Some(at) => sched.sleep(live, at),
+            None => {
+                sched.place(live);
+            }
         }
     }
 
     /// Freezes live cell `id` into a template: it never runs again, and
     /// [`spawn_from_template`](Self::spawn_from_template) forks it.
     pub fn freeze(&mut self, id: u32) -> bool {
-        let Some(mut live) = self.sched.remove(|l| l.cell.id == id) else {
+        let Some(mut live) = self.state().sched.remove(|l| l.cell.id == id) else {
             return false;
         };
         let pt = PageTable::<Format>::from_root(live.cell.root);
         if let Some(lazy) = live.lazy.as_mut() {
             lazy.finish(&pt);
         }
-        self.sync_fp(&mut live, true);
+        sync_fp(&mut live, true);
         user::release_user(live.cell.root, live.tag);
         if live.tag != 0 {
-            self.tags.free(live.tag);
+            self.state().tags.free(live.tag);
         }
-        self.templates.push((live.cell, live.fs));
+        let Live { cell, fs, .. } = *live;
+        self.templates.push((cell, fs));
         true
     }
 
@@ -837,7 +1141,7 @@ impl Host {
         let mut child = self.child_of(&cell, &fs, capture, echo)?;
         child.cell.threads.expire_timers();
         let child_id = child.cell.id;
-        self.file(child);
+        file(&mut self.state().sched, None, child);
         Some(child_id)
     }
 
@@ -847,7 +1151,7 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn kill(&mut self, id: u32) -> bool {
-        match self.sched.remove(|l| l.cell.id == id) {
+        match self.state().sched.remove(|l| l.cell.id == id) {
             Some(live) => {
                 self.end(live, Ending::Killed);
                 true
@@ -867,33 +1171,22 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn live(&self) -> usize {
-        self.sched.len()
+        self.shared.with(|s| s.sched.len() + s.running)
     }
 
-    fn end(&mut self, live: Live, ending: Ending) {
-        if self.fp_owner >> 32 == live.cell.id as u64 {
-            self.fp_owner = 0;
+    /// Ends `live` between runs and keeps what remains of it.
+    fn end(&mut self, live: Box<Live>, ending: Ending) {
+        let (finished, tag) = end(live, ending);
+        if tag != 0 {
+            self.state().tags.free(tag);
         }
-        user::release_user(live.cell.root, live.tag);
-        if live.tag != 0 {
-            self.tags.free(live.tag);
-        }
-        space::destroy(
-            PageTable::<Format>::from_root(live.cell.root),
-            &mut DirectMap,
-            &mut KernelFrames,
-        );
-        self.finished.push(Finished {
-            id: live.cell.id,
-            ending,
-            output: live.output.unwrap_or_default(),
-        });
+        self.finished.push(finished);
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        while let Some(live) = self.sched.remove(|_| true) {
+        while let Some(live) = self.state().sched.remove(|_| true) {
             self.end(live, Ending::Killed);
         }
         for (template, _) in self.templates.drain(..) {

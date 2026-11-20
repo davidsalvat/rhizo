@@ -65,6 +65,7 @@ macro_rules! suite {
             ktest_case!(many_cells_in_sequence_stay_isolated),
             ktest_case!(suspend_resume_after_every_step_is_invisible_eager),
             ktest_case!(suspend_resume_after_every_step_is_invisible_lazy),
+            ktest_case!(suspend_between_parallel_runs_is_invisible),
             ktest_case!(suspend_returns_all_memory),
             ktest_case!(lazy_resume_restores_only_touched_pages),
             ktest_case!(suspended_cells_hold_no_kernel_resources),
@@ -105,6 +106,9 @@ macro_rules! suite {
             ktest_case!(template_of_a_threaded_program),
             ktest_case!(every_cpu_has_its_number_and_own_stack),
             ktest_case!(kernel_globals_are_safe_across_cpus),
+            ktest_case!(cells_run_on_every_cpu),
+            ktest_case!(busy_cpus_do_not_starve_a_cell),
+            ktest_case!(cells_in_parallel_stay_isolated),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1583,4 +1587,111 @@ fn kernel_globals_are_safe_across_cpus() {
         heap_before.live,
         "every allocation freed"
     );
+}
+
+/// Every CPU online, as a mask.
+fn all_cpus() -> u32 {
+    u32::MAX >> (32 - crate::smp::count())
+}
+
+/// Two CPU-bound cells per CPU, started together: they all finish, and
+/// between them they ran on every CPU (spec `multi-core`, cells in
+/// parallel).
+fn cells_run_on_every_cpu() {
+    let mut host = Host::new();
+    let ids: Vec<u32> = (0..2 * crate::smp::count())
+        .map(|_| spawn(&mut host, "spin", &[b"20"]))
+        .collect();
+    host.run(|_| false);
+    let mut cpus = 0;
+    for id in ids {
+        assert_eq!(ended(&host, id).0, Ending::Exit(0));
+        cpus |= host.finished(id).expect("ended").cpus;
+    }
+    assert_eq!(cpus, all_cpus(), "the cells used every CPU");
+}
+
+/// More cells spinning for ever than there are CPUs: a cell that prints
+/// and exits still gets its turn (spec `scheduling`, preemption, on every
+/// CPU).
+fn busy_cpus_do_not_starve_a_cell() {
+    let mut host = Host::new();
+    let spinners: Vec<u32> = (0..crate::smp::count() + 1)
+        .map(|_| spawn(&mut host, "spin", &[]))
+        .collect();
+    let hello = spawn(&mut host, "hello", &[]);
+    host.run(|h| h.finished(hello).is_some());
+    assert_eq!(
+        ended(&host, hello),
+        (Ending::Exit(0), "hello from a cell\n".into())
+    );
+    assert_eq!(host.live(), spinners.len(), "the spinners still run");
+    for id in spinners {
+        assert!(host.kill(id));
+    }
+}
+
+/// Four copies each of programs that use memory, files, threads and time,
+/// all at once on every CPU: each prints exactly what it prints alone, and
+/// all memory comes back.
+fn cells_in_parallel_stay_isolated() {
+    let before = memory::free_bytes();
+    let mut host = Host::new();
+    let programs = ["counter", "filer", "libc_threads", "chatter", "threads"];
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        for name in programs {
+            ids.push((name, spawn(&mut host, name, &[])));
+        }
+    }
+    host.run(|_| false);
+    for (name, id) in ids {
+        assert_eq!(
+            ended(&host, id),
+            (Ending::Exit(0), expected_output(name).into()),
+            "{name}"
+        );
+    }
+    drop(host);
+    assert_eq!(memory::free_bytes(), before);
+}
+
+/// `counter` next to spinning cells, run on every CPU twenty slices (of
+/// the boot CPU) at a time, then suspended and resumed from its snapshot's bytes, until it
+/// ends: the host stops every CPU before it suspends, so the output is the
+/// uninterrupted one (spec `multi-core`, a cell is stopped everywhere before
+/// a snapshot).
+fn suspend_between_parallel_runs_is_invisible() {
+    let mut host = Host::new();
+    let spinners: Vec<u32> = (0..crate::smp::count())
+        .map(|_| spawn(&mut host, "spin", &[]))
+        .collect();
+    let mut id = spawn(&mut host, "counter", &[]);
+    let mut output = Vec::new();
+    loop {
+        let mut slices = 0;
+        host.run(|h| {
+            slices += 1;
+            slices > 20 || h.finished(id).is_some()
+        });
+        if let Some(done) = host.finished(id) {
+            assert_eq!(done.ending, Ending::Exit(0));
+            output.extend_from_slice(&done.output);
+            break;
+        }
+        let snapshot = host.suspend(id).expect("the counter is live");
+        output.extend_from_slice(&host.finished(id).expect("suspended").output);
+        let bytes = snapshot.into_bytes();
+        let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+        id = host
+            .resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume");
+    }
+    assert_eq!(
+        alloc::string::String::from_utf8_lossy(&output),
+        expected_output("counter")
+    );
+    for id in spinners {
+        assert!(host.kill(id));
+    }
 }

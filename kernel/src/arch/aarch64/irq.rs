@@ -190,6 +190,17 @@ fn arm(ticks: u64) {
     }
 }
 
+/// Starts this CPU's periodic tick (a secondary CPU running cells).
+pub fn start_tick() {
+    arm(TICK.load(Ordering::Relaxed));
+}
+
+/// Stops this CPU's tick (a secondary CPU going idle for good).
+pub fn stop_tick() {
+    // SAFETY: disabling this CPU's virtual timer only.
+    unsafe { asm!("msr cntv_ctl_el0, xzr", "isb", options(nostack)) };
+}
+
 /// Acknowledges a pending interrupt (if any); a timer interrupt re-arms the
 /// periodic tick.
 pub fn acknowledge() {

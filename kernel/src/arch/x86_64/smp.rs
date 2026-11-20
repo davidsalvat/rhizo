@@ -327,6 +327,7 @@ extern "C" fn rhizo_ap_main(index: u64) -> ! {
     let stacks = crate::smp::stacks(index);
     cpu::init_cpu(stacks.double_fault, stacks.exception);
     irq::init_cpu();
+    super::user::init_cpu();
     crate::smp::secondary_main(index)
 }
 

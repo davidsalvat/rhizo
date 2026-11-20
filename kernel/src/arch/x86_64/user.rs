@@ -1,11 +1,12 @@
 //! Running cell code in ring 3: entry, return on `SYSCALL` or an exception,
 //! and the CR3 switch (design decision D4). The entry code is in `cpu.rs`.
 
-use super::cpu::{read_cr2, wrmsr};
+use super::cpu::{index, read_cr2, wrmsr};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rhizo_cell::{FpState, Registers};
 use rhizo_core::exception::{self, ExceptionInfo};
+use rhizo_core::smp::MAX_CPUS;
 use rhizo_hal::Console;
 
 const FS_BASE: u32 = 0xC000_0100;
@@ -17,6 +18,9 @@ pub const ABI: rhizo_abi::Arch = rhizo_abi::Arch::X86_64;
 /// Whether a cell's root table must carry the kernel half: yes, CR3 holds a
 /// single hierarchy for both halves.
 pub const CELL_ROOT_HAS_KERNEL_HALF: bool = true;
+/// Whether a TLB flush reaches every CPU: no, `INVLPG` and CR3 loads act
+/// on this CPU only.
+pub const TLB_FLUSH_IS_BROADCAST: bool = false;
 
 unsafe extern "C" {
     fn rhizo_enter_cell(regs: *mut Registers, sysret: u64) -> u64;
@@ -66,21 +70,24 @@ impl UserFault {
     }
 }
 
-/// CR3 value (root and PCID) when a cell last ran, and whether PCIDs are on.
-static USER_CR3: AtomicU64 = AtomicU64::new(0);
+/// CR3 value (root and PCID) when a cell last ran on each CPU, and whether
+/// PCIDs are on.
+static USER_CR3: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static PCID: AtomicBool = AtomicBool::new(false);
-/// FS base last written (skipping the write when it does not change).
-static LAST_FS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// FS base last written on each CPU (skipping the write when it does not
+/// change).
+static LAST_FS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
 /// CR3 bit 63 with PCIDs on: keep the translations of the new PCID.
 const NO_FLUSH: u64 = 1 << 63;
 
-/// Whether `CR0.TS` is set: the next FP/SIMD instruction raises `#NM`.
-static FP_TRAPS: AtomicBool = AtomicBool::new(false);
+/// Whether `CR0.TS` is set on each CPU: the next FP/SIMD instruction
+/// raises `#NM`.
+static FP_TRAPS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
-/// Makes FP/SIMD use trap (`CR0.TS`, `#NM`) or not, writing CR0 only when
-/// that changes.
+/// Makes FP/SIMD use trap (`CR0.TS`, `#NM`) or not on this CPU, writing CR0
+/// only when that changes.
 pub fn fp_trap(enable: bool) {
-    if FP_TRAPS.swap(enable, Ordering::Relaxed) == enable {
+    if FP_TRAPS[index()].swap(enable, Ordering::Relaxed) == enable {
         return;
     }
     // SAFETY: CR0.TS only makes FP/SIMD instructions raise #NM; the kernel
@@ -114,8 +121,28 @@ pub fn fp_load(state: &FpState) {
 
 /// Enables SSE for cells (and for the save and load above), and PCIDs when
 /// the CPU has them; returns the highest tag cells may use (4095), or 0
-/// without PCIDs (every switch flushes). Call once.
+/// without PCIDs (every switch flushes). Call once, on the boot CPU, before
+/// the others start.
 pub fn init_tags() -> u16 {
+    enable_sse();
+    if core::arch::x86_64::__cpuid(1).ecx & (1 << 17) == 0 {
+        return 0;
+    }
+    enable_pcid();
+    PCID.store(true, Ordering::Relaxed);
+    4095
+}
+
+/// Sets up a secondary CPU like [`init_tags`] did the boot CPU: SSE, and
+/// PCIDs if the boot CPU uses them.
+pub fn init_cpu() {
+    enable_sse();
+    if PCID.load(Ordering::Relaxed) {
+        enable_pcid();
+    }
+}
+
+fn enable_sse() {
     // SAFETY: CR0.MP set, CR0.EM clear, CR4.OSFXSR and OSXMMEXCPT set: SSE
     // works with FXSAVE support. The kernel is built without SSE.
     unsafe {
@@ -133,9 +160,9 @@ pub fn init_tags() -> u16 {
             options(nostack)
         );
     }
-    if core::arch::x86_64::__cpuid(1).ecx & (1 << 17) == 0 {
-        return 0;
-    }
+}
+
+fn enable_pcid() {
     // SAFETY: CR4.PCIDE may be set while CR3 holds PCID 0, as it does (the
     // kernel's tables are loaded with no PCID bits).
     unsafe {
@@ -148,8 +175,6 @@ pub fn init_tags() -> u16 {
             options(nostack)
         );
     }
-    PCID.store(true, Ordering::Relaxed);
-    4095
 }
 
 fn load_cr3(value: u64) {
@@ -162,14 +187,16 @@ fn load_cr3(value: u64) {
 /// untagged), from `regs` until it makes a system call, is interrupted or
 /// faults; `regs` then holds its state at that point.
 ///
-/// `fresh` marks the first entry of a cell into its tag: the tag's
-/// translations are then dropped as the cell's tables are loaded, so nothing
-/// a previous holder of the tag left (or that was cached again while it was
-/// being released) can be used (design D6 of `add-scheduler`).
-pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Trap {
+/// `flush` drops the tag's translations on this CPU as the cell's tables
+/// are loaded, so nothing a previous holder of the tag left (or that was
+/// cached again while it was being released), and nothing stale from
+/// before the cell's translations shrank on another CPU, can be used
+/// (design D6 of `add-scheduler`, D5 of `add-smp-scheduling`).
+pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Trap {
     let cr3 = root | tag as u64;
-    if USER_CR3.swap(cr3, Ordering::Relaxed) != cr3 || fresh {
-        let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !fresh;
+    let cpu = index();
+    if USER_CR3[cpu].swap(cr3, Ordering::Relaxed) != cr3 || flush {
+        let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
         load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
     }
     // SYSRETQ loads RIP from RCX and RFLAGS from R11, so it restores exactly
@@ -181,7 +208,7 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     let user_flags = (regs.flags & 0xdd5) | 0x202;
     let sysret =
         regs.pc < 0x0000_8000_0000_0000 && regs.gpr[2] == regs.pc && regs.gpr[10] == user_flags;
-    if LAST_FS.swap(regs.tls, Ordering::Relaxed) != regs.tls {
+    if LAST_FS[cpu].swap(regs.tls, Ordering::Relaxed) != regs.tls {
         // SAFETY: the FS base is the cell's thread pointer; the kernel does
         // not use FS.
         unsafe { wrmsr(FS_BASE, regs.tls) };
@@ -218,11 +245,18 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
 /// and the tag of the cell (`root`, `tag`).
 pub fn release_user(_root: u64, _tag: u16) {
     // The tag's translations are dropped when its next cell first loads it
-    // (`enter_user` with `fresh`): one CR3 load here, not two (under nested
-    // virtualization each load can cost a VM exit).
+    // on each CPU (`enter_user` with `flush`): one CR3 load here, not two
+    // (under nested virtualization each load can cost a VM exit).
+    leave_user();
+}
+
+/// Switches this CPU's CR3 back to the kernel's tables, keeping the cell's
+/// translations (another CPU may run it next, or free it; design D4 of
+/// `add-smp-scheduling`).
+pub fn leave_user() {
     let pcid = PCID.load(Ordering::Relaxed);
     let kernel = crate::memory::kernel_tables().root();
-    USER_CR3.store(kernel, Ordering::Relaxed);
+    USER_CR3[index()].store(kernel, Ordering::Relaxed);
     load_cr3(if pcid { kernel | NO_FLUSH } else { kernel });
 }
 
