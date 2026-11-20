@@ -69,9 +69,9 @@ again:
   between cells, and a virtio-net card (smoltcp) to reach the outside;
   established connections are reset on suspend, resume and fork, as CRIU
   does by default.
-- **Multi-core.** Cells run in parallel on up to 16 CPUs, each on one CPU
-  at a time; the threads of one cell still share that CPU, and system calls
-  of different cells take turns.
+- **Multi-core.** Cells run in parallel on up to 16 CPUs; CPUs that no
+  other cell needs run more threads of a running cell at once (TLB
+  shootdowns on x86_64), and system calls of different cells take turns.
 - **CPython.** Unmodified CPython 3.13 (static) runs as a cell, its standard
   library in the cell's own files; a template frozen after its imports
   answers each request without starting the interpreter again.
