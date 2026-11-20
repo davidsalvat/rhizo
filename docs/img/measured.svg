@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1180" width="800" height="1180" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Measured on the same machine</title>
-<desc>Log-scale bar chart, lower is better. Same operation, same kind of VM: a cell against a Linux process. Fork, holding 50 MiB (the fork call): Rhizo cell 0.92 µs, Linux fork() 87 µs. Fork, then the child writes all 50 MiB: Rhizo cell 5.55 ms, Linux fork + write 23.61 ms. Run hello, from start to exit: Rhizo cell 7.18 µs, Linux posix_spawn 595 µs. Resume a suspended 8 MiB program: Cell, lazy 0.94 µs, Cell, eager 601 µs, Cell, lazy + read all 624 µs, CRIU restore (host) 2.51 ms. Answer a Python request (MicroPython): Warm template 471 µs, Cold interpreter 3.56 ms. Whole VMs and sandboxes: a larger scope, shown for scale. Resume a whole environment: Cell, eager 601 µs, Firecracker VM 3.74 ms, gVisor sandbox 93.65 ms. Run hello in a new environment: Rhizo cell 7.18 µs, gVisor sandbox 72.15 ms.</desc>
+<desc>Log-scale bar chart, lower is better. Same operation, same kind of VM: a cell against a Linux process. Fork, holding 50 MiB (the fork call): Rhizo cell 1.45 µs, Linux fork() 87 µs. Fork, then the child writes all 50 MiB: Rhizo cell 7.45 ms, Linux fork + write 27.28 ms. Run hello, from start to exit: Rhizo cell 7.34 µs, Linux posix_spawn 534 µs. Resume a suspended 8 MiB program: Cell, lazy 1.04 µs, Cell, eager 594 µs, Cell, lazy + read all 625 µs, CRIU restore (host) 2.70 ms. Answer a Python request (MicroPython): Warm template 506 µs, Cold interpreter 3.64 ms. Whole VMs and sandboxes: a larger scope, shown for scale. Resume a whole environment: Cell, eager 594 µs, Firecracker VM 4.71 ms, gVisor sandbox 99.85 ms. Run hello in a new environment: Rhizo cell 7.34 µs, gVisor sandbox 70.58 ms.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="1179" rx="12" fill="#ffffff" stroke="#d0d7de"/>
 <text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Measured on the same machine</text>
@@ -27,7 +27,7 @@
 <line x1="24" y1="118" x2="776" y2="118" stroke="#c3ccc8" stroke-width="1"/>
 <text x="24" y="138" font-size="15" fill="#146c4a" font-weight="700">Same operation, same kind of VM: a cell against a Linux process</text>
 <text x="24" y="170" font-size="15" fill="#0e2a20" font-weight="700">Fork, holding 50 MiB (the fork call)</text>
-<text x="776" y="170" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 95× faster</text>
+<text x="776" y="170" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 60× faster</text>
 <line x1="200.0" y1="182" x2="200.0" y2="246" stroke="#d0d7de" stroke-width="1"/>
 <line x1="279.3333333333333" y1="182" x2="279.3333333333333" y2="246" stroke="#d0d7de" stroke-width="1"/>
 <line x1="358.66666666666663" y1="182" x2="358.66666666666663" y2="246" stroke="#d0d7de" stroke-width="1"/>
@@ -36,13 +36,13 @@
 <line x1="596.6666666666667" y1="182" x2="596.6666666666667" y2="246" stroke="#d0d7de" stroke-width="1"/>
 <line x1="676.0" y1="182" x2="676.0" y2="246" stroke="#d0d7de" stroke-width="1"/>
 <text x="190" y="199" font-size="14" fill="#0e2a20" text-anchor="end">Rhizo cell</text>
-<rect x="200" y="185" width="76.5" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="284.5353197369213" y="200" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">0.92 µs</text>
+<rect x="200" y="185" width="92.2" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="300.2301095841595" y="200" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1.45 µs</text>
 <text x="190" y="231" font-size="14" fill="#4b5c55" text-anchor="end">Linux fork()</text>
-<rect x="200" y="217" width="233.4" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="441.38709680671457" y="232" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">87 µs</text>
+<rect x="200" y="217" width="233.3" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="441.2556778263497" y="232" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">87 µs</text>
 <text x="24" y="282" font-size="15" fill="#0e2a20" font-weight="700">Fork, then the child writes all 50 MiB</text>
-<text x="776" y="282" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 4.3× faster</text>
+<text x="776" y="282" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 3.7× faster</text>
 <line x1="200.0" y1="294" x2="200.0" y2="358" stroke="#d0d7de" stroke-width="1"/>
 <line x1="279.3333333333333" y1="294" x2="279.3333333333333" y2="358" stroke="#d0d7de" stroke-width="1"/>
 <line x1="358.66666666666663" y1="294" x2="358.66666666666663" y2="358" stroke="#d0d7de" stroke-width="1"/>
@@ -51,13 +51,13 @@
 <line x1="596.6666666666667" y1="294" x2="596.6666666666667" y2="358" stroke="#d0d7de" stroke-width="1"/>
 <line x1="676.0" y1="294" x2="676.0" y2="358" stroke="#d0d7de" stroke-width="1"/>
 <text x="190" y="311" font-size="14" fill="#0e2a20" text-anchor="end">Rhizo cell</text>
-<rect x="200" y="297" width="376.4" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="584.3687485183627" y="312" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">5.55 ms</text>
+<rect x="200" y="297" width="386.5" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="594.5123296776329" y="312" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">7.45 ms</text>
 <text x="190" y="343" font-size="14" fill="#4b5c55" text-anchor="end">Linux fork + write</text>
-<rect x="200" y="329" width="426.3" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="634.2694483378469" y="344" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">23.61 ms</text>
+<rect x="200" y="329" width="431.2" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="639.2414755925811" y="344" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">27.28 ms</text>
 <text x="24" y="394" font-size="15" fill="#0e2a20" font-weight="700">Run hello, from start to exit</text>
-<text x="776" y="394" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 83× faster</text>
+<text x="776" y="394" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 73× faster</text>
 <line x1="200.0" y1="406" x2="200.0" y2="470" stroke="#d0d7de" stroke-width="1"/>
 <line x1="279.3333333333333" y1="406" x2="279.3333333333333" y2="470" stroke="#d0d7de" stroke-width="1"/>
 <line x1="358.66666666666663" y1="406" x2="358.66666666666663" y2="470" stroke="#d0d7de" stroke-width="1"/>
@@ -66,13 +66,13 @@
 <line x1="596.6666666666667" y1="406" x2="596.6666666666667" y2="470" stroke="#d0d7de" stroke-width="1"/>
 <line x1="676.0" y1="406" x2="676.0" y2="470" stroke="#d0d7de" stroke-width="1"/>
 <text x="190" y="423" font-size="14" fill="#0e2a20" text-anchor="end">Rhizo cell</text>
-<rect x="200" y="409" width="147.3" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="355.25733752035546" y="424" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">7.18 µs</text>
+<rect x="200" y="409" width="148.0" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="355.9978025132654" y="424" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">7.34 µs</text>
 <text x="190" y="455" font-size="14" fill="#4b5c55" text-anchor="end">Linux posix_spawn</text>
-<rect x="200" y="441" width="299.4" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="507.4363835502669" y="456" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">595 µs</text>
+<rect x="200" y="441" width="295.7" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="503.70956166818917" y="456" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">534 µs</text>
 <text x="24" y="506" font-size="15" fill="#0e2a20" font-weight="700">Resume a suspended 8 MiB program</text>
-<text x="776" y="506" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 4.2× faster</text>
+<text x="776" y="506" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 4.5× faster</text>
 <line x1="200.0" y1="518" x2="200.0" y2="646" stroke="#d0d7de" stroke-width="1"/>
 <line x1="279.3333333333333" y1="518" x2="279.3333333333333" y2="646" stroke="#d0d7de" stroke-width="1"/>
 <line x1="358.66666666666663" y1="518" x2="358.66666666666663" y2="646" stroke="#d0d7de" stroke-width="1"/>
@@ -81,19 +81,19 @@
 <line x1="596.6666666666667" y1="518" x2="596.6666666666667" y2="646" stroke="#d0d7de" stroke-width="1"/>
 <line x1="676.0" y1="518" x2="676.0" y2="646" stroke="#d0d7de" stroke-width="1"/>
 <text x="190" y="535" font-size="14" fill="#0e2a20" text-anchor="end">Cell, lazy</text>
-<rect x="200" y="521" width="77.3" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="285.3112609571614" y="536" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">0.94 µs</text>
+<rect x="200" y="521" width="80.6" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="288.6183233786535" y="536" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">1.04 µs</text>
 <text x="190" y="567" font-size="14" fill="#0e2a20" text-anchor="end">Cell, eager</text>
-<rect x="200" y="553" width="299.8" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="507.81580855868464" y="568" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">601 µs</text>
+<rect x="200" y="553" width="299.4" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="507.411874490848" y="568" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">594 µs</text>
 <text x="190" y="599" font-size="14" fill="#0e2a20" text-anchor="end">Cell, lazy + read all</text>
 <rect x="200" y="585" width="301.1" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="509.0629931158182" y="600" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">624 µs</text>
+<text x="509.1430670161181" y="600" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">625 µs</text>
 <text x="190" y="631" font-size="14" fill="#4b5c55" text-anchor="end">CRIU restore (host)</text>
-<rect x="200" y="617" width="349.0" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="556.9927049099597" y="632" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">2.51 ms</text>
+<rect x="200" y="617" width="351.5" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="559.5357121771644" y="632" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">2.70 ms</text>
 <text x="24" y="682" font-size="15" fill="#0e2a20" font-weight="700">Answer a Python request (MicroPython)</text>
-<text x="776" y="682" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 7.6× faster</text>
+<text x="776" y="682" font-size="15" fill="#146c4a" font-weight="700" text-anchor="end">≈ 7.2× faster</text>
 <line x1="200.0" y1="694" x2="200.0" y2="758" stroke="#d0d7de" stroke-width="1"/>
 <line x1="279.3333333333333" y1="694" x2="279.3333333333333" y2="758" stroke="#d0d7de" stroke-width="1"/>
 <line x1="358.66666666666663" y1="694" x2="358.66666666666663" y2="758" stroke="#d0d7de" stroke-width="1"/>
@@ -102,11 +102,11 @@
 <line x1="596.6666666666667" y1="694" x2="596.6666666666667" y2="758" stroke="#d0d7de" stroke-width="1"/>
 <line x1="676.0" y1="694" x2="676.0" y2="758" stroke="#d0d7de" stroke-width="1"/>
 <text x="190" y="711" font-size="14" fill="#0e2a20" text-anchor="end">Warm template</text>
-<rect x="200" y="697" width="291.4" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="499.3880905130353" y="712" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">471 µs</text>
+<rect x="200" y="697" width="293.9" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="501.8582495718371" y="712" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">506 µs</text>
 <text x="190" y="743" font-size="14" fill="#4b5c55" text-anchor="end">Cold interpreter</text>
-<rect x="200" y="729" width="361.1" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="569.1178189182167" y="744" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">3.56 ms</text>
+<rect x="200" y="729" width="361.9" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="569.8874012548825" y="744" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">3.64 ms</text>
 <line x1="24" y1="786" x2="776" y2="786" stroke="#c3ccc8" stroke-width="1"/>
 <text x="24" y="806" font-size="15" fill="#146c4a" font-weight="700">Whole VMs and sandboxes: a larger scope, shown for scale</text>
 <text x="24" y="838" font-size="15" fill="#0e2a20" font-weight="700">Resume a whole environment</text>
@@ -118,14 +118,14 @@
 <line x1="596.6666666666667" y1="850" x2="596.6666666666667" y2="946" stroke="#d0d7de" stroke-width="1"/>
 <line x1="676.0" y1="850" x2="676.0" y2="946" stroke="#d0d7de" stroke-width="1"/>
 <text x="190" y="867" font-size="14" fill="#0e2a20" text-anchor="end">Cell, eager</text>
-<rect x="200" y="853" width="299.8" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="507.81580855868464" y="868" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">601 µs</text>
+<rect x="200" y="853" width="299.4" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="507.411874490848" y="868" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">594 µs</text>
 <text x="190" y="899" font-size="14" fill="#4b5c55" text-anchor="end">Firecracker VM</text>
-<rect x="200" y="885" width="362.8" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="570.7932867898583" y="900" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">3.74 ms</text>
+<rect x="200" y="885" width="370.7" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="578.7074655181614" y="900" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">4.71 ms</text>
 <text x="190" y="931" font-size="14" fill="#4b5c55" text-anchor="end">gVisor sandbox</text>
-<rect x="200" y="917" width="473.7" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="681.741023442114" y="932" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">93.65 ms</text>
+<rect x="200" y="917" width="475.9" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="683.949924318614" y="932" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">99.85 ms</text>
 <text x="24" y="982" font-size="15" fill="#0e2a20" font-weight="700">Run hello in a new environment</text>
 <line x1="200.0" y1="994" x2="200.0" y2="1058" stroke="#d0d7de" stroke-width="1"/>
 <line x1="279.3333333333333" y1="994" x2="279.3333333333333" y2="1058" stroke="#d0d7de" stroke-width="1"/>
@@ -135,11 +135,11 @@
 <line x1="596.6666666666667" y1="994" x2="596.6666666666667" y2="1058" stroke="#d0d7de" stroke-width="1"/>
 <line x1="676.0" y1="994" x2="676.0" y2="1058" stroke="#d0d7de" stroke-width="1"/>
 <text x="190" y="1011" font-size="14" fill="#0e2a20" text-anchor="end">Rhizo cell</text>
-<rect x="200" y="997" width="147.3" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
-<text x="355.25733752035546" y="1012" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">7.18 µs</text>
+<rect x="200" y="997" width="148.0" height="20" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="355.9978025132654" y="1012" font-size="14" fill="#0e2a20" font-weight="700" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">7.34 µs</text>
 <text x="190" y="1043" font-size="14" fill="#4b5c55" text-anchor="end">gVisor sandbox</text>
-<rect x="200" y="1029" width="464.8" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
-<text x="672.7525544631989" y="1044" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">72.15 ms</text>
+<rect x="200" y="1029" width="464.0" height="20" rx="3" fill="#8c959f" stroke="#8c959f" stroke-width="0"/>
+<text x="671.996533470897" y="1044" font-size="14" fill="#0e2a20" font-weight="400" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" paint-order="stroke">70.58 ms</text>
 <text x="24" y="1122" font-size="14" fill="#4b5c55">GitHub-hosted runners with KVM (shared machines, nested virtualization). Rhizo and</text>
 <text x="24" y="1141" font-size="14" fill="#4b5c55">the Linux processes run inside Firecracker; CRIU runs on the host. Eager resume restores</text>
 <text x="24" y="1160" font-size="14" fill="#4b5c55">every page first; lazy brings pages back on first touch.</text>
