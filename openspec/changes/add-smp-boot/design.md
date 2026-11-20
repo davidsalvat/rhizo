@@ -128,3 +128,25 @@ Lost: a ticket lock (fair, but no holder to detect reentrance without a
 second field; contention is not expected until cells run everywhere, where
 `add-smp-scheduling` measures it) and per-CPU allocators (an optimization
 that needs a benchmark first, rule 7).
+
+## D8. Heap pages from the top of memory
+
+With several CPUs the order in which frames are taken and freed changes,
+and the boot path takes more of them (stacks, redistributors). The kernel
+heap keeps the single pages it carves into small blocks; taken next-fit
+like every other frame, they ended up scattered over memory, and the free
+memory between them had no 2 MiB-aligned block for a copy-on-write large
+page, nor a run of a few MiB for a snapshot: a template child was killed on
+a write to a 2 MiB page (CI, AArch64, four vCPUs). Single heap pages now
+come from the top of memory (`FrameAllocator::alloc_high`), so they pile up
+there and leave the rest in large runs; cells, tables and large heap
+allocations keep taking frames next-fit from the bottom. The host's run
+queue holds boxed cells: a thousand live cells need a few KiB of queue, not
+a megabyte of contiguous heap taken from the kernel's reserve when memory is
+nearly all given to cells (`a_thousand_idle_cells` failed on that once heap
+pages moved to the top).
+
+Lost: returning empty heap pages to the allocator (the heap keeps them by
+design, `add-memory-accounting`), and mapping large heap allocations from
+scattered frames into a virtual window (unmapping them would need TLB
+shootdowns of kernel addresses on every CPU).

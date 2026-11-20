@@ -103,8 +103,8 @@ impl<'a> FrameAllocator<'a> {
 
     /// Allocates the highest free frame. The kernel heap takes its pages
     /// here, so the pages it keeps cluster at the top of memory instead of
-    /// splitting the free runs that large allocations need (design D7 of
-    /// `add-smp-scheduling`).
+    /// splitting the free runs that large allocations need (design D8 of
+    /// `add-smp-boot`).
     pub fn alloc_high(&mut self) -> Option<u64> {
         if self.free == 0 {
             return None;
