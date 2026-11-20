@@ -853,6 +853,7 @@ fn vmm_label(id: &str) -> &str {
 
 /// Path of the generated chart, relative to the workspace root.
 const CHART: &str = "bench/boot-time.svg";
+const CHART_DARK: &str = "bench/boot-time-dark.svg";
 
 /// Order in which VMMs appear in the chart.
 const CHART_VMMS: [&str; 4] = [
@@ -869,9 +870,10 @@ fn median_of<'a>(ready: &[&'a Metric], guest: &str, vmm: &str) -> Option<&'a Met
         .find(|m| m.guest == guest && m.vmm.as_deref() == Some(vmm))
 }
 
-/// Horizontal grouped bar chart (one group per VMM, Rhizo vs Linux), as SVG.
-/// Colors and grey text read well on both light and dark backgrounds.
-pub fn chart_svg(results: &Results) -> String {
+/// Horizontal grouped bar chart (one group per VMM, Rhizo vs Linux), as SVG,
+/// for a light or a dark page: no single grey reads at WCAG AA (4.5:1) on
+/// both GitHub's white and its #0d1117, so each theme gets its own text.
+pub fn chart_svg(results: &Results, dark: bool) -> String {
     const WIDTH: f64 = 760.0;
     const LABEL_W: f64 = 150.0;
     const RIGHT_W: f64 = 150.0;
@@ -880,7 +882,11 @@ pub fn chart_svg(results: &Results) -> String {
     const TOP: f64 = 70.0;
     const RHIZO: &str = "#2563eb";
     const LINUX: &str = "#f97316";
-    const TEXT: &str = "#8b949e";
+    // 6.2:1 on white, 6.6:1 on #0d1117.
+    let text = if dark { "#9ba7b3" } else { "#57606a" };
+    // The speed-up label in Rhizo's blue: 5.2:1 on white; on the dark page
+    // that blue is 3.7:1, so a lighter one (7.5:1).
+    let accent = if dark { "#58a6ff" } else { RHIZO };
 
     let ready: Vec<&Metric> = results
         .metrics
@@ -901,7 +907,7 @@ pub fn chart_svg(results: &Results) -> String {
     let mut svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{WIDTH}\" height=\"{height}\" \
          viewBox=\"0 0 {WIDTH} {height}\" font-family=\"-apple-system, Segoe UI, Helvetica, Arial, sans-serif\" \
-         font-size=\"13\" fill=\"{TEXT}\">\n"
+         font-size=\"13\" fill=\"{text}\">\n"
     );
     svg += "  <text x=\"0\" y=\"22\" font-size=\"16\" font-weight=\"600\">Time from VMM launch to guest ready \
          (median, lower is better)</text>\n";
@@ -949,7 +955,7 @@ pub fn chart_svg(results: &Results) -> String {
         }
         if let (Some(r), Some(l)) = (rhizo, linux) {
             svg += &format!(
-                "  <text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-weight=\"600\" fill=\"{RHIZO}\">{:.0}× faster</text>\n",
+                "  <text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-weight=\"600\" fill=\"{accent}\">{:.0}× faster</text>\n",
                 WIDTH - 4.0,
                 y0 + BAR_H + 4.0,
                 l.median / r.median
@@ -983,7 +989,10 @@ pub fn readme_section(results: &Results) -> String {
         s += "_No timing results yet._\n";
         return s;
     }
-    s += &format!("![Boot time: Rhizo vs a reference Linux guest]({CHART})\n\n");
+    s += &format!(
+        "<picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"{CHART_DARK}\">\
+         <img src=\"{CHART}\" alt=\"Boot time: Rhizo vs a reference Linux guest\"></picture>\n\n"
+    );
     s += "| VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |\n";
     s += "|---|---:|---:|---:|---:|---:|\n";
     let cell = |m: Option<&Metric>, p90: bool| {
@@ -1094,9 +1103,11 @@ fn update_readme(results: &Results) -> Result {
     let text = fs::read_to_string(&path).map_err(|e| format!("cannot read README.md: {e}"))?;
     let new = replace_section(&text, &readme_section(results))?;
     fs::write(&path, new).map_err(|e| format!("cannot write README.md: {e}"))?;
-    let chart = workspace_root().join(CHART);
-    fs::write(&chart, chart_svg(results))
-        .map_err(|e| format!("cannot write {}: {e}", chart.display()))?;
+    for (file, dark) in [(CHART, false), (CHART_DARK, true)] {
+        let chart = workspace_root().join(file);
+        fs::write(&chart, chart_svg(results, dark))
+            .map_err(|e| format!("cannot write {}: {e}", chart.display()))?;
+    }
     report::text("README.md benchmark section updated");
     Ok(())
 }
@@ -1262,7 +1273,10 @@ mod tests {
             metric("boot.time_to_ready_ms", "rhizo", Some("qemu-microvm"), 40.0),
         ]);
         let s = readme_section(&r);
-        assert!(s.contains("![Boot time: Rhizo vs a reference Linux guest](bench/boot-time.svg)"));
+        assert!(s.contains("srcset=\"bench/boot-time-dark.svg\""));
+        assert!(s.contains(
+            "<img src=\"bench/boot-time.svg\" alt=\"Boot time: Rhizo vs a reference Linux guest\">"
+        ));
         assert!(s.contains("| Firecracker | 4.2 | 4.2 | 130.0 | 130.0 | 5 |"));
         assert!(s.contains("| QEMU microvm | 40.0 | 40.0 | — | — | 5 |"));
         assert!(s.contains("Environment: `ci`, KVM: yes, measured 2026-11-19"));
@@ -1275,7 +1289,7 @@ mod tests {
             metric("boot.time_to_ready_ms", "linux", Some("firecracker"), 120.0),
             metric("boot.time_to_ready_ms", "rhizo", Some("qemu-microvm"), 40.0),
         ]);
-        let svg = chart_svg(&r);
+        let svg = chart_svg(&r, false);
         assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
         assert!(svg.contains("#2563eb") && svg.contains("#f97316"));
         assert!(svg.contains(">Rhizo</text>") && svg.contains(">Linux (reference guest)</text>"));

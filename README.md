@@ -53,7 +53,7 @@ again:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/lifecycle-dark.svg">
-    <img src="docs/img/lifecycle.svg" alt="A static Linux executable is created as a running cell. The cell can be suspended into a snapshot and resumed (0.93 µs), forked into copy-on-write children (1.29 µs), or frozen as a template from which new, already warmed-up cells start (0.33 µs)." width="800">
+    <img src="docs/img/lifecycle.svg" alt="A static Linux executable is created as a running cell. The cell can be suspended into a snapshot and resumed (1.27 µs), forked into copy-on-write children (1.48 µs), or frozen as a template from which new, already warmed-up cells start (0.35 µs)." width="800">
   </picture>
 </p>
 
@@ -77,7 +77,7 @@ The targets are hypotheses the proof of concept must validate. Where they stand:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/scorecard-dark.svg">
-    <img src="docs/img/scorecard.svg" alt="Fork a 50 MB cell: target under 1 ms, measured 1.1 to 1.3 µs, met. Resume from memory: target under 100 µs, measured 0.7 to 1.1 µs with lazy restore, met. Idle cell overhead: target a few KB, being measured in milestone H9." width="800">
+    <img src="docs/img/scorecard.svg" alt="Fork a 50 MB cell: target under 1 ms, measured 1.4 to 1.5 µs, met. Resume from memory: target under 100 µs, measured 1.2 to 1.3 µs with lazy restore, met. Idle cell overhead: target a few KB, being measured in milestone H9." width="800">
   </picture>
 </p>
 
@@ -112,13 +112,13 @@ on the same machine, with the same clock:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/measured-dark.svg">
-    <img src="docs/img/measured.svg" alt="Log-scale bar chart, lower is better. Resume a suspended environment: Rhizo 0.93 µs, Firecracker snapshot restore 3.56 ms. Fork an environment holding 50 MiB: Rhizo 1.29 µs, Linux fork 1.79 ms. Run hello from start to exit: Rhizo 9.9 µs, Linux posix_spawn 132 µs. Start a cell from a warm template: Rhizo 0.33 µs." width="800">
+    <img src="docs/img/measured.svg" alt="Log-scale bar chart, lower is better. Resume a suspended environment: Rhizo 1.27 µs, Firecracker snapshot restore 3.74 ms. Fork an environment holding 50 MiB: Rhizo 1.48 µs, Linux fork 1.78 ms. Run hello from start to exit: Rhizo 7.2 µs, Linux posix_spawn 112 µs. Start a cell from a warm template: Rhizo 0.35 µs." width="800">
   </picture>
 </p>
 
-Shared runners are noisy, so figures move between runs; the tables below are
-the last run written into this README. Publishable numbers will come from a
-dedicated machine. How benchmarks, environments and baselines work:
+The charts and the tables below come from the same run (the date is under the
+tables). Shared runners are noisy, so figures move between runs; publishable
+numbers will come from a dedicated machine. How benchmarks, environments and baselines work:
 [`bench/README.md`](bench/README.md).
 
 <details>
@@ -130,14 +130,14 @@ Rhizo prints its ready line at the end of boot; the reference is Firecracker's
 CI Linux guest kernel with a minimal `/init` that prints the same line, booted
 on the same machine with the same timing method.
 
-![Boot time: Rhizo vs a reference Linux guest](bench/boot-time.svg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="bench/boot-time-dark.svg"><img src="bench/boot-time.svg" alt="Boot time: Rhizo vs a reference Linux guest"></picture>
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 9.7 | 10.6 | 200.1 | 201.5 | 20 |
-| Cloud Hypervisor | 7.6 | 14.9 | 112.7 | 115.3 | 20 |
-| QEMU microvm | 46.3 | 49.2 | — | — | 20 |
-| QEMU q35 | 65.6 | 68.4 | 182.4 | 190.5 | 20 |
+| Firecracker | 9.7 | 10.1 | 201.5 | 203.2 | 20 |
+| Cloud Hypervisor | 9.0 | 15.2 | 111.9 | 118.2 | 20 |
+| QEMU microvm | 45.9 | 46.5 | — | — | 20 |
+| QEMU q35 | 65.4 | 66.8 | 188.5 | 189.6 | 20 |
 
 ### Cells against existing mechanisms
 
@@ -145,12 +145,12 @@ Same machine, same run. Rhizo runs inside Firecracker; the sandbox column is a L
 
 | Operation | Rhizo cell | Firecracker microVM | Linux process |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 7.2 µs | 200.10 ms | 104.4 µs |
-| Resume a suspended environment until it runs | 1.5 µs | 3.75 ms | — |
-| Fork an environment holding 50 MiB | 1.4 µs | 3.75 ms | 1.66 ms |
-| Serve a request from a warm template | 16.2 µs | 3.75 ms | — |
+| Start a program and run it to its exit (`hello`) | 7.2 µs | 201.48 ms | 111.5 µs |
+| Resume a suspended environment until it runs | 1.3 µs | 3.74 ms | — |
+| Fork an environment holding 50 MiB | 1.5 µs | 3.74 ms | 1.78 ms |
+| Serve a request from a warm template | 15.5 µs | 3.74 ms | — |
 
-Environment: `ci`, KVM: yes, measured 2026-11-19. Regenerate with
+Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 `cargo xtask bench --readme`.
 <!-- bench:end -->
 
