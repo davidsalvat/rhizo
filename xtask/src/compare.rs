@@ -290,8 +290,9 @@ fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
         c
     };
     cmd.args(["--kill-after=5", "60"]).arg(runsc);
-    // Cgroups are left alone (CI runners differ), and every command logs to
-    // `<root>/../logs/`, quoted when a command fails.
+    // gVisor's KVM platform, as Rhizo uses KVM (its default, systrap, hangs on
+    // GitHub's runners); cgroups are left alone (CI runners differ); every
+    // command logs to `<root>/../logs/`, quoted when a command fails.
     let mut logs = root
         .parent()
         .unwrap_or(root)
@@ -301,7 +302,12 @@ fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
     logs.push('/');
     cmd.arg("--root")
         .arg(root)
-        .args(["--network=none", "--ignore-cgroups", "--debug"])
+        .args([
+            "--platform=kvm",
+            "--network=none",
+            "--ignore-cgroups",
+            "--debug",
+        ])
         .arg(format!("--debug-log={logs}"));
     cmd.stdin(Stdio::null());
     cmd

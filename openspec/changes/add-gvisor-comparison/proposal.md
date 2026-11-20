@@ -11,7 +11,8 @@ userspace-kernel sandbox, is not. Without it the claim is half-checked.
 - `cargo xtask bench` measures gVisor (`runsc`) on the same machine, in the
   same run, where `runsc` is installed and runs:
   - `sandbox.run_ms` for guest `gvisor`: a new sandbox running the same
-    static `hello` the cell benchmark runs, to its exit (`runsc do`);
+    static `hello` the cell benchmark runs, to its exit (`runsc run`, KVM
+    platform);
   - `snapshot.restore_ms` for guest `gvisor`: restoring a checkpointed
     sandbox of an idle program until it runs again (`runsc checkpoint` /
     `runsc restore`).
@@ -23,7 +24,7 @@ userspace-kernel sandbox, is not. Without it the claim is half-checked.
 
 ### Out of scope
 
-gVisor platforms other than its default, network setups, OCI runtimes
+gVisor platforms other than KVM, network setups, OCI runtimes
 around it (containerd, Docker).
 
 ## Capabilities
