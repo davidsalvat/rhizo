@@ -146,7 +146,7 @@ pub fn secondary_main(cpu: usize) -> ! {
     loop {
         let job = mail.job.load(Ordering::Acquire);
         if job == 0 {
-            arch::smp::idle();
+            idle();
             continue;
         }
         // SAFETY: `post` stores only addresses of `fn(u64) -> u64`.
@@ -157,15 +157,21 @@ pub fn secondary_main(cpu: usize) -> ! {
     }
 }
 
+/// Sleeps until an interrupt: a wake-up, or the timer if armed.
+pub fn idle() {
+    arch::smp::idle();
+}
+
+/// Wakes CPU `cpu` from [`idle`].
+pub fn wake(cpu: usize) {
+    arch::smp::wake(cpu);
+}
+
 /// Hands `f(arg)` to secondary CPU `cpu` and wakes it; [`join`] waits for
-/// the result (the in-kernel tests use it to reach every CPU).
+/// the result (the host's runs, and in-kernel tests to reach every CPU).
 ///
 /// # Panics
 /// If `cpu` is not an online secondary CPU, or it is busy.
-#[cfg_attr(
-    not(feature = "ktest"),
-    allow(dead_code, reason = "used by in-kernel tests")
-)]
 pub fn post(cpu: usize, f: fn(u64) -> u64, arg: u64) {
     assert!((1..count()).contains(&cpu), "CPU {cpu} is not online");
     let mail = &MAIL[cpu];
@@ -174,14 +180,10 @@ pub fn post(cpu: usize, f: fn(u64) -> u64, arg: u64) {
         .job
         .compare_exchange(0, f as usize, Ordering::Release, Ordering::Relaxed);
     assert!(posted.is_ok(), "CPU {cpu} is busy");
-    arch::smp::wake(cpu);
+    wake(cpu);
 }
 
 /// Waits until CPU `cpu` has run what [`post`] gave it; returns the result.
-#[cfg_attr(
-    not(feature = "ktest"),
-    allow(dead_code, reason = "used by in-kernel tests")
-)]
 pub fn join(cpu: usize) -> u64 {
     let mail = &MAIL[cpu];
     while mail.job.load(Ordering::Acquire) != 0 {

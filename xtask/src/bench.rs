@@ -477,6 +477,32 @@ fn measure_cells(
                 }
             }
         }
+        let (mut parallel, mut scaling, mut ipi_wake) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..opts.runs.clamp(1, 3) {
+            let smp = RunOptions {
+                cpus: crate::SMP_CPUS,
+                ..run_opts
+            };
+            let out = vmm::run(vmm, &guest, smp)?;
+            match parse_smp_line(&out.output) {
+                Some(s) if out.result != VmResult::Failed && s.serial_ns > 0 => {
+                    let cells = 4.0 * s.cpus as f64;
+                    parallel.push(s.parallel_ns as f64 / cells / 1000.0);
+                    scaling.push(100.0 * s.parallel_ns as f64 * s.cpus as f64 / s.serial_ns as f64);
+                    ipi_wake.push(s.ipi_wake_ns as f64 / 1000.0);
+                }
+                _ => {
+                    skipped.push((
+                        format!("cells on {} CPUs/{}", crate::SMP_CPUS, vmm.id()),
+                        format!(
+                            "no `rhizo-smp` line ({:?}); output:\n{}",
+                            out.result, out.output
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
         for (name, unit, values) in [
             ("cell.spawn_us", "us", &mut spawn),
             ("cell.run_us", "us", &mut run),
@@ -502,6 +528,9 @@ fn measure_cells(
             ("workload.cpython_warm_us", "us", &mut cpy_warm),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
+            ("cell.parallel_us", "us", &mut parallel),
+            ("cell.scaling_pct", "%", &mut scaling),
+            ("cell.ipi_wake_us", "us", &mut ipi_wake),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
                 let why = match crate::hostnet::for_vmm(vmm) {
@@ -611,6 +640,31 @@ fn parse_net_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("pipe_rtt_ns")?, field("loopback_rtt_ns")?))
+}
+
+/// The multi-core line of a `bench-cell` kernel booted with several CPUs.
+#[derive(Debug, PartialEq, Eq)]
+struct SmpLine {
+    cpus: u64,
+    serial_ns: u64,
+    parallel_ns: u64,
+    ipi_wake_ns: u64,
+}
+
+fn parse_smp_line(output: &str) -> Option<SmpLine> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-smp "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some(SmpLine {
+        cpus: field("cpus")?,
+        serial_ns: field("serial_ns")?,
+        parallel_ns: field("parallel_ns")?,
+        ipi_wake_ns: field("ipi_wake_ns")?,
+    })
 }
 
 /// `(create_ns, futex_wake_ns)` of the threads line of a `bench-cell`
@@ -1721,6 +1775,22 @@ mod tests {
             Some((4200, 650))
         );
         assert_eq!(parse_threads_line("rhizo-threads create_ns=1\n"), None);
+    }
+
+    #[test]
+    fn smp_line_is_parsed() {
+        assert_eq!(
+            parse_smp_line(
+                "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000\n"
+            ),
+            Some(SmpLine {
+                cpus: 4,
+                serial_ns: 800,
+                parallel_ns: 220,
+                ipi_wake_ns: 9000
+            })
+        );
+        assert_eq!(parse_smp_line("rhizo-smp cpus=4 serial_ns=1\n"), None);
     }
 
     #[test]

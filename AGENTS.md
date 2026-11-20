@@ -133,7 +133,7 @@ The feedback loop, fastest first:
 | `crates/rhizo-virtio` | virtio-mmio (version 2) transport, split virtqueues and the network device, through `rhizo-hal` registers and memory | `rhizo-hal` |
 | `crates/rhizo-abi` | Linux system calls of cells (both conventions), files through the cell's `rhizo-fs`, threads (`clone`, `clone3`, futexes), pipes, `poll`/`select`/`epoll`, sockets through `rhizo-net`, `EFAULT`/`ENOSYS`, scheduling outcomes (yield, block, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs`, `rhizo-net` |
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian, threads, files and sockets sections), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs`, `rhizo-net` |
-| `crates/rhizo-sched` | Run queue, sleep list, waiting set and time slice (time passed in, never read); address-space tag pool | — |
+| `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list, waiting set and time slice (time and CPU passed in, never read); address-space tag pool | — |
 | `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio` |
 | `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
 | `xtask` | Developer tooling (host only); builds the static CPython cell and encodes its files (`cpython.rs`) | `rhizo-fs` |
@@ -170,6 +170,9 @@ Memory layout, the same on both architectures (see
   memory only through `PhysicalMemory` (kernel: `memory::DirectMap`).
 - `0xffff_ffff_8000_0000 + phys`: kernel image with W^X; the page under the
   kernel stack is an unmapped guard page.
+- `0xffff_9000_0000_0000` (512 GiB, builds that run cells): large kernel
+  heap allocations mapped from single frames when no contiguous run is
+  free; addresses never reused.
 - `0xffff_ffff_c000_0000 + n * 128 KiB`: stacks of secondary CPU `n`
   (kernel, exception, double fault), each above an unmapped guard page.
 - AArch64 only: `0xffff_c000_0000_0000 + phys` is a device-memory window

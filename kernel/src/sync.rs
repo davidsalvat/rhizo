@@ -25,4 +25,10 @@ impl<T> Global<T> {
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         self.0.with(crate::arch::cpu::index(), f)
     }
+
+    /// The value, without locking: `&mut self` proves nobody else has it.
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
+    }
 }

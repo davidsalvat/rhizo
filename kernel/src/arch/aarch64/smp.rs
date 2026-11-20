@@ -191,6 +191,7 @@ pub fn start(limit: Option<u16>) -> usize {
 #[unsafe(no_mangle)]
 extern "C" fn rhizo_secondary_main(index: u64) -> ! {
     irq::init_cpu();
+    super::user::init_cpu();
     crate::smp::secondary_main(index as usize)
 }
 

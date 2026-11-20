@@ -208,6 +208,16 @@ pub fn available() -> bool {
     APIC.load(Ordering::Relaxed) != 0
 }
 
+/// Starts this CPU's periodic tick (a secondary CPU running cells).
+pub fn start_tick() {
+    tick();
+}
+
+/// Stops this CPU's tick (a secondary CPU going idle for good).
+pub fn stop_tick() {
+    write(LVT_TIMER, (1 << 16) | TIMER_VECTOR as u32);
+}
+
 /// Ends the interrupt being handled (the periodic tick re-arms itself).
 pub fn acknowledge() {
     write(EOI, 0);

@@ -53,6 +53,9 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.idle_bytes` | deterministic | Memory each of 1000 idle cells costs (forks of a template of `idle`, each run into its sleep): what "thousands of mostly idle cells per node" costs |
 | `cell.suspended_bytes` | deterministic | Snapshot size of one idle cell |
 | `cell.thread_create_us/rhizo/<vmm>` | timing | A thread of the `threads` cell creating a thread (raw `clone`, as `pthread_create` does) that exits at once, and joining it (futex wait on its clear-tid word); measured by the cell with `clock_gettime`, robust figure over 105 runs |
+| `cell.parallel_us/rhizo/<vmm>` | timing | With 4 vCPUs: sixteen CPU-bound cells (`spin 5`, four per CPU) run on every CPU, wall time per cell (`bench-cell` booted with 4 vCPUs) |
+| `cell.scaling_pct/rhizo/<vmm>` | timing | That batch's time on every CPU, times the number of CPUs, over its time stepping on one CPU, in percent: 100 is perfect scaling (lower is better) |
+| `cell.ipi_wake_us/rhizo/<vmm>` | timing | Handing work to an idle CPU: post it, wake the CPU with an inter-processor interrupt, see it done (robust figure over 105) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
 
 Figures the kernel repeats a hundred times or more (`cell.spawn_us`,

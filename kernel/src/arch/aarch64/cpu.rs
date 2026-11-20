@@ -181,9 +181,9 @@ pub(super) fn percpu(cpu: usize, exception_stack: u64) -> u64 {
     p as *const PerCpu as u64
 }
 
-/// Lower-half table loaded in `TTBR0_EL1`: the empty one, or a cell's
-/// (managed by [`super::user`]).
-pub(super) static USER_ROOT: AtomicU64 = AtomicU64::new(0);
+/// Lower-half table loaded in each CPU's `TTBR0_EL1`, by CPU number: the
+/// empty one, or a cell's (managed by [`super::user`]).
+pub(super) static USER_ROOT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 pub(super) static EMPTY_ROOT: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
@@ -222,7 +222,7 @@ pub unsafe fn activate(root: u64, alloc: &mut impl FnMut() -> Option<u64>) {
     let empty = alloc().expect("a frame for the empty lower-half table");
     DirectMap.zero_frame(empty);
     EMPTY_ROOT.store(empty, Ordering::Relaxed);
-    USER_ROOT.store(empty, Ordering::Relaxed);
+    USER_ROOT[index()].store(empty, Ordering::Relaxed);
     // SAFETY: guaranteed by the caller; the barriers make the table writes
     // visible to the walker before the switch and drop stale translations.
     unsafe {
