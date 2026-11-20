@@ -88,6 +88,13 @@ macro_rules! suite {
             ktest_case!(memory_pressure_fails_cells_not_the_kernel),
             ktest_case!(a_thousand_idle_cells),
             ktest_case!(micropython_in_a_cell),
+            ktest_case!(sockets_and_pipes_behave_as_on_linux),
+            ktest_case!(cells_talk_over_loopback),
+            ktest_case!(a_waiting_cell_uses_no_cpu),
+            ktest_case!(sockets_across_suspend_and_resume),
+            ktest_case!(a_blocked_cell_survives_suspend),
+            ktest_case!(forked_servers_share_their_listener),
+            ktest_case!(pipes_and_sockets_of_a_fork),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1169,4 +1176,150 @@ fn micropython_in_a_cell() {
     for id in ids {
         assert_eq!(ended(&host, id), (Ending::Exit(0), answer.into()));
     }
+}
+
+/// Pipes, event counters, `poll`, `epoll`, `select` and sockets through a
+/// real libc print what they print on Linux; every frame comes back.
+fn sockets_and_pipes_behave_as_on_linux() {
+    assert_no_leak("libc_net");
+    for name in ["loopback", "piper", "netstate"] {
+        run_expected(name);
+    }
+    assert_eq!(crate::cell::open_sockets(), 0, "every socket closed");
+}
+
+/// A server cell and a client cell exchange messages over TCP on 127.0.0.1.
+fn cells_talk_over_loopback() {
+    let mut host = Host::new();
+    let server = spawn(&mut host, "loopback", &[b"serve", b"7300", b"100"]);
+    let client = spawn(&mut host, "loopback", &[b"ping", b"7300", b"100"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
+    assert_eq!(ended(&host, client), (Ending::Exit(0), "pinged\n".into()));
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// A server waiting in `accept` does not run while another cell works; it
+/// runs once a client connects.
+fn a_waiting_cell_uses_no_cpu() {
+    let mut host = Host::new();
+    let server = spawn(&mut host, "loopback", &[b"serve", b"7301", b"1"]);
+    host.step(); // it reaches `accept` and waits
+    let chatter = spawn(&mut host, "chatter", &[]);
+    host.run(|h| h.finished(chatter).is_some());
+    assert!(host.finished(server).is_none(), "the server still waits");
+    assert_eq!(host.waiting(), 1, "and it is not runnable");
+    let client = spawn(&mut host, "loopback", &[b"ping", b"7301", b"1"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
+    assert_eq!(ended(&host, client).0, Ending::Exit(0));
+}
+
+/// Runs `netstate` to its `ready` line.
+fn netstate_ready(host: &mut Host) -> u32 {
+    let id = spawn(host, "netstate", &[]);
+    while host.output(id) != Some(b"ready\n") {
+        host.step();
+    }
+    id
+}
+
+/// Suspended at `ready` and resumed from its snapshot's bytes, `netstate`
+/// finds its pipe's bytes and its listener, and its connection reset.
+fn sockets_across_suspend_and_resume() {
+    let mut host = Host::new();
+    let id = netstate_ready(&mut host);
+    let snapshot = host.suspend(id).expect("live");
+    assert_eq!(
+        crate::cell::open_sockets(),
+        0,
+        "a suspended cell holds no socket"
+    );
+    let bytes = snapshot.into_bytes();
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let id = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, id),
+        (
+            Ending::Exit(0),
+            "pipe kept\nconnection reset\nlistener ok\n".into()
+        )
+    );
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// A server suspended while it waits in `accept` waits there again after
+/// its resume, and serves the client that comes.
+fn a_blocked_cell_survives_suspend() {
+    let mut host = Host::new();
+    let server = spawn(&mut host, "loopback", &[b"serve", b"7302", b"1"]);
+    host.step();
+    assert_eq!(host.waiting(), 1);
+    let snapshot = host.suspend(server).expect("live");
+    let server = host
+        .resume(snapshot, Resume::Eager, true, true)
+        .expect("resume");
+    let client = spawn(&mut host, "loopback", &[b"ping", b"7302", b"1"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
+    assert_eq!(ended(&host, client), (Ending::Exit(0), "pinged\n".into()));
+}
+
+/// A server frozen while it waits in `accept`: two cells spawned from it
+/// share its listener and each serves one of two clients.
+fn forked_servers_share_their_listener() {
+    let mut host = Host::new();
+    let template = spawn(&mut host, "loopback", &[b"serve", b"7303", b"1"]);
+    host.step();
+    assert!(host.freeze(template));
+    let servers: Vec<u32> = (0..2)
+        .map(|_| {
+            host.spawn_from_template(template, true, true)
+                .expect("fork")
+        })
+        .collect();
+    let clients: Vec<u32> = (0..2)
+        .map(|_| spawn(&mut host, "loopback", &[b"ping", b"7303", b"1"]))
+        .collect();
+    host.run(|_| false);
+    for id in servers {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "served\n".into()));
+    }
+    for id in clients {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
+    }
+    drop(host);
+    assert_eq!(
+        crate::cell::open_sockets(),
+        0,
+        "the template's listener closed"
+    );
+}
+
+/// Forked at `ready`, `netstate` and its child both read the pipe's bytes;
+/// the child's connection is reset, the parent's is not, and both accept
+/// on the listener they share.
+fn pipes_and_sockets_of_a_fork() {
+    let mut host = Host::new();
+    let parent = netstate_ready(&mut host);
+    let child = host.fork(parent, 1).expect("fork")[0];
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, parent),
+        (
+            Ending::Exit(0),
+            "ready\npipe kept\nconnection open\nlistener ok\n".into()
+        )
+    );
+    assert_eq!(
+        ended(&host, child),
+        (
+            Ending::Exit(0),
+            "pipe kept\nconnection reset\nlistener ok\n".into()
+        )
+    );
+    assert_eq!(crate::cell::open_sockets(), 0);
 }

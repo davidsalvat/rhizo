@@ -69,6 +69,42 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
         "warm\nprimes below 2000000: 148933, below 1000: 168\n",
         Ending::Exit(0),
     ),
+    ("loopback", "loopback ok\n", Ending::Exit(0)),
+    ("piper", "pipes ok\n", Ending::Exit(0)),
+    (
+        "netstate",
+        "ready\npipe kept\nconnection open\nlistener ok\n",
+        Ending::Exit(0),
+    ),
+    (
+        "libc_net",
+        "pipe poll: 1 ready, read end empty, write end writable\n\
+         empty read: -1 errno 11\n\
+         pipe: through a pipe\n\
+         closed pipe: revents 0x10, read 0\n\
+         eventfd: 7\n\
+         drained: -1 errno 11\n\
+         poll timeout: 0\n\
+         listening on 127.0.0.1: a port\n\
+         connect: started\n\
+         epoll: 1 ready, data 42\n\
+         connected: writable 1, SO_ERROR 0\n\
+         nothing yet: -1 errno 11\n\
+         epoll: 1 ready, data 7, events 0x1\n\
+         echo: HELLO, SERVER\n\
+         peer is 127.0.0.1: 1, ports match: 1\n\
+         after shutdown: 1 ready, events 0x2001, read 0\n\
+         nobody listens: -1 errno 111\n\
+         select: 1, readable 1\n\
+         udp: datagram (cut), from 127.0.0.1: 1\n\
+         udp recvmsg: 12 bytes, datag|ram two, flags 0\n\
+         unix: socket file 1\n\
+         unix: over unix\n\
+         unix again: -1 errno 98\n\
+         socketpair: pair\n\
+         net ok\n",
+        Ending::Exit(0),
+    ),
     (
         "counter",
         "step 07 digest 6b4e24cdafe14e6b\nstep 15 digest c93f1c055e5410cf\nstep 23 digest 65632246df41d107\nstep 31 digest a7c1ff878b0627df\nstep 39 digest 9a1ea881edd8f792\n",

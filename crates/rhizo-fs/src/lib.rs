@@ -1,6 +1,9 @@
 //! The file system of a cell (spec `files`, design D1–D3 of
 //! `add-cell-files`): in memory, private to the cell, shared copy-on-write
-//! with its forks, and encodable into its snapshots.
+//! with its forks, and encodable into its snapshots. It also holds the
+//! cell's other open objects: pipes, event counters and `epoll` instances,
+//! and the handles of its sockets, which live in the kernel (design D1 of
+//! `add-sockets-and-poll`).
 //!
 //! The inode table holds reference-counted inodes; a regular file is a size
 //! and a list of reference-counted 4 KiB blocks. Cloning an [`Fs`] (a fork)
@@ -12,6 +15,7 @@
 extern crate alloc;
 
 mod codec;
+mod io;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -20,6 +24,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub use codec::DecodeError;
+pub use io::{EpollOp, Interest, PIPE_BUF, PIPE_CAP};
 
 /// Inode number (index in the inode table).
 pub type Ino = u32;
@@ -53,13 +58,31 @@ pub enum Error {
     NoSpace,
     /// Past the largest file size.
     TooBig,
+    /// It would wait (`EAGAIN`).
+    Again,
+    /// The read end of a pipe is closed (`EPIPE`).
+    Pipe,
+    /// Not allowed for this kind of descriptor (`EPERM`).
+    Perm,
+    /// Not a socket descriptor (`ENOTSOCK`).
+    NotSocket,
+    /// A file that cannot be opened: a socket (`ENXIO`).
+    NoDevice,
+    /// The path names no socket (`ECONNREFUSED`).
+    Refused,
 }
 
 impl Error {
     /// The Linux `errno` value.
     pub const fn errno(self) -> i64 {
         match self {
+            Error::Perm => 1,
             Error::NotFound => 2,
+            Error::NoDevice => 6,
+            Error::Again => 11,
+            Error::Pipe => 32,
+            Error::NotSocket => 88,
+            Error::Refused => 111,
             Error::BadFd => 9,
             Error::Busy => 16,
             Error::Exists => 17,
@@ -106,6 +129,9 @@ enum Node {
         parent: Ino,
     },
     File(File),
+    /// A Unix socket's name: the number the kernel's sockets know it by
+    /// (0: no socket any more).
+    Socket(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +141,7 @@ struct Inode {
     node: Node,
 }
 
-/// What a descriptor refers to.
+/// What a descriptor or a name refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// The cell's console (standard input, output, error).
@@ -124,12 +150,33 @@ pub enum Kind {
     File,
     /// A directory (opened for `getdents64`).
     Dir,
+    /// A pipe end.
+    Pipe,
+    /// An event counter (`eventfd`).
+    Event,
+    /// An `epoll` instance.
+    Epoll,
+    /// A socket, or a Unix socket's name.
+    Socket,
+}
+
+/// What an open file description refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Console,
+    Inode(Ino),
+    /// Object index; `true` for the write end.
+    Pipe(u32, bool),
+    Event(u32),
+    Epoll(u32),
+    /// A socket handle of the kernel (`rhizo-net`), opaque here.
+    Socket(u32),
 }
 
 /// An open file description, shared by duplicated descriptors.
 #[derive(Debug, Clone)]
 struct Desc {
-    target: Option<Ino>, // None: the console
+    target: Target,
     offset: u64,
     flags: u32,
     refs: u32,
@@ -174,6 +221,8 @@ pub enum Whence {
 
 /// File status flags kept for `fcntl(F_GETFL)` (append is applied).
 pub const O_APPEND_FLAG: u32 = 0x400;
+/// `O_NONBLOCK` (the same value on both architectures).
+pub const O_NONBLOCK_FLAG: u32 = 0x800;
 
 /// The file system and open descriptors of one cell: its [`Tables`], shared
 /// with the cell's forks (and with every cell spawned without files) until
@@ -215,8 +264,8 @@ impl core::ops::DerefMut for Fs {
     }
 }
 
-/// The tables of a file system: inodes, open descriptions, descriptors and
-/// the working directory. Reached through an [`Fs`].
+/// The tables of a file system: inodes, open descriptions, descriptors,
+/// other open objects and the working directory. Reached through an [`Fs`].
 #[derive(Debug, Clone)]
 pub struct Tables {
     inodes: Vec<Option<Arc<Inode>>>,
@@ -226,6 +275,11 @@ pub struct Tables {
     cwd: Ino,
     /// File blocks held (shared ones included), at most `DATA_MAX / BLOCK`.
     used: u64,
+    /// Pipes, event counters and `epoll` instances.
+    objects: Vec<Option<Arc<io::Object>>>,
+    /// Socket handles whose last description closed, for the kernel to
+    /// release ([`Tables::take_released`]); empty between system calls.
+    released: Vec<u32>,
 }
 
 impl Tables {
@@ -239,7 +293,7 @@ impl Tables {
             },
         };
         let console = Desc {
-            target: None,
+            target: Target::Console,
             offset: 0,
             flags: 2, // O_RDWR
             refs: 3,
@@ -250,6 +304,8 @@ impl Tables {
             fds: vec![Some((0, false)); 3],
             cwd: ROOT,
             used: 0,
+            objects: Vec::new(),
+            released: Vec::new(),
         }
     }
 
@@ -283,7 +339,11 @@ impl Tables {
 
     /// Frees `ino` if no name and no open description refers to it.
     fn maybe_free(&mut self, ino: Ino) {
-        let open = self.descs.iter().flatten().any(|d| d.target == Some(ino));
+        let open = self
+            .descs
+            .iter()
+            .flatten()
+            .any(|d| d.target == Target::Inode(ino));
         if self.inode(ino).links == 0 && !open {
             if let Node::File(f) = &self.inode(ino).node {
                 self.used -= f.held();
@@ -319,8 +379,12 @@ impl Tables {
     /// What descriptor `fd` refers to.
     pub fn kind(&self, fd: Fd) -> Result<Kind> {
         Ok(match self.desc(fd)?.target {
-            None => Kind::Console,
-            Some(ino) => kind_of(self.inode(ino)),
+            Target::Console => Kind::Console,
+            Target::Inode(ino) => kind_of(self.inode(ino)),
+            Target::Pipe(..) => Kind::Pipe,
+            Target::Event(_) => Kind::Event,
+            Target::Epoll(_) => Kind::Epoll,
+            Target::Socket(_) => Kind::Socket,
         })
     }
 
@@ -333,7 +397,7 @@ impl Tables {
         match dirfd {
             None => Ok(self.cwd),
             Some(fd) => match self.desc(fd)?.target {
-                Some(ino) if matches!(self.inode(ino).node, Node::Dir { .. }) => Ok(ino),
+                Target::Inode(ino) if matches!(self.inode(ino).node, Node::Dir { .. }) => Ok(ino),
                 _ => Err(Error::NotDir),
             },
         }
@@ -379,7 +443,7 @@ impl Tables {
         }
         .and_then(|ino| match self.inode(ino).node {
             Node::Dir { .. } => Ok(ino),
-            Node::File(_) => Err(Error::NotDir),
+            _ => Err(Error::NotDir),
         })
     }
 
@@ -410,7 +474,7 @@ impl Tables {
         Ok(fd as Fd)
     }
 
-    fn new_desc(&mut self, target: Option<Ino>, flags: u32) -> u32 {
+    fn new_desc(&mut self, target: Target, flags: u32) -> u32 {
         let desc = Some(Desc {
             target,
             offset: 0,
@@ -461,6 +525,9 @@ impl Tables {
             Err(e) => return Err(e),
         };
         let is_dir = matches!(self.inode(ino).node, Node::Dir { .. });
+        if matches!(self.inode(ino).node, Node::Socket(_)) {
+            return Err(Error::NoDevice);
+        }
         if flags.directory && !is_dir {
             return Err(Error::NotDir);
         }
@@ -475,7 +542,7 @@ impl Tables {
             *f = File::default();
             self.used -= held;
         }
-        let desc = self.new_desc(Some(ino), access);
+        let desc = self.new_desc(Target::Inode(ino), access);
         self.new_fd(desc, 0, false)
             .inspect_err(|_| self.descs[desc as usize] = None)
     }
@@ -489,6 +556,7 @@ impl Tables {
             .flatten()
             .ok_or(Error::BadFd)?;
         self.fds[fd as usize] = None;
+        self.forget_interest(fd);
         let desc = self.descs[d as usize]
             .as_mut()
             .expect("descriptions in use");
@@ -496,8 +564,13 @@ impl Tables {
         if desc.refs == 0 {
             let target = desc.target;
             self.descs[d as usize] = None;
-            if let Some(ino) = target {
-                self.maybe_free(ino);
+            match target {
+                Target::Inode(ino) => self.maybe_free(ino),
+                Target::Socket(h) => self.released.push(h),
+                Target::Console => {}
+                Target::Pipe(..) | Target::Event(_) | Target::Epoll(_) => {
+                    self.drop_end(target);
+                }
             }
         }
         Ok(())
@@ -535,11 +608,17 @@ impl Tables {
         Ok(self.desc(fd)?.flags)
     }
 
-    /// `fcntl(F_SETFL)`: only `O_APPEND` can change.
-    pub fn set_append(&mut self, fd: Fd, append: bool) -> Result<()> {
+    /// `fcntl(F_SETFL)`: only `O_APPEND` and `O_NONBLOCK` can change.
+    pub fn set_status_flags(&mut self, fd: Fd, flags: u32) -> Result<()> {
+        const CHANGEABLE: u32 = O_APPEND_FLAG | O_NONBLOCK_FLAG;
         let desc = self.desc_mut(fd)?;
-        desc.flags = (desc.flags & !O_APPEND_FLAG) | if append { O_APPEND_FLAG } else { 0 };
+        desc.flags = (desc.flags & !CHANGEABLE) | (flags & CHANGEABLE);
         Ok(())
+    }
+
+    /// Whether `fd` is in non-blocking mode.
+    pub fn nonblocking(&self, fd: Fd) -> Result<bool> {
+        Ok(self.desc(fd)?.flags & O_NONBLOCK_FLAG != 0)
     }
 
     /// `fcntl(F_GETFD)` / `F_SETFD` (close-on-exec, kept only for `F_GETFD`).
@@ -557,10 +636,12 @@ impl Tables {
 
     fn file_of(&self, fd: Fd) -> Result<(Ino, &File, &Desc)> {
         let desc = self.desc(fd)?;
-        let ino = desc.target.ok_or(Error::Invalid)?;
+        let Target::Inode(ino) = desc.target else {
+            return Err(Error::Invalid);
+        };
         match &self.inode(ino).node {
             Node::File(f) => Ok((ino, f, desc)),
-            Node::Dir { .. } => Err(Error::IsDir),
+            _ => Err(Error::IsDir),
         }
     }
 
@@ -719,11 +800,11 @@ impl Tables {
     /// `lseek`.
     pub fn seek(&mut self, fd: Fd, offset: i64, whence: Whence) -> Result<u64> {
         let size = match self.desc(fd)?.target {
-            None => return Err(Error::Invalid), // ESPIPE on Linux; console only
-            Some(ino) => match &self.inode(ino).node {
+            Target::Inode(ino) => match &self.inode(ino).node {
                 Node::File(f) => f.size,
-                Node::Dir { .. } => 0,
+                _ => 0,
             },
+            _ => return Err(Error::Invalid), // ESPIPE on Linux; checked by callers
         };
         let desc = self.desc_mut(fd)?;
         let base = match whence {
@@ -783,18 +864,35 @@ impl Tables {
                         .filter(|&&i| matches!(self.inode(i).node, Node::Dir { .. }))
                         .count() as u32
                 }
-                Node::File(_) => inode.links,
+                _ => inode.links,
             },
             size: match &inode.node {
                 Node::File(f) => f.size,
                 Node::Dir { .. } => BLOCK as u64,
+                Node::Socket(_) => 0,
             },
         }
     }
 
-    /// `fstat` (`None` for the console).
+    /// `fstat` (`None` for the console). Objects other than inodes report
+    /// their kind and a number of their own.
     pub fn fstat(&self, fd: Fd) -> Result<Option<Stat>> {
-        Ok(self.desc(fd)?.target.map(|ino| self.stat_of(ino)))
+        let object = |index: u32, kind| {
+            Some(Stat {
+                ino: (1 << 32) + u64::from(index),
+                kind,
+                links: 1,
+                size: 0,
+            })
+        };
+        Ok(match self.desc(fd)?.target {
+            Target::Console => None,
+            Target::Inode(ino) => Some(self.stat_of(ino)),
+            Target::Pipe(i, _) => object(i, Kind::Pipe),
+            Target::Event(i) => object(i, Kind::Event),
+            Target::Epoll(i) => object(i, Kind::Epoll),
+            Target::Socket(h) => object(h, Kind::Socket),
+        })
     }
 
     /// `newfstatat` / `stat` by path.
@@ -841,7 +939,7 @@ impl Tables {
             }
             (Node::Dir { .. }, true) if ino == self.cwd => return Err(Error::Busy),
             (Node::Dir { .. }, false) => return Err(Error::IsDir),
-            (Node::File(_), true) => return Err(Error::NotDir),
+            (Node::File(_) | Node::Socket(_), true) => return Err(Error::NotDir),
             _ => {}
         }
         if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
@@ -900,7 +998,7 @@ impl Tables {
             }
             match (&self.inode(target).node, moving_dir) {
                 (Node::Dir { .. }, false) => return Err(Error::IsDir),
-                (Node::File(_), true) => return Err(Error::NotDir),
+                (Node::File(_) | Node::Socket(_), true) => return Err(Error::NotDir),
                 (Node::Dir { entries, .. }, true) if !entries.is_empty() => {
                     return Err(Error::NotEmpty);
                 }
@@ -972,7 +1070,9 @@ impl Tables {
     /// (no room); the offset advances past those taken.
     pub fn read_dir(&mut self, fd: Fd, mut emit: impl FnMut(&DirEntry) -> bool) -> Result<usize> {
         let desc = self.desc(fd)?;
-        let ino = desc.target.ok_or(Error::NotDir)?;
+        let Target::Inode(ino) = desc.target else {
+            return Err(Error::NotDir);
+        };
         let Node::Dir { entries, parent } = &self.inode(ino).node else {
             return Err(Error::NotDir);
         };
@@ -1037,8 +1137,11 @@ fn kind_of(inode: &Inode) -> Kind {
     match inode.node {
         Node::Dir { .. } => Kind::Dir,
         Node::File(_) => Kind::File,
+        Node::Socket(_) => Kind::Socket,
     }
 }
 
+#[cfg(test)]
+mod io_tests;
 #[cfg(test)]
 mod tests;

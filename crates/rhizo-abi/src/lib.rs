@@ -10,6 +10,8 @@
 extern crate alloc;
 
 mod files;
+mod poll;
+mod sockets;
 
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
@@ -29,7 +31,19 @@ pub mod errno {
     pub const EFAULT: i64 = 14;
     pub const EINVAL: i64 = 22;
     pub const ENOTTY: i64 = 25;
+    pub const ESPIPE: i64 = 29;
+    pub const EPIPE: i64 = 32;
     pub const ENOSYS: i64 = 38;
+    pub const ENOTSOCK: i64 = 88;
+    pub const ENOPROTOOPT: i64 = 92;
+    pub const EPROTONOSUPPORT: i64 = 93;
+    pub const ESOCKTNOSUPPORT: i64 = 94;
+    pub const EOPNOTSUPP: i64 = 95;
+    pub const EAFNOSUPPORT: i64 = 97;
+    pub const EADDRINUSE: i64 = 98;
+    pub const ENOBUFS: i64 = 105;
+    pub const ENOTCONN: i64 = 107;
+    pub const EINPROGRESS: i64 = 115;
 }
 use errno::*;
 
@@ -111,6 +125,34 @@ enum Sys {
     Access,
     Select,
     Pselect6,
+    Readv,
+    Pipe2,
+    Pipe,
+    Eventfd2,
+    Eventfd,
+    Poll,
+    Ppoll,
+    EpollCreate1,
+    EpollCreate,
+    EpollCtl,
+    EpollWait,
+    EpollPwait,
+    Socket,
+    Socketpair,
+    Bind,
+    Listen,
+    Accept,
+    Accept4,
+    Connect,
+    Getsockname,
+    Getpeername,
+    Sendto,
+    Recvfrom,
+    Setsockopt,
+    Getsockopt,
+    Shutdown,
+    Sendmsg,
+    Recvmsg,
 }
 
 impl Arch {
@@ -184,6 +226,34 @@ impl Arch {
             (Arch::X86_64, 21) => Access,
             (Arch::X86_64, 23) => Select,
             (Arch::Aarch64, 72) | (Arch::X86_64, 270) => Pselect6,
+            (Arch::Aarch64, 65) | (Arch::X86_64, 19) => Readv,
+            (Arch::Aarch64, 59) | (Arch::X86_64, 293) => Pipe2,
+            (Arch::X86_64, 22) => Pipe,
+            (Arch::Aarch64, 19) | (Arch::X86_64, 290) => Eventfd2,
+            (Arch::X86_64, 284) => Eventfd,
+            (Arch::X86_64, 7) => Poll,
+            (Arch::Aarch64, 73) | (Arch::X86_64, 271) => Ppoll,
+            (Arch::Aarch64, 20) | (Arch::X86_64, 291) => EpollCreate1,
+            (Arch::X86_64, 213) => EpollCreate,
+            (Arch::Aarch64, 21) | (Arch::X86_64, 233) => EpollCtl,
+            (Arch::X86_64, 232) => EpollWait,
+            (Arch::Aarch64, 22) | (Arch::X86_64, 281) => EpollPwait,
+            (Arch::Aarch64, 198) | (Arch::X86_64, 41) => Socket,
+            (Arch::Aarch64, 199) | (Arch::X86_64, 53) => Socketpair,
+            (Arch::Aarch64, 200) | (Arch::X86_64, 49) => Bind,
+            (Arch::Aarch64, 201) | (Arch::X86_64, 50) => Listen,
+            (Arch::Aarch64, 202) | (Arch::X86_64, 43) => Accept,
+            (Arch::Aarch64, 242) | (Arch::X86_64, 288) => Accept4,
+            (Arch::Aarch64, 203) | (Arch::X86_64, 42) => Connect,
+            (Arch::Aarch64, 204) | (Arch::X86_64, 51) => Getsockname,
+            (Arch::Aarch64, 205) | (Arch::X86_64, 52) => Getpeername,
+            (Arch::Aarch64, 206) | (Arch::X86_64, 44) => Sendto,
+            (Arch::Aarch64, 207) | (Arch::X86_64, 45) => Recvfrom,
+            (Arch::Aarch64, 208) | (Arch::X86_64, 54) => Setsockopt,
+            (Arch::Aarch64, 209) | (Arch::X86_64, 55) => Getsockopt,
+            (Arch::Aarch64, 210) | (Arch::X86_64, 48) => Shutdown,
+            (Arch::Aarch64, 211) | (Arch::X86_64, 46) => Sendmsg,
+            (Arch::Aarch64, 212) | (Arch::X86_64, 47) => Recvmsg,
             _ => return None,
         })
     }
@@ -202,6 +272,16 @@ impl Arch {
         match self {
             Arch::Aarch64 => b"aarch64",
             Arch::X86_64 => b"x86_64",
+        }
+    }
+
+    /// Length of the system-call instruction (`SVC #0`, `SYSCALL`): a
+    /// blocked call runs again from it (design D3 of
+    /// `add-sockets-and-poll`).
+    const fn syscall_len(self) -> u64 {
+        match self {
+            Arch::Aarch64 => 4,
+            Arch::X86_64 => 2,
         }
     }
 }
@@ -233,6 +313,11 @@ pub enum Outcome {
     Sleep(u64),
     /// The cell exited with this status (0–255).
     Exit(i32),
+    /// The call must wait for a descriptor, until another cell's action
+    /// may have made it ready or, if given, this monotonic time
+    /// (nanoseconds). The cell's registers are back at the system-call
+    /// instruction: when it runs again, it makes the call again.
+    Block(Option<u64>),
 }
 
 pub use rhizo_cell::memory::NoPager;
@@ -246,6 +331,12 @@ pub struct Context<'a, F, M, T, A, S> {
     pub services: &'a mut S,
     /// The cell's files and descriptors.
     pub fs: &'a mut rhizo_fs::Fs,
+    /// The sockets of every cell (spec `networking`).
+    pub net: &'a mut rhizo_net::Net,
+    /// On entry, the deadline of the blocked call the cell makes again, if
+    /// any (it keeps its timeout); a call that blocks sets the deadline it
+    /// waits for ([`Outcome::Block`]).
+    pub deadline: Option<u64>,
     /// Brings in pages that are not mapped yet (lazy resume); [`NoPager`]
     /// otherwise.
     pub pager: &'a mut dyn Pager<F, M>,
@@ -280,6 +371,9 @@ pub struct Abi {
 
 /// `AT_FDCWD` as a system-call argument.
 const AT_FDCWD: u64 = -100i64 as u64;
+/// What a call returns when it must wait ([`Outcome::Block`]); never a
+/// Linux result.
+const BLOCK: i64 = i64::MIN;
 /// Bytes copied per step when moving data between a cell and the kernel.
 const CHUNK: usize = 256;
 /// Lowest address the stack region (with its guard page) may reach.
@@ -321,7 +415,43 @@ impl Abi {
                 return Outcome::Exit(status);
             }
             Some(Sys::Write) => files::write(cx, a[0], a[1], a[2], None),
-            Some(Sys::Writev) => writev(cx, a[0], a[1], a[2]),
+            Some(Sys::Writev) => writev(cx, a[0], a[1], a[2], false),
+            Some(Sys::Readv) => writev(cx, a[0], a[1], a[2], true),
+            Some(Sys::Pipe2) => poll::pipe2(cx, a[0], a[1]),
+            Some(Sys::Pipe) => poll::pipe2(cx, a[0], 0),
+            Some(Sys::Eventfd2) => poll::eventfd2(cx, a[0], a[1]),
+            Some(Sys::Eventfd) => poll::eventfd2(cx, a[0], 0),
+            Some(Sys::Poll) => {
+                let ms = a[2] as i32;
+                poll::poll(cx, a[0], a[1], (ms >= 0).then(|| ms as u64 * 1_000_000))
+            }
+            Some(Sys::Ppoll) => match poll::timespec_timeout(cx, a[2]) {
+                Ok(timeout) => poll::poll(cx, a[0], a[1], timeout),
+                Err(e) => e,
+            },
+            Some(Sys::EpollCreate1) => poll::epoll_create(cx, a[0]),
+            Some(Sys::EpollCreate) if (a[0] as i32) <= 0 => -EINVAL,
+            Some(Sys::EpollCreate) => poll::epoll_create(cx, 0),
+            Some(Sys::EpollCtl) => poll::epoll_ctl(cx, self.arch, a[0], a[1], a[2], a[3]),
+            Some(Sys::EpollWait | Sys::EpollPwait) => {
+                poll::epoll_wait(cx, self.arch, a[0], a[1], a[2], a[3])
+            }
+            Some(Sys::Socket) => sockets::socket(cx, a[0], a[1], a[2]),
+            Some(Sys::Socketpair) => sockets::socketpair(cx, a),
+            Some(Sys::Bind) => sockets::bind(cx, a[0], a[1], a[2]),
+            Some(Sys::Listen) => sockets::listen(cx, a[0], a[1]),
+            Some(Sys::Accept) => sockets::accept(cx, a[0], a[1], a[2], 0),
+            Some(Sys::Accept4) => sockets::accept(cx, a[0], a[1], a[2], a[3]),
+            Some(Sys::Connect) => sockets::connect(cx, a[0], a[1], a[2]),
+            Some(Sys::Getsockname) => sockets::name(cx, a[0], a[1], a[2], false),
+            Some(Sys::Getpeername) => sockets::name(cx, a[0], a[1], a[2], true),
+            Some(Sys::Sendto) => sockets::sendto(cx, a),
+            Some(Sys::Recvfrom) => sockets::recvfrom(cx, a),
+            Some(Sys::Sendmsg) => sockets::sendmsg(cx, a[0], a[1], a[2]),
+            Some(Sys::Recvmsg) => sockets::recvmsg(cx, a[0], a[1], a[2]),
+            Some(Sys::Shutdown) => sockets::shutdown(cx, a[0], a[1]),
+            Some(Sys::Setsockopt) => sockets::setsockopt(cx, a),
+            Some(Sys::Getsockopt) => sockets::getsockopt(cx, a),
             Some(Sys::Brk) => brk(cell, cx, a[0]),
             Some(Sys::Mmap) => mmap(cell, cx, a),
             Some(Sys::Munmap) => munmap(cx, a[0], a[1]),
@@ -400,9 +530,19 @@ impl Abi {
                 }
                 Err(e) => e,
             },
+            Some(sys @ (Sys::Select | Sys::Pselect6)) if a[0] != 0 => {
+                let timeout = if sys == Sys::Select {
+                    poll::timeval_timeout(cx, a[4])
+                } else {
+                    poll::timespec_timeout(cx, a[4])
+                };
+                match timeout {
+                    Ok(timeout) => poll::select(cx, a, timeout),
+                    Err(e) => e,
+                }
+            }
             // Without descriptors, `select` is a sleep (how MicroPython's
-            // `time.sleep` waits); descriptors are not supported yet.
-            Some(Sys::Select | Sys::Pselect6) if a[0] != 0 => -ENOSYS,
+            // `time.sleep` waits).
             Some(sys @ (Sys::Select | Sys::Pselect6)) => {
                 match select_sleep(cx, a[4], sys == Sys::Select) {
                     Ok(until) => {
@@ -424,6 +564,16 @@ impl Abi {
                 -ENOSYS
             }
         };
+        // Sockets whose last descriptor the call closed.
+        if cx.fs.has_released() {
+            for h in cx.fs.take_released() {
+                cx.net.release(h);
+            }
+        }
+        if result == BLOCK {
+            cell.regs.pc -= self.arch.syscall_len();
+            return Outcome::Block(cx.deadline);
+        }
         // The result goes in x0 / rax, which is gpr[0] on both.
         cell.regs.gpr[0] = result as u64;
         Outcome::Resume
@@ -440,11 +590,13 @@ impl Abi {
     }
 }
 
+/// `writev`, or `readv` with `read`.
 fn writev<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     iov: u64,
     count: u64,
+    read: bool,
 ) -> i64 {
     if count > 1024 {
         return -EINVAL;
@@ -457,7 +609,11 @@ fn writev<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         }
         let base = u64::from_le_bytes(entry[..8].try_into().unwrap_or_default());
         let len = u64::from_le_bytes(entry[8..].try_into().unwrap_or_default());
-        let n = files::write(cx, fd, base, len, None);
+        let n = if read {
+            files::read(cx, fd, base, len, None)
+        } else {
+            files::write(cx, fd, base, len, None)
+        };
         if n < 0 {
             return if total == 0 { n } else { total };
         }
@@ -751,6 +907,24 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     }
 }
 
+/// Makes the current call wait (design D3 of `add-sockets-and-poll`) for at
+/// most `timeout` nanoseconds (`None`: no limit), keeping the deadline of a
+/// call made again. Returns [`BLOCK`], or `None` once the deadline passed.
+fn block<F, M, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    timeout: Option<u64>,
+) -> Option<i64> {
+    let now = cx.services.monotonic_ns();
+    let deadline = cx
+        .deadline
+        .or_else(|| timeout.map(|t| now.saturating_add(t)));
+    if deadline.is_some_and(|d| d <= now) {
+        return None;
+    }
+    cx.deadline = deadline;
+    Some(BLOCK)
+}
+
 /// `getrlimit`/`prlimit64` (no new limit is enforced): an 8 MiB stack, 1024
 /// files, everything else unlimited.
 fn rlimit<F: EntryFormat, M: PhysicalMemory, T, A, S>(
@@ -801,5 +975,7 @@ fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     }
 }
 
+#[cfg(test)]
+mod net_tests;
 #[cfg(test)]
 mod tests;

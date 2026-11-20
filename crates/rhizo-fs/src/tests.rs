@@ -300,7 +300,7 @@ fn dup_shares_the_offset() {
     fs.close(copy).unwrap();
     fs.write(1, b"e", None).unwrap();
     assert_eq!(read_all(&mut fs, b"/f").unwrap(), b"abcde");
-    fs.set_append(1, true).unwrap();
+    fs.set_status_flags(1, O_APPEND_FLAG).unwrap();
     assert_eq!(fs.status_flags(1).unwrap() & O_APPEND_FLAG, O_APPEND_FLAG);
 }
 
@@ -368,14 +368,25 @@ fn decode_round_trips_and_refuses_corruption() {
 }
 
 /// Runs operations that would panic on an inconsistent state.
-fn exercise(fs: &mut Fs) {
+pub(crate) fn exercise(fs: &mut Fs) {
     let _ = fs.getcwd();
     for fd in 0..8 {
         let _ = fs.fstat(fd);
         let _ = fs.read(fd, &mut [0u8; 64], None);
         let _ = fs.read_dir(fd, |_| true);
+        let _ = fs.poll(fd, &|_| 0);
+        let _ = fs.read_pipe(fd, 8, &mut |_| true);
+        let _ = fs.write_pipe(fd, b"x");
+        let _ = fs.read_event(fd);
+        let _ = fs.write_event(fd, 1);
+        let _ = fs.epoll_interests(fd);
+        let _ = fs.epoll_ctl(fd, EpollOp::Add, 0, 1, 0);
+    }
+    for fd in 0..8 {
         let _ = fs.close(fd);
     }
+    let _ = fs.socket_name(None, b"/d/s");
+    let _ = fs.pipe(false, false);
     let _ = fs.stat(None, b"/d/f");
     let _ = fs.unlink(None, b"/d/f", false);
     let _ = fs.unlink(None, b"/d", true);

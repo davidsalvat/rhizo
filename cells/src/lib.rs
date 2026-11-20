@@ -22,6 +22,15 @@ pub mod nr {
     pub const CLOSE: usize = 57;
     pub const READ: usize = 63;
     pub const PREAD64: usize = 67;
+    pub const PIPE2: usize = 59;
+    pub const FCNTL: usize = 25;
+    pub const SOCKET: usize = 198;
+    pub const BIND: usize = 200;
+    pub const LISTEN: usize = 201;
+    pub const CONNECT: usize = 203;
+    pub const GETSOCKNAME: usize = 204;
+    pub const SETSOCKOPT: usize = 208;
+    pub const ACCEPT4: usize = 242;
 }
 
 /// Linux system-call numbers for the target architecture.
@@ -42,6 +51,15 @@ pub mod nr {
     pub const CLOSE: usize = 3;
     pub const READ: usize = 0;
     pub const PREAD64: usize = 17;
+    pub const PIPE2: usize = 293;
+    pub const FCNTL: usize = 72;
+    pub const SOCKET: usize = 41;
+    pub const BIND: usize = 49;
+    pub const LISTEN: usize = 50;
+    pub const CONNECT: usize = 42;
+    pub const GETSOCKNAME: usize = 51;
+    pub const SETSOCKOPT: usize = 54;
+    pub const ACCEPT4: usize = 288;
 }
 
 /// Raw system call with up to six arguments; returns the kernel's value
@@ -118,6 +136,107 @@ pub fn yield_now() {
 pub fn sleep_ns(ns: u64) {
     let ts = [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64];
     syscall(nr::NANOSLEEP, [ts.as_ptr() as usize, 0, 0, 0, 0, 0]);
+}
+
+/// Decimal number in `bytes` (0 if none).
+pub fn number(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .fold(0, |n, d| n * 10 + (d - b'0') as usize)
+}
+
+/// A `sockaddr_in` for 127.0.0.1:`port`.
+pub fn loopback(port: u16) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[0] = 2; // AF_INET
+    a[2..4].copy_from_slice(&port.to_be_bytes());
+    a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    a
+}
+
+/// A TCP socket (`flags`: `SOCK_NONBLOCK` and so on); negative on error.
+pub fn tcp_socket(flags: usize) -> isize {
+    syscall(nr::SOCKET, [2, 1 | flags, 0, 0, 0, 0])
+}
+
+/// Binds `fd` to 127.0.0.1:`port` (`SO_REUSEADDR` first) and listens.
+pub fn tcp_listen(fd: usize, port: u16) -> isize {
+    let one = 1i32;
+    syscall(
+        nr::SETSOCKOPT,
+        [fd, 1, 2, &one as *const i32 as usize, 4, 0],
+    );
+    let addr = loopback(port);
+    let r = syscall(nr::BIND, [fd, addr.as_ptr() as usize, 16, 0, 0, 0]);
+    if r < 0 {
+        return r;
+    }
+    syscall(nr::LISTEN, [fd, 16, 0, 0, 0, 0])
+}
+
+/// Connects `fd` to 127.0.0.1:`port`.
+pub fn tcp_connect(fd: usize, port: u16) -> isize {
+    let addr = loopback(port);
+    syscall(nr::CONNECT, [fd, addr.as_ptr() as usize, 16, 0, 0, 0])
+}
+
+/// The port `fd` is bound to.
+pub fn local_port(fd: usize) -> u16 {
+    let mut addr = [0u8; 16];
+    let mut len = 16u32;
+    syscall(
+        nr::GETSOCKNAME,
+        [
+            fd,
+            addr.as_mut_ptr() as usize,
+            &mut len as *mut u32 as usize,
+            0,
+            0,
+            0,
+        ],
+    );
+    u16::from_be_bytes([addr[2], addr[3]])
+}
+
+/// Reads exactly `buf.len()` bytes from `fd` (fewer at the end of the
+/// stream); returns how many, or the error.
+pub fn read_full(fd: usize, buf: &mut [u8]) -> isize {
+    let mut done = 0;
+    while done < buf.len() {
+        let n = syscall(
+            nr::READ,
+            [
+                fd,
+                buf[done..].as_mut_ptr() as usize,
+                buf.len() - done,
+                0,
+                0,
+                0,
+            ],
+        );
+        if n <= 0 {
+            return if done > 0 { done as isize } else { n };
+        }
+        done += n as usize;
+    }
+    done as isize
+}
+
+/// Writes all of `buf` to `fd`; returns how many, or the error.
+pub fn write_all(fd: usize, buf: &[u8]) -> isize {
+    let mut done = 0;
+    while done < buf.len() {
+        let n = syscall(
+            nr::WRITE,
+            [fd, buf[done..].as_ptr() as usize, buf.len() - done, 0, 0, 0],
+        );
+        if n <= 0 {
+            return n;
+        }
+        done += n as usize;
+    }
+    done as isize
 }
 
 /// Address of `argc` on the initial stack, saved by `_start`.

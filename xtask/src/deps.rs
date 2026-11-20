@@ -16,14 +16,27 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
     ("rhizo-mm", &["rhizo-hal"]),
     ("rhizo-cell", &["rhizo-hal", "rhizo-mm"]),
     ("rhizo-fs", &[]),
+    ("rhizo-net", &[]),
     (
         "rhizo-abi",
-        &["rhizo-hal", "rhizo-mm", "rhizo-cell", "rhizo-fs"],
+        &[
+            "rhizo-hal",
+            "rhizo-mm",
+            "rhizo-cell",
+            "rhizo-fs",
+            "rhizo-net",
+        ],
     ),
     ("rhizo-sched", &[]),
     (
         "rhizo-snapshot",
-        &["rhizo-hal", "rhizo-mm", "rhizo-cell", "rhizo-fs"],
+        &[
+            "rhizo-hal",
+            "rhizo-mm",
+            "rhizo-cell",
+            "rhizo-fs",
+            "rhizo-net",
+        ],
     ),
     (
         "rhizo-kernel",
@@ -36,6 +49,7 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
             "rhizo-sched",
             "rhizo-snapshot",
             "rhizo-fs",
+            "rhizo-net",
         ],
     ),
     ("rhizo-cells", &[]),

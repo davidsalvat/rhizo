@@ -294,6 +294,7 @@ dependencies = [
  "rhizo-fs",
  "rhizo-hal",
  "rhizo-mm",
+ "rhizo-net",
 ]
 
 [[package]]
@@ -336,6 +337,7 @@ dependencies = [
  "rhizo-fs",
  "rhizo-hal",
  "rhizo-mm",
+ "rhizo-net",
  "rhizo-sched",
  "rhizo-snapshot",
 ]
@@ -346,6 +348,13 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "rhizo-hal",
+]
+
+[[package]]
+name = "rhizo-net"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
@@ -363,6 +372,7 @@ dependencies = [
  "rhizo-fs",
  "rhizo-hal",
  "rhizo-mm",
+ "rhizo-net",
 ]
 
 [[package]]

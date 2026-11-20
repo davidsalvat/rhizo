@@ -30,10 +30,10 @@ fn cell<F: EntryFormat>(mem: &mut FakePhysicalMemory, frames: &mut CountingFrame
 fn round_trip<F: EntryFormat>() {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let original = cell::<F>(&mut mem, &mut frames);
-    let snap = Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), 77, &mem);
+    let snap = Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), &[], 77, &mem);
     assert_eq!(
         snap,
-        Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), 77, &mem),
+        Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), &[], 77, &mem),
         "deterministic"
     );
     let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
@@ -64,6 +64,7 @@ fn round_trip<F: EntryFormat>() {
         Machine::Aarch64,
         &Cell { id: 9, ..restored },
         &Fs::new(),
+        &[],
         77,
         &mem,
     );
@@ -87,14 +88,15 @@ fn files_travel_with_the_snapshot() {
     let mut fs = Fs::new();
     fs.put_file(b"/in/data.txt", b"input").unwrap();
     fs.chdir(b"/in").unwrap();
-    let snap = Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &fs, 0, &mem);
+    let snap = Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &fs, &[], 0, &mem);
     let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
     let back = snap.files();
     assert_eq!(back.getcwd(), b"/in");
     assert_eq!(back.stat(None, b"data.txt").unwrap().size, 5);
-    // A files section that does not decode is refused.
+    // A files section that does not decode is refused (its last byte is
+    // just before the sockets section: a length and an empty list).
     let mut bytes = snap.into_bytes();
-    let last = bytes.len() - 1;
+    let last = bytes.len() - 13;
     bytes[last] ^= 0xff;
     assert_eq!(
         Snapshot::from_bytes(bytes, Machine::Aarch64),
@@ -102,10 +104,61 @@ fn files_travel_with_the_snapshot() {
     );
 }
 
+#[test]
+fn socket_records_travel_one_per_descriptor() {
+    use rhizo_net::{Family, Options, Record, Saved, Type};
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let c = cell::<Aarch64>(&mut mem, &mut frames);
+    let listener = Record {
+        family: Family::Inet,
+        ty: Type::Stream,
+        state: Saved::Listening(4),
+        local: Some(rhizo_net::Addr::Inet {
+            ip: [127, 0, 0, 1],
+            port: 80,
+        }),
+        opts: Options::default(),
+    };
+    let mut fs = Fs::new();
+    let fd = fs.socket_fd(0, false, false).unwrap();
+    let snap = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &fs,
+        std::slice::from_ref(&listener),
+        0,
+        &mem,
+    );
+    let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
+    assert_eq!(snap.sockets(), std::slice::from_ref(&listener));
+    assert_eq!(snap.files().socket(fd), Ok(0));
+    let refused = |fs: &Fs, records: &[Record]| {
+        let snap = Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, fs, records, 0, &mem);
+        Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64)
+    };
+    assert_eq!(
+        refused(&fs, &[]),
+        Err(FormatError::BadSockets),
+        "a descriptor without its record"
+    );
+    assert_eq!(
+        refused(&Fs::new(), std::slice::from_ref(&listener)),
+        Err(FormatError::BadSockets),
+        "a record without its descriptor"
+    );
+    let mut twice = fs.clone();
+    twice.socket_fd(0, false, false).unwrap();
+    assert_eq!(
+        refused(&twice, &[listener]),
+        Err(FormatError::BadSockets),
+        "one record, two holders"
+    );
+}
+
 fn sample() -> Vec<u8> {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let c = cell::<Aarch64>(&mut mem, &mut frames);
-    Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &Fs::new(), 0, &mem).into_bytes()
+    Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &Fs::new(), &[], 0, &mem).into_bytes()
 }
 
 #[test]

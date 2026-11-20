@@ -382,6 +382,7 @@ fn measure_cells(
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
+        let (mut pipe_rtt, mut loopback_rtt) = (Vec::new(), Vec::new());
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
@@ -421,6 +422,10 @@ fn measure_cells(
                         file_write_read.push(w as f64 / 1000.0);
                         fork_files.push(f as f64 / 1000.0);
                     }
+                    if let Some((p, l)) = parse_net_line(&out.output) {
+                        pipe_rtt.push(p as f64);
+                        loopback_rtt.push(l as f64 / 1000.0);
+                    }
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
                         resume.push(snap.resume_ns as f64 / 1000.0);
@@ -458,6 +463,8 @@ fn measure_cells(
             ("workload.warm_us", "us", &mut warm),
             ("cell.file_write_read_us", "us", &mut file_write_read),
             ("cell.fork_with_files_us", "us", &mut fork_files),
+            ("cell.pipe_rtt_ns", "ns", &mut pipe_rtt),
+            ("cell.loopback_rtt_us", "us", &mut loopback_rtt),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
         ] {
@@ -523,6 +530,19 @@ fn parse_density_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("idle_bytes")?, field("suspended_bytes")?))
+}
+
+/// `(pipe_rtt_ns, loopback_rtt_ns)` of the network line of a `bench-cell`
+/// kernel.
+fn parse_net_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-net "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("pipe_rtt_ns")?, field("loopback_rtt_ns")?))
 }
 
 /// `(write_read_ns, fork_ns)` of the files line of a `bench-cell` kernel.
@@ -1476,6 +1496,15 @@ mod tests {
             Some((120_000, 1500))
         );
         assert_eq!(parse_files_line("rhizo-files write_read_ns=1\n"), None);
+    }
+
+    #[test]
+    fn net_line_is_parsed() {
+        assert_eq!(
+            parse_net_line("x\nrhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200\n"),
+            Some((310, 4200))
+        );
+        assert_eq!(parse_net_line("rhizo-net pipe_rtt_ns=1\n"), None);
     }
 
     #[test]

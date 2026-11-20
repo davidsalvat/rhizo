@@ -7,10 +7,10 @@ use rhizo_hal::testing::{FakePhysicalMemory, RecordingConsole, RecordingTlb};
 use rhizo_mm::paging::{Aarch64, PageSize};
 
 #[derive(Default)]
-struct FakeServices {
+pub(crate) struct FakeServices {
     console: RecordingConsole,
     log: String,
-    clock: u64,
+    pub(crate) clock: u64,
     /// Bytes the cell may still store (`None`: unlimited).
     room: Option<u64>,
 }
@@ -48,22 +48,25 @@ impl Services for FakeServices {
 
 /// A cell with one writable page at `DATA`, a read-only page at `RO`, and
 /// its heap starting at `HEAP`.
-struct World {
-    cell: Cell,
+pub(crate) struct World {
+    pub(crate) cell: Cell,
     abi: Abi,
     mem: FakePhysicalMemory,
     tlb: RecordingTlb,
     frames: CountingFrames,
-    services: FakeServices,
-    fs: rhizo_fs::Fs,
+    pub(crate) services: FakeServices,
+    pub(crate) fs: rhizo_fs::Fs,
+    pub(crate) net: rhizo_net::Net,
+    /// Deadline of the last blocked call (kept, as the kernel does).
+    pub(crate) deadline: Option<u64>,
 }
 
-const DATA: u64 = 0x10_0000;
+pub(crate) const DATA: u64 = 0x10_0000;
 const RO: u64 = 0x11_0000;
 const HEAP: u64 = 0x20_0000;
 
 impl World {
-    fn new(arch: Arch) -> Self {
+    pub(crate) fn new(arch: Arch) -> Self {
         let mut mem = FakePhysicalMemory::new();
         let mut frames = CountingFrames::new(1024);
         let mut tlb = RecordingTlb::default();
@@ -80,6 +83,8 @@ impl World {
             frames,
             services: FakeServices::default(),
             fs: rhizo_fs::Fs::new(),
+            net: rhizo_net::Net::new(),
+            deadline: None,
         }
     }
 
@@ -88,7 +93,7 @@ impl World {
     }
 
     /// Calls `name` (AArch64 numbering unless the world is x86_64).
-    fn call(&mut self, nr: u64, args: &[u64]) -> (i64, Outcome) {
+    pub(crate) fn call(&mut self, nr: u64, args: &[u64]) -> (i64, Outcome) {
         let regs = &mut self.cell.regs.gpr;
         match self.abi.arch {
             Arch::Aarch64 => {
@@ -109,17 +114,22 @@ impl World {
             frames: &mut self.frames,
             services: &mut self.services,
             fs: &mut self.fs,
+            net: &mut self.net,
+            deadline: self.deadline.take(),
             pager: &mut NoPager,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
+        if let Outcome::Block(deadline) = out {
+            self.deadline = deadline;
+        }
         (self.cell.regs.gpr[0] as i64, out)
     }
 
-    fn poke(&mut self, addr: u64, data: &[u8]) {
+    pub(crate) fn poke(&mut self, addr: u64, data: &[u8]) {
         memory::copy_to(&self.pt(), &mut self.mem, addr, data).unwrap();
     }
 
-    fn peek(&self, addr: u64, len: usize) -> Vec<u8> {
+    pub(crate) fn peek(&self, addr: u64, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
         memory::copy_from(&self.pt(), &self.mem, addr, &mut out).unwrap();
         out
@@ -605,7 +615,14 @@ fn select_without_descriptors_sleeps() {
         Outcome::Sleep(2_500),
         "pselect6"
     );
-    assert_eq!(w.call(23, &[1, DATA, 0, 0, DATA]).0, -ENOSYS, "descriptors");
+    // With descriptors it waits on them (spec change `add-sockets-and-poll`):
+    // standard input reads as empty, so it is ready at once.
+    w.poke(DATA + 16, &1u64.to_le_bytes());
+    assert_eq!(
+        w.call(23, &[1, DATA + 16, 0, 0, DATA]),
+        (1, Outcome::Resume),
+        "descriptors"
+    );
     assert_eq!(w.call(23, &[0, 0, 0, 0, 0]).0, -EINVAL, "no timeout");
     w.poke(
         DATA,

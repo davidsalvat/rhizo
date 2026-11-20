@@ -21,6 +21,7 @@ use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::paging::{PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
+use rhizo_net::Net;
 use rhizo_sched::{SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::Snapshot;
 
@@ -68,6 +69,89 @@ fn with_no_files<R>(f: impl FnOnce(&Fs, &[u8]) -> R) -> R {
 fn files_of(snapshot: &Snapshot) -> Fs {
     with_no_files(|fs, bytes| (snapshot.files_bytes() == bytes).then(|| fs.clone()))
         .unwrap_or_else(|| snapshot.files())
+}
+
+/// The sockets of every cell (spec `networking`): cells of this kernel talk
+/// over its loopback network.
+static NET: Global<Net> = Global::new(Net::new());
+
+/// The files of a fork of a cell with `fs`: its sockets as design D4 of
+/// `add-sockets-and-poll` says (listeners shared, connections reset).
+fn fork_files(fs: &Fs) -> Fs {
+    let mut child = fs.clone();
+    if fs.sockets().next().is_some() {
+        NET.with(|net| child.map_sockets(|h| net.fork(h).unwrap_or(h)));
+    }
+    child
+}
+
+/// Sockets open in the kernel.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn open_sockets() -> usize {
+    NET.with(|net| net.open())
+}
+
+/// Releases the sockets `fs` holds (its cell ended or was suspended).
+fn release_sockets(fs: &Fs) {
+    if fs.sockets().next().is_some() {
+        NET.with(|net| fs.sockets().for_each(|h| net.release(h)));
+    }
+}
+
+/// `fs` with its sockets replaced by indices into the records returned, for
+/// a snapshot.
+fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
+    let mut records = Vec::new();
+    if fs.sockets().next().is_none() {
+        return (fs.clone(), records);
+    }
+    let mut out = fs.clone();
+    NET.with(|net| {
+        out.map_sockets(|h| {
+            let record = net.export(h).unwrap_or(rhizo_net::Record {
+                family: rhizo_net::Family::Inet,
+                ty: rhizo_net::Type::Stream,
+                state: rhizo_net::Saved::Reset,
+                local: None,
+                opts: rhizo_net::Options::default(),
+            });
+            records.push(record);
+            (records.len() - 1) as u32
+        });
+    });
+    (out, records)
+}
+
+/// Makes the sockets of a resumed cell from its snapshot's records, and
+/// points its descriptors and Unix socket names at them. A socket that
+/// cannot be made at all is left out: its descriptor reads as reset.
+fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
+    if records.is_empty() {
+        return;
+    }
+    let mut handles = Vec::with_capacity(records.len());
+    let mut renamed = Vec::new();
+    NET.with(|net| {
+        for r in records {
+            let reset = rhizo_net::Record {
+                state: rhizo_net::Saved::Reset,
+                local: None,
+                ..r.clone()
+            };
+            let made = net.import(r).or_else(|_| net.import(&reset));
+            let (h, name) = made.unwrap_or((u32::MAX, None));
+            handles.push(h);
+            renamed.extend(name);
+        }
+    });
+    fs.map_sockets(|i| handles.get(i as usize).copied().unwrap_or(u32::MAX));
+    // A name keeps working only if its socket came back with the cell.
+    if fs.socket_names().next().is_some() {
+        fs.map_socket_names(|n| renamed.iter().find(|r| r.0 == n).map_or(0, |r| r.1));
+    }
 }
 
 impl Frames for KernelFrames {
@@ -189,6 +273,9 @@ struct Live {
     lazy: Option<Lazy>,
     /// Its files and open descriptors (spec `files`).
     fs: Fs,
+    /// Deadline of the blocked call it makes again when it runs (design D3
+    /// of `add-sockets-and-poll`).
+    deadline: Option<u64>,
 }
 
 /// The snapshot of a lazily resumed cell and which of its pages are still
@@ -326,6 +413,8 @@ pub struct Host {
     /// Cell whose FP/SIMD state is in the registers (0: none). The kernel
     /// never uses them, so they are saved only when another cell runs.
     fp_owner: u32,
+    /// [`Net::changes`] when waiting cells were last woken.
+    net_seen: u64,
 }
 
 impl Host {
@@ -341,6 +430,7 @@ impl Host {
             finished: Vec::new(),
             templates: Vec::new(),
             fp_owner: 0,
+            net_seen: 0,
         }
     }
 
@@ -409,6 +499,7 @@ impl Host {
             random: services.random,
             lazy: None,
             fs: files,
+            deadline: None,
         });
         Ok(id)
     }
@@ -447,8 +538,15 @@ impl Host {
         }
         self.sync_fp(&mut live, true);
         let remaining = wake.map_or(0, |w| w.saturating_sub(now_ns()).max(1));
-        let snapshot =
-            Snapshot::capture::<Format>(user::MACHINE, &live.cell, &live.fs, remaining, &DirectMap);
+        let (files, sockets) = export_sockets(&live.fs);
+        let snapshot = Snapshot::capture::<Format>(
+            user::MACHINE,
+            &live.cell,
+            &files,
+            &sockets,
+            remaining,
+            &DirectMap,
+        );
         self.end(live, Ending::Suspended);
         Some(snapshot)
     }
@@ -480,7 +578,8 @@ impl Host {
         }
         let cell = snapshot.cell(id, pt.root());
         let sleep = snapshot.state().sleep_remaining_ns;
-        let fs = files_of(&snapshot);
+        let mut fs = files_of(&snapshot);
+        import_sockets(&mut fs, &snapshot.sockets());
         let mut lazy = Lazy::new(snapshot);
         if mode == Resume::Eager {
             lazy.finish(&pt);
@@ -495,6 +594,7 @@ impl Host {
             random: Counter.cycles() | 1,
             lazy: (lazy.left > 0).then_some(lazy),
             fs,
+            deadline: None,
         };
         match sleep {
             0 => self.sched.add(live),
@@ -551,6 +651,7 @@ impl Host {
     /// ends or gives up the CPU).
     pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
         while !stop(self) {
+            self.wake_on_changes();
             let now = now_ns();
             let Some(live) = self.sched.next(now) else {
                 match self.sched.next_wake() {
@@ -560,6 +661,16 @@ impl Host {
                 continue;
             };
             self.run_slice(live);
+        }
+    }
+
+    /// Makes every waiting cell runnable if a socket changed since they
+    /// started waiting (design D3 of `add-sockets-and-poll`).
+    fn wake_on_changes(&mut self) {
+        let changes = NET.with(|net| net.changes());
+        if changes != self.net_seen {
+            self.net_seen = changes;
+            self.sched.wake_waiting();
         }
     }
 
@@ -586,21 +697,29 @@ impl Host {
                         echo: live.echo,
                         random: live.random,
                     };
-                    let mut cx = Context {
-                        pt,
-                        mem: &mut DirectMap,
-                        tlb: &mut CpuTlb,
-                        frames: &mut KernelFrames,
-                        services: &mut services,
-                        fs: &mut live.fs,
-                        pager: &mut CellPager(&mut live.lazy),
-                    };
-                    let outcome = live.abi.handle(&mut live.cell, &mut cx);
+                    let (outcome, deadline) = NET.with(|net| {
+                        let mut cx = Context {
+                            pt,
+                            mem: &mut DirectMap,
+                            tlb: &mut CpuTlb,
+                            frames: &mut KernelFrames,
+                            services: &mut services,
+                            fs: &mut live.fs,
+                            net,
+                            deadline: live.deadline.take(),
+                            pager: &mut CellPager(&mut live.lazy),
+                        };
+                        (live.abi.handle(&mut live.cell, &mut cx), cx.deadline)
+                    });
                     live.random = services.random;
                     match outcome {
                         Outcome::Resume => continue,
                         Outcome::Yield => self.sched.add(live),
                         Outcome::Sleep(until) => self.sched.sleep(live, until),
+                        Outcome::Block(until) => {
+                            live.deadline = deadline;
+                            self.sched.wait(live, until);
+                        }
                         Outcome::Exit(status) => self.end(live, Ending::Exit(status)),
                     }
                 }
@@ -697,12 +816,13 @@ impl Host {
         Some(ids)
     }
 
-    /// Frees the memory and tag of a cell that never ran, leaving no trace
-    /// (no [`Finished`]); the caller drops it.
+    /// Frees the memory, tag and sockets of a cell that never ran, leaving
+    /// no trace (no [`Finished`]).
     fn discard(&mut self, live: &Live) {
         if live.tag != 0 {
             self.tags.free(live.tag);
         }
+        release_sockets(&live.fs);
         space::destroy(
             PageTable::<Format>::from_root(live.cell.root),
             &mut DirectMap,
@@ -727,7 +847,8 @@ impl Host {
             echo,
             random: Counter.cycles() | 1,
             lazy: None,
-            fs: fs.clone(),
+            fs: fork_files(fs),
+            deadline: None,
         })
     }
 
@@ -789,6 +910,15 @@ impl Host {
         self.finished.iter().find(|f| f.id == id)
     }
 
+    /// Number of live cells waiting on descriptors.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn waiting(&self) -> usize {
+        self.sched.waiting()
+    }
+
     /// Number of live cells.
     #[cfg_attr(
         not(feature = "ktest"),
@@ -811,6 +941,7 @@ impl Host {
             &mut DirectMap,
             &mut KernelFrames,
         );
+        release_sockets(&live.fs);
         self.finished.push(Finished {
             id: live.cell.id,
             ending,
@@ -824,12 +955,13 @@ impl Drop for Host {
         while let Some(live) = self.sched.remove(|_| true) {
             self.end(live, Ending::Killed);
         }
-        for (template, _) in self.templates.drain(..) {
+        for (template, fs) in self.templates.drain(..) {
             space::destroy(
                 PageTable::<Format>::from_root(template.root),
                 &mut DirectMap,
                 &mut KernelFrames,
             );
+            release_sockets(&fs);
         }
     }
 }
@@ -936,6 +1068,11 @@ pub fn bench(console: &mut impl Console) {
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
         "rhizo-files write_read_ns={write_read} fork_ns={fork_files}"
+    );
+    let (pipe, loopback) = net();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback}"
     );
     let s = suspend_resume();
     let _ = writeln!(
@@ -1210,6 +1347,54 @@ fn files() -> (u64, u64) {
         assert!(host.kill(child));
     }
     (robust(&mut write_read), robust(&mut fork))
+}
+
+/// Robust figures (see [`robust`]) of the time per round trip: `piper`
+/// writing one byte into a pipe and reading it back, and two `loopback`
+/// cells exchanging a 64-byte message over TCP on 127.0.0.1 (design D7 of
+/// `add-sockets-and-poll`).
+#[cfg(feature = "bench-cell")]
+fn net() -> (u64, u64) {
+    const RUNS: usize = 3 * ROUNDS;
+    const PIPE_TRIPS: u64 = 2000;
+    const NET_TRIPS: u64 = 200;
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let mut pipe = Vec::with_capacity(RUNS);
+    let trips = b"2000";
+    for _ in 0..RUNS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn(test_image("piper"), &[b"piper", trips], true, false)
+            .expect("spawn piper");
+        host.run(|h| h.finished(id).is_some());
+        pipe.push(ns(t0, Counter.cycles()) / PIPE_TRIPS);
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    let image = test_image("loopback");
+    let mut loopback = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let server = host
+            .spawn(
+                image,
+                &[b"loopback", b"serve", b"7400", b"200"],
+                true,
+                false,
+            )
+            .expect("spawn server");
+        host.step(); // listening, waiting in `accept`
+        let t0 = Counter.cycles();
+        let client = host
+            .spawn(image, &[b"loopback", b"ping", b"7400", b"200"], true, false)
+            .expect("spawn client");
+        host.run(|h| h.finished(server).is_some() && h.finished(client).is_some());
+        loopback.push(ns(t0, Counter.cycles()) / NET_TRIPS);
+        for id in [server, client] {
+            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        }
+    }
+    (robust(&mut pipe), robust(&mut loopback))
 }
 
 /// Medians over 7 rounds, for the `ballast` cell (8 MiB written): suspend,
