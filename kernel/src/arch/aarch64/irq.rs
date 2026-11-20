@@ -165,9 +165,12 @@ pub fn init_cpu() {
     GICR[crate::arch::cpu::index()].store(gicr, Ordering::Relaxed);
 }
 
+/// Counter ticks in `ns`, at most what `CNTV_TVAL_EL0` holds (a signed
+/// 32-bit value: a larger one would fire at once; a longer wait ends early
+/// and the CPU looks again).
 fn ns_to_ticks(ns: u64) -> u64 {
     let ticks = ns as u128 * super::timer::frequency() as u128 / 1_000_000_000;
-    (ticks as u64).clamp(1, u32::MAX as u64)
+    (ticks as u64).clamp(1, i32::MAX as u64)
 }
 
 /// Whether preemption is available (a GICv3 was found).
@@ -218,13 +221,15 @@ pub fn acknowledge() {
 }
 
 /// Waits about `ns` nanoseconds (or until any interrupt): with interrupts
-/// masked, `wfi` still wakes up when one is pending. Acknowledging it
-/// restarts the periodic tick.
+/// masked, `wfi` still wakes up when one is pending. Then goes back to the
+/// periodic tick, whichever interrupt ended the wait (a wake-up must not
+/// leave the wait's long timer to preempt the next cell).
 pub fn wait_ns(ns: u64) {
     arm(ns_to_ticks(ns));
     // SAFETY: waiting for an interrupt has no other effect.
     unsafe { asm!("dsb sy", "wfi", options(nostack)) };
     acknowledge();
+    arm(TICK.load(Ordering::Relaxed));
 }
 
 /// Waits for an interrupt (a wake-up), with the timer left as it is.
