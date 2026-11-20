@@ -181,12 +181,10 @@ impl BootOptions {
     }
 }
 
-/// A decimal count from 1 to 65535.
+/// A count from 1 to 65535 (with [`number`]'s syntax, which the other
+/// numeric options share and keeps the boot image small).
 fn parse_count(digits: &[u8]) -> Option<u16> {
-    let text = core::str::from_utf8(digits).ok()?;
-    text.parse::<u16>()
-        .ok()
-        .filter(|&n| n > 0 && !text.starts_with('+'))
+    u16::try_from(number(digits)?).ok().filter(|&n| n > 0)
 }
 
 /// Offset of `cmdline_paddr` in `hvm_start_info`.
