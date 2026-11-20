@@ -38,10 +38,16 @@ for the cases cells use in H2.
 ### Requirement: Unsupported calls are visible
 Any other system call SHALL return `-ENOSYS` and the kernel SHALL print the
 call's name or number and the cell once, so missing calls are found quickly.
+Numbers from 1023 up, past every Linux call, SHALL share one report, so a
+cell cannot make the kernel print without end.
 
 #### Scenario: Unknown call
 - **WHEN** a cell invokes a system call Rhizo does not implement
 - **THEN** it receives `-ENOSYS` and the console shows `unimplemented syscall` with the call
+
+#### Scenario: Endless unknown numbers
+- **WHEN** a cell invokes many different call numbers past every Linux one
+- **THEN** each receives `-ENOSYS` and the console shows one report for all of them
 
 ### Requirement: Scheduling calls
 The kernel SHALL implement `sched_yield`, `nanosleep` and `clock_nanosleep`
@@ -58,8 +64,8 @@ The kernel SHALL implement `mprotect` (W^X kept), `prlimit64` and
 `getrlimit`, `set_robust_list`, `fstat` and `newfstatat` of the standard
 descriptors (character devices), `readlink` and `readlinkat` (no link
 exists), `getuid`, `geteuid`, `getgid`, `getegid`, `getppid`,
-`sigaltstack`, `madvise` and a single-threaded `futex`, and SHALL decline
-`rseq` with `ENOSYS` without reporting it.
+`sigaltstack` and `madvise`, and SHALL decline `rseq` with `ENOSYS` without
+reporting it. `futex` is specified by the `threads` capability.
 
 #### Scenario: Relocation protection
 - **WHEN** a static glibc program makes its relocated data read-only with `mprotect` at startup
@@ -110,3 +116,14 @@ descriptors are given.
 #### Scenario: Timer select
 - **WHEN** a cell calls `select(0, NULL, NULL, NULL, &timeout)`
 - **THEN** it sleeps for the timeout and receives 0
+
+### Requirement: Reserved mappings
+An anonymous private `mmap` with `PROT_NONE` SHALL reserve its addresses
+without memory. `mprotect` with an accessible protection on reserved
+addresses SHALL back them with zeroed pages that have that protection
+(how glibc makes thread stacks with a guard page and per-thread malloc
+arenas); the pages it does not cover stay inaccessible.
+
+#### Scenario: Stack with a guard page
+- **WHEN** a cell reserves 1 MiB with `PROT_NONE` and makes all but its lowest page readable and writable
+- **THEN** the pages read as zero and keep what is written, and touching the lowest page kills the cell with a fault report

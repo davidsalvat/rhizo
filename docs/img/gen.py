@@ -81,6 +81,8 @@ GV_RUN = median("sandbox.run_ms", "gvisor", "runsc", required=False)
 GV_RESTORE = median("snapshot.restore_ms", "gvisor", "runsc", required=False)
 GV_RUN = GV_RUN and GV_RUN * 1000
 GV_RESTORE = GV_RESTORE and GV_RESTORE * 1000
+THREADS = median("cell.thread_create_us", required=False)
+SECURITY = (OUT.parent / "security.md").exists()
 PY_COLD = median("workload.python_cold_us")
 PY_WARM = median("workload.python_warm_us")
 IDLE_KB = median("cell.idle_bytes", vmm=None) / 1000
@@ -411,13 +413,17 @@ def roadmap(t):
     ] + ([("H11", "gVisor comparison", "userspace-kernel sandboxes, same machine")]
          if GV_RUN else []) + \
         ([("H12", "Fair comparisons", "Linux processes in the same VM, CRIU")]
-         if CALL_AT == "same VM" else [])
+         if CALL_AT == "same VM" else []) + \
+        ([("H13", "Adversarial security review", "12 findings fixed, docs/security.md")]
+         if SECURITY else []) + \
+        ([("H14", "Threads", f"pthreads, futexes; a thread in {us(THREADS)}")]
+         if THREADS else [])
     now = []
-    nxt = ([] if GV_RUN else [("next", "gVisor comparison", "")]) + \
-        ([] if CALL_AT == "same VM" else [("next", "Fair comparisons", "")]) + \
-        [("next", name, "") for name in [
-            "Adversarial security review", "Threads", "Sockets and network",
-            "CPython in a cell", "Multi-core", "Dedicated benchmark machine"]]
+    nxt = [("next", name, "") for name, done_ in [
+        ("gVisor comparison", GV_RUN), ("Fair comparisons", CALL_AT == "same VM"),
+        ("Adversarial security review", SECURITY), ("Threads", THREADS),
+        ("Sockets and network", None), ("CPython in a cell", None), ("Multi-core", None),
+        ("Dedicated benchmark machine", None)] if not done_]
     rows = [(r, "done") for r in done] + [(r, "now") for r in now] + \
         [(r, "next") for r in nxt]
     rh, top = 34, 92

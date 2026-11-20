@@ -63,6 +63,12 @@ again:
   until one of them writes.
 - **Templates.** Freeze a cell after its warm-up, then start new cells from it
   instead of from the executable.
+- **Threads.** `pthread_create`, mutexes, condition variables and futexes;
+  snapshots, forks and templates carry every thread.
+- **Isolation, reviewed.** An adversarial review of the cell boundary, with
+  hostile cells and property tests that keep it fixed:
+  [`docs/security.md`](docs/security.md) lists the threat model, the
+  findings and what is still open.
 
 ## Thesis
 
@@ -186,7 +192,7 @@ Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H10, from the boot and test harness to MicroPython running as a cell with warm templates. Next: a gVisor comparison and a dedicated benchmark machine." width="800">
+    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H14, from the boot and test harness to threads inside a cell, including the gVisor and fair comparisons and an adversarial security review. Next: sockets and network, CPython in a cell, multi-core, and a dedicated benchmark machine." width="800">
   </picture>
 </p>
 
@@ -194,8 +200,8 @@ Each milestone ships its speed work with a benchmark that proves it; the
 details live in the archived changes under
 [`openspec/changes/archive/`](openspec/changes/archive/).
 
-Out of scope for the proof of concept: networking, multicore, real disks,
-hardware other than virtio/QEMU, full CPython, SDKs.
+Out of scope for the proof of concept: real disks, hardware other than
+virtio/QEMU, SDKs.
 
 ## Try it
 
