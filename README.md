@@ -5,28 +5,28 @@
   </picture>
 </p>
 
-# Rhizo
+<p align="center"><b>An operating system kernel built for AI agents.</b></p>
 
-**An operating system kernel built for AI agents.**
+Rhizo is an open-source (MIT) kernel, written in Rust, whose basic unit is not
+the process or the container but the **agent cell**: an isolated environment
+that can be created, suspended, resumed and forked as native kernel operations.
 
-Rhizo is an open-source (MIT) kernel whose basic unit is not the process or the
-container, but the **agent cell**: an isolated execution environment that can be
-created, suspended, resumed and forked as native kernel operations.
+> **Status: pre-alpha proof of concept.** Nothing here is usable in production
+> yet. See [where it stands](#status).
 
-> **Status: pre-alpha proof of concept.** Nothing here is usable yet. Follow the
-> roadmap below to see where we are.
+## The problem
 
-## Why
+An AI agent that runs code today sits on top of a tall stack. Every layer was
+designed for something else, and what agents need most (fast suspend and
+resume, cheap clones of the whole environment, strict isolation of untrusted
+code) is bolted on from the outside.
 
-Today an AI agent that runs code sits on top of a tall stack:
-
-```
-orchestrator → host Linux → VMM or userspace kernel → (often) guest Linux → agent
-```
-
-Every layer was designed for something else, and the features agents need most
-(fast suspend/resume, cheap cloning of the full environment, strict isolation of
-untrusted code, fine-grained permissions) are bolted on from the outside.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/stack-dark.svg">
+    <img src="docs/img/stack.svg" alt="Today: orchestrator, host Linux, a VMM or userspace kernel and often a guest Linux under the agent. With Rhizo: the orchestrator talks to the Rhizo kernel, which runs the agents as cells and offers create, suspend, resume and fork." width="800">
+  </picture>
+</p>
 
 Agent workloads look nothing like classic services:
 
@@ -39,37 +39,30 @@ Agent workloads look nothing like classic services:
 | Static permissions | Per-task permissions: tools, network, secrets |
 
 Rhizo explores what happens when those needs are the design center of the
-kernel itself.
+kernel itself. The name comes from the *rhizome*: an underground stem that
+branches into independent shoots (fork), can regrow a whole plant from a
+fragment (snapshot) and lies dormant until it sprouts again (suspend/resume).
 
-The name comes from the *rhizome*: an underground stem that branches into
-independent shoots (fork), can regrow a whole plant from a fragment (snapshot)
-and lies dormant until it sprouts again (suspend/resume).
+## What a cell can do
 
-## Why ARM64
+A cell runs an unmodified static Linux program (Rust or C with glibc) through
+a Linux-compatible system call layer. Its whole state (memory, registers,
+files) belongs to the kernel, so the kernel can stop it, copy it and start it
+again:
 
-AArch64 is the primary architecture; x86_64 is kept as a second one behind
-the same `arch/` boundary (see below). Rhizo's primitives are dominated by
-address-space and TLB costs, and AArch64 handles those better:
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/lifecycle-dark.svg">
+    <img src="docs/img/lifecycle.svg" alt="A static Linux executable is created as a running cell. The cell can be suspended into a snapshot and resumed (0.93 µs), forked into copy-on-write children (1.29 µs), or frozen as a template from which new, already warmed-up cells start (0.33 µs)." width="800">
+  </picture>
+</p>
 
-- **16-bit ASIDs.** Each address space carries one of 65,536 tags (x86_64 has
-  4,096 PCIDs), so thousands of cells keep their TLB entries across switches
-  instead of flushing them.
-- **TLB invalidation broadcast in hardware.** `TLBI ... IS` removes a stale
-  translation on every core at once. x86_64 needs inter-processor interrupts
-  (TLB shootdowns) for the same thing, which is what copy-on-write `fork` and
-  unmapping do all the time.
-- **Lighter virtualization.** A dedicated hypervisor level (EL2, with VHE) and
-  a simple boot protocol (an image header and a device tree, no firmware, no
-  legacy devices) mean smaller VMMs and faster guest entry.
-- **Server efficiency.** Graviton, Ampere and Cobalt instances give more cores
-  per watt and per dollar, which matters for dense, mostly idle cells.
-
-Why x86_64 stays: GitHub's x86_64 runners are the only place where CI can
-measure with KVM today (the ARM64 runners do not expose it), and the sandboxes
-Rhizo is compared with (Agent Substrate, Firecracker, E2B) run mostly on
-x86_64. Shared code is written once; only the thin `arch/` layer exists twice,
-and every spec is tested on both. The trade-offs are in
-[`design.md` of the switch-to-arm64 change](openspec/changes/archive/2026-11-19-switch-to-arm64/design.md).
+- **Suspend / resume.** A snapshot is a versioned, self-contained image of the
+  cell. Resume is lazy: pages come back on first touch.
+- **Fork(n).** Children share the parent's pages, and even its page tables,
+  until one of them writes.
+- **Templates.** Freeze a cell after its warm-up, then start new cells from it
+  instead of from the executable.
 
 ## Thesis
 
@@ -79,20 +72,31 @@ The proof of concept must demonstrate one measurable claim:
 > cells running real Linux programs orders of magnitude faster than today's
 > microVM- and userspace-kernel-based sandboxes.
 
-## Performance targets
+The targets are hypotheses the proof of concept must validate. Where they stand:
 
-These are **hypotheses to validate**, not results. The comparison figures are
-what each project or its users have published, on different hardware and with
-different measurement methods, so they are orders of magnitude to aim at, not
-a like-for-like comparison. `cargo xtask bench` produces the like-for-like
-numbers (see [Benchmarks](#benchmarks)).
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/scorecard-dark.svg">
+    <img src="docs/img/scorecard.svg" alt="Fork a 50 MB cell: target under 1 ms, measured 1.1 to 1.3 µs, met. Resume from memory: target under 100 µs, measured 0.7 to 1.1 µs with lazy restore, met. Idle cell overhead: target a few KB, being measured in milestone H9." width="800">
+  </picture>
+</p>
 
-| Metric | Rhizo target | Measured (CI, KVM, see [Benchmarks](#benchmarks)) | Firecracker | Unikraft | Hyperlight |
-|---|---|---|---|---|---|
-| Boot: VMM launch → guest ready (KVM) | **≤ 10 ms** (kernel part ≤ 1 ms) | 6–10 ms on Firecracker / Cloud Hypervisor | < 125 ms to a Linux guest accepting API calls[^fc] | < 1 ms guest boot, ~3 ms including the Firecracker VMM[^uk] | sub-millisecond partition creation, no guest OS (reported)[^hl] |
-| Resume a suspended cell / VM | **< 100 µs** (in-kernel, no VMM) | **1.5 µs** lazy, 8 MiB cell (Firecracker restore, same machine: 3.75 ms) | 4–28 ms snapshot restore reported[^fcr] | — | ~0.9 ms snapshot restore (hyperlight-unikraft v0.16)[^hlu] |
-| Fork a 50 MiB cell | **< 1 ms** (stretch: < 200 µs with lazy copy-on-write) | **1.4 µs**, one page-table frame (Linux `fork`, same machine: 1.66 ms) | no native fork (snapshot + restore of a copy) | no native fork in the open-source core | no native fork |
-| Idle cell overhead | **a few KiB** plus its own pages | suspended: its snapshot only (no frame, table or tag); running `hello`: 7 page-table frames | a microVM per sandbox (MiBs) | a microVM per app | a micro-VM per sandbox |
+<details>
+<summary>Targets next to the figures other sandboxes publish</summary>
+
+The comparison figures are what each project or its users have published, on
+different hardware and with different measurement methods, so they are orders
+of magnitude to aim at, not a like-for-like comparison. The like-for-like
+numbers are [below](#measured).
+
+| Metric | Rhizo target | Firecracker | Unikraft | Hyperlight |
+|---|---|---|---|---|
+| Boot: VMM launch → guest ready (KVM) | **≤ 10 ms** (kernel part ≤ 1 ms) | < 125 ms to a Linux guest accepting API calls[^fc] | < 1 ms guest boot, ~3 ms including the Firecracker VMM[^uk] | sub-millisecond partition creation, no guest OS (reported)[^hl] |
+| Resume a suspended cell / VM | **< 100 µs** (in-kernel, no VMM) | 4–28 ms snapshot restore reported[^fcr] | — | ~0.9 ms snapshot restore (hyperlight-unikraft v0.16)[^hlu] |
+| Fork a 50 MiB cell | **< 1 ms** (stretch: < 200 µs with lazy copy-on-write) | no native fork (snapshot + restore of a copy) | no native fork in the open-source core | no native fork |
+| Idle cell overhead | **a few KiB** plus its own pages | a microVM per sandbox (MiBs) | a microVM per app | a micro-VM per sandbox |
+
+</details>
 
 [^fc]: Agache et al., *Firecracker: Lightweight Virtualization for Serverless Applications*, NSDI 2020.
 [^uk]: [Unikraft performance documentation](https://unikraft.org/docs/concepts/performance).
@@ -100,41 +104,25 @@ numbers (see [Benchmarks](#benchmarks)).
 [^fcr]: [Benchmarking Firecracker boot and restore](https://numavm.com/blog/2026-03-10-1-second-boot/) and [Restoring uniqueness in microVM snapshots](https://arxiv.org/pdf/2102.12892).
 [^hlu]: [hyperlight-unikraft v0.16.0 release notes](https://github.com/hyperlight-dev/hyperlight-unikraft/releases/tag/v0.16.0).
 
-## Principles
+## Measured
 
-- **Primitives in the kernel.** Snapshot, resume, fork and capabilities are
-  native kernel operations, not features added on top.
-- **Linux ABI, not Linux code.** Cells run unmodified Linux binaries through a
-  Linux-compatible syscall layer. No GPL code is copied into this repository.
-- **Deterministic by design.** All hardware access goes through narrow
-  interfaces so the kernel core can run inside a deterministic simulator.
-- **Performance is a test.** Benchmarks run in CI with thresholds; a regression
-  fails the build.
-- **Specs first.** Every behavior is specified before it is built
-  (see [`openspec/`](openspec/)).
-- **Open for real.** MIT licensed, no proprietary core, no "open core" bait.
-- **Model-agnostic.** Contribute with any AI coding agent, or with none.
+`cargo xtask bench` measures Rhizo and the existing mechanisms in the same run,
+on the same machine, with the same clock:
 
-## Roadmap (proof of concept)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/measured-dark.svg">
+    <img src="docs/img/measured.svg" alt="Log-scale bar chart, lower is better. Resume a suspended environment: Rhizo 0.93 µs, Firecracker snapshot restore 3.56 ms. Fork an environment holding 50 MiB: Rhizo 1.29 µs, Linux fork 1.79 ms. Run hello from start to exit: Rhizo 9.9 µs, Linux posix_spawn 132 µs. Start a cell from a warm template: Rhizo 0.33 µs." width="800">
+  </picture>
+</p>
 
-| Milestone | Goal | Speed work (each with its benchmark) | Status |
-|---|---|---|---|
-| H0 | Boot in QEMU, serial console, in-kernel test harness, hardware boundary | — | Done |
-| H1 | Physical memory, higher-half paging with W^X, kernel heap, CPU exceptions | Word-level frame bitmap, zero-cost init | Done |
-| H1.5 | Fast boot and benchmarks: microvm, Firecracker, Cloud Hypervisor, fast console, release profile, CI gates | 1 GiB direct-map pages (`memory.kernel_pt_frames`, `boot.kernel_cycles`) | Done |
-| H1.6 | AArch64 as primary architecture (QEMU `virt`, Firecracker, Cloud Hypervisor), x86_64 kept as second | 1 GiB blocks for the direct map; broadcast TLB invalidation | Done |
-| H2 | First cell: user mode, ELF loader, basic Linux syscalls, static binaries | 2 MiB pages for cell memory where possible (`cell.spawn_us`, `cell.run_us`, `cell.pt_frames`) | Done |
-| H3 | Multiple cells, scheduler, isolation tests | ASIDs (PCID on x86_64): no TLB flush when switching cells (`cell.switch_ns` vs `cell.switch_untagged_ns`) | Done |
-| H4 | Suspend / resume with snapshot-equivalence tests | Lazy restore: snapshot pages mapped on first touch, an in-kernel analogue of Firecracker + `userfaultfd` (`cell.resume_us` vs `cell.resume_eager_us`, `cell.resume_touch_us`) | Done |
-| H5 | `fork(n)` with copy-on-write | Lazy copy-on-write including page tables (`cell.fork_us`, `cell.fork_pt_frames`, `cell.fork_touch_us`); pre-warmed cell templates (`cell.spawn_from_template_us` vs `cell.spawn_us`) | Done |
-| H6 | Real workloads with differential tests against Linux: static glibc programs, FP/SIMD per cell (MicroPython pending: its build needs maintainer approval in the development environment) | Template of a warm real program (`workload.warm_us` vs `workload.cold_us`); lazy FP/SIMD switching | Done (glibc) |
-| H7 | Reproducible benchmarks against existing sandboxes: Firecracker snapshot restore and Linux processes, same machine and run | Dedicated KVM machine with tight thresholds (job ready, needs a registered runner) | Done |
-| H8 | Files inside each cell (Linux file calls, glibc stdio), carried by snapshots, forks and templates; initial files from the host | File data shared copy-on-write between forks, block by block (`cell.fork_with_files_us`, `cell.file_write_read_us`); cell figures as the minimum of per-round medians | Done |
+Shared runners are noisy, so figures move between runs; the tables below are
+the last run written into this README. Publishable numbers will come from a
+dedicated machine. How benchmarks, environments and baselines work:
+[`bench/README.md`](bench/README.md).
 
-Out of scope for the proof of concept: networking, multicore, real disks,
-hardware other than virtio/QEMU, full CPython, SDKs.
-
-## Benchmarks
+<details>
+<summary>Boot time and the full comparison table</summary>
 
 <!-- bench:start -->
 Time from launching the VMM to the guest being ready (median, lower is better).
@@ -166,67 +154,89 @@ Environment: `ci`, KVM: yes, measured 2026-11-19. Regenerate with
 `cargo xtask bench --readme`.
 <!-- bench:end -->
 
-How benchmarks, environments and baselines work: [`bench/README.md`](bench/README.md).
+</details>
 
-## Getting started
+## Status
 
-Prerequisites:
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
+    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 boot and test harness, H1 memory, paging and heap, H1.5 fast boot and benchmarks, H1.6 AArch64 as primary, H2 first cell, H3 scheduler and isolation, H4 suspend and resume, H5 fork and templates, H6 real glibc programs, H7 comparisons, H8 files per cell. In progress: H9 memory accounting and density. Next: gVisor comparison, MicroPython workload, dedicated benchmark machine." width="800">
+  </picture>
+</p>
 
-- [rustup](https://rustup.rs). The pinned toolchain (`rust-toolchain.toml`,
-  with both kernel targets) is installed automatically on first use.
-- QEMU 8.2 or later (verified by CI). AArch64 is the default architecture;
-  install the x86_64 emulator too to work on both. On Debian/Ubuntu:
+Each milestone ships its speed work with a benchmark that proves it; the
+details live in the archived changes under
+[`openspec/changes/archive/`](openspec/changes/archive/).
+
+Out of scope for the proof of concept: networking, multicore, real disks,
+hardware other than virtio/QEMU, full CPython, SDKs.
+
+## Try it
+
+You need [rustup](https://rustup.rs) (the pinned toolchain installs itself)
+and QEMU 8.2 or later; the C test cells also need gcc with a static glibc.
+On Debian/Ubuntu:
 
 ```bash
-sudo apt-get install qemu-system-arm qemu-system-x86
+sudo apt-get install qemu-system-arm qemu-system-x86 gcc libc6-dev
 ```
 
-Commands (add `--arch x86_64` right after `cargo xtask` for the second
-architecture):
+Boot the kernel, run the in-kernel tests and every cell (AArch64, the default):
 
-| Command | What it does |
-|---|---|
-| `cargo xtask check` | Fast loop, about a second: format, lints, host tests, crate rules |
-| `cargo xtask build` | Build the kernel image |
-| `cargo xtask run` | Build and boot the kernel (QEMU `virt` on AArch64, `microvm` on x86_64; `--vmm firecracker`, `--vmm cloud-hypervisor`) and report the time to ready |
-| `cargo xtask test` | Host tests, boot check, in-kernel tests and harness self-checks |
-| `cargo xtask bench` | Release-build boot benchmarks on every available VMM, against a reference Linux guest |
-| `cargo xtask ci` | Everything CI runs for one architecture |
-
-A successful boot on AArch64 (QEMU `virt`, emulated) looks like this:
-
-```
-Rhizo 0.1.0
-memory: 126 MiB usable, 126 MiB free, 9 page-table frames
-rhizo-ready cycles=1114569
-boot time: 1114569 cycles (17833 us)
-boot complete
+```bash
+cargo xtask test
 ```
 
-QEMU uses KVM automatically when `/dev/kvm` is available and the host CPU has
-the kernel's architecture, and falls back to emulation otherwise (timings are
-then not meaningful). Firecracker and Cloud Hypervisor need KVM; `xtask`
-downloads pinned releases on first use.
+The same on the second architecture:
 
-## Repository layout
-
-```
-kernel/                Bootable kernel image
-  src/arch/aarch64/    Image header and EL1 entry, MMU, vectors, PL011/16550, PSCI
-  src/arch/x86_64/     PVH entry, paging, IDT/GDT, serial and debug port
-crates/rhizo-hal/      Hardware interfaces (traits) and host test doubles
-crates/rhizo-core/     Boot reports, options, device tree, exception reports
-crates/rhizo-mm/       Frames, page tables (both entry formats), heap
-xtask/                 Developer tool: check, build, run, test, bench, ci
-openspec/              Specifications and change proposals (spec-driven development)
-.agents/skills/        Project skills (open Agent Skills format)
-AGENTS.md              Instructions for AI coding agents (open standard, any vendor)
-CONTRIBUTING.md        How to contribute, with or without AI tools
+```bash
+cargo xtask --arch x86_64 test
 ```
 
-## Contributing
+Benchmarks (Firecracker and Cloud Hypervisor need KVM; `xtask` downloads
+pinned releases on first use):
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+```bash
+cargo xtask bench
+```
+
+```bash
+cargo xtask --arch x86_64 bench
+```
+
+`cargo xtask check` is the fast loop (format, lints, host tests, crate rules)
+and `cargo xtask ci` runs everything CI runs. AArch64 is the primary
+architecture: 16-bit ASIDs and TLB invalidation broadcast in hardware suit
+cells that switch and fork all the time. x86_64 stays because GitHub's x86_64
+runners are where CI can measure with KVM; only the thin `arch/` layer exists
+twice, and every spec is tested on both
+([trade-offs](openspec/changes/archive/2026-11-19-switch-to-arm64/design.md)).
+
+## Principles
+
+- **Primitives in the kernel.** Snapshot, resume, fork and capabilities are
+  native kernel operations, not features added on top.
+- **Linux ABI, not Linux code.** Cells run unmodified Linux binaries through a
+  Linux-compatible syscall layer. No GPL code is copied into this repository.
+- **Deterministic by design.** All hardware access goes through narrow
+  interfaces so the kernel core can run inside a deterministic simulator.
+- **Performance is a test.** Benchmarks run in CI with thresholds; a regression
+  fails the build.
+- **Specs first.** Every behavior is specified before it is built
+  (see [`openspec/`](openspec/)).
+- **Open for real.** MIT licensed, no proprietary core, no "open core" bait.
+- **Model-agnostic.** Contribute with any AI coding agent, or with none.
+
+## Learn more
+
+- [`openspec/specs/`](openspec/specs/): how the system behaves today, one spec
+  per capability.
+- [`bench/README.md`](bench/README.md): every metric, environment and baseline.
+- [`AGENTS.md`](AGENTS.md): code map, rules and the feedback loop (for people
+  and AI coding agents alike).
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute, with or without AI
+  tools.
 
 ## License
 
