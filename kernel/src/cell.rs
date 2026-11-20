@@ -2029,6 +2029,7 @@ fn cpython() -> Option<(u64, u64)> {
         warm.push(ns(t0, Counter.cycles()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
+    use core::fmt::Write;
     // DIAGNOSTIC ONLY: cold starts with 2 MiB pages for the kept image
     // (bit 0) and the break (bit 1), interleaved.
     let mut modes: [Vec<u64>; 4] = Default::default();
