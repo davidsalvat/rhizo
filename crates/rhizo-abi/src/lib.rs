@@ -16,7 +16,7 @@ use core::fmt;
 use rhizo_cell::memory::{self, Pager};
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
-use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_PAGES, STACK_TOP, USER_END};
+use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_LIMIT, STACK_TOP, USER_END};
 use rhizo_hal::{Console, PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
@@ -301,8 +301,9 @@ pub struct Abi {
 const AT_FDCWD: u64 = -100i64 as u64;
 /// Bytes copied per step when moving data between a cell and the kernel.
 const CHUNK: usize = 256;
-/// Lowest address the stack region (with its guard page) may reach.
-const STACK_FLOOR: u64 = STACK_TOP - (STACK_PAGES + 1) * FRAME_SIZE;
+/// Lowest address the stack region (grown to its limit, with a guard page)
+/// may reach.
+const STACK_FLOOR: u64 = STACK_TOP - STACK_LIMIT - FRAME_SIZE;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
@@ -861,8 +862,8 @@ fn rlimit<F: EntryFormat, M: PhysicalMemory, T, A, S>(
 ) -> i64 {
     const INFINITY: u64 = u64::MAX;
     let (cur, max) = match resource {
-        3 => (8 << 20, INFINITY), // RLIMIT_STACK
-        7 => (1024, 1024),        // RLIMIT_NOFILE
+        3 => (STACK_LIMIT, INFINITY), // RLIMIT_STACK
+        7 => (1024, 1024),            // RLIMIT_NOFILE
         0..=15 => (INFINITY, INFINITY),
         _ => return -EINVAL,
     };

@@ -301,7 +301,7 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
         if self.0.as_mut().is_some_and(|lazy| lazy.page_in(pt, addr)) {
             return true;
         }
-        write && resolve_write(pt, addr)
+        (write && resolve_write(pt, addr)) || grow_stack(pt, addr)
     }
 
     fn discard(&mut self, addr: u64, len: u64) {
@@ -309,6 +309,13 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
             lazy.discard(addr, len);
         }
     }
+}
+
+/// Grows the stack of the cell with tables `pt` to cover `addr` (design D5
+/// of `add-cpython`), if memory allows.
+fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
+    memory::cells_may_take(FRAME_SIZE)
+        && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, &mut KernelFrames, addr)
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
@@ -692,6 +699,13 @@ impl Host {
                         if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
                             live.lazy = None; // fully restored: drop the snapshot
                         }
+                        continue;
+                    }
+                    Trap::Fault(fault)
+                        if fault
+                            .missing_page()
+                            .is_some_and(|addr| grow_stack(&pt, addr)) =>
+                    {
                         continue;
                     }
                     Trap::Fault(fault)

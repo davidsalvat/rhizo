@@ -74,6 +74,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
         "tids ok\nfutex ok\nmutex ok\nping-pong ok\nregs ok\n",
         Ending::Exit(0),
     ),
+    ("libc_deep_stack", "deep 130560\nbuffer ok\n", Ending::Exit(0)),
     (
         "libc_threads",
         "ready\n\

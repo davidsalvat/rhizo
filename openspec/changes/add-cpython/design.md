@@ -108,3 +108,23 @@ tree, the script, `bench/host/cpython_forkserver.py`, and
 files) and the Firecracker boot loop is shared with the process
 comparison. Skipped with the reason when CPython is not built or
 Firecracker cannot run.
+
+## D5. A stack that grows on touch
+
+A cell started with 16 stack pages (64 KiB) mapped eagerly and nothing
+below: CPython's start-up (glibc's user lookup for `site`, then the
+interpreter's own frames) went past it and faulted. Linux gives a process
+8 MiB of stack that grows on touch, and `getrlimit` already reported that
+limit. So a fault on an unmapped page within 8 MiB below `STACK_TOP` maps
+a zeroed page (`rhizo_cell::space::grow_stack`, host-tested), from the
+kernel's fault path and from the system-call pager (a call writing into
+untouched stack, as Linux's `copy_to_user` grows it too); `mmap` keeps
+below that range and a guard page. Pages come and go like any other:
+forks share them, snapshots carry them, the cell's end returns them.
+
+The 16 eager pages stay: mapping 8 MiB eagerly would cost every spawn
+(`cell.spawn_us`) and every idle cell (`cell.idle_bytes`) 8 MiB, and
+mapping fewer would add faults to the `hello` benchmark.
+
+Alternative: a larger eager stack (fixed cost for every cell, still a
+hard limit below Linux's).
