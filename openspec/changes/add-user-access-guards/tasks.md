@@ -13,4 +13,4 @@
 ## 3. Documentation and CI
 
 - [x] 3.1 `docs/security.md`: O5 closed, finding S13, the direct map's place; verify by reading
-- [ ] 3.2 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
+- [x] 3.2 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
