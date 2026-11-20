@@ -342,6 +342,10 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
         }
+        match crate::compare::gvisor(&crate::build_cells()?, opts.runs.clamp(3, 20), &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("gvisor".into(), e)),
+        }
     }
     Ok(())
 }

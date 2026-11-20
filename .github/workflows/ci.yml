@@ -151,6 +151,18 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
+      - name: Install gVisor (runsc) for the comparison
+        # The Ubuntu package (signed archive); if this Ubuntu has none, a fixed
+        # gVisor release checked against its published SHA-512.
+        run: |
+          if ! sudo apt-get install -y --no-install-recommends runsc; then
+            base=https://storage.googleapis.com/gvisor/releases/release/20240603.0/x86_64
+            curl --fail --silent --show-error --location -O "$base/runsc" -O "$base/runsc.sha512"
+            sha512sum -c runsc.sha512
+            sudo install -m 755 runsc /usr/local/bin/runsc
+          fi
+          runsc --version
+
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
 

@@ -256,3 +256,180 @@ pub fn firecracker_restore(runs: usize, accel: Accel, scratch: &Path) -> Result<
 pub fn scratch_dir() -> PathBuf {
     crate::target_dir().join("compare")
 }
+
+/// The `runsc` binary: `RHIZO_RUNSC`, or `runsc` on `PATH`.
+fn runsc() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("RHIZO_RUNSC") {
+        return Ok(PathBuf::from(path));
+    }
+    let out = Command::new("sh")
+        .args(["-c", "command -v runsc"])
+        .output()
+        .map_err(|e| format!("cannot look for runsc: {e}"))?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err("gVisor's runsc is not installed (CI installs it; see bench/README.md)".into());
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// A `runsc` command run as root (`sudo -n` unless already root): gVisor
+/// needs root for `do`, `run`, `checkpoint` and `restore`.
+fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
+    let as_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+    let mut cmd = if as_root {
+        Command::new(runsc)
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("-n").arg(runsc);
+        c
+    };
+    cmd.arg("--root").arg(root).arg("--network=none");
+    cmd.stdin(Stdio::null());
+    cmd
+}
+
+/// Runs `cmd`; its output on failure, as the error.
+fn checked(cmd: &mut Command, what: &str) -> Result<String> {
+    let out = cmd
+        .output()
+        .map_err(|e| format!("cannot run runsc ({what}): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "runsc {what} failed ({}): {}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The OCI configuration for a bundle running `/idle`: no terminal (it runs
+/// detached), read-only root, no network.
+pub fn gvisor_config(spec: &str) -> Result<String> {
+    let mut v: serde_json::Value =
+        serde_json::from_str(spec).map_err(|e| format!("bad runsc spec output: {e}"))?;
+    v["process"]["terminal"] = serde_json::Value::Bool(false);
+    v["process"]["args"] = serde_json::json!(["/idle"]);
+    v["root"]["readonly"] = serde_json::Value::Bool(true);
+    serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+}
+
+/// gVisor (design D1 of `add-gvisor-comparison`): `sandbox.run_ms` (a new
+/// sandbox running the cells' static `hello` to its exit) and
+/// `snapshot.restore_ms` (restoring a checkpointed sandbox of `idle` until it
+/// runs), each over `runs` runs after one warm-up.
+pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> {
+    let runsc = runsc()?;
+    let version = checked(Command::new(&runsc).arg("--version"), "--version")?;
+    let dir = scratch.join(format!("gvisor-{}", std::process::id()));
+    let root = dir.join("state");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let result = (|| {
+        // A sandbox running `hello` to its exit.
+        let mut run = Vec::new();
+        for i in 0..=runs {
+            let t0 = Instant::now();
+            let out = checked(
+                runsc_cmd(&runsc, &root).arg("do").arg(cells.join("hello")),
+                "do",
+            )?;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if !out.contains("hello from a cell") {
+                return Err(format!("runsc do printed {out:?}"));
+            }
+            if i > 0 {
+                run.push(ms);
+            }
+        }
+        // Checkpoint a sandbox of `idle` once, then restore new ones from it.
+        let bundle = dir.join("bundle");
+        let rootfs = bundle.join("rootfs");
+        std::fs::create_dir_all(&rootfs).map_err(|e| e.to_string())?;
+        std::fs::copy(cells.join("idle"), rootfs.join("idle")).map_err(|e| e.to_string())?;
+        checked(
+            Command::new(&runsc).arg("spec").current_dir(&bundle),
+            "spec",
+        )?;
+        let spec =
+            std::fs::read_to_string(bundle.join("config.json")).map_err(|e| e.to_string())?;
+        std::fs::write(bundle.join("config.json"), gvisor_config(&spec)?)
+            .map_err(|e| e.to_string())?;
+        let image = dir.join("image");
+        std::fs::create_dir_all(&image).map_err(|e| e.to_string())?;
+        let bundle_arg = bundle.display().to_string();
+        checked(
+            runsc_cmd(&runsc, &root).args(["run", "--detach", "--bundle", &bundle_arg, "rz-base"]),
+            "run",
+        )?;
+        checked(
+            runsc_cmd(&runsc, &root)
+                .arg("checkpoint")
+                .arg("--image-path")
+                .arg(&image)
+                .arg("rz-base"),
+            "checkpoint",
+        )?;
+        let _ = runsc_cmd(&runsc, &root)
+            .args(["delete", "--force", "rz-base"])
+            .output();
+        let mut restore = Vec::new();
+        for i in 0..=runs {
+            let id = format!("rz-{i}");
+            let t0 = Instant::now();
+            checked(
+                runsc_cmd(&runsc, &root)
+                    .arg("restore")
+                    .arg("--detach")
+                    .arg("--image-path")
+                    .arg(&image)
+                    .args(["--bundle", &bundle_arg, &id]),
+                "restore",
+            )?;
+            let state = checked(runsc_cmd(&runsc, &root).args(["state", &id]), "state")?;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let _ = runsc_cmd(&runsc, &root)
+                .args(["delete", "--force", &id])
+                .output();
+            if !state.contains("\"running\"") {
+                return Err(format!("restored sandbox is not running: {state}"));
+            }
+            if i > 0 {
+                restore.push(ms);
+            }
+        }
+        Ok(vec![
+            metric("sandbox.run_ms", "gvisor", "runsc", "ms", &mut run),
+            metric("snapshot.restore_ms", "gvisor", "runsc", "ms", &mut restore),
+        ])
+    })();
+    // The state directory is root-owned; leave it to the next run's clean-up.
+    let _ = std::fs::remove_dir_all(&dir);
+    report::text(&format!(
+        "gvisor ({}): {}",
+        version.lines().next().unwrap_or("runsc"),
+        if result.is_ok() { "measured" } else { "failed" }
+    ));
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gvisor_bundle_runs_idle_detached_without_a_terminal() {
+        let spec = r#"{"ociVersion":"1.0.0","process":{"terminal":true,"args":["sh"],"cwd":"/"},
+            "root":{"path":"rootfs","readonly":false}}"#;
+        let v: serde_json::Value = serde_json::from_str(&gvisor_config(spec).unwrap()).unwrap();
+        assert_eq!(v["process"]["terminal"], false);
+        assert_eq!(v["process"]["args"], serde_json::json!(["/idle"]));
+        assert_eq!(v["root"]["readonly"], true);
+        assert_eq!(v["root"]["path"], "rootfs", "the rest is kept");
+        assert!(gvisor_config("not json").is_err());
+    }
+}
