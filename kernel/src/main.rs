@@ -12,6 +12,8 @@ extern crate alloc;
 mod arch;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod cell;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod cost;
 mod heap;
 mod memory;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
@@ -23,6 +25,8 @@ mod sync;
 mod tests;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod wire;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod workloads;
 
 use arch::console::BootConsole;
 use arch::power::Machine;

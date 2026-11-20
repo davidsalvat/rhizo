@@ -71,7 +71,7 @@ counting (`-icount`) they do not move at all.
 New crate `crates/rhizo-prof`; `rhizo-core` (`SpinLock` contention),
 `rhizo-hal` (`PhysicalMemory::copy`), `rhizo-mm` (copy-on-write copies),
 `rhizo-abi` (call number, name and socket class for reports); kernel
-`prof.rs`, hooks in `cell.rs`, `memory.rs`, `sync.rs`, `arch/*/pmu.rs`, the
+`cost.rs`, hooks in `cell.rs`, `memory.rs`, `sync.rs`, `arch/*/pmu.rs`, the
 `profile` feature and the benchmark passes; `cells` (`yielder getpid`);
 `xtask` (`profile.rs`, `--accel icount`, `--no-icount`, gate thresholds);
 `bench/README.md`, `bench/baseline.json`, `AGENTS.md`.

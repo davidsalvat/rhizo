@@ -84,7 +84,7 @@ impl PhysicalMemory for DirectMap {
 #[inline]
 fn copying() -> impl Sized {
     #[cfg(feature = "profile")]
-    return crate::prof::scope(rhizo_prof::Part::Copy);
+    return crate::cost::scope(rhizo_prof::Part::Copy);
     #[cfg(not(feature = "profile"))]
     ()
 }

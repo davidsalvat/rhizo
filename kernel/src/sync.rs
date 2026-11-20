@@ -28,7 +28,7 @@ impl<T> Global<T> {
         #[cfg(feature = "profile")]
         return self.0.with_waiting(
             crate::arch::cpu::index(),
-            || crate::prof::scope(rhizo_prof::Part::Lock),
+            || crate::cost::scope(rhizo_prof::Part::Lock),
             drop,
             f,
         );

@@ -44,6 +44,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.python_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off MicroPython frozen after its warm-up |
 | `workload.cpython_cold_us/rhizo/<vmm>` | timing | CPython (static, pinned 3.13.18) answering one agent tool call (`cells/python/agent_demo.py`: JSON, regular expressions, dates, a CRC) started from its executable, with the standard library it imports as compiled modules in the cell's files: interpreter start, imports, warm-up, answer, exit. Measured only where CPython is built (`RHIZO_CPYTHON_SRC`, set in CI) |
 | `workload.cpython_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off CPython frozen after its warm-up |
+| `workload.dynamic_run_us/rhizo/<vmm>` | timing | The dynamically linked `hello` (`cells/c/dynamic/hello.c`, glibc) started from the cell's files and run to its exit: the kernel maps it and `ld.so`, `ld.so` maps `libc.so.6` with `mmap` of files, relocates and runs `main`; file pages come from frames kept by content after a first run (change `add-dynamic-linking`). Robust figure over 25 runs; compare with `cell.run_us` (a static `hello`) |
+| `workload.dynamic_template_us/rhizo/<vmm>` | timing | The same program forked from a template frozen once it printed `ready` (`hello wait`), its libraries mapped and relocated: what a dynamically linked program costs once a template absorbs the dynamic linking |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
@@ -75,6 +77,78 @@ loading the file again. The figures started from the executable
 that, as the Linux processes they are compared with start from an
 executable in the page cache.
 
+## Reference workloads
+
+Two workloads run the kernel the way its two markets will
+(`docs/vision.md`, change `add-reference-workloads`). `cargo xtask bench`
+runs both on every VMM after the cell figures; `--workload laptop` or
+`--workload server` runs one alone, `--soak` the long versions (the weekly
+`soak` job), `--cells N` changes the server's target and `--llm-delay-ms N`
+the fake model's delay (0 by default, so a turn measures Rhizo).
+
+**Laptop** (B2C, 2 vCPUs, 512 MiB): an `agent` template (1 MiB of history
+warmed up), 50 agents opened from it, 45 of them suspended; agents ask a
+fake model server on the host (`xtask`, plain HTTP through the network
+card). There is no virtio-fs or vsock yet, so the shared folder is a file
+(`/shared/notes.txt`, 64 KiB) seeded into the template's files at boot and
+shared copy-on-write by the agents, not with the host; a user's message is
+the host waking the agent (`Host::wake`). Skipped, with the reason, where
+the VMM has no network card.
+
+| Metric | Kind | Meaning |
+|---|---|---|
+| `laptop.open_us/rhizo/<vmm>` | timing | Opening an agent: fork from the template until it opened its session (wrote its history file, printed `open`) |
+| `laptop.suspend_us/rhizo/<vmm>` | timing | Suspending an open agent into a snapshot |
+| `laptop.resume_us/rhizo/<vmm>` | timing | Lazy resume of a suspended agent until it can run |
+| `workload.agent_turn_us/rhizo/<vmm>` | timing | One turn of a live agent: woken by its user, HTTP request to the model, answer, tool action (history appended, shared notes read and checked) |
+| `laptop.resume_turn_us/rhizo/<vmm>` | timing | The same turn right after a lazy resume (its pages come back as it touches them) |
+| `laptop.memory_bytes/rhizo/<vmm>` | size | Memory the template and the 50 agents take (45 snapshots in the kernel heap included) |
+| `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second |
+| `laptop.idle_host_cpu_pct/rhizo/<vmm>` | rate | Over the same window, read on the host: the VMM process's CPU time (all threads, `/proc/PID/task/*/schedstat`) over wall time, in percent of one CPU |
+
+**Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from four
+`worker` templates, in groups of ten: 4 computing (2,000 xorshift rounds),
+2 writing and reading back 4 KiB of a file, and 2 pairs over loopback TCP
+(the servers share one listener). Each runs one operation every 200 ms for
+3 s (600 s in the soak): 50,000 operations per second offered at 10,000
+cells. Every 10 ms the host suspends and lazily resumes the next worker
+(its connections stay open) and forks a computing one, killing the
+previous child (a fork's connections are reset). With several
+CPUs every host operation would stop them all (a run ends to make one), so
+the workload uses one vCPU. Then the out-of-memory push: idle cells forked
+until the kernel refuses one; spawn, fork and eager resume must be
+refused, `hog` must get `ENOMEM`, nothing may panic and every byte must
+come back, or the benchmark fails.
+
+| Metric | Kind | Meaning |
+|---|---|---|
+| `density.cells/rhizo/<vmm>` | deterministic, higher is better | Workers made: the target, or fewer when memory keeps less than 32 MiB of headroom (`limit=` in the `rhizo-server` line says which) |
+| `density.ops_per_s/rhizo/<vmm>` | rate, higher is better | Operations of the workers that exited with 0, over the load's wall time |
+| `density.cell_bytes/rhizo/<vmm>` | size | Most memory in use during the load, per cell (pages, tables, files, sockets, kernel record) |
+| `density.sched_p50_us`, `_p99_us`, `_p999_us` | timing | Scheduling latency: a cell joined a run queue (preempted, yielded, new, or its deadline passed) until it runs |
+| `density.wake_p50_us`, `density.wake_p99_us`, `_p999_us` | timing | Wake-up latency: its event (deadline, or a socket change by another cell's system call) until it runs |
+| `density.syscall_p50_ns`, `_p99_ns`, `_p999_ns` | timing | Time in the system-call handler, locks included |
+| `density.oom_cells/rhizo/<vmm>` | count, higher is better | Idle cells memory held before the kernel refused one |
+
+In the `ci` environment (from two CI runs that agreed within the
+threshold) every workload metric is gated except these, recorded but
+listed under `ungated.ci`: `workload.agent_turn_us` and
+`laptop.resume_turn_us` (bimodal: about 0.3 ms, or 1 s when the answer
+arrives after the guest stopped polling its card and only smoltcp's
+retransmission timer wakes it), `laptop.idle_host_cpu_pct` (the host's
+own load on a shared runner), the p99.9 latencies (`*_p999_*`: a
+handful of samples per run), and `density.sched_p99_us` and
+`density.wake_p99_us`: the server load runs close to saturation (every
+socket change wakes every cell waiting on a socket), so its tails moved
+up to 5x between runners of the same code. They are gated once that is
+fixed.
+
+The `rhizo-server-breakdown` line printed with the results says where the
+load's time went (idle, system calls, scheduling decisions, host
+operations; runs, socket wake-ups, faults): simple counters in
+`kernel/src/prof.rs`, until the permanent per-workload breakdown replaces
+them.
+
 Figures the kernel repeats a hundred times or more (`cell.spawn_us`,
 `cell.run_us`, `cell.spawn_from_template_us`, the file and network
 metrics) are the
@@ -82,7 +156,7 @@ minimum over five consecutive rounds of each round's median, so one noisy
 moment of the host does not decide them.
 
 Each timing is the median (and p90) of `--runs` boots after one discarded
-warm-up boot. Lower is better for every metric.
+warm-up boot. Lower is better for every metric not marked "higher is better".
 
 ## Where the time goes (spec `profiling`)
 
@@ -166,6 +240,8 @@ same clock as the cells (spec `comparisons`):
 | `workload.cpython_cold_us/linux-process/firecracker` | The same static CPython, files and script in a Linux guest in Firecracker: `fork` and `execve` of `python3 /app/agent_demo.py`, output read from a pipe, until it exits (`bench/host/linux_cpython.c` as `/init`). Pairs with `workload.cpython_cold_us/rhizo/firecracker` |
 | `workload.cpython_warm_us/linux-process/firecracker` | In the same guest, a CPython process that imported and warmed up the script forks one child per request; the child answers and exits normally, the parent waits (`bench/host/cpython_forkserver.py`, the pre-fork pattern). Pairs with `workload.cpython_warm_us/rhizo/firecracker` |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
+| `workload.dynamic_run_us/linux-process/firecracker` | `posix_spawn` of the same dynamically linked `hello` the cell benchmark runs, with the same `ld.so` and `libc.so.6` at their paths in the guest's initramfs, until it exits (`bench/host/linux_process.c` as `/init`). Pairs with `workload.dynamic_run_us/rhizo/firecracker` |
+| `workload.dynamic_run_us/linux-process/host` | The same on the benchmark host, with the host's own `ld.so` and `libc` |
 | `sandbox.run_ms/gvisor/runsc` | `runsc run` of a gVisor sandbox (systrap platform, no network) running the same static `hello`, until it exits. First run dropped |
 | `snapshot.restore_ms/gvisor/runsc` | `runsc restore --detach` of a checkpointed sandbox running the idle cell program, until `runsc state` reports it running. First restore dropped |
 
@@ -243,10 +319,8 @@ A baseline changes only on purpose, in a pull request that explains why:
 cargo xtask bench --env dedicated --update-baseline
 ```
 
-CI publishes its measured results, compact JSON in 3000-character pieces,
-as annotations `bench-results-1`, `-2`… of the benchmark job (nine per step,
-by `.github/publish-bench.sh`); to adopt them as the `ci` baseline, join
-the pieces in order into a file
+CI publishes its measured results as an annotation named `bench-results` on
+the `bench` job; to adopt them as the `ci` baseline, save that JSON to a file
 and run:
 
 ```bash

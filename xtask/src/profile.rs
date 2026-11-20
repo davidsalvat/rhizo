@@ -154,6 +154,8 @@ pub fn measure(
         network: false,
         pci_card: false,
         cpus: 1,
+        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        bench: None,
     };
     for &vmm in &opts.vmms {
         if vmm.unavailable_reason(opts.accel).is_some() {
@@ -216,6 +218,8 @@ fn icount(
         network: false,
         pci_card: false,
         cpus: 1,
+        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        bench: None,
     };
     let mut samples = Samples::default();
     for guest in [&plain, profiled] {
