@@ -169,10 +169,57 @@ pub fn fp_load(state: &FpState) {
     unsafe { rhizo_fp_load(state) }
 }
 
+/// Whether the CPU has Privileged Access Never (`ID_AA64MMFR1_EL1.PAN`).
+pub fn has_pan() -> bool {
+    let mmfr1: u64;
+    // SAFETY: reading an ID register has no side effects.
+    unsafe { asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1, options(nomem, nostack)) };
+    (mmfr1 >> 20) & 0xf != 0
+}
+
+/// Turns on Privileged Access Never where the CPU has it (design D1 of
+/// `add-user-access-guards`): EL1 loads and stores to pages EL0 can reach
+/// fault. `SCTLR_EL1.SPAN` cleared sets `PSTATE.PAN` on every exception
+/// taken to EL1, so it is back on after each return from a cell. (EL1
+/// never executes a cell's page: they are mapped `PXN`.)
+fn enable_pan() {
+    if !has_pan() {
+        return;
+    }
+    // SAFETY: the kernel never loads from or stores to a lower-half address:
+    // cell memory is reached through the direct map (`sync_code` cleans
+    // caches by direct-map address too), and the entry code touches only
+    // per-CPU data, kernel stacks and the `Registers` in the kernel heap.
+    // `s3_0_c4_c2_3` is `PAN` (bit 22).
+    unsafe {
+        asm!(
+            "mrs {t}, sctlr_el1",
+            "bic {t}, {t}, #(1 << 23)",
+            "msr sctlr_el1, {t}",
+            "mov {t}, #(1 << 22)",
+            "msr s3_0_c4_c2_3, {t}",
+            "isb",
+            t = out(reg) _,
+            options(nostack)
+        );
+    }
+}
+
+/// Whether `PSTATE.PAN` is set on this CPU now.
+#[cfg(feature = "ktest")]
+pub fn pan_on() -> bool {
+    let pan: u64;
+    // SAFETY: reading PAN has no side effects (only called when it exists).
+    unsafe { asm!("mrs {}, s3_0_c4_c2_3", out(reg) pan, options(nomem, nostack)) };
+    pan & (1 << 22) != 0
+}
+
 /// Enables FP/SIMD on this CPU for cells (and for the save and load
-/// above). The boot CPU calls it through [`init_tags`]; the others once at
-/// bring-up, with the boot CPU's `TCR_EL1` (ASID size) already copied.
+/// above), and PAN. The boot CPU calls it through [`init_tags`]; the
+/// others once at bring-up, with the boot CPU's `TCR_EL1` (ASID size)
+/// already copied.
 pub fn init_cpu() {
+    enable_pan();
     // SAFETY: CPACR_EL1.FPEN = 0b11 stops trapping FP/SIMD at EL0 and EL1;
     // the kernel is built without FP instructions, so only cells and the
     // explicit save/load use them.
@@ -341,4 +388,11 @@ pub fn sync_code(virt: u64, len: u64) {
     }
     // SAFETY: invalidating the instruction cache only drops cached lines.
     unsafe { asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack)) };
+}
+
+/// Loads the lower-half table `root` in `TTBR0_EL1`, untagged: for the
+/// self-checks that touch a user page from the kernel.
+#[cfg(any(feature = "ktest-user-read", feature = "ktest-user-exec"))]
+pub fn load_tables(root: u64) {
+    set_user_root(root, 0);
 }

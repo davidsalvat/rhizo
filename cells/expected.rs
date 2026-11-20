@@ -25,6 +25,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("fault_null", "", Ending::Fault),
     ("fault_kernel", "", Ending::Fault),
     ("chatter", "x\nx\nx\n", Ending::Exit(0)),
+    ("flags", "flags ok\n", Ending::Exit(0)),
     ("sleeper", "slept ok\n", Ending::Exit(0)),
     ("same_addr", "own value ok\n", Ending::Exit(0)),
     ("peek", "", Ending::Fault),

@@ -25,6 +25,10 @@ ktest-page-fault = ["ktest"]
 ktest-stack-overflow = ["ktest"]
 ktest-invalid-opcode = ["ktest"]
 ktest-oom = ["ktest"]
+# Self-checks of the guards on user memory (SMAP/PAN, SMEP/PXN): the kernel
+# reading, then executing, a user page must fault.
+ktest-user-read = ["ktest"]
+ktest-user-exec = ["ktest"]
 # Benchmark build: spawn and run the hello cell repeatedly and print
 # `rhizo-cell spawn_ns=<median>` (`cargo xtask bench`).
 bench-cell = []

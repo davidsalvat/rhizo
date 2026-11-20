@@ -748,6 +748,34 @@ const SELF_CHECKS: &[SelfCheck] = &[
         ],
         output_aarch64: None,
     },
+    SelfCheck {
+        feature: "ktest-user-read",
+        description: "the kernel reading a user page faults (SMAP, PAN)",
+        expected: VmResult::Failed,
+        timeout_secs: None,
+        output: &[
+            "EXCEPTION: page fault (vector 14",
+            "address 0x400000: read, protection violation, kernel mode",
+        ],
+        output_aarch64: Some(&[
+            "EXCEPTION: data abort (class 0x25",
+            "address 0x400000: read, permission fault",
+        ]),
+    },
+    SelfCheck {
+        feature: "ktest-user-exec",
+        description: "the kernel executing a user page faults (SMEP, PXN)",
+        expected: VmResult::Failed,
+        timeout_secs: None,
+        output: &[
+            "EXCEPTION: page fault (vector 14",
+            "address 0x400000: instruction fetch, protection violation, kernel mode",
+        ],
+        output_aarch64: Some(&[
+            "EXCEPTION: instruction abort (class 0x21",
+            "address 0x400000: instruction fetch, permission fault",
+        ]),
+    },
 ];
 
 // ---------------------------------------------------------------------------
