@@ -40,7 +40,7 @@ the host's, and timers would wake the idle window).
 `worker MODE PERIOD_MS SECS [PORT]` prints `ready` and sleeps (frozen
 there); from its first wake it waits a random part of a period (so forks
 spread), then runs one operation per period for `SECS` seconds and prints
-`ops=N`. Modes: `cpu` (20,000 xorshift rounds), `file` (4 KiB written and
+`ops=N`. Modes: `cpu` (2,000 xorshift rounds), `file` (4 KiB written and
 read back), `serve` (listens before `ready`, so its forks share the
 listener; accepts one connection and echoes until it closes) and `ping`
 (connects, one 64-byte round trip per operation). Groups of ten forks

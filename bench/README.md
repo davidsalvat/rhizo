@@ -99,7 +99,7 @@ the VMM has no network card.
 | `laptop.idle_host_cpu_pct/rhizo/<vmm>` | rate | Over the same window, read on the host: the VMM process's CPU time (all threads, `/proc/PID/task/*/schedstat`) over wall time, in percent of one CPU |
 
 **Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from four
-`worker` templates, in groups of ten: 4 computing (20,000 xorshift rounds),
+`worker` templates, in groups of ten: 4 computing (2,000 xorshift rounds),
 2 writing and reading back 4 KiB of a file, and 2 pairs over loopback TCP
 (the servers share one listener). Each runs one operation every 200 ms for
 3 s (600 s in the soak): 50,000 operations per second offered at 10,000

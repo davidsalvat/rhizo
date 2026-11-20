@@ -7,7 +7,7 @@
 //! spread out) for `SECS` seconds, then prints `ops=N` and exits with 0.
 //! Any failed operation exits with 1. Modes:
 //!
-//! - `cpu`: 20,000 rounds of a xorshift generator;
+//! - `cpu`: 2,000 rounds of a xorshift generator;
 //! - `file`: writes 4 KiB at the start of `work.bin` and reads them back;
 //! - `serve`: listens on 127.0.0.1:`PORT` before `ready` (its forks share
 //!   the listener), accepts one connection and echoes 64-byte messages
@@ -37,7 +37,7 @@ fn random() -> u64 {
 
 fn crunch(seed: u64) -> u64 {
     let mut x = seed | 1;
-    for _ in 0..20_000 {
+    for _ in 0..2_000 {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
