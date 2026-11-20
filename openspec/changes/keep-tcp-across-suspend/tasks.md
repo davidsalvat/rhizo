@@ -8,9 +8,9 @@
 ## 2. Kernel and cells
 
 - [x] 2.1 Kernel: boot identity, export parks, import re-attaches, `cell::close_parked`; verify `cargo xtask test --only ktest` on both architectures
-- [ ] 2.2 Cells and in-kernel tests: `netstate` checks the reset sequence; `loopback twice`; tests for every new scenario of `networking` (loopback pair across suspend, host echo across suspend, second resume, discard, fork); verify `cargo xtask test` and `--only ktest-smp` on both architectures, and the host echo test on QEMU and Firecracker in CI
+- [x] 2.2 Cells and in-kernel tests: `netstate` checks the reset sequence; `loopback twice`; tests for every new scenario of `networking` (loopback pair across suspend, host echo across suspend, second resume, discard, fork); verify `cargo xtask test` and `--only ktest-smp` on both architectures, and the host echo test on QEMU and Firecracker in CI
 
 ## 3. Benchmarks and documentation
 
-- [ ] 3.1 `cell.tcp_resume_us` in `bench-cell` and `xtask/src/bench.rs`, described in `bench/README.md`; verify `cargo xtask bench --runs 1` locally and the CI benchmark gate
-- [ ] 3.2 Verify `cargo xtask ci` and `openspec validate keep-tcp-across-suspend --strict`
+- [x] 3.1 `cell.tcp_resume_us` in `bench-cell` and `xtask/src/bench.rs`, described in `bench/README.md`; verify `cargo xtask bench --runs 1` locally and the CI benchmark gate
+- [x] 3.2 Verify `cargo xtask ci` and `openspec validate keep-tcp-across-suspend --strict`
