@@ -80,3 +80,15 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
 /// not run by the differential check.
 #[allow(dead_code)]
 pub const ENDLESS: &[&str] = &["spin", "mapper", "idle"];
+
+/// MicroPython (`cells/python`, built only when its source is given): the
+/// command it runs, with `rhizo_demo.py` in `lib/` relative to the working
+/// directory, and what it prints. The module pauses after `warm`, where a
+/// host may freeze it as a template.
+#[allow(dead_code)]
+pub const PYTHON_COMMAND: &str =
+    "import sys; sys.path.insert(0, 'lib'); import rhizo_demo; rhizo_demo.main()";
+#[allow(dead_code)]
+pub const PYTHON_STDOUT: &str = "warm\n\
+     primes below 10000: 1229, last 9973; top words: agent=70, kernel=69, fork=67\n\
+     python ok\n";

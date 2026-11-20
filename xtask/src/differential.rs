@@ -11,7 +11,7 @@ use std::process::Command;
 mod expected {
     include!("../../cells/expected.rs");
 }
-use expected::{Ending, PROGRAMS};
+use expected::{Ending, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT};
 
 /// Why the check cannot run on this host, if it cannot.
 pub fn unavailable_reason() -> Option<String> {
@@ -66,6 +66,50 @@ pub fn check(dir: &Path) -> Result {
             .reproduce(&reproduce)
             .into_error());
         }
+    }
+    check_python(dir, &scratch)
+}
+
+/// MicroPython, when built (`micropython` in `dir`): run natively in an
+/// empty directory holding `lib/rhizo_demo.py`, it prints
+/// [`PYTHON_STDOUT`], as it must in a cell.
+fn check_python(dir: &Path, scratch: &Path) -> Result {
+    let path = dir.join("micropython");
+    if !path.exists() {
+        crate::report::text("[xtask] MicroPython not built (RHIZO_MICROPYTHON_SRC unset): skipped");
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(scratch);
+    let lib = scratch.join("lib");
+    std::fs::create_dir_all(&lib).map_err(|e| format!("cannot create {}: {e}", lib.display()))?;
+    let module = crate::workspace_root().join("cells/python/rhizo_demo.py");
+    std::fs::copy(&module, lib.join("rhizo_demo.py")).map_err(|e| e.to_string())?;
+    let out = Command::new(&path)
+        .args(["-c", PYTHON_COMMAND])
+        .current_dir(scratch)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", path.display()))?;
+    let _ = std::fs::remove_dir_all(scratch);
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || text != PYTHON_STDOUT {
+        return Err(
+            Failure::new("differential", "MicroPython behaves differently on Linux")
+                .location("cells/python/rhizo_demo.py")
+                .expected(format!(
+                    "exit 0, stdout {PYTHON_STDOUT:?} (cells/expected.rs)"
+                ))
+                .actual(format!(
+                    "{:?}, stdout {text:?}, stderr {:?}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                ))
+                .hint("Linux is the reference: fix the module or the expectation")
+                .reproduce(format!(
+                    "cd <dir with lib/rhizo_demo.py> && {} -c \"{PYTHON_COMMAND}\"",
+                    path.display()
+                ))
+                .into_error(),
+        );
     }
     Ok(())
 }
