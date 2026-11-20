@@ -54,3 +54,10 @@ never used) than its TLB entries save. Only D1 and D2 ship. The figures
 also say that TLB misses are not where CPython's user time goes: the cold
 start is dominated by the interpreter's own work, so large pages cannot
 remove more than a few percent of it.
+
+The CI benchmark run of the change itself (unpaired, against the
+`add-image-cache` run before it) puts `workload.cpython_cold_us` between
+−1.2 % and +0.6 % across the four VMMs: inside the runners' noise, which
+is why the paired figures above decide. No other metric moves beyond the
+noise `main` shows between runs (the fork figures, which no executable
+here affects, swing by tens of percent between any two runs).

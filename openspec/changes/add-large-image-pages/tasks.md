@@ -7,8 +7,8 @@
 ## 2. Loader and build
 
 - [x] 2.1 `Image::load` maps whole 2 MiB pieces of a segment with 2 MiB pages and takes `Frames` (D1); host test of the page sizes, contents and the fallback to 4 KiB pages; verify `cargo test -p rhizo-cell`
-- [ ] 2.2 CPython linked with `-z max-page-size=0x200000`, the flags in the build recipe (D2); verify its code segment starts on a 2 MiB boundary (`readelf -l`), `cargo xtask test` on both architectures, and the differential check in CI
+- [x] 2.2 CPython linked with `-z max-page-size=0x200000`, the flags in the build recipe (D2); verify its code segment starts on a 2 MiB boundary (`readelf -l`), `cargo xtask test` on both architectures, and the differential check in CI
 
 ## 3. Benchmarks
 
-- [ ] 3.1 Verify the CI benchmark gate passes with no metric worse than on `add-image-cache`
+- [x] 3.1 Verify the CI benchmark gate passes with no metric worse than on `add-image-cache`
