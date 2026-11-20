@@ -12,4 +12,4 @@
 
 ## 3. Benchmarks and documentation
 
-- [x] 3.1 `bench/README.md` describes what `cell.spawn_us` and the cold workloads now measure (D6); verify the CI benchmark gate passes, with `workload.cpython_cold_us` lower than on `main` and no metric worse (`cell.spawn_us` and `cell.run_us` unchanged within noise, D6)
+- [x] 3.1 `bench/README.md` describes what `cell.spawn_us` and the cold workloads now measure (D6); verify the CI benchmark gate passes, with `cell.spawn_us`, `cell.run_us` and `workload.cpython_cold_us` lower than on `main` and no metric worse
