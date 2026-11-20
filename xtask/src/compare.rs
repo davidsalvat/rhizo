@@ -13,7 +13,7 @@ use crate::{Result, arch, refguest, report, tools, workspace_root};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn metric(name: &str, guest: &str, vmm: &str, unit: &str, values: &mut [f64]) -> Metric {
@@ -315,9 +315,22 @@ fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
 /// Runs `cmd`; on failure, its output and the end of gVisor's newest debug
 /// logs (in `logs`) as the error.
 fn checked(cmd: &mut Command, what: &str, logs: &Path) -> Result<String> {
-    let out = cmd
-        .output()
+    // Output goes to files, not pipes: the sandbox and gofer `runsc` starts
+    // inherit them, and a pipe would stay open (and `output()` wait) for as
+    // long as they live, even after `timeout` killed `runsc` itself.
+    let dir = logs.parent().unwrap_or(logs);
+    let (out_path, err_path) = (dir.join("command.out"), dir.join("command.err"));
+    let file = |p: &Path| std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()));
+    let status = cmd
+        .stdout(file(&out_path)?)
+        .stderr(file(&err_path)?)
+        .status()
         .map_err(|e| format!("cannot run runsc ({what}): {e}"))?;
+    let out = Output {
+        status,
+        stdout: std::fs::read(&out_path).unwrap_or_default(),
+        stderr: std::fs::read(&err_path).unwrap_or_default(),
+    };
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
@@ -364,6 +377,16 @@ fn checked(cmd: &mut Command, what: &str, logs: &Path) -> Result<String> {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     ))
+}
+
+/// Removes sandbox `id`, whatever state it is in (bounded like every
+/// `runsc` command; output discarded, so no pipe can keep it waiting).
+fn remove(runsc: &Path, root: &Path, id: &str) {
+    let _ = runsc_cmd(runsc, root)
+        .args(["delete", "--force", id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// An OCI bundle in `dir` whose root holds `program` as `/prog`.
@@ -421,11 +444,10 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
                 runsc_cmd(&runsc, &root).args(["run", "--bundle", &hello, &id]),
                 "run (hello)",
                 &logs,
-            )?;
+            );
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let _ = runsc_cmd(&runsc, &root)
-                .args(["delete", "--force", &id])
-                .output();
+            remove(&runsc, &root, &id);
+            let out = out?;
             if !out.contains("hello from a cell") {
                 return Err(format!("runsc run printed {out:?}"));
             }
@@ -437,23 +459,24 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
         let bundle_arg = gvisor_bundle(&runsc, &dir.join("idle"), &cells.join("idle"), &logs)?;
         let image = dir.join("image");
         std::fs::create_dir_all(&image).map_err(|e| e.to_string())?;
-        checked(
+        let base = checked(
             runsc_cmd(&runsc, &root).args(["run", "--detach", "--bundle", &bundle_arg, "rz-base"]),
             "run --detach (idle)",
             &logs,
-        )?;
-        checked(
-            runsc_cmd(&runsc, &root)
-                .arg("checkpoint")
-                .arg("--image-path")
-                .arg(&image)
-                .arg("rz-base"),
-            "checkpoint",
-            &logs,
-        )?;
-        let _ = runsc_cmd(&runsc, &root)
-            .args(["delete", "--force", "rz-base"])
-            .output();
+        )
+        .and_then(|_| {
+            checked(
+                runsc_cmd(&runsc, &root)
+                    .arg("checkpoint")
+                    .arg("--image-path")
+                    .arg(&image)
+                    .arg("rz-base"),
+                "checkpoint",
+                &logs,
+            )
+        });
+        remove(&runsc, &root, "rz-base");
+        base?;
         let mut restore = Vec::new();
         for i in 0..=runs {
             if started.elapsed() > BUDGET {
@@ -463,7 +486,7 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
             }
             let id = format!("rz-{i}");
             let t0 = Instant::now();
-            checked(
+            let state = checked(
                 runsc_cmd(&runsc, &root)
                     .arg("restore")
                     .arg("--detach")
@@ -472,16 +495,17 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
                     .args(["--bundle", &bundle_arg, &id]),
                 "restore",
                 &logs,
-            )?;
-            let state = checked(
-                runsc_cmd(&runsc, &root).args(["state", &id]),
-                "state",
-                &logs,
-            )?;
+            )
+            .and_then(|_| {
+                checked(
+                    runsc_cmd(&runsc, &root).args(["state", &id]),
+                    "state",
+                    &logs,
+                )
+            });
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let _ = runsc_cmd(&runsc, &root)
-                .args(["delete", "--force", &id])
-                .output();
+            remove(&runsc, &root, &id);
+            let state = state?;
             if !state.contains("\"running\"") {
                 return Err(format!("restored sandbox is not running: {state}"));
             }
