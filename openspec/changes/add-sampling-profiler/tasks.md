@@ -14,4 +14,4 @@
 ## 3. xtask and documentation
 
 - [x] 3.1 `cargo xtask profile` (parsing, `nm` symbols, folded stacks per workload and per system call, summary) (D5); unit tests; verify `cargo xtask --arch x86_64 profile --accel tcg` and `cargo xtask --arch aarch64 profile`
-- [ ] 3.2 `bench/README.md`; `cargo xtask ci` on both architectures; CI green
+- [x] 3.2 `bench/README.md`; `cargo xtask ci` on both architectures; CI green
