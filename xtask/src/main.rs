@@ -15,6 +15,7 @@ mod refguest;
 mod report;
 mod tools;
 mod vmm;
+mod workloads;
 
 use report::Failure;
 use std::env;
@@ -63,6 +64,12 @@ Commands:
       --update-baseline      Store the results as the baseline for --env
       --readme               Regenerate the README benchmark section
       --no-reference         Skip the reference Linux guest
+      --workload <laptop|server>
+                             Only this reference workload (both run by
+                             default, after the cell figures)
+      --soak                 The long versions of the workloads (weekly)
+      --cells <n>            Cells of the server workload (default 10000)
+      --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
   ci                         Everything CI runs: fmt, clippy, test
   mutants                    Mutation testing of rhizo-mm and rhizo-core
                              (needs cargo-mutants; slow, runs weekly in CI)
@@ -249,6 +256,8 @@ impl RunArgs {
             network: false,
             pci_card: false,
             cpus: 1,
+            memory_mib: vmm::DEFAULT_MEMORY_MIB,
+            bench: None,
         }
     }
 }

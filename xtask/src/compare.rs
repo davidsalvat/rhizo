@@ -323,11 +323,11 @@ pub fn cpython_in_vm(
     ];
     if agent.len() == samples.len() {
         columns.push((
-            "workload.agent_turn_us",
+            "workload.agent_cpython_turn_us",
             agent.iter().map(|a| a[0]).collect(),
         ));
         columns.push((
-            "workload.agent_model_us",
+            "workload.agent_cpython_model_us",
             agent.iter().map(|a| a[1]).collect(),
         ));
         columns.push((

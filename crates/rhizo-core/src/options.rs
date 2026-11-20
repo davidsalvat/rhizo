@@ -10,12 +10,14 @@
 //!   `exit=semihosting` (AArch64 under QEMU emulation)
 //! - `ip=dhcp` or `ip=ADDR/PREFIX[,GATEWAY]`: the network card's address
 //! - `echo=ADDR:PORT`: a TCP echo server the in-kernel tests may reach
-//! - `llm=ADDR:PORT`: the host's fake model server (an HTTP chat API) the
-//!   agent workload talks to
 //! - `virtio_mmio.device=SIZE@BASE:IRQ` (added by QEMU `microvm` and
 //!   Firecracker on x86_64): read by [`virtio_mmio_devices`]
 //! - `smp=N`: use at most `N` CPUs (`N` from 1 to 65535; default: every CPU
 //!   the firmware describes)
+//! - `bench=laptop` or `bench=server`: the reference workload a benchmark
+//!   kernel runs instead of its cell figures (spec `benchmarks`), with
+//!   `cells=N` (target cells, 1 to 65535), `secs=N` (seconds of load, 1 to
+//!   65535) and `llm=ADDR:PORT` (the host's fake model server)
 
 use rhizo_hal::PhysicalMemory;
 
@@ -55,6 +57,15 @@ pub enum IpOption {
     },
 }
 
+/// A reference workload (spec `benchmarks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workload {
+    /// Local agents on a laptop: few, mostly suspended, talking to a model.
+    Laptop,
+    /// Many active cells on a server: density and tail latencies.
+    Server,
+}
+
 /// Parsed boot options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootOptions {
@@ -66,10 +77,16 @@ pub struct BootOptions {
     pub ip: Option<IpOption>,
     /// A TCP echo server for the in-kernel tests.
     pub echo: Option<([u8; 4], u16)>,
-    /// The host's fake model server (`llm=ADDR:PORT`).
-    pub llm: Option<([u8; 4], u16)>,
     /// Most CPUs to use (`smp=N`); `None`: all the firmware describes.
     pub smp: Option<u16>,
+    /// The reference workload to run (`bench=`).
+    pub bench: Option<Workload>,
+    /// Target number of cells of a workload (`cells=N`).
+    pub cells: Option<u16>,
+    /// Seconds of load of a workload (`secs=N`).
+    pub secs: Option<u16>,
+    /// The host's fake model server (`llm=ADDR:PORT`).
+    pub llm: Option<([u8; 4], u16)>,
 }
 
 impl Default for BootOptions {
@@ -79,8 +96,11 @@ impl Default for BootOptions {
             exit: ExitKind::DebugExit,
             ip: None,
             echo: None,
-            llm: None,
             smp: None,
+            bench: None,
+            cells: None,
+            secs: None,
+            llm: None,
         }
     }
 }
@@ -171,6 +191,8 @@ impl BootOptions {
                 b"exit=ch-acpi" => options.exit = ExitKind::CloudHypervisorAcpi,
                 b"exit=psci" => options.exit = ExitKind::Psci,
                 b"exit=semihosting" => options.exit = ExitKind::Semihosting,
+                b"bench=laptop" => options.bench = Some(Workload::Laptop),
+                b"bench=server" => options.bench = Some(Workload::Server),
                 _ => {
                     if let Some(v) = word.strip_prefix(b"ip=") {
                         options.ip = ip_option(v).or(options.ip);
@@ -180,6 +202,10 @@ impl BootOptions {
                         options.llm = endpoint(v).or(options.llm);
                     } else if let Some(n) = word.strip_prefix(b"smp=").and_then(parse_count) {
                         options.smp = Some(n);
+                    } else if let Some(n) = word.strip_prefix(b"cells=").and_then(parse_count) {
+                        options.cells = Some(n);
+                    } else if let Some(n) = word.strip_prefix(b"secs=").and_then(parse_count) {
+                        options.secs = Some(n);
                     }
                 }
             }
@@ -309,6 +335,29 @@ mod tests {
         assert_eq!(both.echo, Some(([10, 0, 2, 2], 7)));
         assert_eq!(both.llm, Some(([172, 16, 0, 1], 8080)));
         assert_eq!(BootOptions::parse(b"llm=172.16.0.1").llm, None);
+    }
+
+    #[test]
+    fn workload_options() {
+        let o = BootOptions::parse(b"bench=server cells=10000 secs=3 llm=10.0.2.2:8080");
+        assert_eq!(o.bench, Some(Workload::Server));
+        assert_eq!((o.cells, o.secs), (Some(10000), Some(3)));
+        assert_eq!(o.llm, Some(([10, 0, 2, 2], 8080)));
+        assert_eq!(
+            BootOptions::parse(b"bench=laptop").bench,
+            Some(Workload::Laptop)
+        );
+        for bad in [
+            &b"bench=other cells=0 secs=x llm=1.2.3:4"[..],
+            b"cells=70000 secs=",
+        ] {
+            let o = BootOptions::parse(bad);
+            assert_eq!(
+                (o.bench, o.cells, o.secs, o.llm),
+                (None, None, None, None),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

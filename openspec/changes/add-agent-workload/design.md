@@ -1,30 +1,35 @@
 # Design
 
-## D1. The fake model: a thread of `xtask` next to the echo server
+## D1. The fake model: `add-reference-workloads`' server, kept alive and deterministic
 
-`hostnet::llm_server(addr)` listens on the host side of each guest network
-(127.0.0.1 for QEMU's user network, seen as 10.0.2.2; the tap device's
-address for Firecracker and Cloud Hypervisor) and every Rhizo guest with a
-network gets `llm=ADDR:PORT` on its command line, next to `echo=`. One
-thread per connection reads HTTP/1.1 requests (headers, then
-`Content-Length` bytes), waits `RHIZO_LLM_DELAY_MS` (0 by default: the
-benchmark measures Rhizo, not a sleep), and answers a chat completion that
-calls the `compute` tool. The tool's arguments and the call's identifier
-are an FNV-1a hash of the request body, so the same conversation always
-gets the same answer. The answer is formatted without parsing the request
-as JSON: `xtask` runs as a debug build, and the server's own time is part
-of every turn measured, on both sides (`serde_json` parsing a 3 KiB
-conversation in a debug build cost more than the kernel's part of a turn).
-The connection stays open unless the
-request says `Connection: close` (so a client that reads to the end of the
-stream works too, as the laptop workload of `add-reference-workloads`
-does); each answer carries `x_requests_on_connection`, which lets the
-agent's transcript show that its connection survived a suspend.
+The laptop workload of `add-reference-workloads` brought a fake model
+server to `xtask` (`hostnet::llm_server`, `llm=ADDR:PORT` on the command
+line). This change reuses it rather than adding a second one, and extends
+it in three compatible ways:
 
-Alternatives: a Python server (one more process to manage, and xtask is
-where the echo server lives), a real model (measures the model), a fixed
-answer (a transcript could not show that the conversation reached the
-model intact).
+- **Every guest network gets it**: `for_vmm` adds `llm=` (no delay) next
+  to `echo=`, as the agent test and benchmark run on every VMM with a card.
+  The laptop workload still passes its own `llm=` (with its
+  `--llm-delay-ms`), later on the command line, which wins.
+- **Kept-alive connections**: one thread per connection answers request
+  after request until the client closes it or sends `Connection: close`.
+  The laptop's `agent` cell sends `Connection: close` and reads to the end
+  of the stream, so it sees what it saw before. Each answer carries
+  `x_requests_on_connection`, which lets the agent's transcript show that
+  its connection survived every suspend.
+- **Deterministic tool calls**: the answer calls the `compute` tool with
+  arguments and an identifier from an FNV-1a hash of the request body, so
+  the same conversation always gets the same answer and a transcript can
+  be recorded. The answer is formatted without parsing the request as
+  JSON: `xtask` is a debug build and the server's time is part of every
+  turn measured, on both sides (`serde_json` parsing a 3 KiB conversation
+  in a debug build cost more than the kernel's share of a turn). The
+  laptop's fixed answer (`LLM_ANSWER`) goes, and its test with it: the
+  kept-alive test replaces it.
+
+Alternatives: a second server for the CPython agent (two fake models to
+keep in step), a Python server (one more process to manage), a real model
+in CI (a download, and it measures the model).
 
 ## D2. HTTP without TLS, through CPython's own sockets
 
@@ -100,12 +105,12 @@ each, and three times without suspending it, and prints
 `rhizo-agent turn_ns=... model_ns=... suspend_resume_ns=... fork_ns=...` (or
 `rhizo-agent skipped: <why>`):
 
-- `workload.agent_turn_us`: one turn as the agent itself times it with
+- `workload.agent_cpython_turn_us`: one turn as the agent itself times it with
   `time.perf_counter_ns` (request, answer, JSON, tool, append), the same
   code on both sides; median of turns 2 to 8 (the first connects and runs
   cold code) of runs that are not suspended, as the Linux process is not
   (a turn right after a resume runs with cold caches and TLB).
-- `workload.agent_model_us`: the part of those turns spent on the model,
+- `workload.agent_cpython_model_us`: the part of those turns spent on the model,
   from sending the request until the whole answer is read (network card,
   TCP stack, the host's server), so a gap in the turn can be told apart
   from a gap in the interpreter.

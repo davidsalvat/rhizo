@@ -11,7 +11,7 @@ cannot, it SHALL list them as skipped with the reason.
 
 #### Scenario: Measured in the guest
 - **WHEN** `cargo xtask bench` runs on a host with KVM, password-less `sudo` and CPython built
-- **THEN** the results contain `workload.agent_turn_us` and `workload.agent_fork_us` for guest `linux-process` on `firecracker`
+- **THEN** the results contain `workload.agent_cpython_turn_us` and `workload.agent_fork_us` for guest `linux-process` on `firecracker`
 
 #### Scenario: No tap device
 - **WHEN** the tap device cannot be made

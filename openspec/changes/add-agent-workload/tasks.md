@@ -2,8 +2,8 @@
 
 ## 1. Host side
 
-- [x] 1.1 `rhizo-core`: boot option `llm=ADDR:PORT`; verify `cargo test -p rhizo-core options`
-- [x] 1.2 `xtask`: the fake model server (kept-alive connections, `Connection: close`, deterministic tool calls, `RHIZO_LLM_DELAY_MS`) on every guest network, `llm=` on Rhizo's command line; verify `cargo test -p xtask hostnet`
+- [x] 1.1 `rhizo-core`: boot option `llm=ADDR:PORT` (from `add-reference-workloads`), tested next to `echo=`; verify `cargo test -p rhizo-core options`
+- [x] 1.2 `xtask`: the fake model server of `add-reference-workloads` kept alive (`Connection: close` still closes) with deterministic tool calls, on every guest network; verify `cargo test -p xtask hostnet`
 
 ## 2. The agent
 
@@ -13,6 +13,6 @@
 
 ## 3. Benchmarks and comparison
 
-- [x] 3.1 `rhizo-agent` line in `bench-cell`, metrics `workload.agent_turn_us`, `workload.agent_model_us`, `workload.agent_suspend_resume_us`, `workload.agent_fork_us` in `xtask/src/bench.rs`; verify `cargo test -p xtask bench` and the CI benchmark job
+- [x] 3.1 `rhizo-agent` line in `bench-cell`, metrics `workload.agent_cpython_turn_us`, `workload.agent_cpython_model_us`, `workload.agent_suspend_resume_us`, `workload.agent_fork_us` in `xtask/src/bench.rs`; verify `cargo test -p xtask bench` and the CI benchmark job
 - [x] 3.2 The agent as a Linux process in Firecracker (`linux_cpython.c` with a network card, `compare::cpython_in_vm`); verify `cargo test -p xtask compare` and the CI benchmark job's `linux-process` figures
 - [ ] 3.3 `bench/README.md` documents the metrics; the `ci` baseline gains the agent metrics from a CI run; verify `cargo xtask ci` and `openspec validate add-agent-workload --strict`

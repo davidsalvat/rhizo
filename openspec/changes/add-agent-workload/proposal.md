@@ -14,12 +14,12 @@ costs on Rhizo against Linux.
 
 ## What Changes
 
-- **A fake model on the host**: `xtask` serves a chat-completions-style
-  HTTP API on the host side of every guest network (`llm=ADDR:PORT` on the
-  kernel command line, next to `echo=`). It keeps connections alive,
-  answers after a configurable delay (`RHIZO_LLM_DELAY_MS`, 0 by default)
-  and always asks for a tool call whose arguments derive from the whole
-  conversation, so a conversation always gets the same answers.
+- **The fake model on the host** (`xtask`, from `add-reference-workloads`)
+  is reused: every guest network now gets it (`llm=ADDR:PORT` next to
+  `echo=`), it keeps connections alive, and it always asks for a tool call
+  whose arguments derive from the whole conversation, so a conversation
+  always gets the same answers. Its delay stays configurable
+  (`--llm-delay-ms`, 0 by default).
 - **The agent**, `cells/python/agent_loop.py`, a CPython program: each
   turn sends the conversation over one kept-alive HTTP/1.1 connection,
   parses the JSON answer, runs the requested tool (a small computation and
@@ -40,9 +40,9 @@ costs on Rhizo against Linux.
 - **The same agent as a Linux process** in the same Firecracker VM: the
   guest's `/init` brings its network card up, and the agent forks its
   branches with `os.fork`.
-- **Metrics** in `cargo xtask bench`: `workload.agent_turn_us`,
+- **Metrics** in `cargo xtask bench`: `workload.agent_cpython_turn_us`,
   `workload.agent_suspend_resume_us`, `workload.agent_fork_us` for Rhizo on
-  every VMM with a network card, and `workload.agent_turn_us` and
+  every VMM with a network card, and `workload.agent_cpython_turn_us` and
   `workload.agent_fork_us` for the Linux process in Firecracker.
 - **Tests**: an in-kernel test runs a few turns with a suspend and lazy
   resume after each and the fork, and checks the transcript against the one

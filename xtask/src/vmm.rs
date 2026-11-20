@@ -18,6 +18,9 @@ const QEMU_SUCCESS: i32 = (0x10 << 1) | 1;
 /// QEMU exit status produced by the kernel writing 0x11 to `isa-debug-exit`.
 const QEMU_FAILURE: i32 = (0x11 << 1) | 1;
 
+/// Memory of a VM unless a run asks for more.
+pub const DEFAULT_MEMORY_MIB: u32 = 128;
+
 /// Line printed by the kernel (and the reference guest) when it is ready.
 pub const READY_MARKER: &str = "rhizo-ready";
 
@@ -231,6 +234,59 @@ pub struct VmRun {
     pub time_to_ready: Option<Duration>,
     /// Cycles reported in the ready marker (Rhizo only).
     pub ready_cycles: Option<u64>,
+    /// The `rhizo-mark NAME` lines the guest printed, in order.
+    pub marks: Vec<Mark>,
+}
+
+/// A `rhizo-mark NAME` line (design D6 of `add-reference-workloads`): when
+/// the host read it, and the CPU time the VMM process had used by then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mark {
+    pub name: String,
+    pub at: Duration,
+    /// Nanoseconds every thread of the VMM process ran (`None` when
+    /// `/proc` does not say).
+    pub cpu_ns: Option<u64>,
+}
+
+/// Nanoseconds every thread of process `pid` has run, from the first field
+/// of each `/proc/PID/task/TID/schedstat`.
+pub fn process_cpu_ns(pid: u32) -> Option<u64> {
+    let tasks = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut total = 0;
+    for task in tasks.flatten() {
+        let text = fs::read_to_string(task.path().join("schedstat")).ok()?;
+        total += text.split_whitespace().next()?.parse::<u64>().ok()?;
+    }
+    Some(total)
+}
+
+/// A reference workload a `bench-cell` kernel runs (spec `benchmarks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bench {
+    /// `bench=laptop secs=IDLE llm=HOST:PORT`: the model answers after
+    /// `llm_delay_ms`.
+    Laptop { idle_secs: u16, llm_delay_ms: u32 },
+    /// `bench=server cells=N secs=S`.
+    Server { cells: u16, secs: u16 },
+}
+
+impl Bench {
+    /// The kernel options for this workload on `vmm`.
+    fn cmdline(self, vmm: Vmm) -> String {
+        match self {
+            Bench::Laptop {
+                idle_secs,
+                llm_delay_ms,
+            } => {
+                let llm = crate::hostnet::llm_option(vmm, llm_delay_ms)
+                    .map(|o| format!(" {o}"))
+                    .unwrap_or_default();
+                format!(" bench=laptop secs={idle_secs}{llm}")
+            }
+            Bench::Server { cells, secs } => format!(" bench=server cells={cells} secs={secs}"),
+        }
+    }
 }
 
 /// Options for one run.
@@ -256,6 +312,10 @@ pub struct RunOptions {
     pub pci_card: bool,
     /// Virtual CPUs of the VM.
     pub cpus: u32,
+    /// Memory of the VM, in MiB.
+    pub memory_mib: u32,
+    /// A reference workload for a `bench-cell` Rhizo kernel.
+    pub bench: Option<Bench>,
 }
 
 /// Parses `rhizo-ready cycles=<n>` from console output.
@@ -323,7 +383,8 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
     } else {
         "max"
     };
-    cmd.args(["-cpu", cpu, "-m", "128M", "-nodefaults", "-no-user-config"])
+    cmd.args(["-cpu", cpu, "-m", &format!("{}M", opts.memory_mib)])
+        .args(["-nodefaults", "-no-user-config"])
         .args(["-smp", &opts.cpus.to_string()])
         .args(["-display", "none", "-no-reboot"])
         .args(["-accel", if kvm { "kvm" } else { "tcg" }]);
@@ -357,6 +418,9 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
                         .args(["-global", "virtio-mmio.force-legacy=false"]);
                 }
                 args += &cmdline;
+            }
+            if let Some(bench) = opts.bench {
+                args += &bench.cmdline(vmm);
             }
             cmd.arg("-kernel").arg(kernel).args(["-append", &args]);
         }
@@ -400,6 +464,9 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
         );
         args += &cmdline;
     }
+    if let (Some(bench), Guest::Rhizo(_)) = (opts.bench, guest) {
+        args += &bench.cmdline(Vmm::Firecracker);
+    }
     let initrd_json = match &initrd {
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
         None => String::new(),
@@ -407,10 +474,11 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     let config = format!(
         "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}{initrd_json}}}, \
          \"drives\": [], \"network-interfaces\": [{interfaces}], \
-         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": 128}}}}",
+         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": {}}}}}",
         kernel.display().to_string(),
         args,
-        opts.cpus
+        opts.cpus,
+        opts.memory_mib
     );
     let path = scratch.join(format!("firecracker-{}.json", std::process::id()));
     fs::write(&path, config).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -425,12 +493,9 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
 fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command> {
     let binary = tools::cloud_hypervisor()?;
     let mut cmd = Command::new(binary);
-    cmd.args(["--cpus", &format!("boot={}", opts.cpus)]).args([
-        "--memory",
-        "size=128M",
-        "--console",
-        "off",
-    ]);
+    cmd.args(["--cpus", &format!("boot={}", opts.cpus)])
+        .args(["--memory", &format!("size={}M", opts.memory_mib)])
+        .args(["--console", "off"]);
     match guest {
         Guest::Rhizo(kernel) => {
             let mut args = Vmm::CloudHypervisor.rhizo_cmdline(true).to_string();
@@ -441,6 +506,9 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
                 // A virtio-pci card on the tap device.
                 cmd.args(["--net", &format!("tap={tap},mac=06:00:ac:10:01:02")]);
                 args += &cmdline;
+            }
+            if let Some(bench) = opts.bench {
+                args += &bench.cmdline(Vmm::CloudHypervisor);
             }
             cmd.arg("--kernel").arg(kernel).args(["--cmdline", &args]);
             if arch::current() == Arch::X86_64 {
@@ -485,6 +553,8 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
         .spawn()
         .map_err(|e| format!("failed to start {} (is it installed?): {e}", vmm.id()))?;
 
+    let pid = child.id();
+    let marks = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::new(Mutex::new(Vec::new()));
     // Milliseconds since `started` of the last console output.
     let last_output = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -497,9 +567,12 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
         let ready_at = Arc::clone(&ready_at);
         let ready_flag = Arc::clone(&ready_flag);
         let last_output = Arc::clone(&last_output);
+        let marks = Arc::clone(&marks);
         let echo = opts.echo;
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            // Where the first line not yet looked at for a mark starts.
+            let mut line_start = 0;
             while let Ok(n) = stdout.read(&mut buf) {
                 if n == 0 {
                     break;
@@ -513,6 +586,17 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
                 let mut all = captured.lock().expect("capture lock");
                 let search_from = all.len().saturating_sub(READY_MARKER.len());
                 all.extend_from_slice(chunk);
+                while let Some(end) = all[line_start..].iter().position(|&b| b == b'\n') {
+                    let line = &all[line_start..line_start + end];
+                    if let Some(name) = line.strip_prefix(b"rhizo-mark ") {
+                        marks.lock().expect("marks lock").push(Mark {
+                            name: String::from_utf8_lossy(name).trim().to_string(),
+                            at: now,
+                            cpu_ns: process_cpu_ns(pid),
+                        });
+                    }
+                    line_start += end + 1;
+                }
                 if !ready_flag.load(Ordering::Relaxed)
                     && contains(&all[search_from..], READY_MARKER.as_bytes())
                 {
@@ -581,6 +665,7 @@ pub fn run(vmm: Vmm, guest: &Guest, opts: RunOptions) -> Result<VmRun> {
         ready_cycles: parse_ready_cycles(&output),
         time_to_ready,
         output,
+        marks: std::mem::take(&mut *marks.lock().expect("marks lock")),
     })
 }
 

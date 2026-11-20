@@ -120,7 +120,7 @@ fn check_cpython(scratch: &Path) -> Result {
 /// with `fork`) against the host's fake model prints [`AGENT_TRANSCRIPT`],
 /// the transcript the cell must print (change `add-agent-workload`).
 fn check_agent(python: &Path, root: &Path, scratch: &Path) -> Result {
-    let port = crate::hostnet::llm_server("127.0.0.1")?.to_string();
+    let port = crate::hostnet::llm_server("127.0.0.1", 0)?.to_string();
     let _ = std::fs::remove_dir_all(scratch);
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let script = root.join("app/agent_loop.py");

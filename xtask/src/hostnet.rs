@@ -1,8 +1,9 @@
 //! The host side of a guest's network (design D6 of `add-virtio-net`, D5 of
 //! `add-virtio-pci`): a TCP echo server the kernel's tests and benchmark
 //! reach, QEMU's user network, and a tap device each for Firecracker and
-//! Cloud Hypervisor when `sudo` allows it; and a fake model server, an HTTP
-//! chat API the agent workload talks to (design D1 of `add-agent-workload`).
+//! Cloud Hypervisor when `sudo` allows it; and a fake model server, an
+//! HTTP chat API (design D1 of `add-reference-workloads` and of
+//! `add-agent-workload`).
 
 use crate::vmm::Vmm;
 use std::collections::BTreeMap;
@@ -39,7 +40,7 @@ pub enum Network {
 pub fn for_vmm(vmm: Vmm) -> Network {
     match vmm {
         Vmm::QemuMicrovm | Vmm::QemuVirt | Vmm::QemuQ35 => {
-            match echo_server("127.0.0.1").and_then(|e| Ok((e, llm_server("127.0.0.1")?))) {
+            match echo_server("127.0.0.1").and_then(|e| Ok((e, llm_server("127.0.0.1", 0)?))) {
                 Ok((echo, llm)) => Network::Qemu {
                     cmdline: format!(" ip=dhcp echo={SLIRP_HOST}:{echo} llm={SLIRP_HOST}:{llm}"),
                 },
@@ -54,7 +55,7 @@ pub fn for_vmm(vmm: Vmm) -> Network {
 /// Tap device `tap` with the host at `host`/24, the guest at `guest`, and
 /// an echo server and a model server on the host's address.
 fn tap_network(tap: &'static str, host: &str, guest: &str) -> Network {
-    let servers = || Ok((echo_server(host)?, llm_server(host)?));
+    let servers = || Ok((echo_server(host)?, llm_server(host, 0)?));
     match tap_device(tap, host).and_then(|()| servers()) {
         Ok((echo, llm)) => Network::Tap {
             tap,
@@ -70,30 +71,62 @@ fn tap_network(tap: &'static str, host: &str, guest: &str) -> Network {
 /// (`rhizo_ip`, `rhizo_llm`).
 pub fn linux_guest_network() -> Result<(&'static str, String), String> {
     tap_device(TAP, TAP_HOST)?;
-    let port = llm_server(TAP_HOST)?;
+    let port = llm_server(TAP_HOST, 0)?;
     Ok((
         TAP,
         format!(" rhizo_ip={TAP_GUEST} rhizo_llm={TAP_HOST}:{port}"),
     ))
 }
 
-/// The port of a fake model server listening on `addr` (started once),
-/// answering after `RHIZO_LLM_DELAY_MS` milliseconds (0 when unset: the
-/// benchmark measures Rhizo, not a sleep).
-pub fn llm_server(addr: &str) -> Result<u16, String> {
+/// The port of a TCP echo server listening on `addr` (started once).
+fn echo_server(addr: &str) -> Result<u16, String> {
     static SERVERS: OnceLock<Mutex<BTreeMap<String, Result<u16, String>>>> = OnceLock::new();
-    let delay = std::env::var("RHIZO_LLM_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map_or(Duration::ZERO, Duration::from_millis);
     let servers = SERVERS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut servers = servers.lock().map_err(|e| e.to_string())?;
     servers
         .entry(addr.to_string())
         .or_insert_with(|| {
             let listener = TcpListener::bind((addr, 0))
+                .map_err(|e| format!("cannot start an echo server on {addr}: {e}"))?;
+            let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    thread::spawn(move || echo(stream));
+                }
+            });
+            Ok(port)
+        })
+        .clone()
+}
+
+/// The `llm=HOST:PORT` option for a guest on `vmm`: a fake model server on
+/// the host's side of its network, answering after `delay_ms` (`None`
+/// without a network).
+pub fn llm_option(vmm: Vmm, delay_ms: u32) -> Option<String> {
+    let (bind, seen_as) = match for_vmm(vmm) {
+        Network::Qemu { .. } => ("127.0.0.1", SLIRP_HOST),
+        Network::Tap { tap, .. } if tap == TAP => (TAP_HOST, TAP_HOST),
+        Network::Tap { .. } => (CH_TAP_HOST, CH_TAP_HOST),
+        Network::None(_) => return None,
+    };
+    let port = llm_server(bind, delay_ms).ok()?;
+    Some(format!("llm={seen_as}:{port}"))
+}
+
+/// The port of a fake model server on `addr` answering after `delay_ms`
+/// (started once per address and delay).
+pub fn llm_server(addr: &str, delay_ms: u32) -> Result<u16, String> {
+    type Servers = BTreeMap<(String, u32), Result<u16, String>>;
+    static SERVERS: OnceLock<Mutex<Servers>> = OnceLock::new();
+    let servers = SERVERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut servers = servers.lock().map_err(|e| e.to_string())?;
+    servers
+        .entry((addr.to_string(), delay_ms))
+        .or_insert_with(|| {
+            let listener = TcpListener::bind((addr, 0))
                 .map_err(|e| format!("cannot start a model server on {addr}: {e}"))?;
             let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+            let delay = Duration::from_millis(delay_ms.into());
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     thread::spawn(move || serve_model(stream, delay));
@@ -180,27 +213,6 @@ fn model_answer(request: &[u8], served: u32) -> String {
          \"arguments\": \"{{\\\"n\\\": {n}, \\\"seed\\\": {seed}}}\"}}}}]}}}}], \
          \"x_requests_on_connection\": {served}}}"
     )
-}
-
-/// The port of a TCP echo server listening on `addr` (started once).
-fn echo_server(addr: &str) -> Result<u16, String> {
-    static SERVERS: OnceLock<Mutex<BTreeMap<String, Result<u16, String>>>> = OnceLock::new();
-    let servers = SERVERS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut servers = servers.lock().map_err(|e| e.to_string())?;
-    servers
-        .entry(addr.to_string())
-        .or_insert_with(|| {
-            let listener = TcpListener::bind((addr, 0))
-                .map_err(|e| format!("cannot start an echo server on {addr}: {e}"))?;
-            let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-            thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    thread::spawn(move || echo(stream));
-                }
-            });
-            Ok(port)
-        })
-        .clone()
 }
 
 fn echo(mut stream: TcpStream) {
@@ -305,8 +317,8 @@ mod tests {
 
     #[test]
     fn the_model_answers_on_a_kept_alive_connection_deterministically() {
-        let port = llm_server("127.0.0.1").unwrap();
-        assert_eq!(llm_server("127.0.0.1"), Ok(port), "started once");
+        let port = llm_server("127.0.0.1", 0).unwrap();
+        assert_eq!(llm_server("127.0.0.1", 0), Ok(port), "started once");
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let a = chat(
             &mut s,
@@ -347,6 +359,12 @@ mod tests {
         let mut whole = post.to_vec();
         whole.push(b'c');
         assert_eq!(request_end(&whole), Some((whole.len(), true)));
+    }
+
+    #[test]
+    fn qemu_guests_reach_the_model_through_the_user_network() {
+        let option = llm_option(Vmm::QemuMicrovm, 0).unwrap();
+        assert!(option.starts_with("llm=10.0.2.2:"), "{option}");
     }
 
     #[test]
