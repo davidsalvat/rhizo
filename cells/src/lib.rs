@@ -22,6 +22,7 @@ pub mod nr {
     pub const CLOSE: usize = 57;
     pub const READ: usize = 63;
     pub const PREAD64: usize = 67;
+    pub const PWRITE64: usize = 68;
     pub const PIPE2: usize = 59;
     pub const FCNTL: usize = 25;
     pub const SOCKET: usize = 198;
@@ -55,6 +56,7 @@ pub mod nr {
     pub const CLOSE: usize = 3;
     pub const READ: usize = 0;
     pub const PREAD64: usize = 17;
+    pub const PWRITE64: usize = 18;
     pub const PIPE2: usize = 293;
     pub const FCNTL: usize = 72;
     pub const SOCKET: usize = 41;

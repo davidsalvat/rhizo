@@ -13,14 +13,25 @@ use std::time::Duration;
 const BASELINE: &str = "bench/baseline.json";
 const README_START: &str = "<!-- bench:start -->";
 const README_END: &str = "<!-- bench:end -->";
-const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Metrics whose value does not depend on machine noise.
-const DETERMINISTIC: [&str; 3] = [
+const DETERMINISTIC: [&str; 4] = [
     "image.size_bytes",
     "memory.kernel_pt_frames",
     "cell.pt_frames",
+    "density.cells",
 ];
+
+/// Metrics for which higher is better (every other metric: lower is).
+const HIGHER_IS_BETTER: [&str; 3] = ["density.cells", "density.ops_per_s", "density.oom_cells"];
+
+/// A reference workload measured alone (`--workload`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Only {
+    Laptop,
+    Server,
+}
 
 /// Options for `cargo xtask bench`.
 #[derive(Debug)]
@@ -35,6 +46,14 @@ pub struct Options {
     pub update_baseline: bool,
     pub readme: bool,
     pub reference: bool,
+    /// Measure only this reference workload.
+    pub workload: Option<Only>,
+    /// The long versions of the workloads (the weekly soak).
+    pub soak: bool,
+    /// How long the fake model server waits before it answers.
+    pub llm_delay_ms: u32,
+    /// Cells the server workload aims for.
+    pub cells: u16,
 }
 
 impl Default for Options {
@@ -50,6 +69,10 @@ impl Default for Options {
             update_baseline: false,
             readme: false,
             reference: true,
+            workload: None,
+            soak: false,
+            llm_delay_ms: 0,
+            cells: 10_000,
         }
     }
 }
@@ -88,6 +111,30 @@ impl Options {
                 "--update-baseline" => o.update_baseline = true,
                 "--readme" => o.readme = true,
                 "--no-reference" => o.reference = false,
+                "--workload" => {
+                    o.workload = Some(match value("--workload")?.as_str() {
+                        "laptop" => Only::Laptop,
+                        "server" => Only::Server,
+                        other => {
+                            return Err(format!(
+                                "unknown workload `{other}` (expected laptop or server)"
+                            ));
+                        }
+                    });
+                }
+                "--soak" => o.soak = true,
+                "--llm-delay-ms" => {
+                    o.llm_delay_ms = value("--llm-delay-ms")?
+                        .parse()
+                        .map_err(|_| "--llm-delay-ms needs a number".to_string())?;
+                }
+                "--cells" => {
+                    o.cells = value("--cells")?
+                        .parse()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or("--cells needs a number from 1 to 65535")?;
+                }
                 other => return Err(format!("unknown bench option `{other}`")),
             }
         }
@@ -237,6 +284,17 @@ pub fn cmd(opts: &Options) -> Result {
 }
 
 fn measure(opts: &Options) -> Result<Results> {
+    if opts.workload.is_some() {
+        let (mut metrics, mut skipped) = (Vec::new(), Vec::new());
+        crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
+        return Ok(Results {
+            environment: opts.env.clone(),
+            date: today(),
+            kvm: vmm::kvm_available(),
+            metrics,
+            skipped,
+        });
+    }
     let kernel = build_kernel(Profile::Release, &[])?;
     let size = fs::metadata(&kernel)
         .map_err(|e| format!("cannot stat {}: {e}", kernel.display()))?
@@ -313,6 +371,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
     measure_comparisons(opts, &mut metrics, &mut skipped)?;
     Ok(Results {
         environment: opts.env.clone(),
@@ -380,6 +439,8 @@ fn measure_cells(
         network: true,
         pci_card: false,
         cpus: 1,
+        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        bench: None,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -784,7 +845,7 @@ fn parse_cell_line(output: &str) -> Option<CellLine> {
     })
 }
 
-fn deterministic(name: &str, unit: &str, value: f64) -> Metric {
+pub(crate) fn deterministic(name: &str, unit: &str, value: f64) -> Metric {
     Metric {
         name: name.into(),
         guest: "rhizo".into(),
@@ -841,6 +902,8 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         network: false,
         pci_card: false,
         cpus: 1,
+        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        bench: None,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),
@@ -954,15 +1017,32 @@ pub struct Regression {
     pub baseline: f64,
     pub current: f64,
     pub allowed_pct: f64,
+    /// The metric is better when higher ([`HIGHER_IS_BETTER`]).
+    pub higher_is_better: bool,
 }
 
 impl Regression {
     fn worse_pct(&self) -> f64 {
-        (self.current / self.baseline - 1.0) * 100.0
+        if self.higher_is_better {
+            (self.baseline / self.current - 1.0) * 100.0
+        } else {
+            (self.current / self.baseline - 1.0) * 100.0
+        }
+    }
+
+    /// The worst value the threshold allows.
+    fn limit(&self) -> f64 {
+        if self.higher_is_better {
+            self.baseline / (1.0 + self.allowed_pct / 100.0)
+        } else {
+            self.baseline * (1.0 + self.allowed_pct / 100.0)
+        }
     }
 }
 
-/// Compares `results` with the stored values for `env` (lower is better).
+/// Compares `results` with the stored values for `env` (lower is better,
+/// but for [`HIGHER_IS_BETTER`], where worse by X % means the baseline is
+/// X % above the value).
 pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regression> {
     let stored = &baseline["environments"][env];
     let mut out = Vec::new();
@@ -974,14 +1054,20 @@ pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regres
         let Some(base) = stored[m.key()].as_f64() else {
             continue;
         };
-        let allowed = threshold_pct(baseline, env, &m.name);
-        if m.median > base * (1.0 + allowed / 100.0) {
-            out.push(Regression {
-                key: m.key(),
-                baseline: base,
-                current: m.median,
-                allowed_pct: allowed,
-            });
+        let r = Regression {
+            key: m.key(),
+            baseline: base,
+            current: m.median,
+            allowed_pct: threshold_pct(baseline, env, &m.name),
+            higher_is_better: HIGHER_IS_BETTER.contains(&m.name.as_str()),
+        };
+        let worse = if r.higher_is_better {
+            r.current < r.limit()
+        } else {
+            r.current > r.limit()
+        };
+        if worse {
+            out.push(r);
         }
     }
     out
@@ -1011,12 +1097,17 @@ fn check_baseline(env: &str, results: &Results) -> Result {
             Failure::new("bench", format!("benchmark regression: {}", r.key))
                 .location(format!("{BASELINE} (environment `{env}`)"))
                 .expected(format!(
-                    "at most {:.3} (baseline {:.3} + {:.0}%)",
-                    r.baseline * (1.0 + r.allowed_pct / 100.0),
+                    "{} {:.3} (baseline {:.3}, {:.0}% worse at most)",
+                    if r.higher_is_better {
+                        "at least"
+                    } else {
+                        "at most"
+                    },
+                    r.limit(),
                     r.baseline,
                     r.allowed_pct
                 ))
-                .actual(format!("{:.3} (+{:.1}%)", r.current, r.worse_pct()))
+                .actual(format!("{:.3} ({:.1}% worse)", r.current, r.worse_pct()))
                 .hint(format!(
                     "find what made it slower; if the regression is intended, justify it in the \
                      pull request and run `cargo xtask bench --env {env} --update-baseline`"
@@ -1542,6 +1633,36 @@ mod tests {
     }
 
     #[test]
+    fn higher_is_better_metrics_fail_when_they_drop() {
+        let baseline = json!({
+            "thresholds_pct": {"deterministic": 1, "timing": {"ci": 100}},
+            "environments": {"ci": {
+                "density.ops_per_s/rhizo/firecracker": 1000.0,
+                "density.cells/rhizo/firecracker": 10000.0
+            }}
+        });
+        let keys = |ops: f64, cells: f64| -> Vec<String> {
+            let r = results(vec![
+                metric("density.ops_per_s", "rhizo", Some("firecracker"), ops),
+                metric("density.cells", "rhizo", Some("firecracker"), cells),
+            ]);
+            regressions(&baseline, "ci", &r)
+                .into_iter()
+                .map(|r| r.key)
+                .collect()
+        };
+        assert!(keys(5000.0, 10000.0).is_empty(), "more is better");
+        assert!(keys(501.0, 9901.0).is_empty(), "within the thresholds");
+        assert_eq!(
+            keys(499.0, 9899.0),
+            [
+                "density.ops_per_s/rhizo/firecracker",
+                "density.cells/rhizo/firecracker"
+            ]
+        );
+    }
+
+    #[test]
     fn ungated_metrics_never_fail_the_gate() {
         let baseline = json!({
             "thresholds_pct": {"deterministic": 1, "timing": {"ci": 100}},
@@ -1650,6 +1771,26 @@ mod tests {
         assert_eq!(o.vmms, vec![Vmm::QemuQ35, Vmm::Firecracker]);
         assert!(o.check && o.env == "ci");
         assert!(Options::parse(&["--runs".to_string(), "0".to_string()]).is_err());
+        let args: Vec<String> = [
+            "--workload",
+            "server",
+            "--soak",
+            "--cells",
+            "500",
+            "--llm-delay-ms",
+            "250",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let o = Options::parse(&args).unwrap();
+        assert_eq!(o.workload, Some(Only::Server));
+        assert!(o.soak);
+        assert_eq!((o.cells, o.llm_delay_ms), (500, 250));
+        for bad in [["--workload", "phone"], ["--cells", "0"]] {
+            let bad: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(Options::parse(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

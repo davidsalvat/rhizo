@@ -58,6 +58,64 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.ipi_wake_us/rhizo/<vmm>` | timing | Handing work to an idle CPU: post it, wake the CPU with an inter-processor interrupt, see it done (robust figure over 105) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
 
+## Reference workloads
+
+Two workloads run the kernel the way its two markets will
+(`docs/vision.md`, change `add-reference-workloads`). `cargo xtask bench`
+runs both on every VMM after the cell figures; `--workload laptop` or
+`--workload server` runs one alone, `--soak` the long versions (the weekly
+`soak` job), `--cells N` changes the server's target and `--llm-delay-ms N`
+the fake model's delay (0 by default, so a turn measures Rhizo).
+
+**Laptop** (B2C, 2 vCPUs, 512 MiB): an `agent` template (1 MiB of history
+warmed up), 50 agents opened from it, 45 of them suspended; agents ask a
+fake model server on the host (`xtask`, plain HTTP through the network
+card). There is no virtio-fs or vsock yet, so the shared folder is a file
+(`/shared/notes.txt`, 64 KiB) seeded into the template's files at boot and
+shared copy-on-write by the agents, not with the host; a user's message is
+the host waking the agent (`Host::wake`). Skipped, with the reason, where
+the VMM has no network card.
+
+| Metric | Kind | Meaning |
+|---|---|---|
+| `laptop.open_us/rhizo/<vmm>` | timing | Opening an agent: fork from the template until it opened its session (wrote its history file, printed `open`) |
+| `laptop.suspend_us/rhizo/<vmm>` | timing | Suspending an open agent into a snapshot |
+| `laptop.resume_us/rhizo/<vmm>` | timing | Lazy resume of a suspended agent until it can run |
+| `workload.agent_turn_us/rhizo/<vmm>` | timing | One turn of a live agent: woken by its user, HTTP request to the model, answer, tool action (history appended, shared notes read and checked) |
+| `laptop.resume_turn_us/rhizo/<vmm>` | timing | The same turn right after a lazy resume (its pages come back as it touches them) |
+| `laptop.memory_bytes/rhizo/<vmm>` | size | Memory the template and the 50 agents take (45 snapshots in the kernel heap included) |
+| `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second |
+| `laptop.idle_host_cpu_pct/rhizo/<vmm>` | rate | Over the same window, read on the host: the VMM process's CPU time (all threads, `/proc/PID/task/*/schedstat`) over wall time, in percent of one CPU |
+
+**Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from four
+`worker` templates, in groups of ten: 4 computing (20,000 xorshift rounds),
+2 writing and reading back 4 KiB of a file, and 2 pairs over loopback TCP
+(the servers share one listener). Each runs one operation every 200 ms for
+3 s (600 s in the soak): 50,000 operations per second offered at 10,000
+cells. Every 10 ms the host suspends and resumes one computing or file
+worker and forks one (sockets do not survive a suspend yet). With several
+CPUs every host operation would stop them all (a run ends to make one), so
+the workload uses one vCPU. Then the out-of-memory push: idle cells forked
+until the kernel refuses one; spawn, fork and eager resume must be
+refused, `hog` must get `ENOMEM`, nothing may panic and every byte must
+come back, or the benchmark fails.
+
+| Metric | Kind | Meaning |
+|---|---|---|
+| `density.cells/rhizo/<vmm>` | deterministic, higher is better | Workers made: the target, or fewer when memory keeps less than 32 MiB of headroom (`limit=` in the `rhizo-server` line says which) |
+| `density.ops_per_s/rhizo/<vmm>` | rate, higher is better | Operations of the workers that exited with 0, over the load's wall time |
+| `density.cell_bytes/rhizo/<vmm>` | size | Most memory in use during the load, per cell (pages, tables, files, sockets, kernel record) |
+| `density.sched_p50_us`, `_p99_us`, `_p999_us` | timing | Scheduling latency: a cell joined a run queue (preempted, yielded, new, or its deadline passed) until it runs |
+| `density.wake_p50_us`, `density.wake_p99_us`, `_p999_us` | timing | Wake-up latency: its event (deadline, or a socket change by another cell's system call) until it runs |
+| `density.syscall_p50_ns`, `_p99_ns`, `_p999_ns` | timing | Time in the system-call handler, locks included |
+| `density.oom_cells/rhizo/<vmm>` | count, higher is better | Idle cells memory held before the kernel refused one |
+
+The `rhizo-server-breakdown` line printed with the results says where the
+load's time went (idle, system calls, scheduling decisions, host
+operations; runs, socket wake-ups, faults): simple counters in
+`kernel/src/prof.rs`, until the permanent per-workload breakdown replaces
+them.
+
 Figures the kernel repeats a hundred times or more (`cell.spawn_us`,
 `cell.run_us`, `cell.spawn_from_template_us`, the file and network
 metrics) are the
@@ -65,7 +123,7 @@ minimum over five consecutive rounds of each round's median, so one noisy
 moment of the host does not decide them.
 
 Each timing is the median (and p90) of `--runs` boots after one discarded
-warm-up boot. Lower is better for every metric.
+warm-up boot. Lower is better for every metric not marked "higher is better".
 
 ## Comparisons with existing mechanisms
 
