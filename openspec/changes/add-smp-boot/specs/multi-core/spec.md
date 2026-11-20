@@ -6,7 +6,8 @@
 A kernel build that runs cells SHALL use the boot CPU and the other CPUs the
 firmware describes, in firmware order: on AArch64 the `/cpus` nodes of the
 device tree whose `enable-method` is `psci`, on x86_64 the enabled or
-online-capable processors of the ACPI MADT (local APIC and x2APIC entries).
+online-capable processors of the ACPI MADT (local APIC and x2APIC entries),
+or, without ACPI, the enabled processors of the MP configuration table.
 It SHALL use at most 16 CPUs and report `cpus: <n> online` on the boot
 console once they are up.
 

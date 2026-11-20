@@ -19,6 +19,8 @@ mod smp;
 mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod wire;
 
 use arch::console::BootConsole;
 use arch::power::Machine;

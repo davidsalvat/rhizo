@@ -27,9 +27,14 @@ loader and Cloud Hypervisor), else from the EBDA and `0xe0000..0x100000`
 (Firecracker writes it at `0xe0000`). Tables are checksummed and bounded
 (64 KiB); pages outside the direct map are mapped read-only on demand.
 
-Lost: MP tables (Firecracker still writes them, but every supported VMM
-has ACPI), and counting CPUs by broadcasting INIT/STARTUP (no list, so no
-way to know when all have arrived).
+Without ACPI (QEMU `microvm` with `acpi=off`, which the network tests use
+so that `microvm` lists its virtio-mmio devices on the command line), the
+CPUs come from the MP configuration table instead (enabled processor
+entries; qboot leaves the entry count at zero, so entries are read up to
+the base table's length).
+
+Lost: counting CPUs by broadcasting INIT/STARTUP (no list, so no way to
+know when all have arrived).
 
 ## D3. Bring-up one CPU at a time
 
@@ -147,10 +152,11 @@ nearly all given to cells (`a_thousand_idle_cells` failed on that once heap
 pages moved to the top).
 
 Fragmentation must not kill a cell either: a write to a shared 2 MiB page
-that finds no free 2 MiB block now copies the page into 512 small pages
-under a new table (`resolve_write`, with break-before-make on the block
-entry, so `resolve_write` takes the TLB and flushes itself). It costs the
-same memory, only more TLB entries for that region of that cell.
+that finds no free 2 MiB block copies the page into 512 small pages under
+a new table. This change found it on the AArch64 runner and fixed it;
+`add-sockets-and-poll` landed the same fallback on `main` meanwhile, so
+the merge keeps `main`'s code and this change adds its requirement to the
+`fork` spec.
 
 Lost: returning empty heap pages to the allocator (the heap keeps them by
 design, `add-memory-accounting`), and mapping large heap allocations from

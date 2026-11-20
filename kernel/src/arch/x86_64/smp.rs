@@ -189,13 +189,17 @@ impl PhysicalMemory for Firmware {
     }
 }
 
-/// The APIC identifiers of the MADT (none without ACPI).
+/// The APIC identifiers of the MADT, or of the MP table without ACPI (QEMU
+/// `microvm` with `acpi=off`); none without either.
 fn firmware_cpus() -> Vec<u64> {
     let start_info = super::boot::boot_arg();
     let hint = acpi::pvh_rsdp(&DirectMap, start_info);
     let mut ids = Vec::new();
     if let Some(rsdp) = acpi::find_rsdp(&Firmware, hint) {
         let _ = acpi::processors(&Firmware, rsdp, |id| ids.push(id as u64));
+    }
+    if ids.is_empty() {
+        acpi::mp_processors(&Firmware, |id| ids.push(id as u64));
     }
     ids
 }

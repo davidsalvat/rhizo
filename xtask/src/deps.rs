@@ -16,14 +16,30 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
     ("rhizo-mm", &["rhizo-hal"]),
     ("rhizo-cell", &["rhizo-hal", "rhizo-mm"]),
     ("rhizo-fs", &[]),
+    ("rhizo-net", &["rhizo-hal"]),
+    ("rhizo-virtio", &["rhizo-hal"]),
     (
         "rhizo-abi",
-        &["rhizo-hal", "rhizo-mm", "rhizo-cell", "rhizo-fs"],
+        &[
+            "rhizo-hal",
+            "rhizo-mm",
+            "rhizo-cell",
+            "rhizo-fs",
+            "rhizo-net",
+            "rhizo-virtio",
+        ],
     ),
     ("rhizo-sched", &[]),
     (
         "rhizo-snapshot",
-        &["rhizo-hal", "rhizo-mm", "rhizo-cell", "rhizo-fs"],
+        &[
+            "rhizo-hal",
+            "rhizo-mm",
+            "rhizo-cell",
+            "rhizo-fs",
+            "rhizo-net",
+            "rhizo-virtio",
+        ],
     ),
     (
         "rhizo-kernel",
@@ -36,10 +52,12 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
             "rhizo-sched",
             "rhizo-snapshot",
             "rhizo-fs",
+            "rhizo-net",
+            "rhizo-virtio",
         ],
     ),
     ("rhizo-cells", &[]),
-    ("xtask", &[]),
+    ("xtask", &["rhizo-fs"]),
 ];
 
 /// Workspace-internal edges `(from, to)` found in `cargo metadata` output.

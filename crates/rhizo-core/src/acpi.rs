@@ -1,5 +1,7 @@
-//! The ACPI tables the kernel reads on x86_64 to find its CPUs: the RSDP,
-//! the RSDT or XSDT, and the processor entries of the MADT (ACPI 6.5, §5.2).
+//! The firmware tables the kernel reads on x86_64 to find its CPUs: the
+//! RSDP, the RSDT or XSDT, and the processor entries of the MADT (ACPI 6.5,
+//! §5.2); without ACPI (QEMU `microvm` with `acpi=off`), the processor
+//! entries of the MP configuration table (MP specification 1.4, §4).
 //! Everything is read through [`PhysicalMemory`] and checked (signatures,
 //! checksums, lengths); nothing is allocated.
 
@@ -62,6 +64,21 @@ fn is_rsdp(mem: &impl PhysicalMemory, at: u64) -> bool {
     }
 }
 
+/// The places firmware tables are looked for, on 16-byte boundaries: the
+/// first KiB of the EBDA (or the last KiB of base memory), then `start` to
+/// the end of the BIOS area.
+fn legacy_areas(mem: &impl PhysicalMemory, start: u64) -> impl Iterator<Item = u64> {
+    let ebda = (u16::from_le_bytes(bytes(mem, 0x40e)) as u64) << 4;
+    let ebda = if (0x8_0000..0xa_0000).contains(&ebda) {
+        ebda
+    } else {
+        0x9_fc00
+    };
+    (ebda..ebda + 1024)
+        .step_by(16)
+        .chain((start..0x10_0000).step_by(16))
+}
+
 /// Finds the RSDP: at `hint` (from the boot protocol) when it holds one,
 /// else in the first KiB of the EBDA, else in `0xe0000..0x100000`, on 16-byte
 /// boundaries.
@@ -69,15 +86,47 @@ pub fn find_rsdp(mem: &impl PhysicalMemory, hint: u64) -> Option<u64> {
     if hint != 0 && is_rsdp(mem, hint) {
         return Some(hint);
     }
-    let ebda = (u16::from_le_bytes(bytes(mem, 0x40e)) as u64) << 4;
-    let ebda = (0x8_0000..0xa_0000)
-        .contains(&ebda)
-        .then_some(ebda..ebda + 1024);
-    ebda.into_iter()
-        .flatten()
-        .chain(0xe_0000..0x10_0000)
-        .step_by(16)
-        .find(|&at| is_rsdp(mem, at))
+    legacy_areas(mem, 0xe_0000).find(|&at| is_rsdp(mem, at))
+}
+
+/// Calls `f` with the local APIC identifier of every enabled processor of
+/// the MP configuration table, in table order; `false` when there is none
+/// (or it is invalid).
+pub fn mp_processors(mem: &impl PhysicalMemory, mut f: impl FnMut(u32)) -> bool {
+    let floating = legacy_areas(mem, 0xf_0000)
+        .find(|&at| bytes::<4>(mem, at) == *b"_MP_" && sums_to_zero(mem, at, 16));
+    let Some(floating) = floating else {
+        return false;
+    };
+    let table = u32_at(mem, floating + 4) as u64;
+    if table == 0 || bytes::<4>(mem, table) != *b"PCMP" {
+        return false; // a default configuration: no table to read
+    }
+    let len = u16::from_le_bytes(bytes(mem, table + 4)) as u64;
+    if !(44..=MAX_TABLE as u64).contains(&len) || !sums_to_zero(mem, table, len) {
+        return false;
+    }
+    // Entries run to the end of the base table (qboot, under QEMU
+    // `microvm`, leaves the entry count at zero).
+    let mut at = table + 44;
+    while at < table + len {
+        let size = match bytes::<1>(mem, at)[0] {
+            0 => 20,
+            1..=4 => 8,
+            _ => return false,
+        };
+        if at + size > table + len {
+            return false;
+        }
+        if size == 20 {
+            let [_, id, _, flags] = bytes::<4>(mem, at);
+            if flags & 1 != 0 {
+                f(id as u32);
+            }
+        }
+        at += size;
+    }
+    true
 }
 
 /// Checks the header of the table at `at`: signature `sig` (when given),
@@ -243,6 +292,52 @@ mod tests {
         mem.write_bytes(0x40e, &0x9fc0u16.to_le_bytes());
         put_rsdp(&mut mem, 0x9_fc20, 0, 0x6000);
         assert_eq!(find_rsdp(&mem, 0x1234), Some(0x9_fc20), "bad hint ignored");
+    }
+
+    /// An MP table as QEMU `microvm` without ACPI writes it: processors 0
+    /// and 1, a disabled processor 5, a bus and an I/O APIC.
+    fn put_mp(mem: &mut FakePhysicalMemory, floating: u64, table: u64) {
+        let mut t = Vec::new();
+        t.extend(*b"PCMP");
+        t.extend([0u8, 0]); // length, below
+        t.extend([4u8, 0]); // revision, checksum
+        t.extend(*b"RHIZO   RHIZOTABLE  ");
+        t.extend(0u32.to_le_bytes()); // OEM table
+        t.extend(0u16.to_le_bytes());
+        t.extend(0u16.to_le_bytes()); // entry count, left at 0 as qboot does
+        t.extend(0xfee0_0000u32.to_le_bytes());
+        t.extend([0u8; 4]); // extended length, checksum, reserved
+        for (id, flags) in [(0u8, 3u8), (1, 1), (5, 0)] {
+            t.extend([0, id, 0x14, flags]);
+            t.extend([0u8; 16]);
+        }
+        t.extend([1, 0, b'I', b'S', b'A', b' ', b' ', b' ']);
+        t.extend([2, 2, 0x11, 1, 0, 0, 0xc0, 0xfe]);
+        let len = t.len() as u16;
+        t[4..6].copy_from_slice(&len.to_le_bytes());
+        fix_checksum(&mut t, 7);
+        mem.write_bytes(table, &t);
+        let mut f = Vec::new();
+        f.extend(*b"_MP_");
+        f.extend((table as u32).to_le_bytes());
+        f.extend([1, 4, 0, 0, 0, 0, 0, 0]);
+        fix_checksum(&mut f, 10);
+        mem.write_bytes(floating, &f);
+    }
+
+    #[test]
+    fn reads_processors_from_the_mp_table() {
+        let mut mem = FakePhysicalMemory::new();
+        let mut ids = Vec::new();
+        assert!(!mp_processors(&mem, |id| ids.push(id)), "no table");
+        put_mp(&mut mem, 0x9_fc00, 0x9_fd00);
+        assert!(mp_processors(&mem, |id| ids.push(id)));
+        assert_eq!(ids, [0, 1]);
+        // A broken checksum makes the table unusable.
+        mem.write_bytes(0x9_fd00 + 50, &[0x42]);
+        ids.clear();
+        assert!(!mp_processors(&mem, |id| ids.push(id)));
+        assert!(ids.is_empty());
     }
 
     #[test]

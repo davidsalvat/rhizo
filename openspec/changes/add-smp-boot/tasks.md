@@ -4,7 +4,7 @@
 
 - [x] 1.1 `rhizo_core::options`: `smp=N`; host tests; verify `cargo test -p rhizo-core options`
 - [x] 1.2 `rhizo_core::fdt::cpus` (CPU nodes, two-cell identifiers, status, PSCI), QEMU `-smp 4` fixture; verify `cargo test -p rhizo-core fdt`
-- [x] 1.3 `rhizo_core::acpi`: RSDP (hint, EBDA, BIOS area), RSDT/XSDT, MADT processors, checksums; host tests; verify `cargo test -p rhizo-core acpi`
+- [x] 1.3 `rhizo_core::acpi`: RSDP (hint, EBDA, BIOS area), RSDT/XSDT, MADT processors, checksums, MP table processors without ACPI; host tests; verify `cargo test -p rhizo-core acpi`
 - [x] 1.4 `rhizo_core::smp::Cpus::select` (D2) with a property test; `rhizo_core::sync::SpinLock` (D7) with threads as CPUs; verify `cargo test -p rhizo-core`
 
 ## 2. Kernel
@@ -15,7 +15,7 @@
 - [x] 2.4 x86_64 bring-up: MADT, trampoline, INIT/STARTUP, local APIC per CPU, wake-up vector (D3, D6); verify `cargo xtask --arch x86_64 test --only ktest-smp` on microvm and q35
 - [x] 2.5 In-kernel tests: every CPU's number and stack, globals and heap from all CPUs at once; verify `cargo xtask test --only ktest-smp` on both architectures
 
-- [x] 2.6 Heap pages from the top of memory, boxed run-queue entries, copy-on-write of a large page into small pages when no large frame is free (D8): `FrameAllocator::alloc_high`, `resolve_write` fallback, host unit and property tests; verify `cargo test -p rhizo-mm frames` and `cargo xtask test --only ktest-smp` on both architectures
+- [x] 2.6 Heap pages from the top of memory, boxed run-queue entries, copy-on-write of a large page into small pages when no large frame is free (D8; the fallback itself now from `main`): `FrameAllocator::alloc_high`, host unit and property tests; verify `cargo test -p rhizo-mm frames` and `cargo xtask test --only ktest-smp` on both architectures
 
 ## 3. Tooling and documentation
 

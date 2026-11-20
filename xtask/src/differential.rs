@@ -11,7 +11,7 @@ use std::process::Command;
 mod expected {
     include!("../../cells/expected.rs");
 }
-use expected::{Ending, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT};
+use expected::{CPYTHON_ARGV, CPYTHON_STDOUT, Ending, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT};
 
 /// Why the check cannot run on this host, if it cannot.
 pub fn unavailable_reason() -> Option<String> {
@@ -67,7 +67,50 @@ pub fn check(dir: &Path) -> Result {
             .into_error());
         }
     }
-    check_python(dir, &scratch)
+    check_python(dir, &scratch)?;
+    check_cpython(&scratch)
+}
+
+/// CPython, when built: its files laid out on the host as in a cell
+/// (`usr/bin/python3`, `usr/lib/python3.13`, `app`), run with an empty environment
+/// (a cell has none) from an empty directory, it prints [`CPYTHON_STDOUT`]
+/// and nothing on standard error, as it must in a cell.
+fn check_cpython(scratch: &Path) -> Result {
+    let root = crate::cpython::root();
+    let python = root.join("usr/bin/python3");
+    if !python.exists() {
+        crate::report::text("[xtask] CPython not built (RHIZO_CPYTHON_SRC unset): skipped");
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(scratch);
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let script = root.join(CPYTHON_ARGV[1].trim_start_matches('/'));
+    let out = Command::new(&python)
+        .arg(&script)
+        .env_clear()
+        .current_dir(scratch)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", python.display()))?;
+    let _ = std::fs::remove_dir_all(scratch);
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || text != CPYTHON_STDOUT || !out.stderr.is_empty() {
+        return Err(
+            Failure::new("differential", "CPython behaves differently on Linux")
+                .location("cells/python/agent_demo.py")
+                .expected(format!(
+                    "exit 0, stdout {CPYTHON_STDOUT:?} (cells/expected.rs), no stderr"
+                ))
+                .actual(format!(
+                    "{:?}, stdout {text:?}, stderr {:?}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                ))
+                .hint("Linux is the reference: fix the script or the expectation")
+                .reproduce(format!("env -i {} {}", python.display(), script.display()))
+                .into_error(),
+        );
+    }
+    Ok(())
 }
 
 /// MicroPython, when built (`micropython` in `dir`): run natively in an

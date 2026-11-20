@@ -12,6 +12,8 @@ all-features = true
 allow = [
     "MIT",
     "Apache-2.0",
+    # smoltcp and managed (TCP/IP on the network card, design D2 of add-virtio-net).
+    "0BSD",
 ]
 confidence-threshold = 0.9
 

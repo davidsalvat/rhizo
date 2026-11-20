@@ -25,6 +25,11 @@ pub enum Wait {
         bitset: u32,
         until: Option<u64>,
     },
+    /// Descriptors: until a socket changes ([`Threads::wake_io`]) or the
+    /// monotonic time `until`. The thread is back at its system-call
+    /// instruction and makes the call again when it runs (design D3 of
+    /// `add-sockets-and-poll`).
+    Io { until: Option<u64> },
 }
 
 impl Wait {
@@ -32,7 +37,7 @@ impl Wait {
         match self {
             Wait::Ready => None,
             Wait::Sleep(until) => Some(until),
-            Wait::Futex { until, .. } => until,
+            Wait::Futex { until, .. } | Wait::Io { until } => until,
         }
     }
 }
@@ -225,6 +230,25 @@ impl Threads {
         }
     }
 
+    /// Makes every thread waiting on descriptors runnable: something they
+    /// may wait for happened, and each makes its call again. Returns whether
+    /// one did.
+    pub fn wake_io(&mut self) -> bool {
+        let mut woken = false;
+        for t in core::iter::once(&mut self.current).chain(&mut self.others) {
+            if let Wait::Io { .. } = t.wait {
+                t.wait = Wait::Ready;
+                woken = true;
+            }
+        }
+        woken
+    }
+
+    /// Whether a thread waits on descriptors.
+    pub fn waits_on_io(&self) -> bool {
+        self.iter().any(|t| matches!(t.wait, Wait::Io { .. }))
+    }
+
     /// Whether a thread can run without waiting.
     pub fn is_runnable(&self) -> bool {
         self.iter().any(|t| t.wait == Wait::Ready)
@@ -298,6 +322,32 @@ mod tests {
         assert_eq!(t.wake_at(), Some(100));
         assert!(t.next(100));
         assert_eq!(t.wake_at(), None);
+    }
+
+    #[test]
+    fn threads_waiting_on_descriptors_wake_on_a_change_or_their_deadline() {
+        let mut t = three();
+        t.block(Wait::Io { until: None }); // 7
+        assert!(t.waits_on_io());
+        assert!(t.next(0));
+        t.block(Wait::Io { until: Some(50) }); // 8
+        assert!(t.next(0));
+        t.block(Wait::Sleep(1000)); // 9
+        assert!(!t.next(10), "nobody can run");
+        assert_eq!(t.wake_at(), Some(50));
+        let pc = t.get_mut(8).unwrap().regs.gpr[0];
+        assert!(t.next(50), "the deadline makes 8 run");
+        assert_eq!(t.current().tid, 8);
+        assert_eq!(
+            t.current().regs.gpr[0],
+            pc,
+            "its call is made again, untouched"
+        );
+        t.block(Wait::Io { until: None });
+        assert!(t.wake_io(), "a socket changed");
+        assert!(!t.waits_on_io());
+        assert!(t.next(60));
+        assert!(!t.wake_io(), "nobody waits any more");
     }
 
     #[test]

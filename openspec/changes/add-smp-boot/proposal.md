@@ -17,7 +17,8 @@ on all of them.
 - **CPU discovery**: AArch64 reads `/cpus` from the device tree (CPUs with
   `enable-method = "psci"`); x86_64 reads the processors of the ACPI MADT
   (RSDP from the PVH start info, else the EBDA and BIOS area). The boot
-  CPU is CPU 0; others follow in firmware order.
+  CPU is CPU 0; others follow in firmware order. Without ACPI (QEMU
+  `microvm` with `acpi=off`), x86_64 reads the MP configuration table.
 - **`smp=N`** on the command line caps the CPUs used (default: every CPU
   the firmware describes, at most 16). `smp=1`, and any VM with one vCPU,
   starts nothing and behaves as before.
@@ -74,8 +75,7 @@ in xAPIC mode; more than 16 CPUs.
 ## Impact
 
 `crates/rhizo-core` (`acpi`, `smp`, `sync`, `fdt::cpus`, `smp=` option,
-`boot::report_cpus`), `crates/rhizo-mm` (`FrameAllocator::alloc_high`,
-`resolve_write` fallback),
+`boot::report_cpus`), `crates/rhizo-mm` (`FrameAllocator::alloc_high`),
 `kernel/src/heap.rs`, `kernel/src/sync.rs`, `kernel/src/smp.rs` (new),
 `kernel/src/arch/aarch64/{boot,cpu,irq,platform,smp}.rs`,
 `kernel/src/arch/x86_64/{boot,cpu,irq,user,smp}.rs`, `kernel/src/cell.rs`

@@ -1,8 +1,10 @@
 //! Hostile: makes 20000 system calls with numbers and arguments from a
 //! fixed-seed generator (kernel and non-canonical addresses, huge lengths,
 //! negative descriptors, wild flags), and checks every answer is a value or
-//! a Linux `errno`. Only calls that would end it, put it to sleep or take
-//! away its own stack are tamed. Prints `fuzz ok`. Never run on Linux.
+//! a Linux `errno`. Only calls that would end it, put it to sleep, make
+//! descriptors it could then wait on for ever (pipes, event counters,
+//! `epoll` instances, sockets) or take away its own stack are tamed. Prints
+//! `fuzz ok`. Never run on Linux.
 #![no_std]
 #![no_main]
 
@@ -10,14 +12,25 @@ use rhizo_cells::{check, exit, nr, syscall};
 
 #[cfg(target_arch = "aarch64")]
 mod call {
-    pub const ENDS_OR_SLEEPS: &[usize] = &[93, 94, 101, 115, 72];
+    pub const ENDS_OR_SLEEPS: &[usize] = &[
+        93, 94, 101, 115, 72, // exit, exit_group, sleeps, pselect6
+        73, 22, // ppoll, epoll_pwait
+        59, 19, 20, 198, 199, // pipe2, eventfd2, epoll_create1, socket, socketpair
+    ];
     pub const MEMORY: &[usize] = &[215, 226, 233]; // munmap, mprotect, madvise
     pub const DUP3: usize = 24;
 }
 
 #[cfg(target_arch = "x86_64")]
 mod call {
-    pub const ENDS_OR_SLEEPS: &[usize] = &[60, 231, 35, 230, 23, 270];
+    pub const ENDS_OR_SLEEPS: &[usize] = &[
+        60, 231, 35, 230, 23, 270, // exit, exit_group, sleeps, select, pselect6
+        7, 271, 232, 281, // poll, ppoll, epoll_wait, epoll_pwait
+        22, 293, 284, 290, 213, 291, 41,
+        53, // pipe, pipe2, eventfd, eventfd2,
+            // epoll_create, epoll_create1,
+            // socket, socketpair
+    ];
     pub const MEMORY: &[usize] = &[11, 10, 28]; // munmap, mprotect, madvise
     pub const DUP3: usize = 292;
 }
