@@ -345,7 +345,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
                 && let crate::hostnet::Network::Qemu { cmdline } = crate::hostnet::for_vmm(vmm)
             {
                 cmd.args(["-netdev", "user,id=n0"]);
-                if vmm == Vmm::QemuQ35 || opts.pci_card {
+                if vmm == Vmm::QemuQ35 || (vmm == Vmm::QemuVirt && opts.pci_card) {
                     // A modern-only virtio-pci card, without the boot ROM.
                     cmd.args([
                         "-device",
