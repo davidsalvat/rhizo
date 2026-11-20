@@ -162,7 +162,7 @@ pub fn load<F: EntryFormat>(
 ) -> Result<PageTable<F>, elf::ElfError> {
     let pt =
         PageTable::<F>::new(mem, &mut || frames.alloc()).map_err(|_| elf::ElfError::OutOfMemory)?;
-    match image.load(&pt, mem, &mut || frames.alloc()) {
+    match image.load(&pt, mem, frames) {
         Ok(()) => Ok(pt),
         Err(e) => {
             space::destroy(pt, mem, frames);
