@@ -13,4 +13,4 @@
 
 ## 3. Documentation
 
-- [ ] 3.1 README roadmap (H9), `bench/README.md`, `cargo xtask ci` on both architectures
+- [x] 3.1 `bench/README.md`, `cargo xtask ci` on both architectures; the README roadmap marks H9 done with the archive, after the README redesign (#27) lands
