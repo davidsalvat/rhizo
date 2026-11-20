@@ -273,6 +273,21 @@ jobs:
           path: target/tools
           key: tools-${{ hashFiles('xtask/src/tools.rs') }}
 
+      - name: TEMPORARY diagnose the Firecracker network (fix-firecracker-network)
+        continue-on-error: true
+        env:
+          RHIZO_TEST_TIMEOUT: "75"
+        run: |
+          sudo tcpdump -i any -n -U -w "$RUNNER_TEMP/tap.pcap" 'arp or net 172.16.0.0/24' &
+          sleep 2
+          RHIZO_FC_METRICS="$RUNNER_TEMP/fc-metrics.json" timeout 600 \
+            cargo xtask --arch x86_64 test --only ktest --vmm firecracker || true
+          sleep 1; sudo pkill tcpdump || true; sleep 1
+          ip addr show rhizotap0 || true
+          sudo tcpdump -n -e -r "$RUNNER_TEMP/tap.pcap" | head -80 || true
+          echo "--- firecracker net metrics (last flush)"
+          tail -n 1 "$RUNNER_TEMP/fc-metrics.json" | jq -c '.net' || cat "$RUNNER_TEMP/fc-metrics.json" || true
+
       - name: Boot on Firecracker
         run: cargo xtask --arch x86_64 run --release --vmm firecracker
 

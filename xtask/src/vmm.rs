@@ -399,10 +399,14 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     let config = format!(
         "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}{initrd_json}}}, \
          \"drives\": [], \"network-interfaces\": [{interfaces}], \
-         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": 128}}}}",
+         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": 128}}{}}}",
         kernel.display().to_string(),
         args,
-        opts.cpus
+        opts.cpus,
+        // TEMPORARY diagnostic (fix-firecracker-network): device counters.
+        std::env::var("RHIZO_FC_METRICS")
+            .map(|p| format!(", \"metrics\": {{\"metrics_path\": {p:?}}}"))
+            .unwrap_or_default()
     );
     let path = scratch.join(format!("firecracker-{}.json", std::process::id()));
     fs::write(&path, config).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
