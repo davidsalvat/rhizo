@@ -317,6 +317,43 @@ pub(crate) fn dup3<F, M, T, A, S>(
     dup(cx, old, new, true, flags != 0)
 }
 
+/// `ioctl`: the generic descriptor requests (the same numbers on both
+/// architectures) that CPython's sockets and `os.set_inheritable` make:
+/// `FIONBIO` (non-blocking mode, as `F_SETFL` with `O_NONBLOCK`), `FIOCLEX`
+/// and `FIONCLEX` (close-on-exec). There are no terminals or devices: any
+/// other request is `ENOTTY`.
+pub(crate) fn ioctl<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    fd: u64,
+    request: u64,
+    arg: u64,
+) -> i64 {
+    const FIONBIO: u64 = 0x5421;
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
+    let fd32 = fd as u32;
+    let done = |r: Result<(), Error>| r.map_or_else(err, |()| 0);
+    match request {
+        FIONBIO => {
+            let mut on = [0u8; 4];
+            if cx.read(arg, &mut on).is_err() {
+                return -EFAULT;
+            }
+            let flags = match cx.fs.status_flags(fd32) {
+                Ok(f) => f,
+                Err(e) => return err(e),
+            };
+            let flags = match u32::from_le_bytes(on) {
+                0 => flags & !rhizo_fs::O_NONBLOCK_FLAG,
+                _ => flags | rhizo_fs::O_NONBLOCK_FLAG,
+            };
+            done(cx.fs.set_status_flags(fd32, flags))
+        }
+        FIOCLEX | FIONCLEX => done(cx.fs.cloexec(fd32, Some(request == FIOCLEX)).map(|_| ())),
+        _ => -ENOTTY,
+    }
+}
+
 pub(crate) fn fcntl<F, M, T, A, S>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,

@@ -300,14 +300,21 @@ jobs:
           path: target/cpython
           key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
 
-      - name: Publish results
+      - name: Publish medians
         if: always()
         run: |
           if [ -f bench-results.json ]; then
             # Annotations are cut at 4 KB: medians first, one per metric.
             echo "::notice title=bench-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results.json | tr '\n' ' ')"
-            # The full results, in numbered pieces that each fit an annotation.
-            tr -d '\n' < bench-results.json | fold -w 3000 | nl -nln -w1 -s' ' |
+          fi
+
+      - name: Publish results
+        # A step shows at most 10 annotations: the full results, compact, in
+        # numbered pieces that each fit one, in a step of their own.
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            jq -c . bench-results.json | fold -w 3500 | nl -nln -w1 -s' ' |
               while IFS= read -r line; do
                 echo "::notice title=bench-results-${line%% *}::${line#* }"
               done

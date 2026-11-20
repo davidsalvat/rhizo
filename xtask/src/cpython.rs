@@ -23,22 +23,30 @@ pub const STDLIB: &str = "usr/lib/python3.13";
 /// C extension modules built into the executable. The standard library's
 /// other C modules are not built at all (`make python` builds no shared
 /// module): what is left out needs what cells do not have (processes,
-/// `dlopen`) or is not used by the workloads. Sockets, `select` and `array`
-/// (imported by `socket`) serve the agent's connection to its model
-/// (design D2 of `add-agent-workload`).
+/// `dlopen`) or is not used by the workloads. For the agent (design D2 of
+/// `add-agent-workload`): sockets, `select` and `array` (imported by
+/// `socket`) for its connection to its model, `unicodedata` for the `idna`
+/// codec `getaddrinfo` encodes host names with, and the hash modules
+/// `hashlib` imports (HACL* and BLAKE2 code in CPython's tree, no OpenSSL).
 const SETUP_LOCAL: &str = "\
 *static*
 _bisect _bisectmodule.c
+_blake2 _blake2/blake2module.c _blake2/blake2b_impl.c _blake2/blake2s_impl.c
 _datetime _datetimemodule.c
 _heapq _heapqmodule.c
 _json _json.c
+_md5 md5module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_MD5.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
 _random _randommodule.c
+_sha1 sha1module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA1.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha2 sha2module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA2.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha3 sha3module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA3.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
 _socket socketmodule.c
 _struct _struct.c
 array arraymodule.c
 binascii binascii.c
 math mathmodule.c
 select selectmodule.c
+unicodedata unicodedata.c
 zlib zlibmodule.c
 ";
 /// The scripts a CPython cell runs, from `cells/python` to `/app`.

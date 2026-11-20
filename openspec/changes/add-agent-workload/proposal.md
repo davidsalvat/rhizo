@@ -32,8 +32,11 @@ costs on Rhizo against Linux.
   one cell per branch, telling each its branch in a file. The kernel gains
   two host operations for that: whether a cell sleeps (a safe point to
   suspend or freeze it) and writing a file into a live cell.
-- **CPython** gains its `_socket`, `select` and `array` modules (built in,
-  static); the packed standard library covers both scripts.
+- **CPython** gains its `_socket`, `select`, `array`, `unicodedata` and
+  hash modules (built in, static); the packed standard library covers both
+  scripts.
+- **`ioctl`** implements `FIONBIO`, `FIOCLEX` and `FIONCLEX` (a Python
+  socket with a timeout needs `FIONBIO`); other requests stay `ENOTTY`.
 - **The same agent as a Linux process** in the same Firecracker VM: the
   guest's `/init` brings its network card up, and the agent forks its
   branches with `os.fork`.
@@ -69,11 +72,14 @@ None.
 
 - `workloads`: a real agent end to end.
 - `benchmarks`: agent metrics.
+- `linux-abi`: descriptor `ioctl`s.
 - `comparisons`: the agent as a Linux process in the same VM.
 
 ## Impact
 
-`cells/python/agent_loop.py` (new), `cells/python/pack_stdlib.py` (several
+`crates/rhizo-abi` (`ioctl`), `AGENTS.md` (`zlib1g-dev`),
+`.github/workflows/ci.yml` (results published compact, in a step of their
+own: they outgrew one step's ten annotations), `cells/python/agent_loop.py` (new), `cells/python/pack_stdlib.py` (several
 scripts), `cells/expected.rs`, `crates/rhizo-core` (boot option `llm=`),
 `kernel/src/cell.rs` (`Host::asleep`, `Host::write_file`, the agent driver
 and its figures), `kernel/src/tests.rs`, `xtask/src/{hostnet,cpython,

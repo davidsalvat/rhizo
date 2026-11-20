@@ -30,7 +30,16 @@ model intact).
 
 The agent uses CPython's `socket` module (`_socket`, and `select` and
 `array`, which `socket.py` imports), built into the static executable like
-the other C modules. Its HTTP/1.1 client is twenty lines in the script
+the other C modules, and connects as HTTP clients do:
+`socket.create_connection` with a timeout. That resolves the host through
+`getaddrinfo`, whose host name CPython encodes with the `idna` codec
+(`unicodedata`), and puts the socket in non-blocking mode with
+`ioctl(FIONBIO)`, which the kernel now implements with `FIOCLEX` and
+`FIONCLEX` (`os.set_inheritable`) instead of refusing every `ioctl` with
+`ENOTTY`. Its tool hashes its notes with `hashlib`, so the hash modules
+`hashlib` imports are built in too (`_md5`, `_sha1`, `_sha2`, `_sha3`,
+`_blake2`: HACL* and BLAKE2 code in CPython's tree, no OpenSSL); without
+them `hashlib` prints an error for every algorithm at import. Its HTTP/1.1 client is twenty lines in the script
 (request, headers, `Content-Length` body, kept alive): `http.client` would
 work too but imports the `email` package (some thirty more modules to pack)
 for header parsing the agent does not need.

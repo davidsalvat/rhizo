@@ -25,7 +25,7 @@
 # `os.fork` until every branch runs; in `cell` mode the host measures it).
 # Without arguments it runs one turn offline (how its standard library is
 # packed, cells/python/pack_stdlib.py).
-import binascii
+import hashlib
 import json
 import os
 import socket
@@ -62,9 +62,10 @@ class Model:
     def connect(self):
         if self.sock is not None:
             self.sock.close()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # As HTTP clients do: name resolution (the `idna` codec), and a
+        # timeout, which puts the socket in non-blocking mode (`FIONBIO`).
+        self.sock = socket.create_connection(self.addr, timeout=60)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.sock.connect(self.addr)
         self.buf = b""
 
     def recv(self):
@@ -114,7 +115,7 @@ def compute(n, seed):
         f.write(b"n=%d seed=%d value=%d\n" % (n, seed, value))
     with open(NOTES, "rb") as f:
         notes = f.read()
-    return {"value": value, "notes": notes.count(b"\n"), "crc": binascii.crc32(notes)}
+    return {"value": value, "notes": notes.count(b"\n"), "sha": hashlib.sha256(notes).hexdigest()[:8]}
 
 
 def turn(model, messages, label, variant=0):
@@ -126,14 +127,14 @@ def turn(model, messages, label, variant=0):
     result = compute(args["n"], args["seed"] + variant)
     messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result)})
-    return "%s %s n=%d seed=%d value=%d notes=%d crc=%08x conn_requests=%d" % (
+    return "%s %s n=%d seed=%d value=%d notes=%d sha=%s conn_requests=%d" % (
         label,
         call["id"],
         args["n"],
         args["seed"],
         result["value"],
         result["notes"],
-        result["crc"],
+        result["sha"],
         answer["x_requests_on_connection"],
     )
 
@@ -216,6 +217,7 @@ def run(model, mode, turns, timed):
 
 def main():
     if len(sys.argv) < 5:
+        "model".encode("idna")  # what `getaddrinfo` does with a host name
         print(turn(Offline(), [], "offline"))
         return
     host, port, mode, turns = sys.argv[1:5]
