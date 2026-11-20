@@ -147,3 +147,10 @@ medians) over 25 runs after a first that fills the page cache, against
 program forked from a template frozen at `ready`, after `ld.so` did its
 work: what an agent platform pays once relocations are absorbed. Both are
 new; no baseline exists for them until a CI run records one.
+
+The Linux side (`bench/host/linux_process.c`, spec `comparisons`) spawns the
+same dynamic `hello` with `posix_spawn` until it exits, after its static
+one: in the Firecracker guest of the comparison, whose initramfs gets the
+`dynamic-files` tree (`hello`, `ld.so`, `libc.so.6` at their paths), and on
+the benchmark host with its own `ld.so` and `libc`. It reports
+`workload.dynamic_run_us` for guest `linux-process`.

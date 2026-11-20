@@ -97,6 +97,8 @@ same clock as the cells (spec `comparisons`):
 | `workload.cpython_cold_us/linux-process/firecracker` | The same static CPython, files and script in a Linux guest in Firecracker: `fork` and `execve` of `python3 /app/agent_demo.py`, output read from a pipe, until it exits (`bench/host/linux_cpython.c` as `/init`). Pairs with `workload.cpython_cold_us/rhizo/firecracker` |
 | `workload.cpython_warm_us/linux-process/firecracker` | In the same guest, a CPython process that imported and warmed up the script forks one child per request; the child answers and exits normally, the parent waits (`bench/host/cpython_forkserver.py`, the pre-fork pattern). Pairs with `workload.cpython_warm_us/rhizo/firecracker` |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
+| `workload.dynamic_run_us/linux-process/firecracker` | `posix_spawn` of the same dynamically linked `hello` the cell benchmark runs, with the same `ld.so` and `libc.so.6` at their paths in the guest's initramfs, until it exits (`bench/host/linux_process.c` as `/init`). Pairs with `workload.dynamic_run_us/rhizo/firecracker` |
+| `workload.dynamic_run_us/linux-process/host` | The same on the benchmark host, with the host's own `ld.so` and `libc` |
 | `sandbox.run_ms/gvisor/runsc` | `runsc run` of a gVisor sandbox (systrap platform, no network) running the same static `hello`, until it exits. First run dropped |
 | `snapshot.restore_ms/gvisor/runsc` | `runsc restore --detach` of a checkpointed sandbox running the idle cell program, until `runsc state` reports it running. First restore dropped |
 

@@ -45,14 +45,14 @@ refuses such executables, and its `mmap` knows neither files nor
 - **Metrics**: `workload.dynamic_run_us` (spawn and run the dynamic
   `hello` to its exit) and `workload.dynamic_template_us` (the same from a
   template frozen after `ld.so` relocated it), next to `cell.run_us` for a
-  static `hello`.
+  static `hello`, and the same `hello` spawned as a Linux process in the
+  same Firecracker VM and on the host (`bench/host/linux_process.c`).
 
 ### Out of scope
 
 `MAP_SHARED` file mappings, symbolic links (the packed tree has none: each
-file is at the path programs look for), `execve` from a cell, `vDSO`,
-address-space randomization, and a Linux-process comparison of the dynamic
-`hello` (the comparison guest has no dynamic loader).
+file is at the path programs look for), `execve` from a cell, `vDSO` and
+address-space randomization.
 
 ## Capabilities
 
@@ -79,7 +79,8 @@ file's first bytes, mapping from file pages, `AT_BASE`; `map_program`,
 `fadvise64`), `kernel/src/cell.rs` (`Host::spawn_file`, the kept file
 pages), `kernel/src/tests.rs`, `cells/c/dynamic/hello.c`,
 `cells/python/{dynamic_demo,pack_stdlib}.py`, `cells/expected.rs`,
-`xtask/src/{dynamic,differential,bench}.rs`, `kernel/build.rs` (images
+`xtask/src/{dynamic,differential,bench,compare}.rs`,
+`bench/host/linux_process.c`, `kernel/build.rs` (images
 embedded in test kernels only), `kernel/src/arch/aarch64/boot.rs` (the
 early tables map the whole image: test kernels now pass 32 MiB),
 `bench/README.md`. The `bench-cell` kernel embeds the dynamic `hello`

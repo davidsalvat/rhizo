@@ -274,12 +274,24 @@ fn add_libraries(root: &Path, native: bool) -> Result {
 
 /// Every ELF file under `dir`.
 fn elf_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(files(dir)?
+        .into_iter()
+        .filter(|p| std::fs::read(p).is_ok_and(|d| d.starts_with(b"\x7fELF")))
+        .collect())
+}
+
+/// Every file under `dir`, in name order.
+pub fn files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(|e| Some(e.ok()?.path()))
+        .collect();
+    entries.sort();
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
+    for path in entries {
         if path.is_dir() {
-            out.extend(elf_files(&path)?);
-        } else if std::fs::read(&path).is_ok_and(|d| d.starts_with(b"\x7fELF")) {
+            out.extend(files(&path)?);
+        } else {
             out.push(path);
         }
     }

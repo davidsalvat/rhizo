@@ -17,5 +17,5 @@
 
 ## 4. Benchmarks and documentation
 
-- [ ] 4.1 `rhizo-dynamic` line of the `bench-cell` kernel and `workload.dynamic_run_us`, `workload.dynamic_template_us` in `xtask/src/bench.rs` with a parser test; `bench/README.md` describes them (D8); verify `cargo test -p xtask` and the CI benchmark gate passes with both metrics present and no metric worse
+- [ ] 4.1 `rhizo-dynamic` line of the `bench-cell` kernel and `workload.dynamic_run_us`, `workload.dynamic_template_us` in `xtask/src/bench.rs` with a parser test; the dynamic `hello` as a Linux process (`linux_process.c`, in the Firecracker guest and on the host) with a parser test; `bench/README.md` describes them (D8); verify `cargo test -p xtask` and the CI benchmark gate passes with both metrics present and no metric worse
 - [ ] 4.2 `AGENTS.md` code map names the new parts of `rhizo-cell`, `rhizo-abi` and `xtask`; verify `openspec validate add-dynamic-linking --strict`
