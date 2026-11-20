@@ -397,7 +397,7 @@ fn measure_cells(
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
-        let (mut pipe_rtt, mut loopback_rtt) = (Vec::new(), Vec::new());
+        let (mut pipe_rtt, mut loopback_rtt, mut tcp_resume) = (Vec::new(), Vec::new(), Vec::new());
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
@@ -444,9 +444,10 @@ fn measure_cells(
                         file_write_read.push(w as f64 / 1000.0);
                         fork_files.push(f as f64 / 1000.0);
                     }
-                    if let Some((p, l)) = parse_net_line(&out.output) {
+                    if let Some((p, l, r)) = parse_net_line(&out.output) {
                         pipe_rtt.push(p as f64);
                         loopback_rtt.push(l as f64 / 1000.0);
+                        tcp_resume.push(r as f64 / 1000.0);
                     }
                     match parse_wire_line(&out.output) {
                         Some(Ok(rtt)) => wire_rtt.push(rtt as f64 / 1000.0),
@@ -522,6 +523,7 @@ fn measure_cells(
             ("cell.fork_with_files_us", "us", &mut fork_files),
             ("cell.pipe_rtt_ns", "ns", &mut pipe_rtt),
             ("cell.loopback_rtt_us", "us", &mut loopback_rtt),
+            ("cell.tcp_resume_us", "us", &mut tcp_resume),
             ("net.tcp_rtt_us", "us", &mut wire_rtt),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
@@ -630,9 +632,9 @@ fn parse_wire_line(output: &str) -> Option<std::result::Result<u64, String>> {
     Some(value.trim().parse().map_err(|_| line.to_string()))
 }
 
-/// `(pipe_rtt_ns, loopback_rtt_ns)` of the network line of a `bench-cell`
-/// kernel.
-fn parse_net_line(output: &str) -> Option<(u64, u64)> {
+/// `(pipe_rtt_ns, loopback_rtt_ns, tcp_resume_ns)` of the network line of
+/// a `bench-cell` kernel.
+fn parse_net_line(output: &str) -> Option<(u64, u64, u64)> {
     let line = output.lines().find(|l| l.starts_with("rhizo-net "))?;
     let field = |key: &str| -> Option<u64> {
         line.split_whitespace()
@@ -640,7 +642,11 @@ fn parse_net_line(output: &str) -> Option<(u64, u64)> {
             .parse()
             .ok()
     };
-    Some((field("pipe_rtt_ns")?, field("loopback_rtt_ns")?))
+    Some((
+        field("pipe_rtt_ns")?,
+        field("loopback_rtt_ns")?,
+        field("tcp_resume_ns")?,
+    ))
 }
 
 /// The multi-core line of a `bench-cell` kernel booted with several CPUs.
@@ -1764,8 +1770,14 @@ mod tests {
     #[test]
     fn net_line_is_parsed() {
         assert_eq!(
-            parse_net_line("x\nrhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200\n"),
-            Some((310, 4200))
+            parse_net_line(
+                "x\nrhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200 tcp_resume_ns=31000\n"
+            ),
+            Some((310, 4200, 31000))
+        );
+        assert_eq!(
+            parse_net_line("rhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200\n"),
+            None
         );
         assert_eq!(parse_net_line("rhizo-net pipe_rtt_ns=1\n"), None);
     }
