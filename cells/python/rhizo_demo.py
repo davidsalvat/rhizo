@@ -7,7 +7,7 @@ import time
 
 
 def primes_below(n):
-    sieve = bytearray([1]) * n
+    sieve = bytearray(b"\x01" * n)
     sieve[0] = sieve[1] = 0
     i = 2
     while i * i < n:
