@@ -8,9 +8,11 @@ extern crate alloc;
 
 pub mod elf;
 pub mod memory;
+pub mod quota;
 pub mod space;
 pub mod threads;
 
+use quota::Quota;
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, PageTable};
 use space::Frames;
@@ -96,6 +98,11 @@ pub struct Cell {
     pub mmap_next: u64,
     /// Exit status, once the cell has exited.
     pub exit_status: Option<i32>,
+    /// What the host lets it use (spec `isolation`, quotas).
+    pub quota: Quota,
+    /// CPU time it has used, in nanoseconds (counted against
+    /// [`Quota::cpu_ns`]).
+    pub cpu_ns: u64,
 }
 
 impl Cell {
@@ -115,7 +122,16 @@ impl Cell {
             brk: brk_start,
             mmap_next: MMAP_BASE,
             exit_status: None,
+            quota: Quota::NONE,
+            cpu_ns: 0,
         }
+    }
+
+    /// Counts `ns` more CPU time; returns whether the cell is still within
+    /// its quota.
+    pub fn charge_cpu(&mut self, ns: u64) -> bool {
+        self.cpu_ns = self.cpu_ns.saturating_add(ns);
+        self.cpu_ns < self.quota.cpu_ns || self.quota.cpu_ns == u64::MAX
     }
 
     /// The registers of the current thread.

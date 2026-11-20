@@ -98,6 +98,30 @@ What makes the boundary hold:
   copies of shared pages (whole-page copy), resumed pages (whole-page
   copy), new file blocks (`[0; 4096]`).
 
+## Quotas
+
+`add-cell-quotas` closed O1. The host sets a cell's quotas with
+`Host::set_quota`; without one a cell has the kernel's limits, as before.
+
+- **Memory** (bytes of pages and page tables): every frame the kernel takes
+  for the cell goes through `rhizo_cell::quota::Metered`: system calls,
+  copy-on-write copies, lazy pages, stack growth, spawn and resume. Past
+  the quota, `mmap` and `brk` answer `ENOMEM`; a fault that needs a frame
+  kills the cell, as when memory runs out. Frames given back are credited
+  (never below zero), so a forked cell holds at most its quota plus what it
+  inherited (counted to its parent). File data (64 MiB) and names (4096)
+  keep their own bounds per cell.
+- **CPU time**, over the cell's life and its system calls included:
+  counted per slice; past the quota the cell ends (`Ending::OutOfCpu`,
+  `cell N killed: CPU time quota used up`) at the end of that slice, at
+  most 10 ms and one call late.
+- **Descriptors** (at most 1024): `EMFILE` past the quota. **Sockets**:
+  `ENFILE` past the quota.
+- **Cell state.** Quotas live in the `Cell`: forks and template copies keep
+  them (with no usage), snapshots (format version 6) keep them and the CPU
+  time used, so a suspend and resume buys no time. `getrlimit` reports
+  them; nothing in a cell can raise them.
+
 ## System calls
 
 Every call is decoded from the saved registers by `Arch::decode`; numbers
@@ -140,7 +164,7 @@ relies on:
 | `select` (—/23), `pselect6` (72/270) | descriptor count, timeout | descriptors not supported (`ENOSYS`); null timeout `EINVAL`; timeout read as above |
 | `set_robust_list` (99/273) | — | accepted, never walked |
 | `rseq` (293/334) | — | `-ENOSYS` (declined) |
-| `prlimit64` (261/302), `getrlimit` (163/97) | resource, old-limit buffer | resource ≤ 15 (`EINVAL`); new limit and pid not read; 16 bytes written |
+| `prlimit64` (261/302), `getrlimit` (163/97) | resource, old-limit buffer | resource ≤ 15 (`EINVAL`); new limit and pid not read; 16 bytes written; the cell's quotas for `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_NOFILE` |
 | `readlink` (—/89), `readlinkat` (78/267) | — | `-ENOENT` (no links exist), nothing read |
 | `futex` (98/202) | operation | no memory touched: wake 0, others `EAGAIN` |
 | `fstat` (80/5) | fd, buffer | 128 / 144 bytes written |
@@ -300,7 +324,7 @@ These are not fixed by this change; each needs its own design.
 
 | # | Severity | Item |
 |---|---|---|
-| O1 | Medium | **No per-cell quota.** One cell may take all memory down to the kernel's reserve; others are then refused (`ENOMEM`, `ENOSPC`), and the kernel survives (spec `cells`). Host-set quotas need per-cell accounting of frames and heap. |
+| O1 | — | **Closed by `add-cell-quotas`** (see *Quotas*). What remains: a cell without a quota may still take all memory down to the reserve, as before; file data and names are bounded per cell but not by the memory quota; a cell may hold its quota plus what it inherited from a fork. |
 | O2 | Medium | **Kernel time proportional to what a cell holds.** A call runs without preemption: reading or writing up to 64 MiB of file data, `getrandom` or `write` over gigabytes of the cell's own memory, or mapping and zeroing a large region delays every other cell for as long as it takes. Bounded by the cell's own memory, not by a time slice. |
 | O3 | High on affected CPUs | **Side channels are out of scope.** Caches, branch predictors, speculation and timing are not reviewed. On x86_64 the kernel half is mapped (supervisor only) in every cell's table, with no KPTI: on CPUs vulnerable to Meltdown a cell could read kernel memory. Cells see a nanosecond clock. |
 | O4 | Medium | **Randomness is not cryptographic.** `getrandom` and `AT_RANDOM` come from xorshift seeded by the cycle counter: predictable. Cells that need secrets must not rely on it. |
@@ -344,3 +368,9 @@ These are not fixed by this change; each needs its own design.
     cell taking all memory.
   - `shared_read_only_pages_stay_shared_after_mprotect`: `rewrite`, forked,
     each copy makes its constants writable and writes them.
+  - Quotas: `memory_quota_refuses_the_cell_not_the_others` (`hog` with a
+    quota next to `ballast`), `cpu_quota_ends_the_cell` (`spin`),
+    `file_and_socket_quotas_travel_with_the_cell` (`limits`, forked,
+    copied from a template, resumed); host tests in `rhizo_cell::quota`,
+    `quotas_limit_descriptors_and_sockets` (`rhizo-fs`),
+    `rlimits_report_the_cells_quotas` (`rhizo-abi`).

@@ -379,6 +379,26 @@ fn yield_and_sleep_become_scheduling_outcomes() {
 }
 
 #[test]
+fn rlimits_report_the_cells_quotas() {
+    let mut w = World::new(Arch::Aarch64);
+    let limit = |w: &mut World, resource: u64| {
+        assert_eq!(w.call(163, &[resource, DATA]).0, 0, "getrlimit");
+        u64::from_le_bytes(w.peek(DATA, 8).try_into().unwrap())
+    };
+    assert_eq!(limit(&mut w, 0), u64::MAX, "no quota: unlimited");
+    assert_eq!(limit(&mut w, 7), 1024);
+    w.cell.quota = rhizo_cell::quota::Quota {
+        memory: 64 << 20,
+        cpu_ns: 1_500_000_000,
+        files: 32,
+        sockets: 4,
+    };
+    assert_eq!(limit(&mut w, 0), 2, "CPU seconds, rounded up");
+    assert_eq!(limit(&mut w, 7), 32);
+    assert_eq!(limit(&mut w, 9), 64 << 20);
+}
+
+#[test]
 fn libc_startup_calls() {
     let mut w = World::new(Arch::Aarch64);
     // mprotect: read-only, then W+X refused, unmapped range refused.
