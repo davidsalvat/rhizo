@@ -7,9 +7,26 @@
 
 <p align="center"><b>An operating system kernel built for AI agents.</b></p>
 
-Rhizo is an open-source (MIT) kernel, written in Rust, whose basic unit is not
-the process or the container but the **agent cell**: an isolated environment
-that can be created, suspended, resumed and forked as native kernel operations.
+AI agents write and run code. Each one needs a safe place to do it: a sandbox
+it cannot escape, that starts instantly, costs nothing while the agent waits
+for the model, and can be paused, resumed or copied to try several ideas at
+once. Today that place is built from pieces made for something else (virtual
+machines, containers, processes), and it shows: slow to start, heavy to keep,
+expensive to copy.
+
+Rhizo is an operating system kernel built for that job. Its basic unit is the
+**agent cell**, a sealed environment that the kernel itself can create,
+suspend, resume and fork in microseconds. It is meant for two kinds of users:
+
+- **platforms that run many agents on servers**, where density, cost per agent
+  and isolation between customers matter;
+- **people running agents on their own computer**, next to a local model,
+  where an agent should cost almost nothing while idle.
+
+Underneath, Rhizo is deep: it rebuilds memory, scheduling and isolation around
+the agent. On top, the goal is that none of it shows: two clicks and your
+agents are ready, fast and safe. Rhizo is open source (MIT) and written in
+Rust.
 
 > **Status: pre-alpha proof of concept.** Nothing here is usable in production
 > yet. See [where it stands](#status).
@@ -42,6 +59,68 @@ Rhizo explores what happens when those needs are the design center of the
 kernel itself. The name comes from the *rhizome*: an underground stem that
 branches into independent shoots (fork), can regrow a whole plant from a
 fragment (snapshot) and lies dormant until it sprouts again (suspend/resume).
+
+## Vision
+
+Rhizo is complex underneath so that it can be simple on top. The kernel
+rebuilds the foundations of the operating system around the agent; the person
+using it sees none of that.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/layers-dark.svg">
+    <img src="docs/img/layers.svg" alt="Layers of Rhizo. On top, what the user sees: a two-click app and a template catalog, both planned, and their agents. A line separates what the user does not see: agent cells, created, suspended, resumed and forked in microseconds (measured), and below them the Rhizo kernel, which rebuilds memory, scheduling, isolation, networking and snapshots." width="800">
+  </picture>
+</p>
+
+For someone running agents, it should look like this. The steps that exist
+today show their measured time; the others are planned:
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/clicks-dark.svg">
+    <img src="docs/img/clicks.svg" alt="The user's path in five steps: pick a template and download it (both planned), open an agent (a resume from memory, measured in microseconds), open ten more (ten forks, no extra memory until they write, measured), and suspend them to come back later (a few kilobytes per idle agent, measured)." width="800">
+  </picture>
+</p>
+
+On a personal computer the model runs next to Rhizo, not inside it: any model
+and any runtime, at full GPU speed. Agents live in cells and talk to the model
+over a local socket.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/model-dark.svg">
+    <img src="docs/img/model.svg" alt="Local architecture. On the user's computer, a model runtime such as Ollama, llama.cpp or vLLM runs on the GPU or NPU with one shared copy of the weights. The Rhizo VM (on KVM today; macOS and Windows planned) runs agent cells, including a fork, each keeping its own state. Cells reach the model over a local socket, and the Rhizo app coordinates both; the app and the socket are planned." width="800">
+  </picture>
+</p>
+
+The same engine serves servers and personal computers:
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/markets-dark.svg">
+    <img src="docs/img/markets.svg" alt="Two markets, one engine. Servers: many agents per machine, low cost per agent, an API to create, fork and resume. Personal computers: a two-click app, downloadable templates, your own local model. Both products are planned; both run on the Rhizo kernel and its agent cells, which exist today." width="800">
+  </picture>
+</p>
+
+The full picture, and what the kernel still needs for it, is in
+[`docs/vision.md`](docs/vision.md).
+
+## Status
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
+    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in eight stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running agent in microseconds), real programs (threads, networking, Python, every core) and proven with numbers (fair comparisons with Linux, VMs and sandboxes, and a security review). In progress: a real agent. Next: scale and compatibility. Vision: the product, with downloadable agents and your own model." width="800">
+  </picture>
+</p>
+
+Each stage groups several pieces of work, and each piece ships its speed work
+with a benchmark that proves it; the details live in the archived changes
+under [`openspec/changes/archive/`](openspec/changes/archive/).
+
+Out of scope for the proof of concept: real disks, hardware other than
+virtio/QEMU, SDKs.
 
 ## What a cell can do
 
@@ -203,22 +282,6 @@ Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 <!-- bench:end -->
 
 </details>
-
-## Status
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H17, from the boot and test harness to multi-core, including the gVisor and fair comparisons, an adversarial security review, threads, sockets with a network card and CPython in a cell. Next: a dedicated benchmark machine." width="800">
-  </picture>
-</p>
-
-Each milestone ships its speed work with a benchmark that proves it; the
-details live in the archived changes under
-[`openspec/changes/archive/`](openspec/changes/archive/).
-
-Out of scope for the proof of concept: real disks, hardware other than
-virtio/QEMU, SDKs.
 
 ## Try it
 
