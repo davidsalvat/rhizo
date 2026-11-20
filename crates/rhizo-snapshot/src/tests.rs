@@ -165,6 +165,7 @@ fn socket_records_travel_one_per_descriptor() {
             port: 80,
         }),
         opts: Options::default(),
+        parked: None,
     };
     let mut fs = Fs::new();
     let fd = fs.socket_fd(0, false, false).unwrap();
@@ -200,6 +201,44 @@ fn socket_records_travel_one_per_descriptor() {
         Err(FormatError::BadSockets),
         "one record, two holders"
     );
+}
+
+#[test]
+fn parked_connections_travel_as_their_key() {
+    use rhizo_net::{Family, Options, Park, Record, Saved, Type};
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let c = cell::<Aarch64>(&mut mem, &mut frames);
+    let parked = Record {
+        family: Family::Unix,
+        ty: Type::Stream,
+        state: Saved::Reset,
+        local: None,
+        opts: Options {
+            no_delay: true,
+            ..Options::default()
+        },
+        parked: Some(Park {
+            boot: 0x1234_5678_9abc_def0,
+            key: 42,
+        }),
+    };
+    let mut fs = Fs::new();
+    let fd = fs.socket_fd(0, false, false).unwrap();
+    let snap = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &fs,
+        std::slice::from_ref(&parked),
+        0,
+        &mem,
+    );
+    let mut bytes = snap.into_bytes();
+    let back = Snapshot::from_bytes(bytes.clone(), Machine::Aarch64).unwrap();
+    assert_eq!(back.sockets(), std::slice::from_ref(&parked));
+    assert_eq!(back.files().socket(fd), Ok(0));
+    // The last byte of the section belongs to the record: cut, it is refused.
+    bytes.pop();
+    assert!(Snapshot::from_bytes(bytes, Machine::Aarch64).is_err());
 }
 
 fn sample() -> Vec<u8> {

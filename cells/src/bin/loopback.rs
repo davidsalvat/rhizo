@@ -6,17 +6,20 @@
 //!   64-byte messages back, print `served`;
 //! - `ping PORT N [ADDR]`: connect to ADDR:PORT (127.0.0.1 by default;
 //!   retrying while nobody listens), send N 64-byte messages and check each
-//!   echo, print `pinged`.
+//!   echo, print `pinged`;
+//! - `twice PORT`: as `ping PORT 2`, but print `once` and yield after the
+//!   first echo (where a host suspends it), then `twice` after the second.
 //!
 //! Two cells, one serving and one pinging, measure `cell.loopback_rtt_us`;
 //! one pinging the host's echo server through the network card measures
-//! `net.tcp_rtt_us`.
+//! `net.tcp_rtt_us`; `twice`, suspended after `once`, measures
+//! `cell.tcp_resume_us`.
 #![no_std]
 #![no_main]
 
 use rhizo_cells::{
     arg, check, local_port, loopback, nr, number, print, read_full, sleep_ns, syscall, tcp_connect,
-    tcp_listen, tcp_socket, write_all,
+    tcp_listen, tcp_socket, write_all, yield_now,
 };
 
 const ECONNREFUSED: isize = -111;
@@ -48,7 +51,8 @@ fn ipv4(text: &[u8]) -> [u8; 4] {
     out
 }
 
-fn ping(port: u16, n: usize, ip: [u8; 4]) -> i32 {
+/// A connected TCP socket to `ip:port`.
+fn connect(port: u16, ip: [u8; 4]) -> usize {
     let c = tcp_socket(0);
     check(c >= 0, "socket");
     let mut addr = loopback(port);
@@ -69,16 +73,33 @@ fn ping(port: u16, n: usize, ip: [u8; 4]) -> i32 {
             _ => check(false, "connect"),
         }
     }
+    c as usize
+}
+
+/// Sends a 64-byte message of `i` on `c` and checks its echo.
+fn round_trip(c: usize, i: usize) {
     let (mut msg, mut back) = ([0u8; 64], [0u8; 64]);
+    msg.fill(i as u8);
+    check(write_all(c, &msg) == 64, "send");
+    check(read_full(c, &mut back) == 64 && back == msg, "echo");
+}
+
+fn ping(port: u16, n: usize, ip: [u8; 4]) -> i32 {
+    let c = connect(port, ip);
     for i in 0..n {
-        msg.fill(i as u8);
-        check(write_all(c as usize, &msg) == 64, "send");
-        check(
-            read_full(c as usize, &mut back) == 64 && back == msg,
-            "echo",
-        );
+        round_trip(c, i);
     }
     print(b"pinged\n");
+    0
+}
+
+fn twice(port: u16) -> i32 {
+    let c = connect(port, [127, 0, 0, 1]);
+    round_trip(c, 1);
+    print(b"once\n");
+    yield_now();
+    round_trip(c, 2);
+    print(b"twice\n");
     0
 }
 
@@ -114,6 +135,7 @@ fn main() -> i32 {
     match arg(1) {
         Some(b"serve") => serve(port, n),
         Some(b"ping") => ping(port, n, arg(4).map_or([127, 0, 0, 1], ipv4)),
+        Some(b"twice") => twice(port),
         _ => alone(),
     }
 }

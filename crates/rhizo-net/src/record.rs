@@ -3,6 +3,8 @@
 //!
 //! Per record: `family: u8` (0 Inet, 1 Unix), `type: u8` (0 stream,
 //! 1 datagram), `state: u8` (0 open, 1 listening, 2 reset), `backlog: u32`,
+//! `parked: u8` (1: a listener or connection parked in the kernel, then
+//! `boot: u64` and `key: u64`; a parked reset connection has no address),
 //! the address (`tag: u8`: 0 none; 1 Inet, `ip: [u8; 4]`, `port: u16`;
 //! 2 Unix, `name: u64`, `len: u16`, path; 3 unnamed Unix), then the options
 //! (`flags: u8`: 1 reuse address, 2 reuse port, 4 keepalive, 8 no delay,
@@ -23,14 +25,25 @@ pub enum Saved {
     Reset,
 }
 
+/// Where a listener or connection of a suspended cell waits in the kernel
+/// (design D2 of `keep-tcp-across-suspend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Park {
+    /// Identity of the boot that parked it.
+    pub boot: u64,
+    pub key: u64,
+}
+
 /// A socket as a snapshot holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub family: Family,
     pub ty: Type,
+    /// The state it comes back in when it is not parked in this boot.
     pub state: Saved,
     pub local: Option<Addr>,
     pub opts: Options,
+    pub parked: Option<Park>,
 }
 
 /// Why encoded records are refused.
@@ -61,6 +74,14 @@ pub fn encode_records(records: &[Record], out: &mut Vec<u8>) {
         };
         out.push(state);
         out.extend_from_slice(&backlog.to_le_bytes());
+        match r.parked {
+            None => out.push(0),
+            Some(p) => {
+                out.push(1);
+                out.extend_from_slice(&p.boot.to_le_bytes());
+                out.extend_from_slice(&p.key.to_le_bytes());
+            }
+        }
         match &r.local {
             None => out.push(0),
             Some(Addr::Inet { ip, port }) => {
@@ -150,6 +171,14 @@ pub fn decode_records(bytes: &[u8]) -> core::result::Result<Vec<Record>, DecodeE
             2 if ty == Type::Stream => Saved::Reset,
             _ => return Err(Corrupt),
         };
+        let parked = match r.u8()? {
+            0 => None,
+            1 if matches!(state, Saved::Listening(_) | Saved::Reset) => Some(Park {
+                boot: r.u64()?,
+                key: r.u64()?,
+            }),
+            _ => return Err(Corrupt),
+        };
         let local = match (r.u8()?, family) {
             (0, _) => None,
             (1, Family::Inet) => {
@@ -171,6 +200,9 @@ pub fn decode_records(bytes: &[u8]) -> core::result::Result<Vec<Record>, DecodeE
             (3, Family::Unix) => Some(Addr::UnixUnnamed),
             _ => return Err(Corrupt),
         };
+        if parked.is_some() && state == Saved::Reset && local.is_some() {
+            return Err(Corrupt);
+        }
         let flags = r.u8()?;
         if flags & !0x3f != 0 {
             return Err(Corrupt);
@@ -197,6 +229,7 @@ pub fn decode_records(bytes: &[u8]) -> core::result::Result<Vec<Record>, DecodeE
             state,
             local,
             opts,
+            parked,
         });
     }
     if !r.0.is_empty() {
