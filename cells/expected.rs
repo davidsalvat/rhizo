@@ -69,11 +69,48 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
         "warm\nprimes below 2000000: 148933, below 1000: 168\n",
         Ending::Exit(0),
     ),
+    ("loopback", "loopback ok\n", Ending::Exit(0)),
+    ("piper", "pipes ok\n", Ending::Exit(0)),
+    (
+        "netstate",
+        "ready\npipe kept\nconnection open\nlistener ok\n",
+        Ending::Exit(0),
+    ),
+    (
+        "libc_net",
+        "pipe poll: 1 ready, read end empty, write end writable\n\
+         empty read: -1 errno 11\n\
+         pipe: through a pipe\n\
+         closed pipe: revents 0x10, read 0\n\
+         eventfd: 7\n\
+         drained: -1 errno 11\n\
+         poll timeout: 0\n\
+         listening on 127.0.0.1: a port\n\
+         connect: started\n\
+         epoll: 1 ready, data 42\n\
+         connected: writable 1, SO_ERROR 0\n\
+         nothing yet: -1 errno 11\n\
+         epoll: 1 ready, data 7, events 0x1\n\
+         echo: HELLO, SERVER\n\
+         peer is 127.0.0.1: 1, ports match: 1\n\
+         after shutdown: 1 ready, events 0x2001, read 0\n\
+         nobody listens: -1 errno 111\n\
+         select: 1, readable 1\n\
+         udp: datagram (cut), from 127.0.0.1: 1\n\
+         udp recvmsg: 12 bytes, datag|ram two, flags 0\n\
+         unix: socket file 1\n\
+         unix: over unix\n\
+         unix again: -1 errno 98\n\
+         socketpair: pair\n\
+         net ok\n",
+        Ending::Exit(0),
+    ),
     (
         "threads",
         "tids ok\nfutex ok\nmutex ok\nping-pong ok\nregs ok\n",
         Ending::Exit(0),
     ),
+    ("libc_deep_stack", "deep 130560\nbuffer ok\n", Ending::Exit(0)),
     (
         "libc_threads",
         "ready\n\
@@ -126,3 +163,18 @@ pub const PYTHON_COMMAND: &str =
 pub const PYTHON_STDOUT: &str = "warm\n\
      primes below 10000: 1229, last 9973; top words: agent=70, kernel=69, fork=67\n\
      python ok\n";
+
+/// CPython (`cells/python/agent_demo.py`, built only when its source is
+/// given): its command line, in a cell holding the files `xtask` packs
+/// (`/usr/lib/python3.13`, `/app`) and on Linux in a directory laid out the same
+/// way, and what it prints. The script pauses after `warm`, where a host may
+/// freeze it as a template.
+#[allow(dead_code)]
+pub const CPYTHON_ARGV: [&str; 2] = ["/usr/bin/python3", "/app/agent_demo.py"];
+#[allow(dead_code)]
+pub const CPYTHON_STDOUT: &str = "warm\n\
+     {\"contacts\": 24, \"counts\": [82, 71, 71], \"dates_since\": 24, \
+     \"digest\": \"fa17d1e499110000\", \"first_contact\": \"Agent@Team0\", \
+     \"gap_spread\": 7.62, \"last_date\": \"22 Dec 2026\", \"mean_gap_days\": 8.6087, \
+     \"tool\": \"summarize\", \"top_words\": [\"KERNEL\", \"FORK\", \"PAGE\"]}\n\
+     cpython ok\n";

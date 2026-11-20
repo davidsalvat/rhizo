@@ -41,7 +41,14 @@ def us(v):
 
 
 def times(fast, slow):
-    """'≈ N× faster', N to two significant figures."""
+    """'≈ N× faster' (or slower, when `fast` is not), N to two significant
+    figures; "about the same" within 10%."""
+    if 1 / 1.1 < slow / fast < 1.1:
+        return "about the same"
+    if fast > slow:
+        r = fast / slow
+        r = round(r, 1 - int(math.floor(math.log10(r))))
+        return f"≈ {r:,.0f}× slower" if r >= 10 else f"≈ {r:.1f}× slower"
     r = slow / fast
     r = round(r, 1 - int(math.floor(math.log10(r))))
     return f"≈ {r:,.0f}× faster" if r >= 10 else f"≈ {r:.1f}× faster"
@@ -81,6 +88,13 @@ GV_RUN = median("sandbox.run_ms", "gvisor", "runsc", required=False)
 GV_RESTORE = median("snapshot.restore_ms", "gvisor", "runsc", required=False)
 GV_RUN = GV_RUN and GV_RUN * 1000
 GV_RESTORE = GV_RESTORE and GV_RESTORE * 1000
+THREADS = median("cell.thread_create_us", required=False)
+LOOPBACK = median("cell.loopback_rtt_us", required=False)
+CPY_COLD = median("workload.cpython_cold_us", required=False)
+CPY_WARM = median("workload.cpython_warm_us", required=False)
+LX_CPY_COLD = median("workload.cpython_cold_us", "linux-process", required=False)
+LX_CPY_WARM = median("workload.cpython_warm_us", "linux-process", required=False)
+SECURITY = (OUT.parent / "security.md").exists()
 PY_COLD = median("workload.python_cold_us")
 PY_WARM = median("workload.python_warm_us")
 IDLE_KB = median("cell.idle_bytes", vmm=None) / 1000
@@ -273,6 +287,14 @@ def chart(t):
           ("Cell, eager", RESUME_EAGER, us(RESUME_EAGER), True),
           ("Cell, lazy + read all", RESUME_TOUCH, us(RESUME_TOUCH), True)]
          + ([("CRIU restore (host)", CRIU, us(CRIU), False)] if CRIU else [])),
+    ] + ([
+        ("CPython agent request, cold start", ratio(CPY_COLD, LX_CPY_COLD),
+         [("Rhizo cell", CPY_COLD, us(CPY_COLD), True)]
+         + linux("process", LX_CPY_COLD, "same VM")),
+        ("CPython agent request, from a warm template", ratio(CPY_WARM, LX_CPY_WARM),
+         [("Rhizo cell", CPY_WARM, us(CPY_WARM), True)]
+         + linux("fork of warm", LX_CPY_WARM, "same VM")),
+    ] if CPY_COLD and CPY_WARM else []) + [
         ("Answer a Python request (MicroPython)", ratio(PY_WARM, PY_COLD),
          [("Warm template", PY_WARM, us(PY_WARM), True),
           ("Cold interpreter", PY_COLD, us(PY_COLD), False)]),
@@ -330,7 +352,9 @@ def chart(t):
         for title, rt, bars in gs:
             s.text(24, y + 22, title, 15, weight=700)
             if rt:
-                s.text(776, y + 22, rt, 15, fill=t["accent"], weight=700, anchor="end")
+                color = (t["warn"] if "slower" in rt else
+                         t["muted"] if rt == "about the same" else t["accent"])
+                s.text(776, y + 22, rt, 15, fill=color, weight=700, anchor="end")
             by = y + 34
             for v, _ in ticks:
                 s.line(X(v), by, X(v), by + 32 * len(bars), color=t["border"], arrow=False,
@@ -411,13 +435,22 @@ def roadmap(t):
     ] + ([("H11", "gVisor comparison", "userspace-kernel sandboxes, same machine")]
          if GV_RUN else []) + \
         ([("H12", "Fair comparisons", "Linux processes in the same VM, CRIU")]
-         if CALL_AT == "same VM" else [])
+         if CALL_AT == "same VM" else []) + \
+        ([("H13", "Adversarial security review", "12 findings fixed, docs/security.md")]
+         if SECURITY else []) + \
+        ([("H14", "Threads", f"pthreads, futexes; a thread in {us(THREADS)}")]
+         if THREADS else []) + \
+        ([("H15", "Sockets and network", "poll, epoll, TCP/UDP, virtio-net")]
+         if LOOPBACK else []) + \
+        ([("H16", "CPython in a cell", "CPython 3.13, warm templates")]
+         if CPY_WARM else [])
     now = []
-    nxt = ([] if GV_RUN else [("next", "gVisor comparison", "")]) + \
-        ([] if CALL_AT == "same VM" else [("next", "Fair comparisons", "")]) + \
-        [("next", name, "") for name in [
-            "Adversarial security review", "Threads", "Sockets and network",
-            "CPython in a cell", "Multi-core", "Dedicated benchmark machine"]]
+    nxt = [("next", name, "") for name, done_ in [
+        ("gVisor comparison", GV_RUN), ("Fair comparisons", CALL_AT == "same VM"),
+        ("Adversarial security review", SECURITY), ("Threads", THREADS),
+        ("Sockets and network", LOOPBACK), ("CPython in a cell", CPY_WARM),
+        ("Multi-core", None),
+        ("Dedicated benchmark machine", None)] if not done_]
     rows = [(r, "done") for r in done] + [(r, "now") for r in now] + \
         [(r, "next") for r in nxt]
     rh, top = 34, 92

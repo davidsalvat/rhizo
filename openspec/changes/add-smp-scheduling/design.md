@@ -134,3 +134,24 @@ the boot CPU alone, then on every CPU (`cell.parallel_us` per cell,
 interrupt, run nothing, see it done; `cell.ipi_wake_us`). `xtask` boots it
 with 4 vCPUs on every VMM after the one-CPU runs. The metrics start
 ungated: there is no baseline from CI yet, and runners share their cores.
+
+## D9. Sockets and the network card with several CPUs
+
+`add-sockets-and-poll` and `add-virtio-net` landed while this change was
+open. Their state stays where they put it: one `Net` behind a global lock,
+taken around every system call (with `SHARING` first, for cells that
+share memory). The waiting set moves into the per-CPU scheduler: any CPU
+taking a cell first wakes the waiting cells onto its own queue when the
+socket change counter moved (`Shared::net_seen`). A cell records the
+counter its last call saw, under the same `Net` lock as its readiness
+checks; filed to wait after a later change, it runs again at once
+(otherwise another CPU could wake the waiters between the check and the
+filing, and the cell would wait for a change that already happened). The
+boot CPU alone polls the network card, as before; with several CPUs an
+idle CPU looks again at least once per slice, a safety net behind the
+wake-up interrupts.
+
+Lost, for now: system calls of different cells in parallel. Every call
+holds the `Net` lock (the ABI takes `&mut Net`), so calls serialize while
+cell code runs in parallel; splitting it (sockets per cell, or a lock
+taken only by socket calls) is the next measured step.

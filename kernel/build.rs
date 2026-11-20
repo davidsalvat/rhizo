@@ -1,5 +1,8 @@
 use std::path::Path;
 
+/// Cells built only when their source is given.
+const OPTIONAL: [&str; 3] = ["micropython", "cpython", "cpython-files"];
+
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
     let script = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
@@ -37,9 +40,10 @@ fn embed_cells() {
                 }),
         );
     }
-    // MicroPython, built by `xtask` only when its source is given
-    // (`RHIZO_MICROPYTHON_SRC`); an empty image means "not built".
-    names.push("micropython".into());
+    // MicroPython and CPython (its executable and its files), built by
+    // `xtask` only when their source is given (`RHIZO_MICROPYTHON_SRC`,
+    // `RHIZO_CPYTHON_SRC`); an empty image means "not built".
+    names.extend(OPTIONAL.iter().map(|n| n.to_string()));
     names.sort();
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
@@ -57,7 +61,7 @@ fn embed_cells() {
                 println!("cargo:rerun-if-changed={}", path.display());
                 match std::fs::read(&path) {
                     Ok(data) => data,
-                    Err(_) if name == "micropython" => Vec::new(),
+                    Err(_) if OPTIONAL.contains(&name.as_str()) => Vec::new(),
                     Err(e) => panic!("{}: {e}", path.display()),
                 }
             }

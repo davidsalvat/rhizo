@@ -108,5 +108,56 @@ pub fn map_devices(
         map(d, d_len)?;
         map(r, 0x2_0000)?; // the boot CPU's; the others map theirs (`irq`)
     }
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    {
+        // Transports share pages: map each page once.
+        let (mut result, mut last) = (Ok(()), u64::MAX);
+        for_each_virtio_mmio(|base| {
+            if result.is_ok() && base & !(FRAME_SIZE - 1) != last {
+                last = base & !(FRAME_SIZE - 1);
+                result = map(base, rhizo_virtio::REGION);
+            }
+        });
+        result?;
+    }
     Ok(())
+}
+
+/// Calls `f` with the physical base of every virtio-mmio transport the
+/// device tree lists (QEMU `virt`, Firecracker).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
+    let _ = device_tree().for_each_compatible(b"virtio,mmio", |r| f(r.base));
+}
+
+/// The registers of a device at physical address `base`, mapped as device
+/// memory in the MMIO window by [`map_devices`].
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[derive(Debug)]
+pub struct Mmio(u64);
+
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+impl Mmio {
+    pub fn new(base: u64) -> Self {
+        Self(MMIO_BASE + base)
+    }
+}
+
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+impl rhizo_hal::DeviceRegisters for Mmio {
+    fn read32(&mut self, offset: usize) -> u32 {
+        // SAFETY: `map_devices` mapped the device's registers as device
+        // memory at this address; offsets stay within its region.
+        unsafe { ((self.0 + offset as u64) as *const u32).read_volatile() }
+    }
+
+    fn write32(&mut self, offset: usize, value: u32) {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *mut u32).write_volatile(value) }
+    }
+
+    fn barrier(&mut self) {
+        // SAFETY: a full-system data barrier only orders memory accesses.
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
 }

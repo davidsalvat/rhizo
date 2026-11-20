@@ -25,6 +25,9 @@ pub const USER_END: u64 = 0x0000_7fff_ffff_f000;
 pub const STACK_TOP: u64 = USER_END;
 /// Stack pages mapped when a cell starts.
 pub const STACK_PAGES: u64 = 16;
+/// Most the stack grows to below [`STACK_TOP`], a page at a time on first
+/// touch (the 8 MiB `RLIMIT_STACK` Linux gives a process).
+pub const STACK_LIMIT: u64 = 8 << 20;
 /// First address used for anonymous mappings (`mmap`).
 pub const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
 

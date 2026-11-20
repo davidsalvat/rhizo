@@ -1,7 +1,7 @@
 //! A cell's address space: anonymous mappings (with 2 MiB pages when the
 //! region allows it), unmapping, and teardown that returns every frame.
 
-use crate::USER_END;
+use crate::{STACK_LIMIT, STACK_TOP, USER_END};
 use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
@@ -81,6 +81,31 @@ pub fn map_anonymous<F: EntryFormat>(
         let _ = unmap(pt, mem, tlb, frames, addr, done);
     }
     result
+}
+
+/// Grows the stack as Linux does on a fault: maps a zeroed, writable page at
+/// `addr` when it lies within [`STACK_LIMIT`] below [`STACK_TOP`] and is not
+/// mapped yet. Returns whether it did (`false` also when no frame is left).
+pub fn grow_stack<F: EntryFormat>(
+    pt: &PageTable<F>,
+    mem: &mut impl PhysicalMemory,
+    tlb: &mut impl Tlb,
+    frames: &mut impl Frames,
+    addr: u64,
+) -> bool {
+    let rw = PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+    (STACK_TOP - STACK_LIMIT..STACK_TOP).contains(&addr)
+        && pt.translate(mem, addr).is_none()
+        && map_anonymous(
+            pt,
+            mem,
+            tlb,
+            frames,
+            addr & !(FRAME_SIZE - 1),
+            FRAME_SIZE,
+            rw,
+        )
+        .is_ok()
 }
 
 /// Unmaps every page in `addr..addr + len` (holes are skipped, a whole empty
@@ -219,6 +244,39 @@ mod tests {
         let mut frames = CountingFrames::new(1024);
         let pt = PageTable::new(&mut mem, &mut || frames.alloc()).unwrap();
         (pt, mem, RecordingTlb::default(), frames)
+    }
+
+    #[test]
+    fn stack_grows_on_touch_within_its_limit() {
+        let (pt, mut mem, mut tlb, mut frames) = setup::<X86_64>();
+        let deep = STACK_TOP - STACK_LIMIT + 12;
+        assert!(grow_stack(&pt, &mut mem, &mut tlb, &mut frames, deep));
+        let t = pt.translate(&mem, deep).expect("mapped");
+        assert!(t.flags.contains(PageFlags::WRITABLE | PageFlags::USER));
+        let mut word = [1u8; 8];
+        mem.read_bytes(t.phys, &mut word);
+        assert_eq!(word, [0; 8], "zeroed");
+        assert!(
+            !grow_stack(&pt, &mut mem, &mut tlb, &mut frames, deep + 8),
+            "already mapped"
+        );
+        for outside in [
+            STACK_TOP - STACK_LIMIT - 1,
+            STACK_TOP,
+            0x1000,
+            crate::MMAP_BASE,
+        ] {
+            assert!(!grow_stack(&pt, &mut mem, &mut tlb, &mut frames, outside));
+            assert!(pt.translate(&mem, outside).is_none());
+        }
+        frames.limit = 0; // out of frames
+        assert!(!grow_stack(
+            &pt,
+            &mut mem,
+            &mut tlb,
+            &mut frames,
+            STACK_TOP - 8
+        ));
     }
 
     fn large_regions_use_large_pages<F: EntryFormat>() {
@@ -380,7 +438,7 @@ mod tests {
         let t = child.translate(&mem, 0x40_0000).unwrap();
         if !t.flags.is_writable() {
             assert_eq!(
-                child.resolve_write(&mut mem, &mut frames, &mut tlb, 0x40_0000),
+                child.resolve_write(&mut mem, &mut frames, 0x40_0000),
                 Ok(true)
             );
         }

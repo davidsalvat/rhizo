@@ -1,0 +1,270 @@
+//! Host tests against a simulated virtio-mmio network device that reads and
+//! writes the rings in fake physical memory, as a VMM would.
+
+use super::*;
+use rhizo_hal::testing::FakePhysicalMemory;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct QueueState {
+    num: u32,
+    ready: u32,
+    desc: u64,
+    avail: u64,
+    used: u64,
+    /// Next available entry the device takes.
+    next: u16,
+}
+
+#[derive(Debug)]
+struct Device {
+    mem: FakePhysicalMemory,
+    version: u32,
+    id: u32,
+    features: [u32; 2],
+    driver: [u32; 2],
+    features_sel: usize,
+    driver_sel: usize,
+    status: u32,
+    queue_sel: usize,
+    queues: [QueueState; 2],
+    sent: Vec<Vec<u8>>,
+    notifies: [usize; 2],
+}
+
+impl Device {
+    fn new() -> Self {
+        Self {
+            mem: FakePhysicalMemory::new(),
+            version: 2,
+            id: NET_DEVICE,
+            features: [F_MAC, F_VERSION_1],
+            driver: [0; 2],
+            features_sel: 0,
+            driver_sel: 0,
+            status: 0,
+            queue_sel: 0,
+            queues: [QueueState::default(); 2],
+            sent: Vec::new(),
+            notifies: [0; 2],
+        }
+    }
+
+    fn read16(&self, at: u64) -> u16 {
+        let mut b = [0u8; 2];
+        self.mem.read_bytes(at, &mut b);
+        u16::from_le_bytes(b)
+    }
+
+    /// The next buffer the driver offered on queue `q`: (id, address, length).
+    fn next_buffer(&mut self, q: usize) -> Option<(u16, u64, u32)> {
+        let s = self.queues[q];
+        if self.read16(s.avail + 2) == s.next {
+            return None;
+        }
+        let id = self.read16(s.avail + 4 + u64::from(s.next % s.num as u16) * 2);
+        let mut d = [0u8; 16];
+        self.mem.read_bytes(s.desc + u64::from(id) * 16, &mut d);
+        self.queues[q].next = s.next.wrapping_add(1);
+        let addr = u64::from_le_bytes(d[..8].try_into().unwrap());
+        Some((id, addr, u32::from_le_bytes(d[8..12].try_into().unwrap())))
+    }
+
+    fn give_back(&mut self, q: usize, id: u16, len: u32) {
+        let s = self.queues[q];
+        let idx = self.read16(s.used + 2);
+        let slot = s.used + 4 + u64::from(idx % s.num as u16) * 8;
+        let mut e = [0u8; 8];
+        e[..4].copy_from_slice(&u32::from(id).to_le_bytes());
+        e[4..].copy_from_slice(&len.to_le_bytes());
+        self.mem.write_bytes(slot, &e);
+        self.mem
+            .write_bytes(s.used + 2, &idx.wrapping_add(1).to_le_bytes());
+    }
+
+    /// Puts `frame` in the next receive buffer; `false` if none is offered.
+    fn deliver(&mut self, frame: &[u8]) -> bool {
+        let Some((id, addr, len)) = self.next_buffer(0) else {
+            return false;
+        };
+        assert!(frame.len() + HDR <= len as usize);
+        self.mem.write_bytes(addr, &[0; HDR]);
+        self.mem.write_bytes(addr + HDR as u64, frame);
+        self.give_back(0, id, (HDR + frame.len()) as u32);
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Regs(Rc<RefCell<Device>>);
+
+impl DeviceRegisters for Regs {
+    fn read32(&mut self, offset: usize) -> u32 {
+        let d = self.0.borrow();
+        match offset {
+            reg::MAGIC => MAGIC,
+            reg::VERSION => d.version,
+            reg::DEVICE_ID => d.id,
+            reg::DEVICE_FEATURES => d.features[d.features_sel],
+            reg::QUEUE_NUM_MAX => 64,
+            reg::QUEUE_READY => d.queues[d.queue_sel].ready,
+            reg::STATUS => d.status,
+            reg::CONFIG => {
+                u32::from_le_bytes([0x52, 0x54, 0, 0x12, 0x34, 0x56][..4].try_into().unwrap())
+            }
+            o if o == reg::CONFIG + 4 => u32::from_le_bytes([0x34, 0x56, 0, 0]),
+            _ => 0,
+        }
+    }
+
+    fn write32(&mut self, offset: usize, value: u32) {
+        let mut d = self.0.borrow_mut();
+        let q = d.queue_sel;
+        let set_low = |r: &mut u64, v: u32| *r = (*r & !0xffff_ffff) | u64::from(v);
+        let set_high = |r: &mut u64, v: u32| *r = (*r & 0xffff_ffff) | u64::from(v) << 32;
+        match offset {
+            reg::DEVICE_FEATURES_SEL => d.features_sel = value as usize,
+            reg::DRIVER_FEATURES_SEL => d.driver_sel = value as usize,
+            reg::DRIVER_FEATURES => {
+                let sel = d.driver_sel;
+                d.driver[sel] = value;
+            }
+            reg::STATUS => {
+                // FEATURES_OK only sticks if the driver took VERSION_1.
+                let refused = value & FEATURES_OK != 0 && d.driver[1] & F_VERSION_1 == 0;
+                d.status = if refused { value & !FEATURES_OK } else { value };
+            }
+            reg::QUEUE_SEL => d.queue_sel = value as usize,
+            reg::QUEUE_NUM => d.queues[q].num = value,
+            reg::QUEUE_READY => d.queues[q].ready = value,
+            reg::QUEUE_DESC_LOW => set_low(&mut d.queues[q].desc, value),
+            reg::QUEUE_DESC_HIGH => set_high(&mut d.queues[q].desc, value),
+            reg::QUEUE_DRIVER_LOW => set_low(&mut d.queues[q].avail, value),
+            reg::QUEUE_DRIVER_HIGH => set_high(&mut d.queues[q].avail, value),
+            reg::QUEUE_DEVICE_LOW => set_low(&mut d.queues[q].used, value),
+            reg::QUEUE_DEVICE_HIGH => set_high(&mut d.queues[q].used, value),
+            reg::QUEUE_NOTIFY => {
+                d.notifies[value as usize] += 1;
+                // The transmit queue: send everything offered.
+                while value == 1
+                    && let Some((id, addr, len)) = d.next_buffer(1)
+                {
+                    let mut frame = vec![0u8; len as usize - HDR];
+                    d.mem.read_bytes(addr + HDR as u64, &mut frame);
+                    d.sent.push(frame);
+                    d.give_back(1, id, 0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn barrier(&mut self) {}
+}
+
+#[derive(Debug, Clone)]
+struct Mem(Rc<RefCell<Device>>);
+
+impl PhysicalMemory for Mem {
+    fn read_u64(&self, phys: u64) -> u64 {
+        self.0.borrow().mem.read_u64(phys)
+    }
+    fn write_u64(&mut self, phys: u64, value: u64) {
+        self.0.borrow_mut().mem.write_u64(phys, value);
+    }
+}
+
+fn frames() -> impl FnMut() -> Option<u64> {
+    let mut next = 0x10_0000u64;
+    move || {
+        next += FRAME;
+        Some(next)
+    }
+}
+
+type Probed = Result<VirtioNet<Regs, Mem>, ProbeError>;
+
+fn card(device: Device) -> (Probed, Rc<RefCell<Device>>) {
+    let shared = Rc::new(RefCell::new(device));
+    let card = VirtioNet::probe(Regs(shared.clone()), Mem(shared.clone()), &mut frames());
+    (card, shared)
+}
+
+#[test]
+fn probe_negotiates_and_sets_up_both_queues() {
+    let (card, dev) = card(Device::new());
+    let card = card.unwrap();
+    assert_eq!(card.mac(), [0x52, 0x54, 0, 0x12, 0x34, 0x56]);
+    let d = dev.borrow();
+    assert_eq!(d.status, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+    assert_eq!(d.driver, [F_MAC, F_VERSION_1]);
+    for q in d.queues {
+        assert_eq!((q.num, q.ready), (u32::from(QUEUE_SIZE), 1));
+        assert_eq!(q.desc % FRAME, 0);
+    }
+    assert_eq!(
+        d.read16(d.queues[0].avail + 2),
+        QUEUE_SIZE,
+        "every receive buffer is offered"
+    );
+    assert_eq!(d.notifies, [1, 0]);
+}
+
+#[test]
+fn frames_go_out_and_descriptors_come_back() {
+    let (card, dev) = card(Device::new());
+    let mut card = card.unwrap();
+    for i in 0..100u8 {
+        assert!(card.send(&[i; 60]));
+    }
+    let d = dev.borrow();
+    assert_eq!(d.sent.len(), 100, "more frames than descriptors");
+    assert_eq!(d.sent[99], [99; 60]);
+    drop(d);
+    assert!(!card.send(&vec![0; FRAME_MAX + 1]), "too large");
+}
+
+#[test]
+fn received_frames_come_in_order_and_buffers_are_reused() {
+    let (card, dev) = card(Device::new());
+    let mut card = card.unwrap();
+    let mut got = Vec::new();
+    assert!(!card.recv(&mut |f| got.push(f.to_vec())));
+    for round in 0..10u8 {
+        for i in 0..20u8 {
+            assert!(dev.borrow_mut().deliver(&[round, i, 1, 2, 3]));
+        }
+        while card.recv(&mut |f| got.push(f.to_vec())) {}
+    }
+    assert_eq!(got.len(), 200, "more frames than buffers");
+    assert_eq!(got[199], [9, 19, 1, 2, 3]);
+    assert_eq!(got[0], [0, 0, 1, 2, 3]);
+}
+
+#[test]
+fn probe_refuses_what_it_cannot_drive() {
+    let mut d = Device::new();
+    d.version = 1;
+    assert_eq!(card(d).0.err(), Some(ProbeError::Version(1)));
+    let mut d = Device::new();
+    d.id = 0;
+    assert_eq!(card(d).0.err(), Some(ProbeError::NotNet(0)));
+    let mut d = Device::new();
+    d.features = [F_MAC, 0];
+    assert_eq!(card(d).0.err(), Some(ProbeError::Features));
+    let shared = Rc::new(RefCell::new(Device::new()));
+    let mut none = || None;
+    assert_eq!(
+        VirtioNet::probe(Regs(shared.clone()), Mem(shared), &mut none).err(),
+        Some(ProbeError::OutOfMemory)
+    );
+}
+
+#[test]
+fn without_a_mac_feature_the_address_is_local() {
+    let mut d = Device::new();
+    d.features = [0, F_VERSION_1];
+    let card = card(d).0.unwrap();
+    assert_eq!(card.mac(), [0x02, 0, 0, 0, 0, 1]);
+}

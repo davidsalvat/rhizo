@@ -38,6 +38,8 @@ rhizo-abi = { path = "../crates/rhizo-abi" }
 rhizo-sched = { path = "../crates/rhizo-sched" }
 rhizo-snapshot = { path = "../crates/rhizo-snapshot" }
 rhizo-fs = { path = "../crates/rhizo-fs" }
+rhizo-net = { path = "../crates/rhizo-net" }
+rhizo-virtio = { path = "../crates/rhizo-virtio" }
 
 [lints]
 workspace = true

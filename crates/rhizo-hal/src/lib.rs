@@ -94,14 +94,66 @@ pub trait Tlb {
     fn flush_page(&mut self, virt: u64);
 }
 
+/// The registers of a memory-mapped device: 32-bit, little endian, at byte
+/// offsets from its base.
+pub trait DeviceRegisters {
+    /// Reads the register at `offset`.
+    fn read32(&mut self, offset: usize) -> u32;
+    /// Writes `value` to the register at `offset`.
+    fn write32(&mut self, offset: usize, value: u32);
+    /// Orders memory accesses: what was written to memory before is seen
+    /// by the device before any later register access, and what the device
+    /// wrote before is seen by later reads.
+    fn barrier(&mut self);
+}
+
+/// A network card: sends and receives Ethernet frames.
+pub trait NetLink {
+    /// The card's MAC address.
+    fn mac(&self) -> [u8; 6];
+    /// Queues `frame` for sending; `false` if the card has no room now (the
+    /// frame is dropped, as a full wire would).
+    fn send(&mut self, frame: &[u8]) -> bool;
+    /// Hands the next received frame to `take`; `false` if none is waiting.
+    fn recv(&mut self, take: &mut dyn FnMut(&[u8])) -> bool;
+}
+
 /// In-memory test doubles for host tests.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use super::{Console, CycleCounter, PhysicalMemory, Tlb};
+    use super::{Console, CycleCounter, NetLink, PhysicalMemory, Tlb};
     use std::cell::Cell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::string::String;
     use std::vec::Vec;
+
+    /// A network card whose wire is two queues: what it sends goes to
+    /// `sent`, what is put in `inbox` it receives.
+    #[derive(Debug, Default)]
+    pub struct QueueLink {
+        pub mac: [u8; 6],
+        pub sent: VecDeque<Vec<u8>>,
+        pub inbox: VecDeque<Vec<u8>>,
+    }
+
+    impl NetLink for QueueLink {
+        fn mac(&self) -> [u8; 6] {
+            self.mac
+        }
+        fn send(&mut self, frame: &[u8]) -> bool {
+            self.sent.push_back(frame.to_vec());
+            true
+        }
+        fn recv(&mut self, take: &mut dyn FnMut(&[u8])) -> bool {
+            match self.inbox.pop_front() {
+                Some(frame) => {
+                    take(&frame);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
 
     /// A console that records everything written to it.
     #[derive(Debug, Default)]
@@ -209,7 +261,9 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{FakePhysicalMemory, ManualCycleCounter, RecordingConsole, RecordingTlb};
+    use super::testing::{
+        FakePhysicalMemory, ManualCycleCounter, QueueLink, RecordingConsole, RecordingTlb,
+    };
     use super::*;
     use core::fmt::Write;
 
@@ -260,6 +314,18 @@ mod tests {
         tlb.flush_page(0x4000);
         tlb.flush_page(0x8000);
         assert_eq!(tlb.flushed, vec![0x4000, 0x8000]);
+    }
+
+    #[test]
+    fn queue_link_moves_frames() {
+        let mut link = QueueLink::default();
+        assert!(link.send(b"out"));
+        assert_eq!(link.sent.pop_front().unwrap(), b"out");
+        link.inbox.push_back(b"in".to_vec());
+        let mut got = Vec::new();
+        assert!(link.recv(&mut |f| got.extend_from_slice(f)));
+        assert_eq!(got, b"in");
+        assert!(!link.recv(&mut |_| {}));
     }
 
     #[test]

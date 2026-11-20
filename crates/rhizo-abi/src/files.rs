@@ -17,7 +17,6 @@ const O_TRUNC: u64 = 0x200;
 const O_APPEND: u64 = 0x400;
 const O_CLOEXEC: u64 = 0x8_0000;
 const PATH_MAX: usize = 4096;
-const ESPIPE: i64 = 29;
 const ERANGE: i64 = 34;
 const ENOSPC: i64 = 28;
 /// Kernel heap a new name and inode may take (an estimate, on the high
@@ -28,7 +27,7 @@ const NAME_BYTES: u64 = 512;
 /// fewer entries per call, as Linux allows).
 const DIRENTS_MAX: u64 = 64 << 10;
 
-fn err(e: Error) -> i64 {
+pub(crate) fn err(e: Error) -> i64 {
     -e.errno()
 }
 
@@ -81,7 +80,7 @@ fn piece(addr: u64, left: u64) -> usize {
 }
 
 /// `read`/`pread64` (with `offset`) and the reading half of `readv`.
-pub(crate) fn read<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn read<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     addr: u64,
@@ -91,9 +90,13 @@ pub(crate) fn read<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     let fd = fd as u32;
     match cx.fs.kind(fd) {
         Err(e) => return err(e),
-        Ok(Kind::Console) if offset.is_some() => return -ESPIPE,
+        Ok(Kind::File | Kind::Dir) => {}
+        Ok(_) if offset.is_some() => return -ESPIPE,
         Ok(Kind::Console) => return 0, // standard input is empty
-        Ok(_) => {}
+        Ok(Kind::Pipe) => return poll::read_pipe(cx, fd, addr, len),
+        Ok(Kind::Event) => return poll::read_event(cx, fd, addr, len),
+        Ok(Kind::Socket) => return sockets::recv(cx, fd, addr, len, 0),
+        Ok(Kind::Epoll) => return -EINVAL,
     }
     let start = match cx.fs.read_position(fd, offset) {
         Ok(at) => at,
@@ -135,9 +138,13 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     let fd = fd as u32;
     match cx.fs.kind(fd) {
         Err(e) => return err(e),
-        Ok(Kind::Console) if offset.is_some() => return -ESPIPE,
+        Ok(Kind::File | Kind::Dir) => {}
+        Ok(_) if offset.is_some() => return -ESPIPE,
         Ok(Kind::Console) => return console(cx, addr, len),
-        Ok(_) => {}
+        Ok(Kind::Pipe) => return poll::write_pipe(cx, fd, addr, len),
+        Ok(Kind::Event) => return poll::write_event(cx, fd, addr, len),
+        Ok(Kind::Socket) => return sockets::send(cx, fd, addr, len, 0),
+        Ok(Kind::Epoll) => return -EINVAL,
     }
     let start = match cx.fs.write_position(fd, offset) {
         Ok(at) => at,
@@ -248,11 +255,11 @@ pub(crate) fn lseek<F, M, T, A, S>(
     };
     match cx.fs.kind(fd as u32) {
         Err(e) => err(e),
-        Ok(Kind::Console) => -ESPIPE,
-        Ok(_) => match cx.fs.seek(fd as u32, offset as i64, whence) {
+        Ok(Kind::File | Kind::Dir) => match cx.fs.seek(fd as u32, offset as i64, whence) {
             Ok(at) => at as i64,
             Err(e) => err(e),
         },
+        Ok(_) => -ESPIPE,
     }
 }
 
@@ -271,10 +278,12 @@ pub(crate) fn ftruncate<F, M, T, A, S>(
     }
 }
 
-/// `fsync`/`fdatasync`: files live in memory; only the descriptor is checked.
+/// `fsync`/`fdatasync`: files live in memory; only the descriptor is checked
+/// (pipes, sockets and other objects cannot be synced).
 pub(crate) fn fsync<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, fd: u64) -> i64 {
     match cx.fs.kind(fd as u32) {
-        Ok(_) => 0,
+        Ok(Kind::File | Kind::Dir | Kind::Console) => 0,
+        Ok(_) => -EINVAL,
         Err(e) => err(e),
     }
 }
@@ -323,7 +332,7 @@ pub(crate) fn fcntl<F, M, T, A, S>(
         1 => done(cx.fs.cloexec(fd32, None).map(i64::from)), // F_GETFD
         2 => done(cx.fs.cloexec(fd32, Some(arg & FD_CLOEXEC != 0)).map(|_| 0)), // F_SETFD
         3 => done(cx.fs.status_flags(fd32).map(i64::from)),  // F_GETFL
-        4 => done(cx.fs.set_append(fd32, arg & O_APPEND != 0).map(|_| 0)), // F_SETFL
+        4 => done(cx.fs.set_status_flags(fd32, arg as u32).map(|_| 0)), // F_SETFL
         _ => match cx.fs.kind(fd32) {
             Err(e) => err(e),
             Ok(_) => -EINVAL,
@@ -333,13 +342,18 @@ pub(crate) fn fcntl<F, M, T, A, S>(
 
 /// `struct stat` in each architecture's layout; `None` is the console.
 fn stat_bytes(arch: Arch, stat: Option<Stat>) -> ([u8; 144], usize) {
+    const S_IFIFO: u64 = 0o010_000;
     const S_IFCHR: u64 = 0o020_000;
     const S_IFDIR: u64 = 0o040_000;
     const S_IFREG: u64 = 0o100_000;
+    const S_IFSOCK: u64 = 0o140_000;
     let (ino, mode, links, size) = match stat {
         None => (1, S_IFCHR | 0o620, 1, 0),
         Some(s) => match s.kind {
             Kind::Dir => (s.ino, S_IFDIR | 0o755, s.links, s.size),
+            Kind::Pipe => (s.ino, S_IFIFO | 0o600, s.links, s.size),
+            Kind::Socket => (s.ino, S_IFSOCK | 0o777, s.links, s.size),
+            Kind::Event | Kind::Epoll => (s.ino, 0o600, s.links, s.size),
             _ => (s.ino, S_IFREG | 0o644, s.links, s.size),
         },
     };
@@ -442,9 +456,11 @@ pub(crate) fn getdents64<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     addr: u64,
     count: u64,
 ) -> i64 {
+    const DT_FIFO: u8 = 1;
     const DT_CHR: u8 = 2;
     const DT_DIR: u8 = 4;
     const DT_REG: u8 = 8;
+    const DT_SOCK: u8 = 12;
     let count = count.min(DIRENTS_MAX);
     let mut out = Vec::new();
     let mut next = 0u64;
@@ -464,6 +480,9 @@ pub(crate) fn getdents64<F: EntryFormat, M: PhysicalMemory, T, A, S>(
             Kind::Dir => DT_DIR,
             Kind::File => DT_REG,
             Kind::Console => DT_CHR,
+            Kind::Socket => DT_SOCK,
+            Kind::Pipe => DT_FIFO,
+            Kind::Event | Kind::Epoll => 0,
         });
         out.extend_from_slice(&e.name);
         out.resize(out.len() + reclen - 19 - e.name.len(), 0);

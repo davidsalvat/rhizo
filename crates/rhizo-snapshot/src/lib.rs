@@ -18,7 +18,10 @@
 //!                                                     (24 bytes each)
 //! data     page contents, in record order
 //! files    length u64, then the cell's file system as `rhizo_fs` encodes
-//!          it (tree, open descriptions and descriptors, working directory)
+//!          it (tree, open descriptions and descriptors, pipes, event
+//!          counters, `epoll` instances, working directory)
+//! sockets  length u64, then one record per socket as `rhizo_net` encodes
+//!          them; a socket descriptor's index is its record's
 //! ```
 //!
 //! Every value is little endian; records are sorted by address.
@@ -35,10 +38,11 @@ use rhizo_cell::{Cell, Registers, USER_END};
 use rhizo_fs::Fs;
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
+use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 const HEADER: usize = 24;
 const STATE: usize = 4 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.
@@ -67,6 +71,9 @@ pub enum FormatError {
     BadThread { index: usize },
     /// The files section does not decode to a consistent file system.
     BadFiles,
+    /// The sockets section does not decode, or its records do not match
+    /// the socket descriptors one to one.
+    BadSockets,
     /// Registers the kernel cannot enter safely: a program counter (or, on
     /// x86_64, a thread pointer) outside the cell's addresses, or reserved
     /// `MXCSR` bits, any of which would fault in the kernel itself.
@@ -129,7 +136,10 @@ fn decode_flags(b: u8) -> Option<PageFlags> {
 fn thread_words(t: &Thread, now: u64) -> impl Iterator<Item = u64> + '_ {
     let left = |until: u64| until.saturating_sub(now).max(1);
     let (kind, addr, bitset, time) = match t.wait {
-        Wait::Ready => (0, 0, 0, NO_DEADLINE),
+        // A thread waiting on descriptors is back at its system-call
+        // instruction: it runs and makes its call again (design D3 of
+        // `add-sockets-and-poll`).
+        Wait::Ready | Wait::Io { .. } => (0, 0, 0, NO_DEADLINE),
         Wait::Sleep(until) => (1, 0, 0, left(until)),
         Wait::Futex {
             addr,
@@ -158,11 +168,13 @@ impl Snapshot {
     /// Captures `cell` (not running) and the user half of its page table,
     /// copying every page; its threads' deadlines are kept as time left
     /// after monotonic time `now`. The cell's memory is left as it was; the
-    /// caller frees it.
+    /// caller frees it. `files` refers to its sockets by index in
+    /// `sockets`.
     pub fn capture<F: EntryFormat>(
         machine: Machine,
         cell: &Cell,
         files: &Fs,
+        sockets: &[Record],
         now: u64,
         mem: &impl PhysicalMemory,
     ) -> Self {
@@ -176,8 +188,10 @@ impl Snapshot {
         let data_start = HEADER + STATE + threads * THREAD + pages * RECORD;
         let mut encoded = Vec::new();
         files.encode(&mut encoded);
+        let mut records = Vec::new();
+        rhizo_net::encode_records(sockets, &mut records);
         // Sized once: growing past the pages would copy them all again.
-        let mut b = Vec::with_capacity(data_start + data_len + 8 + encoded.len());
+        let mut b = Vec::with_capacity(data_start + data_len + 16 + encoded.len() + records.len());
         b.extend_from_slice(MAGIC);
         b.extend_from_slice(&VERSION.to_le_bytes());
         b.extend_from_slice(&(machine as u16).to_le_bytes());
@@ -212,6 +226,8 @@ impl Snapshot {
         });
         b.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
         b.extend_from_slice(&encoded);
+        b.extend_from_slice(&(records.len() as u64).to_le_bytes());
+        b.extend_from_slice(&records);
         Self { bytes: b }
     }
 
@@ -272,10 +288,31 @@ impl Snapshot {
         }
         let files_at = data_start as u64 + expected_offset;
         let len = snapshot.bytes.len() as u64;
-        if len < files_at + 8 || len - files_at - 8 != u64_at(&snapshot.bytes, files_at as usize) {
+        if len < files_at + 8 {
             return Err(FormatError::Truncated);
         }
-        Fs::decode(snapshot.files_bytes()).map_err(|_| FormatError::BadFiles)?;
+        let sockets_at = u64_at(&snapshot.bytes, files_at as usize)
+            .checked_add(files_at + 8)
+            .ok_or(FormatError::Truncated)?;
+        if len < sockets_at.saturating_add(8)
+            || len - sockets_at - 8 != u64_at(&snapshot.bytes, sockets_at as usize)
+        {
+            return Err(FormatError::Truncated);
+        }
+        let fs = Fs::decode(snapshot.files_bytes()).map_err(|_| FormatError::BadFiles)?;
+        let records = rhizo_net::decode_records(snapshot.sockets_bytes())
+            .map_err(|_| FormatError::BadSockets)?;
+        // Each record is held by exactly one description.
+        let mut held = alloc::vec![false; records.len()];
+        for i in fs.sockets() {
+            match held.get_mut(i as usize) {
+                Some(h) if !*h => *h = true,
+                _ => return Err(FormatError::BadSockets),
+            }
+        }
+        if held.contains(&false) {
+            return Err(FormatError::BadSockets);
+        }
         Ok(snapshot)
     }
 
@@ -402,8 +439,8 @@ impl Snapshot {
             .unwrap_or_else(|| Threads::new(Thread::new(1, Registers::default())))
     }
 
-    /// The encoded file system (after the page data and its length).
-    pub fn files_bytes(&self) -> &[u8] {
+    /// Where the files section starts (its length).
+    fn files_at(&self) -> usize {
         let pages = self.page_count();
         let data_start = self.records() + pages * RECORD;
         // Pages are stored in record order: the data ends after the last.
@@ -411,7 +448,26 @@ impl Snapshot {
             let page = self.page(last);
             u64_at(&self.bytes, self.records() + last * RECORD + 8) + page.size.bytes()
         });
-        &self.bytes[data_start + data_len as usize + 8..]
+        data_start + data_len as usize
+    }
+
+    /// The encoded file system (after the page data and its length).
+    pub fn files_bytes(&self) -> &[u8] {
+        let at = self.files_at();
+        &self.bytes[at + 8..at + 8 + u64_at(&self.bytes, at) as usize]
+    }
+
+    /// The encoded socket records (after the file system and their length).
+    fn sockets_bytes(&self) -> &[u8] {
+        let at = self.files_at();
+        &self.bytes[at + 16 + u64_at(&self.bytes, at) as usize..]
+    }
+
+    /// The records of the cell's sockets, in the order its descriptors
+    /// refer to them.
+    pub fn sockets(&self) -> Vec<Record> {
+        // Validated by `from_bytes` or written by `capture`.
+        rhizo_net::decode_records(self.sockets_bytes()).unwrap_or_default()
     }
 
     /// The cell's file system, open descriptors and working directory.

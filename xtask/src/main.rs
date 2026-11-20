@@ -7,8 +7,10 @@
 mod arch;
 mod bench;
 mod compare;
+mod cpython;
 mod deps;
 mod differential;
+mod hostnet;
 mod refguest;
 mod report;
 mod tools;
@@ -244,6 +246,7 @@ impl RunArgs {
             echo: true,
             accel: self.accel,
             gdb: self.gdb,
+            network: false,
             cpus: 1,
         }
     }
@@ -371,7 +374,14 @@ fn cmd_test(args: &RunArgs) -> Result {
     if args.wants("ktest") {
         step("in-kernel tests");
         let kernel = build_kernel(Profile::Debug, &["ktest"])?;
-        let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
+        let run = vmm::run(
+            args.vmm,
+            &Guest::Rhizo(kernel),
+            RunOptions {
+                network: true,
+                ..opts
+            },
+        )?;
         check_vm(
             run.result == VmResult::Passed && run.output.contains("test result: ok."),
             VmCheck {
@@ -388,6 +398,7 @@ fn cmd_test(args: &RunArgs) -> Result {
         step(&format!("in-kernel tests on {SMP_CPUS} CPUs"));
         let kernel = build_kernel(Profile::Debug, &["ktest"])?;
         let smp = RunOptions {
+            network: true,
             cpus: SMP_CPUS,
             ..opts
         };
@@ -780,6 +791,7 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     let out = dir.join(target).join("release");
     build_c_cells(&out)?;
     build_micropython(&out)?;
+    cpython::build(&out)?;
     Ok(out)
 }
 

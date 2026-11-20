@@ -14,6 +14,8 @@
 
 - [x] 2.6 Heap window for large allocations when no contiguous run is left (D7); in-kernel test with every other frame taken; `memory_pressure_fails_cells_not_the_kernel` floods with 16 MiB cells so memory overflows whatever the order cells run in on several CPUs; verify `cargo xtask test` and `ktest-smp` on both architectures
 
+- [x] 2.7 Merge `main` (sockets, virtio-net, CPython): waiting set per CPU, counter seen by a cell's last call, network card polled by the boot CPU (D9); verify `cargo xtask test` and `ktest-smp` (repeated) on both architectures
+
 ## 3. Benchmarks and documentation
 
 - [x] 3.1 `rhizo-smp` line of `bench-cell` with several CPUs, `cell.parallel_us`, `cell.scaling_pct`, `cell.ipi_wake_us` parsed by `xtask` with a unit test, `bench/README.md` (D8); verify `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference` locally

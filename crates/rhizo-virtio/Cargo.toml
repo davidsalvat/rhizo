@@ -1,0 +1,19 @@
+[package]
+name = "rhizo-virtio"
+description = "virtio-mmio network device driver for Rhizo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Not published to crates.io (workspace path dependencies only).
+publish = false
+
+[dependencies]
+rhizo-hal = { path = "../rhizo-hal" }
+
+[dev-dependencies]
+rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
+
+[lints]
+workspace = true

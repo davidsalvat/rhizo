@@ -247,6 +247,9 @@ pub struct RunOptions {
     pub accel: Accel,
     /// Wait for gdb (QEMU only).
     pub gdb: bool,
+    /// Give a Rhizo guest a network card and a host echo server where the
+    /// VMM allows it (`hostnet`).
+    pub network: bool,
     /// Virtual CPUs of the VM.
     pub cpus: u32,
 }
@@ -262,7 +265,7 @@ pub fn parse_ready_cycles(output: &str) -> Option<u64> {
 fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
     match vmm {
         Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
-        Vmm::Firecracker => firecracker_command(guest, scratch, opts.cpus),
+        Vmm::Firecracker => firecracker_command(guest, opts, scratch),
         Vmm::CloudHypervisor => cloud_hypervisor_command(guest, opts.cpus),
     }
 }
@@ -292,6 +295,13 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
     // legacy timers or interrupt controller; Linux needs them to calibrate its
     // clock when KVM's paravirtual clock is not available.
     match (vmm, guest) {
+        // Without ACPI, `microvm` lists its virtio-mmio devices on the
+        // kernel command line (`virtio_mmio.device=`), where Rhizo finds its
+        // network card.
+        (Vmm::QemuMicrovm, Guest::Rhizo(_)) if opts.network => cmd.args([
+            "-M",
+            "microvm,rtc=off,pit=off,pic=off,isa-serial=on,acpi=off",
+        ]),
         (Vmm::QemuMicrovm, Guest::Rhizo(_)) => {
             cmd.args(["-M", "microvm,rtc=off,pit=off,pic=off,isa-serial=on"])
         }
@@ -326,9 +336,21 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
             } else {
                 cmd.args(["-debugcon", "stdio", "-serial", "none"]);
             }
-            cmd.arg("-kernel")
-                .arg(kernel)
-                .args(["-append", vmm.rhizo_cmdline(kvm)]);
+            let mut args = vmm.rhizo_cmdline(kvm).to_string();
+            if opts.network
+                && let crate::hostnet::Network::Qemu { cmdline } = crate::hostnet::for_vmm(vmm)
+            {
+                // A modern virtio-mmio network card on the user network.
+                cmd.args([
+                    "-netdev",
+                    "user,id=n0",
+                    "-device",
+                    "virtio-net-device,netdev=n0",
+                ])
+                .args(["-global", "virtio-mmio.force-legacy=false"]);
+                args += &cmdline;
+            }
+            cmd.arg("-kernel").arg(kernel).args(["-append", &args]);
         }
         Guest::ReferenceLinux { kernel, initramfs } => {
             cmd.args(["-serial", "stdio"])
@@ -345,26 +367,42 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
     cmd
 }
 
-fn firecracker_command(guest: &Guest, scratch: &Path, cpus: u32) -> Result<Command> {
+fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
     let binary = tools::firecracker()?;
-    let (kernel, initrd, args) = match guest {
-        Guest::Rhizo(kernel) => (kernel.clone(), None, Vmm::Firecracker.rhizo_cmdline(true)),
+    let (kernel, initrd, mut args) = match guest {
+        Guest::Rhizo(kernel) => (
+            kernel.clone(),
+            None,
+            Vmm::Firecracker.rhizo_cmdline(true).to_string(),
+        ),
         Guest::ReferenceLinux { kernel, initramfs } => (
             kernel.clone(),
             Some(initramfs.clone()),
-            linux_cmdline(Vmm::Firecracker),
+            linux_cmdline(Vmm::Firecracker).to_string(),
         ),
     };
+    let mut interfaces = String::new();
+    if opts.network
+        && matches!(guest, Guest::Rhizo(_))
+        && let crate::hostnet::Network::Firecracker { tap, cmdline } =
+            crate::hostnet::for_vmm(Vmm::Firecracker)
+    {
+        interfaces = format!(
+            "{{\"iface_id\": \"net0\", \"host_dev_name\": {tap:?}, \"guest_mac\": \"06:00:ac:10:00:02\"}}"
+        );
+        args += &cmdline;
+    }
     let initrd_json = match &initrd {
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
         None => String::new(),
     };
     let config = format!(
         "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}{initrd_json}}}, \
-         \"drives\": [], \
-         \"machine-config\": {{\"vcpu_count\": {cpus}, \"mem_size_mib\": 128}}}}",
+         \"drives\": [], \"network-interfaces\": [{interfaces}], \
+         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": 128}}}}",
         kernel.display().to_string(),
-        args
+        args,
+        opts.cpus
     );
     let path = scratch.join(format!("firecracker-{}.json", std::process::id()));
     fs::write(&path, config).map_err(|e| format!("cannot write {}: {e}", path.display()))?;

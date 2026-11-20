@@ -3,6 +3,8 @@
 use crate::memory::DirectMap;
 use rhizo_mm::memmap::{BootInfo, RegionKind};
 use rhizo_mm::paging::{MapError, PageTable};
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+use rhizo_mm::paging::{PageFlags, PageSize};
 
 /// Page-table entry format of this architecture.
 pub type Format = rhizo_mm::paging::X86_64;
@@ -39,10 +41,77 @@ pub fn for_each_reserved(mut f: impl FnMut(u64, u64)) {
 }
 
 /// Maps device memory the kernel keeps using after the switch to its own
-/// tables. x86_64 uses port I/O for its console and exit device: nothing.
+/// tables. x86_64 uses port I/O for its console and exit device; builds
+/// that run cells map the virtio-mmio transports, uncached, where the
+/// direct map would have them.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(unused_variables, reason = "nothing to map without cells")
+)]
 pub fn map_devices(
-    _pt: &PageTable<Format>,
-    _alloc: &mut impl FnMut() -> Option<u64>,
+    pt: &PageTable<Format>,
+    alloc: &mut impl FnMut() -> Option<u64>,
 ) -> Result<(), MapError> {
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    {
+        let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
+        // Transports share pages: map each page once.
+        let (mut result, mut last) = (Ok(()), u64::MAX);
+        for_each_virtio_mmio(|base| {
+            let page = base & !0xfff;
+            if result.is_ok() && page != last {
+                last = page;
+                result = pt.map(
+                    &mut DirectMap,
+                    alloc,
+                    DirectMap::virt(page),
+                    page,
+                    PageSize::Small,
+                    flags,
+                );
+            }
+        });
+        result?;
+    }
     Ok(())
+}
+
+/// Calls `f` with the physical base of every virtio-mmio transport the
+/// command line lists (`virtio_mmio.device=`, from QEMU `microvm` and
+/// Firecracker).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
+    let mut buf = [0u8; 1024];
+    rhizo_core::options::virtio_mmio_devices(cmdline(&mut buf), |base, _| f(base));
+}
+
+/// The registers of a device at physical address `base`, mapped uncached
+/// by [`map_devices`].
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[derive(Debug)]
+pub struct Mmio(u64);
+
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+impl Mmio {
+    pub fn new(base: u64) -> Self {
+        Self(DirectMap::virt(base))
+    }
+}
+
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+impl rhizo_hal::DeviceRegisters for Mmio {
+    fn read32(&mut self, offset: usize) -> u32 {
+        // SAFETY: `map_devices` mapped the device's registers uncached at
+        // this address; offsets stay within its region.
+        unsafe { ((self.0 + offset as u64) as *const u32).read_volatile() }
+    }
+
+    fn write32(&mut self, offset: usize, value: u32) {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *mut u32).write_volatile(value) }
+    }
+
+    fn barrier(&mut self) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
 }
