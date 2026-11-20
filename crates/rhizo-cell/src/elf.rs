@@ -8,7 +8,7 @@ use crate::space::{self, Frames};
 use crate::{STACK_PAGES, STACK_TOP, USER_END};
 use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
-use rhizo_mm::{FRAME_SIZE, align_down, align_up};
+use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_down, align_up};
 
 /// ELF machine numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,22 +295,38 @@ impl<'a> Image<'a> {
 
     /// Maps every segment into `pt` with fresh zeroed frames and copies the
     /// file contents (the rest of each segment, its `.bss`, stays zero).
+    /// Each 2 MiB-aligned 2 MiB piece that lies wholly in one segment gets a
+    /// 2 MiB page when a 2 MiB frame is free (design D1 of
+    /// `add-large-image-pages`); the rest gets 4 KiB pages.
     pub fn load<F: EntryFormat>(
         &self,
         pt: &PageTable<F>,
         mem: &mut impl PhysicalMemory,
-        alloc: &mut impl FnMut() -> Option<u64>,
+        frames: &mut impl Frames,
     ) -> Result<(), ElfError> {
         for s in self.segments() {
-            let first = align_down(s.vaddr, FRAME_SIZE);
-            for page in
-                (first..align_up(s.vaddr + s.mem_size, FRAME_SIZE)).step_by(FRAME_SIZE as usize)
-            {
-                let frame = alloc().ok_or(ElfError::OutOfMemory)?;
-                mem.zero_frame(frame);
+            let end = align_up(s.vaddr + s.mem_size, FRAME_SIZE);
+            let mut page = align_down(s.vaddr, FRAME_SIZE);
+            while page < end {
+                let large = if page.is_multiple_of(LARGE_PAGE_SIZE) && end - page >= LARGE_PAGE_SIZE
+                {
+                    frames.alloc_large()
+                } else {
+                    None
+                };
+                let (frame, size) = match large {
+                    Some(frame) => (frame, PageSize::Large),
+                    None => (
+                        frames.alloc().ok_or(ElfError::OutOfMemory)?,
+                        PageSize::Small,
+                    ),
+                };
+                for f in (frame..frame + size.bytes()).step_by(FRAME_SIZE as usize) {
+                    mem.zero_frame(f);
+                }
                 // Bytes of the file that fall in this page.
                 let lo = page.max(s.vaddr);
-                let hi = (page + FRAME_SIZE).min(s.vaddr + s.file_size);
+                let hi = (page + size.bytes()).min(s.vaddr + s.file_size);
                 if hi > lo {
                     let from = (s.file_offset + (lo - s.vaddr)) as usize;
                     write_bytes(
@@ -319,11 +335,14 @@ impl<'a> Image<'a> {
                         &self.data[from..from + (hi - lo) as usize],
                     );
                 }
-                pt.map(mem, alloc, page, frame, PageSize::Small, s.flags)
-                    .map_err(|e| match e {
+                if let Err(e) = pt.map(mem, &mut || frames.alloc(), page, frame, size, s.flags) {
+                    frames.free(frame, size);
+                    return Err(match e {
                         MapError::OutOfFrames => ElfError::OutOfMemory,
                         _ => ElfError::BadSegment { vaddr: s.vaddr },
-                    })?;
+                    });
+                }
+                page += size.bytes();
             }
         }
         Ok(())
@@ -568,6 +587,7 @@ pub fn build_stack<F: EntryFormat>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::testing::CountingFrames;
     use rhizo_hal::testing::FakePhysicalMemory;
     use rhizo_mm::paging::Aarch64;
 
@@ -735,14 +755,73 @@ pub(crate) mod tests {
         }
     }
 
+    /// Whole 2 MiB-aligned pieces of a segment get 2 MiB pages, the rest
+    /// 4 KiB pages, with the file's bytes where they belong in both; with no
+    /// 2 MiB frame free, 4 KiB pages only.
+    #[test]
+    fn whole_2mib_pieces_of_a_segment_get_2mib_pages() {
+        let text: Vec<u8> = (0..0x1100u32).map(|i| (i % 251) as u8).collect();
+        let data = elf(183, 2, &[(0x3f_f000, R_X, &text, 0x40_2000)]);
+        let image = Image::parse(&data, Machine::Aarch64).unwrap();
+        for large in [true, false] {
+            let mut mem = FakePhysicalMemory::new();
+            let mut frames = CountingFrames::new(1024);
+            let pt = PageTable::<Aarch64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+            image
+                .load(&pt, &mut mem, &mut NoLarge(&mut frames, !large))
+                .unwrap();
+            for at in [
+                0x3f_f000, 0x40_0000, 0x40_00ff, 0x40_0100, 0x5f_f000, 0x60_0000, 0x7f_ffff,
+                0x80_0000,
+            ] {
+                let t = pt.translate(&mem, at).unwrap();
+                let expected = if large && (0x40_0000..0x80_0000).contains(&at) {
+                    PageSize::Large
+                } else {
+                    PageSize::Small
+                };
+                assert_eq!(t.size, expected, "{at:#x}");
+                let mut byte = [0u8];
+                mem.read_bytes(t.phys, &mut byte);
+                let i = (at - 0x3f_f000) as usize;
+                assert_eq!(byte[0], text.get(i).copied().unwrap_or(0), "{at:#x}");
+            }
+            crate::space::destroy(pt, &mut mem, &mut frames);
+            assert_eq!(frames.outstanding(), 0);
+        }
+    }
+
+    /// Frames that refuse 2 MiB when told to.
+    struct NoLarge<'a>(&'a mut CountingFrames, bool);
+
+    impl Frames for NoLarge<'_> {
+        fn alloc(&mut self) -> Option<u64> {
+            self.0.alloc()
+        }
+        fn alloc_large(&mut self) -> Option<u64> {
+            if self.1 { None } else { self.0.alloc_large() }
+        }
+        fn free(&mut self, phys: u64, size: PageSize) {
+            self.0.free(phys, size)
+        }
+        fn share(&mut self, phys: u64) {
+            self.0.share(phys)
+        }
+        fn is_shared(&self, phys: u64) -> bool {
+            self.0.is_shared(phys)
+        }
+    }
+
     #[test]
     fn loads_segments_with_permissions_and_zeroed_bss() {
         let data = sample();
         let image = Image::parse(&data, Machine::Aarch64).unwrap();
         assert_eq!(image.entry, 0x40_0000);
         assert_eq!(image.end(), 0x41_2000);
-        let (pt, mut mem, mut alloc) = table();
-        image.load(&pt, &mut mem, &mut alloc).unwrap();
+        let mut mem = FakePhysicalMemory::new();
+        let mut frames = CountingFrames::new(1024);
+        let pt = PageTable::<Aarch64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+        image.load(&pt, &mut mem, &mut frames).unwrap();
 
         let mut code = [0u8; 4];
         memory::copy_from(&pt, &mem, 0x40_0000, &mut code).unwrap();
