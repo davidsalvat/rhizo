@@ -802,7 +802,9 @@ fn flushed_on(cpu: usize) -> u32 {
 /// Runs the system call of `live`'s current thread, whose FP/SIMD state is
 /// in this CPU's registers when `fp_in_cpu`, through the TLB of `gang` when
 /// other CPUs may run the cell's code. Returns what the thread does next
-/// and whether the cell's translations shrank.
+/// and whether the cell's translations shrank. Inlined: it is the hot path
+/// of `run_slice`, as it was before it was shared with gangs.
+#[inline(always)]
 fn syscall(
     live: &mut Live,
     pt: PageTable<Format>,
