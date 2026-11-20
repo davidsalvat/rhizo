@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 622" width="800" height="622" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Roadmap status</title>
+<desc>Milestones H0 to H8 are done. H9, memory accounting and density, is in progress. Next: a gVisor comparison, a MicroPython workload and a dedicated benchmark machine.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="621" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 11 milestones done, 1 in progress</text>
+<circle cx="33" cy="66" r="9" fill="#16784f"/>
+<path d="M28.5 66l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="48" y="71" font-size="14" fill="#4b5c55">Done</text>
+<circle cx="119" cy="66" r="9" fill="#fff4d6" stroke="#875a00" stroke-width="2"/>
+<path d="M119 59A7 7 0 0 1 119 73z" fill="#875a00"/>
+<text x="134" y="71" font-size="14" fill="#4b5c55">In progress</text>
+<circle cx="259" cy="66" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="274" y="71" font-size="14" fill="#4b5c55">Next</text>
+<line x1="52" y1="109.0" x2="52" y2="585.0" stroke="#d0d7de" stroke-width="2"/>
+<circle cx="52" cy="109.0" r="9" fill="#16784f"/>
+<path d="M47.5 109.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="114.5" font-size="15" fill="#146c4a" font-weight="700">H0</text>
+<text x="128" y="114.5" font-size="15" fill="#0e2a20">Boot and test harness</text>
+<text x="416" y="114.5" font-size="14" fill="#4b5c55">QEMU, serial console, in-kernel tests</text>
+<circle cx="52" cy="143.0" r="9" fill="#16784f"/>
+<path d="M47.5 143.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="148.5" font-size="15" fill="#146c4a" font-weight="700">H1</text>
+<text x="128" y="148.5" font-size="15" fill="#0e2a20">Memory, paging and heap</text>
+<text x="416" y="148.5" font-size="14" fill="#4b5c55">higher half, W^X, CPU exceptions</text>
+<circle cx="52" cy="177.0" r="9" fill="#16784f"/>
+<path d="M47.5 177.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="182.5" font-size="15" fill="#146c4a" font-weight="700">H1.5</text>
+<text x="128" y="182.5" font-size="15" fill="#0e2a20">Fast boot and benchmarks</text>
+<text x="416" y="182.5" font-size="14" fill="#4b5c55">Firecracker, Cloud Hypervisor, CI gates</text>
+<circle cx="52" cy="211.0" r="9" fill="#16784f"/>
+<path d="M47.5 211.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="216.5" font-size="15" fill="#146c4a" font-weight="700">H1.6</text>
+<text x="128" y="216.5" font-size="15" fill="#0e2a20">AArch64 as primary</text>
+<text x="416" y="216.5" font-size="14" fill="#4b5c55">x86_64 kept as the second architecture</text>
+<circle cx="52" cy="245.0" r="9" fill="#16784f"/>
+<path d="M47.5 245.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="250.5" font-size="15" fill="#146c4a" font-weight="700">H2</text>
+<text x="128" y="250.5" font-size="15" fill="#0e2a20">First cell</text>
+<text x="416" y="250.5" font-size="14" fill="#4b5c55">user mode, ELF loader, Linux system calls</text>
+<circle cx="52" cy="279.0" r="9" fill="#16784f"/>
+<path d="M47.5 279.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="284.5" font-size="15" fill="#146c4a" font-weight="700">H3</text>
+<text x="128" y="284.5" font-size="15" fill="#0e2a20">Scheduler and isolation</text>
+<text x="416" y="284.5" font-size="14" fill="#4b5c55">address-space tags (ASIDs, PCIDs)</text>
+<circle cx="52" cy="313.0" r="9" fill="#16784f"/>
+<path d="M47.5 313.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="318.5" font-size="15" fill="#146c4a" font-weight="700">H4</text>
+<text x="128" y="318.5" font-size="15" fill="#0e2a20">Suspend and resume</text>
+<text x="416" y="318.5" font-size="14" fill="#4b5c55">lazy restore, pages back on first touch</text>
+<circle cx="52" cy="347.0" r="9" fill="#16784f"/>
+<path d="M47.5 347.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="352.5" font-size="15" fill="#146c4a" font-weight="700">H5</text>
+<text x="128" y="352.5" font-size="15" fill="#0e2a20">Fork and templates</text>
+<text x="416" y="352.5" font-size="14" fill="#4b5c55">copy-on-write down to the page tables</text>
+<circle cx="52" cy="381.0" r="9" fill="#16784f"/>
+<path d="M47.5 381.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="386.5" font-size="15" fill="#146c4a" font-weight="700">H6</text>
+<text x="128" y="386.5" font-size="15" fill="#0e2a20">Real glibc programs</text>
+<text x="416" y="386.5" font-size="14" fill="#4b5c55">differential tests; MicroPython pending</text>
+<circle cx="52" cy="415.0" r="9" fill="#16784f"/>
+<path d="M47.5 415.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="420.5" font-size="15" fill="#146c4a" font-weight="700">H7</text>
+<text x="128" y="420.5" font-size="15" fill="#0e2a20">Comparisons</text>
+<text x="416" y="420.5" font-size="14" fill="#4b5c55">against Firecracker and Linux, same machine</text>
+<circle cx="52" cy="449.0" r="9" fill="#16784f"/>
+<path d="M47.5 449.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="454.5" font-size="15" fill="#146c4a" font-weight="700">H8</text>
+<text x="128" y="454.5" font-size="15" fill="#0e2a20">Files per cell</text>
+<text x="416" y="454.5" font-size="14" fill="#4b5c55">carried by snapshots, forks and templates</text>
+<circle cx="52" cy="483.0" r="9" fill="#fff4d6" stroke="#875a00" stroke-width="2"/>
+<path d="M52 476.0A7 7 0 0 1 52 490.0z" fill="#875a00"/>
+<text x="76" y="488.5" font-size="15" fill="#875a00" font-weight="700">H9</text>
+<text x="128" y="488.5" font-size="15" fill="#0e2a20" font-weight="700">Memory accounting and density</text>
+<text x="416" y="488.5" font-size="14" fill="#4b5c55">goal: 1,000 idle cells</text>
+<circle cx="52" cy="517.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="522.5" font-size="15" fill="#4b5c55">gVisor comparison</text>
+<circle cx="52" cy="551.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="556.5" font-size="15" fill="#4b5c55">MicroPython workload</text>
+<circle cx="52" cy="585.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="590.5" font-size="15" fill="#4b5c55">Dedicated benchmark machine</text>
+</svg>
