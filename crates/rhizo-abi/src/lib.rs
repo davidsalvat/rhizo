@@ -538,7 +538,7 @@ impl Abi {
             // Signals are not delivered yet: accept, report no previous state.
             Some(Sys::RtSigaction) => zero_out(cx, a[2], 32),
             Some(Sys::RtSigprocmask) => zero_out(cx, a[2], a[3].min(128)),
-            Some(Sys::Ioctl) => -ENOTTY,
+            Some(Sys::Ioctl) => files::ioctl(cx, a[0], a[1], a[2]),
             Some(Sys::ArchPrctl) => arch_prctl(cell, cx, a[0], a[1]),
             Some(Sys::Mprotect) => mprotect(cell, cx, a[0], a[1], a[2]),
             Some(Sys::Sysinfo) => sysinfo(cx, a[0]),

@@ -178,6 +178,40 @@ fn tcp_to_a_host_outside() {
     assert!(!w.net.wire_busy(), "closed connections leave smoltcp");
 }
 
+/// Frames the card sends for two 1-byte writes on a connection, the
+/// second before the peer could acknowledge the first, with `TCP_NODELAY`
+/// set after connecting or not.
+fn frames_for_two_writes(no_delay: bool) -> usize {
+    let mut w = World::new();
+    let s = w.connect(80);
+    let opts = Options {
+        no_delay,
+        ..w.net.options(s).unwrap()
+    };
+    w.net.set_options(s, opts).unwrap();
+    w.link.sent.clear();
+    for byte in [b"a", b"b"] {
+        assert_eq!(w.net.send(s, byte, None), Ok(1));
+        w.now += MS;
+        w.net.poll_wire(&mut w.link, w.now);
+    }
+    w.link.sent.len()
+}
+
+#[test]
+fn no_delay_set_on_a_connection_applies_at_once() {
+    assert_eq!(
+        frames_for_two_writes(false),
+        1,
+        "Nagle holds the second byte"
+    );
+    assert_eq!(
+        frames_for_two_writes(true),
+        2,
+        "TCP_NODELAY sends it at once"
+    );
+}
+
 #[test]
 fn a_peer_that_never_closes_is_given_up() {
     let mut w = World::new();

@@ -119,6 +119,7 @@ macro_rules! suite {
             ktest_case!(a_cell_reaches_the_host),
             ktest_case!(stack_grows_on_touch_and_returns_its_frames),
             ktest_case!(cpython_in_a_cell),
+            ktest_case!(a_cpython_agent_talks_forks_and_survives_suspend),
             ktest_case!(dynamically_linked_programs_behave_as_on_linux),
             ktest_case!(a_dynamically_linked_cell_suspends_resumes_and_forks),
             ktest_case!(threads_behave_as_on_linux_and_return_memory),
@@ -1667,6 +1668,51 @@ fn cpython_in_a_cell() {
     for id in ids {
         assert_eq!(ended(&host, id), (Ending::Exit(0), answer.into()));
     }
+}
+
+/// The CPython agent end to end (change `add-agent-workload`): it talks to
+/// the host's fake model over HTTP through the network card for a few
+/// turns, suspended and lazily resumed after each one with its connection
+/// kept, then forks into branches at its decision point. Its transcript is
+/// the one a Linux process prints (`cells/expected.rs`, checked on Linux by
+/// `xtask`), and nothing stays open once the host is gone.
+fn a_cpython_agent_talks_forks_and_survives_suspend() {
+    if crate::cell::cpython_files().is_none() {
+        arch::console::BootConsole.write_bytes(b"(CPython not built: not run) ");
+        return;
+    }
+    if crate::wire::options().llm.is_none() {
+        arch::console::BootConsole.write_bytes(b"(no network card and model server: not run) ");
+        return;
+    }
+    let mut host = Host::new();
+    let run = crate::cell::agent(
+        &mut host,
+        expected::AGENT_TURNS,
+        Some(Resume::Lazy),
+        b"fake",
+        crate::cell::AgentOutput::Transcript,
+    )
+    .unwrap_or_else(|why| panic!("the agent did not finish: {why}"));
+    assert_eq!(
+        run.suspend_resume_ns.len(),
+        expected::AGENT_TURNS,
+        "suspended after every turn"
+    );
+    assert_eq!(
+        alloc::string::String::from_utf8_lossy(&run.transcript),
+        expected::AGENT_TRANSCRIPT
+    );
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0);
+    // The card's connections finish closing with the model server: the
+    // kernel goes back to holding nothing for the agent.
+    let mut host = Host::new();
+    let end = crate::cell::now_ns() + 10_000_000_000;
+    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
+        host.wire_address(0);
+    }
+    assert!(!crate::cell::wire_busy(), "the card's connections closed");
 }
 
 // --- C.1: dynamic linking ---------------------------------------------------
