@@ -64,6 +64,9 @@ macro_rules! suite {
             ktest_case!(cell_cannot_touch_another_cells_mapping),
             ktest_case!(fault_does_not_disturb_other_cells),
             ktest_case!(many_cells_in_sequence_stay_isolated),
+            ktest_case!(an_image_spawned_again_starts_fresh),
+            ktest_case!(kept_images_give_way_to_cells),
+            ktest_case!(a_cell_from_a_kept_image_suspends_resumes_and_forks),
             ktest_case!(suspend_resume_after_every_step_is_invisible_eager),
             ktest_case!(suspend_resume_after_every_step_is_invisible_lazy),
             ktest_case!(suspend_between_parallel_runs_is_invisible),
@@ -102,6 +105,10 @@ macro_rules! suite {
             ktest_case!(cells_talk_over_loopback),
             ktest_case!(a_waiting_cell_uses_no_cpu),
             ktest_case!(sockets_across_suspend_and_resume),
+            ktest_case!(a_discarded_snapshot_closes_its_connections),
+            ktest_case!(loopback_connection_across_suspend_of_one_end),
+            ktest_case!(a_connection_to_the_host_survives_suspend),
+            ktest_case!(connections_of_a_template_reset_in_its_cells),
             ktest_case!(a_blocked_cell_survives_suspend),
             ktest_case!(forked_servers_share_their_listener),
             ktest_case!(pipes_and_sockets_of_a_fork),
@@ -120,6 +127,9 @@ macro_rules! suite {
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
+            ktest_case!(unmapped_page_is_gone_on_every_cpu),
+            ktest_case!(a_cell_on_several_cpus_survives_suspend_and_fork),
+            ktest_case!(threads_of_a_cell_run_on_several_cpus_at_once),
             ktest_case!(performance_counters_count_where_present),
             ktest_case!(cost_accounting_adds_up_over_a_cell),
             $(ktest_case!($extra),)*
@@ -518,13 +528,15 @@ fn cell_rejects_bad_executables() {
     use rhizo_cell::elf::ElfError;
     let mut other = crate::cell::test_image("hello").to_vec();
     other[18] ^= 1; // e_machine of another architecture
+    // Spawned images are static (the kernel keeps them loaded by address).
+    let other: &'static [u8] = other.leak();
     let before = memory::free_bytes();
     assert_eq!(
         crate::cell::run(b"not an elf", &[]).map(|r| r.0),
         Err(ElfError::NotElf)
     );
     assert!(matches!(
-        crate::cell::run(&other, &[]).map(|r| r.0),
+        crate::cell::run(other, &[]).map(|r| r.0),
         Err(ElfError::WrongMachine { .. })
     ));
     assert_eq!(memory::free_bytes(), before);
@@ -648,6 +660,70 @@ fn many_cells_in_sequence_stay_isolated() {
         pair();
     }
     assert_eq!(memory::free_bytes(), before);
+}
+
+// --- Executables kept loaded (change `add-image-cache`) ---------------------
+
+/// An executable spawned again, from the space kept for it, starts with the
+/// data in the executable, not what an earlier cell of it wrote; two cells
+/// of it at once keep their writes to themselves.
+fn an_image_spawned_again_starts_fresh() {
+    let mut host = Host::new();
+    let first = spawn(&mut host, "same_addr", &[b"first"]);
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, first),
+        (Ending::Exit(0), "own value ok\n".into())
+    );
+    let ids = [b"a", b"b"].map(|tag| spawn(&mut host, "same_addr", &[tag]));
+    host.run(|_| false);
+    for id in ids {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "own value ok\n".into()));
+    }
+}
+
+/// Short of frames, the executables kept loaded are dropped before a cell
+/// is refused: with every frame cells may take taken, but for those kept,
+/// a new cell still starts and runs; nothing leaks.
+fn kept_images_give_way_to_cells() {
+    let before = memory_balance();
+    run_expected("libc_hello"); // kept loaded from now on
+    run_expected("libc_float");
+    // The frames taken are listed in themselves: the heap stays as it is.
+    let mut taken = u64::MAX;
+    while let Some(frame) = memory::alloc_for_cell(1) {
+        DirectMap.write_u64(frame, taken);
+        taken = frame;
+    }
+    let ran = crate::cell::run(crate::cell::test_image("hello"), &[b"hello"]);
+    while taken != u64::MAX {
+        let next = DirectMap.read_u64(taken);
+        memory::with_frames(|f| f.free_contiguous(taken, 1));
+        taken = next;
+    }
+    let (ending, output) = ran.expect("the cell starts");
+    assert_eq!(ending, Ending::Exit(0));
+    assert_eq!(output, b"hello from a cell\n");
+    drop(output);
+    assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// A cell started from a kept executable is a cell like any other: it is
+/// suspended, resumed and forked, and every copy runs to its end.
+fn a_cell_from_a_kept_image_suspends_resumes_and_forks() {
+    let mut host = Host::new();
+    let first = forkme_ready(&mut host);
+    assert!(host.kill(first)); // `forkme` is kept loaded from now on
+    let parent = forkme_ready(&mut host);
+    let snapshot = host.suspend(parent).expect("live");
+    let resumed = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    let children = host.fork(resumed, 2).expect("fork");
+    host.run(|_| false);
+    for id in [resumed].into_iter().chain(children) {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "own ok\n".into()));
+    }
 }
 
 use crate::cell::Resume;
@@ -1102,8 +1178,10 @@ fn file_data_takes_its_own_size() {
 
 /// Memory that is not leaked: frames free in the allocator plus frames the
 /// kernel heap holds (it keeps small-object pages for reuse, by design), and
-/// the heap's live allocations.
+/// the heap's live allocations; measured with no image kept loaded (spec
+/// `cells`, image cache: those frames are the kernel's until dropped).
 fn memory_balance() -> (u64, usize) {
+    crate::cell::drop_images();
     let heap = crate::heap::stats();
     (
         memory::free_bytes() + heap.pages as u64 * FRAME_SIZE,
@@ -1629,20 +1707,35 @@ fn threaded_ready(host: &mut Host) -> u32 {
 }
 
 /// Suspended at `ready` and resumed from its snapshot's bytes, `netstate`
-/// finds its pipe's bytes and its listener, and its connection reset.
+/// finds its pipe's bytes, its listener and its connection (parked in the
+/// kernel meanwhile); a copy of the same snapshot resumed after it finds
+/// the connection reset (spec `networking`).
 fn sockets_across_suspend_and_resume() {
     let mut host = Host::new();
     let id = netstate_ready(&mut host);
     let snapshot = host.suspend(id).expect("live");
     assert_eq!(
         crate::cell::open_sockets(),
-        0,
-        "a suspended cell holds no socket"
+        3,
+        "a suspended cell's listener and connection's two ends, parked"
     );
     let bytes = snapshot.into_bytes();
+    let copy = Snapshot::from_bytes(bytes.clone(), crate::arch::user::MACHINE).expect("valid");
     let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
     let id = host
         .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, id),
+        (
+            Ending::Exit(0),
+            "pipe kept\nconnection open\nlistener ok\n".into()
+        )
+    );
+    assert_eq!(crate::cell::open_sockets(), 0);
+    let id = host
+        .resume(copy, Resume::Eager, true, true)
         .expect("resume");
     host.run(|_| false);
     assert_eq!(
@@ -1655,12 +1748,126 @@ fn sockets_across_suspend_and_resume() {
     assert_eq!(crate::cell::open_sockets(), 0);
 }
 
+/// A snapshot dropped without a resume closes its parked connections.
+fn a_discarded_snapshot_closes_its_connections() {
+    let mut host = Host::new();
+    let id = netstate_ready(&mut host);
+    let snapshot = host.suspend(id).expect("live");
+    assert_eq!(crate::cell::open_sockets(), 3, "parked");
+    crate::cell::close_parked(&snapshot);
+    assert_eq!(crate::cell::open_sockets(), 0, "closed");
+}
+
+/// Runs `loopback serve PORT N` and `loopback ping PORT N` (with `addr`, or
+/// against the server), suspending cell `moving` (0: server, 1: client)
+/// after every scheduling step and resuming it at once, after `pause` when
+/// given (a cell run meanwhile); returns the moving cell's whole output and
+/// the number of resumes.
+fn suspended_every_step(
+    host: &mut Host,
+    port: &[u8],
+    n: &[u8],
+    moving: usize,
+    addr: Option<&[u8]>,
+    pause: Option<&str>,
+) -> (Vec<u8>, usize) {
+    let mut ids = alloc::vec::Vec::new();
+    if addr.is_none() {
+        ids.push(spawn(host, "loopback", &[b"serve", port, n]));
+    }
+    let mut ping = alloc::vec![b"ping".as_slice(), port, n];
+    ping.extend(addr);
+    ids.push(spawn(host, "loopback", &ping));
+    let mut output = Vec::new();
+    let mut resumes = 0;
+    loop {
+        host.step();
+        if let Some(done) = host.finished(ids[moving]) {
+            assert_eq!(done.ending, Ending::Exit(0));
+            output.extend_from_slice(&done.output);
+            break;
+        }
+        let snapshot = host.suspend(ids[moving]).expect("live");
+        output.extend_from_slice(&host.finished(ids[moving]).expect("suspended").output);
+        if let Some(cell) = pause {
+            let other = spawn(host, cell, &[]);
+            host.run(|h| h.finished(other).is_some());
+        }
+        ids[moving] = host
+            .resume(snapshot, Resume::Lazy, true, true)
+            .expect("resume");
+        resumes += 1;
+    }
+    host.run(|_| false);
+    for (i, &id) in ids.iter().enumerate() {
+        if i != moving {
+            assert_eq!(ended(host, id).0, Ending::Exit(0));
+        }
+    }
+    (output, resumes)
+}
+
+/// A loopback TCP connection between two cells keeps working while either
+/// end is suspended and resumed after every scheduling step.
+fn loopback_connection_across_suspend_of_one_end() {
+    for (moving, port, said) in [(0, b"7304", "served\n"), (1, b"7305", "pinged\n")] {
+        let mut host = Host::new();
+        let (output, resumes) = suspended_every_step(&mut host, port, b"20", moving, None, None);
+        assert!(resumes >= 20, "suspended {resumes} times");
+        assert_eq!(alloc::string::String::from_utf8_lossy(&output), said);
+        drop(host);
+        assert_eq!(crate::cell::open_sockets(), 0);
+    }
+}
+
+/// A connection to the host's echo server through the network card keeps
+/// working while its cell is suspended after every step, with the card
+/// polled meanwhile (a `sleeper` runs); not run without a card.
+fn a_connection_to_the_host_survives_suspend() {
+    let Some((ip, port)) = crate::wire::options().echo else {
+        arch::console::BootConsole.write_bytes(b"(no network card and echo server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card gets an address"
+    );
+    let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let port = alloc::format!("{port}");
+    let (output, resumes) = suspended_every_step(
+        &mut host,
+        port.as_bytes(),
+        b"10",
+        0,
+        Some(ip.as_bytes()),
+        Some("sleeper"),
+    );
+    assert!(resumes >= 10, "suspended {resumes} times");
+    assert_eq!(alloc::string::String::from_utf8_lossy(&output), "pinged\n");
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
 /// A server suspended while it waits in `accept` waits there again after
 /// its resume, and serves the client that comes.
+/// Steps `host` until one cell waits on its descriptors (a server in
+/// `accept`): a slice may end, preempted, before it gets there (under
+/// emulation a tick can be due as the slice starts).
+fn step_until_waiting(host: &mut Host) {
+    for _ in 0..100 {
+        if host.waiting() == 1 {
+            return;
+        }
+        host.step();
+    }
+    assert_eq!(host.waiting(), 1, "the server waits in accept");
+}
+
 fn a_blocked_cell_survives_suspend() {
     let mut host = Host::new();
     let server = spawn(&mut host, "loopback", &[b"serve", b"7302", b"1"]);
-    host.step();
+    step_until_waiting(&mut host);
     assert_eq!(host.waiting(), 1);
     let snapshot = host.suspend(server).expect("live");
     let server = host
@@ -1677,7 +1884,7 @@ fn a_blocked_cell_survives_suspend() {
 fn forked_servers_share_their_listener() {
     let mut host = Host::new();
     let template = spawn(&mut host, "loopback", &[b"serve", b"7303", b"1"]);
-    host.step();
+    step_until_waiting(&mut host);
     assert!(host.freeze(template));
     let servers: Vec<u32> = (0..2)
         .map(|_| {
@@ -1725,6 +1932,29 @@ fn pipes_and_sockets_of_a_fork() {
             "pipe kept\nconnection reset\nlistener ok\n".into()
         )
     );
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// Frozen at `ready`, `netstate` keeps its connection as a template; a cell
+/// spawned from it finds the connection reset and accepts on the listener
+/// it shares with the template.
+fn connections_of_a_template_reset_in_its_cells() {
+    let mut host = Host::new();
+    let template = netstate_ready(&mut host);
+    assert!(host.freeze(template));
+    let id = host
+        .spawn_from_template(template, true, true)
+        .expect("spawn");
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, id),
+        (
+            Ending::Exit(0),
+            "pipe kept\nconnection reset\nlistener ok\n".into()
+        )
+    );
+    assert_eq!(crate::cell::open_sockets(), 3, "the template's");
+    drop(host);
     assert_eq!(crate::cell::open_sockets(), 0);
 }
 
@@ -1906,6 +2136,7 @@ fn busy_cpus_do_not_starve_a_cell() {
 /// all at once on every CPU: each prints exactly what it prints alone, and
 /// all memory comes back.
 fn cells_in_parallel_stay_isolated() {
+    crate::cell::drop_images(); // free memory with no image kept loaded
     let before = memory::free_bytes();
     let mut host = Host::new();
     let programs = ["counter", "filer", "libc_threads", "chatter", "threads"];
@@ -1924,6 +2155,7 @@ fn cells_in_parallel_stay_isolated() {
         );
     }
     drop(host);
+    crate::cell::drop_images();
     assert_eq!(memory::free_bytes(), before);
 }
 
@@ -1965,6 +2197,102 @@ fn suspend_between_parallel_runs_is_invisible() {
     for id in spinners {
         assert!(host.kill(id));
     }
+}
+
+/// `parsum` with `threads` threads summing `millions` million rounds,
+/// alone on every CPU: its output, and the most CPUs that ran its threads
+/// at the same time.
+fn parsum(threads: &[u8], millions: &[u8]) -> (alloc::string::String, u32) {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "parsum", &[threads, millions]);
+    host.run(|h| h.finished(id).is_some());
+    let (ending, output) = ended(&host, id);
+    assert_eq!(ending, Ending::Exit(0), "{output}");
+    (output, host.finished(id).expect("ended").peak)
+}
+
+/// Four threads of one cell on four CPUs: the same sum as one thread (and
+/// as Linux, `cells/expected.rs`), with threads of the cell running on
+/// several CPUs at the same time (spec `threads`, threads of a cell in
+/// parallel; `scheduling`, idle CPUs run threads of running cells). The
+/// speed-up itself is measured by `cell.thread_scaling_pct`, not here: it
+/// depends on the host's spare cores.
+fn threads_of_a_cell_run_on_several_cpus_at_once() {
+    run_expected("parsum");
+    let (one, _) = parsum(b"1", b"24");
+    let (four, peak) = parsum(b"4", b"24");
+    assert_eq!(four, one, "the sum does not depend on the threads");
+    assert_eq!(one, "sum 2868a16807fecd08\n");
+    if crate::smp::count() >= 2 {
+        assert!(peak >= 2, "its threads ran on {peak} CPU at a time");
+    } else {
+        assert_eq!(peak, 1, "one CPU: one thread at a time");
+    }
+}
+
+/// A thread keeps reading a page that another unmaps on another CPU: once
+/// the unmap has returned, the reader's next read faults; it never reads
+/// the page after it saw the flag raised after the unmap (spec
+/// `multi-core`, TLB coherence; on x86_64 a shootdown). Several rounds, the
+/// race being the point; after the first (which caches the executable),
+/// every frame comes back.
+fn unmapped_page_is_gone_on_every_cpu() {
+    run_expected("shootdown");
+    let before = memory::free_bytes();
+    for _ in 0..4 {
+        run_expected("shootdown");
+    }
+    assert_eq!(memory::free_bytes(), before, "every frame returned");
+}
+
+/// `parsum` computing with 4 threads on every CPU, stopped after each slice
+/// of the boot CPU, then suspended and resumed from its snapshot's bytes,
+/// or once forked into two children, until it ends: the resumed cell and
+/// both children print the uninterrupted sum (spec `multi-core`, cells
+/// stopped before host operations). Every cell ends; the frames of cells
+/// that ran on several CPUs are checked by `unmapped_page_is_gone_on_every_cpu`
+/// and `cells_in_parallel_stay_isolated`.
+fn a_cell_on_several_cpus_survives_suspend_and_fork() {
+    const SUM: &str = "sum c75f7d3df19f452d\n";
+    let mut host = Host::new();
+    let mut id = spawn(&mut host, "parsum", &[b"4", b"96"]);
+    let mut children = Vec::new();
+    let mut output = Vec::new();
+    let mut round = 0;
+    loop {
+        // Asked before the run starts, then after each slice.
+        let mut started = false;
+        host.run(|_| core::mem::replace(&mut started, true));
+        if host.finished(id).is_some() {
+            break;
+        }
+        round += 1;
+        if round == 1 {
+            children = host.fork(id, 2).expect("fork");
+            continue;
+        }
+        let snapshot = host.suspend(id).expect("live");
+        output.extend_from_slice(&host.finished(id).expect("suspended").output);
+        let snapshot =
+            Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE).expect("valid");
+        id = host
+            .resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume");
+    }
+    assert!(round >= 2, "stopped only {round} times");
+    host.run(|_| false);
+    let (ending, last) = ended(&host, id);
+    assert_eq!(ending, Ending::Exit(0));
+    output.extend_from_slice(last.as_bytes());
+    assert_eq!(alloc::string::String::from_utf8_lossy(&output), SUM);
+    for id in children {
+        assert_eq!(
+            ended(&host, id),
+            (Ending::Exit(0), SUM.into()),
+            "child {id}"
+        );
+    }
+    assert_eq!(host.live(), 0);
 }
 
 /// Where the CPU or hypervisor has performance counters, they count cycles

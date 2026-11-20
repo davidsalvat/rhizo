@@ -402,7 +402,7 @@ fn measure_cells(
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
-        let (mut pipe_rtt, mut loopback_rtt) = (Vec::new(), Vec::new());
+        let (mut pipe_rtt, mut loopback_rtt, mut tcp_resume) = (Vec::new(), Vec::new(), Vec::new());
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
@@ -453,9 +453,10 @@ fn measure_cells(
                         file_write_read.push(w as f64 / 1000.0);
                         fork_files.push(f as f64 / 1000.0);
                     }
-                    if let Some((p, l)) = parse_net_line(&out.output) {
+                    if let Some((p, l, r)) = parse_net_line(&out.output) {
                         pipe_rtt.push(p as f64);
                         loopback_rtt.push(l as f64 / 1000.0);
+                        tcp_resume.push(r as f64 / 1000.0);
                     }
                     match parse_wire_line(&out.output) {
                         Some(Ok(rtt)) => wire_rtt.push(rtt as f64 / 1000.0),
@@ -501,6 +502,7 @@ fn measure_cells(
             }
         }
         let (mut parallel, mut scaling, mut ipi_wake) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut thread_scaling, mut shootdown) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 3) {
             let smp = RunOptions {
                 cpus: crate::SMP_CPUS,
@@ -513,6 +515,11 @@ fn measure_cells(
                     parallel.push(s.parallel_ns as f64 / cells / 1000.0);
                     scaling.push(100.0 * s.parallel_ns as f64 * s.cpus as f64 / s.serial_ns as f64);
                     ipi_wake.push(s.ipi_wake_ns as f64 / 1000.0);
+                    if s.threads1_ns > 0 {
+                        thread_scaling
+                            .push(100.0 * s.threads4_ns as f64 * 4.0 / s.threads1_ns as f64);
+                    }
+                    shootdown.push(s.shootdown_ns as f64 / 1000.0);
                 }
                 _ => {
                     skipped.push((
@@ -544,6 +551,7 @@ fn measure_cells(
             ("cell.fork_with_files_us", "us", &mut fork_files),
             ("cell.pipe_rtt_ns", "ns", &mut pipe_rtt),
             ("cell.loopback_rtt_us", "us", &mut loopback_rtt),
+            ("cell.tcp_resume_us", "us", &mut tcp_resume),
             ("net.tcp_rtt_us", "us", &mut wire_rtt),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
@@ -554,6 +562,8 @@ fn measure_cells(
             ("cell.parallel_us", "us", &mut parallel),
             ("cell.scaling_pct", "%", &mut scaling),
             ("cell.ipi_wake_us", "us", &mut ipi_wake),
+            ("cell.thread_scaling_pct", "%", &mut thread_scaling),
+            ("cell.shootdown_us", "us", &mut shootdown),
             ("cell.syscall_ns", "ns", &mut syscall),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
@@ -663,9 +673,9 @@ fn parse_wire_line(output: &str) -> Option<std::result::Result<u64, String>> {
     Some(value.trim().parse().map_err(|_| line.to_string()))
 }
 
-/// `(pipe_rtt_ns, loopback_rtt_ns)` of the network line of a `bench-cell`
-/// kernel.
-fn parse_net_line(output: &str) -> Option<(u64, u64)> {
+/// `(pipe_rtt_ns, loopback_rtt_ns, tcp_resume_ns)` of the network line of
+/// a `bench-cell` kernel.
+fn parse_net_line(output: &str) -> Option<(u64, u64, u64)> {
     let line = output.lines().find(|l| l.starts_with("rhizo-net "))?;
     let field = |key: &str| -> Option<u64> {
         line.split_whitespace()
@@ -673,7 +683,11 @@ fn parse_net_line(output: &str) -> Option<(u64, u64)> {
             .parse()
             .ok()
     };
-    Some((field("pipe_rtt_ns")?, field("loopback_rtt_ns")?))
+    Some((
+        field("pipe_rtt_ns")?,
+        field("loopback_rtt_ns")?,
+        field("tcp_resume_ns")?,
+    ))
 }
 
 /// The multi-core line of a `bench-cell` kernel booted with several CPUs.
@@ -683,6 +697,11 @@ struct SmpLine {
     serial_ns: u64,
     parallel_ns: u64,
     ipi_wake_ns: u64,
+    /// `parsum` with 1 and with 4 threads, and one `munmap` while the
+    /// cell's other threads run (design D9 of `add-parallel-threads`).
+    threads1_ns: u64,
+    threads4_ns: u64,
+    shootdown_ns: u64,
 }
 
 fn parse_smp_line(output: &str) -> Option<SmpLine> {
@@ -698,6 +717,9 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         serial_ns: field("serial_ns")?,
         parallel_ns: field("parallel_ns")?,
         ipi_wake_ns: field("ipi_wake_ns")?,
+        threads1_ns: field("threads1_ns")?,
+        threads4_ns: field("threads4_ns")?,
+        shootdown_ns: field("shootdown_ns")?,
     })
 }
 
@@ -1861,8 +1883,14 @@ mod tests {
     #[test]
     fn net_line_is_parsed() {
         assert_eq!(
-            parse_net_line("x\nrhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200\n"),
-            Some((310, 4200))
+            parse_net_line(
+                "x\nrhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200 tcp_resume_ns=31000\n"
+            ),
+            Some((310, 4200, 31000))
+        );
+        assert_eq!(
+            parse_net_line("rhizo-net pipe_rtt_ns=310 loopback_rtt_ns=4200\n"),
+            None
         );
         assert_eq!(parse_net_line("rhizo-net pipe_rtt_ns=1\n"), None);
     }
@@ -1880,13 +1908,17 @@ mod tests {
     fn smp_line_is_parsed() {
         assert_eq!(
             parse_smp_line(
-                "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000\n"
+                "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000 \
+                 threads1_ns=400 threads4_ns=110 shootdown_ns=3000\n"
             ),
             Some(SmpLine {
                 cpus: 4,
                 serial_ns: 800,
                 parallel_ns: 220,
-                ipi_wake_ns: 9000
+                ipi_wake_ns: 9000,
+                threads1_ns: 400,
+                threads4_ns: 110,
+                shootdown_ns: 3000,
             })
         );
         assert_eq!(parse_smp_line("rhizo-smp cpus=4 serial_ns=1\n"), None);

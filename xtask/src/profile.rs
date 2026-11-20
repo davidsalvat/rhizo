@@ -33,6 +33,7 @@ pub const COUNTED: &[(&str, &str, &str)] = &[
     ("rhizo-files", "fork_ns", "cell.fork_with_files"),
     ("rhizo-net", "pipe_rtt_ns", "cell.pipe_rtt"),
     ("rhizo-net", "loopback_rtt_ns", "cell.loopback_rtt"),
+    ("rhizo-net", "tcp_resume_ns", "cell.tcp_resume"),
     ("rhizo-snapshot", "suspend_ns", "cell.suspend"),
     ("rhizo-snapshot", "resume_ns", "cell.resume"),
     ("rhizo-snapshot", "resume_eager_ns", "cell.resume_eager"),
