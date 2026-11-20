@@ -1140,6 +1140,24 @@ pub fn comparison_table(results: &Results) -> String {
     for (what, rhizo, firecracker, process) in rows {
         s += &format!("| {what} | {rhizo} | {firecracker} | {process} |\n");
     }
+    let (cold, warm) = (
+        find("workload.python_cold_us", "rhizo", "firecracker"),
+        find("workload.python_warm_us", "rhizo", "firecracker"),
+    );
+    if let (Some(c), Some(w)) = (cold, warm) {
+        s += &format!(
+            "\n### A real interpreter\n\n\
+             MicroPython (static, v1.24.1) answering one request \
+             (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell \
+             in Firecracker:\n\n\
+             | Started | Time |\n|---|---:|\n\
+             | Cold, from its executable (interpreter start, imports, warm-up) | {} |\n\
+             | Forked from a template frozen after the warm-up | {} ({:.1}× faster) |\n",
+            time(cold),
+            time(warm),
+            c.median / w.median
+        );
+    }
     s
 }
 
@@ -1390,6 +1408,32 @@ mod tests {
             parse_workload_line("x\nrhizo-workload cold_ns=900 warm_ns=30\n"),
             Some((900, 30))
         );
+    }
+
+    #[test]
+    fn comparison_table_shows_python_when_measured() {
+        let mut m = metric(
+            "workload.python_cold_us",
+            "rhizo",
+            Some("firecracker"),
+            3600.0,
+        );
+        m.unit = "us".into();
+        let mut w = metric(
+            "workload.python_warm_us",
+            "rhizo",
+            Some("firecracker"),
+            540.0,
+        );
+        w.unit = "us".into();
+        let mut run = metric("cell.run_us", "rhizo", Some("firecracker"), 7.2);
+        run.unit = "us".into();
+        let t = comparison_table(&results(vec![run.clone(), m, w]));
+        assert!(t.contains(
+            "| Cold, from its executable (interpreter start, imports, warm-up) | 3.60 ms |"
+        ));
+        assert!(t.contains("| 540.0 µs (6.7× faster) |"), "{t}");
+        assert!(!comparison_table(&results(vec![run])).contains("A real interpreter"));
     }
 
     #[test]

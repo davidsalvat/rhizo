@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 622" width="800" height="622" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Roadmap status</title>
-<desc>Milestones H0 to H9 are done. Next: a gVisor comparison, a MicroPython workload and a dedicated benchmark machine.</desc>
+<desc>Milestones H0 to H10 are done (13). Next: a gVisor comparison and a dedicated benchmark machine.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="621" rx="12" fill="#ffffff" stroke="#d0d7de"/>
-<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 12 milestones done</text>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 13 milestones done</text>
 <circle cx="33" cy="66" r="9" fill="#16784f"/>
 <path d="M28.5 66l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="48" y="71" font-size="14" fill="#4b5c55">Done</text>
@@ -54,7 +54,7 @@
 <path d="M47.5 381.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="76" y="386.5" font-size="15" fill="#146c4a" font-weight="700">H6</text>
 <text x="128" y="386.5" font-size="15" fill="#0e2a20">Real glibc programs</text>
-<text x="416" y="386.5" font-size="14" fill="#4b5c55">differential tests; MicroPython pending</text>
+<text x="416" y="386.5" font-size="14" fill="#4b5c55">differential tests against Linux</text>
 <circle cx="52" cy="415.0" r="9" fill="#16784f"/>
 <path d="M47.5 415.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="76" y="420.5" font-size="15" fill="#146c4a" font-weight="700">H7</text>
@@ -69,11 +69,14 @@
 <path d="M47.5 483.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="76" y="488.5" font-size="15" fill="#146c4a" font-weight="700">H9</text>
 <text x="128" y="488.5" font-size="15" fill="#0e2a20">Memory accounting, density</text>
-<text x="416" y="488.5" font-size="14" fill="#4b5c55">1,000 idle cells, 22 KB each</text>
-<circle cx="52" cy="517.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="76" y="522.5" font-size="15" fill="#4b5c55">gVisor comparison</text>
+<text x="416" y="488.5" font-size="14" fill="#4b5c55">1,000 idle cells, 23 KB each</text>
+<circle cx="52" cy="517.0" r="9" fill="#16784f"/>
+<path d="M47.5 517.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="522.5" font-size="15" fill="#146c4a" font-weight="700">H10</text>
+<text x="128" y="522.5" font-size="15" fill="#0e2a20">A real interpreter</text>
+<text x="416" y="522.5" font-size="14" fill="#4b5c55">MicroPython as a cell, warm templates</text>
 <circle cx="52" cy="551.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="76" y="556.5" font-size="15" fill="#4b5c55">MicroPython workload</text>
+<text x="76" y="556.5" font-size="15" fill="#4b5c55">gVisor comparison</text>
 <circle cx="52" cy="585.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
 <text x="76" y="590.5" font-size="15" fill="#4b5c55">Dedicated benchmark machine</text>
 </svg>
