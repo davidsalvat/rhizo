@@ -42,7 +42,9 @@ def us(v):
 
 def times(fast, slow):
     """'≈ N× faster' (or slower, when `fast` is not), N to two significant
-    figures."""
+    figures; "about the same" within 10%."""
+    if 1 / 1.1 < slow / fast < 1.1:
+        return "about the same"
     if fast > slow:
         r = fast / slow
         r = round(r, 1 - int(math.floor(math.log10(r))))
@@ -350,7 +352,8 @@ def chart(t):
         for title, rt, bars in gs:
             s.text(24, y + 22, title, 15, weight=700)
             if rt:
-                color = t["warn"] if "slower" in rt else t["accent"]
+                color = (t["warn"] if "slower" in rt else
+                         t["muted"] if rt == "about the same" else t["accent"])
                 s.text(776, y + 22, rt, 15, fill=color, weight=700, anchor="end")
             by = y + 34
             for v, _ in ticks:
