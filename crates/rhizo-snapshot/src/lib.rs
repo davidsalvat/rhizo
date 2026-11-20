@@ -27,7 +27,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use rhizo_cell::elf::Machine;
 use rhizo_cell::space::Frames;
-use rhizo_cell::{Cell, Registers};
+use rhizo_cell::{Cell, Registers, USER_END};
 use rhizo_fs::Fs;
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
@@ -38,8 +38,6 @@ pub const VERSION: u32 = 3;
 const HEADER: usize = 24;
 const STATE: usize = (39 + 66) * 8;
 const RECORD: usize = 24;
-/// Highest user address + 1.
-const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Why bytes are not a snapshot this kernel can resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +55,10 @@ pub enum FormatError {
     BadPage { index: usize },
     /// The files section does not decode to a consistent file system.
     BadFiles,
+    /// Registers the kernel cannot enter safely: a program counter (or, on
+    /// x86_64, a thread pointer) outside the cell's addresses, or reserved
+    /// `MXCSR` bits, any of which would fault in the kernel itself.
+    BadState,
 }
 
 /// The plain state of a suspended cell besides its memory.
@@ -198,6 +200,12 @@ impl Snapshot {
             });
         }
         let snapshot = Self { bytes };
+        let regs = snapshot.state().regs;
+        // MXCSR is bytes 24-27 of the FXSAVE image; bits 16-31 are reserved.
+        let x86 = machine == Machine::X86_64;
+        if regs.pc >= USER_END || x86 && (regs.tls >= USER_END || regs.fp.0[3] >> 16 != 0) {
+            return Err(FormatError::BadState);
+        }
         let pages = snapshot.page_count();
         let data_start =
             (HEADER + STATE).checked_add(pages.checked_mul(RECORD).ok_or(FormatError::Truncated)?);

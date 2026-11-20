@@ -29,6 +29,8 @@ pub trait Frames {
 }
 
 const ENTRIES: u64 = 512;
+/// First address past the lower (user) half.
+const LOWER_HALF_END: u64 = 0x0000_8000_0000_0000;
 
 fn index(virt: u64, level: u32) -> u64 {
     (virt >> (12 + 9 * level)) & (ENTRIES - 1)
@@ -120,13 +122,18 @@ impl<F: EntryFormat> PageTable<F> {
 
     /// Walks to the leaf for `virt`, making every table on the way private
     /// and writable. Returns the leaf's slot and level, or `None` if there is
-    /// no leaf (the walk stops at the first empty entry).
+    /// no leaf (the walk stops at the first empty entry). The upper half is
+    /// the kernel's, shared by every cell on x86_64: never walked, so no cell
+    /// write or mapping change reaches it (spec `isolation`).
     fn walk_private(
         &self,
         mem: &mut impl PhysicalMemory,
         frames: &mut impl Frames,
         virt: u64,
     ) -> Result<Option<(u64, u32)>, MapError> {
+        if virt >= LOWER_HALF_END {
+            return Ok(None);
+        }
         let mut table = self.root();
         for level in (0..=3).rev() {
             let slot = table + index(virt, level) * 8;

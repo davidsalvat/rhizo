@@ -14,13 +14,14 @@ mod files;
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
 use rhizo_cell::space::{self, Frames};
-use rhizo_cell::{Cell, MMAP_BASE, STACK_PAGES, STACK_TOP};
+use rhizo_cell::{Cell, MMAP_BASE, STACK_PAGES, STACK_TOP, USER_END};
 use rhizo_hal::{Console, PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
 
 /// Linux `errno` values used here.
 pub mod errno {
+    pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
     pub const EBADF: i64 = 9;
     pub const EAGAIN: i64 = 11;
@@ -217,8 +218,9 @@ pub trait Services: Console {
     fn realtime_ns(&mut self) -> u64;
     /// Fills `out` with random bytes.
     fn random(&mut self, out: &mut [u8]);
-    /// Whether the cell may store `bytes` more of kernel-held data (file
-    /// blocks) without eating into the memory the kernel keeps for itself.
+    /// Whether the cell may take `bytes` more memory (pages, or kernel-held
+    /// data such as file blocks and names) without eating into the memory
+    /// the kernel keeps for itself.
     fn can_store(&mut self, bytes: u64) -> bool;
 }
 
@@ -273,8 +275,9 @@ impl<F: EntryFormat, M: PhysicalMemory, T, A, S> Context<'_, F, M, T, A, S> {
 #[derive(Debug)]
 pub struct Abi {
     arch: Arch,
-    /// Unimplemented call numbers already reported (one bit each, < 1024,
-    /// beyond every Linux call number; larger values are reported each time).
+    /// Unimplemented call numbers already reported: one bit each below 1023
+    /// (beyond every Linux call number), and bit 1023 for all larger ones,
+    /// so no cell can make the kernel print without end.
     reported: [u64; 16],
 }
 
@@ -430,12 +433,12 @@ impl Abi {
     }
 
     fn report_unimplemented(&mut self, cell: u32, nr: u64, out: &mut impl Services) {
-        if let Some(word) = self.reported.get_mut((nr / 64) as usize) {
-            if *word & (1 << (nr % 64)) != 0 {
-                return;
-            }
-            *word |= 1 << (nr % 64);
+        let bit = nr.min(1023);
+        let word = &mut self.reported[(bit / 64) as usize];
+        if *word & (1 << (bit % 64)) != 0 {
+            return;
         }
+        *word |= 1 << (bit % 64);
         out.log(format_args!("cell {cell}: unimplemented syscall {nr}"));
     }
 }
@@ -473,7 +476,7 @@ fn user_rw() -> PageFlags {
     PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE
 }
 
-fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
+fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     want: u64,
@@ -482,17 +485,19 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         return cell.brk as i64;
     }
     let (old_end, new_end) = (align_up(cell.brk, FRAME_SIZE), align_up(want, FRAME_SIZE));
+    // Memory that cannot be had is refused before any of it is zeroed.
     let ok = if new_end > old_end {
-        space::map_anonymous(
-            &cx.pt,
-            cx.mem,
-            cx.tlb,
-            cx.frames,
-            old_end,
-            new_end - old_end,
-            user_rw(),
-        )
-        .is_ok()
+        cx.services.can_store(new_end - old_end)
+            && space::map_anonymous(
+                &cx.pt,
+                cx.mem,
+                cx.tlb,
+                cx.frames,
+                old_end,
+                new_end - old_end,
+                user_rw(),
+            )
+            .is_ok()
     } else {
         space::unmap(
             &cx.pt,
@@ -510,7 +515,7 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     cell.brk as i64
 }
 
-fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
+fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     a: [u64; 6],
@@ -541,6 +546,9 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         return -ENOMEM;
     }
     if prot != 0 {
+        if !cx.services.can_store(len) {
+            return -ENOMEM; // refused before any of it is zeroed
+        }
         let mut pf = PageFlags::USER;
         if prot & PROT_WRITE != 0 {
             pf = pf | PageFlags::WRITABLE;
@@ -726,14 +734,22 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     if prot == 0 {
         return -EINVAL; // inaccessible pages are not supported yet
     }
-    let Some(end) = addr.checked_add(len).map(|e| align_up(e, FRAME_SIZE)) else {
+    // Only the cell's own addresses (spec `isolation`): on x86_64 its table
+    // also holds the kernel half, whose pages must never become the cell's.
+    let Some(end) = addr
+        .checked_add(len)
+        .map(|e| align_up(e, FRAME_SIZE))
+        .filter(|&e| e <= USER_END)
+    else {
         return -ENOMEM;
     };
-    // Pages not in memory yet (lazy resume) are brought in first.
+    // Pages not in memory yet (lazy resume) are brought in first; the first
+    // page that cannot be is the answer (`ENOMEM`), so a huge range of
+    // nothing costs one step, not one per page.
     let mut at = addr;
     while at < end {
-        if cx.pt.translate(cx.mem, at).is_none() {
-            cx.pager.page_in(&cx.pt, cx.mem, at, false);
+        if cx.pt.translate(cx.mem, at).is_none() && !cx.pager.page_in(&cx.pt, cx.mem, at, false) {
+            return -ENOMEM;
         }
         at += FRAME_SIZE;
     }
@@ -792,6 +808,9 @@ fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
     match code {
+        // A kernel or non-canonical base would fault when loaded into the
+        // FS base, in the kernel (as on Linux: `EPERM`).
+        ARCH_SET_FS if addr >= USER_END => -EPERM,
         ARCH_SET_FS => {
             cell.regs.tls = addr;
             0
@@ -801,5 +820,7 @@ fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     }
 }
 
+#[cfg(test)]
+mod hostile;
 #[cfg(test)]
 mod tests;
