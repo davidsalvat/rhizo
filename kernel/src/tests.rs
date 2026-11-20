@@ -1989,7 +1989,8 @@ fn performance_counters_count_where_present() {
 
 /// With every part accounted, a cell making 100 `getpid` calls shows up as
 /// cell time, system calls (100 of them `getpid`), spawn, teardown, frames
-/// and copies, and the parts add up to no more than the time it took
+/// and copies, and the parts add up to no more than the time it took on
+/// every CPU
 /// (spec `profiling`).
 fn cost_accounting_adds_up_over_a_cell() {
     use rhizo_prof::Part;
@@ -2003,7 +2004,9 @@ fn cost_accounting_adds_up_over_a_cell() {
     crate::prof::stop(|account, calls| {
         let elapsed = arch::timer::Counter.cycles() - t0;
         assert_eq!(ending, Ending::Exit(0));
-        assert!(account.total() <= elapsed, "more time than elapsed");
+        // Every CPU accounts its own time.
+        let cpus = crate::smp::count() as u64;
+        assert!(account.total() <= cpus * elapsed, "more time than elapsed");
         assert!(account.count(Part::Syscall) >= 101, "100 getpid and exit");
         assert!(account.count(Part::Cell) >= account.count(Part::Syscall));
         for part in [
