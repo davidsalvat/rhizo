@@ -39,6 +39,9 @@ pub const NAME_MAX: usize = 255;
 pub const FD_MAX: usize = 1024;
 /// Most file data a cell may hold, and the largest file size (bytes).
 pub const DATA_MAX: u64 = 64 << 20;
+/// Most files and directories a cell may have (the root included): bounds
+/// the kernel memory its names take, and so how deep a path can nest.
+pub const INODES_MAX: usize = 4096;
 const ROOT: Ino = 0;
 
 /// Why an operation failed, with its Linux error number.
@@ -54,7 +57,8 @@ pub enum Error {
     NameTooLong,
     TooManyFiles,
     Busy,
-    /// The cell holds [`DATA_MAX`] bytes of file data.
+    /// The cell holds [`DATA_MAX`] bytes of file data, or [`INODES_MAX`]
+    /// files and directories.
     NoSpace,
     /// Past the largest file size.
     TooBig,
@@ -323,16 +327,17 @@ impl Tables {
         )
     }
 
-    fn alloc_inode(&mut self, inode: Inode) -> Ino {
+    fn alloc_inode(&mut self, inode: Inode) -> Result<Ino> {
         let inode = Some(Arc::new(inode));
         match self.inodes.iter().position(Option::is_none) {
             Some(i) => {
                 self.inodes[i] = inode;
-                i as Ino
+                Ok(i as Ino)
             }
+            None if self.inodes.len() >= INODES_MAX => Err(Error::NoSpace),
             None => {
                 self.inodes.push(inode);
-                (self.inodes.len() - 1) as Ino
+                Ok((self.inodes.len() - 1) as Ino)
             }
         }
     }
@@ -515,7 +520,7 @@ impl Tables {
                 let ino = self.alloc_inode(Inode {
                     links: 1,
                     node: Node::File(File::default()),
-                });
+                })?;
                 let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node else {
                     return Err(Error::NotDir);
                 };
@@ -916,7 +921,7 @@ impl Tables {
                 entries: BTreeMap::new(),
                 parent: dir,
             },
-        });
+        })?;
         if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
             entries.insert(name.to_vec(), ino);
         }

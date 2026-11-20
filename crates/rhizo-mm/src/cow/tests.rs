@@ -10,6 +10,8 @@ struct Counted {
     next: u64,
     refs: BTreeMap<u64, (u32, PageSize)>,
     recycled: Vec<u64>,
+    /// No whole 2 MiB block left: `alloc_large` fails.
+    no_large: bool,
 }
 
 impl Counted {
@@ -39,7 +41,7 @@ impl Frames for Counted {
         Some(self.take(PageSize::Small))
     }
     fn alloc_large(&mut self) -> Option<u64> {
-        Some(self.take(PageSize::Large))
+        (!self.no_large).then(|| self.take(PageSize::Large))
     }
     fn free(&mut self, phys: u64, size: PageSize) {
         let (count, s) = self
@@ -209,16 +211,45 @@ fn mapping_in_a_child_is_not_seen_by_the_parent<F: EntryFormat>() {
     assert_eq!(w.frames.live(), 0);
 }
 
+/// Without a free 2 MiB block, a write to a shared 2 MiB page copies it
+/// into 4 KiB pages: every byte is kept, the write stays private.
+fn large_page_copied_as_small_pages<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let parent = w.table();
+    w.map(&parent, 0x4000_0000_0000, PageSize::Large, RW);
+    w.write(&parent, 0x4000_0000_0008, 22);
+    w.write(&parent, 0x4000_001f_f000, 23);
+    let child = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    w.frames.no_large = true;
+    assert!(w.write(&child, 0x4000_0000_0010, 5));
+    let t = child.translate(&w.mem, 0x4000_001f_f000).unwrap();
+    assert_eq!((t.size, t.flags.is_writable()), (PageSize::Small, true));
+    assert_eq!(w.read(&child, 0x4000_0000_0008), 22);
+    assert_eq!(w.read(&child, 0x4000_001f_f000), 23);
+    assert_eq!(w.read(&parent, 0x4000_0000_0010), 0, "private to the child");
+    assert!(
+        w.write(&parent, 0x4000_0000_0008, 7),
+        "sole owner: writable"
+    );
+    assert_eq!(w.read(&child, 0x4000_0000_0008), 22);
+    for pt in [parent, child] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0, "every frame returned once");
+}
+
 #[test]
 fn fork_aarch64() {
     fork_shares_everything_and_writes_stay_private::<Aarch64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<Aarch64>();
+    large_page_copied_as_small_pages::<Aarch64>();
 }
 
 #[test]
 fn fork_x86_64() {
     fork_shares_everything_and_writes_stay_private::<X86_64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<X86_64>();
+    large_page_copied_as_small_pages::<X86_64>();
 }
 
 /// Addresses spread over different tables at every level.
@@ -313,4 +344,31 @@ proptest! {
     fn model_x86_64(ops in proptest::collection::vec(op(), 1..80)) {
         model_check::<X86_64>(&ops);
     }
+}
+
+/// A cell sharing the kernel half (x86_64): a write fault or a mapping change
+/// at a kernel address is never "resolved", and no kernel table changes.
+#[test]
+fn kernel_half_is_never_made_writable_or_private() {
+    let mut w = World::<X86_64>::new();
+    let kernel = w.table();
+    let kernel_rw = PageFlags::WRITABLE.union(PageFlags::NO_EXECUTE);
+    let read_only = PageFlags::empty();
+    w.map(&kernel, 0xffff_8000_0000_0000, PageSize::Small, kernel_rw);
+    w.map(&kernel, 0xffff_ffff_8000_0000, PageSize::Small, read_only);
+    let cell = w.table();
+    cell.share_upper_half(&mut w.mem, &kernel);
+    let before = w.mem.clone();
+    for virt in [
+        0xffff_8000_0000_0000,
+        0xffff_ffff_8000_0000,
+        0xffff_8000_0001_0000,
+    ] {
+        assert_eq!(
+            cell.resolve_write(&mut w.mem, &mut w.frames, virt),
+            Ok(false)
+        );
+        cell.unshare_path(&mut w.mem, &mut w.frames, virt).unwrap();
+    }
+    assert!(w.mem == before, "no kernel entry changed");
 }

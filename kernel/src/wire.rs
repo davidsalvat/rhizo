@@ -25,8 +25,7 @@ pub fn options() -> BootOptions {
 /// `net` with the address the command line gives (none: no address).
 pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
     let mut card = None;
-    // One run of frames for the card's rings and buffers, taken where it
-    // breaks no free 2 MiB block that cells' large pages need.
+    // One run of frames for the card's rings and buffers.
     let mut run: Option<(u64, usize)> = None;
     platform::for_each_virtio_mmio(|base| {
         if card.is_some() {
@@ -35,8 +34,7 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
         let alloc = &mut || {
             if run.is_none() {
                 let start =
-                    memory::with_frames(|f| f.alloc_contiguous_sparing_large(rhizo_virtio::FRAMES))
-                        .flatten()?;
+                    memory::with_frames(|f| f.alloc_contiguous(rhizo_virtio::FRAMES)).flatten()?;
                 run = Some((start, 0));
             }
             let (start, used) = run.as_mut()?;

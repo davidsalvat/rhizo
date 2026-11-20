@@ -106,16 +106,50 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
         Ending::Exit(0),
     ),
     (
+        "threads",
+        "tids ok\nfutex ok\nmutex ok\nping-pong ok\nregs ok\n",
+        Ending::Exit(0),
+    ),
+    (
+        "libc_threads",
+        "ready\n\
+         pool: 500500 2001000 4501500\n\
+         queue: 400 items, sum 240200\n\
+         mutex: 400 increments\n\
+         fp: 210.0 20190.0\n\
+         threads: 13, distinct ids yes\n",
+        Ending::Exit(0),
+    ),
+    (
         "counter",
         "step 07 digest 6b4e24cdafe14e6b\nstep 15 digest c93f1c055e5410cf\nstep 23 digest 65632246df41d107\nstep 31 digest a7c1ff878b0627df\nstep 39 digest 9a1ea881edd8f792\n",
         Ending::Exit(0),
     ),
+    // Hostile cells (spec `isolation`) whose answers Linux gives too.
+    (
+        "hostile_ptrs",
+        "efault ok\nkernel ranges ok\nhuge ranges ok\nthread pointer ok\n",
+        Ending::Exit(0),
+    ),
+    ("poke_kernel", "", Ending::Fault),
+    ("scrub", "ready\nzero ok\n", Ending::Exit(0)),
+    ("rewrite", "ready\nown ok\n", Ending::Exit(0)),
+];
+
+/// Hostile test cells run only in the kernel (spec `isolation`): random
+/// system calls, or taking all memory, are not for the host that runs the
+/// differential check.
+#[allow(dead_code)]
+pub const KERNEL_ONLY: &[(&str, &str, Ending)] = &[
+    ("fuzz", "fuzz ok\n", Ending::Exit(0)),
+    ("hog", "exhausted\n", Ending::Exit(0)),
+    ("namer", "names full\n", Ending::Exit(0)),
 ];
 
 /// Test cells that never end on their own (they are killed by the tests):
 /// not run by the differential check.
 #[allow(dead_code)]
-pub const ENDLESS: &[&str] = &["spin", "mapper", "idle"];
+pub const ENDLESS: &[&str] = &["spin", "mapper", "idle", "storm"];
 
 /// MicroPython (`cells/python`, built only when its source is given): the
 /// command it runs, with `rhizo_demo.py` in `lib/` relative to the working

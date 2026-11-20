@@ -556,7 +556,8 @@ impl<F: EntryFormat> PageTable<F> {
     /// Changes the permissions of the page containing `virt` to `flags`,
     /// keeping its frame, invalidates its TLB entry and returns its size. A
     /// copy-on-write page made writable stays copy-on-write (read-only until
-    /// written).
+    /// written), and so does one made writable with `COPY_ON_WRITE` in
+    /// `flags` (its frame is shared).
     pub fn protect(
         &self,
         mem: &mut impl PhysicalMemory,
@@ -571,7 +572,9 @@ impl<F: EntryFormat> PageTable<F> {
         let phys = F::address(entry) & !(size.bytes() - 1);
         let plain = PageFlags(flags.0 & !PageFlags::COPY_ON_WRITE.0);
         let mut new = F::leaf(phys, size, plain);
-        if F::flags(entry).contains(PageFlags::COPY_ON_WRITE) && plain.is_writable() {
+        let cow = F::flags(entry).contains(PageFlags::COPY_ON_WRITE)
+            || flags.contains(PageFlags::COPY_ON_WRITE);
+        if cow && plain.is_writable() {
             new = F::with_cow(F::with_leaf_writable(new, false), true);
         }
         mem.write_u64(slot, new);
@@ -639,6 +642,29 @@ impl<F: EntryFormat> PageTable<F> {
                 .sum()
         }
         1 + walk::<F>(mem, self.root, 3, 0..ENTRIES / 2)
+    }
+
+    /// End (exclusive, saturating) of the unmapped region around `virt`, as
+    /// far as the first empty entry on its walk covers, or `None` if `virt`
+    /// is mapped. Walking a large empty range then takes one step per empty
+    /// table entry instead of one per 4 KiB page.
+    pub fn hole_end(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<u64> {
+        if !is_canonical(virt) {
+            return Some(virt.saturating_add(FRAME_SIZE) & !(FRAME_SIZE - 1));
+        }
+        let mut table = self.root;
+        for level in (0..=3).rev() {
+            let entry = mem.read_u64(table + index(virt, level) * 8);
+            if !F::is_valid(entry) {
+                let span = 1u64 << (12 + 9 * level);
+                return Some((virt & !(span - 1)).saturating_add(span));
+            }
+            if F::is_leaf(entry, level) {
+                return None;
+            }
+            table = F::address(entry);
+        }
+        None
     }
 
     /// Walks to the valid leaf entry for `virt`: (slot address, entry, level).
@@ -1039,6 +1065,32 @@ mod tests {
                         pt.protect(&mut mem, &mut tlb, 0x9000, ro),
                         Err(UnmapError::NotMapped(0x9000))
                     );
+                }
+
+                #[test]
+                fn holes_end_where_their_empty_entry_ends() {
+                    let mut mem = FakePhysicalMemory::new();
+                    let mut alloc = frames();
+                    let pt = PT::new(&mut mem, &mut alloc).unwrap();
+                    pt.map(
+                        &mut mem,
+                        &mut alloc,
+                        0x40_5000,
+                        0x5000,
+                        PageSize::Small,
+                        RW_NX,
+                    )
+                    .unwrap();
+                    assert_eq!(pt.hole_end(&mem, 0x40_5abc), None, "mapped");
+                    assert_eq!(pt.hole_end(&mem, 0x40_6000), Some(0x40_7000));
+                    assert_eq!(pt.hole_end(&mem, 0x60_0000), Some(0x80_0000));
+                    assert_eq!(pt.hole_end(&mem, 0x4000_0000), Some(0x8000_0000));
+                    assert_eq!(pt.hole_end(&mem, 0x80_0000_0000), Some(0x100_0000_0000));
+                    assert_eq!(
+                        pt.hole_end(&mem, 0x0000_7fff_ffff_f000),
+                        Some(0x0000_8000_0000_0000)
+                    );
+                    assert_eq!(pt.hole_end(&mem, u64::MAX - 5), Some(u64::MAX));
                 }
 
                 #[test]

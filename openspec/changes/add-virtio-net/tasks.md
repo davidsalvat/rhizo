@@ -12,7 +12,6 @@
 - [x] 2.1 Kernel: virtio-mmio discovery and register mapping on both architectures, the card polled in the scheduler loop (D4); verify `cargo xtask test --only ktest` on both architectures shows the card and its DHCP address
 - [x] 2.2 `xtask`: QEMU user network and host echo server, Firecracker tap when `sudo` allows; in-kernel test of a cell reaching the host; verify `cargo xtask test` on both architectures
 - [x] 2.3 `net.tcp_rtt_us` in `bench-cell` and `xtask/src/bench.rs`, described in `bench/README.md`; verify `cargo xtask bench --runs 1` locally
-- [x] 2.4 Frames: the card, the heap's single pages and cells' 4 KiB frames from 2 MiB blocks already in use (D7); verify `cargo test -p rhizo-mm` and the MicroPython in-kernel test with the card on AArch64
 
 ## 3. Documentation
 

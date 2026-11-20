@@ -87,6 +87,14 @@ macro_rules! suite {
             ktest_case!(file_data_takes_its_own_size),
             ktest_case!(memory_pressure_fails_cells_not_the_kernel),
             ktest_case!(a_thousand_idle_cells),
+            ktest_case!(hostile_pointers_get_efault),
+            ktest_case!(cell_cannot_write_kernel_memory),
+            ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
+            ktest_case!(syscall_storm_does_not_starve_others),
+            ktest_case!(memory_hog_is_refused_and_others_run),
+            ktest_case!(fresh_memory_never_holds_another_cells_data),
+            ktest_case!(names_cannot_fill_kernel_memory),
+            ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
             ktest_case!(micropython_in_a_cell),
             ktest_case!(sockets_and_pipes_behave_as_on_linux),
             ktest_case!(cells_talk_over_loopback),
@@ -96,6 +104,13 @@ macro_rules! suite {
             ktest_case!(forked_servers_share_their_listener),
             ktest_case!(pipes_and_sockets_of_a_fork),
             ktest_case!(a_cell_reaches_the_host),
+            ktest_case!(threads_behave_as_on_linux_and_return_memory),
+            ktest_case!(spinning_thread_does_not_starve_its_siblings),
+            ktest_case!(thread_count_does_not_buy_cpu_time),
+            ktest_case!(cells_whose_threads_all_wait_use_no_cpu),
+            ktest_case!(threaded_cell_survives_suspend_and_resume),
+            ktest_case!(forks_of_a_threaded_cell_run_all_threads),
+            ktest_case!(template_of_a_threaded_program),
             $(ktest_case!($extra),)*
         ]
     };
@@ -385,6 +400,7 @@ mod expected {
 fn run_expected(name: &str) -> alloc::string::String {
     let &(_, stdout, ending) = expected::PROGRAMS
         .iter()
+        .chain(expected::KERNEL_ONLY)
         .find(|p| p.0 == name)
         .unwrap_or_else(|| panic!("{name} is not in cells/expected.rs"));
     let (got, out) = crate::cell::run(crate::cell::test_image(name), &[name.as_bytes()])
@@ -1122,6 +1138,172 @@ fn a_thousand_idle_cells() {
     assert_eq!(memory_balance(), before, "nothing leaked");
 }
 
+// --- H13: isolation under attack (spec `isolation`) -------------------------
+
+fn hostile_pointers_get_efault() {
+    assert_no_leak("hostile_ptrs");
+}
+
+fn cell_cannot_write_kernel_memory() {
+    let report = run_expected("poke_kernel");
+    assert!(
+        report.contains("address 0xffff800000000000: write"),
+        "{report}"
+    );
+    run_expected("hello");
+}
+
+/// Twenty thousand random system calls next to a well-behaved cell: the
+/// fuzzer gets only values and errnos, the other cell finishes, and running
+/// it again leaves memory as it was.
+fn syscall_fuzzer_cannot_hurt_the_kernel() {
+    fn round() {
+        let mut host = Host::new();
+        let image = crate::cell::test_image("fuzz");
+        let fuzz = host
+            .spawn(image, &[b"fuzz"], true, false)
+            .expect("spawn fuzz");
+        let chatter = spawn(&mut host, "chatter", &[b"c"]);
+        host.run(|_| false);
+        assert_eq!(ended(&host, fuzz), (Ending::Exit(0), "fuzz ok\n".into()));
+        assert_eq!(ended(&host, chatter), (Ending::Exit(0), "c\nc\nc\n".into()));
+    }
+    round();
+    let before = memory_balance();
+    round();
+    assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// A cell that never stops making the calls that once took the kernel a
+/// step per page of their range: the others still get the CPU.
+fn syscall_storm_does_not_starve_others() {
+    let mut host = Host::new();
+    let storm = spawn(&mut host, "storm", &[]);
+    let hello = spawn(&mut host, "hello", &[]);
+    host.run(|h| h.finished(hello).is_some());
+    assert_eq!(
+        ended(&host, hello),
+        (Ending::Exit(0), "hello from a cell\n".into())
+    );
+    assert_eq!(host.output(storm), Some(&b"storm\n"[..]));
+    assert!(host.kill(storm));
+}
+
+/// A cell takes every frame it can: it is refused (`ENOMEM`), the cell
+/// beside it finishes, and every frame comes back.
+fn memory_hog_is_refused_and_others_run() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let hog = spawn(&mut host, "hog", &[]);
+    let chatter = spawn(&mut host, "chatter", &[b"c"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, hog), (Ending::Exit(0), "exhausted\n".into()));
+    assert_eq!(ended(&host, chatter), (Ending::Exit(0), "c\nc\nc\n".into()));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame came back");
+    run_expected("hello");
+}
+
+/// Memory a cell is given never holds another cell's data: not when it
+/// starts, not in a forked child, not after a resume (eager or lazy), each
+/// right after another cell filled frames with a pattern and freed them.
+/// And what an ended cell mapped is mapped for no one.
+fn fresh_memory_never_holds_another_cells_data() {
+    fn dirty(host: &mut Host) {
+        let id = spawn(host, "scrub", &[b"dirty"]);
+        host.run(|h| h.finished(id).is_some());
+        assert_eq!(ended(host, id), (Ending::Exit(0), "dirty\n".into()));
+    }
+    fn ready(host: &mut Host) -> u32 {
+        let id = spawn(host, "scrub", &[]);
+        while host.output(id) != Some(b"ready\n") {
+            host.step();
+        }
+        id
+    }
+    fn zero(host: &mut Host, ids: &[u32]) {
+        host.run(|_| false);
+        for &id in ids {
+            let (ending, out) = ended(host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            assert!(out.ends_with("zero ok\n"), "{out}");
+        }
+    }
+    let mut host = Host::new();
+    dirty(&mut host);
+    let fresh = ready(&mut host);
+    zero(&mut host, &[fresh]);
+
+    dirty(&mut host);
+    let parent = ready(&mut host);
+    let child = host.fork(parent, 1).expect("fork")[0];
+    zero(&mut host, &[parent, child]);
+
+    for mode in [Resume::Eager, Resume::Lazy] {
+        let id = ready(&mut host);
+        let snapshot = host.suspend(id).expect("suspend");
+        dirty(&mut host);
+        let resumed = host.resume(snapshot, mode, true, true).expect("resume");
+        zero(&mut host, &[resumed]);
+    }
+
+    dirty(&mut host);
+    let peek = spawn(&mut host, "peek", &[]);
+    host.run(|_| false);
+    let (ending, report) = ended(&host, peek);
+    assert_eq!(ending, Ending::Fault, "the ended cell's mapping is gone");
+    assert!(report.contains("address 0x400000000000: read"), "{report}");
+}
+
+/// After a fork, read-only pages are shared: a cell that makes one writable
+/// and writes it gets its own copy; the others keep theirs.
+fn shared_read_only_pages_stay_shared_after_mprotect() {
+    let mut host = Host::new();
+    let parent = spawn(&mut host, "rewrite", &[]);
+    while host.output(parent) != Some(b"ready\n") {
+        host.step();
+    }
+    let mut ids = host.fork(parent, 2).expect("fork");
+    ids.push(parent);
+    host.run(|_| false);
+    for id in ids {
+        let (ending, out) = ended(&host, id);
+        assert_eq!(ending, Ending::Exit(0), "{out}");
+        assert!(out.ends_with("own ok\n"), "{out}");
+    }
+}
+
+/// Cells make directories until refused. Next to a cell that takes all the
+/// memory it can, names are refused once only the kernel's reserve is left
+/// (names live in the kernel heap, which panics if it cannot grow); alone,
+/// each cell stops at its own limit on files. All end, the kernel keeps
+/// running, and every frame comes back.
+fn names_cannot_fill_kernel_memory() {
+    fn namers(host: &mut Host, n: usize) -> Vec<u32> {
+        let image = crate::cell::test_image("namer");
+        (0..n)
+            .map(|_| {
+                host.spawn(image, &[b"namer"], true, false)
+                    .expect("spawn namer")
+            })
+            .collect()
+    }
+    let before = memory_balance();
+    let mut host = Host::new();
+    let mut ids = namers(&mut host, 4);
+    let hog = spawn(&mut host, "hog", &[]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, hog), (Ending::Exit(0), "exhausted\n".into()));
+    ids.extend(namers(&mut host, 4));
+    host.run(|_| false);
+    for id in ids {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "names full\n".into()));
+    }
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame came back");
+    run_expected("hello");
+}
+
 // --- MicroPython ----------------------------------------------------------
 
 /// MicroPython running `cells/python/rhizo_demo.py`, imported from the
@@ -1219,6 +1401,128 @@ fn a_waiting_cell_uses_no_cpu() {
 /// Runs `netstate` to its `ready` line.
 fn netstate_ready(host: &mut Host) -> u32 {
     let id = spawn(host, "netstate", &[]);
+    while host.output(id) != Some(b"ready\n") {
+        host.step();
+    }
+    id
+}
+
+// --- H14: threads ------------------------------------------------------------
+
+/// Raw `clone` and futexes (`threads`) and glibc's pthreads, mutexes and
+/// condition variables (`libc_threads`) behave as on Linux, and a threaded
+/// cell returns every frame: thread stacks, arenas, all of it.
+fn threads_behave_as_on_linux_and_return_memory() {
+    assert_no_leak("threads");
+    assert_no_leak("libc_threads");
+}
+
+/// A thread prints and calls `exit_group` while the first spins: the cell
+/// ends with every thread, and all its memory comes back.
+fn spinning_thread_does_not_starve_its_siblings() {
+    fn round() {
+        let mut host = Host::new();
+        let id = spawn(&mut host, "threads", &[b"starve"]);
+        host.run(|h| h.finished(id).is_some());
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "not starved\n".into()));
+        assert_eq!(host.live(), 0);
+    }
+    round();
+    let before = memory::free_bytes();
+    round();
+    assert_eq!(memory::free_bytes(), before, "every frame returned");
+}
+
+/// Scheduling steps until a `chatter` cell ends next to a cell of `n`
+/// spinning threads.
+fn steps_next_to_spinners(n: &[u8]) -> usize {
+    let mut host = Host::new();
+    let spinner = spawn(&mut host, "threads", &[b"spin", n]);
+    let chatter = spawn(&mut host, "chatter", &[]);
+    let mut steps = 0;
+    while host.finished(chatter).is_none() {
+        host.step();
+        steps += 1;
+    }
+    assert!(host.kill(spinner));
+    steps
+}
+
+fn thread_count_does_not_buy_cpu_time() {
+    let one = steps_next_to_spinners(b"1");
+    let four = steps_next_to_spinners(b"4");
+    assert_eq!(four, one, "the cell, not the thread, gets the time");
+}
+
+fn cells_whose_threads_all_wait_use_no_cpu() {
+    let mut host = Host::new();
+    let parked = spawn(&mut host, "threads", &[b"park"]);
+    let hello = spawn(&mut host, "hello", &[]);
+    host.run(|_| false); // returns: only a cell that can never run is left
+    assert_eq!(
+        ended(&host, hello),
+        (Ending::Exit(0), "hello from a cell\n".into())
+    );
+    assert_eq!(host.live(), 1, "the waiting cell is still live");
+    assert!(host.finished(parked).is_none());
+    // Its threads still wait after a suspend and resume, and it can be killed.
+    let snapshot = host.suspend(parked).expect("live");
+    let parked = host
+        .resume(snapshot, Resume::Lazy, true, false)
+        .expect("resume");
+    host.run(|_| false);
+    assert!(host.kill(parked));
+    assert_eq!(ended(&host, parked).0, Ending::Killed);
+}
+
+fn expected_output(name: &str) -> &'static str {
+    expected::PROGRAMS
+        .iter()
+        .find(|p| p.0 == name)
+        .unwrap_or_else(|| panic!("{name} is not in cells/expected.rs"))
+        .1
+}
+
+/// `libc_threads` suspended after every scheduling step and resumed from
+/// the snapshot's bytes (threads waiting on condition variables included),
+/// eagerly and lazily: its output is the uninterrupted one.
+fn threaded_cell_survives_suspend_and_resume() {
+    for mode in [Resume::Eager, Resume::Lazy] {
+        // Progress for the harness: the run prints nothing else meanwhile.
+        arch::console::BootConsole.write_bytes(if mode == Resume::Eager {
+            b"(eager) "
+        } else {
+            b"(lazy) "
+        });
+        let mut host = Host::new();
+        let mut id = spawn(&mut host, "libc_threads", &[]);
+        let mut output = Vec::new();
+        let mut resumes = 0;
+        loop {
+            host.step();
+            if let Some(done) = host.finished(id) {
+                assert_eq!(done.ending, Ending::Exit(0));
+                output.extend_from_slice(&done.output);
+                break;
+            }
+            let snapshot = host.suspend(id).expect("live");
+            output.extend_from_slice(&host.finished(id).expect("suspended").output);
+            let snapshot = Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE)
+                .expect("valid");
+            id = host.resume(snapshot, mode, true, false).expect("resume");
+            resumes += 1;
+        }
+        assert!(resumes >= 20, "suspended {resumes} times");
+        assert_eq!(
+            alloc::string::String::from_utf8_lossy(&output),
+            expected_output("libc_threads")
+        );
+    }
+}
+
+/// Spawns `libc_threads` and runs it until its workers wait for the go.
+fn threaded_ready(host: &mut Host) -> u32 {
+    let id = spawn(host, "libc_threads", &[]);
     while host.output(id) != Some(b"ready\n") {
         host.step();
     }
@@ -1347,4 +1651,40 @@ fn a_cell_reaches_the_host() {
     );
     host.run(|_| false);
     assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
+}
+
+fn forks_of_a_threaded_cell_run_all_threads() {
+    let after_ready = expected_output("libc_threads")
+        .strip_prefix("ready\n")
+        .expect("ready first");
+    let mut host = Host::new();
+    let parent = threaded_ready(&mut host);
+    let children = host.fork(parent, 2).expect("fork");
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, parent),
+        (Ending::Exit(0), expected_output("libc_threads").into())
+    );
+    for child in children {
+        assert_eq!(ended(&host, child), (Ending::Exit(0), after_ready.into()));
+    }
+}
+
+fn template_of_a_threaded_program() {
+    let after_ready = expected_output("libc_threads")
+        .strip_prefix("ready\n")
+        .expect("ready first");
+    let mut host = Host::new();
+    let template = threaded_ready(&mut host);
+    assert!(host.freeze(template));
+    let ids: Vec<u32> = (0..3)
+        .map(|_| {
+            host.spawn_from_template(template, true, true)
+                .expect("spawn")
+        })
+        .collect();
+    host.run(|_| false);
+    for id in ids {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), after_ready.into()));
+    }
 }

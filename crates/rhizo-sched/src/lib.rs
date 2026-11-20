@@ -62,10 +62,14 @@ impl<T> Scheduler<T> {
     }
 
     /// Makes every waiting entry runnable, in the order they started
-    /// waiting: something they may wait for happened.
-    pub fn wake_waiting(&mut self) {
+    /// waiting, after `f` has seen it: something they may wait for
+    /// happened.
+    pub fn wake_waiting(&mut self, mut f: impl FnMut(&mut T)) {
         self.runnable
-            .extend(self.waiting.drain(..).map(|(_, entry)| entry));
+            .extend(self.waiting.drain(..).map(|(_, mut entry)| {
+                f(&mut entry);
+                entry
+            }));
     }
 
     /// Number of waiting entries.
@@ -288,7 +292,7 @@ mod tests {
         assert_eq!(s.next(1_000), None, "no deadline: waits for a wake");
         assert_eq!(s.next_wake(), None);
         assert_eq!(s.find(|&e| e == 'a'), Some(&'a'));
-        s.wake_waiting();
+        s.wake_waiting(|_| {});
         assert_eq!(s.waiting(), 0);
         assert_eq!(s.next(0), Some('a'));
     }
@@ -365,7 +369,7 @@ mod tests {
             let mut seen = vec![false; ops.len()];
             for now in 0..=50u64 {
                 if ops[now as usize % ops.len()].1 && now % 7 == 0 {
-                    s.wake_waiting();
+                    s.wake_waiting(|_| {});
                     while let Some(id) = s.next(now) {
                         prop_assert!(!seen[id]);
                         seen[id] = true;
@@ -377,7 +381,7 @@ mod tests {
                     seen[id] = true;
                 }
             }
-            s.wake_waiting();
+            s.wake_waiting(|_| {});
             while let Some(id) = s.next(50) {
                 prop_assert!(!seen[id]);
                 prop_assert!(ops[id].0.is_none());

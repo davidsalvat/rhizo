@@ -26,15 +26,7 @@ pub struct FrameAllocator<'a> {
     /// reused before frames never handed out (design D1 of
     /// `reuse-freed-frames`).
     hint: usize,
-    /// 2 MiB block where the search of
-    /// [`alloc_contiguous_sparing_large`](Self::alloc_contiguous_sparing_large)
-    /// starts: where it last found room, or the lowest block freed into
-    /// since, so the kernel's long-lived frames gather in low blocks.
-    spare_hint: usize,
 }
-
-/// Frames in a 2 MiB block.
-const LARGE_FRAMES: usize = (crate::LARGE_PAGE_SIZE / FRAME_SIZE) as usize;
 
 impl<'a> FrameAllocator<'a> {
     /// Creates an allocator for `frames` frames with every frame in use.
@@ -59,7 +51,6 @@ impl<'a> FrameAllocator<'a> {
             usable: 0,
             free: 0,
             hint: 0,
-            spare_hint: 0,
         }
     }
 
@@ -121,46 +112,6 @@ impl<'a> FrameAllocator<'a> {
         Some(start as u64 * FRAME_SIZE)
     }
 
-    /// Allocates `count` contiguous frames for the kernel's own use (its
-    /// heap, device rings and buffers), inside a 2 MiB block already partly
-    /// in use when one has room, so whole free blocks stay available for
-    /// cells' large pages; else as [`alloc_contiguous`](Self::alloc_contiguous).
-    /// The search starts at the lowest block that may have room.
-    pub fn alloc_contiguous_sparing_large(&mut self, count: usize) -> Option<u64> {
-        const BLOCK: usize = LARGE_FRAMES;
-        if count == 0 || count > self.free {
-            return None;
-        }
-        let blocks = self.frames.div_ceil(BLOCK);
-        let first = self.spare_hint.min(blocks);
-        let found = (first..blocks).chain(0..first).find_map(|b| {
-            let (from, to) = (b * BLOCK, ((b + 1) * BLOCK).min(self.frames));
-            let whole = to - from == BLOCK
-                && self.bitmap[from / BITS..to / BITS]
-                    .iter()
-                    .all(|&w| w == u64::MAX);
-            if whole {
-                return None;
-            }
-            if count == 1 {
-                // One frame: the first word with a free bit, word by word.
-                return (from / BITS..to.div_ceil(BITS)).find_map(|w| {
-                    let word = self.bitmap[w];
-                    let frame = w * BITS + word.trailing_zeros() as usize;
-                    (word != 0 && frame < to).then_some(frame)
-                });
-            }
-            self.find_run(from, to, count)
-        });
-        let Some(start) = found else {
-            return self.alloc_contiguous(count);
-        };
-        self.update_range(start, start + count, false);
-        self.free -= count;
-        self.spare_hint = start / BLOCK;
-        Some(start as u64 * FRAME_SIZE)
-    }
-
     /// Allocates 512 contiguous frames aligned to 2 MiB (one large page) and
     /// returns the address of the first. Each candidate block is eight whole
     /// bitmap words, so the search compares words, not bits.
@@ -212,7 +163,6 @@ impl<'a> FrameAllocator<'a> {
         self.update_range(first, first + count, true);
         self.free += count;
         self.hint = self.hint.min(first);
-        self.spare_hint = self.spare_hint.min(first / LARGE_FRAMES);
     }
 
     /// Returns whether the frame at `addr` is currently in use (or reserved).
@@ -287,30 +237,6 @@ mod tests {
 
     fn allocator(bitmap: &mut [u64], frames: usize) -> FrameAllocator<'_> {
         FrameAllocator::new(bitmap, frames)
-    }
-
-    #[test]
-    fn long_lived_runs_spare_free_large_blocks() {
-        let mut bits = [0u64; 64];
-        let mut fa = allocator(&mut bits, 2048); // 8 MiB: four 2 MiB blocks
-        fa.add_free_region(0, 8 * MIB);
-        let used = fa.alloc_contiguous(5).unwrap(); // block 0 partly used
-        assert_eq!(used, 0);
-        let run = fa.alloc_contiguous_sparing_large(34).unwrap();
-        assert!(run < 2 * MIB, "inside the block already in use: {run:#x}");
-        for _ in 0..3 {
-            assert!(fa.alloc_large().is_some(), "the free blocks stay whole");
-        }
-        // Single frames fill partly used blocks first, lowest first.
-        let one = fa.alloc_contiguous_sparing_large(1).unwrap();
-        assert!(one < 2 * MIB, "{one:#x}");
-        // No partly used block has room: any run will do.
-        let mut bits = [0u64; 64];
-        let mut fa = allocator(&mut bits, 1024);
-        fa.add_free_region(0, 4 * MIB);
-        assert!(fa.alloc_contiguous_sparing_large(10).is_some());
-        assert_eq!(fa.free_frames(), 1014);
-        assert_eq!(fa.alloc_contiguous_sparing_large(0), None);
     }
 
     #[test]

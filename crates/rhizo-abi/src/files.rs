@@ -19,6 +19,13 @@ const O_CLOEXEC: u64 = 0x8_0000;
 const PATH_MAX: usize = 4096;
 const ERANGE: i64 = 34;
 const ENOSPC: i64 = 28;
+/// Kernel heap a new name and inode may take (an estimate, on the high
+/// side): asked of [`Services::can_store`] before one is made, so names
+/// count against memory like file data (spec `isolation`).
+const NAME_BYTES: u64 = 512;
+/// Largest `getdents64` answer built at once (a caller asking for more gets
+/// fewer entries per call, as Linux allows).
+const DIRENTS_MAX: u64 = 64 << 10;
 
 pub(crate) fn err(e: Error) -> i64 {
     -e.errno()
@@ -191,7 +198,7 @@ fn console<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     len as i64
 }
 
-pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     arch: Arch,
     dir: u64,
@@ -214,6 +221,9 @@ pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
             append: flags & O_APPEND != 0,
             directory: flags & arch.o_directory() != 0,
         };
+        if how.create && !cx.services.can_store(NAME_BYTES) {
+            return Err(-ENOSPC);
+        }
         let kept = (flags & (O_ACCMODE | O_APPEND)) as u32;
         let fd = cx.fs.open(dir, &name, how, kept).map_err(err)?;
         if flags & O_CLOEXEC != 0 {
@@ -451,6 +461,7 @@ pub(crate) fn getdents64<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     const DT_DIR: u8 = 4;
     const DT_REG: u8 = 8;
     const DT_SOCK: u8 = 12;
+    let count = count.min(DIRENTS_MAX);
     let mut out = Vec::new();
     let mut next = 0u64;
     let mut full = false;
@@ -487,7 +498,7 @@ pub(crate) fn getdents64<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     }
 }
 
-pub(crate) fn mkdirat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn mkdirat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     dir: u64,
     addr: u64,
@@ -495,6 +506,9 @@ pub(crate) fn mkdirat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     let mut run = || -> Result<i64, i64> {
         let dir = dirfd(dir)?;
         let name = path(cx, addr)?;
+        if !cx.services.can_store(NAME_BYTES) {
+            return Err(-ENOSPC);
+        }
         cx.fs.mkdir(dir, &name).map_err(err)?;
         Ok(0)
     };
