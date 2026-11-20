@@ -57,8 +57,26 @@ FORK = median("cell.fork_us")
 RUN = median("cell.run_us")
 TEMPLATE = median("cell.spawn_from_template_us")
 FC_RESTORE = median("snapshot.restore_ms", "linux") * 1000
-LINUX_FORK = median("process.fork_us", "linux-process", "host")
-LINUX_SPAWN = median("process.spawn_us", "linux-process", "host")
+RESUME_EAGER = median("cell.resume_eager_us")
+RESUME_TOUCH = median("cell.resume_touch_us")
+FORK_TOUCH = median("cell.fork_touch_us")
+
+
+def process(name):
+    """A Linux process baseline: inside the same Firecracker VM as the cells
+    when measured there, else on the host. Returns (value, where)."""
+    v = median(name, "linux-process", "firecracker", required=False)
+    if v is not None:
+        return v, "same VM"
+    v = median(name, "linux-process", "host", required=False)
+    return v, "host"
+
+
+LINUX_CALL, CALL_AT = process("process.fork_call_us")
+LINUX_TOUCH, TOUCH_AT = process("process.fork_touch_us")
+LINUX_SPAWN, SPAWN_AT = process("process.spawn_us")
+CRIU = median("snapshot.restore_ms", "criu", "host", required=False)
+CRIU = CRIU and CRIU * 1000
 GV_RUN = median("sandbox.run_ms", "gvisor", "runsc", required=False)
 GV_RESTORE = median("snapshot.restore_ms", "gvisor", "runsc", required=False)
 GV_RUN = GV_RUN and GV_RUN * 1000
@@ -233,24 +251,45 @@ def lifecycle(t):
 
 # ---------------------------------------------------------------- chart
 def chart(t):
-    groups = [
-        ("Resume a suspended environment", times(RESUME, FC_RESTORE),
-         [("Rhizo cell", RESUME, us(RESUME), True),
-          ("Firecracker restore", FC_RESTORE, us(FC_RESTORE), False)]
-         + ([("gVisor restore", GV_RESTORE, us(GV_RESTORE), False)] if GV_RESTORE else [])),
-        ("Fork an environment holding 50 MiB", times(FORK, LINUX_FORK),
-         [("Rhizo cell", FORK, us(FORK), True),
-          ("Linux fork", LINUX_FORK, us(LINUX_FORK), False)]),
-        ("Run hello, from start to exit", times(RUN, LINUX_SPAWN),
-         [("Rhizo cell", RUN, us(RUN), True),
-          ("Linux posix_spawn", LINUX_SPAWN, us(LINUX_SPAWN), False)]
-         + ([("gVisor sandbox", GV_RUN, us(GV_RUN), False)] if GV_RUN else [])),
-        ("Answer a Python request (MicroPython)", times(PY_WARM, PY_COLD),
+    def linux(label, value, at):
+        return [(f"Linux {label}" + ("" if at == "same VM" else " (host)"), value, us(value),
+                 False)] if value else []
+
+    def ratio(fast, slow):
+        return times(fast, slow) if slow else ""
+
+    # Tier 1: the same operation, done by a cell and by a Linux process in the
+    # same kind of VM (design D3 of `add-fair-comparisons`).
+    fair = [
+        ("Fork, holding 50 MiB (the fork call)", ratio(FORK, LINUX_CALL),
+         [("Rhizo cell", FORK, us(FORK), True)] + linux("fork()", LINUX_CALL, CALL_AT)),
+        ("Fork, then the child writes all 50 MiB", ratio(FORK_TOUCH, LINUX_TOUCH),
+         [("Rhizo cell", FORK_TOUCH, us(FORK_TOUCH), True)]
+         + linux("fork + write", LINUX_TOUCH, TOUCH_AT)),
+        ("Run hello, from start to exit", ratio(RUN, LINUX_SPAWN),
+         [("Rhizo cell", RUN, us(RUN), True)] + linux("posix_spawn", LINUX_SPAWN, SPAWN_AT)),
+        ("Resume a suspended 8 MiB program", ratio(RESUME_EAGER, CRIU),
+         [("Cell, lazy", RESUME, us(RESUME), True),
+          ("Cell, eager", RESUME_EAGER, us(RESUME_EAGER), True),
+          ("Cell, lazy + read all", RESUME_TOUCH, us(RESUME_TOUCH), True)]
+         + ([("CRIU restore (host)", CRIU, us(CRIU), False)] if CRIU else [])),
+        ("Answer a Python request (MicroPython)", ratio(PY_WARM, PY_COLD),
          [("Warm template", PY_WARM, us(PY_WARM), True),
           ("Cold interpreter", PY_COLD, us(PY_COLD), False)]),
-        ("Start a cell from a warm template", "",
-         [("Rhizo cell", TEMPLATE, us(TEMPLATE), True)]),
     ]
+    # Tier 2: whole VMs and sandboxes. Not the same scope as a cell: shown
+    # for scale, without a speed-up.
+    whole = [
+        ("Resume a whole environment", "",
+         [("Cell, eager", RESUME_EAGER, us(RESUME_EAGER), True),
+          ("Firecracker VM", FC_RESTORE, us(FC_RESTORE), False)]
+         + ([("gVisor sandbox", GV_RESTORE, us(GV_RESTORE), False)] if GV_RESTORE else [])),
+    ] + ([("Run hello in a new environment", "",
+           [("Rhizo cell", RUN, us(RUN), True),
+            ("gVisor sandbox", GV_RUN, us(GV_RUN), False)])] if GV_RUN else [])
+    tiers = [("Same operation, same kind of VM: a cell against a Linux process", fair),
+             ("Whole VMs and sandboxes: a larger scope, shown for scale", whole)]
+    groups = fair + whole
     x0, x1 = 200, 676
     lo = -1
     hi = math.ceil(math.log10(max(v for g in groups for _, v, _, _ in g[2])))
@@ -258,18 +297,21 @@ def chart(t):
     def X(v):
         return x0 + (math.log10(v) - lo) / (hi - lo) * (x1 - x0)
 
+    def gheight(g):
+        return 30 + 32 * len(g[2]) + 18
+
     top = 104
-    gh = [30 + 32 * len(g[2]) + 18 for g in groups]
-    bottom = top + sum(gh)
+    tier_h = 44
+    bottom = top + sum(tier_h + sum(gheight(g) for g in gs) for _, gs in tiers)
     h = bottom + 108
     s = Svg(t, h, "Measured on the same machine",
             "Log-scale bar chart, lower is better. "
-            + " ".join(f"{g[0]}: " + ", ".join(f"{n} {lab}" for n, _, lab, _ in g[2]) + "."
-                       for g in groups))
+            + " ".join(f"{name}. " + " ".join(
+                f"{g[0]}: " + ", ".join(f"{n} {lab}" for n, _, lab, _ in g[2]) + "."
+                for g in gs) for name, gs in tiers))
     s.text(24, 40, "Measured on the same machine", 20, weight=700)
     s.text(24, 64, "Time per operation, log scale (each line is 10× the previous one); "
            "lower is better", 14, fill=t["muted"])
-    # legend
     s.rect(24, 78, 14, 14, t["bar"], t["bar"], rx=3, sw=0)
     s.text(44, 90, "Rhizo", 14)
     s.rect(110, 78, 14, 14, t["other"], t["other"], rx=3, sw=0)
@@ -281,31 +323,36 @@ def chart(t):
         s.line(X(v), bottom, X(v), bottom + 5, color=t["boxline"], arrow=False, sw=1)
         s.text(X(v), bottom + 20, lab, 14, fill=t["muted"], anchor="middle")
     y = top
-    for (title, ratio, bars), hh in zip(groups, gh):
-        s.text(24, y + 22, title, 15, weight=700)
-        if ratio:
-            s.text(776, y + 22, ratio, 15, fill=t["accent"], weight=700, anchor="end")
-        else:
-            s.text(776, y + 22, "no equivalent measured", 14, fill=t["muted"], anchor="end")
-        by = y + 34
-        for v, _ in ticks:
-            s.line(X(v), by, X(v), by + 32 * len(bars), color=t["border"], arrow=False, sw=1)
-        for name, v, lab, rh in bars:
-            c = t["bar"] if rh else t["other"]
-            s.text(x0 - 10, by + 17, name, 14, fill=t["text"] if rh else t["muted"],
-                   anchor="end")
-            s.rect(x0, by + 3, round(X(v) - x0, 1), 20, c, c, rx=3, sw=0)
-            s.add(f'<text x="{X(v) + 8}" y="{by + 18}" font-size="14" fill="{t['text']}" '
-                  f'font-weight="{700 if rh else 400}" stroke="{t['bg']}" stroke-width="5" '
-                  f'stroke-linejoin="round" paint-order="stroke">{lab}</text>')
-            by += 32
-        y += hh
+    for tier, gs in tiers:
+        s.line(24, y + 14, 776, y + 14, color=t["boxline"], arrow=False, sw=1)
+        s.text(24, y + 34, tier, 15, fill=t["accent"], weight=700)
+        y += tier_h
+        for title, rt, bars in gs:
+            s.text(24, y + 22, title, 15, weight=700)
+            if rt:
+                s.text(776, y + 22, rt, 15, fill=t["accent"], weight=700, anchor="end")
+            by = y + 34
+            for v, _ in ticks:
+                s.line(X(v), by, X(v), by + 32 * len(bars), color=t["border"], arrow=False,
+                       sw=1)
+            for name, v, lab, rh in bars:
+                c = t["bar"] if rh else t["other"]
+                s.text(x0 - 10, by + 17, name, 14, fill=t["text"] if rh else t["muted"],
+                       anchor="end")
+                s.rect(x0, by + 3, round(X(v) - x0, 1), 20, c, c, rx=3, sw=0)
+                s.add(f'<text x="{X(v) + 8}" y="{by + 18}" font-size="14" fill="{t['text']}" '
+                      f'font-weight="{700 if rh else 400}" stroke="{t['bg']}" '
+                      f'stroke-width="5" stroke-linejoin="round" paint-order="stroke">'
+                      f'{lab}</text>')
+                by += 32
+            y += gheight((title, rt, bars))
     cy = bottom + 50
     s.text(24, cy, "GitHub-hosted runners with KVM (shared machines, nested virtualization). "
-           "Rhizo runs", 14, fill=t["muted"])
-    s.text(24, cy + 19, "inside Firecracker, so both sides pay the same virtualization; Linux "
-           "baselines run on the", 14, fill=t["muted"])
-    s.text(24, cy + 38, "host. Medians from cargo xtask bench.", 14, fill=t["muted"])
+           "Rhizo and", 14, fill=t["muted"])
+    s.text(24, cy + 19, "the Linux processes run inside Firecracker; CRIU runs on the host. "
+           "Eager resume restores", 14, fill=t["muted"])
+    s.text(24, cy + 38, "every page first; lazy brings pages back on first touch.", 14,
+           fill=t["muted"])
     return s
 
 
@@ -314,12 +361,13 @@ def scorecard(t):
     s = Svg(t, 250, "Thesis targets and where they stand",
             f"Fork a 50 MB cell: target under 1 ms, measured {span('cell.fork_us')}, met. "
             f"Resume from memory: target under 100 µs, measured {span('cell.resume_us')} "
-            "with lazy restore, met. Overhead per idle cell: target a few KB plus its "
+            f"with lazy restore, met ({us(RESUME_EAGER)} eager). "
+            "Overhead per idle cell: target a few KB plus its "
             f"own pages, measured {IDLE_KB:.0f} KB with 1,000 idle cells live, met.")
     cards = [
         ("Fork a ~50 MB cell", "target < 1 ms", span("cell.fork_us"), "copy-on-write", True),
-        ("Resume from memory", "target < 100 µs", span("cell.resume_us"), "lazy restore",
-         True),
+        ("Resume from memory", "target < 100 µs", span("cell.resume_us"),
+         f"lazy; eager {us(RESUME_EAGER)}", True),
         ("Idle cell overhead", "target: a few KB", f"{IDLE_KB:.0f} KB",
          "1,000 idle cells live", True),
     ]
@@ -361,10 +409,15 @@ def roadmap(t):
         ("H9", "Memory accounting, density", f"1,000 idle cells, {IDLE_KB:.0f} KB each"),
         ("H10", "A real interpreter", "MicroPython as a cell, warm templates"),
     ] + ([("H11", "gVisor comparison", "userspace-kernel sandboxes, same machine")]
-         if GV_RUN else [])
+         if GV_RUN else []) + \
+        ([("H12", "Fair comparisons", "Linux processes in the same VM, CRIU")]
+         if CALL_AT == "same VM" else [])
     now = []
     nxt = ([] if GV_RUN else [("next", "gVisor comparison", "")]) + \
-        [("next", "Dedicated benchmark machine", "")]
+        ([] if CALL_AT == "same VM" else [("next", "Fair comparisons", "")]) + \
+        [("next", name, "") for name in [
+            "Adversarial security review", "Threads", "Sockets and network",
+            "CPython in a cell", "Multi-core", "Dedicated benchmark machine"]]
     rows = [(r, "done") for r in done] + [(r, "now") for r in now] + \
         [(r, "next") for r in nxt]
     rh, top = 34, 92
