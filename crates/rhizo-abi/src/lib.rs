@@ -109,6 +109,8 @@ enum Sys {
     Faccessat,
     Faccessat2,
     Access,
+    Select,
+    Pselect6,
 }
 
 impl Arch {
@@ -180,6 +182,8 @@ impl Arch {
             (Arch::Aarch64, 48) | (Arch::X86_64, 269) => Faccessat,
             (Arch::Aarch64, 439) | (Arch::X86_64, 439) => Faccessat2,
             (Arch::X86_64, 21) => Access,
+            (Arch::X86_64, 23) => Select,
+            (Arch::Aarch64, 72) | (Arch::X86_64, 270) => Pselect6,
             _ => return None,
         })
     }
@@ -396,6 +400,18 @@ impl Abi {
                 }
                 Err(e) => e,
             },
+            // Without descriptors, `select` is a sleep (how MicroPython's
+            // `time.sleep` waits); descriptors are not supported yet.
+            Some(Sys::Select | Sys::Pselect6) if a[0] != 0 => -ENOSYS,
+            Some(sys @ (Sys::Select | Sys::Pselect6)) => {
+                match select_sleep(cx, a[4], sys == Sys::Select) {
+                    Ok(until) => {
+                        cell.regs.gpr[0] = 0;
+                        return Outcome::Sleep(until);
+                    }
+                    Err(e) => e,
+                }
+            }
             Some(Sys::ClockNanosleep) => match sleep_until(cx, a[0], a[1], a[2]) {
                 Ok(until) => {
                     cell.regs.gpr[0] = 0;
@@ -667,6 +683,31 @@ fn sleep_until<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     } else {
         value
     })
+}
+
+/// Deadline of a `select`/`pselect6` with no descriptors: its timeout is a
+/// `timeval` (microseconds, `select`) or a `timespec` (`pselect6`). A null
+/// timeout would wait forever for nothing, which no caller means.
+fn select_sleep<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+    micros: bool,
+) -> Result<u64, i64> {
+    if addr == 0 {
+        return Err(-EINVAL);
+    }
+    let mut t = [0u8; 16];
+    cx.read(addr, &mut t).map_err(|_| -EFAULT)?;
+    let sec = i64::from_le_bytes(t[..8].try_into().unwrap_or_default());
+    let frac = i64::from_le_bytes(t[8..].try_into().unwrap_or_default());
+    let limit = if micros { 1_000_000 } else { 1_000_000_000 };
+    if sec < 0 || !(0..limit).contains(&frac) {
+        return Err(-EINVAL);
+    }
+    let ns = (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(frac as u64 * (1_000_000_000 / limit as u64));
+    Ok(cx.services.monotonic_ns().saturating_add(ns))
 }
 
 fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(

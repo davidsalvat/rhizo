@@ -40,6 +40,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.spawn_from_template_us/rhizo/<vmm>` | timing | Starting `hello` from a frozen template (a fork) and running it to its exit, against `cell.run_us` from the executable |
 | `workload.cold_us/rhizo/<vmm>` | timing | A real static glibc program (`libc_warm`: prime sieve warm-up, then one answer) started from its executable and run to its exit |
 | `workload.warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off a template frozen after the warm-up |
+| `workload.python_cold_us/rhizo/<vmm>` | timing | MicroPython (static, pinned v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's files) started from its executable: interpreter start, imports, warm-up, answer. Measured only where MicroPython is built (`RHIZO_MICROPYTHON_SRC`, set in CI) |
+| `workload.python_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off MicroPython frozen after its warm-up |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |

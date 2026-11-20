@@ -37,6 +37,9 @@ fn embed_cells() {
                 }),
         );
     }
+    // MicroPython, built by `xtask` only when its source is given
+    // (`RHIZO_MICROPYTHON_SRC`); an empty image means "not built".
+    names.push("micropython".into());
     names.sort();
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
@@ -52,7 +55,11 @@ fn embed_cells() {
             Some(dir) => {
                 let path = Path::new(dir).join(name);
                 println!("cargo:rerun-if-changed={}", path.display());
-                std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                match std::fs::read(&path) {
+                    Ok(data) => data,
+                    Err(_) if name == "micropython" => Vec::new(),
+                    Err(e) => panic!("{}: {e}", path.display()),
+                }
             }
             None => Vec::new(),
         };

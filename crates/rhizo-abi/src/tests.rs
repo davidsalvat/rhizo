@@ -586,3 +586,41 @@ fn file_writes_stop_when_the_kernel_refuses_memory() {
         "nothing more written"
     );
 }
+
+#[test]
+fn select_without_descriptors_sleeps() {
+    let mut w = World::new(Arch::X86_64);
+    w.services.clock = 500;
+    let tv = [0i64.to_le_bytes(), 1000i64.to_le_bytes()].concat(); // 1 ms
+    w.poke(DATA, &tv);
+    assert_eq!(
+        w.call(23, &[0, 0, 0, 0, DATA]),
+        (0, Outcome::Sleep(1_000_500)),
+        "select"
+    );
+    let ts = [0i64.to_le_bytes(), 2000i64.to_le_bytes()].concat(); // 2 us
+    w.poke(DATA, &ts);
+    assert_eq!(
+        w.call(270, &[0, 0, 0, 0, DATA, 0]).1,
+        Outcome::Sleep(2_500),
+        "pselect6"
+    );
+    assert_eq!(w.call(23, &[1, DATA, 0, 0, DATA]).0, -ENOSYS, "descriptors");
+    assert_eq!(w.call(23, &[0, 0, 0, 0, 0]).0, -EINVAL, "no timeout");
+    w.poke(
+        DATA,
+        &[0i64.to_le_bytes(), 1_000_000i64.to_le_bytes()].concat(),
+    );
+    assert_eq!(
+        w.call(23, &[0, 0, 0, 0, DATA]).0,
+        -EINVAL,
+        "microseconds out of range"
+    );
+    let mut a = World::new(Arch::Aarch64);
+    a.poke(DATA, &ts);
+    assert_eq!(
+        a.call(72, &[0, 0, 0, 0, DATA, 0]).1,
+        Outcome::Sleep(2_000),
+        "aarch64 pselect6"
+    );
+}
