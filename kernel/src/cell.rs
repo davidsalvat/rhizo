@@ -200,7 +200,7 @@ fn cells_may_take(bytes: u64) -> bool {
 /// for it, loaded first if it is not kept yet.
 fn image_space(data: &'static [u8], image: &Image) -> Result<PageTable<Format>, ElfError> {
     let key = (data.as_ptr() as u64, data.len() as u64);
-    if let Some(pt) = IMAGES.with(|images| copy_image(images, key)) {
+    if let Some(pt) = IMAGES.with(|images| copy_image(images, key, image)) {
         return Ok(pt);
     }
     // Loaded outside the lock: loading may drop the images kept.
@@ -218,7 +218,7 @@ fn image_space(data: &'static [u8], image: &Image) -> Result<PageTable<Format>, 
                     &mut ImageFrames,
                 );
             }
-            copy_image(images, key)
+            copy_image(images, key, image)
         })
         .ok_or(ElfError::OutOfMemory)
 }
@@ -227,9 +227,13 @@ fn image_space(data: &'static [u8], image: &Image) -> Result<PageTable<Format>, 
 /// tables and writable pages the copy's own. Short of frames for that, the
 /// kept space itself, taken out, with every other image dropped: a spawn
 /// never needs more memory than a load. `None` if `key` is not kept.
-fn copy_image(images: &mut Images<KEPT_IMAGES>, key: images::Key) -> Option<PageTable<Format>> {
+fn copy_image(
+    images: &mut Images<KEPT_IMAGES>,
+    key: images::Key,
+    image: &Image,
+) -> Option<PageTable<Format>> {
     let kept = PageTable::<Format>::from_root(images.get(key)?);
-    if let Ok(copy) = kept.clone_lower_half(&mut DirectMap, &mut ImageFrames) {
+    if let Ok(copy) = kept.clone_lower_half(&mut DirectMap, &mut ImageFrames, image.span()) {
         return Some(copy);
     }
     images.remove(key);

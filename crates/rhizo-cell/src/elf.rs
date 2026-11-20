@@ -212,6 +212,17 @@ impl<'a> Image<'a> {
             .unwrap_or(0)
     }
 
+    /// The addresses the loaded segments lie in: from the first page of
+    /// the lowest to [`end`](Self::end).
+    pub fn span(&self) -> core::ops::Range<u64> {
+        let start = self
+            .segments()
+            .map(|s| align_down(s.vaddr, FRAME_SIZE))
+            .min()
+            .unwrap_or(0);
+        start..self.end()
+    }
+
     /// Maps every segment into `pt` with fresh zeroed frames and copies the
     /// file contents (the rest of each segment, its `.bss`, stays zero).
     pub fn load<F: EntryFormat>(

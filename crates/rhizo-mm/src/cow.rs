@@ -63,26 +63,35 @@ impl<F: EntryFormat> PageTable<F> {
         Ok(Self::from_root(child))
     }
 
-    /// Copies the user half into a new hierarchy with tables of its own
-    /// (design D2 of `add-image-cache`): every read-only page is shared
-    /// (one more reference), every writable or copy-on-write page is copied
-    /// into a private frame. This hierarchy is only read, so it may be
-    /// cloned while others clone it too; the copy changes its own tables
-    /// without affecting anyone. On failure every frame taken is returned.
+    /// Copies the pages of the user half within `span` (it must hold every
+    /// page there is) into a new hierarchy with tables of its own (design
+    /// D2 of `add-image-cache`): every read-only page is shared (one more
+    /// reference), every writable or copy-on-write page is copied into a
+    /// private frame. Only the table entries that cover `span` are read.
+    /// This hierarchy is only read, so it may be cloned while others clone
+    /// it too; the copy changes its own tables without affecting anyone. On
+    /// failure every frame taken is returned.
     pub fn clone_lower_half(
         &self,
         mem: &mut impl PhysicalMemory,
         frames: &mut impl Frames,
+        span: core::ops::Range<u64>,
     ) -> Result<Self, MapError> {
+        #[allow(clippy::too_many_arguments)]
         fn walk<F: EntryFormat>(
             mem: &mut impl PhysicalMemory,
             frames: &mut impl Frames,
             from: u64,
             to: u64,
             level: u32,
+            base: u64,
             entries: u64,
+            span: &core::ops::Range<u64>,
         ) -> Result<(), MapError> {
-            for i in 0..entries {
+            let size = 1u64 << (12 + 9 * level);
+            let first = span.start.saturating_sub(base) / size;
+            let last = span.end.saturating_sub(base).div_ceil(size).min(entries);
+            for i in first..last {
                 let entry = mem.read_u64(from + i * 8);
                 if !F::is_valid(entry) {
                     continue;
@@ -95,7 +104,17 @@ impl<F: EntryFormat> PageTable<F> {
                         to + i * 8,
                         F::with_table_writable(F::with_address(entry, table), true),
                     );
-                    walk::<F>(mem, frames, F::address(entry), table, level - 1, ENTRIES)?;
+                    let at = base + i * size;
+                    walk::<F>(
+                        mem,
+                        frames,
+                        F::address(entry),
+                        table,
+                        level - 1,
+                        at,
+                        ENTRIES,
+                        span,
+                    )?;
                     continue;
                 }
                 let bytes = leaf_bytes::<F>(entry, level);
@@ -121,7 +140,7 @@ impl<F: EntryFormat> PageTable<F> {
         let root = frames.alloc().ok_or(MapError::OutOfFrames)?;
         mem.zero_frame(root);
         let copy = Self::from_root(root);
-        if let Err(e) = walk::<F>(mem, frames, self.root(), root, 3, ENTRIES / 2) {
+        if let Err(e) = walk::<F>(mem, frames, self.root(), root, 3, 0, ENTRIES / 2, &span) {
             copy.destroy_lower_half(mem, frames);
             return Err(e);
         }

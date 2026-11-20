@@ -16,6 +16,10 @@ registers, stack, break and page contents (host test).
 `PageTable::clone_lower_half` walks the kept hierarchy and builds new
 tables: a read-only leaf is shared (`Frames::share`), a writable (or
 copy-on-write) leaf gets a private copy of its page, writable at once.
+It reads only the table entries that cover the executable's addresses
+(`Image::span`), not all 256 + 3 × 512 entries of a sparse hierarchy: for
+a small executable the copy then costs no more than the few pages a load
+copied.
 
 Alternatives that lost:
 

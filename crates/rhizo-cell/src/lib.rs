@@ -430,7 +430,7 @@ mod tests {
 
         let loaded = load::<X86_64>(&image, &mut mem, &mut frames).unwrap();
         let start_copy = |id, mem: &mut FakePhysicalMemory, frames: &mut CountingFrames| {
-            let pt = loaded.clone_lower_half(mem, frames).unwrap();
+            let pt = loaded.clone_lower_half(mem, frames, image.span()).unwrap();
             start(
                 id,
                 &image,

@@ -272,7 +272,9 @@ fn clone_shares_read_only_pages_and_copies_the_rest<F: EntryFormat>() {
     let tables = source.lower_half_tables(&w.mem);
     let source_leaves = w.leaves(&source);
 
-    let copy = source.clone_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    let copy = source
+        .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
+        .unwrap();
     assert_eq!(w.leaves(&source), source_leaves, "the source is only read");
     assert_eq!(copy.lower_half_tables(&w.mem), tables);
     assert_eq!(
@@ -310,7 +312,9 @@ fn clone_shares_read_only_pages_and_copies_the_rest<F: EntryFormat>() {
     let before = w.frames.live();
     w.frames.no_large = true;
     assert_eq!(
-        source.clone_lower_half(&mut w.mem, &mut w.frames).err(),
+        source
+            .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
+            .err(),
         Some(MapError::OutOfFrames)
     );
     assert_eq!(w.frames.live(), before);
@@ -401,7 +405,7 @@ fn model_check<F: EntryFormat>(ops: &[Op]) {
             Op::Clone(c) if c < n && n < 4 => {
                 let copy = cells[c]
                     .0
-                    .clone_lower_half(&mut w.mem, &mut w.frames)
+                    .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
                     .unwrap();
                 let model = cells[c].1.clone();
                 cells.push((copy, model));
