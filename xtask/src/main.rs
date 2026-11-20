@@ -259,6 +259,7 @@ impl RunArgs {
             cpus: 1,
             memory_mib: vmm::DEFAULT_MEMORY_MIB,
             bench: None,
+            shard: None,
         }
     }
 }
@@ -326,16 +327,18 @@ fn test_steps() -> Vec<&'static str> {
 }
 
 fn cmd_test(args: &RunArgs) -> Result {
-    if args.wants("host") {
+    let host_args = [
+        "test",
+        "--workspace",
+        "--exclude",
+        KERNEL_PACKAGE,
+        "--exclude",
+        CELLS_PACKAGE,
+    ];
+    let parallel = parallelism(args);
+    if args.wants("host") && parallel == 1 {
         step("host tests");
-        cargo(&[
-            "test",
-            "--workspace",
-            "--exclude",
-            KERNEL_PACKAGE,
-            "--exclude",
-            CELLS_PACKAGE,
-        ])?;
+        cargo(&host_args)?;
     }
 
     if args.wants("differential") {
@@ -346,133 +349,408 @@ fn cmd_test(args: &RunArgs) -> Result {
         }
     }
 
+    // Build everything first (cargo builds one thing at a time anyway),
+    // then run the VMs, several at once where the VMM allows it (spec
+    // `kernel-testing`, fast feedback).
     let timeout = test_timeout()?;
-    let opts = args.run_options(timeout);
-
+    // VMs that share the host's CPUs run slower; the hang limit (time
+    // without console output) grows with them.
+    let opts = args.run_options(if parallel > 1 { timeout * 2 } else { timeout });
+    let mut jobs = Vec::new();
+    if args.wants("host") && parallel > 1 {
+        step("host tests (build)");
+        let mut no_run = host_args.to_vec();
+        no_run.push("--no-run");
+        cargo(&no_run)?;
+        jobs.push(Job::host(&host_args));
+    }
     if args.wants("boot") {
-        step(&format!("boot check on {}", args.vmm.id()));
-        let kernel = build_kernel(Profile::Debug, &[])?;
-        let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
-        report_timing(args.vmm, &run);
-        let check = |what: &str, expected: &str| VmCheck {
-            kind: "boot",
-            what: what.into(),
-            expected: expected.into(),
-            reproduce: args.reproduce("boot"),
-        };
-        check_vm(
-            run.result == VmResult::Passed,
-            check("boot must exit successfully", "Passed"),
-            &run,
+        let kernel = keep_kernel("boot", &build_kernel(Profile::Debug, &[])?)?;
+        jobs.push(Job::vm(
+            format!("boot check on {}", args.vmm.id()),
+            kernel,
+            opts,
+            Check::Boot,
+            args.reproduce("boot"),
+        ));
+    }
+    let ktest =
+        || -> Result<PathBuf> { keep_kernel("ktest", &build_kernel(Profile::Debug, &["ktest"])?) };
+    let ktest_kernel = if args.wants("ktest") || args.wants("ktest-smp") {
+        Some(ktest()?)
+    } else {
+        None
+    };
+    if let (true, Some(kernel)) = (args.wants("ktest"), &ktest_kernel) {
+        let shards = shards(parallel);
+        for i in 0..shards {
+            jobs.push(Job::vm(
+                shard_name("in-kernel tests", i, shards),
+                kernel.clone(),
+                RunOptions {
+                    network: true,
+                    shard: shard(i, shards),
+                    ..opts
+                },
+                Check::Ktest { cpus: 1 },
+                args.reproduce("ktest"),
+            ));
+        }
+    }
+    if let (true, Some(kernel)) = (args.wants("ktest-smp"), &ktest_kernel) {
+        // Each of these VMs has several CPUs: fewer of them at once.
+        let shards = shards(parallel / 2);
+        for i in 0..shards {
+            jobs.push(Job::vm(
+                shard_name(&format!("in-kernel tests on {SMP_CPUS} CPUs"), i, shards),
+                kernel.clone(),
+                RunOptions {
+                    network: true,
+                    // QEMU `virt` takes its card over virtio-pci here and over
+                    // virtio-mmio in `ktest`, so both transports run on AArch64.
+                    pci_card: true,
+                    cpus: SMP_CPUS,
+                    shard: shard(i, shards),
+                    ..opts
+                },
+                Check::Ktest { cpus: SMP_CPUS },
+                args.reproduce("ktest-smp"),
+            ));
+        }
+    }
+    for check in SELF_CHECKS.iter().filter(|c| args.wants(c.feature)) {
+        let kernel = keep_kernel(
+            check.feature,
+            &build_kernel(Profile::Debug, &[check.feature])?,
         )?;
-        for needle in [
-            "Rhizo ",
-            "\nmemory: ",
-            "\nrhizo-ready cycles=",
-            "boot complete",
-        ] {
-            check_vm(
-                run.output.contains(needle),
-                check(
-                    &format!("boot output must contain `{}`", needle.trim()),
-                    &format!("a line containing `{}`", needle.trim()),
-                ),
-                &run,
-            )?;
+        let limit = check
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(timeout);
+        jobs.push(Job::vm(
+            format!("self-check: {}", check.description),
+            kernel,
+            RunOptions {
+                timeout: limit,
+                ..opts
+            },
+            Check::Fails(check),
+            args.reproduce(check.feature),
+        ));
+    }
+    run_jobs(args.vmm, &jobs, parallel)
+}
+
+/// Most in-kernel test VMs one step is split into.
+const MAX_SHARDS: usize = 4;
+
+/// How many VMs share the in-kernel tests of one step: `RHIZO_SHARDS`
+/// (at most [`MAX_SHARDS`] and `parallel`), 1 by default. Splitting runs
+/// tests without the ones before them, which still exposes tests that
+/// depend on their order (`openspec/changes/speed-up-feedback-loop`), so it
+/// is opt-in until they are fixed.
+fn shards(parallel: usize) -> usize {
+    env::var("RHIZO_SHARDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_SHARDS.min(parallel.max(1)))
+}
+
+/// How many test VMs run at once: one where VMs share a host device (the
+/// tap of Firecracker and Cloud Hypervisor) or a debugger waits, otherwise
+/// `RHIZO_JOBS` or the host's CPUs.
+fn parallelism(args: &RunArgs) -> usize {
+    if args.gdb || matches!(args.vmm, Vmm::Firecracker | Vmm::CloudHypervisor) {
+        return 1;
+    }
+    env::var("RHIZO_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+fn shard(i: usize, n: usize) -> Option<(u16, u16)> {
+    (n > 1).then_some((i as u16, n as u16))
+}
+
+fn shard_name(name: &str, i: usize, n: usize) -> String {
+    if n > 1 {
+        format!("{name} (part {} of {n})", i + 1)
+    } else {
+        name.to_string()
+    }
+}
+
+/// Copies a freshly built kernel image aside, so building the next kernel
+/// does not replace it before its VM runs.
+fn keep_kernel(name: &str, image: &Path) -> Result<PathBuf> {
+    let dir = target_dir().join("xtask-test").join(arch::current().id());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let out = dir.join(match image.extension() {
+        Some(ext) => format!("{name}.{}", ext.to_string_lossy()),
+        None => name.to_string(),
+    });
+    std::fs::copy(image, &out)
+        .map_err(|e| format!("cannot copy {} to {}: {e}", image.display(), out.display()))?;
+    Ok(out)
+}
+
+/// What a test VM must show.
+#[derive(Clone, Copy)]
+enum Check {
+    Boot,
+    Ktest { cpus: u32 },
+    Fails(&'static SelfCheck),
+}
+
+/// One step of `test` that can run alongside others.
+struct Job {
+    name: String,
+    work: JobWork,
+}
+
+enum JobWork {
+    Host(Vec<String>),
+    Vm {
+        kernel: PathBuf,
+        opts: RunOptions,
+        check: Check,
+        reproduce: String,
+    },
+}
+
+impl Job {
+    fn host(args: &[&str]) -> Self {
+        Job {
+            name: "host tests".into(),
+            work: JobWork::Host(args.iter().map(|a| a.to_string()).collect()),
         }
     }
 
-    if args.wants("ktest") {
-        step("in-kernel tests");
-        let kernel = build_kernel(Profile::Debug, &["ktest"])?;
-        let run = vmm::run(
-            args.vmm,
-            &Guest::Rhizo(kernel),
-            RunOptions {
-                network: true,
-                ..opts
+    /// Host CPUs the job keeps busy: one per virtual CPU of a VM (emulation
+    /// runs one host thread per virtual CPU); a few for `cargo test`.
+    fn weight(&self) -> usize {
+        match &self.work {
+            JobWork::Host(_) => 2,
+            // A VM with several CPUs takes half the host at most, so the
+            // single-CPU tests run beside it (its CPUs are mostly idle).
+            JobWork::Vm { opts, .. } => opts.cpus as usize,
+        }
+    }
+
+    fn vm(
+        name: String,
+        kernel: PathBuf,
+        opts: RunOptions,
+        check: Check,
+        reproduce: String,
+    ) -> Self {
+        Job {
+            name,
+            work: JobWork::Vm {
+                kernel,
+                opts,
+                check,
+                reproduce,
             },
-        )?;
-        check_vm(
+        }
+    }
+
+    /// Runs the job; with `quiet`, output is kept and shown only on failure.
+    fn run(&self, vmm: Vmm, quiet: bool) -> Result {
+        match &self.work {
+            JobWork::Host(args) => {
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                if !quiet {
+                    return cargo(&refs);
+                }
+                let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+                let out = Command::new(&cargo)
+                    .args(&refs)
+                    .current_dir(workspace_root())
+                    .output()
+                    .map_err(|e| format!("cannot run {cargo}: {e}"))?;
+                if out.status.success() {
+                    return Ok(());
+                }
+                report::text(&String::from_utf8_lossy(&out.stdout));
+                report::text(&String::from_utf8_lossy(&out.stderr));
+                Err(Failure::new("host-tests", "host tests must pass")
+                    .expected("cargo test exits successfully")
+                    .actual(out.status.to_string())
+                    .hint("the failing test and its message are printed above")
+                    .reproduce(format!("cargo {}", refs.join(" ")))
+                    .into_error())
+            }
+            JobWork::Vm {
+                kernel,
+                opts,
+                check,
+                reproduce,
+            } => {
+                let opts = RunOptions {
+                    echo: !quiet,
+                    ..*opts
+                };
+                let run = vmm::run(vmm, &Guest::Rhizo(kernel.clone()), opts)?;
+                let verdict = verify(vmm, *check, reproduce, &run);
+                if verdict.is_err() && quiet {
+                    report::text(&format!("[xtask] console output of `{}`:", self.name));
+                    report::text(&run.output);
+                }
+                verdict
+            }
+        }
+    }
+}
+
+/// Runs `jobs` on `parallel` host CPUs (each job takes [`Job::weight`] of
+/// them, so the host is never oversubscribed and timing-sensitive tests see
+/// the speed they would alone), reporting each as it ends; fails with the
+/// first failure (in job order) after all have run.
+fn run_jobs(vmm: Vmm, jobs: &[Job], parallel: usize) -> Result {
+    if parallel <= 1 {
+        for job in jobs {
+            step(&job.name);
+            job.run(vmm, false)?;
+        }
+        return Ok(());
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, mpsc};
+    let next = AtomicUsize::new(0);
+    let free = (Mutex::new(parallel), Condvar::new());
+    let (tx, rx) = mpsc::channel();
+    let mut results: Vec<Option<Result>> = jobs.iter().map(|_| None).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..parallel.min(jobs.len()) {
+            let tx = tx.clone();
+            let (next, free) = (&next, &free);
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(i) else { break };
+                    let need = job.weight().clamp(1, (parallel / 2).max(1));
+                    let mut cpus = free.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while *cpus < need {
+                        cpus = free.1.wait(cpus).unwrap_or_else(|e| e.into_inner());
+                    }
+                    *cpus -= need;
+                    drop(cpus);
+                    let started = Instant::now();
+                    let result = job.run(vmm, true);
+                    *free.0.lock().unwrap_or_else(|e| e.into_inner()) += need;
+                    free.1.notify_all();
+                    let _ = tx.send((i, started.elapsed(), result));
+                }
+            });
+        }
+        drop(tx);
+        for (i, took, result) in rx {
+            let verdict = if result.is_ok() { "ok" } else { "FAILED" };
+            step(&format!(
+                "{} ... {verdict} ({:.1} s)",
+                jobs[i].name,
+                took.as_secs_f64()
+            ));
+            results[i] = Some(result);
+        }
+    });
+    results
+        .into_iter()
+        .flatten()
+        .find(Result::is_err)
+        .unwrap_or(Ok(()))
+}
+
+/// Checks a test VM's outcome.
+fn verify(vmm: Vmm, check: Check, reproduce: &str, run: &VmRun) -> Result {
+    match check {
+        Check::Boot => {
+            report_timing(vmm, run);
+            let check = |what: &str, expected: &str| VmCheck {
+                kind: "boot",
+                what: what.into(),
+                expected: expected.into(),
+                reproduce: reproduce.into(),
+            };
+            check_vm(
+                run.result == VmResult::Passed,
+                check("boot must exit successfully", "Passed"),
+                run,
+            )?;
+            for needle in [
+                "Rhizo ",
+                "\nmemory: ",
+                "\nrhizo-ready cycles=",
+                "boot complete",
+            ] {
+                check_vm(
+                    run.output.contains(needle),
+                    check(
+                        &format!("boot output must contain `{}`", needle.trim()),
+                        &format!("a line containing `{}`", needle.trim()),
+                    ),
+                    run,
+                )?;
+            }
+            Ok(())
+        }
+        Check::Ktest { cpus: 1 } => check_vm(
             run.result == VmResult::Passed && run.output.contains("test result: ok."),
             VmCheck {
                 kind: "ktest",
                 what: "in-kernel tests must pass".into(),
                 expected: "Passed with `test result: ok.`".into(),
-                reproduce: args.reproduce("ktest"),
+                reproduce: reproduce.into(),
             },
-            &run,
-        )?;
-    }
-
-    if args.wants("ktest-smp") {
-        step(&format!("in-kernel tests on {SMP_CPUS} CPUs"));
-        let kernel = build_kernel(Profile::Debug, &["ktest"])?;
-        let smp = RunOptions {
-            network: true,
-            // QEMU `virt` takes its card over virtio-pci here and over
-            // virtio-mmio in `ktest`, so both transports run on AArch64.
-            pci_card: true,
-            cpus: SMP_CPUS,
-            ..opts
-        };
-        let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), smp)?;
-        let online = format!("cpus: {SMP_CPUS} online");
-        check_vm(
-            run.result == VmResult::Passed
-                && run.output.contains("test result: ok.")
-                && run.output.contains(&online),
-            VmCheck {
-                kind: "ktest",
-                what: format!("in-kernel tests must pass with {SMP_CPUS} CPUs online"),
-                expected: format!("`{online}` and Passed with `test result: ok.`"),
-                reproduce: args.reproduce("ktest-smp"),
-            },
-            &run,
-        )?;
-    }
-
-    for check in SELF_CHECKS.iter().filter(|c| args.wants(c.feature)) {
-        step(&format!("self-check: {}", check.description));
-        let kernel = build_kernel(Profile::Debug, &[check.feature])?;
-        let limit = check
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(timeout);
-        let run = vmm::run(
-            args.vmm,
-            &Guest::Rhizo(kernel),
-            RunOptions {
-                timeout: limit,
-                ..opts
-            },
-        )?;
-        let vm_check = |what: String, expected: String| VmCheck {
-            kind: "self-check",
-            what,
-            expected,
-            reproduce: args.reproduce(check.feature),
-        };
-        check_vm(
-            run.result == check.expected,
-            vm_check(
-                format!("{} must end with {:?}", check.feature, check.expected),
-                format!("{:?}", check.expected),
-            ),
-            &run,
-        )?;
-        for needle in check.expected_output() {
+            run,
+        ),
+        Check::Ktest { cpus } => {
+            let online = format!("cpus: {cpus} online");
             check_vm(
-                run.output.contains(needle),
+                run.result == VmResult::Passed
+                    && run.output.contains("test result: ok.")
+                    && run.output.contains(&online),
+                VmCheck {
+                    kind: "ktest",
+                    what: format!("in-kernel tests must pass with {cpus} CPUs online"),
+                    expected: format!("`{online}` and Passed with `test result: ok.`"),
+                    reproduce: reproduce.into(),
+                },
+                run,
+            )
+        }
+        Check::Fails(check) => {
+            let vm_check = |what: String, expected: String| VmCheck {
+                kind: "self-check",
+                what,
+                expected,
+                reproduce: reproduce.into(),
+            };
+            check_vm(
+                run.result == check.expected,
                 vm_check(
-                    format!("{} output must contain `{needle}`", check.feature),
-                    format!("output containing `{needle}`"),
+                    format!("{} must end with {:?}", check.feature, check.expected),
+                    format!("{:?}", check.expected),
                 ),
-                &run,
+                run,
             )?;
+            for needle in check.expected_output() {
+                check_vm(
+                    run.output.contains(needle),
+                    vm_check(
+                        format!("{} output must contain `{needle}`", check.feature),
+                        format!("output containing `{needle}`"),
+                    ),
+                    run,
+                )?;
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Validates `.github/workflows` with actionlint when it is installed.

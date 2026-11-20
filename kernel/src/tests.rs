@@ -588,7 +588,10 @@ fn spinning_cell_does_not_starve_others() {
 
 fn sleeping_cell_uses_no_cpu_and_wakes_on_time() {
     let mut host = Host::new();
-    let sleeper = spawn(&mut host, "sleeper", &[]);
+    // Long enough that `chatter` finishes first even on a loaded host (the
+    // guest clock follows the host's), so the order checked below does not
+    // depend on how busy the machine running the tests is.
+    let sleeper = spawn(&mut host, "sleeper", &[b"500"]);
     let chatter = spawn(&mut host, "chatter", &[]);
     host.run(|h| h.finished(chatter).is_some());
     assert!(
@@ -2244,26 +2247,32 @@ fn busy_cpus_do_not_starve_a_cell() {
 /// all at once on every CPU: each prints exactly what it prints alone, and
 /// all memory comes back.
 fn cells_in_parallel_stay_isolated() {
-    crate::cell::drop_images(); // free memory with no image kept loaded
-    let before = memory::free_bytes();
-    let mut host = Host::new();
     let programs = ["counter", "filer", "libc_threads", "chatter", "threads"];
-    let mut ids = Vec::new();
-    for _ in 0..4 {
-        for name in programs {
-            ids.push((name, spawn(&mut host, name, &[])));
+    let round = || {
+        let mut host = Host::new();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            for name in programs {
+                ids.push((name, spawn(&mut host, name, &[])));
+            }
         }
-    }
-    host.run(|_| false);
-    for (name, id) in ids {
-        assert_eq!(
-            ended(&host, id),
-            (Ending::Exit(0), expected_output(name).into()),
-            "{name}"
-        );
-    }
-    drop(host);
-    crate::cell::drop_images();
+        host.run(|_| false);
+        for (name, id) in ids {
+            assert_eq!(
+                ended(&host, id),
+                (Ending::Exit(0), expected_output(name).into()),
+                "{name}"
+            );
+        }
+        drop(host);
+        crate::cell::drop_images(); // free memory with no image kept loaded
+    };
+    // The first round grows the kernel heap, which keeps the frames it grows
+    // into (as `assert_no_leak` does), so the check does not depend on which
+    // tests ran before this one.
+    round();
+    let before = memory::free_bytes();
+    round();
     assert_eq!(memory::free_bytes(), before);
 }
 

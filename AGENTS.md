@@ -102,6 +102,13 @@ The feedback loop, fastest first:
 | `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates) |
 | `cargo xtask mutants` | long | Mutation testing (weekly in CI) |
 
+- `cargo xtask test` builds every kernel first, then runs its steps at once
+  on the host's CPUs and prints each step with its time; a failing step
+  shows its console output. `RHIZO_JOBS=N` sets the CPUs it uses
+  (`RHIZO_JOBS=1`: one step at a time, output live). Firecracker, Cloud
+  Hypervisor and `--gdb` run one step at a time. `RHIZO_SHARDS=N` splits
+  the in-kernel tests over `N` VMs (opt-in: see
+  `openspec/changes/speed-up-feedback-loop/design.md`).
 - Add `--json` to `check`, `test`, `ci` or `bench` for one JSON object per
   line on stdout (`step`, `failure`, `data`, `summary`).
 - Every failure prints `FAILED <kind>` with `where`, `expected`, `actual`,
