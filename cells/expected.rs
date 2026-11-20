@@ -207,3 +207,34 @@ branch 2
 branch 2 value=360156
 branch 2 turn call_9848ba8f n=635 seed=988 value=305130 notes=5 sha=fb723766 conn_requests=1
 ";
+/// Dynamically linked programs (change `add-dynamic-linking`) in the files
+/// `xtask` packs: the executable's path in them, its `argv` and what it
+/// prints; each exits with 0. They run from the top of those files (`/` in
+/// a cell; on Linux, a directory laid out the same way). The dynamic
+/// `hello` is always packed (`dynamic-files`); the distribution's `ls`,
+/// `sort` and `python3` only where the cells' architecture is the host's
+/// (`distro-files`).
+#[allow(dead_code)]
+pub const DYNAMIC: &[(&str, &[&str], &str)] = &[
+    (
+        "usr/bin/hello",
+        &["hello"],
+        "hello from a dynamically linked cell: 1 argument(s), interpreter found\n",
+    ),
+    (
+        "usr/bin/hello",
+        &["hello", "wait"],
+        "ready\nhello from a dynamically linked cell: 2 argument(s), interpreter found\n",
+    ),
+    ("usr/bin/ls", &["ls", "data"], "fruit\nnumbers\n"),
+    (
+        "usr/bin/sort",
+        &["sort", "data/fruit"],
+        "apple\nbanana\ncherry\nfig\npear\n",
+    ),
+    (
+        "usr/bin/python3",
+        &["/usr/bin/python3", "-S", "app/demo.py"],
+        "{\"dynamic\": true, \"sum\": 45}\n",
+    ),
+];

@@ -22,3 +22,8 @@
 - [x] 4.1 The agent takes a base URL and a model name, reads chunked answers, survives answers without tool calls; verify `cargo xtask test --only differential` (fake model transcript, and a model that only answers text in chunks)
 - [x] 4.2 `bench=agent-demo`, `cell::agent` live output, `cargo xtask demo agent`; verify `cargo test -p xtask demo` and a run under emulation against a stand-in model
 - [x] 4.3 `docs/demo.md`, linked from the README's "Try it"; verify `openspec validate add-agent-workload --strict`
+
+## 5. Fixes
+
+- [x] 5.1 `rhizo-snapshot`: a 2 MiB page restored as 4 KiB pages without a free 2 MiB run; kernel syncs code per page; verify `cargo test -p rhizo-snapshot` and the agent's in-kernel test after merging `add-large-image-pages`
+- [x] 5.2 The agent's test waits for the card's connections to close; verify `cargo xtask test --only ktest` (the dynamic linking test after it counts the heap)

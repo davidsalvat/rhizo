@@ -11,6 +11,7 @@ mod cpython;
 mod demo;
 mod deps;
 mod differential;
+mod dynamic;
 mod hostnet;
 mod refguest;
 mod report;
@@ -836,6 +837,7 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     build_c_cells(&out)?;
     build_micropython(&out)?;
     cpython::build(&out)?;
+    dynamic::build(&out)?;
     Ok(out)
 }
 

@@ -180,3 +180,20 @@ the agent asks for a fork by printing a line ending in `fork` and sleeping,
 and the host suspends it whenever it sleeps between turns. A control plane
 outside the kernel (a host API to suspend, fork and resume cells on
 request) is a product change, not this proof of concept's.
+
+## D8. Two fixes found by the agent
+
+- **A 2 MiB page restored without a 2 MiB run of frames.** Since
+  `add-large-image-pages`, CPython's code is mapped with 2 MiB pages; a
+  snapshot keeps them as 2 MiB pages, and `Snapshot::restore_page` needed
+  a free 2 MiB run to bring one back. After a few suspends memory is
+  fragmented, the lazy resume of the agent could not restore its code and
+  the cell died on an instruction fetch. A 2 MiB page now comes back as
+  512 pages of 4 KiB when no run is free, as `KernelFrames::alloc_large`
+  already promised its callers (host test in `rhizo-snapshot`); the code
+  cache is synchronized page by page.
+- **Closing connections outlive the test.** `smoltcp` keeps a closed
+  connection until its peer acknowledges the close, so the agent's
+  connections to the model were still on the card (two heap allocations)
+  when the next in-kernel test counted the heap. The agent's test now waits
+  until the card holds no connection (`cell::wire_busy`) before it ends.

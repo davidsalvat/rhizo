@@ -83,7 +83,8 @@ None.
 
 ## Impact
 
-`crates/rhizo-abi` (`ioctl`), `AGENTS.md` (`zlib1g-dev`),
+`crates/rhizo-abi` (`ioctl`), `crates/rhizo-snapshot` (2 MiB pages restored
+without a 2 MiB run), `AGENTS.md` (`zlib1g-dev`),
 `.github/workflows/ci.yml` (results published compact, in a step of their
 own: they outgrew one step's ten annotations), `cells/python/agent_loop.py` (new), `cells/python/pack_stdlib.py` (several
 scripts), `cells/expected.rs`, `crates/rhizo-core` (boot option `llm=`),

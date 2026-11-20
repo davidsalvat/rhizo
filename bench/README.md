@@ -48,6 +48,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.agent_cpython_model_us/rhizo/<vmm>` | timing | The part of those turns spent on the model: from sending the request to having read the whole answer (network card, TCP, the host's server), as the agent times it |
 | `workload.agent_suspend_resume_us/rhizo/<vmm>` | timing | In the same runs, the agent suspended in its pause after a turn and resumed eagerly (every page back, nothing left to page faults), its connection to the model parked in the kernel meanwhile |
 | `workload.agent_fork_us/rhizo/<vmm>` | timing | In the same runs, the agent frozen at its decision point as a template and three cells started from it, each told its branch in `/branch`, until every branch has printed its first line |
+| `workload.dynamic_run_us/rhizo/<vmm>` | timing | The dynamically linked `hello` (`cells/c/dynamic/hello.c`, glibc) started from the cell's files and run to its exit: the kernel maps it and `ld.so`, `ld.so` maps `libc.so.6` with `mmap` of files, relocates and runs `main`; file pages come from frames kept by content after a first run (change `add-dynamic-linking`). Robust figure over 25 runs; compare with `cell.run_us` (a static `hello`) |
+| `workload.dynamic_template_us/rhizo/<vmm>` | timing | The same program forked from a template frozen once it printed `ready` (`hello wait`), its libraries mapped and relocated: what a dynamically linked program costs once a template absorbs the dynamic linking |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
@@ -174,6 +176,8 @@ same clock as the cells (spec `comparisons`):
 | `workload.agent_cpython_model_us/linux-process/firecracker` | The part of its turns spent on the model, timed the same way. Pairs with `workload.agent_cpython_model_us/rhizo/firecracker` |
 | `workload.agent_fork_us/linux-process/firecracker` | Its `os.fork` into the same three branches, from the first fork until every branch has written its first line to its pipe. Pairs with `workload.agent_fork_us/rhizo/firecracker`. The Linux process has no suspend-and-resume figure: CRIU is not in the guest (design D5 of `add-agent-workload`) |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
+| `workload.dynamic_run_us/linux-process/firecracker` | `posix_spawn` of the same dynamically linked `hello` the cell benchmark runs, with the same `ld.so` and `libc.so.6` at their paths in the guest's initramfs, until it exits (`bench/host/linux_process.c` as `/init`). Pairs with `workload.dynamic_run_us/rhizo/firecracker` |
+| `workload.dynamic_run_us/linux-process/host` | The same on the benchmark host, with the host's own `ld.so` and `libc` |
 | `sandbox.run_ms/gvisor/runsc` | `runsc run` of a gVisor sandbox (systrap platform, no network) running the same static `hello`, until it exits. First run dropped |
 | `snapshot.restore_ms/gvisor/runsc` | `runsc restore --detach` of a checkpointed sandbox running the idle cell program, until `runsc state` reports it running. First restore dropped |
 
