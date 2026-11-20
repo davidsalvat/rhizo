@@ -4,7 +4,8 @@
 //! - `boot`: `record`, `entry_cycles`, `boot_arg`, `layout::{kernel_phys,
 //!   text, rodata, data, stack_guard, virt_to_phys}`
 //! - `platform`: `Format` (page-table entry format), `cmdline`,
-//!   `for_each_ram`, `for_each_reserved`, `map_devices`
+//!   `for_each_ram`, `for_each_reserved`, `map_devices`; in builds that run
+//!   cells, `for_each_virtio_mmio` and `Mmio` (a device's registers)
 //! - `console`: `init`, `BootConsole`; `power`: `init`, `Machine`
 //! - `cpu`: `init`, `supports_1gib_pages`, `activate`, `CpuTlb`
 //! - `timer`: `Counter`, `cycles_to_ns`

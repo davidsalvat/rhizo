@@ -8,6 +8,10 @@
 //!   (keyboard-controller reset, Firecracker) or `exit=ch-acpi`
 //!   (Cloud Hypervisor ACPI shutdown device), `exit=psci` (AArch64 PSCI) or
 //!   `exit=semihosting` (AArch64 under QEMU emulation)
+//! - `ip=dhcp` or `ip=ADDR/PREFIX[,GATEWAY]`: the network card's address
+//! - `echo=ADDR:PORT`: a TCP echo server the in-kernel tests may reach
+//! - `virtio_mmio.device=SIZE@BASE:IRQ` (added by QEMU `microvm` and
+//!   Firecracker on x86_64): read by [`virtio_mmio_devices`]
 
 use rhizo_hal::PhysicalMemory;
 
@@ -36,6 +40,17 @@ pub enum ExitKind {
     Semihosting,
 }
 
+/// How the network card gets its address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpOption {
+    Dhcp,
+    Static {
+        addr: [u8; 4],
+        prefix: u8,
+        gateway: Option<[u8; 4]>,
+    },
+}
+
 /// Parsed boot options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootOptions {
@@ -43,6 +58,10 @@ pub struct BootOptions {
     pub console: ConsoleKind,
     /// Exit mechanism.
     pub exit: ExitKind,
+    /// The network card's address, if it is to have one.
+    pub ip: Option<IpOption>,
+    /// A TCP echo server for the in-kernel tests.
+    pub echo: Option<([u8; 4], u16)>,
 }
 
 impl Default for BootOptions {
@@ -50,6 +69,81 @@ impl Default for BootOptions {
         Self {
             console: ConsoleKind::Serial,
             exit: ExitKind::DebugExit,
+            ip: None,
+            echo: None,
+        }
+    }
+}
+
+/// A dotted IPv4 address.
+fn ipv4(s: &[u8]) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = s.split(|&b| b == b'.');
+    for o in &mut out {
+        *o = number(parts.next()?)?.try_into().ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+/// A decimal or `0x` hexadecimal number.
+fn number(s: &[u8]) -> Option<u64> {
+    let (digits, radix) = match s.strip_prefix(b"0x") {
+        Some(hex) => (hex, 16),
+        None => (s, 10),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    digits.iter().try_fold(0u64, |n, &d| {
+        let d = (d as char).to_digit(radix)?;
+        n.checked_mul(u64::from(radix))?.checked_add(u64::from(d))
+    })
+}
+
+fn ip_option(value: &[u8]) -> Option<IpOption> {
+    if value == b"dhcp" {
+        return Some(IpOption::Dhcp);
+    }
+    let mut parts = value.splitn(2, |&b| b == b',');
+    let cidr = parts.next()?;
+    let gateway = match parts.next() {
+        Some(g) => Some(ipv4(g)?),
+        None => None,
+    };
+    let slash = cidr.iter().position(|&b| b == b'/')?;
+    let prefix = number(&cidr[slash + 1..]).filter(|&p| p <= 32)? as u8;
+    Some(IpOption::Static {
+        addr: ipv4(&cidr[..slash])?,
+        prefix,
+        gateway,
+    })
+}
+
+fn endpoint(value: &[u8]) -> Option<([u8; 4], u16)> {
+    let colon = value.iter().position(|&b| b == b':')?;
+    let port = number(&value[colon + 1..])?.try_into().ok()?;
+    Some((ipv4(&value[..colon])?, port))
+}
+
+/// Calls `f(base, size)` for every `virtio_mmio.device=SIZE@BASE:IRQ` of
+/// `cmdline` (`SIZE` in bytes, or with a `K` or `M` suffix).
+pub fn virtio_mmio_devices(cmdline: &[u8], mut f: impl FnMut(u64, u64)) {
+    for word in cmdline.split(|b| b.is_ascii_whitespace()) {
+        let Some(value) = word.strip_prefix(b"virtio_mmio.device=") else {
+            continue;
+        };
+        let Some(at) = value.iter().position(|&b| b == b'@') else {
+            continue;
+        };
+        let (size, rest) = (&value[..at], &value[at + 1..]);
+        let base = &rest[..rest.iter().position(|&b| b == b':').unwrap_or(rest.len())];
+        let (size, unit) = match size.last() {
+            Some(b'K' | b'k') => (&size[..size.len() - 1], 1 << 10),
+            Some(b'M' | b'm') => (&size[..size.len() - 1], 1 << 20),
+            _ => (size, 1),
+        };
+        if let (Some(size), Some(base)) = (number(size), number(base)) {
+            f(base, size * unit);
         }
     }
 }
@@ -67,7 +161,13 @@ impl BootOptions {
                 b"exit=ch-acpi" => options.exit = ExitKind::CloudHypervisorAcpi,
                 b"exit=psci" => options.exit = ExitKind::Psci,
                 b"exit=semihosting" => options.exit = ExitKind::Semihosting,
-                _ => {}
+                _ => {
+                    if let Some(v) = word.strip_prefix(b"ip=") {
+                        options.ip = ip_option(v).or(options.ip);
+                    } else if let Some(v) = word.strip_prefix(b"echo=") {
+                        options.echo = endpoint(v).or(options.echo);
+                    }
+                }
             }
         }
         options
@@ -134,6 +234,51 @@ mod tests {
             BootOptions::parse(b"exit=i8042 exit=debug-exit").exit,
             ExitKind::DebugExit
         );
+    }
+
+    #[test]
+    fn network_options() {
+        assert_eq!(BootOptions::parse(b"ip=dhcp").ip, Some(IpOption::Dhcp));
+        assert_eq!(
+            BootOptions::parse(b"ip=172.16.0.2/24,172.16.0.1").ip,
+            Some(IpOption::Static {
+                addr: [172, 16, 0, 2],
+                prefix: 24,
+                gateway: Some([172, 16, 0, 1])
+            })
+        );
+        assert_eq!(
+            BootOptions::parse(b"ip=10.0.0.2/8").ip,
+            Some(IpOption::Static {
+                addr: [10, 0, 0, 2],
+                prefix: 8,
+                gateway: None
+            })
+        );
+        for bad in [
+            &b"ip=10.0.0/8"[..],
+            b"ip=10.0.0.2/33",
+            b"ip=10.0.0.256/8",
+            b"ip=x",
+        ] {
+            assert_eq!(BootOptions::parse(bad).ip, None, "{bad:?}");
+        }
+        assert_eq!(
+            BootOptions::parse(b"echo=10.0.2.2:7777").echo,
+            Some(([10, 0, 2, 2], 7777))
+        );
+        assert_eq!(BootOptions::parse(b"echo=10.0.2.2:70000").echo, None);
+    }
+
+    #[test]
+    fn virtio_mmio_devices_from_the_command_line() {
+        let mut found = Vec::new();
+        virtio_mmio_devices(
+            b"console=e9 virtio_mmio.device=512@0xfeb00e00:12 virtio_mmio.device=4K@0xd0000000:5 \
+              virtio_mmio.device=bad",
+            |base, size| found.push((base, size)),
+        );
+        assert_eq!(found, [(0xfeb0_0e00, 512), (0xd000_0000, 4096)]);
     }
 
     fn write_str(mem: &mut FakePhysicalMemory, addr: u64, bytes: &[u8]) {

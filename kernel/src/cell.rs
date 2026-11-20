@@ -246,6 +246,10 @@ impl Services for KernelServices<'_> {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// The network card's address last reported on the console (0: none).
+static WIRE_ADDR: AtomicU32 = AtomicU32::new(0);
+/// Shortest time between two polls of the network card while cells run.
+const WIRE_PERIOD_NS: u64 = 20_000;
 static IRQ_READY: AtomicBool = AtomicBool::new(false);
 /// Highest address-space tag of this CPU (set with `IRQ_READY`).
 static MAX_TAG: AtomicU16 = AtomicU16::new(0);
@@ -415,6 +419,13 @@ pub struct Host {
     fp_owner: u32,
     /// [`Net::changes`] when waiting cells were last woken.
     net_seen: u64,
+    /// When the network card is to be polled next, and what its last poll
+    /// said: nanoseconds until it wants polling (design D4 of
+    /// `add-virtio-net`; `None`: no card).
+    wire_due: u64,
+    wire_delay: Option<u64>,
+    /// The card's address after its last poll.
+    wire_addr: Option<[u8; 4]>,
 }
 
 impl Host {
@@ -423,6 +434,7 @@ impl Host {
         if !IRQ_READY.swap(true, Ordering::Relaxed) {
             irq::init(SLICE_NS);
             MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
+            NET.with(|net| crate::wire::init(net, now_ns(), Counter.cycles()));
         }
         Self {
             sched: Scheduler::new(),
@@ -431,6 +443,9 @@ impl Host {
             templates: Vec::new(),
             fp_owner: 0,
             net_seen: 0,
+            wire_due: 0,
+            wire_delay: None,
+            wire_addr: None,
         }
     }
 
@@ -651,16 +666,74 @@ impl Host {
     /// ends or gives up the CPU).
     pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
         while !stop(self) {
-            self.wake_on_changes();
             let now = now_ns();
+            self.poll_wire(now);
+            self.wake_on_changes();
             let Some(live) = self.sched.next(now) else {
-                match self.sched.next_wake() {
+                let mut wake = self.sched.next_wake();
+                // Waiting cells may wait for the wire: look again when it
+                // wants (design D4 of `add-virtio-net`).
+                if self.sched.waiting() > 0
+                    && let Some(delay) = self.wire_delay
+                    && delay != u64::MAX
+                {
+                    let soon = now.saturating_add(delay.max(1));
+                    wake = Some(wake.map_or(soon, |w| w.min(soon)));
+                }
+                match wake {
                     Some(wake) => idle_until(wake),
                     None => return,
                 }
                 continue;
             };
             self.run_slice(live);
+        }
+    }
+
+    /// Polls the network card when it is due (every scheduling step at most
+    /// once per [`WIRE_PERIOD_NS`]), and reports a new address.
+    fn poll_wire(&mut self, now: u64) {
+        if now < self.wire_due {
+            return;
+        }
+        let (delay, addr) = NET.with(|net| (crate::wire::poll(net, now), net.wire_addr()));
+        // As often as the wire needs, but not more than once per period,
+        // and at least every millisecond for frames nobody waits for yet.
+        self.wire_due = now + delay.unwrap_or(u64::MAX).clamp(WIRE_PERIOD_NS, 1_000_000);
+        self.wire_delay = delay;
+        self.wire_addr = addr;
+        let packed = addr.map_or(0, u32::from_be_bytes);
+        if WIRE_ADDR.swap(packed, Ordering::Relaxed) != packed
+            && let Some(a) = addr
+        {
+            use core::fmt::Write;
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(&mut BootConsole),
+                "net: address {}.{}.{}.{}",
+                a[0],
+                a[1],
+                a[2],
+                a[3]
+            );
+        }
+    }
+
+    /// Polls the network card until it has an address, at most
+    /// `timeout_ns`; returns the address.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn wire_address(&mut self, timeout_ns: u64) -> Option<[u8; 4]> {
+        let end = now_ns().saturating_add(timeout_ns);
+        loop {
+            let now = now_ns();
+            self.wire_due = 0;
+            self.poll_wire(now);
+            if self.wire_addr.is_some() || self.wire_delay.is_none() || now >= end {
+                return self.wire_addr;
+            }
+            idle_until(now + WIRE_PERIOD_NS * 50);
         }
     }
 
@@ -1074,6 +1147,20 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback}"
     );
+    match wire_rtt() {
+        Ok(rtt) => {
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-wire tcp_rtt_ns={rtt}"
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-wire skipped: {why}"
+            );
+        }
+    }
     let s = suspend_resume();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -1395,6 +1482,37 @@ fn net() -> (u64, u64) {
         }
     }
     (robust(&mut pipe), robust(&mut loopback))
+}
+
+/// A robust figure (see [`robust`]) of the round trip of a 64-byte message
+/// between a `loopback` cell and the host's echo server, through the
+/// network card (`echo=` on the command line).
+#[cfg(feature = "bench-cell")]
+fn wire_rtt() -> Result<u64, &'static str> {
+    const RUNS: usize = 3 * ROUNDS;
+    const TRIPS: u64 = 100;
+    let (ip, port) = crate::wire::options()
+        .echo
+        .ok_or("no network card and echo server on this VMM")?;
+    let mut host = Host::new();
+    host.wire_address(10_000_000_000)
+        .ok_or("the network card got no address")?;
+    let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let port = alloc::format!("{port}");
+    let argv: [&[u8]; 5] = [b"loopback", b"ping", port.as_bytes(), b"100", ip.as_bytes()];
+    let image = test_image("loopback");
+    let mut samples = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host.spawn(image, &argv, true, false).expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        if host.finished(id).map(|f| f.ending) != Some(Ending::Exit(0)) {
+            return Err("the echo server did not answer");
+        }
+        samples.push(timer::cycles_to_ns(Counter.cycles() - t0).unwrap_or(0) / TRIPS);
+    }
+    Ok(robust(&mut samples))
 }
 
 /// Medians over 7 rounds, for the `ballast` cell (8 MiB written): suspend,

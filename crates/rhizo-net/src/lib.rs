@@ -6,20 +6,26 @@
 //! (127.0.0.0/8) a TCP connection is a pair of byte queues joined here and a
 //! UDP datagram goes straight into the queue of the socket bound at its
 //! destination; a Unix stream socket is reached by its name number, which a
-//! file of type socket in the cell's tree holds. Nothing here reads a clock
-//! or touches hardware: blocking is the caller's business ([`Error::Again`]
-//! and [`Net::changes`]).
+//! file of type socket in the cell's tree holds. Every other address goes
+//! through the network card, with `smoltcp` (module `wire`). Nothing here
+//! reads a clock or touches hardware: time is passed in, the card is a
+//! [`rhizo_hal::NetLink`], and blocking is the caller's business
+//! ([`Error::Again`] and [`Net::changes`]).
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 mod record;
+mod wire;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 pub use record::{DecodeError, Record, Saved, decode_records, encode_records};
+use smoltcp::iface::SocketHandle;
+pub use wire::WireConfig;
+use wire::{Progress, Wire};
 
 /// A socket, as a descriptor holds it.
 pub type Handle = u32;
@@ -99,6 +105,8 @@ pub enum Error {
     MsgSize,
     /// [`SOCKETS_MAX`] sockets are open (`ENFILE`).
     TooMany,
+    /// A connection to the outside has started (`EINPROGRESS`).
+    InProgress,
 }
 
 impl Error {
@@ -119,6 +127,7 @@ impl Error {
             Error::IsConn => 106,
             Error::NotConn => 107,
             Error::ConnRefused => 111,
+            Error::InProgress => 115,
         }
     }
 }
@@ -198,9 +207,16 @@ enum State {
     },
     /// A stream connection; `peer` is gone once the peer closed.
     Connected { peer: Option<Handle> },
-    /// Reset: the next call reports `ECONNRESET` while `pending`; later
-    /// ones see a closed connection.
+    /// Reset: the next call reports `ECONNRESET` (`ECONNREFUSED` if it
+    /// never opened) while `pending`; later ones see a closed connection.
     Reset { pending: bool },
+    /// A TCP connection through the network card; `report` until a
+    /// `connect` made again has reported it open.
+    Wire {
+        handle: SocketHandle,
+        ever_open: bool,
+        report: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +236,10 @@ struct Socket {
     shut_wr: bool,
     dgrams: VecDeque<(Addr, Vec<u8>)>,
     dgram_bytes: usize,
+    /// The `smoltcp` socket of a UDP socket that sent to the wire.
+    udp: Option<SocketHandle>,
+    /// A reset connection was refused (it never opened).
+    refused: bool,
 }
 
 impl Socket {
@@ -238,6 +258,8 @@ impl Socket {
             shut_wr: false,
             dgrams: VecDeque::new(),
             dgram_bytes: 0,
+            udp: None,
+            refused: false,
         }
     }
 
@@ -257,6 +279,8 @@ pub struct Net {
     changes: u64,
     next_port: u16,
     next_name: u64,
+    /// The network card, once attached.
+    wire: Option<Wire>,
 }
 
 impl Default for Net {
@@ -287,6 +311,7 @@ impl Net {
             changes: 0,
             next_port: *EPHEMERAL.start(),
             next_name: 1,
+            wire: None,
         }
     }
 
@@ -384,7 +409,11 @@ impl Net {
         };
         self.open -= 1;
         self.changes += 1;
+        if let Some(udp) = s.udp {
+            self.wire_drop(udp);
+        }
         match s.state {
+            State::Wire { handle, .. } => self.wire_close(handle),
             State::Listening { queue, .. } => {
                 for q in queue {
                     if let Ok(State::Connected { peer: Some(p) }) = self.get(q).map(|q| &q.state) {
@@ -473,7 +502,7 @@ impl Net {
         let (ty, opts) = (s.ty, s.opts);
         let local = match (s.family, addr) {
             (Family::Inet, &Addr::Inet { ip, port }) => {
-                if ip != ANY && !is_loopback(ip) {
+                if ip != ANY && !is_loopback(ip) && Some(ip) != self.wire_addr() {
                     return Err(Error::AddrNotAvail);
                 }
                 let port = match port {
@@ -580,7 +609,7 @@ impl Net {
             (Family::Inet, &Addr::Inet { ip, port }) => {
                 let ip = if ip == ANY { LOOPBACK } else { ip };
                 if !is_loopback(ip) {
-                    return Err(Error::NetUnreach);
+                    return self.connect_out(h, ty, ip, port);
                 }
                 Addr::Inet { ip, port }
             }
@@ -650,6 +679,88 @@ impl Net {
         Ok(())
     }
 
+    /// `connect` to `ip:port` outside, through the network card: the first
+    /// call starts it (`InProgress`), a call made again reports it.
+    fn connect_out(&mut self, h: Handle, ty: Type, ip: [u8; 4], port: u16) -> Result<()> {
+        if self.wire_addr().is_none() {
+            return Err(Error::NetUnreach);
+        }
+        if ty == Type::Dgram {
+            self.autobind(h, ANY)?;
+            self.get_mut(h)?.remote = Some(Addr::Inet { ip, port });
+            return Ok(());
+        }
+        self.settle(h);
+        let s = self.get_mut(h)?;
+        match &mut s.state {
+            State::Open => self.wire_connect(h, ip, port),
+            State::Wire {
+                ever_open, report, ..
+            } => match (*ever_open, *report) {
+                (false, _) => Err(Error::Again),
+                (true, true) => {
+                    *report = false;
+                    Ok(())
+                }
+                (true, false) => Err(Error::IsConn),
+            },
+            State::Reset { pending: true } => {
+                s.state = State::Reset { pending: false };
+                Err(if s.refused {
+                    Error::ConnRefused
+                } else {
+                    Error::ConnReset
+                })
+            }
+            State::Listening { .. } => Err(Error::Invalid),
+            _ => Err(Error::IsConn),
+        }
+    }
+
+    /// Brings a connection through the card up to date: open once it
+    /// opened, reset (or refused) once `smoltcp` closed it without the cell.
+    fn settle(&mut self, h: Handle) {
+        let Ok(s) = self.get(h) else { return };
+        let State::Wire {
+            handle, ever_open, ..
+        } = s.state
+        else {
+            return;
+        };
+        let closed_by_cell = s.shut_wr;
+        match self.wire_progress(handle) {
+            Progress::Connecting => {}
+            Progress::Open => {
+                if let Ok(Socket {
+                    state: State::Wire { ever_open, .. },
+                    ..
+                }) = self.get_mut(h)
+                {
+                    *ever_open = true;
+                }
+            }
+            Progress::Failed => {
+                self.wire_close(handle);
+                if let Ok(s) = self.get_mut(h) {
+                    s.state = State::Reset {
+                        pending: !closed_by_cell,
+                    };
+                    s.refused = !ever_open;
+                    s.eof = true;
+                }
+                self.changes += 1;
+            }
+        }
+    }
+
+    /// The error a reset socket reports first.
+    fn reset_error(&self, h: Handle) -> Error {
+        match self.get(h) {
+            Ok(s) if s.refused => Error::ConnRefused,
+            _ => Error::ConnReset,
+        }
+    }
+
     /// `send`/`sendto`: queues bytes of `data` for the peer (a stream:
     /// as many as fit, `Again` if none fits) or one datagram to `to` or the
     /// default destination (dropped if nobody is bound there or its queue is
@@ -662,10 +773,24 @@ impl Net {
         if s.shut_wr {
             return Err(Error::Pipe);
         }
+        self.settle(h);
+        let s = self.get_mut(h)?;
         let peer = match (reset_pending(&mut s.state), &s.state) {
-            (Some(true), _) => return Err(Error::ConnReset),
+            (Some(true), _) => return Err(self.reset_error(h)),
             (Some(false), _) => return Err(Error::Pipe),
             (None, State::Connected { peer }) => peer.ok_or(Error::Pipe)?,
+            (
+                None,
+                &State::Wire {
+                    handle, ever_open, ..
+                },
+            ) => {
+                return if ever_open {
+                    self.wire_send(handle, data)
+                } else {
+                    Err(Error::Again)
+                };
+            }
             _ => return Err(Error::NotConn),
         };
         let p = self.get_mut(peer)?;
@@ -689,11 +814,16 @@ impl Net {
             Some(_) => return Err(Error::Invalid),
             None => return Err(Error::DestAddrReq),
         };
-        if !is_loopback(ip) {
-            return Err(Error::NetUnreach);
-        }
         if data.len() > DGRAM_MAX {
             return Err(Error::MsgSize);
+        }
+        if !is_loopback(ip) {
+            self.autobind(h, ANY)?;
+            let Some(Addr::Inet { port: mine, .. }) = self.get(h)?.local else {
+                return Err(Error::Invalid);
+            };
+            self.wire_send_to(h, mine, data, ip, port)?;
+            return Ok(data.len());
         }
         self.autobind(h, ANY)?;
         let from = match self.get(h)?.local {
@@ -731,6 +861,16 @@ impl Net {
         peek: bool,
         take: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<Received> {
+        self.settle(h);
+        let s = self.get_mut(h)?;
+        if s.ty == Type::Dgram && s.dgrams.is_empty() && !s.shut_rd {
+            if let Some(udp) = s.udp
+                && let Some(got) = self.wire_recv_from(udp, len, peek, take)
+            {
+                return Ok(got);
+            }
+            return Err(Error::Again);
+        }
         let s = self.get_mut(h)?;
         if s.ty == Type::Dgram {
             let Some((from, data)) = s.dgrams.front() else {
@@ -764,7 +904,7 @@ impl Net {
             return Ok(got);
         }
         match (reset_pending(&mut s.state), &s.state) {
-            (Some(true), _) => return Err(Error::ConnReset),
+            (Some(true), _) => return Err(self.reset_error(h)),
             (Some(false), _) => {
                 return Ok(Received {
                     len: 0,
@@ -773,6 +913,26 @@ impl Net {
                 });
             }
             (None, State::Connected { .. }) => {}
+            (
+                None,
+                &State::Wire {
+                    handle, ever_open, ..
+                },
+            ) => {
+                let shut = s.shut_rd;
+                let len = if !ever_open {
+                    return Err(Error::Again);
+                } else if shut {
+                    0
+                } else {
+                    self.wire_recv(handle, len, peek, take)?
+                };
+                return Ok(Received {
+                    len,
+                    full: len,
+                    from: None,
+                });
+            }
             _ => return Err(Error::NotConn),
         }
         if s.rx.is_empty() {
@@ -808,10 +968,23 @@ impl Net {
 
     /// `shutdown`.
     pub fn shutdown(&mut self, h: Handle, how: Shutdown) -> Result<()> {
+        self.settle(h);
         let s = self.get_mut(h)?;
         let peer = match s.state {
             State::Connected { peer } => peer,
             State::Open if s.ty == Type::Dgram => None,
+            State::Wire { handle, .. } => {
+                if how != Shutdown::Read && !s.shut_wr {
+                    s.shut_wr = true;
+                    self.wire_shutdown(handle);
+                }
+                let s = self.get_mut(h)?;
+                if how != Shutdown::Write {
+                    s.shut_rd = true;
+                }
+                self.changes += 1;
+                return Ok(());
+            }
             _ => return Err(Error::NotConn),
         };
         if how != Shutdown::Write {
@@ -836,12 +1009,18 @@ impl Net {
         };
         match &s.state {
             State::Open if s.ty == Type::Dgram => {
-                OUT | if s.dgrams.is_empty() && !s.shut_rd {
+                let wire = s.udp.is_some_and(|u| self.wire_udp_ready(u));
+                OUT | if s.dgrams.is_empty() && !s.shut_rd && !wire {
                     0
                 } else {
                     IN
                 }
             }
+            &State::Wire { handle, .. } => match self.wire_progress(handle) {
+                Progress::Connecting => 0,
+                Progress::Failed => IN | OUT | HUP | RDHUP | ERR,
+                Progress::Open => self.wire_poll(handle) | if s.shut_rd { IN } else { 0 },
+            },
             State::Open => OUT | HUP,
             State::Listening { queue, .. } => {
                 if queue.is_empty() {
@@ -880,7 +1059,7 @@ impl Net {
     pub fn peer_addr(&self, h: Handle) -> Result<Addr> {
         let s = self.get(h)?;
         match (&s.state, &s.remote) {
-            (State::Connected { .. }, Some(a)) => Ok(a.clone()),
+            (State::Connected { .. } | State::Wire { .. }, Some(a)) => Ok(a.clone()),
             (State::Open, Some(a)) if s.ty == Type::Dgram => Ok(a.clone()),
             _ => Err(Error::NotConn),
         }
@@ -899,8 +1078,10 @@ impl Net {
 
     /// `SO_ERROR`: the pending error of `h`, cleared by reading it.
     pub fn take_error(&mut self, h: Handle) -> Result<Option<Error>> {
+        self.settle(h);
+        let error = self.reset_error(h);
         let reset = reset_pending(&mut self.get_mut(h)?.state);
-        Ok((reset == Some(true)).then_some(Error::ConnReset))
+        Ok((reset == Some(true)).then_some(error))
     }
 
     /// The socket a forked cell gets for `h` (design D4): the same one if it
@@ -979,3 +1160,5 @@ impl Net {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;

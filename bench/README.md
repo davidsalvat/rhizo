@@ -47,6 +47,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
 | `cell.pipe_rtt_ns/rhizo/<vmm>` | timing | The `piper` cell writing one byte into a pipe and reading it back (two system calls), per round trip over 2000 |
 | `cell.loopback_rtt_us/rhizo/<vmm>` | timing | Two `loopback` cells exchanging a 64-byte message over TCP on 127.0.0.1, per round trip over 200 (each side blocks in `read`, wakes, and the other runs) |
+| `net.tcp_rtt_us/rhizo/<vmm>` | timing | A `loopback` cell exchanging a 64-byte message with a TCP echo server on the host through the virtio-net card (QEMU user network; Firecracker on a tap device), per round trip over 100. Skipped, with the reason, on VMMs without a card (Cloud Hypervisor, `q35`: virtio-pci only) or without password-less `sudo` for the tap |
 | `cell.idle_bytes` | deterministic | Memory each of 1000 idle cells costs (forks of a template of `idle`, each run into its sleep): what "thousands of mostly idle cells per node" costs |
 | `cell.suspended_bytes` | deterministic | Snapshot size of one idle cell |
 

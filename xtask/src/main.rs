@@ -9,6 +9,7 @@ mod bench;
 mod compare;
 mod deps;
 mod differential;
+mod hostnet;
 mod refguest;
 mod report;
 mod tools;
@@ -241,6 +242,7 @@ impl RunArgs {
             echo: true,
             accel: self.accel,
             gdb: self.gdb,
+            network: false,
         }
     }
 }
@@ -367,7 +369,14 @@ fn cmd_test(args: &RunArgs) -> Result {
     if args.wants("ktest") {
         step("in-kernel tests");
         let kernel = build_kernel(Profile::Debug, &["ktest"])?;
-        let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
+        let run = vmm::run(
+            args.vmm,
+            &Guest::Rhizo(kernel),
+            RunOptions {
+                network: true,
+                ..opts
+            },
+        )?;
         check_vm(
             run.result == VmResult::Passed && run.output.contains("test result: ok."),
             VmCheck {

@@ -95,6 +95,7 @@ macro_rules! suite {
             ktest_case!(a_blocked_cell_survives_suspend),
             ktest_case!(forked_servers_share_their_listener),
             ktest_case!(pipes_and_sockets_of_a_fork),
+            ktest_case!(a_cell_reaches_the_host),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1322,4 +1323,28 @@ fn pipes_and_sockets_of_a_fork() {
         )
     );
     assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// A cell reaches a TCP echo server on the host through the network card
+/// (`echo=` on the command line, given by `xtask` where the VMM has a
+/// card); without one the test says it did not run.
+fn a_cell_reaches_the_host() {
+    let Some((ip, port)) = crate::wire::options().echo else {
+        arch::console::BootConsole.write_bytes(b"(no network card and echo server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card gets an address"
+    );
+    let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let port = alloc::format!("{port}");
+    let id = spawn(
+        &mut host,
+        "loopback",
+        &[b"ping", port.as_bytes(), b"20", ip.as_bytes()],
+    );
+    host.run(|_| false);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
 }
