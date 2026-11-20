@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 826" width="800" height="826" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Roadmap status</title>
-<desc>15 milestones done, from the boot and test harness to fair comparisons. Next: adversarial security review, threads, sockets and network, cpython in a cell, multi-core, dedicated benchmark machine.</desc>
+<desc>17 milestones done, from the boot and test harness to threads. Next: sockets and network, cpython in a cell, multi-core, dedicated benchmark machine.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="825" rx="12" fill="#ffffff" stroke="#d0d7de"/>
-<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 15 milestones done</text>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 17 milestones done</text>
 <circle cx="33" cy="66" r="9" fill="#16784f"/>
 <path d="M28.5 66l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="48" y="71" font-size="14" fill="#4b5c55">Done</text>
@@ -85,10 +85,16 @@
 <text x="76" y="590.5" font-size="15" fill="#146c4a" font-weight="700">H12</text>
 <text x="128" y="590.5" font-size="15" fill="#0e2a20">Fair comparisons</text>
 <text x="416" y="590.5" font-size="14" fill="#4b5c55">Linux processes in the same VM, CRIU</text>
-<circle cx="52" cy="619.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="76" y="624.5" font-size="15" fill="#4b5c55">Adversarial security review</text>
-<circle cx="52" cy="653.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="76" y="658.5" font-size="15" fill="#4b5c55">Threads</text>
+<circle cx="52" cy="619.0" r="9" fill="#16784f"/>
+<path d="M47.5 619.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="624.5" font-size="15" fill="#146c4a" font-weight="700">H13</text>
+<text x="128" y="624.5" font-size="15" fill="#0e2a20">Adversarial security review</text>
+<text x="416" y="624.5" font-size="14" fill="#4b5c55">12 findings fixed, docs/security.md</text>
+<circle cx="52" cy="653.0" r="9" fill="#16784f"/>
+<path d="M47.5 653.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="658.5" font-size="15" fill="#146c4a" font-weight="700">H14</text>
+<text x="128" y="658.5" font-size="15" fill="#0e2a20">Threads</text>
+<text x="416" y="658.5" font-size="14" fill="#4b5c55">pthreads, futexes; a thread in 0.70 µs</text>
 <circle cx="52" cy="687.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
 <text x="76" y="692.5" font-size="15" fill="#4b5c55">Sockets and network</text>
 <circle cx="52" cy="721.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
