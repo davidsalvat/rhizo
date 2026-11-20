@@ -8,6 +8,7 @@ mod arch;
 mod bench;
 mod compare;
 mod cpython;
+mod demo;
 mod deps;
 mod differential;
 mod dynamic;
@@ -84,6 +85,11 @@ Commands:
       --out <dir>            Where to write them (default target/profile)
       --per-cell             One frame per cell under the image
   ci                         Everything CI runs: fmt, clippy, test
+  demo agent --llm <url> --model <name> [--vmm <name>] [--accel <a>]
+                             The CPython agent in a cell against a real
+                             OpenAI-compatible model (Ollama, llama-server),
+                             shown live; needs RHIZO_CPYTHON_SRC
+                             (docs/demo.md)
   mutants                    Mutation testing of rhizo-mm and rhizo-core
                              (needs cargo-mutants; slow, runs weekly in CI)
   help                       Show this message
@@ -129,6 +135,7 @@ fn main() -> ExitCode {
         Some("bench") => bench::Options::parse(rest).and_then(|o| bench::cmd(&o)),
         Some("profile") => profile::ProfileArgs::parse(rest).and_then(|a| profile::cmd(&a)),
         Some("ci") => cmd_ci(),
+        Some("demo") => demo::cmd(rest),
         Some("mutants") => cmd_mutants(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{HELP}");

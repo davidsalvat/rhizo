@@ -61,10 +61,59 @@ fn wait_for(host: &mut Host, id: u32, line: &[u8], times: usize) {
     }
 }
 
+/// The CPython agent's live demo (design D7 of `add-agent-workload`):
+/// three turns against the model `llm=` points at (`model=NAME`, `fake`
+/// without it), suspended and resumed between turns, then forked into
+/// branches, each step on the console as it happens.
+fn agent_demo(console: &mut impl Console) {
+    let mut buf = [0u8; 1024];
+    let model = crate::arch::platform::cmdline(&mut buf)
+        .split(|b| b.is_ascii_whitespace())
+        .find_map(|w| w.strip_prefix(b"model="))
+        .unwrap_or(b"fake")
+        .to_vec();
+    let _ = writeln!(
+        ConsoleWriter(console),
+        "rhizo-demo agent, model `{}`",
+        String::from_utf8_lossy(&model)
+    );
+    let mut host = Host::new();
+    let t0 = now_ns();
+    let run = crate::cell::agent(
+        &mut host,
+        3,
+        Some(Resume::Lazy),
+        &model,
+        crate::cell::AgentOutput::Live,
+    );
+    let ms = (now_ns() - t0) / 1_000_000;
+    match run {
+        Ok(run) => {
+            let mut times = run.suspend_resume_ns;
+            times.sort_unstable();
+            let _ = writeln!(
+                ConsoleWriter(console),
+                "rhizo-demo done in {ms} ms: {} suspend and resume (median {} us), \
+                 fork into 3 branches {} us",
+                times.len(),
+                times.get(times.len() / 2).copied().unwrap_or(0) / 1000,
+                run.fork_ns / 1000
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(
+                ConsoleWriter(console),
+                "rhizo-demo failed after {ms} ms: {why}"
+            );
+        }
+    }
+}
+
 /// Runs the workload the command line asks for.
 pub fn run(console: &mut impl Console, workload: Workload) {
     match workload {
         Workload::Laptop => laptop(console),
+        Workload::AgentDemo => agent_demo(console),
         Workload::Server => {
             server(console);
             let o = fill_memory();

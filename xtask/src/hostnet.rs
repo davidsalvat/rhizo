@@ -1,8 +1,9 @@
 //! The host side of a guest's network (design D6 of `add-virtio-net`, D5 of
 //! `add-virtio-pci`): a TCP echo server the kernel's tests and benchmark
 //! reach, QEMU's user network, and a tap device each for Firecracker and
-//! Cloud Hypervisor when `sudo` allows it; and, for the laptop workload, a
-//! fake model server (design D1 of `add-reference-workloads`).
+//! Cloud Hypervisor when `sudo` allows it; and a fake model server, an
+//! HTTP chat API (design D1 of `add-reference-workloads` and of
+//! `add-agent-workload`).
 
 use crate::vmm::Vmm;
 use std::collections::BTreeMap;
@@ -38,26 +39,53 @@ pub enum Network {
 /// The network a Rhizo guest gets on `vmm`, with a host echo server.
 pub fn for_vmm(vmm: Vmm) -> Network {
     match vmm {
-        Vmm::QemuMicrovm | Vmm::QemuVirt | Vmm::QemuQ35 => match echo_server("127.0.0.1") {
-            Ok(port) => Network::Qemu {
-                cmdline: format!(" ip=dhcp echo={SLIRP_HOST}:{port}"),
-            },
-            Err(e) => Network::None(e),
-        },
+        Vmm::QemuMicrovm | Vmm::QemuVirt | Vmm::QemuQ35 => {
+            match echo_server("127.0.0.1").and_then(|e| Ok((e, llm_server("127.0.0.1", 0)?))) {
+                Ok((echo, llm)) => Network::Qemu {
+                    cmdline: format!(" ip=dhcp echo={SLIRP_HOST}:{echo} llm={SLIRP_HOST}:{llm}"),
+                },
+                Err(e) => Network::None(e),
+            }
+        }
         Vmm::Firecracker => tap_network(TAP, TAP_HOST, TAP_GUEST),
         Vmm::CloudHypervisor => tap_network(CH_TAP, CH_TAP_HOST, CH_TAP_GUEST),
     }
 }
 
 /// Tap device `tap` with the host at `host`/24, the guest at `guest`, and
-/// an echo server on the host's address.
+/// an echo server and a model server on the host's address.
 fn tap_network(tap: &'static str, host: &str, guest: &str) -> Network {
-    match tap_device(tap, host).and_then(|()| echo_server(host)) {
-        Ok(port) => Network::Tap {
+    let servers = || Ok((echo_server(host)?, llm_server(host, 0)?));
+    match tap_device(tap, host).and_then(|()| servers()) {
+        Ok((echo, llm)) => Network::Tap {
             tap,
-            cmdline: format!(" ip={guest}/24,{host} echo={host}:{port}"),
+            cmdline: format!(" ip={guest}/24,{host} echo={host}:{echo} llm={host}:{llm}"),
         },
         Err(e) => Network::None(e),
+    }
+}
+
+/// What a Linux guest in Firecracker needs to reach the model server over
+/// the Firecracker tap device: the tap, and `NAME=VALUE` words for its
+/// command line, which Linux hands to `/init` as its environment
+/// (`rhizo_ip`, `rhizo_llm`).
+pub fn linux_guest_network() -> Result<(&'static str, String), String> {
+    tap_device(TAP, TAP_HOST)?;
+    let port = llm_server(TAP_HOST, 0)?;
+    Ok((
+        TAP,
+        format!(" rhizo_ip={TAP_GUEST} rhizo_llm={TAP_HOST}:{port}"),
+    ))
+}
+
+/// The host's address as a guest on `vmm` sees it: QEMU's user network
+/// shows the host's loopback at 10.0.2.2, the tap devices give the host an
+/// address of its own.
+pub fn host_address(vmm: Vmm) -> &'static str {
+    match vmm {
+        Vmm::QemuMicrovm | Vmm::QemuVirt | Vmm::QemuQ35 => SLIRP_HOST,
+        Vmm::Firecracker => TAP_HOST,
+        Vmm::CloudHypervisor => CH_TAP_HOST,
     }
 }
 
@@ -98,7 +126,7 @@ pub fn llm_option(vmm: Vmm, delay_ms: u32) -> Option<String> {
 
 /// The port of a fake model server on `addr` answering after `delay_ms`
 /// (started once per address and delay).
-fn llm_server(addr: &str, delay_ms: u32) -> Result<u16, String> {
+pub fn llm_server(addr: &str, delay_ms: u32) -> Result<u16, String> {
     type Servers = BTreeMap<(String, u32), Result<u16, String>>;
     static SERVERS: OnceLock<Mutex<Servers>> = OnceLock::new();
     let servers = SERVERS.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -112,7 +140,7 @@ fn llm_server(addr: &str, delay_ms: u32) -> Result<u16, String> {
             let delay = Duration::from_millis(delay_ms.into());
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    thread::spawn(move || answer(stream, delay));
+                    thread::spawn(move || serve_model(stream, delay));
                 }
             });
             Ok(port)
@@ -120,51 +148,82 @@ fn llm_server(addr: &str, delay_ms: u32) -> Result<u16, String> {
         .clone()
 }
 
-/// What the fake model answers: a short completion naming a tool.
-pub const LLM_ANSWER: &str = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\
-     \"content\":\"noted\",\"tool_calls\":[{\"function\":{\"name\":\"note\"}}]}}]}";
-
-/// Reads one HTTP request (headers and `Content-Length` bytes of body),
-/// waits `delay`, answers [`LLM_ANSWER`] and closes the connection.
-fn answer(mut stream: TcpStream, delay: Duration) {
+/// Answers HTTP requests on one connection, kept alive until the client
+/// closes it or asks for `Connection: close`.
+fn serve_model(mut stream: TcpStream, delay: Duration) {
     let _ = stream.set_nodelay(true);
-    let mut request = Vec::new();
-    let mut buf = [0u8; 4096];
-    let body_end = loop {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => request.extend_from_slice(&buf[..n]),
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 16384];
+    let mut served = 0;
+    loop {
+        let Some((end, close)) = request_end(&pending) else {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => pending.extend_from_slice(&buf[..n]),
+            }
+            continue;
+        };
+        let request: Vec<u8> = pending.drain(..end).collect();
+        served += 1;
+        thread::sleep(delay);
+        let body = model_answer(&request, served);
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: {}\r\n\r\n{body}",
+            body.len(),
+            if close { "close" } else { "keep-alive" }
+        );
+        if stream.write_all(reply.as_bytes()).is_err() || close {
+            return;
         }
-        if let Some(end) = request_end(&request) {
-            break end;
-        }
-    };
-    if request.len() < body_end {
-        return;
     }
-    thread::sleep(delay);
-    let reply = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{LLM_ANSWER}",
-        LLM_ANSWER.len()
-    );
-    let _ = stream.write_all(reply.as_bytes());
 }
 
-/// Where a complete HTTP request in `bytes` ends (headers, then
-/// `Content-Length` bytes), once its headers are in.
-fn request_end(bytes: &[u8]) -> Option<usize> {
+/// Where the first complete HTTP request of `bytes` ends (headers, then
+/// `Content-Length` bytes of body), and whether it asks to close the
+/// connection; `None` until it is complete.
+fn request_end(bytes: &[u8]) -> Option<(usize, bool)> {
     let head = bytes.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    let length = String::from_utf8_lossy(&bytes[..head])
-        .lines()
-        .find_map(|l| {
-            let (name, value) = l.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())?
+    let text = String::from_utf8_lossy(&bytes[..head]);
+    let header = |name: &str| {
+        text.lines().find_map(|l| {
+            let (n, v) = l.split_once(':')?;
+            n.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
         })
+    };
+    let length: usize = header("content-length")
+        .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let end = head + length;
-    (bytes.len() >= end).then_some(end)
+    let close = header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+    (bytes.len() >= head + length).then_some((head + length, close))
+}
+
+/// The fake model's chat completion for `request` (the `served`-th on its
+/// connection): always a call to the agent's `compute` tool, with arguments
+/// derived from the whole request body (FNV-1a), so the same conversation
+/// always gets the same answer. Built without parsing JSON: the server's
+/// own time is part of every turn the benchmark measures, on both sides.
+fn model_answer(request: &[u8], served: u32) -> String {
+    let head = request
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(0, |p| p + 4);
+    let hash = request[head..]
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+    let (n, seed, id) = (500 + hash % 500, (hash >> 20) % 1000, hash as u32);
+    format!(
+        "{{\"object\": \"chat.completion\", \"model\": \"rhizo-fake\", \"choices\": [{{\
+         \"index\": 0, \"finish_reason\": \"tool_calls\", \"message\": {{\"role\": \"assistant\", \
+         \"content\": null, \"tool_calls\": [{{\"id\": \"call_{id:08x}\", \"type\": \"function\", \
+         \"function\": {{\"name\": \"compute\", \
+         \"arguments\": \"{{\\\"n\\\": {n}, \\\"seed\\\": {seed}}}\"}}}}]}}}}], \
+         \"x_requests_on_connection\": {served}}}"
+    )
 }
 
 fn echo(mut stream: TcpStream) {
@@ -241,28 +300,76 @@ mod tests {
         assert_eq!(&back, b"ping");
     }
 
+    /// Sends one chat request on `s` and returns the answer's JSON body.
+    fn chat(s: &mut TcpStream, body: &str, close: bool) -> serde_json::Value {
+        let connection = if close { "Connection: close\r\n" } else { "" };
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: model\r\n{connection}\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(request.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "the server closed early");
+            got.extend_from_slice(&buf[..n]);
+            if let Some((end, _)) = request_end(&got) {
+                assert_eq!(end, got.len(), "one answer");
+                break;
+            }
+        }
+        let text = String::from_utf8(got).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        let (_, body) = text.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+
     #[test]
-    fn the_model_server_answers_a_request() {
+    fn the_model_answers_on_a_kept_alive_connection_deterministically() {
         let port = llm_server("127.0.0.1", 0).unwrap();
+        assert_eq!(llm_server("127.0.0.1", 0), Ok(port), "started once");
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.write_all(b"POST /v1/chat HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
-            .unwrap();
-        let mut reply = String::new();
-        s.read_to_string(&mut reply).unwrap();
-        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
-        assert!(reply.ends_with(LLM_ANSWER), "{reply}");
-        assert!(reply.contains(&format!("Content-Length: {}\r\n", LLM_ANSWER.len())));
+        let a = chat(
+            &mut s,
+            r#"{"messages": [{"role": "user", "content": "hi"}]}"#,
+            false,
+        );
+        // Same conversation, same answer; another, another.
+        let b = chat(
+            &mut s,
+            r#"{"messages": [{"role": "user", "content": "hi"}]}"#,
+            false,
+        );
+        let c = chat(
+            &mut s,
+            r#"{"messages":[{"content":"ho","role":"user"}]}"#,
+            true,
+        );
+        assert_eq!(a["x_requests_on_connection"], 1);
+        assert_eq!(b["x_requests_on_connection"], 2, "the connection was kept");
+        let call = |v: &serde_json::Value| v["choices"][0]["message"]["tool_calls"][0].clone();
+        assert_eq!(call(&a), call(&b));
+        assert_ne!(call(&a), call(&c));
+        assert_eq!(call(&a)["function"]["name"], "compute");
+        let args: serde_json::Value =
+            serde_json::from_str(call(&a)["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert!((500..1000).contains(&args["n"].as_u64().unwrap()), "{args}");
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "closed after `Connection: close`");
     }
 
     #[test]
     fn requests_end_after_their_body() {
         assert_eq!(request_end(b"GET / HTTP/1.1\r\n"), None);
-        assert_eq!(request_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
-        let post = b"POST / HTTP/1.1\r\ncontent-length: 3\r\n\r\nab";
+        assert_eq!(request_end(b"GET / HTTP/1.1\r\n\r\nGET"), Some((18, false)));
+        let post = b"POST / HTTP/1.1\r\ncontent-length: 3\r\nConnection: close\r\n\r\nab";
         assert_eq!(request_end(post), None, "body not complete");
         let mut whole = post.to_vec();
         whole.push(b'c');
-        assert_eq!(request_end(&whole), Some(whole.len()));
+        assert_eq!(request_end(&whole), Some((whole.len(), true)));
     }
 
     #[test]
@@ -277,6 +384,7 @@ mod tests {
             match for_vmm(vmm) {
                 Network::Qemu { cmdline } => {
                     assert!(cmdline.starts_with(" ip=dhcp echo=10.0.2.2:"), "{cmdline}");
+                    assert!(cmdline.contains(" llm=10.0.2.2:"), "{cmdline}");
                 }
                 other => panic!("{other:?}"),
             }
