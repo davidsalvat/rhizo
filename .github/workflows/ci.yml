@@ -301,14 +301,39 @@ jobs:
           key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
 
       - name: Publish results
+        # Annotations are cut at 4 KB and GitHub keeps 10 per step: the
+        # medians, then the full results in numbered pieces of 3000 bytes,
+        # ten per step (the steps below).
         if: always()
         run: |
           if [ -f bench-results.json ]; then
-            # Annotations are cut at 4 KB: medians first, one per metric.
             echo "::notice title=bench-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results.json | tr '\n' ' ')"
-            # The full results, in numbered pieces that each fit an annotation.
-            tr -d '\n' < bench-results.json | fold -w 3000 | nl -nln -w1 -s' ' |
-              while IFS= read -r line; do
-                echo "::notice title=bench-results-${line%% *}::${line#* }"
-              done
+            tr -d '\n' < bench-results.json | fold -w 3000 | nl -nln -w1 -s' ' > bench-pieces.txt
+            sed -n '1,9p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+          fi
+      - name: Publish results (pieces 10 to 19)
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '10,19p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+          fi
+      - name: Publish results (pieces 20 to 29)
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '20,29p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+          fi
+      - name: Publish results (pieces 30 to 39)
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '30,39p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
           fi

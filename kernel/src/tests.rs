@@ -92,6 +92,8 @@ macro_rules! suite {
             ktest_case!(file_data_takes_its_own_size),
             ktest_case!(memory_pressure_fails_cells_not_the_kernel),
             ktest_case!(a_thousand_idle_cells),
+            ktest_case!(memory_full_of_cells_is_refused_cleanly),
+            ktest_case!(a_woken_cell_runs_at_once),
             ktest_case!(hostile_pointers_get_efault),
             ktest_case!(cell_cannot_write_kernel_memory),
             ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
@@ -1258,6 +1260,37 @@ fn a_thousand_idle_cells() {
     let per_cell = round();
     assert!(per_cell < 64 << 10, "{per_cell} bytes per idle cell");
     assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// Idle cells forked until memory runs out (spec `benchmarks`, server
+/// workload): the kernel refuses the next spawn, fork and eager resume, a
+/// cell asking for memory gets `ENOMEM`, nothing panics, and every byte
+/// comes back.
+fn memory_full_of_cells_is_refused_cleanly() {
+    let o = crate::workloads::fill_memory();
+    assert!(o.cells > 1000, "{o:?}");
+    assert!(
+        o.spawn_refused && o.fork_refused && o.resume_refused && o.hog_enomem,
+        "{o:?}"
+    );
+    assert_eq!(o.leaked_bytes, 0, "{o:?}");
+}
+
+/// A sleeping cell woken by the host (the stand-in for a user's message)
+/// runs at once: `worker` sleeps an hour after `ready`, then works for one
+/// second and exits.
+fn a_woken_cell_runs_at_once() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "worker", &[b"cpu", b"10", b"1"]);
+    while host.output(id) != Some(b"ready\n") {
+        host.step();
+    }
+    assert!(host.wake(id));
+    assert!(!host.wake(u32::MAX), "no such cell");
+    host.run(|h| h.finished(id).is_some());
+    let (ending, output) = ended(&host, id);
+    assert_eq!(ending, Ending::Exit(0), "{output}");
+    assert!(output.starts_with("ready\nops="), "{output}");
 }
 
 // --- H13: isolation under attack (spec `isolation`) -------------------------
