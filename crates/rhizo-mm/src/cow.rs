@@ -8,7 +8,7 @@
 //! and a write fault copies only what it must, on the path to the page.
 
 use crate::FRAME_SIZE;
-use crate::paging::{EntryFormat, MapError, PageSize, PageTable};
+use crate::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_hal::PhysicalMemory;
 
 /// Where a cell's frames come from and go back to, with reference counts so
@@ -61,6 +61,90 @@ impl<F: EntryFormat> PageTable<F> {
             mem.write_u64(child + i * 8, entry);
         }
         Ok(Self::from_root(child))
+    }
+
+    /// Copies the pages of the user half within `span` (it must hold every
+    /// page there is) into a new hierarchy with tables of its own (design
+    /// D2 of `add-image-cache`): every read-only page is shared (one more
+    /// reference), every writable or copy-on-write page is copied into a
+    /// private frame. Only the table entries that cover `span` are read.
+    /// This hierarchy is only read, so it may be cloned while others clone
+    /// it too; the copy changes its own tables without affecting anyone. On
+    /// failure every frame taken is returned.
+    pub fn clone_lower_half(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        frames: &mut impl Frames,
+        span: core::ops::Range<u64>,
+    ) -> Result<Self, MapError> {
+        #[allow(clippy::too_many_arguments)]
+        fn walk<F: EntryFormat>(
+            mem: &mut impl PhysicalMemory,
+            frames: &mut impl Frames,
+            from: u64,
+            to: u64,
+            level: u32,
+            base: u64,
+            entries: u64,
+            span: &core::ops::Range<u64>,
+        ) -> Result<(), MapError> {
+            let size = 1u64 << (12 + 9 * level);
+            let first = span.start.saturating_sub(base) / size;
+            let last = span.end.saturating_sub(base).div_ceil(size).min(entries);
+            for i in first..last {
+                let entry = mem.read_u64(from + i * 8);
+                if !F::is_valid(entry) {
+                    continue;
+                }
+                if !F::is_leaf(entry, level) {
+                    let table = frames.alloc().ok_or(MapError::OutOfFrames)?;
+                    mem.zero_frame(table);
+                    // Linked before it is filled, so a failure below frees it.
+                    mem.write_u64(
+                        to + i * 8,
+                        F::with_table_writable(F::with_address(entry, table), true),
+                    );
+                    let at = base + i * size;
+                    walk::<F>(
+                        mem,
+                        frames,
+                        F::address(entry),
+                        table,
+                        level - 1,
+                        at,
+                        ENTRIES,
+                        span,
+                    )?;
+                    continue;
+                }
+                let bytes = leaf_bytes::<F>(entry, level);
+                let page = F::address(entry) & !(bytes - 1);
+                let flags = F::flags(entry);
+                if flags.is_writable() || flags.contains(PageFlags::COPY_ON_WRITE) {
+                    let copy = match bytes {
+                        FRAME_SIZE => frames.alloc(),
+                        crate::LARGE_PAGE_SIZE => frames.alloc_large(),
+                        _ => None,
+                    }
+                    .ok_or(MapError::OutOfFrames)?;
+                    copy_frames(mem, page, copy, bytes);
+                    let private = F::with_cow(F::with_leaf_writable(entry, true), false);
+                    mem.write_u64(to + i * 8, F::with_address(private, copy));
+                } else {
+                    frames.share(page);
+                    mem.write_u64(to + i * 8, entry);
+                }
+            }
+            Ok(())
+        }
+        let root = frames.alloc().ok_or(MapError::OutOfFrames)?;
+        mem.zero_frame(root);
+        let copy = Self::from_root(root);
+        if let Err(e) = walk::<F>(mem, frames, self.root(), root, 3, 0, ENTRIES / 2, &span) {
+            copy.destroy_lower_half(mem, frames);
+            return Err(e);
+        }
+        Ok(copy)
     }
 
     /// Makes the tables on the way to `virt` private to this hierarchy and
