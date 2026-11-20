@@ -171,20 +171,29 @@ fn boot_guest<T: Send + 'static>(
             .map_err(|e| format!("cannot start Firecracker: {e}"))?;
         let stdout = child.stdout.take().ok_or("no Firecracker output")?;
         let (tx, rx) = std::sync::mpsc::channel();
+        let console = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = console.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
                 if let Some(sample) = parse(&line) {
                     let _ = tx.send(sample);
                 }
+                if let Ok(mut lines) = seen.lock() {
+                    lines.push(line);
+                }
             }
         });
         let sample = rx.recv_timeout(Duration::from_secs(120));
         stop(child);
-        samples.push(
-            sample.map_err(|_| {
-                format!("boot {boot}: the guest printed no {what} line within 120 s")
-            })?,
-        );
+        samples.push(sample.map_err(|_| {
+            let lines = console.lock().map(|l| l.clone()).unwrap_or_default();
+            let tail = &lines[lines.len().saturating_sub(15)..];
+            format!(
+                "boot {boot}: the guest printed no {what} line within 120 s; its console ended \
+                 with:\n{}",
+                tail.join("\n")
+            )
+        })?);
     }
     let _ = std::fs::remove_file(&image);
     let _ = std::fs::remove_file(&config);

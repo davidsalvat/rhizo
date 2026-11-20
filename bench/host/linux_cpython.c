@@ -32,8 +32,8 @@ static int by_value(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-// Runs python3 with `args`, its standard output in `out` (NUL-terminated,
-// truncated to `size`); returns the exit status, or -1.
+// Runs python3 with `args`, its standard output and error in `out`
+// (NUL-terminated, truncated to `size`); returns the exit status, or -1.
 static int python(char *const args[], char *out, size_t size) {
     char *const env[] = {NULL};
     int fds[2];
@@ -42,6 +42,7 @@ static int python(char *const args[], char *out, size_t size) {
     if (pid < 0) return -1;
     if (pid == 0) {
         dup2(fds[1], 1);
+        dup2(fds[1], 2);
         close(fds[0]);
         close(fds[1]);
         execve("/usr/bin/python3", args, env);
