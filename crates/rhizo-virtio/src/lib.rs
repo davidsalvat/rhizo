@@ -1,10 +1,11 @@
-//! A virtio network device over memory-mapped I/O (spec `networking`,
-//! design D1 and D3 of `add-virtio-net`).
+//! A virtio network device (spec `networking`, design D1 and D3 of
+//! `add-virtio-net`, D1 of `add-virtio-pci`).
 //!
 //! [`VirtioNet::probe`] brings up a virtio-mmio device (version 2, the
-//! modern interface) with a receive and a transmit split virtqueue, and the
-//! result is a [`NetLink`]. Registers are reached through
-//! [`DeviceRegisters`] and the rings and buffers through
+//! modern interface) and [`VirtioNet::probe_pci`] a modern virtio-pci one
+//! (found and set up with [`pci`]), each with a receive and a transmit
+//! split virtqueue, and the result is a [`NetLink`]. Registers are reached
+//! through [`DeviceRegisters`] and the rings and buffers through
 //! [`PhysicalMemory`]: the driver runs on the host against a simulated
 //! device. It polls: the device is asked for no interrupts.
 
@@ -15,6 +16,8 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use rhizo_hal::{DeviceRegisters, NetLink, PhysicalMemory};
+
+pub mod pci;
 
 /// virtio-mmio register offsets (virtio 1.2, section 4.2.2).
 pub mod reg {
@@ -58,12 +61,20 @@ const DESC_F_WRITE: u16 = 2;
 const AVAIL_F_NO_INTERRUPT: u16 = 1;
 const USED_F_NO_NOTIFY: u16 = 1;
 
-/// Entries per queue.
-pub const QUEUE_SIZE: u16 = 32;
+/// Entries per queue. The receive queue offers `QUEUE_SIZE * BUF` bytes,
+/// which stay above [`RX_MIN_OFFERED`] while up to 31 frames wait to be
+/// taken.
+pub const QUEUE_SIZE: u16 = 64;
 /// Bytes per buffer: a header and a full Ethernet frame fit.
 const BUF: u64 = 2048;
 /// `struct virtio_net_hdr` with `VIRTIO_F_VERSION_1`.
 const HDR: usize = 12;
+/// Receive buffer bytes a device may wait for before it hands over a frame:
+/// the largest frame it takes from the host and its header. Firecracker
+/// (`MAX_BUFFER_SIZE`) reads from its tap only while the receive buffers
+/// offered add up to this much, whatever features were negotiated.
+const RX_MIN_OFFERED: u64 = 65_562;
+const _: () = assert!((QUEUE_SIZE as u64 - 1) * BUF >= RX_MIN_OFFERED);
 /// Largest frame sent or received (without the header).
 pub const FRAME_MAX: usize = BUF as usize - HDR;
 const FRAME: u64 = 4096;
@@ -73,6 +84,9 @@ pub const FRAMES: usize = 2 * (1 + (QUEUE_SIZE as u64 * BUF / FRAME) as usize);
 /// then the used ring.
 const AVAIL_AT: u64 = 1024;
 const USED_AT: u64 = 2048;
+const _: () = assert!(QUEUE_SIZE as u64 * 16 <= AVAIL_AT);
+const _: () = assert!(AVAIL_AT + 6 + QUEUE_SIZE as u64 * 2 <= USED_AT);
+const _: () = assert!(USED_AT + 6 + QUEUE_SIZE as u64 * 8 <= FRAME);
 
 /// Why a device was not brought up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +103,138 @@ pub enum ProbeError {
     Queue(u16),
     /// No frame for the rings or buffers.
     OutOfMemory,
+}
+
+/// How the driver reaches the device.
+#[derive(Debug)]
+enum Transport<R> {
+    Mmio(R),
+    Pci(pci::Transport<R>),
+}
+
+impl<R: DeviceRegisters> Transport<R> {
+    fn set_status(&mut self, status: u32) {
+        match self {
+            Self::Mmio(r) => r.write32(reg::STATUS, status),
+            Self::Pci(p) => p.common.write8(pci::common::DEVICE_STATUS, status as u8),
+        }
+    }
+
+    fn status(&mut self) -> u32 {
+        match self {
+            Self::Mmio(r) => r.read32(reg::STATUS),
+            Self::Pci(p) => p.common.read8(pci::common::DEVICE_STATUS).into(),
+        }
+    }
+
+    /// Feature bits `32 * word ..` the device offers.
+    fn device_features(&mut self, word: u32) -> u32 {
+        let (r, select, features) = match self {
+            Self::Mmio(r) => (r, reg::DEVICE_FEATURES_SEL, reg::DEVICE_FEATURES),
+            Self::Pci(p) => (
+                &mut p.common,
+                pci::common::DEVICE_FEATURE_SELECT,
+                pci::common::DEVICE_FEATURE,
+            ),
+        };
+        r.write32(select, word);
+        r.read32(features)
+    }
+
+    fn set_driver_features(&mut self, word: u32, bits: u32) {
+        let (r, select, features) = match self {
+            Self::Mmio(r) => (r, reg::DRIVER_FEATURES_SEL, reg::DRIVER_FEATURES),
+            Self::Pci(p) => (
+                &mut p.common,
+                pci::common::DRIVER_FEATURE_SELECT,
+                pci::common::DRIVER_FEATURE,
+            ),
+        };
+        r.write32(select, word);
+        r.write32(features, bits);
+    }
+
+    /// The MAC address in the device configuration.
+    fn mac(&mut self) -> [u8; 6] {
+        match self {
+            Self::Mmio(r) => {
+                let (a, b) = (r.read32(reg::CONFIG), r.read32(reg::CONFIG + 4));
+                let (a, b) = (a.to_le_bytes(), b.to_le_bytes());
+                [a[0], a[1], a[2], a[3], b[0], b[1]]
+            }
+            Self::Pci(p) => core::array::from_fn(|i| p.device.read8(i)),
+        }
+    }
+
+    /// Selects queue `index`: its largest size, `None` when it is in use.
+    fn queue_max(&mut self, index: u16) -> Option<u32> {
+        let (max, enabled) = match self {
+            Self::Mmio(r) => {
+                r.write32(reg::QUEUE_SEL, u32::from(index));
+                (r.read32(reg::QUEUE_NUM_MAX), r.read32(reg::QUEUE_READY))
+            }
+            Self::Pci(p) => {
+                p.common.write16(pci::common::QUEUE_SELECT, index);
+                let max = p.common.read16(pci::common::QUEUE_SIZE);
+                (
+                    max.into(),
+                    p.common.read16(pci::common::QUEUE_ENABLE).into(),
+                )
+            }
+        };
+        (enabled == 0).then_some(max)
+    }
+
+    /// Gives the selected queue `index` its size and the addresses of its
+    /// descriptors, available ring and used ring, and enables it.
+    fn enable_queue(&mut self, index: u16, size: u16, rings: [u64; 3]) {
+        match self {
+            Self::Mmio(r) => {
+                r.write32(reg::QUEUE_NUM, u32::from(size));
+                let lows = [
+                    reg::QUEUE_DESC_LOW,
+                    reg::QUEUE_DRIVER_LOW,
+                    reg::QUEUE_DEVICE_LOW,
+                ];
+                for (low, at) in lows.into_iter().zip(rings) {
+                    r.write32(low, at as u32);
+                    r.write32(low + 4, (at >> 32) as u32);
+                }
+                r.write32(reg::QUEUE_READY, 1);
+            }
+            Self::Pci(p) => {
+                let c = &mut p.common;
+                c.write16(pci::common::QUEUE_SIZE, size);
+                let lows = [
+                    pci::common::QUEUE_DESC,
+                    pci::common::QUEUE_DRIVER,
+                    pci::common::QUEUE_DEVICE,
+                ];
+                for (low, at) in lows.into_iter().zip(rings) {
+                    c.write32(low, at as u32);
+                    c.write32(low + 4, (at >> 32) as u32);
+                }
+                let off = c.read16(pci::common::QUEUE_NOTIFY_OFF);
+                p.notify_at[index as usize] = usize::from(off) * p.notify_multiplier as usize;
+                c.write16(pci::common::QUEUE_ENABLE, 1);
+            }
+        }
+    }
+
+    /// Tells the device queue `index` has new buffers.
+    fn notify(&mut self, index: u16) {
+        match self {
+            Self::Mmio(r) => r.write32(reg::QUEUE_NOTIFY, u32::from(index)),
+            Self::Pci(p) => p.notify.write16(p.notify_at[index as usize], index),
+        }
+    }
+
+    fn barrier(&mut self) {
+        match self {
+            Self::Mmio(r) => r.barrier(),
+            Self::Pci(p) => p.common.barrier(),
+        }
+    }
 }
 
 /// One split virtqueue, in one frame.
@@ -130,13 +276,13 @@ impl Queue {
 
     /// Publishes the offered descriptors and tells the device, unless it
     /// asked not to be told.
-    fn publish(&self, mem: &mut impl PhysicalMemory, regs: &mut impl DeviceRegisters) {
-        regs.barrier();
+    fn publish<R: DeviceRegisters>(&self, mem: &mut impl PhysicalMemory, t: &mut Transport<R>) {
+        t.barrier();
         mem.write_bytes(self.frame + AVAIL_AT + 2, &self.avail.to_le_bytes());
-        regs.barrier();
+        t.barrier();
         let flags = Self::read16(mem, self.frame + USED_AT);
         if flags & USED_F_NO_NOTIFY == 0 {
-            regs.write32(reg::QUEUE_NOTIFY, u32::from(self.index));
+            t.notify(self.index);
         }
     }
 
@@ -158,7 +304,7 @@ impl Queue {
 /// A virtio network card.
 #[derive(Debug)]
 pub struct VirtioNet<R, M> {
-    regs: R,
+    regs: Transport<R>,
     mem: M,
     mac: [u8; 6],
     rx: Queue,
@@ -174,7 +320,7 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
     /// long as the kernel).
     pub fn probe(
         mut regs: R,
-        mut mem: M,
+        mem: M,
         alloc: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<Self, ProbeError> {
         if regs.read32(reg::MAGIC) != MAGIC {
@@ -190,28 +336,45 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
             2 => {}
             v => return Err(ProbeError::Version(v)),
         }
-        regs.write32(reg::STATUS, 0);
-        regs.write32(reg::STATUS, ACKNOWLEDGE);
-        regs.write32(reg::STATUS, ACKNOWLEDGE | DRIVER);
-        regs.write32(reg::DEVICE_FEATURES_SEL, 0);
-        let low = regs.read32(reg::DEVICE_FEATURES);
-        regs.write32(reg::DEVICE_FEATURES_SEL, 1);
-        let high = regs.read32(reg::DEVICE_FEATURES);
+        Self::start(Transport::Mmio(regs), mem, alloc)
+    }
+
+    /// Brings up the modern virtio-pci network card whose structures
+    /// `transport` reaches (see [`pci::net_regions`]), taking frames as
+    /// [`probe`](Self::probe) does.
+    pub fn probe_pci(
+        transport: pci::Transport<R>,
+        mem: M,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<Self, ProbeError> {
+        Self::start(Transport::Pci(transport), mem, alloc)
+    }
+
+    /// Driver initialization (virtio 1.2, section 3.1.1).
+    fn start(
+        mut regs: Transport<R>,
+        mut mem: M,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<Self, ProbeError> {
+        regs.set_status(0);
+        while regs.status() != 0 {
+            core::hint::spin_loop(); // the reset is not done yet
+        }
+        regs.set_status(ACKNOWLEDGE);
+        regs.set_status(ACKNOWLEDGE | DRIVER);
+        let low = regs.device_features(0);
+        let high = regs.device_features(1);
         if high & F_VERSION_1 == 0 {
             return Err(ProbeError::Features);
         }
-        regs.write32(reg::DRIVER_FEATURES_SEL, 0);
-        regs.write32(reg::DRIVER_FEATURES, low & F_MAC);
-        regs.write32(reg::DRIVER_FEATURES_SEL, 1);
-        regs.write32(reg::DRIVER_FEATURES, F_VERSION_1);
-        regs.write32(reg::STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK);
-        if regs.read32(reg::STATUS) & FEATURES_OK == 0 {
+        regs.set_driver_features(0, low & F_MAC);
+        regs.set_driver_features(1, F_VERSION_1);
+        regs.set_status(ACKNOWLEDGE | DRIVER | FEATURES_OK);
+        if regs.status() & FEATURES_OK == 0 {
             return Err(ProbeError::Features);
         }
         let mac = if low & F_MAC != 0 {
-            let (a, b) = (regs.read32(reg::CONFIG), regs.read32(reg::CONFIG + 4));
-            let (a, b) = (a.to_le_bytes(), b.to_le_bytes());
-            [a[0], a[1], a[2], a[3], b[0], b[1]]
+            regs.mac()
         } else {
             [0x02, 0, 0, 0, 0, 1] // locally administered
         };
@@ -232,21 +395,22 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
             card.rx.offer(&mut card.mem, id);
         }
         card.regs
-            .write32(reg::STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+            .set_status(ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
         card.rx.publish(&mut card.mem, &mut card.regs);
         Ok(card)
     }
 
     /// Sets up queue `index` in a new frame, with buffers in more frames.
     fn queue(
-        regs: &mut R,
+        regs: &mut Transport<R>,
         mem: &mut M,
         alloc: &mut dyn FnMut() -> Option<u64>,
         index: u16,
     ) -> Result<Queue, ProbeError> {
-        regs.write32(reg::QUEUE_SEL, u32::from(index));
-        let max = regs.read32(reg::QUEUE_NUM_MAX);
-        if max < u32::from(QUEUE_SIZE) || regs.read32(reg::QUEUE_READY) != 0 {
+        if regs
+            .queue_max(index)
+            .is_none_or(|max| max < u32::from(QUEUE_SIZE))
+        {
             return Err(ProbeError::Queue(index));
         }
         let mut frame = || {
@@ -262,16 +426,7 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
         }
         // The driver polls: no interrupts, please.
         mem.write_bytes(ring + AVAIL_AT, &AVAIL_F_NO_INTERRUPT.to_le_bytes());
-        regs.write32(reg::QUEUE_NUM, u32::from(QUEUE_SIZE));
-        for (low, at) in [
-            (reg::QUEUE_DESC_LOW, ring),
-            (reg::QUEUE_DRIVER_LOW, ring + AVAIL_AT),
-            (reg::QUEUE_DEVICE_LOW, ring + USED_AT),
-        ] {
-            regs.write32(low, at as u32);
-            regs.write32(low + 4, (at >> 32) as u32);
-        }
-        regs.write32(reg::QUEUE_READY, 1);
+        regs.enable_queue(index, QUEUE_SIZE, [ring, ring + AVAIL_AT, ring + USED_AT]);
         Ok(Queue {
             index,
             frame: ring,
