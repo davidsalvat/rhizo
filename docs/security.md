@@ -98,6 +98,30 @@ What makes the boundary hold:
   copies of shared pages (whole-page copy), resumed pages (whole-page
   copy), new file blocks (`[0; 4096]`).
 
+## Randomness
+
+`add-crypto-random` closed O4. `getrandom` and `AT_RANDOM` come from
+ChaCha20 (RFC 8439, `rhizo_core::random`, checked against the RFC's
+vectors) run with fast key erasure: every request first replaces the key,
+so the kernel's memory never holds what would reproduce bytes already
+handed out.
+
+- **Seed.** The kernel's generator is seeded at start from the CPU,
+  through `rhizo_hal::Entropy`: `RDSEED`, else `RDRAND`, on x86_64;
+  `RNDR` on AArch64. Without one, the seed is the cycle counter and the
+  console says `getrandom is predictable`.
+- **One generator per cell.** A cell's generator is split off the
+  kernel's (keyed with 32 of its bytes) the first time the cell asks.
+  `AT_RANDOM` comes from the kernel's generator at spawn.
+- **Forks, templates, snapshots.** No generator state is copied into a
+  child or written into a snapshot (`Generator` is not even `Clone`): each
+  child, template copy and resume splits a new one off the kernel's when it
+  first asks, so none draws what another draws, and a snapshot resumed
+  twice does not replay. What a cell keeps in its own memory (a libc's
+  buffered bytes, its stack-protector value from `AT_RANDOM`) is copied
+  like the rest of its memory: a program that forks itself into templates
+  should draw fresh bytes after the fork, as on Linux.
+
 ## System calls
 
 Every call is decoded from the saved registers by `Arch::decode`; numbers
@@ -131,7 +155,7 @@ relies on:
 | `getuid` … `getegid` (174–177 / 102, 104, 107, 108), `getppid` (173/110) | — | 0 |
 | `uname` (160/63) | buffer | 390 bytes written |
 | `clock_gettime` (113/228) | clock, buffer | known clocks only (`EINVAL`); 16 bytes written |
-| `getrandom` (278/318) | buffer, length | 256-byte pieces until the length or a fault; not cryptographic (O4) |
+| `getrandom` (278/318) | buffer, length | 256-byte pieces until the length or a fault; from the cell's own ChaCha20 generator (see *Randomness*) |
 | `rt_sigaction` (134/13), `rt_sigprocmask` (135/14) | old-state buffer, size | new state not read; at most 32 / 128 zero bytes written |
 | `ioctl` (29/16) | — | `-ENOTTY` |
 | `arch_prctl` (—/158) | code, address | `ARCH_SET_FS` only below `USER_END` (`EPERM`, S3); `ARCH_GET_FS` writes 8 bytes; others `EINVAL` |
@@ -303,7 +327,7 @@ These are not fixed by this change; each needs its own design.
 | O1 | Medium | **No per-cell quota.** One cell may take all memory down to the kernel's reserve; others are then refused (`ENOMEM`, `ENOSPC`), and the kernel survives (spec `cells`). Host-set quotas need per-cell accounting of frames and heap. |
 | O2 | Medium | **Kernel time proportional to what a cell holds.** A call runs without preemption: reading or writing up to 64 MiB of file data, `getrandom` or `write` over gigabytes of the cell's own memory, or mapping and zeroing a large region delays every other cell for as long as it takes. Bounded by the cell's own memory, not by a time slice. |
 | O3 | High on affected CPUs | **Side channels are out of scope.** Caches, branch predictors, speculation and timing are not reviewed. On x86_64 the kernel half is mapped (supervisor only) in every cell's table, with no KPTI: on CPUs vulnerable to Meltdown a cell could read kernel memory. Cells see a nanosecond clock. |
-| O4 | Medium | **Randomness is not cryptographic.** `getrandom` and `AT_RANDOM` come from xorshift seeded by the cycle counter: predictable. Cells that need secrets must not rely on it. |
+| O4 | — | **Closed by `add-crypto-random`** (see *Randomness*). What remains: a CPU without a hardware random source (an AArch64 host without FEAT_RNG under KVM) falls back to the cycle counter, and the boot says `getrandom is predictable`; there is no virtio-rng driver yet. |
 | O5 | Low | **Hardening not enabled.** x86_64 does not turn on SMEP or SMAP, AArch64 not PAN. The kernel never touches cell addresses directly (copies go through the direct map), so they would only defend against kernel bugs. On x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
 | O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. |
 | O7 | Low | **Host paths may panic.** Forking one cell more than 65535 times panics (frame reference counts are 16 bits); a frame lost when loading an executable fails half way. Only the host can do either. |
@@ -344,3 +368,8 @@ These are not fixed by this change; each needs its own design.
     cell taking all memory.
   - `shared_read_only_pages_stay_shared_after_mprotect`: `rewrite`, forked,
     each copy makes its constants writable and writes them.
+  - `no_two_cells_draw_the_same_random_bytes`: `dice`, forked, copied from
+    a template and resumed twice from one snapshot; and
+    `hardware_entropy_works_where_present`.
+- Host, `rhizo-core`: `block_function_matches_rfc_8439`,
+  `the_key_is_erased_after_every_request`, `split_generators_share_no_output`.

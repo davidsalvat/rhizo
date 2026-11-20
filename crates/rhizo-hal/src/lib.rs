@@ -88,6 +88,16 @@ pub trait PhysicalMemory {
     }
 }
 
+/// A hardware source of unpredictable bits: a random-number instruction
+/// (RDSEED, RDRAND, RNDR) or device. Core logic never reads one directly:
+/// it is given what the source produced, so it stays deterministic on the
+/// host.
+pub trait Entropy {
+    /// Fills `out` with unpredictable bytes; `false` if the source is
+    /// missing or failed, and `out` must not be relied on.
+    fn fill(&mut self, out: &mut [u8]) -> bool;
+}
+
 /// The processor's cache of address translations.
 pub trait Tlb {
     /// Invalidates any cached translation for the page containing `virt`.
@@ -121,7 +131,7 @@ pub trait NetLink {
 /// In-memory test doubles for host tests.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use super::{Console, CycleCounter, NetLink, PhysicalMemory, Tlb};
+    use super::{Console, CycleCounter, Entropy, NetLink, PhysicalMemory, Tlb};
     use std::cell::Cell;
     use std::collections::{BTreeMap, VecDeque};
     use std::string::String;
@@ -242,6 +252,24 @@ pub mod testing {
             } else {
                 self.words.insert(phys, value);
             }
+        }
+    }
+
+    /// An entropy source whose bytes the test chooses: `Some(b)` gives `b`,
+    /// `b + 1`, ... (wrapping), `None` is a missing source.
+    #[derive(Debug, Default)]
+    pub struct FakeEntropy(pub Option<u8>);
+
+    impl Entropy for FakeEntropy {
+        fn fill(&mut self, out: &mut [u8]) -> bool {
+            let Some(next) = self.0.as_mut() else {
+                return false;
+            };
+            for byte in out {
+                *byte = *next;
+                *next = next.wrapping_add(1);
+            }
+            true
         }
     }
 

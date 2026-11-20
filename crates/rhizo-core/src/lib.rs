@@ -12,6 +12,7 @@ pub mod fdt;
 pub mod ktest;
 pub mod options;
 pub mod panic;
+pub mod random;
 pub mod smp;
 pub mod sync;
 

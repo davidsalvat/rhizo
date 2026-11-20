@@ -8,6 +8,8 @@ pub mod irq;
 pub mod platform;
 pub mod power;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod random;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub mod smp;
 #[cfg(feature = "ktest")]
 pub mod tests;
