@@ -279,9 +279,6 @@ jobs:
       - name: Boot on Cloud Hypervisor
         run: cargo xtask --arch x86_64 run --release --vmm cloud-hypervisor
 
-      - name: "TEMP: in-kernel tests on 1 CPU on Firecracker (diagnosis)"
-        run: cargo xtask --arch x86_64 test --only ktest --vmm firecracker || true
-
       - name: In-kernel tests on 4 CPUs on Firecracker
         run: cargo xtask --arch x86_64 test --only ktest-smp --vmm firecracker
 
