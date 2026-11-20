@@ -1,15 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 622" width="800" height="622" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 826" width="800" height="826" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Roadmap status</title>
-<desc>14 milestones done, from the boot and test harness to gvisor comparison. Next: dedicated benchmark machine.</desc>
+<desc>15 milestones done, from the boot and test harness to fair comparisons. Next: adversarial security review, threads, sockets and network, cpython in a cell, multi-core, dedicated benchmark machine.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
-<rect class="bg" x="0.5" y="0.5" width="799" height="621" rx="12" fill="#ffffff" stroke="#d0d7de"/>
-<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 14 milestones done</text>
+<rect class="bg" x="0.5" y="0.5" width="799" height="825" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 15 milestones done</text>
 <circle cx="33" cy="66" r="9" fill="#16784f"/>
 <path d="M28.5 66l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="48" y="71" font-size="14" fill="#4b5c55">Done</text>
 <circle cx="119" cy="66" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
 <text x="134" y="71" font-size="14" fill="#4b5c55">Next</text>
-<line x1="52" y1="109.0" x2="52" y2="585.0" stroke="#d0d7de" stroke-width="2"/>
+<line x1="52" y1="109.0" x2="52" y2="789.0" stroke="#d0d7de" stroke-width="2"/>
 <circle cx="52" cy="109.0" r="9" fill="#16784f"/>
 <path d="M47.5 109.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="76" y="114.5" font-size="15" fill="#146c4a" font-weight="700">H0</text>
@@ -80,6 +80,21 @@
 <text x="76" y="556.5" font-size="15" fill="#146c4a" font-weight="700">H11</text>
 <text x="128" y="556.5" font-size="15" fill="#0e2a20">gVisor comparison</text>
 <text x="416" y="556.5" font-size="14" fill="#4b5c55">userspace-kernel sandboxes, same machine</text>
-<circle cx="52" cy="585.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="76" y="590.5" font-size="15" fill="#4b5c55">Dedicated benchmark machine</text>
+<circle cx="52" cy="585.0" r="9" fill="#16784f"/>
+<path d="M47.5 585.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="590.5" font-size="15" fill="#146c4a" font-weight="700">H12</text>
+<text x="128" y="590.5" font-size="15" fill="#0e2a20">Fair comparisons</text>
+<text x="416" y="590.5" font-size="14" fill="#4b5c55">Linux processes in the same VM, CRIU</text>
+<circle cx="52" cy="619.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="624.5" font-size="15" fill="#4b5c55">Adversarial security review</text>
+<circle cx="52" cy="653.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="658.5" font-size="15" fill="#4b5c55">Threads</text>
+<circle cx="52" cy="687.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="692.5" font-size="15" fill="#4b5c55">Sockets and network</text>
+<circle cx="52" cy="721.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="726.5" font-size="15" fill="#4b5c55">CPython in a cell</text>
+<circle cx="52" cy="755.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="760.5" font-size="15" fill="#4b5c55">Multi-core</text>
+<circle cx="52" cy="789.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="76" y="794.5" font-size="15" fill="#4b5c55">Dedicated benchmark machine</text>
 </svg>

@@ -834,7 +834,7 @@ fn build_micropython(out: &Path) -> Result {
 
 /// C compiler producing static Linux executables for the selected
 /// architecture: the native one when the host matches, else the cross gcc.
-fn c_compiler() -> &'static str {
+pub(crate) fn c_compiler() -> &'static str {
     match (arch::current(), env::consts::ARCH) {
         (arch::Arch::Aarch64, "aarch64") | (arch::Arch::X86_64, "x86_64") => "cc",
         (arch::Arch::Aarch64, _) => "aarch64-linux-gnu-gcc",

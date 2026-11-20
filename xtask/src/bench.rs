@@ -338,9 +338,17 @@ fn measure_comparisons(
         Err(e) => skipped.push(("linux-process".into(), e)),
     }
     if opts.reference {
+        match crate::compare::linux_process_in_vm(&crate::build_cells()?, opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("linux-process/firecracker".into(), e)),
+        }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
+        }
+        match crate::compare::criu(opts.runs.clamp(3, 20), &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("criu".into(), e)),
         }
         match crate::compare::gvisor(&crate::build_cells()?, opts.runs.clamp(3, 5), &scratch) {
             Ok(m) => metrics.extend(m),
@@ -1122,55 +1130,85 @@ pub fn comparison_table(results: &Results) -> String {
         }
     };
     let cell = |name: &str| time(find(name, "rhizo", "firecracker"));
-    let restore = time(find("snapshot.restore_ms", "linux", "firecracker"));
-    let gvisor_restore = time(find("snapshot.restore_ms", "gvisor", "runsc"));
-    let rows = [
+    let process = |name: &str, vmm: &str| time(find(name, "linux-process", vmm));
+    let criu = find("snapshot.restore_ms", "criu", "host");
+    // The same operation by a cell and by a Linux process, in the same kind of
+    // VM (design D3 of `add-fair-comparisons`).
+    let fair = [
+        (
+            "The `fork` call, holding 50 MiB written",
+            cell("cell.fork_us"),
+            process("process.fork_call_us", "firecracker"),
+            process("process.fork_call_us", "host"),
+        ),
+        (
+            "Fork, then the child writes all 50 MiB and exits",
+            cell("cell.fork_touch_us"),
+            process("process.fork_touch_us", "firecracker"),
+            process("process.fork_touch_us", "host"),
+        ),
+        (
+            "Start a program and run it to its exit (`hello`)",
+            cell("cell.run_us"),
+            process("process.spawn_us", "firecracker"),
+            process("process.spawn_us", "host"),
+        ),
+        (
+            "Resume a suspended 8 MiB program: lazy / eager (CRIU on the host)",
+            format!(
+                "{} / {}",
+                cell("cell.resume_us"),
+                cell("cell.resume_eager_us")
+            ),
+            "—".into(),
+            criu.map_or("—".into(), |m| format!("{} (CRIU)", time(Some(m)))),
+        ),
+    ];
+    // Whole VMs and sandboxes: a larger scope than a cell, shown for scale.
+    let whole = [
         (
             "Start a program and run it to its exit (`hello`)",
             cell("cell.run_us"),
             time(find("boot.time_to_ready_ms", "linux", "firecracker")),
             time(find("sandbox.run_ms", "gvisor", "runsc")),
-            time(find("process.spawn_us", "linux-process", "host")),
         ),
         (
-            "Resume a suspended environment until it runs",
-            cell("cell.resume_us"),
-            restore.clone(),
-            gvisor_restore.clone(),
-            "—".into(),
-        ),
-        (
-            "Fork an environment holding 50 MiB",
-            cell("cell.fork_us"),
-            restore.clone(),
-            gvisor_restore.clone(),
-            time(find("process.fork_us", "linux-process", "host")),
-        ),
-        (
-            "Serve a request from a warm template",
-            cell("workload.warm_us"),
-            restore,
-            gvisor_restore,
-            "—".into(),
+            "Resume a suspended environment until it runs (eager for the cell)",
+            cell("cell.resume_eager_us"),
+            time(find("snapshot.restore_ms", "linux", "firecracker")),
+            time(find("snapshot.restore_ms", "gvisor", "runsc")),
         ),
     ];
-    if rows.iter().all(|r| r.1 == "—") {
+    if fair
+        .iter()
+        .chain(&whole)
+        .all(|r| r.1 == "—" || r.1 == "— / —")
+    {
         return String::new();
     }
     let mut s = String::from(
-        "\n### Cells against existing mechanisms\n\n\
-         Same machine, same run. Rhizo runs inside Firecracker. The microVM column is a \
-         Linux guest in Firecracker (boot to its first output, or a snapshot restored \
-         by a new Firecracker process until the VM runs: the way such sandboxes \
-         resume and clone); the gVisor column is a gVisor sandbox on the host (the same \
-         static program in a new sandbox, or a checkpointed sandbox restored until it \
-         runs); the last column is plain Linux processes on the host, which isolate far \
-         less.\n\n\
-         | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox | Linux process |\n\
-         |---|---:|---:|---:|---:|\n",
+        "\n### A cell against a Linux process, in the same kind of VM\n\n\
+         Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux \
+         guest of the middle column (the same static programs, as its `/init`): both \
+         sides pay the same virtualization. The last column is the same program on the \
+         host, one layer of virtualization less. Lazy resume brings pages back on first \
+         touch; eager restores every page before the program runs.\n\n\
+         | Operation | Rhizo cell | Linux process, same VM | Linux process, host |\n\
+         |---|---:|---:|---:|\n",
     );
-    for (what, rhizo, firecracker, gvisor, process) in rows {
-        s += &format!("| {what} | {rhizo} | {firecracker} | {gvisor} | {process} |\n");
+    for (what, rhizo, vm, host) in fair {
+        s += &format!("| {what} | {rhizo} | {vm} | {host} |\n");
+    }
+    s += "\n### Whole VMs and sandboxes, for scale\n\n\
+          A microVM or a sandbox starts or restores a whole environment (a VM, or a \
+          sandbox process with its own kernel), a larger scope than a cell: these \
+          figures show the scale, not a like-for-like speed-up. The microVM is a Linux \
+          guest in Firecracker (boot to its first output, or a snapshot restored by a new \
+          Firecracker process); the gVisor sandbox runs on the host.\n\n\
+          | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |\n\
+          |---|---:|---:|---:|\n";
+    for (what, rhizo, firecracker, gvisor) in whole {
+        s += &format!("| {what} | {rhizo} | {firecracker} | {gvisor} |\n");
     }
     let (cold, warm) = (
         find("workload.python_cold_us", "rhizo", "firecracker"),
@@ -1229,8 +1267,20 @@ mod tests {
     fn comparison_table_puts_each_mechanism_in_its_column() {
         let mut fork = metric("cell.fork_us", "rhizo", Some("firecracker"), 1.5);
         fork.unit = "us".into();
-        let mut process = metric("process.fork_us", "linux-process", Some("host"), 1700.0);
+        let mut process = metric(
+            "process.fork_call_us",
+            "linux-process",
+            Some("host"),
+            1700.0,
+        );
         process.unit = "us".into();
+        let mut in_vm = metric(
+            "process.fork_call_us",
+            "linux-process",
+            Some("firecracker"),
+            0.6,
+        );
+        in_vm.unit = "us".into();
         let results = Results {
             environment: "ci".into(),
             date: "today".into(),
@@ -1238,6 +1288,8 @@ mod tests {
             metrics: vec![
                 fork,
                 process,
+                in_vm,
+                metric("snapshot.restore_ms", "criu", Some("host"), 45.0),
                 metric("snapshot.restore_ms", "linux", Some("firecracker"), 12.5),
                 metric("snapshot.restore_ms", "gvisor", Some("runsc"), 120.0),
             ],
@@ -1246,13 +1298,18 @@ mod tests {
         let table = comparison_table(&results);
         assert!(
             table.contains(
-                "| Fork an environment holding 50 MiB | 1.5 µs | 12.50 ms | 120.00 ms | 1.70 ms |"
+                "| The `fork` call, holding 50 MiB written | 1.5 µs | 0.6 µs | 1.70 ms |"
             ),
             "{table}"
         );
-        assert!(table.contains(
-            "| Resume a suspended environment until it runs | — | 12.50 ms | 120.00 ms | — |"
-        ));
+        assert!(
+            table.contains(
+                "| Resume a suspended environment until it runs (eager for the cell) | — | \
+                 12.50 ms | 120.00 ms |"
+            ),
+            "{table}"
+        );
+        assert!(table.contains("| — / — | — | 45.00 ms (CRIU) |"), "{table}");
         let empty = Results {
             metrics: Vec::new(),
             ..results
