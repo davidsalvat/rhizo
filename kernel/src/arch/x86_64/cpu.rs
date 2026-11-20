@@ -4,7 +4,9 @@ use super::console::BootConsole;
 use super::power::Machine;
 use crate::sync::Global;
 use core::arch::asm;
+use core::sync::atomic::AtomicU64;
 use rhizo_core::exception::{self, ExceptionInfo};
+use rhizo_core::smp::MAX_CPUS;
 use rhizo_hal::{ExitStatus, Power, Tlb};
 
 const KERNEL_CODE: u16 = 0x08;
@@ -36,22 +38,14 @@ struct TaskStateSegment {
 #[repr(C, align(16))]
 struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
+/// The boot CPU's stacks (the other CPUs' are mapped by `smp`).
 static DOUBLE_FAULT_STACK: Global<Stack> = Global::new(Stack([0; DOUBLE_FAULT_STACK_SIZE]));
 static TRAP_STACK: Global<Stack> = Global::new(Stack([0; TRAP_STACK_SIZE]));
 
-static TSS: Global<TaskStateSegment> = Global::new(TaskStateSegment {
-    reserved0: 0,
-    rsp: [0; 3],
-    reserved1: 0,
-    ist: [0; 7],
-    reserved2: 0,
-    reserved3: 0,
-    iomap_base: size_of::<TaskStateSegment>() as u16,
-});
-
-/// null, kernel code (0x08), kernel data (0x10), TSS (0x18, two slots),
-/// user data (0x28), user code (0x30): the order `SYSCALL`/`SYSRET` need.
-static GDT: Global<[u64; 7]> = Global::new([
+/// null, kernel code (0x08), kernel data (0x10), TSS (0x18, two slots,
+/// filled per CPU), user data (0x28), user code (0x30): the order
+/// `SYSCALL`/`SYSRET` need.
+const GDT: [u64; 7] = [
     0,
     0x00af_9a00_0000_ffff,
     0x00cf_9200_0000_ffff,
@@ -59,7 +53,88 @@ static GDT: Global<[u64; 7]> = Global::new([
     0,
     0x00cf_f200_0000_ffff,
     0x00af_fa00_0000_ffff,
-]);
+];
+
+/// A CPU's GDT and TSS: each CPU needs its own TSS (its stacks, and the
+/// busy bit of its descriptor). Zero until the CPU loads them (so they
+/// cost no image space).
+struct Tables {
+    gdt: [u64; 7],
+    tss: TaskStateSegment,
+}
+
+static TABLES: [Global<Tables>; MAX_CPUS] = [const {
+    Global::new(Tables {
+        gdt: [0; 7],
+        tss: TaskStateSegment {
+            reserved0: 0,
+            rsp: [0; 3],
+            reserved1: 0,
+            ist: [0; 7],
+            reserved2: 0,
+            reserved3: 0,
+            iomap_base: 0,
+        },
+    })
+}; MAX_CPUS];
+
+/// What each CPU keeps for itself, at its kernel GS base (the boot entry
+/// code sets the boot CPU's; `smp` the others'). Cell code runs with its
+/// own GS base: every entry from a cell and every return to one swap them
+/// (`SWAPGS`), so a cell can never point the kernel's at its memory.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PerCpu {
+    /// The CPU's number: 0 for the boot CPU (spec `multi-core`).
+    index: AtomicU64,
+    /// Kernel stack pointer saved while a cell runs on this CPU.
+    kernel_rsp: AtomicU64,
+    /// The `Registers` of the cell running on this CPU.
+    cell_regs: AtomicU64,
+    /// The cell's stack pointer at `SYSCALL`.
+    user_rsp: AtomicU64,
+    /// Error code of the last exception from a cell.
+    trap_error: AtomicU64,
+}
+
+/// Per-CPU data of every CPU, by number.
+#[unsafe(export_name = "rhizo_percpu")]
+static PERCPU: [PerCpu; MAX_CPUS] = [const {
+    PerCpu {
+        index: AtomicU64::new(0),
+        kernel_rsp: AtomicU64::new(0),
+        cell_regs: AtomicU64::new(0),
+        user_rsp: AtomicU64::new(0),
+        trap_error: AtomicU64::new(0),
+    }
+}; MAX_CPUS];
+
+/// The number of the CPU running this code.
+pub fn index() -> usize {
+    let index: u64;
+    // SAFETY: GS points at this CPU's `PerCpu` whenever kernel code runs
+    // (set before any Rust code, swapped only around cell code).
+    unsafe { asm!("mov {}, gs:[0]", out(reg) index, options(nostack, readonly, preserves_flags)) };
+    index as usize
+}
+
+/// Error code of the last exception from a cell on this CPU.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub(super) fn trap_error() -> u64 {
+    PERCPU[index()]
+        .trap_error
+        .load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Prepares the per-CPU data of secondary CPU `cpu`; returns its address
+/// (for its GS base).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub(super) fn percpu(cpu: usize) -> u64 {
+    PERCPU[cpu]
+        .index
+        .store(cpu as u64, core::sync::atomic::Ordering::Relaxed);
+    &PERCPU[cpu] as *const PerCpu as u64
+}
 
 #[repr(C, packed)]
 struct DescriptorPointer {
@@ -77,21 +152,19 @@ fn tss_descriptor(base: u64) -> [u64; 2] {
     [low, base >> 32]
 }
 
-fn load_gdt_and_tss() {
-    let stack_top = DOUBLE_FAULT_STACK.with(|s| s.0.as_ptr_range().end as u64);
-    let trap_top = TRAP_STACK.with(|s| s.0.as_ptr_range().end as u64);
-    let tss_base = TSS.with(|tss| {
-        tss.ist[(DOUBLE_FAULT_IST - 1) as usize] = stack_top;
-        tss.rsp[0] = trap_top;
-        tss as *const TaskStateSegment as u64
-    });
-    let pointer = GDT.with(|gdt| {
-        let [low, high] = tss_descriptor(tss_base);
-        gdt[3] = low;
-        gdt[4] = high;
+/// Loads this CPU's GDT and TSS, with its double-fault and trap stacks.
+fn load_gdt_and_tss(stack_top: u64, trap_top: u64) {
+    let pointer = TABLES[index()].with(|t| {
+        t.gdt = GDT;
+        t.tss.iomap_base = size_of::<TaskStateSegment>() as u16;
+        t.tss.ist[(DOUBLE_FAULT_IST - 1) as usize] = stack_top;
+        t.tss.rsp[0] = trap_top;
+        let [low, high] = tss_descriptor(&t.tss as *const TaskStateSegment as u64);
+        t.gdt[3] = low;
+        t.gdt[4] = high;
         DescriptorPointer {
             limit: (size_of::<[u64; 7]>() - 1) as u16,
-            base: gdt.as_ptr() as u64,
+            base: t.gdt.as_ptr() as u64,
         }
     });
     // SAFETY: the GDT is static and well-formed (same code/data selectors as
@@ -190,6 +263,7 @@ rhizo_isr_\n:
     RHIZO_ISR_ERR \n
     .endr
     RHIZO_ISR_NOERR 32
+    RHIZO_ISR_NOERR 33
     RHIZO_ISR_NOERR 255
 
 rhizo_isr_common:
@@ -214,6 +288,7 @@ rhizo_isr_table:
     .global rhizo_isr_device
 rhizo_isr_device:
     .quad rhizo_isr_32
+    .quad rhizo_isr_33
     .quad rhizo_isr_255
 
     .text
@@ -223,7 +298,7 @@ rhizo_isr_device:
 
 unsafe extern "C" {
     static rhizo_isr_table: [u64; 32];
-    static rhizo_isr_device: [u64; 2];
+    static rhizo_isr_device: [u64; 3];
 }
 
 /// Stack layout built by the stubs and the CPU.
@@ -264,9 +339,11 @@ fn load_idt() {
             };
             idt[vector] = IdtEntry::interrupt_gate(stub, ist);
         }
-        // SAFETY: as above, two more stubs (timer and spurious vectors).
-        let [timer, spurious] = unsafe { *core::ptr::addr_of!(rhizo_isr_device) };
+        // SAFETY: as above, three more stubs (timer, wake-up and spurious
+        // vectors).
+        let [timer, wake, spurious] = unsafe { *core::ptr::addr_of!(rhizo_isr_device) };
         idt[32] = IdtEntry::interrupt_gate(timer, 0);
+        idt[33] = IdtEntry::interrupt_gate(wake, 0);
         idt[255] = IdtEntry::interrupt_gate(spurious, 0);
         DescriptorPointer {
             limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
@@ -278,10 +355,18 @@ fn load_idt() {
     unsafe { asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack)) };
 }
 
-/// Installs the GDT, TSS and IDT and enables `SYSCALL`. Call once, early in
-/// boot.
+/// Installs the boot CPU's GDT, TSS and IDT and enables `SYSCALL`. Call
+/// once, early in boot.
 pub fn init() {
-    load_gdt_and_tss();
+    let stack_top = DOUBLE_FAULT_STACK.with(|s| s.0.as_ptr_range().end as u64);
+    let trap_top = TRAP_STACK.with(|s| s.0.as_ptr_range().end as u64);
+    init_cpu(stack_top, trap_top);
+}
+
+/// Installs this CPU's GDT and TSS (with its double-fault and trap
+/// stacks), the IDT, and enables `SYSCALL`.
+pub(super) fn init_cpu(double_fault_stack: u64, trap_stack: u64) {
+    load_gdt_and_tss(double_fault_stack, trap_stack);
     load_idt();
     // SAFETY: enabling SYSCALL and pointing it at the entry stub below; the
     // selectors match the GDT, and SFMASK clears IF, DF, TF and AC on entry.
@@ -328,6 +413,9 @@ pub(super) unsafe fn wrmsr(msr: u32, value: u64) {
 // or `IRETQ` (any other time). The cell comes back through `SYSCALL`
 // (returns 256) or an exception from ring 3 (returns the vector): both save
 // its registers into `regs` and resume the kernel where it called in.
+// What the paths share lives in this CPU's `PerCpu` (GS: index 0, kernel
+// RSP 8, cell registers 16, user RSP 24, trap error 32), and `SWAPGS`
+// brackets cell code.
 //
 // `Registers` layout: pc 0, sp 8, gpr 16 + 8n (rax rbx rcx rdx rsi rdi rbp
 // r8-r15), tls 264, flags 272.
@@ -342,8 +430,8 @@ rhizo_enter_cell:
     push r13
     push r14
     push r15
-    mov [rip + rhizo_kernel_rsp], rsp
-    mov [rip + rhizo_cell_regs], rdi
+    mov gs:[8], rsp
+    mov gs:[16], rdi
     mov rax, [rdi + 272]
     and eax, 0xdd5                  // user flags only: CF PF AF ZF SF DF OF
     or eax, 0x202                   // reserved bit, IF: preemptible
@@ -365,6 +453,7 @@ rhizo_enter_cell:
     mov r14, [rdi + 120]
     mov r15, [rdi + 128]
     mov rdi, [rdi + 56]
+    swapgs
     sysretq
 2:  push 0x2b                       // user SS
     push qword ptr [rdi + 8]
@@ -386,13 +475,15 @@ rhizo_enter_cell:
     mov r14, [rdi + 120]
     mov r15, [rdi + 128]
     mov rdi, [rdi + 56]
+    swapgs
     iretq
 
     // SYSCALL: RIP in RCX, RFLAGS in R11, still on the cell's stack.
     .global rhizo_syscall_entry
 rhizo_syscall_entry:
-    mov [rip + rhizo_user_rsp], rsp
-    mov rsp, [rip + rhizo_cell_regs]
+    swapgs
+    mov gs:[24], rsp
+    mov rsp, gs:[16]
     mov [rsp + 16], rax
     mov [rsp + 24], rbx
     mov [rsp + 32], rcx
@@ -410,7 +501,7 @@ rhizo_syscall_entry:
     mov [rsp + 128], r15
     mov [rsp + 0], rcx
     mov [rsp + 272], r11
-    mov rax, [rip + rhizo_user_rsp]
+    mov rax, gs:[24]
     mov [rsp + 8], rax
     mov eax, 256
     jmp rhizo_back_to_kernel
@@ -418,8 +509,9 @@ rhizo_syscall_entry:
     // Exception from ring 3, on the TSS RSP0 stack: vector, error code,
     // RIP, CS, RFLAGS, RSP, SS (pushed by the stub and the CPU).
 rhizo_user_trap:
+    swapgs
     push rax
-    mov rax, [rip + rhizo_cell_regs]
+    mov rax, gs:[16]
     mov [rax + 24], rbx
     mov [rax + 32], rcx
     mov [rax + 40], rdx
@@ -443,10 +535,10 @@ rhizo_user_trap:
     mov rbx, [rsp + 40]
     mov [rax + 272], rbx
     mov rbx, [rsp + 16]
-    mov [rip + rhizo_trap_error], rbx
+    mov gs:[32], rbx
     mov rax, [rsp + 8]
 rhizo_back_to_kernel:
-    mov rsp, [rip + rhizo_kernel_rsp]
+    mov rsp, gs:[8]
     pop r15
     pop r14
     pop r13
@@ -454,15 +546,6 @@ rhizo_back_to_kernel:
     pop rbp
     pop rbx
     ret
-
-    .section .bss.cells, "aw", @nobits
-    .balign 8
-rhizo_kernel_rsp: .skip 8
-rhizo_cell_regs: .skip 8
-rhizo_user_rsp: .skip 8
-    .global rhizo_trap_error
-rhizo_trap_error: .skip 8
-    .text
     "#
 );
 

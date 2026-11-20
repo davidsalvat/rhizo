@@ -113,6 +113,8 @@ macro_rules! suite {
             ktest_case!(threaded_cell_survives_suspend_and_resume),
             ktest_case!(forks_of_a_threaded_cell_run_all_threads),
             ktest_case!(template_of_a_threaded_program),
+            ktest_case!(every_cpu_has_its_number_and_own_stack),
+            ktest_case!(kernel_globals_are_safe_across_cpus),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1742,4 +1744,76 @@ fn template_of_a_threaded_program() {
     for id in ids {
         assert_eq!(ended(&host, id), (Ending::Exit(0), after_ready.into()));
     }
+}
+
+/// The current stack pointer, roughly: the address of a local.
+fn stack_address(_: u64) -> u64 {
+    let local = 0u8;
+    core::hint::black_box(&local) as *const u8 as u64
+}
+
+fn cpu_number(_: u64) -> u64 {
+    arch::cpu::index() as u64
+}
+
+fn every_cpu_has_its_number_and_own_stack() {
+    let mut stacks = Vec::new();
+    stacks.push(stack_address(0));
+    assert_eq!(arch::cpu::index(), 0, "tests run on the boot CPU");
+    for cpu in 1..crate::smp::count() {
+        crate::smp::post(cpu, cpu_number, 0);
+        assert_eq!(crate::smp::join(cpu), cpu as u64);
+        crate::smp::post(cpu, stack_address, 0);
+        stacks.push(crate::smp::join(cpu));
+    }
+    for (cpu, &sp) in stacks.iter().enumerate() {
+        let guard = crate::smp::stack_guard(cpu);
+        assert!(
+            sp > guard && sp - guard <= 0x1_1000,
+            "CPU {cpu}: stack {sp:#x} is not above its guard {guard:#x}"
+        );
+        assert!(
+            memory::translate(guard).is_none(),
+            "CPU {cpu}: guard mapped"
+        );
+    }
+}
+
+/// Shared by the CPUs in `kernel_globals_are_safe_across_cpus`.
+static COUNTER: crate::sync::Global<(u64, u64)> = crate::sync::Global::new((0, 0));
+
+/// Increments both halves of [`COUNTER`] `rounds` times, allocating and
+/// freeing kernel heap in between; returns the CPU's number.
+fn hammer(rounds: u64) -> u64 {
+    for i in 0..rounds {
+        COUNTER.with(|(a, b)| {
+            *a += 1;
+            core::hint::black_box(&*a);
+            *b += 1;
+        });
+        let boxed = Box::new([i; 16]);
+        assert_eq!(core::hint::black_box(&boxed)[15], i);
+    }
+    arch::cpu::index() as u64
+}
+
+fn kernel_globals_are_safe_across_cpus() {
+    const ROUNDS: u64 = 20_000;
+    let cpus = crate::smp::count();
+    let before = COUNTER.with(|c| *c);
+    let heap_before = crate::heap::stats();
+    for cpu in 1..cpus {
+        crate::smp::post(cpu, hammer, ROUNDS);
+    }
+    assert_eq!(hammer(ROUNDS), 0);
+    for cpu in 1..cpus {
+        assert_eq!(crate::smp::join(cpu), cpu as u64);
+    }
+    let added = ROUNDS * cpus as u64;
+    assert_eq!(COUNTER.with(|c| *c), (before.0 + added, before.1 + added));
+    assert_eq!(
+        crate::heap::stats().live,
+        heap_before.live,
+        "every allocation freed"
+    );
 }

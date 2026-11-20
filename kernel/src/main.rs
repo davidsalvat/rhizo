@@ -14,6 +14,8 @@ mod arch;
 mod cell;
 mod heap;
 mod memory;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod smp;
 mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
@@ -58,6 +60,10 @@ pub extern "C" fn kernel_main(boot_arg: u64, entry_cycles: u64) -> ! {
     };
     rhizo_core::boot::report_ready(&mut console, entry_cycles, ready);
 
+    // Builds that run cells set up preemption and the other CPUs.
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    rhizo_core::boot::report_cpus(&mut console, cell::init(options.smp));
+
     #[cfg(feature = "ktest")]
     let status = rhizo_core::ktest::run(&mut console, &[tests::ALL, arch::tests::ALL]);
 
@@ -80,8 +86,8 @@ pub extern "C" fn kernel_main(boot_arg: u64, entry_cycles: u64) -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    // A fresh handle is safe here: the console is stateless after init and
-    // the kernel runs on a single CPU with interrupts disabled.
+    // A fresh handle is safe here: the console is stateless after init (on
+    // several CPUs, lines may interleave).
     let mut console = BootConsole;
     let location = info.location().map(|loc| SourceLocation {
         file: loc.file(),

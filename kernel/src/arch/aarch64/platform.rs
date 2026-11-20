@@ -70,13 +70,13 @@ pub fn uart() -> Option<Uart> {
     None
 }
 
-/// GICv3 distributor and CPU 0 redistributor (`RD_base` and `SGI_base`):
-/// `(physical base, bytes)`.
+/// GICv3 distributor and redistributors (one `RD_base` and `SGI_base`
+/// pair per CPU): `(physical base, bytes)`.
 pub fn gic_regions() -> Option<[(u64, u64); 2]> {
     let dt = device_tree();
     let d = dt.find_compatible_reg(b"arm,gic-v3", 0).ok()??;
     let r = dt.find_compatible_reg(b"arm,gic-v3", 1).ok()??;
-    Some([(d.base, 0x1_0000), (r.base, 0x2_0000)])
+    Some([(d.base, 0x1_0000), (r.base, r.size)])
 }
 
 /// Maps the devices the kernel keeps using as device memory in the MMIO
@@ -104,8 +104,9 @@ pub fn map_devices(
     if let Some(Uart::Pl011(r) | Uart::Ns16550(r)) = uart() {
         map(r.base, 1)?;
     }
-    for (base, len) in gic_regions().into_iter().flatten() {
-        map(base, len)?;
+    if let Some([(d, d_len), (r, _)]) = gic_regions() {
+        map(d, d_len)?;
+        map(r, 0x2_0000)?; // the boot CPU's; the others map theirs (`irq`)
     }
     #[cfg(any(feature = "ktest", feature = "bench-cell"))]
     {

@@ -9,6 +9,8 @@ pub mod platform;
 pub mod port;
 pub mod power;
 pub mod serial;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod smp;
 #[cfg(feature = "ktest")]
 pub mod tests;
 pub mod timer;

@@ -50,6 +50,11 @@ pub fn report_memory(
     );
 }
 
+/// Prints how many CPUs are online: `cpus: <n> online`.
+pub fn report_cpus(console: &mut impl Console, online: usize) {
+    let _ = writeln!(ConsoleWriter(console), "cpus: {online} online");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +95,13 @@ mod tests {
         let mut console = RecordingConsole::new();
         report_ready(&mut console, 100, 350);
         assert_eq!(console.text(), "rhizo-ready cycles=250\n");
+    }
+
+    #[test]
+    fn cpu_report() {
+        let mut console = RecordingConsole::new();
+        report_cpus(&mut console, 4);
+        assert_eq!(console.text(), "cpus: 4 online\n");
     }
 
     #[test]

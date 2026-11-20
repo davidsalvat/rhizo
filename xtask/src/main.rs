@@ -27,6 +27,8 @@ const KERNEL_PACKAGE: &str = "rhizo-kernel";
 /// Test programs run as cells (bare-metal targets only).
 const CELLS_PACKAGE: &str = "rhizo-cells";
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
+/// Virtual CPUs of the `ktest-smp` step (spec `multi-core`).
+pub(crate) const SMP_CPUS: u32 = 4;
 /// Timeout for the self-check that expects a hanging kernel.
 const HANG_CHECK_TIMEOUT_SECS: u64 = 5;
 
@@ -48,7 +50,8 @@ Commands:
   test [--vmm <name>] [--accel <a>] [--only <step>]
                              Host tests, boot check, in-kernel tests and
                              harness self-checks; --only runs one step:
-                             host, boot, ktest or a self-check name
+                             host, boot, ktest, ktest-smp (4 CPUs) or a
+                             self-check name
                              (e.g. ktest-page-fault)
   bench [options]            Release-build boot benchmarks on every VMM
       --runs <n>             Boots per VMM (default 20)
@@ -244,6 +247,7 @@ impl RunArgs {
             accel: self.accel,
             gdb: self.gdb,
             network: false,
+            cpus: 1,
         }
     }
 }
@@ -305,7 +309,7 @@ fn report_timing(vmm: Vmm, run: &VmRun) {
 
 /// Names accepted by `test --only`.
 fn test_steps() -> Vec<&'static str> {
-    let mut steps = vec!["host", "differential", "boot", "ktest"];
+    let mut steps = vec!["host", "differential", "boot", "ktest", "ktest-smp"];
     steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
     steps
 }
@@ -385,6 +389,33 @@ fn cmd_test(args: &RunArgs) -> Result {
                 what: "in-kernel tests must pass".into(),
                 expected: "Passed with `test result: ok.`".into(),
                 reproduce: args.reproduce("ktest"),
+            },
+            &run,
+        )?;
+    }
+
+    if args.wants("ktest-smp") {
+        step(&format!("in-kernel tests on {SMP_CPUS} CPUs"));
+        let kernel = build_kernel(Profile::Debug, &["ktest"])?;
+        let smp = RunOptions {
+            // The guest gets no answer from the host over Firecracker's tap
+            // (on `main` too: `net.tcp_rtt_us/firecracker` is skipped), so
+            // there the network tests do not run; QEMU runs them on 4 CPUs.
+            network: args.vmm != Vmm::Firecracker,
+            cpus: SMP_CPUS,
+            ..opts
+        };
+        let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), smp)?;
+        let online = format!("cpus: {SMP_CPUS} online");
+        check_vm(
+            run.result == VmResult::Passed
+                && run.output.contains("test result: ok.")
+                && run.output.contains(&online),
+            VmCheck {
+                kind: "ktest",
+                what: format!("in-kernel tests must pass with {SMP_CPUS} CPUs online"),
+                expected: format!("`{online}` and Passed with `test result: ok.`"),
+                reproduce: args.reproduce("ktest-smp"),
             },
             &run,
         )?;

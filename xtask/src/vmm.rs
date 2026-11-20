@@ -250,6 +250,8 @@ pub struct RunOptions {
     /// Give a Rhizo guest a network card and a host echo server where the
     /// VMM allows it (`hostnet`).
     pub network: bool,
+    /// Virtual CPUs of the VM.
+    pub cpus: u32,
 }
 
 /// Parses `rhizo-ready cycles=<n>` from console output.
@@ -264,7 +266,7 @@ fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result
     match vmm {
         Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
         Vmm::Firecracker => firecracker_command(guest, opts, scratch),
-        Vmm::CloudHypervisor => cloud_hypervisor_command(guest),
+        Vmm::CloudHypervisor => cloud_hypervisor_command(guest, opts.cpus),
     }
 }
 
@@ -318,6 +320,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
         "max"
     };
     cmd.args(["-cpu", cpu, "-m", "128M", "-nodefaults", "-no-user-config"])
+        .args(["-smp", &opts.cpus.to_string()])
         .args(["-display", "none", "-no-reboot"])
         .args(["-accel", if kvm { "kvm" } else { "tcg" }]);
     if vmm != Vmm::QemuVirt {
@@ -396,9 +399,10 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     let config = format!(
         "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}{initrd_json}}}, \
          \"drives\": [], \"network-interfaces\": [{interfaces}], \
-         \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": 128}}}}",
+         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": 128}}}}",
         kernel.display().to_string(),
-        args
+        args,
+        opts.cpus
     );
     let path = scratch.join(format!("firecracker-{}.json", std::process::id()));
     fs::write(&path, config).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -410,12 +414,10 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     Ok(cmd)
 }
 
-fn cloud_hypervisor_command(guest: &Guest) -> Result<Command> {
+fn cloud_hypervisor_command(guest: &Guest, cpus: u32) -> Result<Command> {
     let binary = tools::cloud_hypervisor()?;
     let mut cmd = Command::new(binary);
-    cmd.args([
-        "--cpus",
-        "boot=1",
+    cmd.args(["--cpus", &format!("boot={cpus}")]).args([
         "--memory",
         "size=128M",
         "--console",

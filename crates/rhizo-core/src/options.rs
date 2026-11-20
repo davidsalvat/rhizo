@@ -12,6 +12,8 @@
 //! - `echo=ADDR:PORT`: a TCP echo server the in-kernel tests may reach
 //! - `virtio_mmio.device=SIZE@BASE:IRQ` (added by QEMU `microvm` and
 //!   Firecracker on x86_64): read by [`virtio_mmio_devices`]
+//! - `smp=N`: use at most `N` CPUs (`N` from 1 to 65535; default: every CPU
+//!   the firmware describes)
 
 use rhizo_hal::PhysicalMemory;
 
@@ -62,6 +64,8 @@ pub struct BootOptions {
     pub ip: Option<IpOption>,
     /// A TCP echo server for the in-kernel tests.
     pub echo: Option<([u8; 4], u16)>,
+    /// Most CPUs to use (`smp=N`); `None`: all the firmware describes.
+    pub smp: Option<u16>,
 }
 
 impl Default for BootOptions {
@@ -71,6 +75,7 @@ impl Default for BootOptions {
             exit: ExitKind::DebugExit,
             ip: None,
             echo: None,
+            smp: None,
         }
     }
 }
@@ -166,12 +171,20 @@ impl BootOptions {
                         options.ip = ip_option(v).or(options.ip);
                     } else if let Some(v) = word.strip_prefix(b"echo=") {
                         options.echo = endpoint(v).or(options.echo);
+                    } else if let Some(n) = word.strip_prefix(b"smp=").and_then(parse_count) {
+                        options.smp = Some(n);
                     }
                 }
             }
         }
         options
     }
+}
+
+/// A count from 1 to 65535 (with [`number`]'s syntax, which the other
+/// numeric options share and keeps the boot image small).
+fn parse_count(digits: &[u8]) -> Option<u16> {
+    u16::try_from(number(digits)?).ok().filter(|&n| n > 0)
 }
 
 /// Offset of `cmdline_paddr` in `hvm_start_info`.
@@ -210,6 +223,23 @@ mod tests {
             BootOptions::parse(b"quiet console=ttyS0 exit=bogus"),
             BootOptions::default()
         );
+    }
+
+    #[test]
+    fn cpu_limit() {
+        assert_eq!(BootOptions::parse(b"smp=4").smp, Some(4));
+        assert_eq!(BootOptions::parse(b"console=e9 smp=1").smp, Some(1));
+        assert_eq!(BootOptions::parse(b"smp=2 smp=3").smp, Some(3));
+        for bad in [
+            &b"smp=0"[..],
+            b"smp=",
+            b"smp=-1",
+            b"smp=+2",
+            b"smp=x",
+            b"smp=65536",
+        ] {
+            assert_eq!(BootOptions::parse(bad).smp, None, "{bad:?}");
+        }
     }
 
     #[test]

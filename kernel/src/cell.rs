@@ -10,6 +10,7 @@ use crate::arch::timer::{self, Counter};
 use crate::arch::user::{self, Trap};
 use crate::memory::{self, DirectMap};
 use crate::sync::Global;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
@@ -268,9 +269,18 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 static WIRE_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Shortest time between two polls of the network card while cells run.
 const WIRE_PERIOD_NS: u64 = 20_000;
-static IRQ_READY: AtomicBool = AtomicBool::new(false);
-/// Highest address-space tag of this CPU (set with `IRQ_READY`).
+static WIRE_READY: AtomicBool = AtomicBool::new(false);
+/// Highest address-space tag (set by [`init`]).
 static MAX_TAG: AtomicU16 = AtomicU16::new(0);
+
+/// Sets up preemption and address-space tags on the boot CPU, then starts
+/// the other CPUs, at most `smp` in all (spec `multi-core`); returns how
+/// many are online. Call once, before any [`Host`].
+pub fn init(smp: Option<u16>) -> usize {
+    irq::init(SLICE_NS);
+    MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
+    crate::smp::start(smp)
+}
 
 /// Monotonic time in nanoseconds since boot (0 if the counter frequency is
 /// unknown).
@@ -448,7 +458,10 @@ pub struct Finished {
 /// `scheduling`); ended ones are kept until the caller looks at them.
 #[derive(Debug)]
 pub struct Host {
-    sched: Scheduler<Live>,
+    /// Boxed: the queues move pointers, and a thousand cells need a few
+    /// KiB of queue, not a megabyte of contiguous heap (design D8 of
+    /// `add-smp-boot`).
+    sched: Scheduler<Box<Live>>,
     tags: TagPool,
     finished: Vec<Finished>,
     /// Frozen cells and their files: never run, only forked (spec `fork`,
@@ -470,11 +483,9 @@ pub struct Host {
 }
 
 impl Host {
-    /// An empty host; sets up the timer interrupt the first time.
+    /// An empty host; sets up the network card the first time.
     pub fn new() -> Self {
-        if !IRQ_READY.swap(true, Ordering::Relaxed) {
-            irq::init(SLICE_NS);
-            MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
+        if !WIRE_READY.swap(true, Ordering::Relaxed) {
             NET.with(|net| crate::wire::init(net, now_ns(), Counter.cycles()));
         }
         Self {
@@ -546,7 +557,7 @@ impl Host {
             random,
         )?;
         sync_code(&PageTable::<Format>::from_root(cell.root), image);
-        self.sched.add(Live {
+        self.sched.add(Box::new(Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
             fresh: true,
@@ -557,7 +568,7 @@ impl Host {
             lazy: None,
             fs: files,
             deadlines: Vec::new(),
-        });
+        }));
         Ok(id)
     }
 
@@ -595,7 +606,7 @@ impl Host {
     /// Puts `live` back in the scheduler: runnable if one of its threads can
     /// run, else asleep until its earliest deadline, or parked for good
     /// when none of its threads has one (design D2 of `add-threads`).
-    fn file(&mut self, live: Live) {
+    fn file(&mut self, live: Box<Live>) {
         if live.cell.threads.is_runnable() {
             self.sched.add(live);
         } else if live.cell.threads.waits_on_io() {
@@ -675,7 +686,7 @@ impl Host {
         if mode == Resume::Eager {
             lazy.finish(&pt);
         }
-        let live = Live {
+        let live = Box::new(Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
             fresh: true,
@@ -686,7 +697,7 @@ impl Host {
             lazy: (lazy.left > 0).then_some(lazy),
             fs,
             deadlines: Vec::new(),
-        };
+        });
         self.file(live);
         Ok(id)
     }
@@ -837,7 +848,7 @@ impl Host {
 
     /// Runs `live`'s threads until the cell ends, yields, has no thread that
     /// can run, or is preempted, and files it accordingly.
-    fn run_slice(&mut self, mut live: Live, now: u64) {
+    fn run_slice(&mut self, mut live: Box<Live>, now: u64) {
         if !live.cell.threads.next(now) {
             self.file(live); // nothing due yet after all
             return;
@@ -1016,10 +1027,10 @@ impl Host {
     }
 
     /// A new live cell sharing `cell`'s memory copy-on-write.
-    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Live> {
+    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Box<Live>> {
         let pt = PageTable::<Format>::from_root(cell.root);
         let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
-        Some(Live {
+        Some(Box::new(Live {
             cell: Cell {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 root: child.root(),
@@ -1034,11 +1045,11 @@ impl Host {
             lazy: None,
             fs: fork_files(fs),
             deadlines: Vec::new(),
-        })
+        }))
     }
 
     #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "used by `fork`"))]
-    fn requeue(&mut self, live: Live, wake: Option<u64>) {
+    fn requeue(&mut self, live: Box<Live>, wake: Option<u64>) {
         match wake {
             Some(at) => self.sched.sleep(live, at),
             None => self.sched.add(live),
@@ -1060,7 +1071,8 @@ impl Host {
         if live.tag != 0 {
             self.tags.free(live.tag);
         }
-        self.templates.push((live.cell, live.fs));
+        let Live { cell, fs, .. } = *live;
+        self.templates.push((cell, fs));
         true
     }
 
@@ -1116,7 +1128,7 @@ impl Host {
         self.sched.len()
     }
 
-    fn end(&mut self, live: Live, ending: Ending) {
+    fn end(&mut self, live: Box<Live>, ending: Ending) {
         if self.fp_owner >> 32 == live.cell.id as u64 {
             self.fp_owner = 0;
         }

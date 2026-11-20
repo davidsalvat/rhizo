@@ -8,12 +8,19 @@ use rhizo_mm::DIRECT_MAP_BASE;
 use rhizo_mm::heap::{Heap, PageSource};
 
 /// Pages for the heap: contiguous frames, used through the direct map.
+/// Single pages (most of them carved into small blocks, and kept) come from
+/// the top of memory, so they do not split the free runs that large
+/// allocations such as snapshots need.
 #[derive(Debug)]
 struct FramePages;
 
 impl PageSource for FramePages {
     fn alloc_pages(&mut self, count: usize) -> Option<NonNull<u8>> {
-        let phys = with_frames(|f| f.alloc_contiguous(count)).flatten()?;
+        let phys = with_frames(|f| match count {
+            1 => f.alloc_high(),
+            _ => f.alloc_contiguous(count),
+        })
+        .flatten()?;
         NonNull::new(DirectMap::virt(phys) as *mut u8)
     }
 
