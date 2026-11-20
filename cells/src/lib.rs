@@ -29,6 +29,7 @@ pub mod nr {
     pub const LISTEN: usize = 201;
     pub const CONNECT: usize = 203;
     pub const GETSOCKNAME: usize = 204;
+    pub const SENDTO: usize = 206;
     pub const SETSOCKOPT: usize = 208;
     pub const ACCEPT4: usize = 242;
     pub const CLONE: usize = 220;
@@ -61,6 +62,7 @@ pub mod nr {
     pub const BIND: usize = 49;
     pub const LISTEN: usize = 50;
     pub const CONNECT: usize = 42;
+    pub const SENDTO: usize = 44;
     pub const GETSOCKNAME: usize = 51;
     pub const SETSOCKOPT: usize = 54;
     pub const ACCEPT4: usize = 288;

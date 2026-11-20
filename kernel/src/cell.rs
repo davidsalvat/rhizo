@@ -97,6 +97,20 @@ pub fn open_sockets() -> usize {
     NET.with(|net| net.open())
 }
 
+/// Closes the connections parked for `snapshot`, which the host drops
+/// without resuming it (spec `networking`, design D3 of
+/// `keep-tcp-across-suspend`); resumed later, it finds them reset.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn close_parked(snapshot: &Snapshot) {
+    let records = snapshot.sockets();
+    if !records.is_empty() {
+        NET.with(|net| records.iter().for_each(|r| net.unpark(r)));
+    }
+}
+
 /// Releases the sockets `fs` holds (its cell ended or was suspended).
 fn release_sockets(fs: &Fs) {
     if fs.sockets().next().is_some() {
@@ -105,7 +119,8 @@ fn release_sockets(fs: &Fs) {
 }
 
 /// `fs` with its sockets replaced by indices into the records returned, for
-/// a snapshot.
+/// a snapshot; its connections are parked in the kernel (design D1 of
+/// `keep-tcp-across-suspend`).
 fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     let mut records = Vec::new();
     if fs.sockets().next().is_none() {
@@ -120,6 +135,7 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
                 state: rhizo_net::Saved::Reset,
                 local: None,
                 opts: rhizo_net::Options::default(),
+                parked: None,
             });
             records.push(record);
             (records.len() - 1) as u32
@@ -128,8 +144,9 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     (out, records)
 }
 
-/// Makes the sockets of a resumed cell from its snapshot's records, and
-/// points its descriptors and Unix socket names at them. A socket that
+/// Makes the sockets of a resumed cell from its snapshot's records (its
+/// parked connections come back), and points its descriptors and Unix
+/// socket names at them. A socket that
 /// cannot be made at all is left out: its descriptor reads as reset.
 fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
     if records.is_empty() {
@@ -142,6 +159,7 @@ fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
             let reset = rhizo_net::Record {
                 state: rhizo_net::Saved::Reset,
                 local: None,
+                parked: None,
                 ..r.clone()
             };
             let made = net.import(r).or_else(|_| net.import(&reset));
@@ -942,7 +960,12 @@ impl Host {
     /// An empty host for every CPU online.
     pub fn new() -> Self {
         if !WIRE_READY.swap(true, Ordering::Relaxed) {
-            NET.with(|net| crate::wire::init(net, now_ns(), Counter.cycles()));
+            NET.with(|net| {
+                // Parked connections re-attach only in this boot (design D2
+                // of `keep-tcp-across-suspend`).
+                net.set_boot(Counter.cycles());
+                crate::wire::init(net, now_ns(), Counter.cycles());
+            });
         }
         Self {
             shared: Global::new(Shared {
@@ -1624,10 +1647,10 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-files write_read_ns={write_read} fork_ns={fork_files}"
     );
-    let (pipe, loopback) = net();
+    let (pipe, loopback, tcp_resume) = net();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
-        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback}"
+        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback} tcp_resume_ns={tcp_resume}"
     );
     match wire_rtt() {
         Ok(rtt) => {
@@ -2060,9 +2083,11 @@ fn files() -> (u64, u64) {
 /// Robust figures (see [`robust`]) of the time per round trip: `piper`
 /// writing one byte into a pipe and reading it back, and two `loopback`
 /// cells exchanging a 64-byte message over TCP on 127.0.0.1 (design D7 of
-/// `add-sockets-and-poll`).
+/// `add-sockets-and-poll`); and of the time to resume a `loopback twice`
+/// client suspended with its connection established until it has made one
+/// more round trip and exited (design D5 of `keep-tcp-across-suspend`).
 #[cfg(feature = "bench-cell")]
-fn net() -> (u64, u64) {
+fn net() -> (u64, u64, u64) {
     const RUNS: usize = 3 * ROUNDS;
     const PIPE_TRIPS: u64 = 2000;
     const NET_TRIPS: u64 = 200;
@@ -2102,7 +2127,36 @@ fn net() -> (u64, u64) {
             assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
         }
     }
-    (robust(&mut pipe), robust(&mut loopback))
+    let mut resume = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let server = host
+            .spawn(image, &[b"loopback", b"serve", b"7401", b"2"], true, false)
+            .expect("spawn server");
+        host.step(); // listening, waiting in `accept`
+        let client = host
+            .spawn(image, &[b"loopback", b"twice", b"7401"], true, false)
+            .expect("spawn client");
+        while host.output(client) != Some(b"once\n") {
+            host.step();
+        }
+        let snapshot = host.suspend(client).expect("live");
+        let t0 = Counter.cycles();
+        let client = host
+            .resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume");
+        host.run(|h| h.finished(client).is_some());
+        resume.push(ns(t0, Counter.cycles()));
+        host.run(|h| h.finished(server).is_some());
+        for id in [server, client] {
+            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        }
+    }
+    (
+        robust(&mut pipe),
+        robust(&mut loopback),
+        robust(&mut resume),
+    )
 }
 
 /// A robust figure (see [`robust`]) of the round trip of a 64-byte message
