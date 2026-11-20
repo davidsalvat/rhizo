@@ -1729,10 +1729,23 @@ fn sockets_across_suspend_and_resume() {
 
 /// A server suspended while it waits in `accept` waits there again after
 /// its resume, and serves the client that comes.
+/// Steps `host` until one cell waits on its descriptors (a server in
+/// `accept`): a slice may end, preempted, before it gets there (under
+/// emulation a tick can be due as the slice starts).
+fn step_until_waiting(host: &mut Host) {
+    for _ in 0..100 {
+        if host.waiting() == 1 {
+            return;
+        }
+        host.step();
+    }
+    assert_eq!(host.waiting(), 1, "the server waits in accept");
+}
+
 fn a_blocked_cell_survives_suspend() {
     let mut host = Host::new();
     let server = spawn(&mut host, "loopback", &[b"serve", b"7302", b"1"]);
-    host.step();
+    step_until_waiting(&mut host);
     assert_eq!(host.waiting(), 1);
     let snapshot = host.suspend(server).expect("live");
     let server = host
@@ -1749,7 +1762,7 @@ fn a_blocked_cell_survives_suspend() {
 fn forked_servers_share_their_listener() {
     let mut host = Host::new();
     let template = spawn(&mut host, "loopback", &[b"serve", b"7303", b"1"]);
-    host.step();
+    step_until_waiting(&mut host);
     assert!(host.freeze(template));
     let servers: Vec<u32> = (0..2)
         .map(|_| {
