@@ -65,12 +65,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends qemu-system-arm
           qemu-system-aarch64 --version
 
+      - name: Enable KVM when the runner offers it
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+
       - name: Report whether this runner offers KVM
         run: |
           if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             echo "::notice title=kvm::/dev/kvm is usable on ubuntu-24.04-arm"
+          elif [ -e /dev/kvm ]; then
+            echo "::notice title=kvm::/dev/kvm exists but is not usable on ubuntu-24.04-arm: $(ls -l /dev/kvm)"
           else
-            echo "::notice title=kvm::no usable /dev/kvm on ubuntu-24.04-arm; AArch64 runs are emulated"
+            echo "::notice title=kvm::no /dev/kvm on ubuntu-24.04-arm (no hardware virtualization); AArch64 runs are emulated"
           fi
 
       - name: Install the pinned Rust toolchain
