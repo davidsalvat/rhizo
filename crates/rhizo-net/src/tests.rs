@@ -419,7 +419,7 @@ fn forks_share_listeners_and_reset_connections() {
     assert_ne!(copy, fresh);
     assert_eq!(net.poll(copy), OUT | HUP);
     let reset = net.fork(s).unwrap();
-    assert_eq!(drain(&mut net, reset), Err(Error::ConnReset));
+    assert_reset_sequence(&mut net, reset);
     net.send(c, b"still", None).unwrap();
     assert_eq!(
         drain(&mut net, s).unwrap(),
@@ -441,32 +441,189 @@ fn forks_share_listeners_and_reset_connections() {
 }
 
 #[test]
-fn snapshot_records_rebind_listeners_and_reset_connections() {
+fn snapshot_records_park_listeners_and_connections() {
     let mut net = Net::new();
-    let (_, s, l) = connection(&mut net, 13);
+    let (c, s, l) = connection(&mut net, 13);
     let mut o = net.options(l).unwrap();
     o.no_delay = true;
     net.set_options(l, o).unwrap();
+    net.send(c, b"before", None).unwrap();
     let (rl, rs) = (net.export(l).unwrap(), net.export(s).unwrap());
     assert_eq!(rl.state, Saved::Listening(8));
-    assert_eq!(rs.state, Saved::Reset);
+    assert_eq!(rl.local, Some(inet(LOOPBACK, 13)));
+    assert!(rl.parked.is_some());
+    assert_eq!((rs.state, &rs.local), (Saved::Reset, &None));
+    assert!(rs.parked.is_some());
+    // The cell is suspended: its references go.
     net.release(l);
     net.release(s);
+    let waiting = net.socket(Family::Inet, Type::Stream).unwrap();
+    assert_eq!(
+        net.connect(waiting, &inet(LOOPBACK, 13)),
+        Ok(()),
+        "a parked listener queues connections"
+    );
+    assert_eq!(net.poll(c) & (ERR | HUP), 0, "the peer sees nothing");
+    assert_eq!(net.send(c, b" during", None), Ok(7));
     let (l2, renamed) = net.import(&rl).unwrap();
-    assert_eq!(renamed, None);
-    assert!(net.is_listening(l2));
+    assert_eq!((l2, renamed), (l, None), "the same listener");
     assert!(net.options(l2).unwrap().no_delay);
-    let c = net.socket(Family::Inet, Type::Stream).unwrap();
-    net.connect(c, &inet(LOOPBACK, 13)).unwrap();
-    assert!(net.accept(l2).is_ok());
+    assert!(net.accept(l2).is_ok(), "the connection made meanwhile");
     let (s2, _) = net.import(&rs).unwrap();
-    assert_eq!(drain(&mut net, s2), Err(Error::ConnReset));
+    assert_eq!(s2, s);
+    assert_eq!(drain(&mut net, s2).unwrap(), b"before during");
+    assert_eq!(net.send(s2, b"back", None), Ok(4));
+    assert_eq!(drain(&mut net, c).unwrap(), b"back", "the same peer");
+    assert_eq!(net.peer_addr(s2), net.local_addr(c).map(Option::unwrap));
     let (taken, _) = net.import(&rl).unwrap();
-    assert_eq!(net.poll(taken) & ERR, ERR, "address taken: reset");
+    assert_ne!(taken, l);
+    assert_eq!(
+        net.poll(taken) & ERR,
+        ERR,
+        "parked no more, address taken: reset"
+    );
 }
 
 #[test]
-fn imported_unix_names_are_renumbered() {
+fn a_listener_not_parked_here_is_bound_again() {
+    let mut net = Net::new();
+    net.set_boot(1);
+    let l = listener(&mut net, 19);
+    let r = net.export(l).unwrap();
+    net.release(l);
+    let mut other = Net::new();
+    other.set_boot(2);
+    let (l2, _) = other.import(&r).unwrap();
+    assert!(other.is_listening(l2));
+    let c = other.socket(Family::Inet, Type::Stream).unwrap();
+    other.connect(c, &inet(LOOPBACK, 19)).unwrap();
+    assert!(other.accept(l2).is_ok());
+}
+
+/// The calls on a reset connection: `ECONNRESET` once, then the end of the
+/// stream for reads and `EPIPE` for writes.
+fn assert_reset_sequence(net: &mut Net, h: Handle) {
+    assert_eq!(net.poll(h), IN | OUT | HUP | RDHUP | ERR);
+    assert_eq!(drain(net, h), Err(Error::ConnReset));
+    assert_eq!(net.poll(h), IN | OUT | HUP | RDHUP);
+    assert_eq!(drain(net, h).unwrap(), b"");
+    assert_eq!(net.send(h, b"x", None), Err(Error::Pipe));
+    assert_eq!(net.peer_addr(h), Err(Error::NotConn));
+}
+
+#[test]
+fn a_parked_connection_comes_back_once() {
+    let mut net = Net::new();
+    let (c, s, _) = connection(&mut net, 14);
+    let r = net.export(s).unwrap();
+    net.release(s);
+    let (first, _) = net.import(&r).unwrap();
+    assert_eq!(first, s, "the same socket");
+    let (second, _) = net.import(&r).unwrap();
+    assert_ne!(second, s);
+    assert_reset_sequence(&mut net, second);
+    assert_eq!(net.send(c, b"ok", None), Ok(2));
+    assert_eq!(drain(&mut net, first).unwrap(), b"ok");
+}
+
+#[test]
+fn a_parked_connection_comes_back_only_in_its_boot() {
+    let mut net = Net::new();
+    net.set_boot(1);
+    let (c, s, _) = connection(&mut net, 15);
+    let r = net.export(s).unwrap();
+    net.release(s);
+    let Some(Park { boot: 1, key }) = r.parked else {
+        panic!("parked in boot 1: {:?}", r.parked);
+    };
+    let mut other = Net::new();
+    other.set_boot(2);
+    let (h, _) = other.import(&r).unwrap();
+    assert_reset_sequence(&mut other, h);
+    let elsewhere = Record {
+        parked: Some(Park { boot: 2, key }),
+        ..r.clone()
+    };
+    let (h, _) = net.import(&elsewhere).unwrap();
+    assert_reset_sequence(&mut net, h);
+    let (back, _) = net.import(&r).unwrap();
+    assert_eq!(back, s, "still parked for its own boot");
+    net.send(c, b"x", None).unwrap();
+    assert_eq!(drain(&mut net, back).unwrap(), b"x");
+}
+
+#[test]
+fn a_parked_connection_buffers_up_to_its_bound() {
+    let mut net = Net::new();
+    let (c, s, _) = connection(&mut net, 16);
+    let r = net.export(s).unwrap();
+    net.release(s);
+    let chunk = vec![7u8; 4096];
+    let mut sent = 0;
+    loop {
+        match net.send(c, &chunk, None) {
+            Ok(n) => sent += n,
+            Err(e) => {
+                assert_eq!(e, Error::Again, "the peer waits, as for a slow reader");
+                break;
+            }
+        }
+    }
+    assert_eq!(sent, STREAM_BUF);
+    assert_eq!(net.poll(c) & OUT, 0);
+    let (s, _) = net.import(&r).unwrap();
+    assert_eq!(drain(&mut net, s).unwrap().len(), STREAM_BUF);
+    assert_eq!(net.poll(c) & OUT, OUT);
+}
+
+#[test]
+fn a_close_while_parked_is_seen_after() {
+    let mut net = Net::new();
+    let (c, s, _) = connection(&mut net, 17);
+    let r = net.export(s).unwrap();
+    net.release(s);
+    net.send(c, b"last", None).unwrap();
+    net.release(c);
+    let (s, _) = net.import(&r).unwrap();
+    assert_eq!(drain(&mut net, s).unwrap(), b"last");
+    assert_eq!(drain(&mut net, s).unwrap(), b"", "end of stream");
+    assert_eq!(net.send(s, b"x", None), Err(Error::Pipe));
+}
+
+#[test]
+fn both_ends_of_a_pair_park_together() {
+    let mut net = Net::new();
+    let (a, b) = net.pair().unwrap();
+    net.send(a, b"to b", None).unwrap();
+    let (ra, rb) = (net.export(a).unwrap(), net.export(b).unwrap());
+    net.release(a);
+    net.release(b);
+    assert_eq!(net.open(), 2, "parked, not closed");
+    let ((a, _), (b, _)) = (net.import(&ra).unwrap(), net.import(&rb).unwrap());
+    assert_eq!(drain(&mut net, b).unwrap(), b"to b");
+    net.send(b, b"to a", None).unwrap();
+    assert_eq!(drain(&mut net, a).unwrap(), b"to a");
+}
+
+#[test]
+fn unparking_closes_the_connection() {
+    let mut net = Net::new();
+    let (c, s, l) = connection(&mut net, 18);
+    let r = net.export(s).unwrap();
+    net.release(s);
+    net.unpark(&r);
+    assert_eq!(drain(&mut net, c).unwrap(), b"", "the peer sees the end");
+    net.unpark(&r); // already gone: nothing
+    let (h, _) = net.import(&r).unwrap();
+    assert_reset_sequence(&mut net, h);
+    for h in [c, l, h] {
+        net.release(h);
+    }
+    assert_eq!(net.open(), 0);
+}
+
+#[test]
+fn imported_unix_names_are_renumbered_unless_parked() {
     let mut net = Net::new();
     let name = net.new_name();
     let l = net.socket(Family::Unix, Type::Stream).unwrap();
@@ -475,16 +632,25 @@ fn imported_unix_names_are_renumbered() {
     let r = net.export(l).unwrap();
     net.release(l);
     let (l2, renamed) = net.import(&r).unwrap();
+    assert_eq!((l2, renamed), (l, Some((name, name))), "parked: kept");
+    let mut other = Net::new();
+    other.set_boot(1);
+    other.new_name();
+    let (l2, renamed) = other.import(&r).unwrap();
     let (old, new) = renamed.unwrap();
     assert_eq!(old, name);
     assert_ne!(new, name);
-    let c = net.socket(Family::Unix, Type::Stream).unwrap();
-    assert_eq!(net.connect(c, &unix(new)), Ok(()));
-    assert!(net.accept(l2).is_ok());
+    let c = other.socket(Family::Unix, Type::Stream).unwrap();
+    assert_eq!(other.connect(c, &unix(new)), Ok(()));
+    assert!(other.accept(l2).is_ok());
 }
 
 #[test]
 fn records_round_trip_and_reject_damage() {
+    let park = Some(Park {
+        boot: u64::MAX,
+        key: 1 << 40,
+    });
     let records = vec![
         Record {
             family: Family::Inet,
@@ -497,6 +663,7 @@ fn records_round_trip_and_reject_damage() {
                 rcv_timeout_ns: 5,
                 ..Options::default()
             },
+            parked: park,
         },
         Record {
             family: Family::Unix,
@@ -504,6 +671,7 @@ fn records_round_trip_and_reject_damage() {
             state: Saved::Reset,
             local: Some(unix(9)),
             opts: Options::default(),
+            parked: None,
         },
         Record {
             family: Family::Inet,
@@ -511,11 +679,20 @@ fn records_round_trip_and_reject_damage() {
             state: Saved::Open,
             local: None,
             opts: Options::default(),
+            parked: None,
+        },
+        Record {
+            family: Family::Inet,
+            ty: Type::Stream,
+            state: Saved::Reset,
+            local: None,
+            opts: Options::default(),
+            parked: park,
         },
     ];
     let mut bytes = Vec::new();
     encode_records(&records, &mut bytes);
-    assert_eq!(decode_records(&bytes), Ok(records));
+    assert_eq!(decode_records(&bytes).as_ref(), Ok(&records));
     assert_eq!(
         decode_records(&bytes[..bytes.len() - 1]),
         Err(DecodeError::Truncated)
@@ -526,6 +703,26 @@ fn records_round_trip_and_reject_damage() {
     let mut bad = bytes.clone();
     bad[4] = 7; // family
     assert_eq!(decode_records(&bad), Err(DecodeError::Corrupt));
+    for (damaged, why) in [
+        (
+            Record {
+                local: Some(inet(LOOPBACK, 80)),
+                ..records[3].clone()
+            },
+            "a parked connection has no address",
+        ),
+        (
+            Record {
+                parked: park,
+                ..records[2].clone()
+            },
+            "only listeners and connections park",
+        ),
+    ] {
+        let mut b = Vec::new();
+        encode_records(&[damaged], &mut b);
+        assert_eq!(decode_records(&b), Err(DecodeError::Corrupt), "{why}");
+    }
 }
 
 #[test]

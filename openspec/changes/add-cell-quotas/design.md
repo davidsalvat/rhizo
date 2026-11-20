@@ -55,7 +55,7 @@ already bounds the overrun, and a second timer per CPU is more code.
 - a fork or a copy of a template gets the cell's quotas and none of its
   usage (CPU time 0, its root as its only frame), like a child process's
   limits and CPU time;
-- a snapshot (format version 6) keeps the quotas and the CPU time used, so
+- a snapshot (format version 7) keeps the quotas and the CPU time used, so
   suspending and resuming a cell does not give it new time;
 - the limits on descriptors and sockets are applied to the cell's file
   tables (`Fs::set_limits`) whenever a live cell is made from a `Cell`
