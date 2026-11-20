@@ -71,13 +71,14 @@ pub fn run(console: &mut impl Console, workload: Workload) {
             let _ = writeln!(
                 ConsoleWriter(console),
                 "rhizo-oom cells={} spawn_refused={} fork_refused={} resume_refused={} \
-                 hog_enomem={} leaked_bytes={}",
+                 hog_enomem={} leaked_bytes={} heap_kept_bytes={}",
                 o.cells,
                 o.spawn_refused as u8,
                 o.fork_refused as u8,
                 o.resume_refused as u8,
                 o.hog_enomem as u8,
-                o.leaked_bytes
+                o.leaked_bytes,
+                o.heap_kept_bytes
             );
         }
     }
@@ -439,6 +440,9 @@ pub struct Oom {
     pub hog_enomem: bool,
     /// Memory not back once every cell ended (0: none).
     pub leaked_bytes: u64,
+    /// Of what came back, what the kernel heap kept for itself (its free
+    /// blocks are never returned to the frame allocator).
+    pub heap_kept_bytes: u64,
 }
 
 /// Memory not leaked: free frames plus the pages the kernel heap keeps, and
@@ -456,6 +460,7 @@ fn balance() -> (u64, usize) {
 /// with a panic, and that ending every cell gives all memory back.
 pub fn fill_memory() -> Oom {
     let (before, live_before) = balance();
+    let heap_before = crate::heap::stats().pages as u64 * FRAME_SIZE;
     let mut host = Host::new();
     let idle = test_image("idle");
     let template = host.spawn(idle, &[b"idle"], true, false).expect("spawn");
@@ -497,5 +502,7 @@ pub fn fill_memory() -> Oom {
         resume_refused,
         hog_enomem,
         leaked_bytes: before.saturating_sub(after),
+        heap_kept_bytes: (crate::heap::stats().pages as u64 * FRAME_SIZE)
+            .saturating_sub(heap_before),
     }
 }
