@@ -479,9 +479,10 @@ pub fn criu(runs: usize, scratch: &Path) -> Result<Vec<Metric>> {
     let _ = child.kill();
     let _ = child.wait();
     dumped?;
-    let pidfile = dir.join("restored.pid").display().to_string();
     let mut restore = Vec::new();
     for i in 0..=runs {
+        // CRIU refuses to overwrite a pidfile: a new one for every restore.
+        let pidfile = dir.join(format!("restored-{i}.pid")).display().to_string();
         run(
             &[
                 "restore",
