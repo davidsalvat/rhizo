@@ -126,8 +126,8 @@ The feedback loop, fastest first:
 |---|---|---|
 | `crates/rhizo-hal` | Hardware interfaces (traits: console, memory, TLB, device registers, network link) and host test doubles | — |
 | `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
-| `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, write resolution), kernel heap | `rhizo-hal` |
-| `crates/rhizo-cell` | Cells as plain data (their threads: registers, identifiers, futex, sleep and descriptor waits), static ELF loader and initial stack, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
+| `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, copies with own tables, write resolution), kernel heap | `rhizo-hal` |
+| `crates/rhizo-cell` | Cells as plain data (their threads: registers, identifiers, futex, sleep and descriptor waits), static ELF loader and initial stack (load once, start many), which executables stay loaded, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
 | `crates/rhizo-fs` | A cell's in-memory file system: tree, file blocks shared copy-on-write between forks, descriptors, pipes, event counters, `epoll` instances, socket descriptors and Unix socket names, encoding for snapshots | — |
 | `crates/rhizo-net` | The kernel's sockets, shared by all cells: loopback TCP and UDP, Unix stream sockets, `smoltcp` (0BSD) on the network card for other addresses, readiness, options, change counter for waiting cells, fork and snapshot records | `rhizo-hal` |
 | `crates/rhizo-virtio` | virtio-mmio (version 2) transport, split virtqueues and the network device, through `rhizo-hal` registers and memory | `rhizo-hal` |
