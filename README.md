@@ -53,7 +53,7 @@ again:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/lifecycle-dark.svg">
-    <img src="docs/img/lifecycle.svg" alt="A static Linux executable is created as a running cell. The cell can be suspended into a snapshot and resumed (1.27 µs), forked into copy-on-write children (1.48 µs), or frozen as a template from which new, already warmed-up cells start (0.35 µs)." width="800">
+    <img src="docs/img/lifecycle.svg" alt="A static Linux executable is created as a running cell. The cell can be suspended into a snapshot and resumed, forked into copy-on-write children, or frozen as a template from which new, already warmed-up cells start. Times are in the tables below." width="800">
   </picture>
 </p>
 
@@ -77,7 +77,7 @@ The targets are hypotheses the proof of concept must validate. Where they stand:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/scorecard-dark.svg">
-    <img src="docs/img/scorecard.svg" alt="Fork a 50 MB cell: target under 1 ms, measured 1.4 to 1.5 µs, met. Resume from memory: target under 100 µs, measured 1.2 to 1.3 µs with lazy restore, met. Idle cell overhead: target a few KB plus its own pages, measured 22 KB with 1,000 idle cells live, met." width="800">
+    <img src="docs/img/scorecard.svg" alt="The three thesis targets, all met: fork of a 50 MB cell under 1 ms, resume from memory under 100 µs, a few KB per idle cell. Measured values are in the tables below." width="800">
   </picture>
 </p>
 
@@ -112,7 +112,7 @@ on the same machine, with the same clock:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/measured-dark.svg">
-    <img src="docs/img/measured.svg" alt="Log-scale bar chart, lower is better. Resume a suspended environment: Rhizo 1.27 µs, Firecracker snapshot restore 3.74 ms. Fork an environment holding 50 MiB: Rhizo 1.48 µs, Linux fork 1.78 ms. Run hello from start to exit: Rhizo 7.2 µs, Linux posix_spawn 112 µs. Start a cell from a warm template: Rhizo 0.35 µs." width="800">
+    <img src="docs/img/measured.svg" alt="Log-scale bar chart comparing Rhizo with Firecracker snapshot restore, Linux fork and Linux posix_spawn on the same machine, a MicroPython request from a warm template against a cold interpreter, and a start from a template. The values are in the tables below." width="800">
   </picture>
 </p>
 
@@ -134,10 +134,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 9.7 | 10.1 | 201.5 | 203.2 | 20 |
-| Cloud Hypervisor | 9.0 | 15.2 | 111.9 | 118.2 | 20 |
-| QEMU microvm | 45.9 | 46.5 | — | — | 20 |
-| QEMU q35 | 65.4 | 66.8 | 188.5 | 189.6 | 20 |
+| Firecracker | 8.2 | 8.8 | 194.9 | 196.9 | 20 |
+| Cloud Hypervisor | 7.6 | 16.8 | 102.3 | 109.2 | 20 |
+| QEMU microvm | 44.2 | 45.8 | — | — | 20 |
+| QEMU q35 | 62.3 | 63.2 | 180.6 | 183.4 | 20 |
 
 ### Cells against existing mechanisms
 
@@ -145,10 +145,19 @@ Same machine, same run. Rhizo runs inside Firecracker; the sandbox column is a L
 
 | Operation | Rhizo cell | Firecracker microVM | Linux process |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 7.2 µs | 201.48 ms | 111.5 µs |
-| Resume a suspended environment until it runs | 1.3 µs | 3.74 ms | — |
-| Fork an environment holding 50 MiB | 1.5 µs | 3.74 ms | 1.78 ms |
-| Serve a request from a warm template | 15.5 µs | 3.74 ms | — |
+| Start a program and run it to its exit (`hello`) | 7.2 µs | 194.87 ms | 112.4 µs |
+| Resume a suspended environment until it runs | 1.1 µs | 3.70 ms | — |
+| Fork an environment holding 50 MiB | 1.2 µs | 3.70 ms | 1.51 ms |
+| Serve a request from a warm template | 15.8 µs | 3.70 ms | — |
+
+### A real interpreter
+
+MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
+
+| Started | Time |
+|---|---:|
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.65 ms |
+| Forked from a template frozen after the warm-up | 529.0 µs (6.9× faster) |
 
 Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 `cargo xtask bench --readme`.
@@ -161,7 +170,7 @@ Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 boot and test harness, H1 memory, paging and heap, H1.5 fast boot and benchmarks, H1.6 AArch64 as primary, H2 first cell, H3 scheduler and isolation, H4 suspend and resume, H5 fork and templates, H6 real glibc programs, H7 comparisons, H8 files per cell, H9 memory accounting and density. Next: gVisor comparison, MicroPython workload, dedicated benchmark machine." width="800">
+    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H10, from the boot and test harness to MicroPython running as a cell with warm templates. Next: a gVisor comparison and a dedicated benchmark machine." width="800">
   </picture>
 </p>
 

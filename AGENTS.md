@@ -31,6 +31,12 @@ This repository uses spec-driven development with
 - Validate changes with `openspec validate <change-id> --strict`.
 - After a change is merged, archive it with `openspec archive <change-id>`
   so its deltas are folded into `openspec/specs/`.
+- The archive pull request of a change that completes a milestone or adds a
+  headline metric also brings the README up to date: take one benchmark run
+  (`bench-results.json`, from CI's `bench-results-N` annotations), run
+  `python3 docs/img/gen.py <it>` for the graphics and
+  `cargo xtask bench --from <it> --readme` for the tables, and check every
+  changed image in light and dark themes (no clipped or overlapping text).
 
 ## Non-negotiable rules
 

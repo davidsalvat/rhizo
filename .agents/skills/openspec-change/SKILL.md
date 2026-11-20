@@ -18,6 +18,10 @@ description: Propose, implement and archive a Rhizo change with OpenSpec. Use fo
 4. `openspec validate <id> --strict` must pass.
 5. Implement task by task. Tick a task only after its verification passed.
    Run `cargo xtask check` often and `cargo xtask ci` before pushing.
-6. After merge: `openspec archive <id> --yes`, then validate all specs.
+6. After merge: `openspec archive <id> --yes`, then validate all specs. If the
+   change completes a milestone or adds a headline metric, the same PR updates
+   the README from one benchmark run: `python3 docs/img/gen.py <results.json>`
+   and `cargo xtask bench --from <results.json> --readme`, then check the
+   changed images in light and dark themes.
 
 Rules that apply to every change are in `AGENTS.md`.
