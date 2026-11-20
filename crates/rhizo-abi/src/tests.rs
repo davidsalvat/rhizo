@@ -314,7 +314,8 @@ fn files_map_privately_and_share_their_pages() {
     assert_eq!(t.phys, phys(&w, again).phys);
     assert!(t.flags.contains(PageFlags::COPY_ON_WRITE));
     assert_eq!(
-        w.pt().resolve_write(&mut w.mem, &mut w.frames, base + 4096),
+        w.pt()
+            .resolve_write(&mut w.mem, &mut w.frames, &mut w.tlb, base + 4096),
         Ok(true)
     );
     w.poke(base + 4096, b"mine");

@@ -129,6 +129,9 @@ macro_rules! suite {
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
+            ktest_case!(unmapped_page_is_gone_on_every_cpu),
+            ktest_case!(a_cell_on_several_cpus_survives_suspend_and_fork),
+            ktest_case!(threads_of_a_cell_run_on_several_cpus_at_once),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1921,10 +1924,23 @@ fn a_connection_to_the_host_survives_suspend() {
 
 /// A server suspended while it waits in `accept` waits there again after
 /// its resume, and serves the client that comes.
+/// Steps `host` until one cell waits on its descriptors (a server in
+/// `accept`): a slice may end, preempted, before it gets there (under
+/// emulation a tick can be due as the slice starts).
+fn step_until_waiting(host: &mut Host) {
+    for _ in 0..100 {
+        if host.waiting() == 1 {
+            return;
+        }
+        host.step();
+    }
+    assert_eq!(host.waiting(), 1, "the server waits in accept");
+}
+
 fn a_blocked_cell_survives_suspend() {
     let mut host = Host::new();
     let server = spawn(&mut host, "loopback", &[b"serve", b"7302", b"1"]);
-    host.step();
+    step_until_waiting(&mut host);
     assert_eq!(host.waiting(), 1);
     let snapshot = host.suspend(server).expect("live");
     let server = host
@@ -1941,7 +1957,7 @@ fn a_blocked_cell_survives_suspend() {
 fn forked_servers_share_their_listener() {
     let mut host = Host::new();
     let template = spawn(&mut host, "loopback", &[b"serve", b"7303", b"1"]);
-    host.step();
+    step_until_waiting(&mut host);
     assert!(host.freeze(template));
     let servers: Vec<u32> = (0..2)
         .map(|_| {
@@ -2254,4 +2270,100 @@ fn suspend_between_parallel_runs_is_invisible() {
     for id in spinners {
         assert!(host.kill(id));
     }
+}
+
+/// `parsum` with `threads` threads summing `millions` million rounds,
+/// alone on every CPU: its output, and the most CPUs that ran its threads
+/// at the same time.
+fn parsum(threads: &[u8], millions: &[u8]) -> (alloc::string::String, u32) {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "parsum", &[threads, millions]);
+    host.run(|h| h.finished(id).is_some());
+    let (ending, output) = ended(&host, id);
+    assert_eq!(ending, Ending::Exit(0), "{output}");
+    (output, host.finished(id).expect("ended").peak)
+}
+
+/// Four threads of one cell on four CPUs: the same sum as one thread (and
+/// as Linux, `cells/expected.rs`), with threads of the cell running on
+/// several CPUs at the same time (spec `threads`, threads of a cell in
+/// parallel; `scheduling`, idle CPUs run threads of running cells). The
+/// speed-up itself is measured by `cell.thread_scaling_pct`, not here: it
+/// depends on the host's spare cores.
+fn threads_of_a_cell_run_on_several_cpus_at_once() {
+    run_expected("parsum");
+    let (one, _) = parsum(b"1", b"24");
+    let (four, peak) = parsum(b"4", b"24");
+    assert_eq!(four, one, "the sum does not depend on the threads");
+    assert_eq!(one, "sum 2868a16807fecd08\n");
+    if crate::smp::count() >= 2 {
+        assert!(peak >= 2, "its threads ran on {peak} CPU at a time");
+    } else {
+        assert_eq!(peak, 1, "one CPU: one thread at a time");
+    }
+}
+
+/// A thread keeps reading a page that another unmaps on another CPU: once
+/// the unmap has returned, the reader's next read faults; it never reads
+/// the page after it saw the flag raised after the unmap (spec
+/// `multi-core`, TLB coherence; on x86_64 a shootdown). Several rounds, the
+/// race being the point; after the first (which caches the executable),
+/// every frame comes back.
+fn unmapped_page_is_gone_on_every_cpu() {
+    run_expected("shootdown");
+    let before = memory::free_bytes();
+    for _ in 0..4 {
+        run_expected("shootdown");
+    }
+    assert_eq!(memory::free_bytes(), before, "every frame returned");
+}
+
+/// `parsum` computing with 4 threads on every CPU, stopped after each slice
+/// of the boot CPU, then suspended and resumed from its snapshot's bytes,
+/// or once forked into two children, until it ends: the resumed cell and
+/// both children print the uninterrupted sum (spec `multi-core`, cells
+/// stopped before host operations). Every cell ends; the frames of cells
+/// that ran on several CPUs are checked by `unmapped_page_is_gone_on_every_cpu`
+/// and `cells_in_parallel_stay_isolated`.
+fn a_cell_on_several_cpus_survives_suspend_and_fork() {
+    const SUM: &str = "sum c75f7d3df19f452d\n";
+    let mut host = Host::new();
+    let mut id = spawn(&mut host, "parsum", &[b"4", b"96"]);
+    let mut children = Vec::new();
+    let mut output = Vec::new();
+    let mut round = 0;
+    loop {
+        // Asked before the run starts, then after each slice.
+        let mut started = false;
+        host.run(|_| core::mem::replace(&mut started, true));
+        if host.finished(id).is_some() {
+            break;
+        }
+        round += 1;
+        if round == 1 {
+            children = host.fork(id, 2).expect("fork");
+            continue;
+        }
+        let snapshot = host.suspend(id).expect("live");
+        output.extend_from_slice(&host.finished(id).expect("suspended").output);
+        let snapshot =
+            Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE).expect("valid");
+        id = host
+            .resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume");
+    }
+    assert!(round >= 2, "stopped only {round} times");
+    host.run(|_| false);
+    let (ending, last) = ended(&host, id);
+    assert_eq!(ending, Ending::Exit(0));
+    output.extend_from_slice(last.as_bytes());
+    assert_eq!(alloc::string::String::from_utf8_lossy(&output), SUM);
+    for id in children {
+        assert_eq!(
+            ended(&host, id),
+            (Ending::Exit(0), SUM.into()),
+            "child {id}"
+        );
+    }
+    assert_eq!(host.live(), 0);
 }

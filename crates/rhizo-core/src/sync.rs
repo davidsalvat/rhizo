@@ -65,6 +65,11 @@ impl<T> SpinLock<T> {
     pub fn get_mut(&mut self) -> &mut T {
         self.value.get_mut()
     }
+
+    /// The value, the lock gone: owning it proves nobody else has it.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +116,13 @@ mod tests {
         let mut lock = SpinLock::new(1);
         *lock.get_mut() += 1;
         assert_eq!(lock.with(0, |v| *v), 2);
+    }
+
+    #[test]
+    fn the_owner_takes_the_value_out() {
+        let lock = SpinLock::new(vec![1]);
+        lock.with(2, |v| v.push(2));
+        assert_eq!(lock.into_inner(), [1, 2]);
     }
 
     #[test]
