@@ -1193,7 +1193,7 @@ fn python() -> Option<(u64, u64)> {
 }
 
 /// The files a CPython cell starts with (`cpython-files`, packed by `xtask`:
-/// the standard library under `/lib/python3.13` and `/app/agent_demo.py`;
+/// the standard library under `/usr/lib/python3.13` and `/app/agent_demo.py`;
 /// design D2 of `add-cpython`), decoded once and then shared copy-on-write
 /// by every CPython cell; `None` when CPython was not built.
 #[cfg_attr(
@@ -1221,7 +1221,7 @@ pub fn cpython_files() -> Option<Fs> {
 #[cfg(feature = "bench-cell")]
 fn cpython() -> Option<(u64, u64)> {
     const ROUNDS: usize = 7;
-    const ARGV: [&[u8]; 2] = [b"/bin/python3", b"/app/agent_demo.py"];
+    const ARGV: [&[u8]; 2] = [b"/usr/bin/python3", b"/app/agent_demo.py"];
     let image = test_image("cpython");
     let files = cpython_files()?;
     let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);

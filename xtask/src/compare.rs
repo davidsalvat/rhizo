@@ -210,7 +210,7 @@ pub fn parse_cpython_line(text: &str) -> Option<[f64; 2]> {
 /// process that imported and warmed it up (`cpython_forkserver.py`).
 pub fn cpython_in_vm(accel: Accel, scratch: &Path) -> Result<Vec<Metric>> {
     let root = crate::cpython::root();
-    if !root.join("bin/python3").exists() {
+    if !root.join("usr/bin/python3").exists() {
         return Err("CPython not built (RHIZO_CPYTHON_SRC unset)".into());
     }
     if let Some(reason) = Vmm::Firecracker.unavailable_reason(accel) {

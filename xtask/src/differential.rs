@@ -72,12 +72,12 @@ pub fn check(dir: &Path) -> Result {
 }
 
 /// CPython, when built: its files laid out on the host as in a cell
-/// (`bin/python3`, `lib/python3.13`, `app`), run with an empty environment
+/// (`usr/bin/python3`, `usr/lib/python3.13`, `app`), run with an empty environment
 /// (a cell has none) from an empty directory, it prints [`CPYTHON_STDOUT`]
 /// and nothing on standard error, as it must in a cell.
 fn check_cpython(scratch: &Path) -> Result {
     let root = crate::cpython::root();
-    let python = root.join("bin/python3");
+    let python = root.join("usr/bin/python3");
     if !python.exists() {
         crate::report::text("[xtask] CPython not built (RHIZO_CPYTHON_SRC unset): skipped");
         return Ok(());

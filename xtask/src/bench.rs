@@ -1238,10 +1238,37 @@ pub fn comparison_table(results: &Results) -> String {
         find("workload.python_cold_us", "rhizo", "firecracker"),
         find("workload.python_warm_us", "rhizo", "firecracker"),
     );
+    let cpython = |guest: &str| {
+        (
+            find("workload.cpython_cold_us", guest, "firecracker"),
+            find("workload.cpython_warm_us", guest, "firecracker"),
+        )
+    };
+    let (cpy_cold, cpy_warm) = cpython("rhizo");
+    let (linux_cold, linux_warm) = cpython("linux-process");
+    if (cold.is_some() && warm.is_some()) || (cpy_cold.is_some() && cpy_warm.is_some()) {
+        s += "\n### A real interpreter\n";
+    }
+    if let (Some(c), Some(w)) = (cpy_cold, cpy_warm) {
+        s += &format!(
+            "\nCPython (static, 3.13.18) answering one agent tool call \
+             (`cells/python/agent_demo.py`: JSON, regular expressions, dates; the standard \
+             library it imports compiled in the cell's own files), in a cell and as a Linux \
+             process in the same Firecracker VM:\n\n\
+             | Started | Rhizo cell | Linux process |\n|---|---:|---:|\n\
+             | Cold, from its executable (interpreter start, imports, warm-up) | {} | {} |\n\
+             | Forked from an interpreter frozen (cell) or kept (process) after the warm-up \
+             | {} ({:.1}× faster) | {} |\n",
+            time(cpy_cold),
+            time(linux_cold),
+            time(cpy_warm),
+            c.median / w.median,
+            time(linux_warm)
+        );
+    }
     if let (Some(c), Some(w)) = (cold, warm) {
         s += &format!(
-            "\n### A real interpreter\n\n\
-             MicroPython (static, v1.24.1) answering one request \
+            "\nMicroPython (static, v1.24.1) answering one request \
              (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell \
              in Firecracker:\n\n\
              | Started | Time |\n|---|---:|\n\
@@ -1550,6 +1577,33 @@ mod tests {
         ));
         assert!(t.contains("| 540.0 µs (6.7× faster) |"), "{t}");
         assert!(!comparison_table(&results(vec![run])).contains("A real interpreter"));
+    }
+
+    #[test]
+    fn comparison_table_shows_cpython_next_to_linux() {
+        let us = |name: &str, guest: &str, v: f64| {
+            let mut m = metric(name, guest, Some("firecracker"), v);
+            m.unit = "us".into();
+            m
+        };
+        let run = us("cell.run_us", "rhizo", 7.2);
+        let t = comparison_table(&results(vec![
+            run.clone(),
+            us("workload.cpython_cold_us", "rhizo", 30000.0),
+            us("workload.cpython_warm_us", "rhizo", 1500.0),
+            us("workload.cpython_cold_us", "linux-process", 40000.0),
+            us("workload.cpython_warm_us", "linux-process", 3000.0),
+        ]));
+        assert!(t.contains("### A real interpreter"), "{t}");
+        assert!(t.contains("| Cold, from its executable (interpreter start, imports, warm-up) | 30.00 ms | 40.00 ms |"), "{t}");
+        assert!(t.contains("| 1.50 ms (20.0× faster) | 3.00 ms |"), "{t}");
+        assert!(!t.contains("MicroPython"));
+        let only_cell = comparison_table(&results(vec![
+            run,
+            us("workload.cpython_cold_us", "rhizo", 30000.0),
+            us("workload.cpython_warm_us", "rhizo", 1500.0),
+        ]));
+        assert!(only_cell.contains("| 30.00 ms | — |"), "{only_cell}");
     }
 
     #[test]

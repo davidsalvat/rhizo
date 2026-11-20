@@ -195,7 +195,7 @@ details live in the archived changes under
 [`openspec/changes/archive/`](openspec/changes/archive/).
 
 Out of scope for the proof of concept: networking, multicore, real disks,
-hardware other than virtio/QEMU, full CPython, SDKs.
+hardware other than virtio/QEMU, SDKs.
 
 ## Try it
 

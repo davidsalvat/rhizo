@@ -129,11 +129,11 @@ pub const PYTHON_STDOUT: &str = "warm\n\
 
 /// CPython (`cells/python/agent_demo.py`, built only when its source is
 /// given): its command line, in a cell holding the files `xtask` packs
-/// (`/lib/python3.13`, `/app`) and on Linux in a directory laid out the same
+/// (`/usr/lib/python3.13`, `/app`) and on Linux in a directory laid out the same
 /// way, and what it prints. The script pauses after `warm`, where a host may
 /// freeze it as a template.
 #[allow(dead_code)]
-pub const CPYTHON_ARGV: [&str; 2] = ["/bin/python3", "/app/agent_demo.py"];
+pub const CPYTHON_ARGV: [&str; 2] = ["/usr/bin/python3", "/app/agent_demo.py"];
 #[allow(dead_code)]
 pub const CPYTHON_STDOUT: &str = "warm\n\
      {\"contacts\": 24, \"counts\": [82, 71, 71], \"dates_since\": 24, \

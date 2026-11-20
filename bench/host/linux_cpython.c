@@ -1,7 +1,7 @@
 // CPython on Linux in the benchmark VM (design D4 of `add-cpython`): the
 // `/init` of a Linux guest in Firecracker whose initramfs holds the same
 // static CPython, standard library and script as the CPython cell
-// (`/bin/python3`, `/lib/python3.13`, `/app/agent_demo.py`).
+// (`/usr/bin/python3`, `/usr/lib/python3.13`, `/app/agent_demo.py`).
 //
 // Prints `linux-cpython cold_us=<median> warm_us=<median>`:
 // - cold_us: fork and exec `python3 /app/agent_demo.py` with an empty
@@ -44,7 +44,7 @@ static int python(char *const args[], char *out, size_t size) {
         dup2(fds[1], 1);
         close(fds[0]);
         close(fds[1]);
-        execve("/bin/python3", args, env);
+        execve("/usr/bin/python3", args, env);
         _exit(127);
     }
     close(fds[1]);
@@ -67,7 +67,7 @@ static int python(char *const args[], char *out, size_t size) {
 int main(void) {
     static char out[1 << 16];
     double cold[RUNS];
-    char *const run[] = {"/bin/python3", "/app/agent_demo.py", NULL};
+    char *const run[] = {"/usr/bin/python3", "/app/agent_demo.py", NULL};
     for (int i = 0; i < RUNS; i++) {
         double t0 = now_us();
         if (python(run, out, sizeof out) != 0 || !strstr(out, "cpython ok")) {
@@ -78,7 +78,7 @@ int main(void) {
         cold[i] = now_us() - t0;
     }
     qsort(cold, RUNS, sizeof *cold, by_value);
-    char *const serve[] = {"/bin/python3", "/app/cpython_forkserver.py", "7", NULL};
+    char *const serve[] = {"/usr/bin/python3", "/app/cpython_forkserver.py", "7", NULL};
     const char *warm = NULL;
     if (python(serve, out, sizeof out) == 0) warm = strstr(out, "warm_us=");
     printf("linux-cpython cold_us=%.1f %s\n", cold[RUNS / 2], warm ? warm : "warm_us=failed");

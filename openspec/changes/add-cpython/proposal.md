@@ -22,8 +22,8 @@ template, next to CPython on Linux in the same VM.
   every CPython check reports that it did not run, as for MicroPython.
 - **The standard library in the cell's files**: the modules the workload
   and the interpreter's start-up import, compiled to sourceless `.pyc`
-  files under `/lib/python3.13`, where CPython finds them from its
-  executable `/bin/python3` with no environment. `xtask` encodes them, with
+  files under `/usr/lib/python3.13`, where CPython finds them from its
+  executable `/usr/bin/python3` with no environment. `xtask` encodes them, with
   the script under `/app`, as a cell file system (the encoding snapshots
   use); the kernel decodes it once and every CPython cell gets a
   copy-on-write clone.

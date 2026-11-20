@@ -17,8 +17,8 @@ pub const VERSION: &str = "3.13.18";
 /// SHA-256 of `Python-3.13.18.tar.xz` as python.org publishes it.
 pub const SHA256: &str = "abb0102e6d4ae027509bcb82327d9dd85515b44a3ba8ad538cfc5e9847029f68";
 /// Where the cell finds the standard library: `<prefix>/lib/python3.X`,
-/// found by CPython from its executable `/bin/python3` (D2).
-pub const STDLIB: &str = "lib/python3.13";
+/// found by CPython from its executable `/usr/bin/python3` (D2).
+pub const STDLIB: &str = "usr/lib/python3.13";
 
 /// C extension modules built into the executable. The standard library's
 /// other C modules are not built at all (`make python` builds no shared
@@ -49,7 +49,7 @@ fn dir() -> PathBuf {
         .join(crate::arch::current().id())
 }
 
-/// The tree a CPython cell sees (`bin/python3`, the standard library under
+/// The tree a CPython cell sees (`usr/bin/python3`, the standard library under
 /// [`STDLIB`], `app/agent_demo.py`), as a directory on the host; present
 /// once [`build`] has built CPython.
 pub fn root() -> PathBuf {
@@ -82,7 +82,7 @@ pub fn build(out: &Path) -> Result {
     let _ = std::fs::remove_dir_all(&root);
     let stdlib = root.join(STDLIB);
     for d in [
-        root.join("bin"),
+        root.join("usr/bin"),
         root.join("app"),
         stdlib.join("lib-dynload"),
     ] {
@@ -99,9 +99,9 @@ pub fn build(out: &Path) -> Result {
         &dir().join("pack.log"),
     )?;
     let mut cmd = Command::new("strip");
-    cmd.arg("-o").arg(root.join("bin/python3")).arg(&python);
+    cmd.arg("-o").arg(root.join("usr/bin/python3")).arg(&python);
     run(&mut cmd, "strip python", &dir().join("strip.log"))?;
-    let bin = std::fs::read(root.join("bin/python3")).map_err(|e| e.to_string())?;
+    let bin = std::fs::read(root.join("usr/bin/python3")).map_err(|e| e.to_string())?;
     write_if_changed(&exe, &bin)?;
     write_if_changed(&files, &encode(&root)?)
 }
@@ -195,11 +195,13 @@ fn write_if_changed(path: &Path, data: &[u8]) -> Result {
     std::fs::write(path, data).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// The cell's files: `root` without `bin` (the executable is the image
-/// the cell is spawned from), encoded as a cell file system (D2).
+/// The cell's files: `root` without `usr/bin` (the executable is the
+/// image the cell is spawned from), encoded as a cell file system (D2).
 fn encode(root: &Path) -> Result<Vec<u8>> {
     let mut fs = rhizo_fs::Fs::new();
-    for top in ["lib", "app"] {
+    fs.mkdir(None, b"/usr")
+        .map_err(|e| format!("cannot make /usr: {e:?}"))?;
+    for top in ["usr/lib", "app"] {
         add_tree(&mut fs, &root.join(top), &format!("/{top}"))?;
     }
     let mut out = Vec::new();
@@ -238,13 +240,17 @@ mod tests {
     fn tree_becomes_a_cell_file_system() {
         let root = crate::target_dir().join(format!("cpython-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("lib/python3.13/json/empty")).unwrap();
+        std::fs::create_dir_all(root.join("usr/lib/python3.13/json/empty")).unwrap();
         std::fs::create_dir_all(root.join("app")).unwrap();
-        std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::fs::write(root.join("lib/python3.13/os.pyc"), b"os").unwrap();
-        std::fs::write(root.join("lib/python3.13/json/__init__.pyc"), [7u8; 5000]).unwrap();
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::fs::write(root.join("usr/lib/python3.13/os.pyc"), b"os").unwrap();
+        std::fs::write(
+            root.join("usr/lib/python3.13/json/__init__.pyc"),
+            [7u8; 5000],
+        )
+        .unwrap();
         std::fs::write(root.join("app/agent_demo.py"), b"print(1)\n").unwrap();
-        std::fs::write(root.join("bin/python3"), b"ELF").unwrap();
+        std::fs::write(root.join("usr/bin/python3"), b"ELF").unwrap();
         let bytes = encode(&root).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
 
@@ -267,18 +273,20 @@ mod tests {
             buf.truncate(n);
             buf
         };
-        assert_eq!(read(&mut fs, b"/lib/python3.13/os.pyc"), b"os");
+        assert_eq!(read(&mut fs, b"/usr/lib/python3.13/os.pyc"), b"os");
         assert_eq!(
-            read(&mut fs, b"/lib/python3.13/json/__init__.pyc"),
+            read(&mut fs, b"/usr/lib/python3.13/json/__init__.pyc"),
             [7u8; 5000]
         );
         assert_eq!(read(&mut fs, b"/app/agent_demo.py"), b"print(1)\n");
         assert_eq!(
-            fs.stat(None, b"/lib/python3.13/json/empty").unwrap().kind,
+            fs.stat(None, b"/usr/lib/python3.13/json/empty")
+                .unwrap()
+                .kind,
             rhizo_fs::Kind::Dir
         );
         assert!(
-            fs.stat(None, b"/bin").is_err(),
+            fs.stat(None, b"/usr/bin").is_err(),
             "the executable is not a file"
         );
     }

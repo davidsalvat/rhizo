@@ -11,7 +11,7 @@ answer without warming up again. Where CPython's source is not given, the
 checks SHALL report that they did not run.
 
 #### Scenario: Agent request
-- **WHEN** CPython runs `/app/agent_demo.py` in a cell holding the packed standard library under `/lib/python3.13`
+- **WHEN** CPython runs `/app/agent_demo.py` in a cell holding the packed standard library under `/usr/lib/python3.13`
 - **THEN** it prints the output recorded from Linux, nothing else, and exits with 0
 
 #### Scenario: Warm CPython template

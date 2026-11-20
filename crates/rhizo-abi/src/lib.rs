@@ -62,6 +62,7 @@ enum Sys {
     SetTidAddress,
     Uname,
     ClockGettime,
+    Time,
     Getrandom,
     RtSigaction,
     RtSigprocmask,
@@ -158,6 +159,7 @@ impl Arch {
             (Arch::Aarch64, 101) | (Arch::X86_64, 35) => Nanosleep,
             (Arch::Aarch64, 115) | (Arch::X86_64, 230) => ClockNanosleep,
             (Arch::X86_64, 158) => ArchPrctl,
+            (Arch::X86_64, 201) => Time,
             (Arch::X86_64, 4) => Stat,
             (Arch::X86_64, 6) => Lstat,
             (Arch::Aarch64, 56) | (Arch::X86_64, 257) => Openat,
@@ -364,6 +366,7 @@ impl Abi {
             }
             Some(Sys::Uname) => uname(cx, self.arch, a[0]),
             Some(Sys::ClockGettime) => clock_gettime(cx, a[0], a[1]),
+            Some(Sys::Time) => time(cx, a[0]),
             Some(Sys::Getrandom) => getrandom(cx, a[0], a[1]),
             // Signals are not delivered yet: accept, report no previous state.
             Some(Sys::RtSigaction) => zero_out(cx, a[2], 32),
@@ -675,6 +678,19 @@ fn clock_gettime<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     ts[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
     ts[8..].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
     put(cx, addr, &ts)
+}
+
+/// `time` (x86_64): whole seconds since the epoch, also stored at `addr`
+/// unless it is null.
+fn time<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+) -> i64 {
+    let now = (cx.services.realtime_ns() / 1_000_000_000) as i64;
+    if addr != 0 && cx.write(addr, &now.to_le_bytes()).is_err() {
+        return -EFAULT;
+    }
+    now
 }
 
 fn getrandom<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
