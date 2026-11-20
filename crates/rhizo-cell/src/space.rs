@@ -438,7 +438,7 @@ mod tests {
         let t = child.translate(&mem, 0x40_0000).unwrap();
         if !t.flags.is_writable() {
             assert_eq!(
-                child.resolve_write(&mut mem, &mut frames, 0x40_0000),
+                child.resolve_write(&mut mem, &mut frames, &mut tlb, 0x40_0000),
                 Ok(true)
             );
         }

@@ -120,6 +120,9 @@ macro_rules! suite {
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
+            ktest_case!(unmapped_page_is_gone_on_every_cpu),
+            ktest_case!(a_cell_on_several_cpus_survives_suspend_and_fork),
+            ktest_case!(threads_of_a_cell_run_on_several_cpus_at_once),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1963,4 +1966,91 @@ fn suspend_between_parallel_runs_is_invisible() {
     for id in spinners {
         assert!(host.kill(id));
     }
+}
+
+/// `parsum` with `threads` threads summing `millions` million rounds, timed,
+/// alone on every CPU: its output's sum line, the nanoseconds it reports,
+/// and the CPUs it ran on.
+fn parsum(threads: &[u8], millions: &[u8]) -> (alloc::string::String, u64, u32) {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "parsum", &[threads, millions, b"time"]);
+    host.run(|h| h.finished(id).is_some());
+    let (ending, output) = ended(&host, id);
+    assert_eq!(ending, Ending::Exit(0), "{output}");
+    let (sum, ns) = output.split_once("ns ").expect("a time");
+    let ns = ns.trim().parse().expect("nanoseconds");
+    (sum.into(), ns, host.finished(id).expect("ended").cpus)
+}
+
+/// Four threads of one cell on four CPUs: the same sum as one thread (and
+/// as Linux, `cells/expected.rs`), sooner (spec `threads`, threads of a
+/// cell in parallel; `scheduling`, idle CPUs run threads of running cells).
+fn threads_of_a_cell_run_on_several_cpus_at_once() {
+    run_expected("parsum");
+    let (one, serial, _) = parsum(b"1", b"24");
+    let (four, parallel, cpus) = parsum(b"4", b"24");
+    assert_eq!(four, one, "the sum does not depend on the threads");
+    assert_eq!(one, "sum 2868a16807fecd08\n");
+    if crate::smp::count() >= 4 {
+        assert!(cpus.count_ones() >= 2, "ran on CPUs {cpus:#b}");
+        // At least 1.5 times faster (4 on an idle machine).
+        assert!(
+            3 * parallel < 2 * serial,
+            "4 threads took {parallel} ns, 1 thread {serial} ns"
+        );
+    }
+}
+
+/// A thread keeps reading a page that another unmaps on another CPU: once
+/// the unmap has returned, the reader's next read faults; it never reads
+/// the page after it saw the flag raised after the unmap (spec
+/// `multi-core`, TLB coherence; on x86_64 a shootdown). Several rounds, the
+/// race being the point; every frame comes back.
+fn unmapped_page_is_gone_on_every_cpu() {
+    let before = memory::free_bytes();
+    for _ in 0..5 {
+        run_expected("shootdown");
+    }
+    assert_eq!(memory::free_bytes(), before, "every frame returned");
+}
+
+/// `parsum` computing with 4 threads on every CPU, stopped after each slice
+/// of the boot CPU, then suspended and resumed from its snapshot's bytes,
+/// or once forked into two children, until it ends: the resumed cell and
+/// both children print the uninterrupted sum (spec `multi-core`, cells
+/// stopped before host operations). Every cell ends; the frames of cells
+/// that ran on several CPUs are checked by `unmapped_page_is_gone_on_every_cpu`
+/// and `cells_in_parallel_stay_isolated`.
+fn a_cell_on_several_cpus_survives_suspend_and_fork() {
+    const SUM: &str = "sum c75f7d3df19f452d\n";
+    let mut host = Host::new();
+    let mut id = spawn(&mut host, "parsum", &[b"4", b"96"]);
+    let mut children = Vec::new();
+    let mut round = 0;
+    loop {
+        // Asked before the run starts, then after each slice.
+        let mut started = false;
+        host.run(|_| core::mem::replace(&mut started, true));
+        if host.finished(id).is_some() {
+            break;
+        }
+        round += 1;
+        if round == 1 {
+            children = host.fork(id, 2).expect("fork");
+            continue;
+        }
+        let snapshot = host.suspend(id).expect("live");
+        assert_eq!(ended(&host, id), (Ending::Suspended, "".into()));
+        let snapshot =
+            Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE).expect("valid");
+        id = host
+            .resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume");
+    }
+    assert!(round >= 2, "stopped only {round} times");
+    host.run(|_| false);
+    for id in children.iter().copied().chain([id]) {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), SUM.into()), "cell {id}");
+    }
+    assert_eq!(host.live(), 0);
 }

@@ -83,7 +83,9 @@ None.
 
 `crates/rhizo-sched` (`Gangs`), `crates/rhizo-cell/src/threads.rs`
 (`pick`, `make_current`, `get`), `kernel/src/cell.rs` (gangs, the cell
-lock, shootdowns), `kernel/src/sync.rs` (`get_mut` in every build),
+lock, shootdowns), `crates/rhizo-mm/src/cow.rs` (break-before-make when
+a write copies a shared page), `crates/rhizo-core/src/sync.rs` and
+`kernel/src/sync.rs` (`into_inner`),
 `cells/c/parsum.c`, `cells/src/bin/shootdown.rs`, `cells/expected.rs`,
 `kernel/src/tests.rs`, `xtask/src/bench.rs`, `bench/README.md`,
 `AGENTS.md`, `README.md` (feature list).

@@ -141,7 +141,13 @@ mode on the interrupt without taking any lock.
 
 AArch64's `TLBI VAAE1IS` completes on every CPU before the frame is freed
 (`DSB ISH`): the clean set stays full, no word is published and no
-interrupt is sent.
+interrupt is sent. With other CPUs running the same tables, a
+copy-on-write copy changes a valid entry's output address, which the
+architecture allows only break-before-make: `resolve_write` (`rhizo-mm`)
+now clears the entry and flushes it through the caller's TLB before it
+points the entry at the copy (on x86_64 that flush is what holds the other
+CPUs out). Another CPU that touches the page in between faults, waits for
+the cell lock, finds the page mapped and runs on.
 
 Lost: lazy shootdowns by generation numbers (would leave freed frames
 reachable until the next switch); deferred frees with one interrupt at the
