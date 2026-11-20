@@ -318,8 +318,10 @@ fn checked(cmd: &mut Command, what: &str, logs: &Path) -> Result<String> {
     // Output goes to files, not pipes: the sandbox and gofer `runsc` starts
     // inherit them, and a pipe would stay open (and `output()` wait) for as
     // long as they live, even after `timeout` killed `runsc` itself.
-    let dir = logs.parent().unwrap_or(logs);
-    let (out_path, err_path) = (dir.join("command.out"), dir.join("command.err"));
+    // In the system temporary directory: runsc, run as root, takes over the
+    // permissions of the directories it is given.
+    let base = std::env::temp_dir().join(format!("rhizo-runsc-{}", std::process::id()));
+    let (out_path, err_path) = (base.with_extension("out"), base.with_extension("err"));
     let file = |p: &Path| std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()));
     let status = cmd
         .stdout(file(&out_path)?)
@@ -432,7 +434,12 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
     let started = Instant::now();
     let result = (|| {
         // A sandbox running `hello` to its exit.
+        // Everything on disk first: once runsc has run as root, it may have
+        // taken over the permissions of the directories it was given.
         let hello = gvisor_bundle(&runsc, &dir.join("hello"), &cells.join("hello"), &logs)?;
+        let bundle_arg = gvisor_bundle(&runsc, &dir.join("idle"), &cells.join("idle"), &logs)?;
+        let image = dir.join("image");
+        std::fs::create_dir_all(&image).map_err(|e| e.to_string())?;
         let mut run = Vec::new();
         for i in 0..=runs {
             if started.elapsed() > BUDGET {
@@ -456,9 +463,6 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
             }
         }
         // Checkpoint a sandbox of `idle` once, then restore new ones from it.
-        let bundle_arg = gvisor_bundle(&runsc, &dir.join("idle"), &cells.join("idle"), &logs)?;
-        let image = dir.join("image");
-        std::fs::create_dir_all(&image).map_err(|e| e.to_string())?;
         let base = checked(
             runsc_cmd(&runsc, &root).args(["run", "--detach", "--bundle", &bundle_arg, "rz-base"]),
             "run --detach (idle)",
