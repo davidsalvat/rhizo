@@ -42,27 +42,30 @@ struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
 static DOUBLE_FAULT_STACK: Global<Stack> = Global::new(Stack([0; DOUBLE_FAULT_STACK_SIZE]));
 static TRAP_STACK: Global<Stack> = Global::new(Stack([0; TRAP_STACK_SIZE]));
 
+/// null, kernel code (0x08), kernel data (0x10), TSS (0x18, two slots,
+/// filled per CPU), user data (0x28), user code (0x30): the order
+/// `SYSCALL`/`SYSRET` need.
+const GDT: [u64; 7] = [
+    0,
+    0x00af_9a00_0000_ffff,
+    0x00cf_9200_0000_ffff,
+    0,
+    0,
+    0x00cf_f200_0000_ffff,
+    0x00af_fa00_0000_ffff,
+];
+
 /// A CPU's GDT and TSS: each CPU needs its own TSS (its stacks, and the
-/// busy bit of its descriptor).
+/// busy bit of its descriptor). Zero until the CPU loads them (so they
+/// cost no image space).
 struct Tables {
-    /// null, kernel code (0x08), kernel data (0x10), TSS (0x18, two slots),
-    /// user data (0x28), user code (0x30): the order `SYSCALL`/`SYSRET`
-    /// need.
     gdt: [u64; 7],
     tss: TaskStateSegment,
 }
 
 static TABLES: [Global<Tables>; MAX_CPUS] = [const {
     Global::new(Tables {
-        gdt: [
-            0,
-            0x00af_9a00_0000_ffff,
-            0x00cf_9200_0000_ffff,
-            0,
-            0,
-            0x00cf_f200_0000_ffff,
-            0x00af_fa00_0000_ffff,
-        ],
+        gdt: [0; 7],
         tss: TaskStateSegment {
             reserved0: 0,
             rsp: [0; 3],
@@ -70,7 +73,7 @@ static TABLES: [Global<Tables>; MAX_CPUS] = [const {
             ist: [0; 7],
             reserved2: 0,
             reserved3: 0,
-            iomap_base: size_of::<TaskStateSegment>() as u16,
+            iomap_base: 0,
         },
     })
 }; MAX_CPUS];
@@ -152,6 +155,8 @@ fn tss_descriptor(base: u64) -> [u64; 2] {
 /// Loads this CPU's GDT and TSS, with its double-fault and trap stacks.
 fn load_gdt_and_tss(stack_top: u64, trap_top: u64) {
     let pointer = TABLES[index()].with(|t| {
+        t.gdt = GDT;
+        t.tss.iomap_base = size_of::<TaskStateSegment>() as u16;
         t.tss.ist[(DOUBLE_FAULT_IST - 1) as usize] = stack_top;
         t.tss.rsp[0] = trap_top;
         let [low, high] = tss_descriptor(&t.tss as *const TaskStateSegment as u64);
