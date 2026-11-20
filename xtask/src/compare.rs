@@ -2,7 +2,8 @@
 //! machine as the cells (spec `comparisons`):
 //!
 //! - Linux processes: `fork` of a process with 50 MiB written, and spawning
-//!   the same static `hello` program the cell benchmark runs.
+//!   the same static `hello` program the cell benchmark runs, on the host
+//!   and inside a Firecracker guest (the same VM the cell figures come from).
 //! - Firecracker snapshots: a Linux guest is snapshotted through
 //!   Firecracker's API, then restored from scratch (new VMM process) until
 //!   the VM runs again: the state-of-the-art suspend/resume of a sandbox.
@@ -29,25 +30,72 @@ fn metric(name: &str, guest: &str, vmm: &str, unit: &str, values: &mut [f64]) ->
     }
 }
 
-/// `fork_us` and `spawn_us` of Linux processes on this host, running the
-/// cell `hello` (from `cells`) natively. Needs a Linux host of the target
-/// architecture.
+/// The fields `bench/host/linux_process.c` prints, in this order.
+const PROCESS_FIELDS: [&str; 4] = ["fork_us", "fork_call_us", "fork_touch_us", "spawn_us"];
+
+/// Parses a `linux-process key=value...` line into [`PROCESS_FIELDS`].
+pub fn parse_process_line(text: &str) -> Option<[f64; 4]> {
+    let line = text.lines().find_map(|l| {
+        let at = l.find("linux-process ")?;
+        Some(&l[at..])
+    })?;
+    let field = |key: &str| -> Option<f64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    let mut out = [0.0; 4];
+    for (slot, key) in out.iter_mut().zip(PROCESS_FIELDS) {
+        *slot = field(key)?;
+    }
+    Some(out)
+}
+
+/// One metric per [`PROCESS_FIELDS`] entry, from several result lines.
+fn process_metrics(vmm: &str, samples: &[[f64; 4]]) -> Vec<Metric> {
+    PROCESS_FIELDS
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let mut values: Vec<f64> = samples.iter().map(|s| s[i]).collect();
+            metric(
+                &format!("process.{key}"),
+                "linux-process",
+                vmm,
+                "us",
+                &mut values,
+            )
+        })
+        .collect()
+}
+
+/// Compiles `bench/host/linux_process.c` into `binary` with `cc` and
+/// extra flags.
+fn build_linux_process(cc: &str, flags: &[&str], binary: &Path) -> Result {
+    let source = workspace_root().join("bench/host/linux_process.c");
+    let status = Command::new(cc)
+        .args(flags)
+        .args(["-O2", "-o"])
+        .arg(binary)
+        .arg(&source)
+        .status()
+        .map_err(|e| format!("cannot run {cc}: {e}"))?;
+    if !status.success() {
+        return Err(format!("cannot compile {}", source.display()));
+    }
+    Ok(())
+}
+
+/// Linux process baselines on this host, running the cell `hello` (from
+/// `cells`) natively. Needs a Linux host of the target architecture.
 pub fn linux_process(cells: &Path, scratch: &Path) -> Result<Vec<Metric>> {
     if crate::differential::unavailable_reason().is_some() {
         return Err("the host cannot run the cells natively".into());
     }
-    let source = workspace_root().join("bench/host/linux_process.c");
     let binary = scratch.join("linux_process");
-    let status = Command::new("cc")
-        .args(["-O2", "-o"])
-        .arg(&binary)
-        .arg(&source)
-        .status()
-        .map_err(|e| format!("cannot run cc: {e}"))?;
-    if !status.success() {
-        return Err(format!("cannot compile {}", source.display()));
-    }
-    let (mut fork, mut spawn) = (Vec::new(), Vec::new());
+    build_linux_process("cc", &[], &binary)?;
+    let mut samples = Vec::new();
     for _ in 0..3 {
         let out = Command::new(&binary)
             .arg(cells.join("hello"))
@@ -55,29 +103,76 @@ pub fn linux_process(cells: &Path, scratch: &Path) -> Result<Vec<Metric>> {
             .output()
             .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let line = text
-            .lines()
-            .find(|l| l.starts_with("linux-process "))
-            .ok_or("linux_process printed no result line")?;
-        let field = |key: &str| -> Option<f64> {
-            line.split_whitespace()
-                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
-                .parse()
-                .ok()
-        };
-        fork.push(field("fork_us").ok_or("no fork_us")?);
-        spawn.push(field("spawn_us").ok_or("no spawn_us")?);
+        samples.push(parse_process_line(&text).ok_or("linux_process printed no result line")?);
     }
-    Ok(vec![
-        metric("process.fork_us", "linux-process", "host", "us", &mut fork),
-        metric(
-            "process.spawn_us",
-            "linux-process",
-            "host",
-            "us",
-            &mut spawn,
+    Ok(process_metrics("host", &samples))
+}
+
+/// The same Linux process baselines inside a Firecracker guest: the VM
+/// Rhizo's own cell figures come from (design D1 of `add-fair-comparisons`).
+/// The static program runs as the guest's `/init`, next to `/hello`.
+pub fn linux_process_in_vm(cells: &Path, accel: Accel, scratch: &Path) -> Result<Vec<Metric>> {
+    if let Some(reason) = Vmm::Firecracker.unavailable_reason(accel) {
+        return Err(reason);
+    }
+    let binary = tools::firecracker()?;
+    let kernel = tools::reference_kernel()?;
+    let program = scratch.join("linux_process_static");
+    build_linux_process(crate::c_compiler(), &["-static"], &program)?;
+    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
+    let initramfs = scratch.join(format!("linux-process-{}.cpio", std::process::id()));
+    std::fs::write(
+        &initramfs,
+        refguest::initramfs_with(&read(&program)?, &[("hello", &read(&cells.join("hello"))?)]),
+    )
+    .map_err(|e| e.to_string())?;
+    let config = scratch.join(format!("linux-process-{}.json", std::process::id()));
+    std::fs::write(
+        &config,
+        format!(
+            "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}, \
+             \"initrd_path\": {:?}}}, \"drives\": [], \
+             \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": 256}}}}",
+            kernel.display().to_string(),
+            crate::vmm::linux_cmdline(Vmm::Firecracker),
+            initramfs.display().to_string()
         ),
-    ])
+    )
+    .map_err(|e| e.to_string())?;
+    let mut samples = Vec::new();
+    for boot in 0..3 {
+        let mut child = Command::new(&binary)
+            .arg("--no-api")
+            .arg("--config-file")
+            .arg(&config)
+            .args(["--level", "Error"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot start Firecracker: {e}"))?;
+        let stdout = child.stdout.take().ok_or("no Firecracker output")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
+                if let Some(sample) = parse_process_line(&line) {
+                    let _ = tx.send(sample);
+                }
+            }
+        });
+        let sample = rx.recv_timeout(Duration::from_secs(120));
+        stop(child);
+        samples.push(sample.map_err(|_| {
+            format!("boot {boot}: the guest printed no linux-process line within 120 s")
+        })?);
+    }
+    let _ = std::fs::remove_file(&initramfs);
+    let _ = std::fs::remove_file(&config);
+    report::text(&format!(
+        "linux processes inside firecracker on {}: {} boots",
+        arch::current().id(),
+        samples.len()
+    ));
+    Ok(process_metrics("firecracker", &samples))
 }
 
 /// One HTTP/1.1 request to Firecracker's API socket; returns the status.
@@ -257,20 +352,189 @@ pub fn scratch_dir() -> PathBuf {
     crate::target_dir().join("compare")
 }
 
-/// The `runsc` binary: `RHIZO_RUNSC`, or `runsc` on `PATH`.
-fn runsc() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("RHIZO_RUNSC") {
-        return Ok(PathBuf::from(path));
+/// `program` run as root (`sudo -n` unless already root), stopped after
+/// 60 s, with no standard input.
+fn as_root(program: &Path) -> Command {
+    let root = Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+    let mut cmd = if root {
+        Command::new("timeout")
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("-n").arg("timeout");
+        c
+    };
+    cmd.args(["--kill-after=5", "60"]).arg(program);
+    cmd.stdin(Stdio::null());
+    cmd
+}
+
+/// A program on `PATH`, or the path in the environment variable `var`.
+fn find_tool(var: &str, name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(var) {
+        return Some(PathBuf::from(path));
     }
     let out = Command::new("sh")
-        .args(["-c", "command -v runsc"])
+        .args(["-c", &format!("command -v {name}")])
         .output()
-        .map_err(|e| format!("cannot look for runsc: {e}"))?;
+        .ok()?;
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        return Err("gVisor's runsc is not installed (CI installs it; see bench/README.md)".into());
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// The seconds of the last `(SS.ffffff)` timestamp in a CRIU log: the time
+/// from CRIU's start to its last message.
+pub fn criu_log_seconds(log: &str) -> Option<f64> {
+    log.lines().rev().find_map(|l| {
+        let rest = l.trim_start().strip_prefix('(')?;
+        rest[..rest.find(')')?].trim().parse().ok()
+    })
+}
+
+/// CRIU restore of a process holding as much written memory as the cell
+/// snapshot (design D2 of `add-fair-comparisons`): dumped once, restored
+/// `runs` times until it runs again. Each restore is the time CRIU reports
+/// in its log from its start to "Restore finished" (the `sudo` and exec in
+/// front of it are not counted).
+pub fn criu(runs: usize, scratch: &Path) -> Result<Vec<Metric>> {
+    let criu = find_tool("RHIZO_CRIU", "criu")
+        .ok_or("CRIU is not installed (CI installs it; see bench/README.md)")?;
+    let dir = scratch.join(format!("criu-{}", std::process::id()));
+    let images = dir.join("images");
+    std::fs::create_dir_all(&images).map_err(|e| e.to_string())?;
+    let target = dir.join("criu_target");
+    let source = workspace_root().join("bench/host/criu_target.c");
+    let built = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&target)
+        .arg(&source)
+        .status()
+        .map_err(|e| format!("cannot run cc: {e}"))?;
+    if !built.success() {
+        return Err(format!("cannot compile {}", source.display()));
     }
-    Ok(PathBuf::from(path))
+    let run = |args: &[&str], what: &str| -> Result<()> {
+        let status = as_root(&criu)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("cannot run criu: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        let log = images.join(format!("{what}.log"));
+        let text = Command::new("sudo")
+            .args(["-n", "cat"])
+            .arg(&log)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let why: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("Error"))
+            .take(8)
+            .collect();
+        Err(format!("criu {what} failed ({status}): {}", why.join("\n")))
+    };
+    // The target: its own session (no terminal to carry), output to a file.
+    let out = dir.join("target.out");
+    let file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
+    let mut child = Command::new("setsid")
+        .arg(&target)
+        .arg("8")
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot start the CRIU target: {e}"))?;
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&out)
+        .unwrap_or_default()
+        .contains("ready")
+    {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            return Err("the CRIU target never became ready".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let images_arg = images.display().to_string();
+    let dumped = run(
+        &[
+            "dump",
+            "-t",
+            &pid.to_string(),
+            "-D",
+            &images_arg,
+            "-o",
+            "dump.log",
+            "-v4",
+        ],
+        "dump",
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    dumped?;
+    let pidfile = dir.join("restored.pid").display().to_string();
+    let mut restore = Vec::new();
+    for i in 0..=runs {
+        run(
+            &[
+                "restore",
+                "-d",
+                "-D",
+                &images_arg,
+                "-o",
+                "restore.log",
+                "-v4",
+                "--pidfile",
+                &pidfile,
+            ],
+            "restore",
+        )?;
+        let log = Command::new("sudo")
+            .args(["-n", "cat"])
+            .arg(images.join("restore.log"))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let seconds = criu_log_seconds(&log).ok_or("the CRIU restore log has no timestamp")?;
+        // The restored process has the dumped pid: kill it, and wait until
+        // the pid is free for the next restore.
+        let _ = Command::new("sudo")
+            .args(["-n", "kill", "-9", &pid.to_string()])
+            .status();
+        let gone = Instant::now() + Duration::from_secs(10);
+        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if i > 0 {
+            restore.push(seconds * 1000.0);
+        }
+    }
+    let _ = Command::new("sudo")
+        .args(["-n", "rm", "-rf"])
+        .arg(&dir)
+        .status();
+    report::text(&format!("criu restore: {} runs", restore.len()));
+    Ok(vec![metric(
+        "snapshot.restore_ms",
+        "criu",
+        "host",
+        "ms",
+        &mut restore,
+    )])
+}
+
+/// The `runsc` binary: `RHIZO_RUNSC`, or `runsc` on `PATH`.
+fn runsc() -> Result<PathBuf> {
+    find_tool("RHIZO_RUNSC", "runsc").ok_or_else(|| {
+        "gVisor's runsc is not installed (CI installs it; see bench/README.md)".into()
+    })
 }
 
 /// A `runsc` command run as root (`sudo -n` unless already root), stopped
@@ -548,6 +812,40 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn criu_restore_time_is_the_last_log_timestamp() {
+        let log = "(00.000010) Version: 3.19\n(00.004500) Restoring...\n\
+            (00.012345) Restore finished successfully. Tasks resumed.\n\n";
+        assert_eq!(criu_log_seconds(log), Some(0.012345));
+        assert_eq!(criu_log_seconds("no timestamps"), None);
+    }
+
+    #[test]
+    fn process_line_is_found_among_console_noise() {
+        let console = "[    0.1] Run /init as init process\r\n\
+            junk linux-process fork_us=1.5 fork_call_us=2 fork_touch_us=3.25 spawn_us=4\r\n";
+        assert_eq!(parse_process_line(console), Some([1.5, 2.0, 3.25, 4.0]));
+        assert_eq!(
+            parse_process_line("linux-process fork_us=1 spawn_us=4"),
+            None
+        );
+        let m = process_metrics("firecracker", &[[1.0, 2.0, 3.0, 4.0], [3.0, 2.0, 3.0, 4.0]]);
+        let names: Vec<_> = m.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "process.fork_us",
+                "process.fork_call_us",
+                "process.fork_touch_us",
+                "process.spawn_us"
+            ]
+        );
+        assert!(
+            m.iter()
+                .all(|m| m.guest == "linux-process" && m.vmm.as_deref() == Some("firecracker"))
+        );
+    }
 
     #[test]
     fn gvisor_bundle_runs_its_program_without_a_terminal() {

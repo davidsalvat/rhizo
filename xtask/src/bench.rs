@@ -338,9 +338,17 @@ fn measure_comparisons(
         Err(e) => skipped.push(("linux-process".into(), e)),
     }
     if opts.reference {
+        match crate::compare::linux_process_in_vm(&crate::build_cells()?, opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("linux-process/firecracker".into(), e)),
+        }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
+        }
+        match crate::compare::criu(opts.runs.clamp(3, 20), &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("criu".into(), e)),
         }
         match crate::compare::gvisor(&crate::build_cells()?, opts.runs.clamp(3, 5), &scratch) {
             Ok(m) => metrics.extend(m),

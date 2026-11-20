@@ -119,18 +119,21 @@ fn pad4(out: &mut Vec<u8>) {
 
 /// An initramfs with `/dev/console` and `/init`.
 pub fn initramfs() -> Vec<u8> {
+    initramfs_with(&init_elf(crate::arch::current()), &[])
+}
+
+/// An initramfs with `/dev/console`, `init` as `/init`, and `files`
+/// (executables, at the root).
+pub fn initramfs_with(init: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     cpio_entry(&mut out, 1, "dev", 0o040755, (0, 0), &[]);
     cpio_entry(&mut out, 2, "dev/console", 0o020600, (5, 1), &[]);
-    cpio_entry(
-        &mut out,
-        3,
-        "init",
-        0o100755,
-        (0, 0),
-        &init_elf(crate::arch::current()),
-    );
-    cpio_entry(&mut out, 4, "TRAILER!!!", 0, (0, 0), &[]);
+    cpio_entry(&mut out, 3, "init", 0o100755, (0, 0), init);
+    for (ino, (name, data)) in (4..).zip(files) {
+        cpio_entry(&mut out, ino, name, 0o100755, (0, 0), data);
+    }
+    let ino = 4 + files.len() as u32;
+    cpio_entry(&mut out, ino, "TRAILER!!!", 0, (0, 0), &[]);
     out
 }
 
@@ -186,5 +189,18 @@ mod tests {
         for name in ["dev\0", "dev/console\0", "init\0", "TRAILER!!!\0"] {
             assert!(text.contains(name), "missing {name}");
         }
+    }
+
+    #[test]
+    fn initramfs_carries_extra_executables() {
+        let cpio = initramfs_with(b"INIT", &[("hello", b"HELLO")]);
+        assert_eq!(cpio.len() % 4, 0);
+        let text = String::from_utf8_lossy(&cpio);
+        let hello = text.find("hello\0").expect("hello is packed");
+        assert!(text[hello..].contains("HELLO"));
+        // Regular file, rwxr-xr-x: mode is the second field of the header.
+        let header = hello - 110;
+        assert_eq!(&text[header + 14..header + 22], "000081ed");
+        assert!(text.find("TRAILER!!!").unwrap() > hello);
     }
 }
