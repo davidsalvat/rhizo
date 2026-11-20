@@ -68,13 +68,18 @@ same clock as the cells (spec `comparisons`):
 | `snapshot.restore_ms/linux/firecracker` | A Linux guest snapshotted through Firecracker's API (`Full`), restored by a new Firecracker process until the VM runs again: how Firecracker-based sandboxes resume and clone. First restore (cold page cache) dropped |
 | `snapshot.restore_api_ms/linux/firecracker` | The `PUT /snapshot/load` request alone |
 | `process.fork_us/linux-process/host` | `fork` of a host process holding 50 MiB written, child exits, parent waits (`bench/host/linux_process.c`) |
+| `process.fork_call_us/linux-process/<host or firecracker>` | The parent's `fork()` call alone, holding 50 MiB written (pairs with `cell.fork_us`) |
+| `process.fork_touch_us/linux-process/<host or firecracker>` | `fork`, the child writes every page of the 50 MiB and exits, the parent waits (pairs with `cell.fork_touch_us`) |
+| `process.<metric>/linux-process/firecracker` | The same program as the `/init` of a Linux guest in Firecracker: the VM the cell figures come from, so both sides pay the same virtualization (spec `comparisons`) |
+| `snapshot.restore_ms/criu/host` | `criu restore -d` of a dumped process holding 8 MiB written (`bench/host/criu_target.c`), as long as CRIU's log says it took (from its start to "Restore finished"). First restore dropped |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
 | `sandbox.run_ms/gvisor/runsc` | `runsc run` of a gVisor sandbox (systrap platform, no network) running the same static `hello`, until it exits. First run dropped |
 | `snapshot.restore_ms/gvisor/runsc` | `runsc restore --detach` of a checkpointed sandbox running the idle cell program, until `runsc state` reports it running. First restore dropped |
 
-Firecracker needs KVM for the guest's architecture, and gVisor needs `runsc`
-(the benchmark job installs a pinned release, checksum verified); elsewhere
-each is listed as skipped with the reason. Process baselines need a Linux host of the target
+Firecracker needs KVM for the guest's architecture, gVisor needs `runsc`
+(the benchmark job installs a pinned release, checksum verified) and CRIU
+needs `criu` and root (the benchmark job installs it); elsewhere each is
+listed as skipped with the reason. Process baselines need a Linux host of the target
 architecture. The README table puts each cell operation next to these figures;
 a column not measured in that run shows "—", never a quoted number.
 
