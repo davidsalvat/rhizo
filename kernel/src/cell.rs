@@ -111,6 +111,10 @@ impl Frames for KernelFrames {
     }
 }
 
+/// Most output kept for one cell when the host captures it (spec
+/// `isolation`): a cell printing without end cannot fill the kernel heap.
+const CAPTURE_MAX: usize = 1 << 20;
+
 /// Console output of a cell: echoed to the console and/or copied into
 /// `capture`.
 struct KernelServices<'a> {
@@ -124,8 +128,13 @@ impl Console for KernelServices<'_> {
         if self.echo {
             BootConsole.write_bytes(bytes);
         }
+        // Captured output is kernel heap: bounded per cell, and never grown
+        // by an allocation that could fail (and panic); the rest is dropped.
         if let Some(capture) = self.capture.as_deref_mut() {
-            capture.extend_from_slice(bytes);
+            let n = bytes.len().min(CAPTURE_MAX.saturating_sub(capture.len()));
+            if capture.try_reserve(n).is_ok() {
+                capture.extend_from_slice(&bytes[..n]);
+            }
         }
     }
 }
