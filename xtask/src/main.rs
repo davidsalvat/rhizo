@@ -398,7 +398,10 @@ fn cmd_test(args: &RunArgs) -> Result {
         step(&format!("in-kernel tests on {SMP_CPUS} CPUs"));
         let kernel = build_kernel(Profile::Debug, &["ktest"])?;
         let smp = RunOptions {
-            network: true,
+            // The guest gets no answer from the host over Firecracker's tap
+            // (on `main` too: `net.tcp_rtt_us/firecracker` is skipped), so
+            // there the network tests do not run; QEMU runs them on 4 CPUs.
+            network: args.vmm != Vmm::Firecracker,
             cpus: SMP_CPUS,
             ..opts
         };
