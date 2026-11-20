@@ -485,15 +485,17 @@ fn cell_says_hello() {
     run_expected("hello");
 }
 
-/// Runs `name` once to warm the kernel heap (which keeps the frames it
-/// grows into), then checks that running it again leaves free memory
-/// unchanged: every frame of the cell came back.
+/// Runs `name` once to warm the kernel heap, then checks that running it
+/// again leaves free memory unchanged: every frame of the cell came back.
+/// Memory is counted as [`memory_balance`] counts it, with the pages the
+/// kernel heap holds, so the heap growing for something else meanwhile (the
+/// network card answering, on another CPU) is not taken for a cell's leak.
 fn assert_no_leak(name: &str) -> alloc::string::String {
     run_expected(name);
-    let before = memory::free_bytes();
+    let before = memory_balance().0;
     let text = run_expected(name);
     assert_eq!(
-        memory::free_bytes(),
+        memory_balance().0,
         before,
         "{name}: every frame is returned"
     );
