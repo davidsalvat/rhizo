@@ -13,6 +13,7 @@ pub mod ktest;
 pub mod options;
 pub mod panic;
 pub mod smp;
+pub mod stats;
 pub mod sync;
 
 /// The kernel version, taken from the workspace version.

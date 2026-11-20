@@ -16,7 +16,10 @@ child is credited when it gives back a page it inherited (saturating at
 zero), so a cell holds at most its quota plus what it inherited, which was
 counted against its parent or template. Pages already the cell's that come
 back while it is suspended, forked or frozen (the rest of a lazy resume)
-are counted without being refused: they were the cell's before.
+are counted without being refused: they were the cell's before. The
+frames the dynamic loader takes to start a dynamically linked program are
+not counted yet (it takes the kernel's allocator directly); the host sets
+quotas after the spawn, and the credit for giving them back saturates.
 
 What happens past the quota is what happens when memory runs out today:
 `mmap` and `brk` answer `ENOMEM`; a page fault that needs a frame (a
