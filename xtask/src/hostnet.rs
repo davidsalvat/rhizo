@@ -1,6 +1,7 @@
-//! The host side of a guest's network (design D6 of `add-virtio-net`): a
-//! TCP echo server the kernel's tests and benchmark reach, QEMU's user
-//! network, and a tap device for Firecracker when `sudo` allows it.
+//! The host side of a guest's network (design D6 of `add-virtio-net`, D5 of
+//! `add-virtio-pci`): a TCP echo server the kernel's tests and benchmark
+//! reach, QEMU's user network, and a tap device each for Firecracker and
+//! Cloud Hypervisor when `sudo` allows it.
 
 use crate::vmm::Vmm;
 use std::collections::BTreeMap;
@@ -14,6 +15,10 @@ use std::thread;
 const TAP: &str = "rhizotap0";
 const TAP_HOST: &str = "172.16.0.1";
 const TAP_GUEST: &str = "172.16.0.2";
+/// The same for Cloud Hypervisor, on a subnet of its own.
+const CH_TAP: &str = "rhizotap1";
+const CH_TAP_HOST: &str = "172.16.1.1";
+const CH_TAP_GUEST: &str = "172.16.1.2";
 /// Where QEMU's user network shows the host's loopback to the guest.
 const SLIRP_HOST: &str = "10.0.2.2";
 
@@ -22,8 +27,8 @@ const SLIRP_HOST: &str = "10.0.2.2";
 pub enum Network {
     /// QEMU user network (slirp): DHCP, host at 10.0.2.2.
     Qemu { cmdline: String },
-    /// Firecracker on a tap device with static addresses.
-    Firecracker { tap: &'static str, cmdline: String },
+    /// A tap device with static addresses (Firecracker, Cloud Hypervisor).
+    Tap { tap: &'static str, cmdline: String },
     /// No network card: why.
     None(String),
 }
@@ -31,24 +36,26 @@ pub enum Network {
 /// The network a Rhizo guest gets on `vmm`, with a host echo server.
 pub fn for_vmm(vmm: Vmm) -> Network {
     match vmm {
-        Vmm::QemuMicrovm | Vmm::QemuVirt => match echo_server("127.0.0.1") {
+        Vmm::QemuMicrovm | Vmm::QemuVirt | Vmm::QemuQ35 => match echo_server("127.0.0.1") {
             Ok(port) => Network::Qemu {
                 cmdline: format!(" ip=dhcp echo={SLIRP_HOST}:{port}"),
             },
             Err(e) => Network::None(e),
         },
-        Vmm::Firecracker => match tap().and_then(|()| echo_server(TAP_HOST)) {
-            Ok(port) => Network::Firecracker {
-                tap: TAP,
-                cmdline: format!(" ip={TAP_GUEST}/24,{TAP_HOST} echo={TAP_HOST}:{port}"),
-            },
-            Err(e) => Network::None(e),
+        Vmm::Firecracker => tap_network(TAP, TAP_HOST, TAP_GUEST),
+        Vmm::CloudHypervisor => tap_network(CH_TAP, CH_TAP_HOST, CH_TAP_GUEST),
+    }
+}
+
+/// Tap device `tap` with the host at `host`/24, the guest at `guest`, and
+/// an echo server on the host's address.
+fn tap_network(tap: &'static str, host: &str, guest: &str) -> Network {
+    match tap_device(tap, host).and_then(|()| echo_server(host)) {
+        Ok(port) => Network::Tap {
+            tap,
+            cmdline: format!(" ip={guest}/24,{host} echo={host}:{port}"),
         },
-        Vmm::QemuQ35 | Vmm::CloudHypervisor => Network::None(
-            "this VMM attaches virtio devices only through PCI, and virtio-pci is not \
-             implemented (design D1 of add-virtio-net)"
-                .into(),
-        ),
+        Err(e) => Network::None(e),
     }
 }
 
@@ -83,30 +90,35 @@ fn echo(mut stream: TcpStream) {
     }
 }
 
-/// Creates the tap device for Firecracker once (`sudo -n`, no password).
-fn tap() -> Result<(), String> {
-    static TAP_READY: OnceLock<Result<(), String>> = OnceLock::new();
-    TAP_READY
-        .get_or_init(|| {
+/// Creates tap device `tap` with the host address `host`/24 once (`sudo
+/// -n`, no password).
+fn tap_device(tap: &'static str, host: &str) -> Result<(), String> {
+    static READY: OnceLock<Mutex<BTreeMap<&'static str, Result<(), String>>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut ready = ready.lock().map_err(|e| e.to_string())?;
+    ready
+        .entry(tap)
+        .or_insert_with(|| {
             let user = Command::new("id")
                 .arg("-un")
                 .output()
                 .map_err(|e| e.to_string())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
             let exists = Command::new("ip")
-                .args(["link", "show", TAP])
+                .args(["link", "show", tap])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .is_ok_and(|s| s.success());
+            let cidr = format!("{host}/24");
             let mut steps: Vec<Vec<&str>> = Vec::new();
             if !exists {
                 steps.push(vec![
-                    "ip", "tuntap", "add", "dev", TAP, "mode", "tap", "user", &user,
+                    "ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", &user,
                 ]);
-                steps.push(vec!["ip", "addr", "add", "172.16.0.1/24", "dev", TAP]);
+                steps.push(vec!["ip", "addr", "add", &cidr, "dev", tap]);
             }
-            steps.push(vec!["ip", "link", "set", TAP, "up"]);
+            steps.push(vec!["ip", "link", "set", tap, "up"]);
             for step in steps {
                 let ok = Command::new("sudo")
                     .arg("-n")
@@ -117,8 +129,7 @@ fn tap() -> Result<(), String> {
                     .is_ok_and(|s| s.success());
                 if !ok {
                     return Err(format!(
-                        "no tap device for Firecracker: `sudo -n {}` failed (needs \
-                         password-less sudo)",
+                        "no tap device {tap}: `sudo -n {}` failed (needs password-less sudo)",
                         step.join(" ")
                     ));
                 }
@@ -144,15 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn pci_only_vmms_have_no_card() {
-        for vmm in [Vmm::QemuQ35, Vmm::CloudHypervisor] {
-            assert!(matches!(for_vmm(vmm), Network::None(why) if why.contains("virtio-pci")));
-        }
-        match for_vmm(Vmm::QemuMicrovm) {
-            Network::Qemu { cmdline } => {
-                assert!(cmdline.starts_with(" ip=dhcp echo=10.0.2.2:"), "{cmdline}");
+    fn qemu_machines_get_the_user_network() {
+        for vmm in [Vmm::QemuMicrovm, Vmm::QemuQ35, Vmm::QemuVirt] {
+            match for_vmm(vmm) {
+                Network::Qemu { cmdline } => {
+                    assert!(cmdline.starts_with(" ip=dhcp echo=10.0.2.2:"), "{cmdline}");
+                }
+                other => panic!("{other:?}"),
             }
-            other => panic!("{other:?}"),
         }
     }
 }

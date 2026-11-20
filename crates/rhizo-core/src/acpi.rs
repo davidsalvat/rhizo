@@ -1,7 +1,8 @@
 //! The firmware tables the kernel reads on x86_64 to find its CPUs: the
 //! RSDP, the RSDT or XSDT, and the processor entries of the MADT (ACPI 6.5,
 //! §5.2); without ACPI (QEMU `microvm` with `acpi=off`), the processor
-//! entries of the MP configuration table (MP specification 1.4, §4).
+//! entries of the MP configuration table (MP specification 1.4, §4). The
+//! MCFG (PCI Firmware 3.2, §4.1.2) gives the PCI configuration space.
 //! Everything is read through [`PhysicalMemory`] and checked (signatures,
 //! checksums, lengths); nothing is allocated.
 
@@ -143,25 +144,46 @@ fn table(mem: &impl PhysicalMemory, at: u64, sig: Option<[u8; 4]>) -> Result<u64
     Ok(len as u64)
 }
 
-/// The MADT listed by the RSDT or XSDT of the RSDP at `rsdp`.
-fn madt(mem: &impl PhysicalMemory, rsdp: u64) -> Result<u64, AcpiError> {
+/// The table with signature `sig` listed by the RSDT or XSDT of the RSDP at
+/// `rsdp` (`None`: not listed).
+fn find_table(
+    mem: &impl PhysicalMemory,
+    rsdp: u64,
+    sig: [u8; 4],
+) -> Result<Option<u64>, AcpiError> {
     let revision = bytes::<1>(mem, rsdp + 15)[0];
     let (root, entry) = if revision >= 2 {
         (u64::from_le_bytes(bytes(mem, rsdp + 24)), 8)
     } else {
         (u32_at(mem, rsdp + 16) as u64, 4)
     };
-    let sig = if entry == 8 { *b"XSDT" } else { *b"RSDT" };
-    let len = table(mem, root, Some(sig))?;
-    (root + HEADER..root + len)
+    let root_sig = if entry == 8 { *b"XSDT" } else { *b"RSDT" };
+    let len = table(mem, root, Some(root_sig))?;
+    Ok((root + HEADER..root + len)
         .step_by(entry)
         .take_while(|&at| at + entry as u64 <= root + len)
         .map(|at| match entry {
             8 => u64::from_le_bytes(bytes(mem, at)),
             _ => u32_at(mem, at) as u64,
         })
-        .find(|&t| bytes::<4>(mem, t) == *b"APIC")
-        .ok_or(AcpiError::NoMadt)
+        .find(|&t| bytes::<4>(mem, t) == sig))
+}
+
+/// The ECAM base of PCI segment 0, bus 0, from the MCFG (`None`: no MCFG,
+/// or no such entry): the configuration space of bus 0, device `d`,
+/// function `f` is the 4 KiB at `base + (d << 15) + (f << 12)`.
+pub fn pci_ecam(mem: &impl PhysicalMemory, rsdp: u64) -> Result<Option<u64>, AcpiError> {
+    let Some(mcfg) = find_table(mem, rsdp, *b"MCFG")? else {
+        return Ok(None);
+    };
+    let len = table(mem, mcfg, Some(*b"MCFG"))?;
+    // Header, 8 reserved bytes, then 16-byte entries: base, segment, first
+    // and last bus.
+    Ok((mcfg + HEADER + 8..mcfg + len)
+        .step_by(16)
+        .take_while(|&at| at + 16 <= mcfg + len)
+        .find(|&at| bytes::<3>(mem, at + 8) == [0, 0, 0])
+        .map(|at| u64::from_le_bytes(bytes(mem, at))))
 }
 
 /// Calls `f` with the APIC identifier of every processor the MADT marks
@@ -172,7 +194,7 @@ pub fn processors(
     rsdp: u64,
     mut f: impl FnMut(u32),
 ) -> Result<(), AcpiError> {
-    let madt = madt(mem, rsdp)?;
+    let madt = find_table(mem, rsdp, *b"APIC")?.ok_or(AcpiError::NoMadt)?;
     let len = table(mem, madt, Some(*b"APIC"))?;
     // Header, local interrupt controller address and flags, then entries.
     let mut at = madt + HEADER + 8;
@@ -338,6 +360,63 @@ mod tests {
         ids.clear();
         assert!(!mp_processors(&mem, |id| ids.push(id)));
         assert!(ids.is_empty());
+    }
+
+    /// An MCFG as Cloud Hypervisor writes it: one entry per segment.
+    fn mcfg_body(entries: &[(u64, u16, u8, u8)]) -> Vec<u8> {
+        let mut b = vec![0; 8];
+        for &(base, segment, first, last) in entries {
+            b.extend(base.to_le_bytes());
+            b.extend(segment.to_le_bytes());
+            b.extend([first, last, 0, 0, 0, 0]);
+        }
+        b
+    }
+
+    #[test]
+    fn reads_the_ecam_of_segment_0() {
+        let mut mem = FakePhysicalMemory::new();
+        put_table(&mut mem, 0x8000, b"APIC", &madt_body());
+        put_table(
+            &mut mem,
+            0x9000,
+            b"MCFG",
+            &mcfg_body(&[(0x30_0000_0000, 1, 0, 0), (0xe800_0000, 0, 0, 0)]),
+        );
+        let mut xsdt = Vec::new();
+        xsdt.extend(0x8000u64.to_le_bytes());
+        xsdt.extend(0x9000u64.to_le_bytes());
+        put_table(&mut mem, 0x6000, b"XSDT", &xsdt);
+        put_rsdp(&mut mem, 0x5000, 2, 0x6000);
+        assert_eq!(pci_ecam(&mem, 0x5000), Ok(Some(0xe800_0000)));
+        // Segment 0 starting at bus 1 has no bus 0.
+        put_table(
+            &mut mem,
+            0x9000,
+            b"MCFG",
+            &mcfg_body(&[(0xb000_0000, 0, 1, 0xff)]),
+        );
+        assert_eq!(pci_ecam(&mem, 0x5000), Ok(None));
+        // No MCFG at all (QEMU `microvm`).
+        put_table(&mut mem, 0x6000, b"XSDT", &0x8000u64.to_le_bytes());
+        assert_eq!(pci_ecam(&mem, 0x5000), Ok(None));
+        assert_eq!(cpus(&mem, 0x5000), Ok(vec![0, 2, 300]), "the MADT still");
+    }
+
+    #[test]
+    fn rejects_a_broken_mcfg() {
+        let mut mem = FakePhysicalMemory::new();
+        put_table(
+            &mut mem,
+            0x9000,
+            b"MCFG",
+            &mcfg_body(&[(0xb000_0000, 0, 0, 0xff)]),
+        );
+        put_table(&mut mem, 0x6000, b"RSDT", &0x9000u32.to_le_bytes());
+        put_rsdp(&mut mem, 0x5000, 0, 0x6000);
+        assert_eq!(pci_ecam(&mem, 0x5000), Ok(Some(0xb000_0000)), "q35");
+        mem.write_bytes(0x9000 + 40, &[0x99]);
+        assert_eq!(pci_ecam(&mem, 0x5000), Err(AcpiError::Invalid(*b"MCFG")));
     }
 
     #[test]
