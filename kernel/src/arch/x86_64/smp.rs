@@ -160,7 +160,7 @@ static IDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Physical memory for the ACPI tables: through the direct map, mapping
 /// read-only any page the direct map does not cover (tables may sit
 /// outside RAM).
-struct Firmware;
+pub(super) struct Firmware;
 
 impl Firmware {
     fn ensure_mapped(phys: u64, len: u64) {

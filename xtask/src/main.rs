@@ -247,6 +247,7 @@ impl RunArgs {
             accel: self.accel,
             gdb: self.gdb,
             network: false,
+            pci_card: false,
             cpus: 1,
         }
     }
@@ -402,6 +403,9 @@ fn cmd_test(args: &RunArgs) -> Result {
             // (on `main` too: `net.tcp_rtt_us/firecracker` is skipped), so
             // there the network tests do not run; QEMU runs them on 4 CPUs.
             network: args.vmm != Vmm::Firecracker,
+            // QEMU `virt` takes its card over virtio-pci here and over
+            // virtio-mmio in `ktest`, so both transports run on AArch64.
+            pci_card: true,
             cpus: SMP_CPUS,
             ..opts
         };
@@ -659,6 +663,30 @@ fn cmd_ci() -> Result {
             what: "q35 boot must exit successfully".into(),
             expected: "Passed".into(),
             reproduce: "cargo xtask --arch x86_64 test --only boot --vmm qemu-q35".into(),
+        },
+        &run,
+    )?;
+
+    // q35 is the x86_64 machine whose network card is on PCI.
+    step("in-kernel tests on qemu-q35 (virtio-pci card)");
+    let kernel = build_kernel(Profile::Debug, &["ktest"])?;
+    let run = vmm::run(
+        Vmm::QemuQ35,
+        &Guest::Rhizo(kernel),
+        RunOptions {
+            network: true,
+            ..q35.run_options(test_timeout()?)
+        },
+    )?;
+    check_vm(
+        run.result == VmResult::Passed
+            && run.output.contains("test result: ok.")
+            && run.output.contains("at virtio-pci "),
+        VmCheck {
+            kind: "ktest",
+            what: "in-kernel tests must pass on q35 with a virtio-pci card".into(),
+            expected: "`net: card ... at virtio-pci` and Passed with `test result: ok.`".into(),
+            reproduce: "cargo xtask --arch x86_64 test --only ktest --vmm qemu-q35".into(),
         },
         &run,
     )

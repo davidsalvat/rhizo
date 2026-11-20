@@ -1,19 +1,23 @@
 //! The network card (spec `networking`, design D1, D4 and D5 of
-//! `add-virtio-net`): found among the virtio-mmio transports the platform
-//! lists, given the address the command line asks for, and polled by the
-//! cell host.
+//! `add-virtio-net`, D3 of `add-virtio-pci`): found among the virtio-mmio
+//! transports the platform lists, else on PCI bus 0, given the address the
+//! command line asks for, and polled by the cell host.
 
 use crate::arch::console::BootConsole;
 use crate::arch::platform::{self, Mmio};
 use crate::memory::{self, DirectMap};
 use crate::sync::Global;
+use alloc::format;
+use alloc::string::String;
 use core::fmt::Write;
 use rhizo_core::options::{BootOptions, IpOption};
 use rhizo_hal::{ConsoleWriter, NetLink};
 use rhizo_net::{Net, WireConfig};
-use rhizo_virtio::{ProbeError, VirtioNet};
+use rhizo_virtio::{ProbeError, VirtioNet, pci};
 
-static LINK: Global<Option<VirtioNet<Mmio, DirectMap>>> = Global::new(None);
+type Card = VirtioNet<Mmio, DirectMap>;
+
+static LINK: Global<Option<Card>> = Global::new(None);
 
 /// The command line's boot options.
 pub fn options() -> BootOptions {
@@ -27,25 +31,25 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
     let mut card = None;
     // One run of frames for the card's rings and buffers.
     let mut run: Option<(u64, usize)> = None;
+    let alloc = &mut || {
+        if run.is_none() {
+            let start =
+                memory::with_frames(|f| f.alloc_contiguous(rhizo_virtio::FRAMES)).flatten()?;
+            run = Some((start, 0));
+        }
+        let (start, used) = run.as_mut()?;
+        if *used == rhizo_virtio::FRAMES {
+            return None;
+        }
+        *used += 1;
+        Some(*start + (*used as u64 - 1) * rhizo_mm::FRAME_SIZE)
+    };
     platform::for_each_virtio_mmio(|base| {
         if card.is_some() {
             return;
         }
-        let alloc = &mut || {
-            if run.is_none() {
-                let start =
-                    memory::with_frames(|f| f.alloc_contiguous(rhizo_virtio::FRAMES)).flatten()?;
-                run = Some((start, 0));
-            }
-            let (start, used) = run.as_mut()?;
-            if *used == rhizo_virtio::FRAMES {
-                return None;
-            }
-            *used += 1;
-            Some(*start + (*used as u64 - 1) * rhizo_mm::FRAME_SIZE)
-        };
         match VirtioNet::probe(Mmio::new(base), DirectMap, alloc) {
-            Ok(c) => card = Some((base, c)),
+            Ok(c) => card = Some((format!("virtio-mmio {base:#x}"), c)),
             Err(ProbeError::NotNet(_)) => {}
             Err(e) => {
                 let _ = writeln!(
@@ -55,13 +59,16 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
             }
         }
     });
-    let Some((base, mut card)) = card else {
+    if card.is_none() {
+        card = pci_card(alloc);
+    }
+    let Some((at, mut card)) = card else {
         return;
     };
     let m = card.mac();
     let _ = writeln!(
         ConsoleWriter(&mut BootConsole),
-        "net: card {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} at virtio-mmio {base:#x}",
+        "net: card {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} at {at}",
         m[0],
         m[1],
         m[2],
@@ -86,6 +93,51 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
         net.attach(&mut card, config, now_ns, seed);
     }
     LINK.with(|l| *l = Some(card));
+}
+
+/// The first virtio network card on PCI bus 0 (function 0 of each device),
+/// brought up through the modern virtio-pci transport.
+fn pci_card(alloc: &mut dyn FnMut() -> Option<u64>) -> Option<(String, Card)> {
+    let ecam = platform::pci_ecam()?;
+    let mut window = platform::pci_window();
+    let report = |what: &dyn core::fmt::Debug, device: u64| {
+        let _ = writeln!(
+            ConsoleWriter(&mut BootConsole),
+            "net: virtio-pci at 00:{device:02x}.0: {what:?}"
+        );
+    };
+    for device in 0..32u64 {
+        let config = ecam + (device << 15);
+        if let Err(e) = platform::map_device(config, pci::FUNCTION_BYTES) {
+            report(&e, device);
+            return None;
+        }
+        let regions = match pci::net_regions(&mut Mmio::new(config), window.as_mut()) {
+            Ok(Some(regions)) => regions,
+            Ok(None) => continue,
+            Err(e) => {
+                report(&e, device);
+                continue;
+            }
+        };
+        let regs = |(at, len)| platform::map_device(at, len).map(|()| Mmio::new(at));
+        let transport = match (
+            regs(regions.common),
+            regs(regions.notify),
+            regs(regions.device),
+        ) {
+            (Ok(c), Ok(n), Ok(d)) => pci::Transport::new(c, n, regions.notify_multiplier, d),
+            (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => {
+                report(&e, device);
+                continue;
+            }
+        };
+        match VirtioNet::probe_pci(transport, DirectMap, alloc) {
+            Ok(card) => return Some((format!("virtio-pci 00:{device:02x}.0"), card)),
+            Err(e) => report(&e, device),
+        }
+    }
+    None
 }
 
 /// Longest time the card goes unpolled while cells use it and nothing else

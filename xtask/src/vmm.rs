@@ -250,6 +250,10 @@ pub struct RunOptions {
     /// Give a Rhizo guest a network card and a host echo server where the
     /// VMM allows it (`hostnet`).
     pub network: bool,
+    /// Attach QEMU `virt`'s card through virtio-pci instead of virtio-mmio
+    /// (the other VMMs have a single transport: virtio-mmio on `microvm`
+    /// and Firecracker, virtio-pci on `q35` and Cloud Hypervisor).
+    pub pci_card: bool,
     /// Virtual CPUs of the VM.
     pub cpus: u32,
 }
@@ -266,7 +270,7 @@ fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result
     match vmm {
         Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
         Vmm::Firecracker => firecracker_command(guest, opts, scratch),
-        Vmm::CloudHypervisor => cloud_hypervisor_command(guest, opts.cpus),
+        Vmm::CloudHypervisor => cloud_hypervisor_command(guest, opts),
     }
 }
 
@@ -340,14 +344,18 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
             if opts.network
                 && let crate::hostnet::Network::Qemu { cmdline } = crate::hostnet::for_vmm(vmm)
             {
-                // A modern virtio-mmio network card on the user network.
-                cmd.args([
-                    "-netdev",
-                    "user,id=n0",
-                    "-device",
-                    "virtio-net-device,netdev=n0",
-                ])
-                .args(["-global", "virtio-mmio.force-legacy=false"]);
+                cmd.args(["-netdev", "user,id=n0"]);
+                if vmm == Vmm::QemuQ35 || opts.pci_card {
+                    // A modern-only virtio-pci card, without the boot ROM.
+                    cmd.args([
+                        "-device",
+                        "virtio-net-pci,netdev=n0,disable-legacy=on,romfile=",
+                    ]);
+                } else {
+                    // A modern virtio-mmio network card.
+                    cmd.args(["-device", "virtio-net-device,netdev=n0"])
+                        .args(["-global", "virtio-mmio.force-legacy=false"]);
+                }
                 args += &cmdline;
             }
             cmd.arg("-kernel").arg(kernel).args(["-append", &args]);
@@ -384,7 +392,7 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     let mut interfaces = String::new();
     if opts.network
         && matches!(guest, Guest::Rhizo(_))
-        && let crate::hostnet::Network::Firecracker { tap, cmdline } =
+        && let crate::hostnet::Network::Tap { tap, cmdline } =
             crate::hostnet::for_vmm(Vmm::Firecracker)
     {
         interfaces = format!(
@@ -414,10 +422,10 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     Ok(cmd)
 }
 
-fn cloud_hypervisor_command(guest: &Guest, cpus: u32) -> Result<Command> {
+fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command> {
     let binary = tools::cloud_hypervisor()?;
     let mut cmd = Command::new(binary);
-    cmd.args(["--cpus", &format!("boot={cpus}")]).args([
+    cmd.args(["--cpus", &format!("boot={}", opts.cpus)]).args([
         "--memory",
         "size=128M",
         "--console",
@@ -425,9 +433,16 @@ fn cloud_hypervisor_command(guest: &Guest, cpus: u32) -> Result<Command> {
     ]);
     match guest {
         Guest::Rhizo(kernel) => {
-            cmd.arg("--kernel")
-                .arg(kernel)
-                .args(["--cmdline", Vmm::CloudHypervisor.rhizo_cmdline(true)]);
+            let mut args = Vmm::CloudHypervisor.rhizo_cmdline(true).to_string();
+            if opts.network
+                && let crate::hostnet::Network::Tap { tap, cmdline } =
+                    crate::hostnet::for_vmm(Vmm::CloudHypervisor)
+            {
+                // A virtio-pci card on the tap device.
+                cmd.args(["--net", &format!("tap={tap},mac=06:00:ac:10:01:02")]);
+                args += &cmdline;
+            }
+            cmd.arg("--kernel").arg(kernel).args(["--cmdline", &args]);
             if arch::current() == Arch::X86_64 {
                 cmd.args(["--serial", "off", "--debug-console", "tty"]);
             } else {

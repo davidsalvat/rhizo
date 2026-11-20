@@ -378,6 +378,7 @@ fn measure_cells(
         accel: opts.accel,
         gdb: false,
         network: true,
+        pci_card: false,
         cpus: 1,
     };
     let mut pt_frames = None;
@@ -838,6 +839,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         accel,
         gdb: false,
         network: false,
+        pci_card: false,
         cpus: 1,
     };
     let mut samples = Samples {
