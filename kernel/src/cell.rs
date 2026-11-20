@@ -204,7 +204,11 @@ fn image_space(data: &'static [u8], image: &Image) -> Result<PageTable<Format>, 
         return Ok(pt);
     }
     // Loaded outside the lock: loading may drop the images kept.
-    let loaded = rhizo_cell::load::<Format>(image, &mut DirectMap, &mut KernelFrames)?;
+    let loaded = if TEXT_LARGE.load(Ordering::Relaxed) {
+        rhizo_cell::load::<Format>(image, &mut DirectMap, &mut KernelFrames)?
+    } else {
+        rhizo_cell::load::<Format>(image, &mut DirectMap, &mut SmallOnly)?
+    };
     sync_code(&loaded, image);
     IMAGES
         .with(|images| {
@@ -241,6 +245,30 @@ fn copy_image(images: &mut Images<KEPT_IMAGES>, key: images::Key) -> Option<Page
         );
     }
     Some(kept)
+}
+
+/// DIAGNOSTIC ONLY: whether kept images get 2 MiB pages.
+static TEXT_LARGE: AtomicBool = AtomicBool::new(true);
+
+/// DIAGNOSTIC ONLY: kernel frames without 2 MiB ones.
+struct SmallOnly;
+
+impl Frames for SmallOnly {
+    fn alloc(&mut self) -> Option<u64> {
+        KernelFrames.alloc()
+    }
+    fn alloc_large(&mut self) -> Option<u64> {
+        None
+    }
+    fn free(&mut self, phys: u64, size: PageSize) {
+        KernelFrames.free(phys, size);
+    }
+    fn share(&mut self, phys: u64) {
+        KernelFrames.share(phys);
+    }
+    fn is_shared(&self, phys: u64) -> bool {
+        KernelFrames.is_shared(phys)
+    }
 }
 
 /// The frames of [`KernelFrames`] for work under the [`IMAGES`] lock: an
@@ -2001,6 +2029,43 @@ fn cpython() -> Option<(u64, u64)> {
         warm.push(ns(t0, Counter.cycles()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
+    // DIAGNOSTIC ONLY: cold starts with 2 MiB pages for the kept image
+    // (bit 0) and the break (bit 1), interleaved.
+    let mut modes: [Vec<u64>; 4] = Default::default();
+    for _ in 0..6 {
+        for (mode, samples) in modes.iter_mut().enumerate() {
+            TEXT_LARGE.store(mode & 1 != 0, Ordering::Relaxed);
+            rhizo_abi::BRK_LARGE.store(mode & 2 != 0, Ordering::Relaxed);
+            drop_images();
+            for timed in [false, true] {
+                let t0 = Counter.cycles();
+                let id = host
+                    .spawn_with_files(image, &ARGV, cpython_files()?, true, false)
+                    .expect("spawn");
+                host.run(|h| h.finished(id).is_some());
+                if timed {
+                    samples.push(ns(t0, Counter.cycles()));
+                }
+            }
+        }
+    }
+    TEXT_LARGE.store(true, Ordering::Relaxed);
+    rhizo_abi::BRK_LARGE.store(false, Ordering::Relaxed);
+    let m: Vec<u64> = modes
+        .iter_mut()
+        .map(|v| {
+            v.sort_unstable();
+            v[v.len() / 2]
+        })
+        .collect();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(&mut BootConsole),
+        "rhizo-diag none={} text={} brk={} both={}",
+        m[0],
+        m[1],
+        m[2],
+        m[3]
+    );
     cold.sort_unstable();
     warm.sort_unstable();
     Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))

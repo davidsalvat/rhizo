@@ -671,6 +671,9 @@ fn user_rw() -> PageFlags {
     PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE
 }
 
+/// DIAGNOSTIC ONLY (never merged): large pages for the break.
+pub static BRK_LARGE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
@@ -679,7 +682,18 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     if want < cell.brk_start || want > MMAP_BASE {
         return cell.brk as i64;
     }
-    let (old_end, new_end) = (align_up(cell.brk, FRAME_SIZE), align_up(want, FRAME_SIZE));
+    // What is mapped for a break: 4 KiB pages up to the first 2 MiB
+    // boundary of the heap, whole 2 MiB pages past it.
+    let first = align_up(cell.brk_start, LARGE_PAGE_SIZE);
+    let mapped = |brk: u64| {
+        let end = align_up(brk, FRAME_SIZE);
+        if end <= first || !BRK_LARGE.load(core::sync::atomic::Ordering::Relaxed) {
+            end
+        } else {
+            align_up(brk, LARGE_PAGE_SIZE)
+        }
+    };
+    let (old_end, new_end) = (mapped(cell.brk), mapped(want));
     // Memory that cannot be had is refused before any of it is zeroed.
     let ok = if new_end > old_end {
         cx.services.can_store(new_end - old_end)

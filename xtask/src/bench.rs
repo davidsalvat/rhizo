@@ -595,6 +595,9 @@ fn parse_python_line(output: &str) -> Option<(u64, u64)> {
 /// `(cold_ns, warm_ns)` of the CPython line of a `bench-cell` kernel
 /// (absent when CPython was not built).
 fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
+    for l in output.lines().filter(|l| l.starts_with("rhizo-diag ")) {
+        eprintln!("{l}");
+    }
     let line = output.lines().find(|l| l.starts_with("rhizo-cpython "))?;
     let field = |key: &str| -> Option<u64> {
         line.split_whitespace()
