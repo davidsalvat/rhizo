@@ -71,6 +71,14 @@ fn int(v: i32) -> [u8; 4] {
 }
 
 impl World {
+    /// Makes a call that must wait on descriptors; returns its deadline
+    /// (`Some(None)`: none), or `None` if it did not wait.
+    fn waits(&mut self, nr: u64, args: &[u64]) -> Option<Option<u64>> {
+        let (_, out) = self.call(nr, args);
+        assert_eq!(out, Outcome::Block, "the call waits");
+        self.io
+    }
+
     fn fds_at(&self, addr: u64) -> (u64, u64) {
         let b = self.peek(addr, 8);
         (
@@ -116,10 +124,10 @@ fn pipes_carry_bytes_and_block_when_empty() {
     assert_eq!((r, wr), (3, 4));
     assert_eq!(w.send(wr, b"abc"), 3);
     assert_eq!(w.recv(r, 10), Ok(b"abc".to_vec()));
-    let pc = w.cell.regs.pc;
-    assert_eq!(w.call(READ, &[r, BUF, 10]).1, Outcome::Block(None));
-    assert_eq!(w.cell.regs.pc, pc - 4, "back on the SVC instruction");
-    assert_eq!(w.cell.regs.gpr[0], r, "the arguments are kept");
+    let pc = w.cell.regs().pc;
+    assert_eq!(w.waits(READ, &[r, BUF, 10]), Some(None));
+    assert_eq!(w.cell.regs().pc, pc - 4, "back on the SVC instruction");
+    assert_eq!(w.cell.regs().gpr[0], r, "the arguments are kept");
     assert_eq!(w.call(FCNTL, &[r, 4, O_NONBLOCK]).0, 0);
     assert_eq!(w.call(FCNTL, &[r, 3, 0]).0, O_NONBLOCK as i64);
     assert_eq!(w.recv(r, 10), Err(-EAGAIN));
@@ -218,14 +226,11 @@ fn poll_waits_until_ready_or_its_deadline() {
         &[0i64.to_le_bytes(), (10 * MS as i64).to_le_bytes()].concat(),
     );
     w.services.clock = 1000;
-    assert_eq!(
-        w.call(PPOLL, &[BUF, 1, OUT]).1,
-        Outcome::Block(Some(1000 + 10 * MS))
-    );
+    assert_eq!(w.waits(PPOLL, &[BUF, 1, OUT]), Some(Some(1000 + 10 * MS)));
     w.services.clock = 5 * MS;
     assert_eq!(
-        w.call(PPOLL, &[BUF, 1, OUT]).1,
-        Outcome::Block(Some(1000 + 10 * MS)),
+        w.waits(PPOLL, &[BUF, 1, OUT]),
+        Some(Some(1000 + 10 * MS)),
         "the deadline is kept when the call is made again"
     );
     w.services.clock = 1000 + 10 * MS;
@@ -286,8 +291,8 @@ fn epoll_reports_ready_entries_with_their_data() {
         );
         assert_eq!(w.call(nr(EPOLL_PWAIT, 281), &[ep, OUT, 4, 0, 0]).0, 0);
         assert_eq!(
-            w.call(nr(EPOLL_PWAIT, 281), &[ep, OUT, 4, 20, 0]).1,
-            Outcome::Block(Some(20 * MS))
+            w.waits(nr(EPOLL_PWAIT, 281), &[ep, OUT, 4, 20, 0]),
+            Some(Some(20 * MS))
         );
         w.deadline = None;
         w.poke(BUF + 0x40, b"x");
@@ -334,8 +339,8 @@ fn tcp_over_loopback_in_one_cell() {
     assert_eq!(w.send(c, b"ping"), 4);
     assert_eq!(w.recv(s, 100), Ok(b"ping".to_vec()));
     assert_eq!(
-        w.call(READ, &[s, BUF, 100]).1,
-        Outcome::Block(None),
+        w.waits(READ, &[s, BUF, 100]),
+        Some(None),
         "nothing more yet"
     );
     w.poke(LEN, &int(16));
@@ -545,10 +550,7 @@ fn receive_timeout_bounds_a_blocking_receive() {
     w.poke(BUF, &[0i64.to_le_bytes(), 10_000i64.to_le_bytes()].concat()); // 10 ms
     assert_eq!(w.call(SETSOCKOPT, &[s, 1, 20, BUF, 16]).0, 0);
     w.services.clock = 7;
-    assert_eq!(
-        w.call(READ, &[s, BUF, 1]).1,
-        Outcome::Block(Some(7 + 10 * MS))
-    );
+    assert_eq!(w.waits(READ, &[s, BUF, 1]), Some(Some(7 + 10 * MS)));
     w.services.clock = 7 + 10 * MS;
     assert_eq!(w.call(READ, &[s, BUF, 1]).0, -EAGAIN, "timed out");
 }

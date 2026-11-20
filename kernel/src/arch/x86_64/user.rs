@@ -67,11 +67,8 @@ impl UserFault {
     }
 }
 
-/// CR3 value (root and PCID) when a cell last ran, whether it is at a
-/// system call boundary (so `SYSRETQ` may return to it), and whether PCIDs
-/// are on.
+/// CR3 value (root and PCID) when a cell last ran, and whether PCIDs are on.
 static USER_CR3: AtomicU64 = AtomicU64::new(0);
-static AT_SYSCALL: AtomicBool = AtomicBool::new(false);
 static PCID: AtomicBool = AtomicBool::new(false);
 /// FS base last written (skipping the write when it does not change).
 static LAST_FS: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -175,10 +172,16 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     if USER_CR3.swap(cr3, Ordering::Relaxed) != cr3 || fresh {
         let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !fresh;
         load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
-        AT_SYSCALL.store(false, Ordering::Relaxed);
     }
-    // SYSRETQ needs a canonical lower-half RIP (else it faults in ring 0).
-    let sysret = AT_SYSCALL.load(Ordering::Relaxed) && regs.pc < 0x0000_8000_0000_0000;
+    // SYSRETQ loads RIP from RCX and RFLAGS from R11, so it restores exactly
+    // what IRETQ would when they already hold those values, as after a
+    // system call. Threads of a cell share CR3, so this is a property of
+    // the registers entered, not of the last exit (design D9 of
+    // `add-threads`). It also needs a canonical lower-half RIP (else it
+    // faults in ring 0).
+    let user_flags = (regs.flags & 0xdd5) | 0x202;
+    let sysret =
+        regs.pc < 0x0000_8000_0000_0000 && regs.gpr[2] == regs.pc && regs.gpr[10] == user_flags;
     if LAST_FS.swap(regs.tls, Ordering::Relaxed) != regs.tls {
         // SAFETY: the FS base is the cell's thread pointer; the kernel does
         // not use FS.
@@ -189,7 +192,6 @@ pub fn enter_user(root: u64, tag: u16, fresh: bool, regs: &mut Registers) -> Tra
     // the SYSCALL entry or a ring-3 exception, which restore the kernel
     // stack and callee-saved registers.
     let vector = unsafe { rhizo_enter_cell(regs, sysret as u64) };
-    AT_SYSCALL.store(vector == 256, Ordering::Relaxed);
     if vector == 256 {
         return Trap::Syscall;
     }

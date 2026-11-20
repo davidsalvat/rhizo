@@ -63,6 +63,12 @@ again:
   until one of them writes.
 - **Templates.** Freeze a cell after its warm-up, then start new cells from it
   instead of from the executable.
+- **Threads.** `pthread_create`, mutexes, condition variables and futexes;
+  snapshots, forks and templates carry every thread.
+- **Isolation, reviewed.** An adversarial review of the cell boundary, with
+  hostile cells and property tests that keep it fixed:
+  [`docs/security.md`](docs/security.md) lists the threat model, the
+  findings and what is still open.
 
 ## Thesis
 
@@ -141,10 +147,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 9.0 | 9.5 | 196.1 | 197.1 | 20 |
-| Cloud Hypervisor | 7.3 | 15.0 | 99.5 | 105.9 | 20 |
-| QEMU microvm | 44.2 | 45.2 | — | — | 20 |
-| QEMU q35 | 62.6 | 66.7 | 181.7 | 183.1 | 20 |
+| Firecracker | 9.1 | 9.4 | 198.2 | 201.3 | 20 |
+| Cloud Hypervisor | 11.7 | 14.2 | 110.7 | 116.6 | 20 |
+| QEMU microvm | 44.9 | 46.1 | — | — | 20 |
+| QEMU q35 | 63.8 | 66.1 | 185.0 | 187.8 | 20 |
 
 ### A cell against a Linux process, in the same kind of VM
 
@@ -152,10 +158,10 @@ Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux gue
 
 | Operation | Rhizo cell | Linux process, same VM | Linux process, host |
 |---|---:|---:|---:|
-| The `fork` call, holding 50 MiB written | 0.9 µs | 87.5 µs | 627.2 µs |
-| Fork, then the child writes all 50 MiB and exits | 5.55 ms | 23.61 ms | 21.79 ms |
-| Start a program and run it to its exit (`hello`) | 7.2 µs | 594.9 µs | 95.7 µs |
-| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 0.9 µs / 601.4 µs | — | 2.51 ms (CRIU) |
+| The `fork` call, holding 50 MiB written | 1.5 µs | 87.1 µs | 914.8 µs |
+| Fork, then the child writes all 50 MiB and exits | 7.45 ms | 27.28 ms | 26.40 ms |
+| Start a program and run it to its exit (`hello`) | 7.3 µs | 533.9 µs | 100.1 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.0 µs / 594.4 µs | — | 2.70 ms (CRIU) |
 
 ### Whole VMs and sandboxes, for scale
 
@@ -163,8 +169,8 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 7.2 µs | 196.15 ms | 72.15 ms |
-| Resume a suspended environment until it runs (eager for the cell) | 601.4 µs | 3.74 ms | 93.65 ms |
+| Start a program and run it to its exit (`hello`) | 7.3 µs | 198.20 ms | 70.58 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 594.4 µs | 4.71 ms | 99.85 ms |
 
 ### A real interpreter
 
@@ -172,8 +178,8 @@ MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 3.56 ms |
-| Forked from a template frozen after the warm-up | 470.9 µs (7.6× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.64 ms |
+| Forked from a template frozen after the warm-up | 505.9 µs (7.2× faster) |
 
 Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 `cargo xtask bench --readme`.
@@ -186,7 +192,7 @@ Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H10, from the boot and test harness to MicroPython running as a cell with warm templates. Next: a gVisor comparison and a dedicated benchmark machine." width="800">
+    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H14, from the boot and test harness to threads inside a cell, including the gVisor and fair comparisons and an adversarial security review. Next: sockets and network, CPython in a cell, multi-core, and a dedicated benchmark machine." width="800">
   </picture>
 </p>
 
@@ -194,8 +200,8 @@ Each milestone ships its speed work with a benchmark that proves it; the
 details live in the archived changes under
 [`openspec/changes/archive/`](openspec/changes/archive/).
 
-Out of scope for the proof of concept: networking, multicore, real disks,
-hardware other than virtio/QEMU, full CPython, SDKs.
+Out of scope for the proof of concept: real disks, hardware other than
+virtio/QEMU, SDKs.
 
 ## Try it
 

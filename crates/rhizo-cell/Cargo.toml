@@ -18,6 +18,7 @@ rhizo-hal = { path = "../rhizo-hal" }
 rhizo-mm = { path = "../rhizo-mm" }
 
 [dev-dependencies]
+proptest = "1"
 rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
 
 [lints]

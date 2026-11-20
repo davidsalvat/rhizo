@@ -49,6 +49,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.loopback_rtt_us/rhizo/<vmm>` | timing | Two `loopback` cells exchanging a 64-byte message over TCP on 127.0.0.1, per round trip over 200 (each side blocks in `read`, wakes, and the other runs) |
 | `cell.idle_bytes` | deterministic | Memory each of 1000 idle cells costs (forks of a template of `idle`, each run into its sleep): what "thousands of mostly idle cells per node" costs |
 | `cell.suspended_bytes` | deterministic | Snapshot size of one idle cell |
+| `cell.thread_create_us/rhizo/<vmm>` | timing | A thread of the `threads` cell creating a thread (raw `clone`, as `pthread_create` does) that exits at once, and joining it (futex wait on its clear-tid word); measured by the cell with `clock_gettime`, robust figure over 105 runs |
+| `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
 
 Figures the kernel repeats a hundred times or more (`cell.spawn_us`,
 `cell.run_us`, `cell.spawn_from_template_us`, the file and network

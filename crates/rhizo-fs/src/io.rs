@@ -480,7 +480,7 @@ impl Tables {
         let ino = self.alloc_inode(Inode {
             links: 1,
             node: Node::Socket(name),
-        });
+        })?;
         if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
             entries.insert(last.to_vec(), ino);
         }

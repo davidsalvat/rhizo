@@ -144,6 +144,11 @@ pub(crate) fn write_pipe<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         return 0;
     }
     let n = len.min(rhizo_fs::PIPE_CAP as u64) as usize;
+    // Pipe data lives in the kernel heap: as file data, the cell may only
+    // add what memory can hold.
+    if !cx.services.can_store(n as u64) {
+        return -ENOBUFS;
+    }
     with_user_bytes(cx, addr, n, |cx, bytes| match cx.fs.write_pipe(fd, bytes) {
         Ok(n) => n as i64,
         Err(Error::Again) => {

@@ -122,3 +122,16 @@ two cells exchange a 64-byte message over TCP on 127.0.0.1, 2 000 times,
 blocking reads; time per round trip (two blocks, two wakes, two switches).
 Both are robust figures (minimum over rounds of the median, as the file
 metrics).
+
+### D8. A 2 MiB copy-on-write without a free 2 MiB block
+
+A copy-on-write write to a shared 2 MiB page needed a whole free 2 MiB
+block, and the cell was killed without one. With the security and thread
+tests merged before this change, the MicroPython in-kernel test found too
+few: the memory-pressure test leaves the heap's size-class pages (kept for
+good) spread over nearly every block, about four per block, and a
+MicroPython fork faulted, depending on scheduling. The page-fault path
+already falls back to 4 KiB pages; copy-on-write now does too: with no
+free 2 MiB block it copies the page into 512 private 4 KiB frames under a
+new table, so the write succeeds while 4 KiB frames remain. The usual
+case (a free block) is unchanged.

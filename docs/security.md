@@ -1,0 +1,332 @@
+# Security review of the cell boundary
+
+Rhizo's thesis is that agent cells are isolated *and* fast. This document is
+the adversarial half: what a hostile cell is assumed to do, where the trust
+boundary is, how every system call checks what crosses it, what the review
+found and how each finding was fixed, and what is not covered. It is kept
+up to date with the code; the requirements are in
+`openspec/specs/isolation` and the tests that keep them true are listed at
+the end.
+
+Review of the code as of the `add-security-review` change (milestone H13),
+on both architectures (AArch64 and x86_64).
+
+## Threat model
+
+**Attacker.** Arbitrary code running in a cell: any instruction the CPU
+allows at EL0 / ring 3, any system call number with any six arguments, in
+any order, as many times as it likes, from as many cells as the host runs
+for it. The attacker knows the kernel's source and memory layout (no
+secrecy is assumed: there is no KASLR).
+
+**Goals the kernel must defeat.**
+
+1. Read or write kernel memory (directly, or by making the kernel do it).
+2. Read or write another cell's memory, files or registers.
+3. Crash, panic or hang the kernel.
+4. Use resources without bound in a way that stops other cells (CPU time
+   in the kernel, kernel heap, console).
+5. Learn another cell's data through recycled frames, a fork, a snapshot
+   or a resume.
+
+**Trusted.** The host code that drives the kernel (`Host::spawn`, `fork`,
+`suspend`, `resume`, `kill`): it chooses which executables run and where
+snapshots come from. Executables and snapshot bytes are still validated
+(they may be stored or moved outside the kernel), and findings in those
+paths are rated lower. The hardware, firmware and VMM (QEMU, Firecracker,
+Cloud Hypervisor) are trusted.
+
+## Trust boundary
+
+```text
+ cell code (EL0 / ring 3)            kernel (EL1 / ring 0)
+ ─────────────────────────┐ ┌──────────────────────────────────────────────
+  instructions ──────────►│ │ exception: fault report, cell killed
+                          │ │   (or a lazy page / copy-on-write resolved)
+  SVC / SYSCALL ─────────►│ │ Abi::handle (crates/rhizo-abi)
+    number + 6 registers  │ │   ├─ user memory: rhizo_cell::memory::read/write
+                          │ │   │    range < USER_END, the cell's own table,
+                          │ │   │    USER (+ writable) pages, copied through
+                          │ │   │    the direct map
+                          │ │   ├─ address space: rhizo_cell::space
+                          │ │   │    (lower half only, W^X, reserve kept)
+                          │ │   └─ files: the cell's own rhizo_fs::Fs
+  timer interrupt ───────►│ │ preemption (rhizo-sched)
+ ─────────────────────────┘ └──────────────────────────────────────────────
+```
+
+What makes the boundary hold:
+
+- **Privilege.** Cell code runs at EL0 / ring 3. On entry the kernel sets
+  only the condition flags of the saved state (AArch64 `SPSR_EL1` keeps
+  NZCV; x86_64 `RFLAGS` keeps CF, PF, AF, ZF, SF, DF, OF and sets IF), so
+  a cell cannot pick its privilege level or mask interrupts.
+- **Address spaces.** Each cell has its own page-table root for the lower
+  half. On AArch64 the kernel lives in `TTBR1_EL1` and is never in a
+  cell's table; on x86_64 the cell's root shares the kernel's upper-half
+  entries, all without the user bit. Address-space tags (ASID / PCID) are
+  flushed when a tag changes hands. User pages are never executable by the
+  kernel on AArch64 (`PXN`).
+- **Copies.** The kernel never dereferences a cell address. Every copy
+  translates the address in the cell's own table, requires the user bit
+  (and writability for writes) on the effective permissions, and copies
+  through the kernel's direct map. A range that reaches past `USER_END`
+  (`0x7fff_ffff_f000`) is refused before any translation (finding S1).
+- **Copy-on-write.** Shared tables and pages are read-only for every
+  sharer, even after `mprotect` asks for writes (finding S12); a write
+  fault copies only what is shared, and only in the lower half (S2).
+- **Per-cell state.** Registers, FP/SIMD state (switched lazily, trapped on
+  first use), files and descriptors (`rhizo_fs::Fs`, private copy-on-write)
+  and the system-call handler (`Abi`) belong to one cell.
+- **Zeroed memory.** Every frame a cell is given is zeroed or fully
+  written first: anonymous mappings and the heap (`map_anonymous`), ELF
+  pages and the stack (`zero_frame` before copying), page tables, private
+  copies of shared pages (whole-page copy), resumed pages (whole-page
+  copy), new file blocks (`[0; 4096]`).
+
+## System calls
+
+Every call is decoded from the saved registers by `Arch::decode`; numbers
+that decode to nothing return `-ENOSYS`. General rules that every row
+relies on:
+
+- **Pointers** go through `memory::read` / `memory::write` (above): a bad
+  pointer is `-EFAULT`; calls that stream (`read`, `write`, `getrandom`,
+  `writev`) return the bytes done before the fault, as Linux does.
+- **Descriptors** are the low 32 bits of the argument (Linux's `int`), looked
+  up in the cell's own table (`-EBADF` otherwise); at most 1024.
+- **Lengths** are never used to size a kernel buffer, except where capped
+  (paths: 4096 bytes; `getdents64`: 64 KiB). Data moves in pieces of at
+  most one page (and one file block, or 256 bytes for the console), so a
+  huge length costs time only for memory the cell really has.
+- **Paths** are read up to their NUL, at most `PATH_MAX` (4096) bytes,
+  never past the page holding the NUL.
+
+| Call (AArch64 / x86_64 number) | Takes from the cell | Checked |
+|---|---|---|
+| `read` (63/0), `pread64` (67/17) | fd, buffer, length, offset | fd is a readable file (console: 0 bytes); offset ≥ 0; one piece at a time into the buffer, `-EFAULT` before any byte |
+| `write` (64/1), `pwrite64` (68/18) | fd, buffer, length, offset | console in 256-byte pieces; files one piece at a time, each asking memory (`can_store`) first, ≤ 64 MiB of file data per cell (`ENOSPC`/`EFBIG`) |
+| `writev` (66/20) | fd, iovec array, count | count ≤ 1024 (`EINVAL`); each 16-byte entry copied in, then as `write` |
+| `exit`, `exit_group` (93, 94 / 60, 231) | status | low 8 bits kept |
+| `brk` (214/12) | new break | between the heap start and `MMAP_BASE`; growth asks memory first (finding S11), zeroed, `rw-`, never executable |
+| `mmap` (222/9) | length, protection, flags | anonymous private only, no `MAP_FIXED` (`EINVAL`); W^X (`EACCES`); length rounded with overflow check; the kernel picks the address below the stack's floor; memory asked first (S11) |
+| `munmap` (215/11) | address, length | page aligned, length > 0, end ≤ `USER_END` (`EINVAL`); holes skipped by table entry (S4); 2 MiB pages not split |
+| `mprotect` (226/10) | address, length, protection | aligned, known bits only, W^X, no `PROT_NONE` yet; end ≤ `USER_END` (`ENOMEM`, S1); every page mapped or brought in, else `ENOMEM` at the first one (S4); a shared frame becomes writable only copy-on-write (S12) |
+| `madvise` (233/28), `sigaltstack` (132/131) | — | accepted, nothing read or changed |
+| `getpid`, `gettid`, `set_tid_address` (172, 178, 96 / 39, 186, 218) | — | the cell's identifier; the address is not kept |
+| `getuid` … `getegid` (174–177 / 102, 104, 107, 108), `getppid` (173/110) | — | 0 |
+| `uname` (160/63) | buffer | 390 bytes written |
+| `clock_gettime` (113/228) | clock, buffer | known clocks only (`EINVAL`); 16 bytes written |
+| `getrandom` (278/318) | buffer, length | 256-byte pieces until the length or a fault; not cryptographic (O4) |
+| `rt_sigaction` (134/13), `rt_sigprocmask` (135/14) | old-state buffer, size | new state not read; at most 32 / 128 zero bytes written |
+| `ioctl` (29/16) | — | `-ENOTTY` |
+| `arch_prctl` (—/158) | code, address | `ARCH_SET_FS` only below `USER_END` (`EPERM`, S3); `ARCH_GET_FS` writes 8 bytes; others `EINVAL` |
+| `sched_yield` (124/24) | — | the cell goes to the back of the run queue |
+| `nanosleep` (101/35), `clock_nanosleep` (115/230) | clock, flags, `timespec` | 16 bytes read; negative or ≥ 10⁹ ns `EINVAL`; known clocks only; deadline saturates; only this cell waits |
+| `select` (—/23), `pselect6` (72/270) | descriptor count, timeout | descriptors not supported (`ENOSYS`); null timeout `EINVAL`; timeout read as above |
+| `set_robust_list` (99/273) | — | accepted, never walked |
+| `rseq` (293/334) | — | `-ENOSYS` (declined) |
+| `prlimit64` (261/302), `getrlimit` (163/97) | resource, old-limit buffer | resource ≤ 15 (`EINVAL`); new limit and pid not read; 16 bytes written |
+| `readlink` (—/89), `readlinkat` (78/267) | — | `-ENOENT` (no links exist), nothing read |
+| `futex` (98/202) | operation | no memory touched: wake 0, others `EAGAIN` |
+| `fstat` (80/5) | fd, buffer | 128 / 144 bytes written |
+| `newfstatat` (79/262), `stat` (—/4), `lstat` (—/6) | dirfd, path, buffer, flags | dirfd as `int` (`AT_FDCWD`, else ≥ 0 or `EBADF`); path; `AT_EMPTY_PATH` |
+| `openat` (56/257), `open` (—/2) | dirfd, path, flags | access mode 3 `EINVAL`; with `O_CREAT`, memory asked first and ≤ 4096 files and directories per cell (`ENOSPC`, S5); ≤ 1024 descriptors (`EMFILE`) |
+| `close` (57/3) | fd | own table |
+| `lseek` (62/8) | fd, offset, whence | whence 0–2; result checked for overflow and ≥ 0 |
+| `getdents64` (61/217) | fd, buffer, size | a directory fd; at most min(size, 64 KiB) built (S5) |
+| `mkdirat` (34/258), `mkdir` (—/83) | dirfd, path | memory asked first, file limit (S5) |
+| `unlinkat` (35/263), `unlink` (—/87), `rmdir` (—/84) | dirfd, path, flags | only `AT_REMOVEDIR`; non-empty directories refused |
+| `renameat` (38/264), `renameat2` (276/316), `rename` (—/82) | two dirfds and paths, flags | flags must be 0; a directory cannot move into itself |
+| `getcwd` (17/79) | buffer, size | `ERANGE` if too small; the path is bounded by the file limit |
+| `chdir` (49/80) | path | must be a directory |
+| `ftruncate` (46/77) | fd, length | file open for writing; 0 ≤ length ≤ 64 MiB |
+| `fsync`, `fdatasync` (82, 83 / 74, 75) | fd | checked, nothing else |
+| `dup` (23/32), `dup2` (—/33), `dup3` (24/292), `fcntl` (25/72) | fds, flags, command | target < 1024; `dup3` flags only `O_CLOEXEC`; known commands only |
+| `faccessat` (48/269), `faccessat2` (439/439), `access` (—/21) | dirfd, path, mode | mode bits ≤ 7 |
+| anything else | number | `-ENOSYS`; one console report per number below 1023 and one for all larger (S9) |
+
+## Findings
+
+Each finding says how it was confirmed before its fix: a host test that
+failed, an in-kernel test that hung or panicked, a reproduction in the
+kernel under QEMU, or (for the low ones) reading the code. Severity is for
+the threat model above.
+
+| # | Severity | Arch | Finding | Status |
+|---|---|---|---|---|
+| S1 | Critical | x86_64 | `mprotect` accepted kernel addresses and rewrote kernel page-table entries with the user bit: a cell could map all of RAM for itself | Fixed |
+| S12 | Critical | both | `mprotect` made a read-only page shared with a fork (code, constants, a template's pages) writable in place: one cell could write another's code | Fixed |
+| S2 | High | x86_64 | A write to a kernel address was taken for a copy-on-write fault: the cell was never killed, and kernel table entries could be changed | Fixed |
+| S3 | High | x86_64 | `arch_prctl(ARCH_SET_FS)` accepted any base; loading a non-canonical one faults in the kernel | Fixed |
+| S4 | High | both | `munmap` / `mprotect` took one step per 4 KiB page of their range, even unmapped: one call could stop every cell for hours | Fixed |
+| S5 | High | both | File and directory names grew the kernel heap without limit or memory check: the heap could fail to grow, which panics | Fixed |
+| S6 | Medium | both | Captured output grew without limit (same panic) | Fixed |
+| S7 | Medium | x86_64 | An executable could map code in the last page of the lower half, where a `syscall` returns to a non-canonical address | Fixed |
+| S8 | Medium | both | Snapshot bytes with a kernel program counter (or, on x86_64, thread pointer or reserved `MXCSR` bits) were accepted and would fault in the kernel on resume | Fixed |
+| S9 | Low | both | Unknown call numbers ≥ 1024 were reported on the console every time | Fixed |
+| S10 | Low | both | ELF program-header arithmetic could overflow (a panic in debug builds) | Fixed |
+| S11 | Low | both | `mmap` / `brk` beyond free memory zeroed frames until running out before refusing | Fixed |
+
+**S1. `mprotect` reached the kernel half (Critical, x86_64).** On x86_64 a
+cell's root table shares the kernel's upper-half entries, and those
+intermediate entries carry the user bit (x86_64 needs it at every level;
+the leaves decide). `mprotect` checked alignment and W^X but not the range,
+so `mprotect(0xffff_8000_0000_0000, 1 GiB, PROT_READ | PROT_WRITE)` found
+the direct map's 1 GiB page through the cell's table and rewrote its entry
+with the user bit. Reproduced in the kernel under QEMU: the cell then read
+and wrote physical memory directly. *Fix:* the range must end at or below
+`USER_END` (`ENOMEM`, as Linux); `space::protect`, `unmap` and
+`map_anonymous` refuse such ranges on their own, user-memory copies refuse
+them whatever the tables say, and the copy-on-write walk never enters the
+upper half. AArch64 was not affected (the kernel is not in a cell's table).
+*Tests:* `mprotect_cannot_open_kernel_pages_to_a_cell`,
+`munmap_cannot_remove_kernel_pages`, the property tests, `hostile_ptrs`.
+
+**S12. `mprotect` handed out shared pages (Critical, both).** A fork
+shares every page; writable ones are marked copy-on-write, read-only ones
+(code, constants) need no mark while nobody can write them. `mprotect` to
+`PROT_READ | PROT_WRITE` made such a page writable in place, so the cell
+wrote the frame its parent, its siblings, or a template and every cell
+later forked from it, still used: code injection across cells.
+Reproduced in the kernel under QEMU (`rewrite`: three copies of a forked
+cell each saw another's write). *Fix:* `space::protect` makes a page whose
+frame is shared writable only as copy-on-write (`PageTable::protect` keeps
+or adds the mark), so the first write copies it. *Tests:*
+`protect_never_hands_out_a_shared_page` (both formats),
+`shared_read_only_pages_stay_shared_after_mprotect`.
+
+**S2. Kernel writes were "resolved" as copy-on-write (High, x86_64).** A
+write by cell code to a present kernel page faults with "present, write":
+the fault path asked `resolve_write`, which walked the shared kernel tables,
+found a writable leaf and answered "already resolved", so the kernel
+re-entered the cell at the same instruction, forever (the cell was never
+killed; the in-kernel test hung). The walk could also set the writable bit
+on kernel intermediate entries. *Fix:* the copy-on-write walk returns "no
+page" for any upper-half address. *Tests:*
+`kernel_half_is_never_made_writable_or_private`, `poke_kernel`.
+
+**S3. Non-canonical thread pointer (High, x86_64).** The kernel loads a
+cell's thread pointer into `FS_BASE` with `WRMSR` before entering it; a
+non-canonical value raises `#GP` in ring 0 (Intel SDM, `WRMSR`), a kernel
+panic. QEMU's software emulation does not model that check, so this was
+confirmed by the host test (the call returned 0 and kept the value) rather
+than by a crash; on KVM or hardware it would have crashed. *Fix:* `EPERM`
+at or above `USER_END`, as Linux. *Tests:*
+`the_thread_pointer_stays_in_the_cell`, `hostile_ptrs`.
+
+**S4. Per-page range walks (High, both).** `space::unmap` stepped through
+its range one page at a time, and `mprotect` asked the pager about every
+page before checking anything. The kernel runs a call to its end with
+interrupts off, so `munmap(4 GiB, 128 TiB)` took 2³⁵ steps: hours with
+every cell stopped. Confirmed by the host property test, which did not
+finish before the fix (it draws such ranges). *Fix:* `PageTable::hole_end` skips empty space one
+empty table entry at a time; `mprotect` stops at the first page it cannot
+bring in. *Tests:* `holes_end_where_their_empty_entry_ends`,
+`huge_empty_ranges_take_few_steps`, `syscall_storm_does_not_starve_others`
+(it hung before).
+
+**S5. Names without limit (High, both).** File data was counted against the
+kernel's reserve (H9), but names and inodes were not: a cell creating
+directories in a loop grew the kernel heap until it could not grow, and a
+heap that cannot grow panics. Names also fed allocations sized by the cell:
+`getcwd` of a deep tree, and `getdents64` sized its buffer by the caller's
+length. Reproduced in the kernel under QEMU: with the limits below taken
+out, cells making names next to a cell taking all memory panicked the
+kernel (`memory allocation of 64 bytes failed`). *Fix:* at most 4096 files
+and directories per cell (`ENOSPC`);
+creating one first asks for memory like a file block does; `getdents64`
+builds at most 64 KiB per call. *Tests:*
+`files_and_directories_are_limited_per_cell`,
+`names_cannot_fill_kernel_memory` (cells make names while another takes all
+memory).
+
+**S6. Captured output (Medium).** When the host captures a cell's output,
+it was appended to a vector without limit, so a cell printing forever
+would fill the heap. Found by reading the code. *Fix:* at most 1 MiB per cell, grown with
+`try_reserve`; the rest is dropped (the console still shows it when
+echoed).
+
+**S7. The last page of the lower half (Medium, x86_64).** The ELF loader
+allowed segments up to `0x0000_8000_0000_0000`. Code ending with a
+`syscall` at `0x7fff_ffff_fffe` returns to the non-canonical
+`0x8000_0000_0000`: the kernel already avoided `SYSRET` there, but the
+remaining `IRET` faults in ring 0 for a non-canonical return address. Only
+a host-chosen executable can do this. Found by reading the code (Linux
+leaves out this page for the same reason). *Fix:* `USER_END` is
+`0x7fff_ffff_f000` for executables, snapshots and copies, as Linux's
+`TASK_SIZE_MAX`. *Test:* `the_last_page_of_the_lower_half_is_refused`.
+
+**S8. Snapshot registers (Medium).** `Snapshot::from_bytes` validated pages
+and files but not registers. Tampered bytes with a kernel or non-canonical
+program counter would make `IRET` fault in ring 0; on x86_64 so would a
+non-canonical thread pointer (`WRMSR`) and reserved `MXCSR` bits
+(`FXRSTOR`). Found by reading the code. *Fix:* refused with `FormatError::BadState`. *Tests:*
+`rejects_what_it_cannot_resume`,
+`x86_64_state_that_would_fault_in_the_kernel_is_refused`.
+
+**S9. Console flood (Low).** Unknown numbers below 1024 were reported once,
+larger ones every time: a cell could keep the kernel printing to a slow
+console. Confirmed by a host test (six reports for seven calls with four numbers). *Fix:*
+one report for every number from 1023 up. *Test:*
+`unknown_calls_are_reported_once_whatever_their_number`.
+
+**S10. ELF arithmetic (Low).** `phoff + i * phentsize` and the field
+readers could overflow on hostile headers. Found by reading the code.
+*Fix:* checked arithmetic.
+*Test:* `hostile_headers_never_panic` (property).
+
+**S11. Refusing late (Low).** A `mmap` or `brk` larger than free memory
+zeroed frame after frame until running out, then gave them all back: all
+of free RAM zeroed per refused call. Found by reading the code. *Fix:* ask for the whole length first.
+
+## Known limitations and open findings
+
+These are not fixed by this change; each needs its own design.
+
+| # | Severity | Item |
+|---|---|---|
+| O1 | Medium | **No per-cell quota.** One cell may take all memory down to the kernel's reserve; others are then refused (`ENOMEM`, `ENOSPC`), and the kernel survives (spec `cells`). Host-set quotas need per-cell accounting of frames and heap. |
+| O2 | Medium | **Kernel time proportional to what a cell holds.** A call runs without preemption: reading or writing up to 64 MiB of file data, `getrandom` or `write` over gigabytes of the cell's own memory, or mapping and zeroing a large region delays every other cell for as long as it takes. Bounded by the cell's own memory, not by a time slice. |
+| O3 | High on affected CPUs | **Side channels are out of scope.** Caches, branch predictors, speculation and timing are not reviewed. On x86_64 the kernel half is mapped (supervisor only) in every cell's table, with no KPTI: on CPUs vulnerable to Meltdown a cell could read kernel memory. Cells see a nanosecond clock. |
+| O4 | Medium | **Randomness is not cryptographic.** `getrandom` and `AT_RANDOM` come from xorshift seeded by the cycle counter: predictable. Cells that need secrets must not rely on it. |
+| O5 | Low | **Hardening not enabled.** x86_64 does not turn on SMEP or SMAP, AArch64 not PAN. The kernel never touches cell addresses directly (copies go through the direct map), so they would only defend against kernel bugs. On x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
+| O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. |
+| O7 | Low | **Host paths may panic.** Forking one cell more than 65535 times panics (frame reference counts are 16 bits); a frame lost when loading an executable fails half way. Only the host can do either. |
+| — | — | **Single CPU.** Concurrency between CPUs was not reviewed (there is one). |
+| — | — | **No hardware, firmware or VMM audit.** Device emulation, the boot path and the VMMs are trusted. |
+| — | — | **No formal proof.** This is a review with tests, not a verification. |
+
+## Tests that keep it fixed
+
+- Host, `crates/rhizo-abi/src/hostile.rs`: `x86_64_cells_cannot_hurt_the_kernel`
+  and `aarch64_cells_cannot_hurt_the_kernel` (properties: up to 40 calls of
+  any number and arguments; results are values or errnos, no panic, kernel
+  tables, data and code unchanged, console reports bounded, every frame
+  back), `pointers_outside_the_cell_give_efault` (property, 27 calls taking
+  a pointer), and one test per finding.
+- Host, elsewhere: `ranges_outside_the_user_half_are_refused` (property,
+  `rhizo-cell`), `the_kernel_half_is_out_of_reach` (`space`, both formats),
+  `hostile_headers_never_panic` (ELF), `kernel_half_is_never_made_writable_or_private`
+  and `holes_end_where_their_empty_entry_ends` (`rhizo-mm`),
+  `files_and_directories_are_limited_per_cell` (`rhizo-fs`), the snapshot
+  register tests.
+- In the kernel, both architectures (`kernel/src/tests.rs`, H13 section),
+  with hostile cells in `cells/src/bin`:
+  - `syscall_fuzzer_cannot_hurt_the_kernel`: `fuzz`, 20000 calls from a
+    fixed seed next to a well-behaved cell; nothing leaks.
+  - `hostile_pointers_get_efault`: `hostile_ptrs` (also run on Linux by the
+    differential check, which answers the same).
+  - `cell_cannot_read_kernel_memory` (`fault_kernel`, existing) and
+    `cell_cannot_write_kernel_memory` (`poke_kernel`).
+  - `memory_hog_is_refused_and_others_run`: `hog`.
+  - `syscall_storm_does_not_starve_others`: `storm`; and
+    `spinning_cell_does_not_starve_others` (`spin`, existing) for a cell
+    that never makes a call.
+  - `fresh_memory_never_holds_another_cells_data`: `scrub`, after a cell
+    filled frames with a pattern: a fresh cell, a forked child, eager and
+    lazy resumes all read zeros; the ended cell's mapping faults.
+  - `names_cannot_fill_kernel_memory`: `namer` cells, with and without a
+    cell taking all memory.
+  - `shared_read_only_pages_stay_shared_after_mprotect`: `rewrite`, forked,
+    each copy makes its constants writable and writes them.

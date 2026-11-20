@@ -159,7 +159,8 @@ pub mod testing {
     }
 
     /// Sparse physical memory: every address reads as zero until written.
-    #[derive(Debug, Default)]
+    /// Comparable, so a test can check that nothing changed.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
     pub struct FakePhysicalMemory {
         words: BTreeMap<u64, u64>,
     }

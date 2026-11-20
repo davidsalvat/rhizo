@@ -12,17 +12,20 @@ extern crate alloc;
 mod files;
 mod poll;
 mod sockets;
+mod threads;
 
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
 use rhizo_cell::space::{self, Frames};
-use rhizo_cell::{Cell, MMAP_BASE, STACK_PAGES, STACK_TOP};
+use rhizo_cell::threads::Wait;
+use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_PAGES, STACK_TOP, USER_END};
 use rhizo_hal::{Console, PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
 
 /// Linux `errno` values used here.
 pub mod errno {
+    pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
     pub const EBADF: i64 = 9;
     pub const EAGAIN: i64 = 11;
@@ -44,6 +47,7 @@ pub mod errno {
     pub const ENOBUFS: i64 = 105;
     pub const ENOTCONN: i64 = 107;
     pub const EINPROGRESS: i64 = 115;
+    pub const ETIMEDOUT: i64 = 110;
 }
 use errno::*;
 
@@ -153,6 +157,8 @@ enum Sys {
     Shutdown,
     Sendmsg,
     Recvmsg,
+    Clone,
+    Clone3,
 }
 
 impl Arch {
@@ -254,13 +260,15 @@ impl Arch {
             (Arch::Aarch64, 210) | (Arch::X86_64, 48) => Shutdown,
             (Arch::Aarch64, 211) | (Arch::X86_64, 46) => Sendmsg,
             (Arch::Aarch64, 212) | (Arch::X86_64, 47) => Recvmsg,
+            (Arch::Aarch64, 220) | (Arch::X86_64, 56) => Clone,
+            (Arch::Aarch64, 435) | (Arch::X86_64, 435) => Clone3,
             _ => return None,
         })
     }
 
     /// (number, arguments) from the saved registers.
     fn call(self, cell: &Cell) -> (u64, [u64; 6]) {
-        let r = &cell.regs.gpr;
+        let r = &cell.regs().gpr;
         match self {
             Arch::Aarch64 => (r[8], [r[0], r[1], r[2], r[3], r[4], r[5]]),
             // gpr order: rax rbx rcx rdx rsi rdi rbp r8 r9 r10 ...
@@ -297,27 +305,33 @@ pub trait Services: Console {
     fn realtime_ns(&mut self) -> u64;
     /// Fills `out` with random bytes.
     fn random(&mut self, out: &mut [u8]);
-    /// Whether the cell may store `bytes` more of kernel-held data (file
-    /// blocks) without eating into the memory the kernel keeps for itself.
+    /// Whether the cell may take `bytes` more memory (pages, or kernel-held
+    /// data such as file blocks, names and thread records) without eating
+    /// into the memory the kernel keeps for itself.
     fn can_store(&mut self, bytes: u64) -> bool;
+    /// Brings `fp`, the calling thread's FP/SIMD state, up to date when the
+    /// CPU's registers hold a newer copy (the kernel switches them lazily).
+    fn save_fp(&mut self, fp: &mut FpState) {
+        let _ = fp;
+    }
 }
 
 /// What the cell does after a system call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// Return to the cell (the result is in its registers).
+    /// Return to the calling thread (the result is in its registers).
     Resume,
-    /// Let other cells run first, then resume this one.
+    /// Let other cells run first, then resume the cell.
     Yield,
-    /// Resume the cell no earlier than this monotonic time (nanoseconds).
-    Sleep(u64),
+    /// The calling thread stopped: it waits (a sleep, a futex or
+    /// descriptors, recorded in the cell's thread table) or it exited.
+    /// Another thread of the cell runs, or the cell waits as its threads
+    /// say. A thread waiting on descriptors ([`Wait::Io`]) is back at its
+    /// system-call instruction: when it runs again, it makes the call again
+    /// (design D3 of `add-sockets-and-poll`).
+    Block,
     /// The cell exited with this status (0–255).
     Exit(i32),
-    /// The call must wait for a descriptor, until another cell's action
-    /// may have made it ready or, if given, this monotonic time
-    /// (nanoseconds). The cell's registers are back at the system-call
-    /// instruction: when it runs again, it makes the call again.
-    Block(Option<u64>),
 }
 
 pub use rhizo_cell::memory::NoPager;
@@ -333,9 +347,9 @@ pub struct Context<'a, F, M, T, A, S> {
     pub fs: &'a mut rhizo_fs::Fs,
     /// The sockets of every cell (spec `networking`).
     pub net: &'a mut rhizo_net::Net,
-    /// On entry, the deadline of the blocked call the cell makes again, if
-    /// any (it keeps its timeout); a call that blocks sets the deadline it
-    /// waits for ([`Outcome::Block`]).
+    /// On entry, the deadline of the blocked call the thread makes again,
+    /// if any (it keeps its timeout); a call that blocks on descriptors sets
+    /// the deadline it waits for ([`Wait::Io`]).
     pub deadline: Option<u64>,
     /// Brings in pages that are not mapped yet (lazy resume); [`NoPager`]
     /// otherwise.
@@ -364,8 +378,9 @@ impl<F: EntryFormat, M: PhysicalMemory, T, A, S> Context<'_, F, M, T, A, S> {
 #[derive(Debug)]
 pub struct Abi {
     arch: Arch,
-    /// Unimplemented call numbers already reported (one bit each, < 1024,
-    /// beyond every Linux call number; larger values are reported each time).
+    /// Unimplemented call numbers already reported: one bit each below 1023
+    /// (beyond every Linux call number), and bit 1023 for all larger ones,
+    /// so no cell can make the kernel print without end.
     reported: [u64; 16],
 }
 
@@ -409,11 +424,24 @@ impl Abi {
     {
         let (nr, a) = self.arch.call(cell);
         let result = match self.arch.decode(nr) {
+            // One thread of several: only it ends.
+            Some(Sys::Exit) if cell.threads.len() > 1 => {
+                threads::exit_thread(cell, cx);
+                return Outcome::Block;
+            }
             Some(Sys::Exit | Sys::ExitGroup) => {
                 let status = (a[0] & 0xff) as i32;
                 cell.exit_status = Some(status);
                 return Outcome::Exit(status);
             }
+            Some(Sys::Clone) => {
+                let args = threads::clone_args(a, self.arch == Arch::X86_64);
+                threads::clone(cell, cx, args)
+            }
+            Some(Sys::Clone3) => match threads::clone3_args(cx, a[0], a[1]) {
+                Ok(args) => threads::clone(cell, cx, args),
+                Err(e) => e,
+            },
             Some(Sys::Write) => files::write(cx, a[0], a[1], a[2], None),
             Some(Sys::Writev) => writev(cx, a[0], a[1], a[2], false),
             Some(Sys::Readv) => writev(cx, a[0], a[1], a[2], true),
@@ -455,7 +483,13 @@ impl Abi {
             Some(Sys::Brk) => brk(cell, cx, a[0]),
             Some(Sys::Mmap) => mmap(cell, cx, a),
             Some(Sys::Munmap) => munmap(cx, a[0], a[1]),
-            Some(Sys::Getpid | Sys::Gettid | Sys::SetTidAddress) => cell.id as i64,
+            Some(Sys::Getpid) => cell.id as i64,
+            Some(Sys::Gettid) => cell.threads.current().tid as i64,
+            Some(Sys::SetTidAddress) => {
+                let thread = cell.threads.current_mut();
+                thread.clear_tid = a[0];
+                thread.tid as i64
+            }
             Some(Sys::Uname) => uname(cx, self.arch, a[0]),
             Some(Sys::ClockGettime) => clock_gettime(cx, a[0], a[1]),
             Some(Sys::Getrandom) => getrandom(cx, a[0], a[1]),
@@ -464,8 +498,9 @@ impl Abi {
             Some(Sys::RtSigprocmask) => zero_out(cx, a[2], a[3].min(128)),
             Some(Sys::Ioctl) => -ENOTTY,
             Some(Sys::ArchPrctl) => arch_prctl(cell, cx, a[0], a[1]),
-            Some(Sys::Mprotect) => mprotect(cx, a[0], a[1], a[2]),
-            // No threads: the robust futex list is never walked.
+            Some(Sys::Mprotect) => mprotect(cell, cx, a[0], a[1], a[2]),
+            // Robust futex lists are never walked (no thread dies holding a
+            // lock without its cell ending too: there are no signals).
             Some(Sys::SetRobustList) => 0,
             // Declined on purpose (as on Linux built without it): libc falls
             // back, so it is not reported as missing.
@@ -477,7 +512,10 @@ impl Abi {
             // Cells run as root of their own world: uid, gid 0; no parent.
             Some(Sys::Ids | Sys::Getppid) => 0,
             Some(Sys::Sigaltstack | Sys::Madvise) => 0,
-            Some(Sys::Futex) => futex(a[1]),
+            Some(Sys::Futex) => match threads::futex(cell, cx, a) {
+                Some(result) => result,
+                None => return Outcome::Block,
+            },
             Some(Sys::Fstat) => files::fstat(cx, self.arch, a[0], a[1]),
             Some(Sys::Newfstatat) => files::newfstatat(cx, self.arch, a[0], a[1], a[2], a[3]),
             Some(Sys::Stat | Sys::Lstat) => {
@@ -520,14 +558,11 @@ impl Abi {
             Some(Sys::Faccessat2) => files::faccessat(cx, a[0], a[1], a[2]),
             Some(Sys::Access) => files::faccessat(cx, AT_FDCWD, a[0], a[1]),
             Some(Sys::SchedYield) => {
-                cell.regs.gpr[0] = 0;
+                cell.regs_mut().gpr[0] = 0;
                 return Outcome::Yield;
             }
             Some(Sys::Nanosleep) => match sleep_until(cx, 1, 0, a[0]) {
-                Ok(until) => {
-                    cell.regs.gpr[0] = 0;
-                    return Outcome::Sleep(until);
-                }
+                Ok(until) => return sleep(cell, until),
                 Err(e) => e,
             },
             Some(sys @ (Sys::Select | Sys::Pselect6)) if a[0] != 0 => {
@@ -545,18 +580,12 @@ impl Abi {
             // `time.sleep` waits).
             Some(sys @ (Sys::Select | Sys::Pselect6)) => {
                 match select_sleep(cx, a[4], sys == Sys::Select) {
-                    Ok(until) => {
-                        cell.regs.gpr[0] = 0;
-                        return Outcome::Sleep(until);
-                    }
+                    Ok(until) => return sleep(cell, until),
                     Err(e) => e,
                 }
             }
             Some(Sys::ClockNanosleep) => match sleep_until(cx, a[0], a[1], a[2]) {
-                Ok(until) => {
-                    cell.regs.gpr[0] = 0;
-                    return Outcome::Sleep(until);
-                }
+                Ok(until) => return sleep(cell, until),
                 Err(e) => e,
             },
             None => {
@@ -571,23 +600,32 @@ impl Abi {
             }
         }
         if result == BLOCK {
-            cell.regs.pc -= self.arch.syscall_len();
-            return Outcome::Block(cx.deadline);
+            cell.regs_mut().pc -= self.arch.syscall_len();
+            cell.threads.block(Wait::Io { until: cx.deadline });
+            return Outcome::Block;
         }
         // The result goes in x0 / rax, which is gpr[0] on both.
-        cell.regs.gpr[0] = result as u64;
+        cell.regs_mut().gpr[0] = result as u64;
         Outcome::Resume
     }
 
     fn report_unimplemented(&mut self, cell: u32, nr: u64, out: &mut impl Services) {
-        if let Some(word) = self.reported.get_mut((nr / 64) as usize) {
-            if *word & (1 << (nr % 64)) != 0 {
-                return;
-            }
-            *word |= 1 << (nr % 64);
+        let bit = nr.min(1023);
+        let word = &mut self.reported[(bit / 64) as usize];
+        if *word & (1 << (bit % 64)) != 0 {
+            return;
         }
+        *word |= 1 << (bit % 64);
         out.log(format_args!("cell {cell}: unimplemented syscall {nr}"));
     }
+}
+
+/// The calling thread sleeps until monotonic time `until`; the call
+/// returns 0.
+fn sleep(cell: &mut Cell, until: u64) -> Outcome {
+    cell.regs_mut().gpr[0] = 0;
+    cell.threads.block(Wait::Sleep(until));
+    Outcome::Block
 }
 
 /// `writev`, or `readv` with `read`.
@@ -629,7 +667,7 @@ fn user_rw() -> PageFlags {
     PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE
 }
 
-fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
+fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     want: u64,
@@ -638,17 +676,19 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         return cell.brk as i64;
     }
     let (old_end, new_end) = (align_up(cell.brk, FRAME_SIZE), align_up(want, FRAME_SIZE));
+    // Memory that cannot be had is refused before any of it is zeroed.
     let ok = if new_end > old_end {
-        space::map_anonymous(
-            &cx.pt,
-            cx.mem,
-            cx.tlb,
-            cx.frames,
-            old_end,
-            new_end - old_end,
-            user_rw(),
-        )
-        .is_ok()
+        cx.services.can_store(new_end - old_end)
+            && space::map_anonymous(
+                &cx.pt,
+                cx.mem,
+                cx.tlb,
+                cx.frames,
+                old_end,
+                new_end - old_end,
+                user_rw(),
+            )
+            .is_ok()
     } else {
         space::unmap(
             &cx.pt,
@@ -666,7 +706,7 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     cell.brk as i64
 }
 
-fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
+fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     a: [u64; 6],
@@ -697,6 +737,9 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         return -ENOMEM;
     }
     if prot != 0 {
+        if !cx.services.can_store(len) {
+            return -ENOMEM; // refused before any of it is zeroed
+        }
         let mut pf = PageFlags::USER;
         if prot & PROT_WRITE != 0 {
             pf = pf | PageFlags::WRITABLE;
@@ -816,16 +859,7 @@ fn sleep_until<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     addr: u64,
 ) -> Result<u64, i64> {
     const TIMER_ABSTIME: u64 = 1;
-    let mut ts = [0u8; 16];
-    cx.read(addr, &mut ts).map_err(|_| -EFAULT)?;
-    let sec = i64::from_le_bytes(ts[..8].try_into().unwrap_or_default());
-    let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap_or_default());
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        return Err(-EINVAL);
-    }
-    let value = (sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(nsec as u64);
+    let value = timespec_ns(cx, addr)?;
     let now = cx.services.monotonic_ns();
     let realtime = match clock {
         0 => true,      // CLOCK_REALTIME
@@ -839,6 +873,24 @@ fn sleep_until<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     } else {
         value
     })
+}
+
+/// The `timespec` at `addr` in nanoseconds: `-EFAULT` if unmapped,
+/// `-EINVAL` if negative or with nanoseconds out of range.
+fn timespec_ns<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+) -> Result<u64, i64> {
+    let mut ts = [0u8; 16];
+    cx.read(addr, &mut ts).map_err(|_| -EFAULT)?;
+    let sec = i64::from_le_bytes(ts[..8].try_into().unwrap_or_default());
+    let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap_or_default());
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(-EINVAL);
+    }
+    Ok((sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64))
 }
 
 /// Deadline of a `select`/`pselect6` with no descriptors: its timeout is a
@@ -867,6 +919,7 @@ fn select_sleep<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 }
 
 fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
+    cell: &Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     addr: u64,
     len: u64,
@@ -882,23 +935,54 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     if prot == 0 {
         return -EINVAL; // inaccessible pages are not supported yet
     }
-    let Some(end) = addr.checked_add(len).map(|e| align_up(e, FRAME_SIZE)) else {
+    // Only the cell's own addresses (spec `isolation`): on x86_64 its table
+    // also holds the kernel half, whose pages must never become the cell's.
+    let Some(end) = addr
+        .checked_add(len)
+        .map(|e| align_up(e, FRAME_SIZE))
+        .filter(|&e| e <= USER_END)
+    else {
         return -ENOMEM;
     };
-    // Pages not in memory yet (lazy resume) are brought in first.
-    let mut at = addr;
-    while at < end {
-        if cx.pt.translate(cx.mem, at).is_none() {
-            cx.pager.page_in(&cx.pt, cx.mem, at, false);
-        }
-        at += FRAME_SIZE;
-    }
     let mut flags = PageFlags::USER;
     if prot & PROT_WRITE != 0 {
         flags = flags | PageFlags::WRITABLE;
     }
     if prot & PROT_EXEC == 0 {
         flags = flags | PageFlags::NO_EXECUTE;
+    }
+    // Pages not in memory yet (lazy resume) are brought in first; holes
+    // below the mapping cursor are reserved (`PROT_NONE`) addresses, backed
+    // now (spec `linux-abi`, reserved mappings; design D6 of `add-threads`).
+    // Any other missing page is the answer (`ENOMEM`). Each step is a page
+    // the cell has, or one more frame it gets (in batches, until memory runs
+    // out): a huge range of nothing costs one step (spec `isolation`).
+    // Batches end on a 2 MiB boundary, so large pages are used where they fit.
+    const BATCH: u64 = 64 * LARGE_PAGE_SIZE;
+    let reserved = MMAP_BASE..cell.mmap_next;
+    let present = |cx: &mut Context<'_, F, M, T, A, S>, at: u64| {
+        cx.pt.translate(cx.mem, at).is_some() || cx.pager.page_in(&cx.pt, cx.mem, at, false)
+    };
+    let mut at = addr;
+    while at < end {
+        if present(cx, at) {
+            at += FRAME_SIZE;
+            continue;
+        }
+        if !reserved.contains(&at) {
+            return -ENOMEM;
+        }
+        let hole = at;
+        let batch_end =
+            (hole.saturating_add(BATCH) & !(LARGE_PAGE_SIZE - 1)).max(hole + FRAME_SIZE);
+        let limit = end.min(cell.mmap_next).min(batch_end);
+        while at < limit && !present(cx, at) {
+            at += FRAME_SIZE;
+        }
+        if space::map_anonymous(&cx.pt, cx.mem, cx.tlb, cx.frames, hole, at - hole, flags).is_err()
+        {
+            return -ENOMEM;
+        }
     }
     match space::protect(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr, flags) {
         Ok(()) => 0,
@@ -948,15 +1032,6 @@ fn rlimit<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     put(cx, old, &out)
 }
 
-/// Cells have one thread: a wake wakes nobody, a wait would wait forever.
-fn futex(op: u64) -> i64 {
-    const FUTEX_WAKE: u64 = 1;
-    match op & 0x7f {
-        FUTEX_WAKE => 0,
-        _ => -EAGAIN,
-    }
-}
-
 fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
@@ -966,15 +1041,20 @@ fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
     match code {
+        // A kernel or non-canonical base would fault when loaded into the
+        // FS base, in the kernel (as on Linux: `EPERM`).
+        ARCH_SET_FS if addr >= USER_END => -EPERM,
         ARCH_SET_FS => {
-            cell.regs.tls = addr;
+            cell.regs_mut().tls = addr;
             0
         }
-        ARCH_GET_FS => put(cx, addr, &cell.regs.tls.to_le_bytes()),
+        ARCH_GET_FS => put(cx, addr, &cell.regs().tls.to_le_bytes()),
         _ => -EINVAL,
     }
 }
 
+#[cfg(test)]
+mod hostile;
 #[cfg(test)]
 mod net_tests;
 #[cfg(test)]

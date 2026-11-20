@@ -13,6 +13,8 @@
 - [x] 2.1 Kernel: one `Net`, waiting cells woken on its changes and deadlines, sockets released when a cell ends, forked (D4), suspended and resumed; verify `cargo xtask test --only ktest` on both architectures
 - [x] 2.2 Test cells: `libc_net` (C, differential against Linux), `loopback` (two cells over TCP), `netstate` (sockets across suspend and fork); in-kernel tests for every scenario of `networking`; verify `cargo xtask test` on both architectures
 
+- [x] 2.3 Copy-on-write of a 2 MiB page falls back to 4 KiB pages when no 2 MiB block is free (D8); verify `cargo test -p rhizo-mm` and the MicroPython in-kernel test on both architectures
+
 ## 3. Benchmarks and documentation
 
 - [x] 3.1 `cell.pipe_rtt_ns`, `cell.loopback_rtt_us` in `bench-cell` and `xtask/src/bench.rs`, described in `bench/README.md`; verify `cargo xtask bench --runs 1` locally

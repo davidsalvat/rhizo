@@ -34,3 +34,13 @@ frozen after its warm-up SHALL answer without warming up again.
 #### Scenario: Warm Python template
 - **WHEN** cells are forked from MicroPython frozen after it printed `warm`
 - **THEN** each prints only the answer and exits with 0
+
+### Requirement: Threaded libc programs
+A static glibc program that creates threads with `pthread_create`
+(default attributes, so glibc's own stacks and guard pages), synchronizes
+them with mutexes and condition variables, and joins them SHALL run as a
+cell and print what it prints on Linux.
+
+#### Scenario: Producers and consumers
+- **WHEN** `libc_threads` runs its producer, consumer and counter threads as a cell
+- **THEN** its output and exit status equal those of the same binary on Linux

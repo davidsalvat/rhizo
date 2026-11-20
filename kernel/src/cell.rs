@@ -1,6 +1,6 @@
 //! Running cells: spawn from static executables, schedule them on this CPU
 //! until they exit, fault or are killed, then return every frame (specs
-//! `cells`, `linux-abi` and `scheduling`).
+//! `cells`, `linux-abi`, `scheduling` and `threads`).
 
 use crate::arch::console::BootConsole;
 use crate::arch::cpu::CpuTlb;
@@ -13,10 +13,11 @@ use crate::sync::Global;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
-use rhizo_cell::Cell;
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
+use rhizo_cell::threads::Wait;
+use rhizo_cell::{Cell, FpState};
 use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::paging::{PageSize, PageTable};
@@ -195,12 +196,18 @@ impl Frames for KernelFrames {
     }
 }
 
+/// Most output kept for one cell when the host captures it (spec
+/// `isolation`): a cell printing without end cannot fill the kernel heap.
+const CAPTURE_MAX: usize = 1 << 20;
+
 /// Console output of a cell: echoed to the console and/or copied into
 /// `capture`.
 struct KernelServices<'a> {
     capture: Option<&'a mut Vec<u8>>,
     echo: bool,
     random: u64,
+    /// The calling thread's FP/SIMD state is in the CPU's registers.
+    fp_in_cpu: bool,
 }
 
 impl Console for KernelServices<'_> {
@@ -208,8 +215,13 @@ impl Console for KernelServices<'_> {
         if self.echo {
             BootConsole.write_bytes(bytes);
         }
+        // Captured output is kernel heap: bounded per cell, and never grown
+        // by an allocation that could fail (and panic); the rest is dropped.
         if let Some(capture) = self.capture.as_deref_mut() {
-            capture.extend_from_slice(bytes);
+            let n = bytes.len().min(CAPTURE_MAX.saturating_sub(capture.len()));
+            if capture.try_reserve(n).is_ok() {
+                capture.extend_from_slice(&bytes[..n]);
+            }
         }
     }
 }
@@ -231,6 +243,12 @@ impl Services for KernelServices<'_> {
 
     fn can_store(&mut self, bytes: u64) -> bool {
         memory::cells_may_take(bytes)
+    }
+
+    fn save_fp(&mut self, fp: &mut FpState) {
+        if self.fp_in_cpu {
+            user::fp_save(fp);
+        }
     }
 
     fn random(&mut self, out: &mut [u8]) {
@@ -256,6 +274,13 @@ fn now_ns() -> u64 {
     timer::cycles_to_ns(Counter.cycles()).unwrap_or(0)
 }
 
+/// Who owns the CPU's FP/SIMD registers: thread `tid` of cell `cell` (0:
+/// nobody; cell identifiers start at 1, and neither they nor thread
+/// identifiers are reused, so a key never names another thread).
+fn fp_key(cell: u32, tid: u32) -> u64 {
+    ((cell as u64) << 32) | tid as u64
+}
+
 /// A live cell and what the kernel keeps for it.
 #[derive(Debug)]
 struct Live {
@@ -273,9 +298,17 @@ struct Live {
     lazy: Option<Lazy>,
     /// Its files and open descriptors (spec `files`).
     fs: Fs,
-    /// Deadline of the blocked call it makes again when it runs (design D3
-    /// of `add-sockets-and-poll`).
-    deadline: Option<u64>,
+    /// Deadlines of its threads' calls waiting on descriptors, kept for
+    /// when they make them again (design D3 of `add-sockets-and-poll`).
+    deadlines: Vec<(u32, u64)>,
+}
+
+impl Live {
+    /// The deadline thread `tid`'s call keeps, if it waited with one.
+    fn take_deadline(&mut self, tid: u32) -> Option<u64> {
+        let i = self.deadlines.iter().position(|&(t, _)| t == tid)?;
+        Some(self.deadlines.swap_remove(i).1)
+    }
 }
 
 /// The snapshot of a lazily resumed cell and which of its pages are still
@@ -410,9 +443,10 @@ pub struct Host {
     /// Frozen cells and their files: never run, only forked (spec `fork`,
     /// templates).
     templates: Vec<(Cell, Fs)>,
-    /// Cell whose FP/SIMD state is in the registers (0: none). The kernel
-    /// never uses them, so they are saved only when another cell runs.
-    fp_owner: u32,
+    /// Thread whose FP/SIMD state is in the registers ([`fp_key`]). The
+    /// kernel never uses them, so they are saved only when another thread
+    /// uses them.
+    fp_owner: u64,
     /// [`Net::changes`] when waiting cells were last woken.
     net_seen: u64,
 }
@@ -472,6 +506,7 @@ impl Host {
             capture: None,
             echo: false,
             random: Counter.cycles() | 1,
+            fp_in_cpu: false,
         };
         let mut random = [0u8; 16];
         services.random(&mut random);
@@ -499,19 +534,55 @@ impl Host {
             random: services.random,
             lazy: None,
             fs: files,
-            deadline: None,
+            deadlines: Vec::new(),
         });
         Ok(id)
     }
 
-    /// Brings `live`'s FP/SIMD state up to date in its registers, if it is in
-    /// the CPU; with `leaving`, the CPU's copy stops belonging to it.
+    /// Brings the FP/SIMD state of `live`'s threads up to date in their
+    /// registers, if one of them has it in the CPU; with `leaving`, the
+    /// CPU's copy stops belonging to it.
     fn sync_fp(&mut self, live: &mut Live, leaving: bool) {
-        if self.fp_owner == live.cell.id {
-            user::fp_save(&mut live.cell.regs.fp);
+        if self.fp_owner >> 32 == live.cell.id as u64 {
+            if let Some(thread) = live.cell.threads.get_mut(self.fp_owner as u32) {
+                user::fp_save(&mut thread.regs.fp);
+            }
             if leaving {
                 self.fp_owner = 0;
             }
+        }
+    }
+
+    /// Saves the CPU's FP/SIMD registers into the thread that owns them,
+    /// which may be a thread of `running` (not in the scheduler while it
+    /// runs) or of a cell waiting its turn.
+    fn save_fp_owner(&mut self, running: &mut Live) {
+        let (cell, tid) = ((self.fp_owner >> 32) as u32, self.fp_owner as u32);
+        let owner = if cell == running.cell.id {
+            running.cell.threads.get_mut(tid)
+        } else {
+            self.sched
+                .find_mut(|l| l.cell.id == cell)
+                .and_then(|l| l.cell.threads.get_mut(tid))
+        };
+        if let Some(thread) = owner {
+            user::fp_save(&mut thread.regs.fp);
+        }
+    }
+
+    /// Puts `live` back in the scheduler: runnable if one of its threads can
+    /// run, else asleep until its earliest deadline, or parked for good
+    /// when none of its threads has one (design D2 of `add-threads`).
+    fn file(&mut self, live: Live) {
+        if live.cell.threads.is_runnable() {
+            self.sched.add(live);
+        } else if live.cell.threads.waits_on_io() {
+            // Woken by a socket change or its earliest deadline.
+            let wake = live.cell.threads.wake_at();
+            self.sched.wait(live, wake);
+        } else {
+            let wake = live.cell.threads.wake_at().unwrap_or(u64::MAX);
+            self.sched.sleep(live, wake);
         }
     }
 
@@ -531,20 +602,19 @@ impl Host {
         if !memory::cells_may_take(bytes) {
             return None;
         }
-        let (mut live, wake) = self.sched.remove_with_wake(|l| l.cell.id == id)?;
+        let mut live = self.sched.remove(|l| l.cell.id == id)?;
         let pt = PageTable::<Format>::from_root(live.cell.root);
         if let Some(lazy) = live.lazy.as_mut() {
             lazy.finish(&pt);
         }
         self.sync_fp(&mut live, true);
-        let remaining = wake.map_or(0, |w| w.saturating_sub(now_ns()).max(1));
         let (files, sockets) = export_sockets(&live.fs);
         let snapshot = Snapshot::capture::<Format>(
             user::MACHINE,
             &live.cell,
             &files,
             &sockets,
-            remaining,
+            now_ns(),
             &DirectMap,
         );
         self.end(live, Ending::Suspended);
@@ -576,8 +646,7 @@ impl Host {
         if user::CELL_ROOT_HAS_KERNEL_HALF {
             pt.share_upper_half(&mut DirectMap, &memory::kernel_tables());
         }
-        let cell = snapshot.cell(id, pt.root());
-        let sleep = snapshot.state().sleep_remaining_ns;
+        let cell = snapshot.cell(id, pt.root(), now_ns());
         let mut fs = files_of(&snapshot);
         import_sockets(&mut fs, &snapshot.sockets());
         let mut lazy = Lazy::new(snapshot);
@@ -594,12 +663,9 @@ impl Host {
             random: Counter.cycles() | 1,
             lazy: (lazy.left > 0).then_some(lazy),
             fs,
-            deadline: None,
+            deadlines: Vec::new(),
         };
-        match sleep {
-            0 => self.sched.add(live),
-            ns => self.sched.sleep(live, now_ns() + ns),
-        }
+        self.file(live);
         Ok(id)
     }
 
@@ -647,127 +713,148 @@ impl Host {
         Some(live.lazy.as_ref().map_or(0, |l| l.left))
     }
 
-    /// Runs cells until none is left or `stop` holds (checked whenever a cell
-    /// ends or gives up the CPU).
+    /// Runs cells until none is left that can ever run or `stop` holds
+    /// (checked whenever a cell ends or gives up the CPU).
     pub fn run(&mut self, mut stop: impl FnMut(&Self) -> bool) {
         while !stop(self) {
             self.wake_on_changes();
             let now = now_ns();
             let Some(live) = self.sched.next(now) else {
                 match self.sched.next_wake() {
+                    // Only parked cells are left: nothing will wake them.
+                    Some(u64::MAX) | None => return,
                     Some(wake) => idle_until(wake),
-                    None => return,
                 }
                 continue;
             };
-            self.run_slice(live);
+            self.run_slice(live, now);
         }
     }
 
-    /// Makes every waiting cell runnable if a socket changed since they
-    /// started waiting (design D3 of `add-sockets-and-poll`).
+    /// Makes every cell waiting on descriptors runnable if a socket
+    /// changed since they started waiting; their waiting threads make their
+    /// calls again (design D3 of `add-sockets-and-poll`).
     fn wake_on_changes(&mut self) {
         let changes = NET.with(|net| net.changes());
         if changes != self.net_seen {
             self.net_seen = changes;
-            self.sched.wake_waiting();
+            self.sched.wake_waiting(|live| {
+                live.cell.threads.wake_io();
+            });
         }
     }
 
-    /// Runs `live` until it ends, sleeps, yields or is preempted, and files it
-    /// accordingly.
-    fn run_slice(&mut self, mut live: Live) {
-        // FP/SIMD state moves only if this cell actually uses it (design D1).
-        user::fp_trap(self.fp_owner != live.cell.id);
+    /// Runs `live`'s threads until the cell ends, yields, has no thread that
+    /// can run, or is preempted, and files it accordingly.
+    fn run_slice(&mut self, mut live: Live, now: u64) {
+        if !live.cell.threads.next(now) {
+            self.file(live); // nothing due yet after all
+            return;
+        }
         let pt = PageTable::<Format>::from_root(live.cell.root);
         // Ticks seen in this slice: the first may have been pending since
         // before the cell was picked, so a cell is preempted at the second,
         // and always makes progress (design D4).
         let mut ticks = 0;
-        loop {
-            match user::enter_user(
-                live.cell.root,
-                live.tag,
-                core::mem::replace(&mut live.fresh, false),
-                &mut live.cell.regs,
-            ) {
-                Trap::Syscall => {
-                    let mut services = KernelServices {
-                        capture: live.output.as_mut(),
-                        echo: live.echo,
-                        random: live.random,
-                    };
-                    let (outcome, deadline) = NET.with(|net| {
-                        let mut cx = Context {
-                            pt,
-                            mem: &mut DirectMap,
-                            tlb: &mut CpuTlb,
-                            frames: &mut KernelFrames,
-                            services: &mut services,
-                            fs: &mut live.fs,
-                            net,
-                            deadline: live.deadline.take(),
-                            pager: &mut CellPager(&mut live.lazy),
+        // Each thread that runs in the slice (design D2 of `add-threads`).
+        'thread: loop {
+            let key = fp_key(live.cell.id, live.cell.threads.current().tid);
+            // FP/SIMD state moves only if this thread actually uses it
+            // (design D1).
+            user::fp_trap(self.fp_owner != key);
+            loop {
+                match user::enter_user(
+                    live.cell.root,
+                    live.tag,
+                    core::mem::replace(&mut live.fresh, false),
+                    live.cell.regs_mut(),
+                ) {
+                    Trap::Syscall => {
+                        let tid = live.cell.threads.current().tid;
+                        let deadline = live.take_deadline(tid);
+                        let mut services = KernelServices {
+                            capture: live.output.as_mut(),
+                            echo: live.echo,
+                            random: live.random,
+                            fp_in_cpu: self.fp_owner == key,
                         };
-                        (live.abi.handle(&mut live.cell, &mut cx), cx.deadline)
-                    });
-                    live.random = services.random;
-                    match outcome {
-                        Outcome::Resume => continue,
-                        Outcome::Yield => self.sched.add(live),
-                        Outcome::Sleep(until) => self.sched.sleep(live, until),
-                        Outcome::Block(until) => {
-                            live.deadline = deadline;
-                            self.sched.wait(live, until);
+                        let (outcome, deadline) = NET.with(|net| {
+                            let mut cx = Context {
+                                pt,
+                                mem: &mut DirectMap,
+                                tlb: &mut CpuTlb,
+                                frames: &mut KernelFrames,
+                                services: &mut services,
+                                fs: &mut live.fs,
+                                net,
+                                deadline,
+                                pager: &mut CellPager(&mut live.lazy),
+                            };
+                            (live.abi.handle(&mut live.cell, &mut cx), cx.deadline)
+                        });
+                        live.random = services.random;
+                        // A call waiting on descriptors keeps its deadline for
+                        // when it is made again (design D3 of
+                        // `add-sockets-and-poll`).
+                        if let Wait::Io { until: Some(_) } = live.cell.threads.current().wait
+                            && let Some(at) = deadline
+                        {
+                            live.deadlines.push((tid, at));
                         }
-                        Outcome::Exit(status) => self.end(live, Ending::Exit(status)),
+                        match outcome {
+                            Outcome::Resume => continue,
+                            Outcome::Yield => self.sched.add(live),
+                            // Another thread of the cell runs at once, in this
+                            // slice, without changing address space.
+                            Outcome::Block if live.cell.threads.next(now_ns()) => continue 'thread,
+                            Outcome::Block => self.file(live),
+                            Outcome::Exit(status) => self.end(live, Ending::Exit(status)),
+                        }
                     }
-                }
-                Trap::FpUnavailable => {
-                    let owner = self.fp_owner;
-                    if let Some(previous) = self.sched.find_mut(|l| l.cell.id == owner) {
-                        user::fp_save(&mut previous.cell.regs.fp);
-                    }
-                    user::fp_load(&live.cell.regs.fp);
-                    user::fp_trap(false);
-                    self.fp_owner = live.cell.id;
-                    continue;
-                }
-                Trap::Interrupt => {
-                    ticks += 1;
-                    if ticks < 2 {
+                    Trap::FpUnavailable => {
+                        self.save_fp_owner(&mut live);
+                        user::fp_load(&live.cell.regs().fp);
+                        user::fp_trap(false);
+                        self.fp_owner = key;
                         continue;
                     }
-                    self.sched.add(live);
-                }
-                Trap::Fault(fault)
-                    if fault.missing_page().is_some_and(|addr| {
-                        live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr))
-                    }) =>
-                {
-                    if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
-                        live.lazy = None; // fully restored: drop the snapshot
+                    Trap::Interrupt => {
+                        ticks += 1;
+                        if ticks < 2 {
+                            continue;
+                        }
+                        self.sched.add(live);
                     }
-                    continue;
+                    Trap::Fault(fault)
+                        if fault.missing_page().is_some_and(|addr| {
+                            live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr))
+                        }) =>
+                    {
+                        if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
+                            live.lazy = None; // fully restored: drop the snapshot
+                        }
+                        continue;
+                    }
+                    Trap::Fault(fault)
+                        if fault
+                            .write_denied()
+                            .is_some_and(|addr| resolve_write(&pt, addr)) =>
+                    {
+                        continue;
+                    }
+                    Trap::Fault(fault) => {
+                        let mut services = KernelServices {
+                            capture: live.output.as_mut(),
+                            echo: live.echo,
+                            random: 0,
+                            fp_in_cpu: false,
+                        };
+                        fault.report(&mut services, live.cell.id);
+                        self.end(live, Ending::Fault);
+                    }
                 }
-                Trap::Fault(fault)
-                    if fault
-                        .write_denied()
-                        .is_some_and(|addr| resolve_write(&pt, addr)) =>
-                {
-                    continue;
-                }
-                Trap::Fault(fault) => {
-                    let mut services = KernelServices {
-                        capture: live.output.as_mut(),
-                        echo: live.echo,
-                        random: 0,
-                    };
-                    fault.report(&mut services, live.cell.id);
-                    self.end(live, Ending::Fault);
-                }
+                return;
             }
-            return;
         }
     }
 
@@ -838,7 +925,7 @@ impl Host {
             cell: Cell {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 root: child.root(),
-                ..*cell
+                ..cell.clone()
             },
             tag: self.tags.alloc().unwrap_or(0),
             fresh: true,
@@ -848,7 +935,7 @@ impl Host {
             random: Counter.cycles() | 1,
             lazy: None,
             fs: fork_files(fs),
-            deadline: None,
+            deadlines: Vec::new(),
         })
     }
 
@@ -879,14 +966,17 @@ impl Host {
         true
     }
 
-    /// Starts a new cell from template `id`: a fork of the frozen cell.
+    /// Starts a new cell from template `id`: a fork of the frozen cell, with
+    /// every deadline of its threads expired (spec `fork`, templates keep no
+    /// time).
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
         let index = self.templates.iter().position(|(c, _)| c.id == id)?;
         let (cell, fs) = &self.templates[index];
-        let (cell, fs) = (*cell, fs.clone());
-        let child = self.child_of(&cell, &fs, capture, echo)?;
+        let (cell, fs) = (cell.clone(), fs.clone());
+        let mut child = self.child_of(&cell, &fs, capture, echo)?;
+        child.cell.threads.expire_timers();
         let child_id = child.cell.id;
-        self.sched.add(child);
+        self.file(child);
         Some(child_id)
     }
 
@@ -929,7 +1019,7 @@ impl Host {
     }
 
     fn end(&mut self, live: Live, ending: Ending) {
-        if self.fp_owner == live.cell.id {
+        if self.fp_owner >> 32 == live.cell.id as u64 {
             self.fp_owner = 0;
         }
         user::release_user(live.cell.root, live.tag);
@@ -1063,6 +1153,11 @@ pub fn bench(console: &mut impl Console) {
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
         "rhizo-density idle_bytes={idle} suspended_bytes={suspended}"
+    );
+    let (create, wake) = threads();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-threads create_ns={create} futex_wake_ns={wake}"
     );
     let (write_read, fork_files) = files();
     let _ = writeln!(
@@ -1290,6 +1385,32 @@ fn density() -> (u64, u64) {
     }
     let suspended = host.suspend(id).map_or(0, |s| s.as_bytes().len() as u64);
     (idle, suspended)
+}
+
+/// What the `threads` cell measures in its `bench` mode (design D10 of
+/// `add-threads`): creating and joining a thread, and one futex hand-off
+/// between two threads.
+#[cfg(feature = "bench-cell")]
+fn threads() -> (u64, u64) {
+    let mut host = Host::new();
+    let id = host
+        .spawn(test_image("threads"), &[b"threads", b"bench"], true, false)
+        .expect("spawn threads");
+    host.run(|h| h.finished(id).is_some());
+    let done = host.finished(id).expect("ended");
+    assert_eq!(
+        done.ending,
+        Ending::Exit(0),
+        "the threads cell exits with 0"
+    );
+    let text = core::str::from_utf8(&done.output).unwrap_or("");
+    let field = |key: &str| -> u64 {
+        text.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (field("create_ns"), field("futex_wake_ns"))
 }
 
 /// Rounds of a repeated measure (design D4 of `add-cell-files`).
