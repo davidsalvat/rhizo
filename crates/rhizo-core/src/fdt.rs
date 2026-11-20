@@ -275,6 +275,20 @@ impl<'a> Fdt<'a> {
         self.find_compatible_reg(compatible, 0)
     }
 
+    /// Calls `f` with the first `reg` region of every node whose
+    /// `compatible` list contains `compatible` (for example every
+    /// `virtio,mmio` transport).
+    pub fn for_each_compatible(
+        &self,
+        compatible: &[u8],
+        mut f: impl FnMut(Region),
+    ) -> Result<(), FdtError> {
+        self.compatible_regs(compatible, 0, |r| {
+            f(r);
+            true
+        })
+    }
+
     /// Region `index` of the `reg` property of the first node whose
     /// `compatible` list contains `compatible` (for example the GICv3
     /// distributor, 0, and redistributors, 1).
@@ -283,10 +297,25 @@ impl<'a> Fdt<'a> {
         compatible: &[u8],
         index: usize,
     ) -> Result<Option<Region>, FdtError> {
+        let mut found = None;
+        self.compatible_regs(compatible, index, |r| {
+            found = Some(r);
+            false
+        })?;
+        Ok(found)
+    }
+
+    /// Region `index` of the `reg` of each node whose `compatible` list
+    /// contains `compatible`, handed to `f` until it returns `false`.
+    fn compatible_regs(
+        &self,
+        compatible: &[u8],
+        index: usize,
+        mut f: impl FnMut(Region) -> bool,
+    ) -> Result<(), FdtError> {
         let mut cells = [DEFAULT_CELLS; MAX_DEPTH + 1];
         let mut matches = [false; MAX_DEPTH + 1];
         let mut regs: [Option<&'a [u8]>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
-        let mut found = None;
         self.walk(|event| {
             match event {
                 Event::Begin { depth, .. } => {
@@ -311,14 +340,16 @@ impl<'a> Fdt<'a> {
                         && let Some(reg) = regs[node]
                     {
                         let parent = cells[depth];
-                        found = nth_reg(reg, parent.address, parent.size, index);
-                        return false;
+                        if let Some(region) = nth_reg(reg, parent.address, parent.size, index)
+                            && !f(region)
+                        {
+                            return false;
+                        }
                     }
                 }
             }
             true
-        })?;
-        Ok(found)
+        })
     }
 }
 
@@ -333,6 +364,20 @@ mod tests {
     /// Same, with `-M virt,gic-version=3` (the GIC of Firecracker and Cloud
     /// Hypervisor too).
     const QEMU_VIRT_GICV3: &[u8] = include_bytes!("../fixtures/qemu-virt-gicv3.dtb");
+
+    #[test]
+    fn lists_every_virtio_mmio_transport() {
+        let dt = Fdt::new(QEMU_VIRT).unwrap();
+        let mut found = Vec::new();
+        dt.for_each_compatible(b"virtio,mmio", |r| found.push(r))
+            .unwrap();
+        assert_eq!(found.len(), 32);
+        assert!(found.iter().all(|r| r.size == 0x200));
+        assert!(found.contains(&Region {
+            base: 0x0a00_0000,
+            size: 0x200
+        }));
+    }
 
     #[test]
     fn finds_both_gicv3_regions() {

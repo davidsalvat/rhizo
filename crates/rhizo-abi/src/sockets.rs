@@ -315,7 +315,7 @@ pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     }
 }
 
-pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     addr: u64,
@@ -330,16 +330,36 @@ pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A, S>(
                 Addr::Unix { name, path }
             }
         };
-        cx.net.connect(h, &to).map_err(net_err)?;
+        let nonblocking = cx.fs.nonblocking(fd as u32).unwrap_or(false);
+        match cx.net.connect(h, &to) {
+            Ok(()) => {}
+            // Through the network card the handshake takes time: a blocking
+            // call waits and is made again until it reports the connection
+            // (design D2 of `add-virtio-net`).
+            Err(e @ (NetError::InProgress | NetError::Again)) if nonblocking => {
+                return Err(if e == NetError::Again {
+                    -EALREADY
+                } else {
+                    -EINPROGRESS
+                });
+            }
+            Err(NetError::InProgress | NetError::Again) => {
+                return Ok(block(cx, None).unwrap_or(-ETIMEDOUT));
+            }
+            Err(e) => return Err(net_err(e)),
+        }
         // Over loopback the connection is made at once; Linux still answers
-        // a non-blocking TCP connect with `EINPROGRESS` (design D6).
-        let pending = family == Family::Inet
-            && ty == Type::Stream
-            && cx.fs.nonblocking(fd as u32).unwrap_or(false);
+        // a non-blocking TCP connect with `EINPROGRESS` (design D6 of
+        // `add-sockets-and-poll`).
+        let loopback = matches!(to, Addr::Inet { ip, .. } if ip[0] == 127 || ip == rhizo_net::ANY);
+        let pending = loopback && family == Family::Inet && ty == Type::Stream && nonblocking;
         Ok(if pending { -EINPROGRESS } else { 0 })
     };
     run(cx).unwrap_or_else(|e| e)
 }
+
+const EALREADY: i64 = 114;
+const ETIMEDOUT: i64 = 110;
 
 /// `write` on a socket, and `send`/`sendto` without a destination.
 pub(crate) fn send<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(

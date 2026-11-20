@@ -377,6 +377,7 @@ fn measure_cells(
         echo: false,
         accel: opts.accel,
         gdb: false,
+        network: true,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -395,6 +396,7 @@ fn measure_cells(
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
         let (mut pipe_rtt, mut loopback_rtt) = (Vec::new(), Vec::new());
+        let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
@@ -444,6 +446,11 @@ fn measure_cells(
                         pipe_rtt.push(p as f64);
                         loopback_rtt.push(l as f64 / 1000.0);
                     }
+                    match parse_wire_line(&out.output) {
+                        Some(Ok(rtt)) => wire_rtt.push(rtt as f64 / 1000.0),
+                        Some(Err(why)) => wire_skipped = Some(why),
+                        None => {}
+                    }
                     if let Some((c, w)) = parse_threads_line(&out.output) {
                         thread_create.push(c as f64 / 1000.0);
                         futex_wake.push(w as f64);
@@ -487,6 +494,7 @@ fn measure_cells(
             ("cell.fork_with_files_us", "us", &mut fork_files),
             ("cell.pipe_rtt_ns", "ns", &mut pipe_rtt),
             ("cell.loopback_rtt_us", "us", &mut loopback_rtt),
+            ("net.tcp_rtt_us", "us", &mut wire_rtt),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
             ("workload.cpython_cold_us", "us", &mut cpy_cold),
@@ -494,6 +502,15 @@ fn measure_cells(
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
         ] {
+            if values.is_empty() && name == "net.tcp_rtt_us" {
+                let why = match crate::hostnet::for_vmm(vmm) {
+                    crate::hostnet::Network::None(why) => why,
+                    _ => wire_skipped
+                        .clone()
+                        .unwrap_or_else(|| "not measured".into()),
+                };
+                skipped.push((format!("{name}/{}", vmm.id()), why));
+            }
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
                 metrics.push(Metric {
@@ -569,6 +586,17 @@ fn parse_density_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("idle_bytes")?, field("suspended_bytes")?))
+}
+
+/// The network card line of a `bench-cell` kernel: the round trip to the
+/// host's echo server in nanoseconds, or why it was not measured.
+fn parse_wire_line(output: &str) -> Option<std::result::Result<u64, String>> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-wire "))?;
+    if let Some(why) = line.strip_prefix("rhizo-wire skipped: ") {
+        return Some(Err(why.trim().to_string()));
+    }
+    let value = line.strip_prefix("rhizo-wire tcp_rtt_ns=")?;
+    Some(value.trim().parse().map_err(|_| line.to_string()))
 }
 
 /// `(pipe_rtt_ns, loopback_rtt_ns)` of the network line of a `bench-cell`
@@ -754,6 +782,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         echo: false,
         accel,
         gdb: false,
+        network: false,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),
@@ -1659,6 +1688,19 @@ mod tests {
             Some((120_000, 1500))
         );
         assert_eq!(parse_files_line("rhizo-files write_read_ns=1\n"), None);
+    }
+
+    #[test]
+    fn wire_line_is_parsed() {
+        assert_eq!(
+            parse_wire_line("rhizo-wire tcp_rtt_ns=52000\n"),
+            Some(Ok(52_000))
+        );
+        assert_eq!(
+            parse_wire_line("rhizo-wire skipped: no card\n"),
+            Some(Err("no card".into()))
+        );
+        assert_eq!(parse_wire_line("nothing\n"), None);
     }
 
     #[test]

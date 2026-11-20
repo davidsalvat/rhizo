@@ -9,8 +9,14 @@ rust-version.workspace = true
 # Not published to crates.io (workspace path dependencies only).
 publish = false
 
+[dependencies]
+rhizo-hal = { path = "../rhizo-hal" }
+# TCP/IP for the network card (design D2 of add-virtio-net): 0BSD.
+smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4"] }
+
 [dev-dependencies]
 proptest = "1"
+rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
 
 [lints]
 workspace = true
