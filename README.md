@@ -65,6 +65,13 @@ again:
   instead of from the executable.
 - **Threads.** `pthread_create`, mutexes, condition variables and futexes;
   snapshots, forks and templates carry every thread.
+- **Network.** Pipes, `poll`/`select`/`epoll`, Unix and TCP/UDP sockets
+  between cells, and a virtio-net card (smoltcp) to reach the outside;
+  established connections are reset on suspend, resume and fork, as CRIU
+  does by default.
+- **CPython.** Unmodified CPython 3.13 (static) runs as a cell, its standard
+  library in the cell's own files; a template frozen after its imports
+  answers each request without starting the interpreter again.
 - **Isolation, reviewed.** An adversarial review of the cell boundary, with
   hostile cells and property tests that keep it fixed:
   [`docs/security.md`](docs/security.md) lists the threat model, the
@@ -199,7 +206,7 @@ Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H14, from the boot and test harness to threads inside a cell, including the gVisor and fair comparisons and an adversarial security review. Next: sockets and network, CPython in a cell, multi-core, and a dedicated benchmark machine." width="800">
+    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H16, from the boot and test harness to CPython in a cell, including the gVisor and fair comparisons, an adversarial security review, threads, and sockets with a network card. Next: multi-core and a dedicated benchmark machine." width="800">
   </picture>
 </p>
 

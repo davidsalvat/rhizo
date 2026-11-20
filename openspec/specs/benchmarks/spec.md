@@ -179,3 +179,34 @@ that measures cells.
 #### Scenario: Metrics present
 - **WHEN** `cargo xtask bench` runs on a VMM where the counter frequency is known
 - **THEN** the results contain `cell.thread_create_us` and `cell.futex_wake_ns`
+
+### Requirement: Network metrics
+`cargo xtask bench` SHALL report `cell.pipe_rtt_ns`, the time for a cell to
+write one byte into a pipe and read it back, and `cell.loopback_rtt_us`, the
+round-trip time of a 64-byte message between two cells over TCP on
+127.0.0.1, as robust cell figures.
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench` runs a `bench-cell` kernel where the counter frequency is known
+- **THEN** the results contain `cell.pipe_rtt_ns` and `cell.loopback_rtt_us`
+
+### Requirement: CPython workload metrics
+Where CPython is built, `cargo xtask bench` SHALL report the time for a
+CPython cell to answer one agent request started cold from its executable
+(`workload.cpython_cold_us`: interpreter start, imports, warm-up and
+answer) and forked from a template frozen after the warm-up
+(`workload.cpython_warm_us`), for every VMM that measures cells.
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench` runs with CPython built
+- **THEN** the results contain `workload.cpython_cold_us` and `workload.cpython_warm_us` for guest `rhizo`
+
+### Requirement: Network card metric
+Where the VMM gives the kernel a network card and a host echo server,
+`cargo xtask bench` SHALL report `net.tcp_rtt_us`, the round-trip time of a
+64-byte message between a cell and a TCP echo server on the host; elsewhere
+it SHALL report the metric as skipped with the reason.
+
+#### Scenario: Metric present
+- **WHEN** `cargo xtask bench` runs on QEMU `microvm` with KVM
+- **THEN** the results contain `net.tcp_rtt_us/rhizo/qemu-microvm`

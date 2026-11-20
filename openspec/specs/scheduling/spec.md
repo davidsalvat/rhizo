@@ -64,3 +64,13 @@ killed, suspended or forked.
 #### Scenario: Waiting threads
 - **WHEN** a cell's threads all wait on futexes without timeout while another cell runs
 - **THEN** the other cell completes, the waiting cell stays live without running, and it can be killed
+
+### Requirement: Waiting on descriptors
+A cell whose system call must wait for a descriptor SHALL leave the run queue
+until another cell's action may have made it ready or its deadline passes;
+it then runs again and its call completes or waits again. The scheduler SHALL
+receive the time from its caller, never read a clock.
+
+#### Scenario: Deadline
+- **WHEN** a cell waits with a deadline and nothing happens
+- **THEN** it becomes runnable once the time passed to the scheduler reaches the deadline, not before
