@@ -171,7 +171,9 @@
       "laptop.idle_host_cpu_pct",
       "density.sched_p999_us",
       "density.wake_p999_us",
-      "density.syscall_p999_ns"
+      "density.syscall_p999_ns",
+      "density.sched_p99_us",
+      "density.wake_p99_us"
     ]
   }
 }

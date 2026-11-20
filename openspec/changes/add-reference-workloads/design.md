@@ -135,5 +135,6 @@ Firecracker and publishes the results like the benchmark job.
 when higher: the gate fails them when the baseline is more than the
 threshold above the value (by ratio, so +100 % allows halving). Metrics
 enter the `ci` baseline once two CI runs agree within the threshold; the
-tails (p99.9) and the host CPU stay ungated on shared runners, listed in
+tails (p99.9, and p99 while the load runs near saturation), the agent
+turns (bimodal) and the host CPU stay ungated on shared runners, listed in
 `ungated.ci` with the reason in `bench/README.md`.

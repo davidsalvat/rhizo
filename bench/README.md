@@ -128,8 +128,12 @@ listed under `ungated.ci`: `workload.agent_turn_us` and
 `laptop.resume_turn_us` (bimodal: about 0.3 ms, or 1 s when the answer
 arrives after the guest stopped polling its card and only smoltcp's
 retransmission timer wakes it), `laptop.idle_host_cpu_pct` (the host's
-own load on a shared runner), and the p99.9 latencies (`*_p999_*`: a
-handful of samples per run).
+own load on a shared runner), the p99.9 latencies (`*_p999_*`: a
+handful of samples per run), and `density.sched_p99_us` and
+`density.wake_p99_us`: the server load runs close to saturation (every
+socket change wakes every cell waiting on a socket), so its tails moved
+up to 5x between runners of the same code. They are gated once that is
+fixed.
 
 The `rhizo-server-breakdown` line printed with the results says where the
 load's time went (idle, system calls, scheduling decisions, host
