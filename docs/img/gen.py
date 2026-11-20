@@ -312,13 +312,12 @@ def chart(t):
             ("gVisor sandbox", GV_RUN, us(GV_RUN), False)])] if GV_RUN else [])
     tiers = [("Same operation, same kind of VM: a cell against a Linux process", fair),
              ("Whole VMs and sandboxes: a larger scope, shown for scale", whole)]
-    groups = fair + whole
     x0, x1 = 200, 676
-    lo = -1
-    hi = math.ceil(math.log10(max(v for g in groups for _, v, _, _ in g[2])))
 
-    def X(v):
-        return x0 + (math.log10(v) - lo) / (hi - lo) * (x1 - x0)
+    def X(v, longest):
+        """Linear within a comparison: the longest bar spans the whole width,
+        so bar lengths keep the ratios the labels state."""
+        return x0 + max(3.0, v / longest * (x1 - x0))
 
     def gheight(g):
         return 30 + 32 * len(g[2]) + 18
@@ -326,25 +325,19 @@ def chart(t):
     top = 104
     tier_h = 44
     bottom = top + sum(tier_h + sum(gheight(g) for g in gs) for _, gs in tiers)
-    h = bottom + 108
+    h = bottom + 78
     s = Svg(t, h, "Measured on the same machine",
-            "Log-scale bar chart, lower is better. "
+            "Bar chart, lower is better, bars to scale within each comparison. "
             + " ".join(f"{name}. " + " ".join(
                 f"{g[0]}: " + ", ".join(f"{n} {lab}" for n, _, lab, _ in g[2]) + "."
                 for g in gs) for name, gs in tiers))
     s.text(24, 40, "Measured on the same machine", 20, weight=700)
-    s.text(24, 64, "Time per operation, log scale (each line is 10× the previous one); "
+    s.text(24, 64, "Time per operation; bars to scale within each comparison; "
            "lower is better", 14, fill=t["muted"])
     s.rect(24, 78, 14, 14, t["bar"], t["bar"], rx=3, sw=0)
     s.text(44, 90, "Rhizo", 14)
     s.rect(110, 78, 14, 14, t["other"], t["other"], rx=3, sw=0)
     s.text(130, 90, "Existing mechanism, or a cold start", 14)
-    names = ["0.1 µs", "1 µs", "10 µs", "100 µs", "1 ms", "10 ms", "100 ms", "1 s"]
-    ticks = [(10.0 ** e, names[e + 1]) for e in range(lo, hi + 1)]
-    s.line(x0, bottom, x1, bottom, color=t["boxline"], arrow=False, sw=1)
-    for v, lab in ticks:
-        s.line(X(v), bottom, X(v), bottom + 5, color=t["boxline"], arrow=False, sw=1)
-        s.text(X(v), bottom + 20, lab, 14, fill=t["muted"], anchor="middle")
     y = top
     for tier, gs in tiers:
         s.line(24, y + 14, 776, y + 14, color=t["boxline"], arrow=False, sw=1)
@@ -357,21 +350,19 @@ def chart(t):
                          t["muted"] if rt == "about the same" else t["accent"])
                 s.text(776, y + 22, rt, 15, fill=color, weight=700, anchor="end")
             by = y + 34
-            for v, _ in ticks:
-                s.line(X(v), by, X(v), by + 32 * len(bars), color=t["border"], arrow=False,
-                       sw=1)
+            longest = max(v for _, v, _, _ in bars)
             for name, v, lab, rh in bars:
                 c = t["bar"] if rh else t["other"]
                 s.text(x0 - 10, by + 17, name, 14, fill=t["text"] if rh else t["muted"],
                        anchor="end")
-                s.rect(x0, by + 3, round(X(v) - x0, 1), 20, c, c, rx=3, sw=0)
-                s.add(f'<text x="{X(v) + 8}" y="{by + 18}" font-size="14" fill="{t['text']}" '
+                s.rect(x0, by + 3, round(X(v, longest) - x0, 1), 20, c, c, rx=3, sw=0)
+                s.add(f'<text x="{X(v, longest) + 8}" y="{by + 18}" font-size="14" fill="{t['text']}" '
                       f'font-weight="{700 if rh else 400}" stroke="{t['bg']}" '
                       f'stroke-width="5" stroke-linejoin="round" paint-order="stroke">'
                       f'{lab}</text>')
                 by += 32
             y += gheight((title, rt, bars))
-    cy = bottom + 50
+    cy = bottom + 20
     s.text(24, cy, "GitHub-hosted runners with KVM (shared machines, nested virtualization). "
            "Rhizo and", 14, fill=t["muted"])
     s.text(24, cy + 19, "the Linux processes run inside Firecracker; CRIU runs on the host. "
