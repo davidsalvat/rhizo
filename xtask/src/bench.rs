@@ -421,6 +421,9 @@ fn measure_comparisons(
     Ok(())
 }
 
+/// Memory of the VM the cell metrics are measured in.
+const CELLS_MEMORY_MIB: u32 = 256;
+
 /// Cell metrics: a `bench-cell` kernel spawns and runs the hello cell many
 /// times per boot and prints medians; each VMM boots it a few times.
 fn measure_cells(
@@ -439,7 +442,10 @@ fn measure_cells(
         network: true,
         pci_card: false,
         cpus: 1,
-        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        // Room for the 50 MiB template and its fully written fork at once,
+        // next to the files the kernel now embeds (CPython's, the dynamic
+        // programs'): at 128 MiB the fork ran out of memory.
+        memory_mib: CELLS_MEMORY_MIB,
         bench: None,
     };
     let mut pt_frames = None;

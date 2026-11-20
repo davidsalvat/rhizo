@@ -197,3 +197,10 @@ request) is a product change, not this proof of concept's.
   connections to the model were still on the card (two heap allocations)
   when the next in-kernel test counted the heap. The agent's test now waits
   until the card holds no connection (`cell::wire_busy`) before it ends.
+- **The cell benchmarks ran out of memory.** Since the kernel embeds the
+  dynamic programs' files (`add-dynamic-linking`) next to CPython's, a
+  `bench-cell` kernel in 128 MiB had 106 MiB left: not enough for the
+  50 MiB template of `cell.fork_touch_us` and its fully written fork, so
+  the benchmark kernel panicked before printing any cell figure, on every
+  VMM, and the gate, which does not fail on missing metrics, passed. The
+  cell metrics are now measured in a 256 MiB VM.
