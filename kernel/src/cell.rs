@@ -918,12 +918,6 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-workload cold_ns={cold} warm_ns={warm}"
     );
-    if let Some((cold, warm)) = python() {
-        let _ = writeln!(
-            rhizo_hal::ConsoleWriter(console),
-            "rhizo-python cold_ns={cold} warm_ns={warm}"
-        );
-    }
     let (idle, suspended) = density();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -944,6 +938,15 @@ pub fn bench(console: &mut impl Console) {
         s[3],
         s[4]
     );
+    // Last: the interpreter leaves the heap and the frame allocator in a
+    // different state (a measured follow-up), and the figures above keep
+    // their conditions.
+    if let Some((cold, warm)) = python() {
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-python cold_ns={cold} warm_ns={warm}"
+        );
+    }
 }
 
 /// A real program (`libc_warm`, static glibc) answering one request: started
