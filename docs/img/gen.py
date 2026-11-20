@@ -18,11 +18,13 @@ OUT = Path(__file__).resolve().parent
 RESULTS = json.load(open(sys.argv[1]))
 
 
-def median(name, guest="rhizo", vmm="firecracker"):
+def median(name, guest="rhizo", vmm="firecracker", required=True):
     for m in RESULTS["metrics"]:
         if m["name"] == name and m["guest"] == guest and m["vmm"] == vmm:
             return m["median"]
-    raise SystemExit(f"{name}/{guest}/{vmm} is not in the results")
+    if required:
+        raise SystemExit(f"{name}/{guest}/{vmm} is not in the results")
+    return None
 
 
 def spread(name):
@@ -57,6 +59,10 @@ TEMPLATE = median("cell.spawn_from_template_us")
 FC_RESTORE = median("snapshot.restore_ms", "linux") * 1000
 LINUX_FORK = median("process.fork_us", "linux-process", "host")
 LINUX_SPAWN = median("process.spawn_us", "linux-process", "host")
+GV_RUN = median("sandbox.run_ms", "gvisor", "runsc", required=False)
+GV_RESTORE = median("snapshot.restore_ms", "gvisor", "runsc", required=False)
+GV_RUN = GV_RUN and GV_RUN * 1000
+GV_RESTORE = GV_RESTORE and GV_RESTORE * 1000
 PY_COLD = median("workload.python_cold_us")
 PY_WARM = median("workload.python_warm_us")
 IDLE_KB = median("cell.idle_bytes", vmm=None) / 1000
@@ -230,13 +236,15 @@ def chart(t):
     groups = [
         ("Resume a suspended environment", times(RESUME, FC_RESTORE),
          [("Rhizo cell", RESUME, us(RESUME), True),
-          ("Firecracker restore", FC_RESTORE, us(FC_RESTORE), False)]),
+          ("Firecracker restore", FC_RESTORE, us(FC_RESTORE), False)]
+         + ([("gVisor restore", GV_RESTORE, us(GV_RESTORE), False)] if GV_RESTORE else [])),
         ("Fork an environment holding 50 MiB", times(FORK, LINUX_FORK),
          [("Rhizo cell", FORK, us(FORK), True),
           ("Linux fork", LINUX_FORK, us(LINUX_FORK), False)]),
         ("Run hello, from start to exit", times(RUN, LINUX_SPAWN),
          [("Rhizo cell", RUN, us(RUN), True),
-          ("Linux posix_spawn", LINUX_SPAWN, us(LINUX_SPAWN), False)]),
+          ("Linux posix_spawn", LINUX_SPAWN, us(LINUX_SPAWN), False)]
+         + ([("gVisor sandbox", GV_RUN, us(GV_RUN), False)] if GV_RUN else [])),
         ("Answer a Python request (MicroPython)", times(PY_WARM, PY_COLD),
          [("Warm template", PY_WARM, us(PY_WARM), True),
           ("Cold interpreter", PY_COLD, us(PY_COLD), False)]),
@@ -244,7 +252,8 @@ def chart(t):
          [("Rhizo cell", TEMPLATE, us(TEMPLATE), True)]),
     ]
     x0, x1 = 200, 676
-    lo, hi = -1, 4
+    lo = -1
+    hi = math.ceil(math.log10(max(v for g in groups for _, v, _, _ in g[2])))
 
     def X(v):
         return x0 + (math.log10(v) - lo) / (hi - lo) * (x1 - x0)
@@ -265,8 +274,8 @@ def chart(t):
     s.text(44, 90, "Rhizo", 14)
     s.rect(110, 78, 14, 14, t["other"], t["other"], rx=3, sw=0)
     s.text(130, 90, "Existing mechanism, or a cold start", 14)
-    ticks = [(0.1, "0.1 µs"), (1, "1 µs"), (10, "10 µs"), (100, "100 µs"),
-             (1000, "1 ms"), (10000, "10 ms")]
+    names = ["0.1 µs", "1 µs", "10 µs", "100 µs", "1 ms", "10 ms", "100 ms", "1 s"]
+    ticks = [(10.0 ** e, names[e + 1]) for e in range(lo, hi + 1)]
     s.line(x0, bottom, x1, bottom, color=t["boxline"], arrow=False, sw=1)
     for v, lab in ticks:
         s.line(X(v), bottom, X(v), bottom + 5, color=t["boxline"], arrow=False, sw=1)
@@ -351,17 +360,19 @@ def roadmap(t):
         ("H8", "Files per cell", "carried by snapshots, forks and templates"),
         ("H9", "Memory accounting, density", f"1,000 idle cells, {IDLE_KB:.0f} KB each"),
         ("H10", "A real interpreter", "MicroPython as a cell, warm templates"),
-    ]
+    ] + ([("H11", "gVisor comparison", "userspace-kernel sandboxes, same machine")]
+         if GV_RUN else [])
     now = []
-    nxt = [("next", "gVisor comparison", ""),
-           ("next", "Dedicated benchmark machine", "")]
+    nxt = ([] if GV_RUN else [("next", "gVisor comparison", "")]) + \
+        [("next", "Dedicated benchmark machine", "")]
     rows = [(r, "done") for r in done] + [(r, "now") for r in now] + \
         [(r, "next") for r in nxt]
     rh, top = 34, 92
     h = top + rh * len(rows) + 20
     s = Svg(t, h, "Roadmap status",
-            f"Milestones H0 to H10 are done ({len(done)}). Next: a gVisor comparison "
-            "and a dedicated benchmark machine.")
+            f"{len(done)} milestones done, from the boot and test harness to "
+            f"{done[-1][1].lower()}. Next: "
+            + ", ".join(n for _, n, _ in nxt).lower() + ".")
     s.text(24, 40, f"Proof of concept: {len(done)} milestones done", 20, weight=700)
     # legend
     for lx, kind, lab in [(24, "done", "Done"), (110, "next", "Next")]:

@@ -342,6 +342,10 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
         }
+        match crate::compare::gvisor(&crate::build_cells()?, opts.runs.clamp(3, 5), &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("gvisor".into(), e)),
+        }
     }
     Ok(())
 }
@@ -1099,29 +1103,34 @@ pub fn comparison_table(results: &Results) -> String {
     };
     let cell = |name: &str| time(find(name, "rhizo", "firecracker"));
     let restore = time(find("snapshot.restore_ms", "linux", "firecracker"));
+    let gvisor_restore = time(find("snapshot.restore_ms", "gvisor", "runsc"));
     let rows = [
         (
             "Start a program and run it to its exit (`hello`)",
             cell("cell.run_us"),
             time(find("boot.time_to_ready_ms", "linux", "firecracker")),
+            time(find("sandbox.run_ms", "gvisor", "runsc")),
             time(find("process.spawn_us", "linux-process", "host")),
         ),
         (
             "Resume a suspended environment until it runs",
             cell("cell.resume_us"),
             restore.clone(),
+            gvisor_restore.clone(),
             "—".into(),
         ),
         (
             "Fork an environment holding 50 MiB",
             cell("cell.fork_us"),
             restore.clone(),
+            gvisor_restore.clone(),
             time(find("process.fork_us", "linux-process", "host")),
         ),
         (
             "Serve a request from a warm template",
             cell("workload.warm_us"),
             restore,
+            gvisor_restore,
             "—".into(),
         ),
     ];
@@ -1130,15 +1139,18 @@ pub fn comparison_table(results: &Results) -> String {
     }
     let mut s = String::from(
         "\n### Cells against existing mechanisms\n\n\
-         Same machine, same run. Rhizo runs inside Firecracker; the sandbox column is a \
+         Same machine, same run. Rhizo runs inside Firecracker. The microVM column is a \
          Linux guest in Firecracker (boot to its first output, or a snapshot restored \
          by a new Firecracker process until the VM runs: the way such sandboxes \
-         resume and clone); the last column is plain Linux processes on the host, which \
-         isolate far less.\n\n\
-         | Operation | Rhizo cell | Firecracker microVM | Linux process |\n|---|---:|---:|---:|\n",
+         resume and clone); the gVisor column is a gVisor sandbox on the host (the same \
+         static program in a new sandbox, or a checkpointed sandbox restored until it \
+         runs); the last column is plain Linux processes on the host, which isolate far \
+         less.\n\n\
+         | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox | Linux process |\n\
+         |---|---:|---:|---:|---:|\n",
     );
-    for (what, rhizo, firecracker, process) in rows {
-        s += &format!("| {what} | {rhizo} | {firecracker} | {process} |\n");
+    for (what, rhizo, firecracker, gvisor, process) in rows {
+        s += &format!("| {what} | {rhizo} | {firecracker} | {gvisor} | {process} |\n");
     }
     let (cold, warm) = (
         find("workload.python_cold_us", "rhizo", "firecracker"),
@@ -1207,17 +1219,20 @@ mod tests {
                 fork,
                 process,
                 metric("snapshot.restore_ms", "linux", Some("firecracker"), 12.5),
+                metric("snapshot.restore_ms", "gvisor", Some("runsc"), 120.0),
             ],
             skipped: Vec::new(),
         };
         let table = comparison_table(&results);
         assert!(
-            table.contains("| Fork an environment holding 50 MiB | 1.5 µs | 12.50 ms | 1.70 ms |"),
+            table.contains(
+                "| Fork an environment holding 50 MiB | 1.5 µs | 12.50 ms | 120.00 ms | 1.70 ms |"
+            ),
             "{table}"
         );
-        assert!(
-            table.contains("| Resume a suspended environment until it runs | — | 12.50 ms | — |")
-        );
+        assert!(table.contains(
+            "| Resume a suspended environment until it runs | — | 12.50 ms | 120.00 ms | — |"
+        ));
         let empty = Results {
             metrics: Vec::new(),
             ..results
