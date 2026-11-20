@@ -3,6 +3,7 @@
 
 use super::*;
 use rhizo_cell::testing::CountingFrames;
+use rhizo_cell::threads::Wait;
 use rhizo_hal::testing::{FakePhysicalMemory, RecordingConsole, RecordingTlb};
 use rhizo_mm::paging::{Aarch64, PageSize};
 
@@ -13,6 +14,8 @@ struct FakeServices {
     clock: u64,
     /// Bytes the cell may still store (`None`: unlimited).
     room: Option<u64>,
+    /// Word 0 of the FP/SIMD state "in the CPU" (`save_fp`), if any.
+    cpu_fp: Option<u64>,
 }
 
 impl Console for FakeServices {
@@ -42,6 +45,11 @@ impl Services for FakeServices {
                 true
             }
             Some(_) => false,
+        }
+    }
+    fn save_fp(&mut self, fp: &mut rhizo_cell::FpState) {
+        if let Some(word) = self.cpu_fp {
+            fp.0[0] = word;
         }
     }
 }
@@ -89,7 +97,7 @@ impl World {
 
     /// Calls `name` (AArch64 numbering unless the world is x86_64).
     fn call(&mut self, nr: u64, args: &[u64]) -> (i64, Outcome) {
-        let regs = &mut self.cell.regs.gpr;
+        let regs = &mut self.cell.regs_mut().gpr;
         match self.abi.arch {
             Arch::Aarch64 => {
                 regs[8] = nr;
@@ -112,7 +120,17 @@ impl World {
             pager: &mut NoPager,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
-        (self.cell.regs.gpr[0] as i64, out)
+        (self.cell.regs().gpr[0] as i64, out)
+    }
+
+    /// The deadline the current thread sleeps until, if it sleeps; it is
+    /// then made runnable again, as the kernel does at that time.
+    fn slept(&mut self) -> Option<u64> {
+        let thread = self.cell.threads.current_mut();
+        match core::mem::replace(&mut thread.wait, Wait::Ready) {
+            Wait::Sleep(until) => Some(until),
+            _ => None,
+        }
     }
 
     fn poke(&mut self, addr: u64, data: &[u8]) {
@@ -254,7 +272,7 @@ fn x86_64_numbers_and_registers() {
     assert_eq!(w.services.console.text(), "x86");
     assert_eq!(w.call(39, &[]).0, 5, "getpid");
     assert_eq!(w.call(158, &[0x1002, 0x7000]).0, 0, "arch_prctl(SET_FS)");
-    assert_eq!(w.cell.regs.tls, 0x7000);
+    assert_eq!(w.cell.regs().tls, 0x7000);
     assert_eq!(w.call(158, &[0x1003, DATA]).0, 0, "arch_prctl(GET_FS)");
     assert_eq!(w.peek(DATA, 8), 0x7000u64.to_le_bytes());
     assert_eq!(w.call(16, &[1, 0x5401, 0]).0, -ENOTTY, "ioctl");
@@ -299,13 +317,19 @@ fn yield_and_sleep_become_scheduling_outcomes() {
     w.poke(DATA, &ts(0, 20_000_000));
     assert_eq!(
         w.call(101, &[DATA, 0]),
-        (0, Outcome::Sleep(20_001_000)),
+        (0, Outcome::Block),
         "nanosleep 20 ms"
     );
+    assert_eq!(w.slept(), Some(20_001_000), "nanosleep 20 ms");
     w.poke(DATA, &ts(2, 0));
     assert_eq!(
         w.call(115, &[1, 1, DATA, 0]),
-        (0, Outcome::Sleep(2_000_000_000)),
+        (0, Outcome::Block),
+        "clock_nanosleep(MONOTONIC, TIMER_ABSTIME)"
+    );
+    assert_eq!(
+        w.slept(),
+        Some(2_000_000_000),
         "clock_nanosleep(MONOTONIC, TIMER_ABSTIME)"
     );
     // Realtime is monotonic + 1.7e18 in the fake: an absolute realtime
@@ -315,7 +339,8 @@ fn yield_and_sleep_become_scheduling_outcomes() {
         DATA,
         &ts(deadline / 1_000_000_000, deadline % 1_000_000_000),
     );
-    assert_eq!(w.call(115, &[0, 1, DATA, 0]).1, Outcome::Sleep(1_005));
+    assert_eq!(w.call(115, &[0, 1, DATA, 0]), (0, Outcome::Block));
+    assert_eq!(w.slept(), Some(1_005));
 
     w.poke(DATA, &ts(0, 1_000_000_000));
     assert_eq!(
@@ -595,16 +620,18 @@ fn select_without_descriptors_sleeps() {
     w.poke(DATA, &tv);
     assert_eq!(
         w.call(23, &[0, 0, 0, 0, DATA]),
-        (0, Outcome::Sleep(1_000_500)),
+        (0, Outcome::Block),
         "select"
     );
+    assert_eq!(w.slept(), Some(1_000_500), "select");
     let ts = [0i64.to_le_bytes(), 2000i64.to_le_bytes()].concat(); // 2 us
     w.poke(DATA, &ts);
     assert_eq!(
-        w.call(270, &[0, 0, 0, 0, DATA, 0]).1,
-        Outcome::Sleep(2_500),
+        w.call(270, &[0, 0, 0, 0, DATA, 0]),
+        (0, Outcome::Block),
         "pselect6"
     );
+    assert_eq!(w.slept(), Some(2_500), "pselect6");
     assert_eq!(w.call(23, &[1, DATA, 0, 0, DATA]).0, -ENOSYS, "descriptors");
     assert_eq!(w.call(23, &[0, 0, 0, 0, 0]).0, -EINVAL, "no timeout");
     w.poke(
@@ -619,8 +646,449 @@ fn select_without_descriptors_sleeps() {
     let mut a = World::new(Arch::Aarch64);
     a.poke(DATA, &ts);
     assert_eq!(
-        a.call(72, &[0, 0, 0, 0, DATA, 0]).1,
-        Outcome::Sleep(2_000),
+        a.call(72, &[0, 0, 0, 0, DATA, 0]),
+        (0, Outcome::Block),
         "aarch64 pselect6"
     );
+    assert_eq!(a.slept(), Some(2_000), "aarch64 pselect6");
+}
+
+// --- Threads (spec `threads`) ----------------------------------------------
+
+// AArch64 numbers.
+const CLONE: u64 = 220;
+const CLONE3: u64 = 435;
+const EXIT: u64 = 93;
+const FUTEX: u64 = 98;
+const GETTID: u64 = 178;
+const GETPID: u64 = 172;
+const SET_TID_ADDRESS: u64 = 96;
+const MPROTECT: u64 = 226;
+/// The flags glibc's `pthread_create` passes.
+const PTHREAD_FLAGS: u64 =
+    0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x10_0000 | 0x20_0000;
+const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
+const PRIVATE: u64 = 128;
+const CLOCK_REALTIME: u64 = 256;
+const EAGAIN_: i64 = 11;
+const ETIMEDOUT_: i64 = 110;
+
+impl World {
+    /// Makes thread `tid` the current one, as the kernel's scheduling would.
+    fn switch_to(&mut self, tid: u32) {
+        for _ in 0..self.cell.threads.len() {
+            if self.cell.threads.current().tid == tid {
+                return;
+            }
+            assert!(
+                self.cell.threads.next(self.services.clock),
+                "nothing can run"
+            );
+        }
+        assert_eq!(
+            self.cell.threads.current().tid,
+            tid,
+            "thread {tid} cannot run"
+        );
+    }
+
+    fn thread(&mut self, tid: u32) -> &rhizo_cell::threads::Thread {
+        self.cell.threads.get_mut(tid).expect("thread exists")
+    }
+}
+
+#[test]
+fn clone_creates_a_thread_like_pthread_create() {
+    let mut w = World::new(Arch::Aarch64);
+    w.cell.regs_mut().pc = 0x40_1234;
+    w.cell.regs_mut().gpr[19] = 0x1919;
+    w.cell.regs_mut().fp.0[5] = 55;
+    w.services.cpu_fp = Some(77); // the caller's FP state is in the CPU
+    let (ptid, ctid) = (DATA + 0x100, DATA + 0x104);
+    // AArch64: clone(flags, stack, parent_tid, tls, child_tid)
+    let (tid, out) = w.call(
+        CLONE,
+        &[
+            PTHREAD_FLAGS | CLONE_CHILD_SETTID,
+            0x60_0000,
+            ptid,
+            0x7777,
+            ctid,
+        ],
+    );
+    assert_eq!(
+        (tid, out),
+        (6, Outcome::Resume),
+        "the caller gets the new id"
+    );
+    assert_eq!(w.cell.threads.len(), 2);
+    assert_eq!(w.peek(ptid, 4), 6u32.to_le_bytes(), "CLONE_PARENT_SETTID");
+    assert_eq!(w.peek(ctid, 4), 6u32.to_le_bytes(), "CLONE_CHILD_SETTID");
+    let child = w.thread(6).clone();
+    assert_eq!(child.regs.gpr[0], 0, "the child sees 0");
+    assert_eq!((child.regs.sp, child.regs.tls), (0x60_0000, 0x7777));
+    assert_eq!((child.regs.pc, child.regs.gpr[19]), (0x40_1234, 0x1919));
+    assert_eq!(
+        (child.regs.fp.0[0], child.regs.fp.0[5]),
+        (77, 55),
+        "FP copied"
+    );
+    assert_eq!(child.clear_tid, ctid, "CLONE_CHILD_CLEARTID");
+    assert_eq!(w.cell.regs().tls, 0, "the caller keeps its thread pointer");
+
+    // x86_64: clone(flags, stack, parent_tid, child_tid, tls)
+    let mut x = World::new(Arch::X86_64);
+    assert_eq!(
+        x.call(56, &[PTHREAD_FLAGS, 0x60_0000, ptid, ctid, 0x8888])
+            .0,
+        6
+    );
+    let child = x.thread(6).clone();
+    assert_eq!((child.regs.tls, child.clear_tid), (0x8888, ctid));
+}
+
+#[test]
+fn clones_that_are_not_threads_are_refused() {
+    let mut w = World::new(Arch::Aarch64);
+    const SIGCHLD: u64 = 17;
+    // glibc's fork(): a new process.
+    assert_eq!(
+        w.call(CLONE, &[0x120_0000 | SIGCHLD, 0, 0, 0, 0]).0,
+        -ENOSYS
+    );
+    assert_eq!(
+        w.call(CLONE, &[0x100 | 0x800, 0, 0, 0, 0]).0,
+        -ENOSYS,
+        "no CLONE_THREAD"
+    );
+    assert_eq!(
+        w.call(CLONE, &[PTHREAD_FLAGS | 0x2000_0000, 0, 0, 0, 0]).0,
+        -EINVAL,
+        "CLONE_NEWUTS"
+    );
+    assert_eq!(w.cell.threads.len(), 1);
+    assert_eq!(w.services.log, "", "refusals are not missing calls");
+    w.services.room = Some(100);
+    assert_eq!(
+        w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]).0,
+        -EAGAIN_,
+        "no room"
+    );
+    assert_eq!(w.cell.threads.len(), 1);
+}
+
+#[test]
+fn clone3_reads_its_argument_block() {
+    let mut w = World::new(Arch::Aarch64);
+    let args = |flags: u64, stack: u64, size: u64, tls: u64, set_tid: u64| {
+        // flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+        // stack_size, tls, set_tid (glibc fills pidfd without CLONE_PIDFD)
+        [
+            flags,
+            DATA + 0x200,
+            DATA + 0x200,
+            DATA + 0x204,
+            0,
+            stack,
+            size,
+            tls,
+            set_tid,
+        ]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<u8>>()
+    };
+    w.poke(DATA, &args(PTHREAD_FLAGS, 0x50_0000, 0x1_0000, 0x99, 0));
+    assert_eq!(w.call(CLONE3, &[DATA, 64]).0, 6);
+    let child = w.thread(6).clone();
+    assert_eq!(child.regs.sp, 0x51_0000, "stack plus its size");
+    assert_eq!((child.regs.tls, child.clear_tid), (0x99, DATA + 0x200));
+    assert_eq!(w.peek(DATA + 0x204, 4), 6u32.to_le_bytes(), "parent_tid");
+
+    assert_eq!(
+        w.call(CLONE3, &[DATA, 63]).0,
+        -EINVAL,
+        "smaller than version 0"
+    );
+    assert_eq!(w.call(CLONE3, &[0xdead_0000, 64]).0, -EFAULT);
+    w.poke(DATA, &args(PTHREAD_FLAGS, 0x50_0000, 0x1_0000, 0, 1));
+    assert_eq!(
+        w.call(CLONE3, &[DATA, 72]).0,
+        -EINVAL,
+        "set_tid is not supported"
+    );
+    assert_eq!(
+        w.call(CLONE3, &[DATA, 64]).0,
+        7,
+        "ignored beyond the size given"
+    );
+    w.poke(DATA, &args(PTHREAD_FLAGS | 17, 0, 0, 0, 0));
+    assert_eq!(
+        w.call(CLONE3, &[DATA, 64]).0,
+        -EINVAL,
+        "a signal in the flags"
+    );
+    w.poke(DATA, &args(0x100_0000, 0, 0, 0, 0));
+    assert_eq!(w.call(CLONE3, &[DATA, 64]).0, -ENOSYS, "a process");
+    assert_eq!(w.cell.threads.len(), 3);
+}
+
+#[test]
+fn identifiers_per_thread() {
+    let mut w = World::new(Arch::Aarch64);
+    assert_eq!(
+        w.call(GETTID, &[]).0,
+        5,
+        "the first thread is the cell's id"
+    );
+    assert_eq!(w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]).0, 6);
+    w.switch_to(6);
+    assert_eq!(w.call(GETTID, &[]).0, 6);
+    assert_eq!(w.call(GETPID, &[]).0, 5, "one process id for all threads");
+    assert_eq!(w.call(SET_TID_ADDRESS, &[DATA + 8]).0, 6);
+    assert_eq!(w.thread(6).clear_tid, DATA + 8);
+    assert_eq!(w.thread(5).clear_tid, 0, "per thread");
+}
+
+#[test]
+fn thread_exit_clears_its_tid_and_wakes_the_joiner() {
+    let mut w = World::new(Arch::Aarch64);
+    let tid_word = DATA + 0x40;
+    w.poke(tid_word, &6u32.to_le_bytes());
+    assert_eq!(w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, tid_word]).0, 6);
+    // pthread_join: wait while the word holds the thread's id.
+    assert_eq!(
+        w.call(
+            FUTEX,
+            &[
+                tid_word,
+                FUTEX_WAIT_BITSET | CLOCK_REALTIME,
+                6,
+                0,
+                0,
+                u32::MAX as u64
+            ]
+        )
+        .1,
+        Outcome::Block
+    );
+    assert!(w.cell.threads.next(0));
+    assert_eq!(w.cell.threads.current().tid, 6);
+    assert_eq!(w.call(EXIT, &[9]).1, Outcome::Block, "only the thread ends");
+    assert_eq!(w.cell.threads.len(), 1);
+    assert_eq!(w.peek(tid_word, 4), [0; 4], "the tid word is cleared");
+    assert!(w.cell.threads.next(0), "the joiner was woken");
+    assert_eq!(w.cell.regs().gpr[0], 0, "its wait returns 0");
+    assert_eq!(w.call(EXIT, &[4]).1, Outcome::Exit(4), "the last thread");
+    assert_eq!(w.cell.exit_status, Some(4));
+
+    let mut w = World::new(Arch::Aarch64);
+    w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]);
+    assert_eq!(w.call(EXIT_GROUP, &[2]).1, Outcome::Exit(2), "every thread");
+}
+
+#[test]
+fn futex_waits_block_and_wakes_wake() {
+    let mut w = World::new(Arch::Aarch64);
+    let word = DATA + 0x80;
+    w.poke(word, &1u32.to_le_bytes());
+    assert_eq!(w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]).0, 6);
+    assert_eq!(
+        w.call(FUTEX, &[word, FUTEX_WAIT | PRIVATE, 0, 0]).0,
+        -EAGAIN_,
+        "changed"
+    );
+    assert_eq!(
+        w.call(FUTEX, &[word, FUTEX_WAIT | PRIVATE, 1, 0]).1,
+        Outcome::Block
+    );
+    assert_eq!(
+        w.cell.threads.current().wait,
+        Wait::Futex {
+            addr: word,
+            bitset: u32::MAX,
+            until: None
+        }
+    );
+    assert!(w.cell.threads.next(0));
+    assert_eq!(w.cell.threads.current().tid, 6);
+    assert_eq!(
+        w.call(FUTEX, &[word + 4, FUTEX_WAKE, 1]).0,
+        0,
+        "another word"
+    );
+    assert_eq!(w.call(FUTEX, &[word, FUTEX_WAKE | PRIVATE, 1]).0, 1);
+    assert_eq!(w.thread(5).wait, Wait::Ready);
+    assert_eq!(w.thread(5).regs.gpr[0], 0, "the wait returns 0");
+    assert_eq!(w.call(FUTEX, &[word, FUTEX_WAKE, 1]).0, 0, "nobody left");
+
+    // Bitsets: only intersecting waiters wake.
+    let mut w = World::new(Arch::Aarch64);
+    w.poke(word, &0u32.to_le_bytes());
+    for _ in 0..2 {
+        w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]);
+    }
+    for (tid, bits) in [(6, 1), (7, 2)] {
+        w.switch_to(tid);
+        assert_eq!(
+            w.call(FUTEX, &[word, FUTEX_WAIT_BITSET, 0, 0, 0, bits]).1,
+            Outcome::Block
+        );
+    }
+    w.switch_to(5);
+    assert_eq!(
+        w.call(FUTEX, &[word, FUTEX_WAKE_BITSET, i32::MAX as u64, 0, 0, 2])
+            .0,
+        1
+    );
+    assert_eq!(w.thread(7).wait, Wait::Ready);
+    assert_ne!(w.thread(6).wait, Wait::Ready);
+    assert_eq!(
+        w.call(FUTEX, &[word, FUTEX_WAKE, 0]).0,
+        1,
+        "asked for none, wakes one"
+    );
+}
+
+#[test]
+fn futex_timeouts_and_errors() {
+    let mut w = World::new(Arch::Aarch64);
+    w.services.clock = 1_000;
+    let word = DATA + 0x80;
+    let ts = DATA + 0x90;
+    w.poke(word, &3u32.to_le_bytes());
+    w.poke(
+        ts,
+        &[0i64.to_le_bytes(), 20_000_000i64.to_le_bytes()].concat(),
+    );
+    // FUTEX_WAIT: relative.
+    assert_eq!(w.call(FUTEX, &[word, FUTEX_WAIT, 3, ts]).1, Outcome::Block);
+    let until = |w: &World| match w.cell.threads.current().wait {
+        Wait::Futex { until, .. } => until,
+        _ => None,
+    };
+    assert_eq!(until(&w), Some(20_001_000));
+    assert!(!w.cell.threads.next(20_000_999), "not yet");
+    assert!(w.cell.threads.next(20_001_000));
+    assert_eq!(w.cell.regs().gpr[0] as i64, -ETIMEDOUT_);
+    // FUTEX_WAIT_BITSET: absolute, monotonic or real time.
+    w.poke(ts, &[1i64.to_le_bytes(), 0i64.to_le_bytes()].concat());
+    w.call(FUTEX, &[word, FUTEX_WAIT_BITSET, 3, ts, 0, 1]);
+    assert_eq!(until(&w), Some(1_000_000_000));
+    w.cell.threads.current_mut().wait = Wait::Ready;
+    let real = 1_700_000_000_000_000_000i64 + 1_000 + 7; // 7 ns from now
+    w.poke(
+        ts,
+        &[
+            (real / 1_000_000_000).to_le_bytes(),
+            (real % 1_000_000_000).to_le_bytes(),
+        ]
+        .concat(),
+    );
+    w.call(
+        FUTEX,
+        &[word, FUTEX_WAIT_BITSET | CLOCK_REALTIME, 3, ts, 0, 1],
+    );
+    assert_eq!(until(&w), Some(1_007));
+    w.cell.threads.current_mut().wait = Wait::Ready;
+    w.poke(ts, &[0i64.to_le_bytes(), 999i64.to_le_bytes()].concat());
+    assert_eq!(
+        w.call(FUTEX, &[word, FUTEX_WAIT_BITSET, 3, ts, 0, 1]).0,
+        -ETIMEDOUT_,
+        "a deadline already passed"
+    );
+    assert_eq!(
+        w.call(FUTEX, &[word, FUTEX_WAIT_BITSET, 4, ts, 0, 1]).0,
+        -EAGAIN_,
+        "value first"
+    );
+
+    for (args, err, what) in [
+        ([word + 2, FUTEX_WAIT, 3, 0, 0, 0], -EINVAL, "misaligned"),
+        (
+            [word + 2, FUTEX_WAKE, 1, 0, 0, 0],
+            -EINVAL,
+            "misaligned wake",
+        ),
+        (
+            [word, FUTEX_WAIT_BITSET, 3, 0, 0, 0],
+            -EINVAL,
+            "empty bitset",
+        ),
+        (
+            [word, FUTEX_WAKE_BITSET, 1, 0, 0, 0],
+            -EINVAL,
+            "empty wake bitset",
+        ),
+        (
+            [0xdead_0000, FUTEX_WAIT, 3, 0, 0, 0],
+            -EFAULT,
+            "unmapped word",
+        ),
+        (
+            [word, FUTEX_WAIT, 3, 0xdead_0000, 0, 0],
+            -EFAULT,
+            "unmapped timeout",
+        ),
+        (
+            [word, FUTEX_WAIT | CLOCK_REALTIME, 3, 0, 0, 0],
+            -ENOSYS,
+            "real time on WAIT",
+        ),
+        ([word, 3, 1, 0, 0, 0], -ENOSYS, "FUTEX_REQUEUE"),
+        ([word, 5, 1, 0, 0, 0], -ENOSYS, "FUTEX_WAKE_OP"),
+    ] {
+        assert_eq!(w.call(FUTEX, &args).0, err, "{what}");
+    }
+    w.poke(
+        ts,
+        &[0i64.to_le_bytes(), 1_000_000_000i64.to_le_bytes()].concat(),
+    );
+    assert_eq!(
+        w.call(FUTEX, &[word, FUTEX_WAIT, 3, ts]).0,
+        -EINVAL,
+        "bad timeout"
+    );
+    assert_eq!(w.cell.threads.current().wait, Wait::Ready, "never blocked");
+}
+
+#[test]
+fn reserved_mappings_are_backed_by_mprotect() {
+    let mut w = World::new(Arch::Aarch64);
+    // A thread stack as glibc makes it: reserve, then open all but the
+    // guard page at the bottom.
+    let base = w.call(MMAP, &[0, 1 << 20, 0, 0x22]).0 as u64;
+    assert_eq!(base, MMAP_BASE);
+    assert!(
+        w.pt().translate(&w.mem, base).is_none(),
+        "reserved, not backed"
+    );
+    assert_eq!(w.call(MPROTECT, &[base + 4096, (1 << 20) - 4096, 3]).0, 0);
+    assert!(
+        w.pt().translate(&w.mem, base).is_none(),
+        "the guard page stays"
+    );
+    let top = base + (1 << 20) - 8;
+    assert_eq!(w.peek(top, 8), [0; 8]);
+    w.poke(top, b"stacked!");
+    assert_eq!(w.peek(top, 8), *b"stacked!");
+    let t = w.pt().translate(&w.mem, base + 4096).unwrap();
+    assert!(t.flags.is_writable() && !t.flags.is_executable());
+    // Opening it again changes nothing; beyond the cursor is not reserved.
+    assert_eq!(w.call(MPROTECT, &[base + 4096, 4096, 3]).0, 0);
+    assert_eq!(w.call(MPROTECT, &[base + (1 << 20), 4096, 3]).0, -ENOMEM);
+
+    // A large reservation opens with 2 MiB pages where it can.
+    let big = w.call(MMAP, &[0, 8 << 20, 0, 0x22]).0 as u64;
+    assert_eq!(w.call(MPROTECT, &[big + 4096, (8 << 20) - 4096, 3]).0, 0);
+    let size = |w: &World, at: u64| w.pt().translate(&w.mem, at).unwrap().size;
+    assert_eq!(size(&w, big + 4096), PageSize::Small);
+    assert_eq!(size(&w, big + (2 << 20)), PageSize::Large);
+    let before = w.frames.outstanding();
+    assert_eq!(w.call(MUNMAP, &[big, 8 << 20]).0, 0);
+    assert!(w.frames.outstanding() < before, "frames returned");
 }

@@ -4,13 +4,17 @@
 
 #![cfg_attr(not(any(test, feature = "testing")), no_std)]
 
+extern crate alloc;
+
 pub mod elf;
 pub mod memory;
 pub mod space;
+pub mod threads;
 
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, PageTable};
 use space::Frames;
+use threads::{Thread, Threads};
 
 /// Top of a cell's stack (exclusive); the stack grows down from here.
 pub const STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
@@ -68,14 +72,14 @@ pub struct Registers {
 }
 
 /// A cell: plain data, no pointers into kernel memory (spec `cells`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     /// Identifier, unique while the cell exists.
     pub id: u32,
     /// Physical address of the cell's root page table.
     pub root: u64,
-    /// Saved user registers.
-    pub regs: Registers,
+    /// Its threads (spec `threads`).
+    pub threads: Threads,
     /// Start of the heap (end of the loaded image, page aligned).
     pub brk_start: u64,
     /// Current program break.
@@ -87,21 +91,33 @@ pub struct Cell {
 }
 
 impl Cell {
-    /// A new cell rooted at `root`, about to start at `entry` with stack `sp`.
+    /// A new cell rooted at `root`, about to start at `entry` with stack `sp`;
+    /// its first thread's identifier is the cell's.
     pub fn new(id: u32, root: u64, entry: u64, sp: u64, brk_start: u64) -> Self {
+        let regs = Registers {
+            pc: entry,
+            sp,
+            ..Registers::default()
+        };
         Self {
             id,
             root,
-            regs: Registers {
-                pc: entry,
-                sp,
-                ..Registers::default()
-            },
+            threads: Threads::new(Thread::new(id, regs)),
             brk_start,
             brk: brk_start,
             mmap_next: MMAP_BASE,
             exit_status: None,
         }
+    }
+
+    /// The registers of the current thread.
+    pub fn regs(&self) -> &Registers {
+        &self.threads.current().regs
+    }
+
+    /// The registers of the current thread, mutably.
+    pub fn regs_mut(&mut self) -> &mut Registers {
+        &mut self.threads.current_mut().regs
     }
 }
 
@@ -132,7 +148,7 @@ pub fn spawn<F: EntryFormat>(
     match built {
         Ok(sp) => {
             let mut cell = Cell::new(id, pt.root(), image.entry, sp, image.end());
-            cell.regs.fp = FpState::initial(machine);
+            cell.regs_mut().fp = FpState::initial(machine);
             Ok(cell)
         }
         Err(e) => {
@@ -287,8 +303,16 @@ mod tests {
             [0; 16],
         )
         .unwrap();
-        assert_eq!((cell.id, cell.regs.pc, cell.brk), (3, 0x40_0000, 0x40_3000));
-        assert!(cell.regs.sp < STACK_TOP && cell.regs.sp.is_multiple_of(16));
+        assert_eq!(
+            (cell.id, cell.regs().pc, cell.brk),
+            (3, 0x40_0000, 0x40_3000)
+        );
+        assert!(cell.regs().sp < STACK_TOP && cell.regs().sp.is_multiple_of(16));
+        assert_eq!(
+            cell.threads.current().tid,
+            3,
+            "the first thread is the cell's id"
+        );
         assert_eq!(
             mem.read_u64(cell.root + 511 * 8),
             0x1234_5003,
@@ -320,10 +344,12 @@ mod tests {
     #[test]
     fn cell_state_copies_bit_for_bit() {
         let mut cell = Cell::new(7, 0x8000, 0x40_1000, STACK_TOP - 64, 0x60_0000);
-        cell.regs.gpr[3] = 0xdead;
-        let copy = cell;
+        cell.regs_mut().gpr[3] = 0xdead;
+        let regs = *cell.regs();
+        assert_eq!(regs, *cell.regs());
+        assert_eq!(regs.pc, 0x40_1000);
+        let copy = cell.clone();
         assert_eq!(copy, cell);
-        assert_eq!(copy.regs.pc, 0x40_1000);
         assert_eq!(copy.brk, copy.brk_start);
     }
 }

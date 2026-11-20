@@ -1,5 +1,5 @@
 //! Snapshots of cells (spec `snapshots`, design D1–D3 of
-//! `add-suspend-resume`).
+//! `add-suspend-resume`, D7 of `add-threads`).
 //!
 //! A [`Snapshot`] is the encoded byte form itself: capture writes the
 //! format directly, and restore reads it in place, so suspending or resuming
@@ -7,9 +7,12 @@
 //!
 //! ```text
 //! header   "RHZSNAP1", version u32, machine u16, reserved u16, pages u32,
-//!          reserved u32                                      (24 bytes)
-//! state    pc, sp, gpr[31], tls, flags, brk_start, brk, mmap_next,
-//!          sleep_remaining_ns, fp[66]                (105 x u64, 840 bytes)
+//!          threads u32                                       (24 bytes)
+//! state    brk_start, brk, mmap_next, next thread identifier  (4 x u64)
+//! threads  per thread, the current one first: tid, clear_tid, wait kind
+//!          (0 runnable, 1 sleep, 2 futex), futex address, futex bitset,
+//!          time left in ns (u64::MAX: no deadline), pc, sp, gpr[31], tls,
+//!          flags, fp[66]                          (107 x u64, 856 bytes each)
 //! records  per page: virt u64, data offset u64, size u8 (0 = 4 KiB,
 //!          1 = 2 MiB), permissions u8 (1 W, 2 USER, 4 NX), 6 zero bytes
 //!                                                     (24 bytes each)
@@ -27,6 +30,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use rhizo_cell::elf::Machine;
 use rhizo_cell::space::Frames;
+use rhizo_cell::threads::{Thread, Threads, Wait};
 use rhizo_cell::{Cell, Registers};
 use rhizo_fs::Fs;
 use rhizo_hal::PhysicalMemory;
@@ -34,10 +38,15 @@ use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 const HEADER: usize = 24;
-const STATE: usize = (39 + 66) * 8;
+const STATE: usize = 4 * 8;
+/// Words per thread: 6 of identity and wait, then the registers.
+const THREAD_WORDS: usize = 6 + 35 + 66;
+const THREAD: usize = THREAD_WORDS * 8;
 const RECORD: usize = 24;
+/// "No deadline" in a thread's time left.
+const NO_DEADLINE: u64 = u64::MAX;
 /// Highest user address + 1.
 const USER_END: u64 = 0x0000_8000_0000_0000;
 
@@ -55,19 +64,19 @@ pub enum FormatError {
     /// Record `index` is malformed: size, permissions, address, alignment,
     /// order or data offset.
     BadPage { index: usize },
+    /// Thread `index` is malformed: identifier (zero, repeated or not below
+    /// the next one), wait kind, futex address or bitset; or there is none.
+    BadThread { index: usize },
     /// The files section does not decode to a consistent file system.
     BadFiles,
 }
 
-/// The plain state of a suspended cell besides its memory.
+/// The plain state of a suspended cell besides its memory and threads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct State {
-    pub regs: Registers,
     pub brk_start: u64,
     pub brk: u64,
     pub mmap_next: u64,
-    /// Time left in `nanosleep` when suspended (0 = runnable).
-    pub sleep_remaining_ns: u64,
 }
 
 /// One page of a snapshot.
@@ -113,15 +122,46 @@ fn decode_flags(b: u8) -> Option<PageFlags> {
     (!(f.is_writable() && f.is_executable())).then_some(f)
 }
 
+/// The words of thread `t` in the format; deadlines become time left after
+/// `now` (at least 1 ns, so a due deadline stays a deadline).
+fn thread_words(t: &Thread, now: u64) -> impl Iterator<Item = u64> + '_ {
+    let left = |until: u64| until.saturating_sub(now).max(1);
+    let (kind, addr, bitset, time) = match t.wait {
+        Wait::Ready => (0, 0, 0, NO_DEADLINE),
+        Wait::Sleep(until) => (1, 0, 0, left(until)),
+        Wait::Futex {
+            addr,
+            bitset,
+            until,
+        } => (2, addr, bitset as u64, until.map_or(NO_DEADLINE, left)),
+    };
+    let r = &t.regs;
+    [
+        t.tid as u64,
+        t.clear_tid,
+        kind,
+        addr,
+        bitset,
+        time,
+        r.pc,
+        r.sp,
+    ]
+    .into_iter()
+    .chain(r.gpr)
+    .chain([r.tls, r.flags])
+    .chain(r.fp.0)
+}
+
 impl Snapshot {
     /// Captures `cell` (not running) and the user half of its page table,
-    /// copying every page. The cell's memory is left as it was; the caller
-    /// frees it.
+    /// copying every page; its threads' deadlines are kept as time left
+    /// after monotonic time `now`. The cell's memory is left as it was; the
+    /// caller frees it.
     pub fn capture<F: EntryFormat>(
         machine: Machine,
         cell: &Cell,
         files: &Fs,
-        sleep_remaining_ns: u64,
+        now: u64,
         mem: &impl PhysicalMemory,
     ) -> Self {
         let pt = PageTable::<F>::from_root(cell.root);
@@ -130,7 +170,8 @@ impl Snapshot {
             pages += 1;
             data_len += size.bytes() as usize;
         });
-        let data_start = HEADER + STATE + pages * RECORD;
+        let threads = cell.threads.len();
+        let data_start = HEADER + STATE + threads * THREAD + pages * RECORD;
         let mut encoded = Vec::new();
         files.encode(&mut encoded);
         // Sized once: growing past the pages would copy them all again.
@@ -140,21 +181,15 @@ impl Snapshot {
         b.extend_from_slice(&(machine as u16).to_le_bytes());
         b.extend_from_slice(&[0, 0]);
         b.extend_from_slice(&(pages as u32).to_le_bytes());
-        b.extend_from_slice(&[0; 4]);
-        let r = &cell.regs;
-        for v in [r.pc, r.sp]
-            .into_iter()
-            .chain(r.gpr)
-            .chain([
-                r.tls,
-                r.flags,
-                cell.brk_start,
-                cell.brk,
-                cell.mmap_next,
-                sleep_remaining_ns,
-            ])
-            .chain(r.fp.0)
-        {
+        b.extend_from_slice(&(threads as u32).to_le_bytes());
+        let state = [
+            cell.brk_start,
+            cell.brk,
+            cell.mmap_next,
+            cell.threads.next_tid() as u64,
+        ];
+        let words = cell.threads.iter().flat_map(|t| thread_words(t, now));
+        for v in state.into_iter().chain(words) {
             b.extend_from_slice(&v.to_le_bytes());
         }
         let mut offset = 0u64;
@@ -199,16 +234,17 @@ impl Snapshot {
         }
         let snapshot = Self { bytes };
         let pages = snapshot.page_count();
-        let data_start =
-            (HEADER + STATE).checked_add(pages.checked_mul(RECORD).ok_or(FormatError::Truncated)?);
-        let data_start = data_start.ok_or(FormatError::Truncated)?;
+        // Counts are 32-bit: these products cannot overflow a 64-bit usize.
+        let records = HEADER + STATE + snapshot.thread_count() * THREAD;
+        let data_start = records + pages * RECORD;
         if snapshot.bytes.len() < data_start {
             return Err(FormatError::Truncated);
         }
+        snapshot.check_threads()?;
         let mut expected_offset = 0u64;
         let mut prev_end = 0u64;
         for index in 0..pages {
-            let rec = HEADER + STATE + index * RECORD;
+            let rec = records + index * RECORD;
             let b = &snapshot.bytes;
             let (virt, offset, size, flags) =
                 (u64_at(b, rec), u64_at(b, rec + 8), b[rec + 16], b[rec + 17]);
@@ -251,50 +287,117 @@ impl Snapshot {
         self.bytes
     }
 
-    fn page_count(&self) -> usize {
+    fn u32_at(&self, at: usize) -> usize {
         u32::from_le_bytes([
-            self.bytes[16],
-            self.bytes[17],
-            self.bytes[18],
-            self.bytes[19],
+            self.bytes[at],
+            self.bytes[at + 1],
+            self.bytes[at + 2],
+            self.bytes[at + 3],
         ]) as usize
     }
 
-    /// The cell's plain state.
+    fn page_count(&self) -> usize {
+        self.u32_at(16)
+    }
+
+    fn thread_count(&self) -> usize {
+        self.u32_at(20)
+    }
+
+    /// Where the page records start.
+    fn records(&self) -> usize {
+        HEADER + STATE + self.thread_count() * THREAD
+    }
+
+    /// Validates the threads (`from_bytes`; the size was checked).
+    fn check_threads(&self) -> Result<(), FormatError> {
+        let next_tid = u64_at(&self.bytes, HEADER + 24);
+        if self.thread_count() == 0 {
+            return Err(FormatError::BadThread { index: 0 });
+        }
+        let mut tids = Vec::with_capacity(self.thread_count());
+        for index in 0..self.thread_count() {
+            let w = |i: usize| u64_at(&self.bytes, HEADER + STATE + index * THREAD + i * 8);
+            let (tid, kind, addr, bitset, time) = (w(0), w(2), w(3), w(4), w(5));
+            let wait_ok = match kind {
+                0 => addr == 0 && bitset == 0 && time == NO_DEADLINE,
+                1 => addr == 0 && bitset == 0 && time != NO_DEADLINE,
+                2 => {
+                    addr.is_multiple_of(4)
+                        && addr < USER_END
+                        && bitset != 0
+                        && bitset <= u32::MAX as u64
+                }
+                _ => false,
+            };
+            if !wait_ok || tid == 0 || tid >= next_tid || next_tid > 1 << 31 || tids.contains(&tid)
+            {
+                return Err(FormatError::BadThread { index });
+            }
+            tids.push(tid);
+        }
+        Ok(())
+    }
+
+    /// The cell's plain state besides its threads.
     pub fn state(&self) -> State {
         let w = |i: usize| u64_at(&self.bytes, HEADER + i * 8);
-        let mut gpr = [0u64; 31];
-        for (i, g) in gpr.iter_mut().enumerate() {
-            *g = w(2 + i);
-        }
-        let mut fp = [0u64; 66];
-        for (i, f) in fp.iter_mut().enumerate() {
-            *f = w(39 + i);
-        }
         State {
-            regs: Registers {
-                pc: w(0),
-                sp: w(1),
-                gpr,
-                tls: w(33),
-                flags: w(34),
-                fp: rhizo_cell::FpState(fp),
-            },
-            brk_start: w(35),
-            brk: w(36),
-            mmap_next: w(37),
-            sleep_remaining_ns: w(38),
+            brk_start: w(0),
+            brk: w(1),
+            mmap_next: w(2),
         }
+    }
+
+    /// The cell's threads, their deadlines taken as time left after
+    /// monotonic time `now`.
+    pub fn threads(&self, now: u64) -> Threads {
+        let thread = |index: usize| {
+            let w = |i: usize| u64_at(&self.bytes, HEADER + STATE + index * THREAD + i * 8);
+            let until = |left: u64| (left != NO_DEADLINE).then(|| now.saturating_add(left));
+            let wait = match w(2) {
+                1 => Wait::Sleep(until(w(5)).unwrap_or(now)),
+                2 => Wait::Futex {
+                    addr: w(3),
+                    bitset: w(4) as u32,
+                    until: until(w(5)),
+                },
+                _ => Wait::Ready,
+            };
+            let mut regs = Registers {
+                pc: w(6),
+                sp: w(7),
+                tls: w(39),
+                flags: w(40),
+                ..Registers::default()
+            };
+            for (i, g) in regs.gpr.iter_mut().enumerate() {
+                *g = w(8 + i);
+            }
+            for (i, f) in regs.fp.0.iter_mut().enumerate() {
+                *f = w(41 + i);
+            }
+            Thread {
+                tid: w(0) as u32,
+                regs,
+                clear_tid: w(1),
+                wait,
+            }
+        };
+        let next_tid = u64_at(&self.bytes, HEADER + 24) as u32;
+        // Validated by `from_bytes` or written by `capture`: never empty.
+        Threads::from_parts((0..self.thread_count()).map(thread).collect(), next_tid)
+            .unwrap_or_else(|| Threads::new(Thread::new(1, Registers::default())))
     }
 
     /// The encoded file system (after the page data and its length).
     pub fn files_bytes(&self) -> &[u8] {
         let pages = self.page_count();
-        let data_start = HEADER + STATE + pages * RECORD;
+        let data_start = self.records() + pages * RECORD;
         // Pages are stored in record order: the data ends after the last.
         let data_len = pages.checked_sub(1).map_or(0, |last| {
             let page = self.page(last);
-            u64_at(&self.bytes, HEADER + STATE + last * RECORD + 8) + page.size.bytes()
+            u64_at(&self.bytes, self.records() + last * RECORD + 8) + page.size.bytes()
         });
         &self.bytes[data_start + data_len as usize + 8..]
     }
@@ -313,14 +416,14 @@ impl Snapshot {
     /// Page `index` (records were validated by `from_bytes` or written by
     /// `capture`).
     pub fn page(&self, index: usize) -> Page<'_> {
-        let rec = HEADER + STATE + index * RECORD;
+        let rec = self.records() + index * RECORD;
         let b = &self.bytes;
         let size = if b[rec + 16] == 1 {
             PageSize::Large
         } else {
             PageSize::Small
         };
-        let start = HEADER + STATE + self.page_count() * RECORD + u64_at(b, rec + 8) as usize;
+        let start = self.records() + self.page_count() * RECORD + u64_at(b, rec + 8) as usize;
         Page {
             virt: u64_at(b, rec),
             size,
@@ -373,13 +476,14 @@ impl Snapshot {
     }
 
     /// A cell `id` with root `root` (an empty user half, sharing the kernel
-    /// half as the architecture needs) in the snapshot's state.
-    pub fn cell(&self, id: u32, root: u64) -> Cell {
+    /// half as the architecture needs) in the snapshot's state, its threads'
+    /// deadlines counted from monotonic time `now`.
+    pub fn cell(&self, id: u32, root: u64, now: u64) -> Cell {
         let s = self.state();
         Cell {
             id,
             root,
-            regs: s.regs,
+            threads: self.threads(now),
             brk_start: s.brk_start,
             brk: s.brk,
             mmap_next: s.mmap_next,

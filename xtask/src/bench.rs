@@ -383,6 +383,7 @@ fn measure_cells(
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
+        let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -420,6 +421,10 @@ fn measure_cells(
                     if let Some((w, f)) = parse_files_line(&out.output) {
                         file_write_read.push(w as f64 / 1000.0);
                         fork_files.push(f as f64 / 1000.0);
+                    }
+                    if let Some((c, w)) = parse_threads_line(&out.output) {
+                        thread_create.push(c as f64 / 1000.0);
+                        futex_wake.push(w as f64);
                     }
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
@@ -460,6 +465,8 @@ fn measure_cells(
             ("cell.fork_with_files_us", "us", &mut fork_files),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
+            ("cell.thread_create_us", "us", &mut thread_create),
+            ("cell.futex_wake_ns", "ns", &mut futex_wake),
         ] {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -523,6 +530,19 @@ fn parse_density_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("idle_bytes")?, field("suspended_bytes")?))
+}
+
+/// `(create_ns, futex_wake_ns)` of the threads line of a `bench-cell`
+/// kernel.
+fn parse_threads_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-threads "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("create_ns")?, field("futex_wake_ns")?))
 }
 
 /// `(write_read_ns, fork_ns)` of the files line of a `bench-cell` kernel.
@@ -1476,6 +1496,15 @@ mod tests {
             Some((120_000, 1500))
         );
         assert_eq!(parse_files_line("rhizo-files write_read_ns=1\n"), None);
+    }
+
+    #[test]
+    fn threads_line_is_parsed() {
+        assert_eq!(
+            parse_threads_line("x\nrhizo-threads create_ns=4200 futex_wake_ns=650\n"),
+            Some((4200, 650))
+        );
+        assert_eq!(parse_threads_line("rhizo-threads create_ns=1\n"), None);
     }
 
     #[test]
