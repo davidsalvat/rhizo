@@ -447,6 +447,7 @@ impl Abi {
         S: Services,
     {
         let (nr, a) = self.arch.call(cell);
+        let fs_seen = cx.fs.changes();
         let result = match self.arch.decode(nr) {
             // One thread of several: only it ends.
             Some(Sys::Exit) if cell.threads.len() > 1 => {
@@ -637,6 +638,12 @@ impl Abi {
             for h in cx.fs.take_released() {
                 cx.net.release(h);
             }
+        }
+        // Another thread of the cell may wait for what changed in its pipes,
+        // event counters or `epoll` instances (design D3 of
+        // `add-socket-wait-queues`).
+        if cx.fs.changes() != fs_seen {
+            cell.threads.wake_io();
         }
         if result == BLOCK {
             cell.regs_mut().pc -= self.arch.syscall_len();

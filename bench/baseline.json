@@ -181,7 +181,8 @@
       "density.wake_p999_us",
       "density.syscall_p999_ns",
       "density.sched_p99_us",
-      "density.wake_p99_us"
+      "density.wake_p99_us",
+      "density.wasted_wakeups_pct"
     ]
   }
 }

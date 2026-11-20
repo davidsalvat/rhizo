@@ -106,6 +106,7 @@ macro_rules! suite {
             ktest_case!(sockets_and_pipes_behave_as_on_linux),
             ktest_case!(cells_talk_over_loopback),
             ktest_case!(a_waiting_cell_uses_no_cpu),
+            ktest_case!(only_the_cells_waiting_on_a_socket_wake),
             ktest_case!(sockets_across_suspend_and_resume),
             ktest_case!(a_discarded_snapshot_closes_its_connections),
             ktest_case!(loopback_connection_across_suspend_of_one_end),
@@ -1553,6 +1554,29 @@ fn a_waiting_cell_uses_no_cpu() {
     host.run(|_| false);
     assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
     assert_eq!(ended(&host, client).0, Ending::Exit(0));
+}
+
+/// A socket change wakes only the cells waiting on that socket (design D1
+/// of `add-socket-wait-queues`): a server waiting for a client that never
+/// comes stays asleep while two other cells talk, and no wake-up finds
+/// nothing to do.
+fn only_the_cells_waiting_on_a_socket_wake() {
+    use crate::prof::{self, Count};
+    let mut host = Host::new();
+    let idle = spawn(&mut host, "loopback", &[b"serve", b"7310", b"1"]);
+    step_until_waiting(&mut host); // it reaches `accept` and waits
+    prof::start();
+    let server = spawn(&mut host, "loopback", &[b"serve", b"7311", b"50"]);
+    let client = spawn(&mut host, "loopback", &[b"ping", b"7311", b"50"]);
+    host.run(|h| h.finished(server).is_some() && h.finished(client).is_some());
+    let report = prof::stop();
+    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
+    assert_eq!(ended(&host, client), (Ending::Exit(0), "pinged\n".into()));
+    assert_eq!(report.count(Count::IoWasted), 0, "no wake-up found nothing");
+    assert!(host.finished(idle).is_none());
+    assert_eq!(host.waiting(), 1, "the idle server was never woken");
+    assert!(host.kill(idle));
+    assert_eq!(crate::cell::open_sockets(), 0);
 }
 
 /// Runs `netstate` to its `ready` line.

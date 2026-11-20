@@ -327,3 +327,22 @@ fn a_reset_from_outside_is_reported_once() {
     assert_eq!(drain(&mut w.net, s), Err(Error::ConnReset));
     assert_eq!(drain(&mut w.net, s).unwrap(), b"");
 }
+
+#[test]
+fn frames_from_the_wire_wake_the_waiters_of_its_sockets() {
+    let mut w = World::new();
+    let s = w.connect(80);
+    let loopback = w.net.socket(Family::Inet, Type::Stream).unwrap();
+    w.net.end_call(None);
+    assert_eq!(drain(&mut w.net, s), Err(Error::Again));
+    w.net.end_call(Some(1));
+    w.net.poll(loopback);
+    w.net.end_call(Some(2));
+    w.net.send(s, b"echo", None).unwrap();
+    w.net.end_call(None);
+    w.net.take_woken();
+    w.run(20);
+    let woken = w.net.take_woken();
+    assert!(woken.contains(&1), "the echo arrived");
+    assert!(!woken.contains(&2), "nothing for a loopback socket");
+}

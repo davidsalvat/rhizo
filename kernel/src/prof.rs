@@ -30,8 +30,11 @@ pub enum Count {
     IdleCycles,
     /// Interrupts taken while cell code ran (preemption ticks, wake-ups).
     Interrupts,
-    /// Cells made runnable because a socket changed (all waiters wake).
+    /// Cells made runnable because a socket they waited on changed.
     IoWoken,
+    /// Of those, the ones whose first system call waited on descriptors
+    /// again: a wake-up that found nothing.
+    IoWasted,
     /// Socket changes made by system calls.
     NetChanges,
     /// Writes to copy-on-write pages resolved.
@@ -45,7 +48,7 @@ pub enum Count {
     Untagged,
 }
 
-const COUNTS: usize = 9;
+const COUNTS: usize = 10;
 static COUNTERS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 /// When a system call last changed a socket (nanoseconds since boot).
 static NET_CHANGED_AT: AtomicU64 = AtomicU64::new(0);
