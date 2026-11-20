@@ -378,6 +378,7 @@ fn measure_cells(
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
+        let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -404,6 +405,10 @@ fn measure_cells(
                         fork_touch.push(f.fork_touch_ns as f64 / 1000.0);
                         template.push(f.spawn_from_template_ns as f64 / 1000.0);
                         fork_pt_frames = Some(f.fork_pt_frames);
+                    }
+                    if let Some((c, w)) = parse_python_line(&out.output) {
+                        py_cold.push(c as f64 / 1000.0);
+                        py_warm.push(w as f64 / 1000.0);
                     }
                     if let Some(d) = parse_density_line(&out.output) {
                         density = Some(d);
@@ -449,6 +454,8 @@ fn measure_cells(
             ("workload.warm_us", "us", &mut warm),
             ("cell.file_write_read_us", "us", &mut file_write_read),
             ("cell.fork_with_files_us", "us", &mut fork_files),
+            ("workload.python_cold_us", "us", &mut py_cold),
+            ("workload.python_warm_us", "us", &mut py_warm),
         ] {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -486,6 +493,19 @@ fn measure_cells(
         ));
     }
     Ok(())
+}
+
+/// `(cold_ns, warm_ns)` of the MicroPython line of a `bench-cell` kernel
+/// (absent when MicroPython was not built).
+fn parse_python_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-python "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("cold_ns")?, field("warm_ns")?))
 }
 
 /// `(idle_bytes, suspended_bytes)` of the density line of a `bench-cell`
@@ -1370,6 +1390,15 @@ mod tests {
             parse_workload_line("x\nrhizo-workload cold_ns=900 warm_ns=30\n"),
             Some((900, 30))
         );
+    }
+
+    #[test]
+    fn python_line_is_parsed() {
+        assert_eq!(
+            parse_python_line("rhizo-python cold_ns=900000 warm_ns=40000\n"),
+            Some((900_000, 40_000))
+        );
+        assert_eq!(parse_python_line("no python here"), None);
     }
 
     #[test]

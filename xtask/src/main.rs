@@ -752,7 +752,84 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     ])?;
     let out = dir.join(target).join("release");
     build_c_cells(&out)?;
+    build_micropython(&out)?;
     Ok(out)
+}
+
+/// MicroPython's commit, pinned (v1.24.1, MIT license).
+pub(crate) const MICROPYTHON_COMMIT: &str = "ecfdd5d6f9be971852003c2049600dc7b3e2a838";
+
+/// Builds MicroPython's Unix port as a static executable into `out` when its
+/// source is given (`RHIZO_MICROPYTHON_SRC`, a checkout of
+/// [`MICROPYTHON_COMMIT`]); without it, the MicroPython checks report that
+/// they did not run. Options left out need what cells do not have yet
+/// (threads, sockets, FFI) or are not needed (TLS, readline, frozen code).
+fn build_micropython(out: &Path) -> Result {
+    let target = out.join("micropython");
+    let Some(src) = env::var_os("RHIZO_MICROPYTHON_SRC") else {
+        let _ = std::fs::remove_file(&target);
+        return Ok(());
+    };
+    let src = PathBuf::from(src);
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&src)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if head != MICROPYTHON_COMMIT {
+        return Err(
+            Failure::new("build", "MicroPython is not the pinned commit")
+                .location(src.display().to_string())
+                .expected(MICROPYTHON_COMMIT)
+                .actual(head)
+                .hint("check out the pinned commit, or update MICROPYTHON_COMMIT on purpose")
+                .reproduce(format!(
+                    "git -C {} checkout {MICROPYTHON_COMMIT}",
+                    src.display()
+                ))
+                .into_error(),
+        );
+    }
+    if target.exists() {
+        return Ok(());
+    }
+    let port = src.join("ports").join("unix");
+    let cc = format!("CC={}", c_compiler());
+    let args = [
+        "VARIANT=standard",
+        "MICROPY_PY_FFI=0",
+        "MICROPY_PY_THREAD=0",
+        "MICROPY_PY_SOCKET=0",
+        "MICROPY_PY_SSL=0",
+        "MICROPY_PY_BTREE=0",
+        "MICROPY_USE_READLINE=0",
+        "FROZEN_MANIFEST=",
+        "LDFLAGS_EXTRA=-static",
+        &cc,
+    ];
+    let status = Command::new("make")
+        .arg("-C")
+        .arg(&port)
+        .arg(format!(
+            "-j{}",
+            std::thread::available_parallelism().map_or(2, |n| n.get())
+        ))
+        .args(args)
+        .status()
+        .map_err(|e| format!("cannot run make: {e}"))?;
+    if !status.success() {
+        return Err(Failure::new("build", "cannot build MicroPython")
+            .location(port.display().to_string())
+            .expected("a static micropython executable")
+            .actual(status.to_string())
+            .reproduce(format!("make -C {} {}", port.display(), args.join(" ")))
+            .into_error());
+    }
+    std::fs::copy(port.join("build-standard").join("micropython"), &target)
+        .map_err(|e| format!("cannot copy micropython: {e}"))?;
+    Ok(())
 }
 
 /// C compiler producing static Linux executables for the selected

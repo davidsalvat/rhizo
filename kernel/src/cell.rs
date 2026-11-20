@@ -918,6 +918,12 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-workload cold_ns={cold} warm_ns={warm}"
     );
+    if let Some((cold, warm)) = python() {
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-python cold_ns={cold} warm_ns={warm}"
+        );
+    }
     let (idle, suspended) = density();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -1043,6 +1049,65 @@ fn fork_and_templates() -> [u64; 4] {
         frames,
         robust(&mut template),
     ]
+}
+
+/// MicroPython answering one request (`cells/python/rhizo_demo.py`): started
+/// cold from its executable (interpreter start, imports, warm-up), and
+/// forked from a template frozen after the warm-up. Medians over 7 rounds;
+/// `None` when MicroPython was not built.
+#[cfg(feature = "bench-cell")]
+fn python() -> Option<(u64, u64)> {
+    const ROUNDS: usize = 7;
+    const COMMAND: &[u8] =
+        b"import sys; sys.path.insert(0, 'lib'); import rhizo_demo; rhizo_demo.main()";
+    let image = test_image("micropython");
+    if image.is_empty() {
+        return None;
+    }
+    let files = || {
+        let mut fs = Fs::new();
+        fs.put_file(
+            b"/lib/rhizo_demo.py",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../cells/python/rhizo_demo.py"
+            )),
+        )
+        .expect("module");
+        fs
+    };
+    let argv: [&[u8]; 3] = [b"micropython", b"-c", COMMAND];
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let (mut cold, mut warm) = (Vec::new(), Vec::new());
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_with_files(image, &argv, files(), true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        cold.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    let template = host
+        .spawn_with_files(image, &argv, files(), true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"warm\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    cold.sort_unstable();
+    warm.sort_unstable();
+    Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
 }
 
 /// Memory per idle cell, from 1000 forks of a template of `idle` each run
