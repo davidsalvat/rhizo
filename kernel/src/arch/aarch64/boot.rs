@@ -99,17 +99,24 @@ _start:
     cmp     x2, #4
     b.lo    6b
 
-    // l2_kernel[j] = load address + j * 2 MiB, normal block, EL0 execute-never.
+    // l2_kernel[j] = load address + j * 2 MiB, normal block, EL0 execute-never,
+    // for as many blocks as the image takes (test kernels embed tens of MiB
+    // of cells), at least 16.
     adrp    x0, rhizo_l2_kernel
     add     x0, x0, :lo12:rhizo_l2_kernel
     mov     x2, #0
     ldr     x3, =0x0040000000000701
+    ldr     x5, =(__image_size + 0x1fffff)
+    lsr     x5, x5, #21
+    cmp     x5, #16
+    mov     x6, #16
+    csel    x5, x5, x6, hs
 7:  lsl     x4, x2, #21
     add     x4, x4, x21
     orr     x4, x4, x3
     str     x4, [x0, x2, lsl #3]
     add     x2, x2, #1
-    cmp     x2, #16
+    cmp     x2, x5
     b.lo    7b
 
     // TTBR0 root: [0] -> l1_ram (identity).

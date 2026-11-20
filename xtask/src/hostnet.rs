@@ -1,7 +1,8 @@
 //! The host side of a guest's network (design D6 of `add-virtio-net`, D5 of
 //! `add-virtio-pci`): a TCP echo server the kernel's tests and benchmark
 //! reach, QEMU's user network, and a tap device each for Firecracker and
-//! Cloud Hypervisor when `sudo` allows it.
+//! Cloud Hypervisor when `sudo` allows it; and, for the laptop workload, a
+//! fake model server (design D1 of `add-reference-workloads`).
 
 use crate::vmm::Vmm;
 use std::collections::BTreeMap;
@@ -10,6 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 /// Tap device given to Firecracker, its host address and the guest's.
 const TAP: &str = "rhizotap0";
@@ -78,6 +80,91 @@ fn echo_server(addr: &str) -> Result<u16, String> {
             Ok(port)
         })
         .clone()
+}
+
+/// The `llm=HOST:PORT` option for a guest on `vmm`: a fake model server on
+/// the host's side of its network, answering after `delay_ms` (`None`
+/// without a network).
+pub fn llm_option(vmm: Vmm, delay_ms: u32) -> Option<String> {
+    let (bind, seen_as) = match for_vmm(vmm) {
+        Network::Qemu { .. } => ("127.0.0.1", SLIRP_HOST),
+        Network::Tap { tap, .. } if tap == TAP => (TAP_HOST, TAP_HOST),
+        Network::Tap { .. } => (CH_TAP_HOST, CH_TAP_HOST),
+        Network::None(_) => return None,
+    };
+    let port = llm_server(bind, delay_ms).ok()?;
+    Some(format!("llm={seen_as}:{port}"))
+}
+
+/// The port of a fake model server on `addr` answering after `delay_ms`
+/// (started once per address and delay).
+fn llm_server(addr: &str, delay_ms: u32) -> Result<u16, String> {
+    type Servers = BTreeMap<(String, u32), Result<u16, String>>;
+    static SERVERS: OnceLock<Mutex<Servers>> = OnceLock::new();
+    let servers = SERVERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut servers = servers.lock().map_err(|e| e.to_string())?;
+    servers
+        .entry((addr.to_string(), delay_ms))
+        .or_insert_with(|| {
+            let listener = TcpListener::bind((addr, 0))
+                .map_err(|e| format!("cannot start a model server on {addr}: {e}"))?;
+            let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+            let delay = Duration::from_millis(delay_ms.into());
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    thread::spawn(move || answer(stream, delay));
+                }
+            });
+            Ok(port)
+        })
+        .clone()
+}
+
+/// What the fake model answers: a short completion naming a tool.
+pub const LLM_ANSWER: &str = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\
+     \"content\":\"noted\",\"tool_calls\":[{\"function\":{\"name\":\"note\"}}]}}]}";
+
+/// Reads one HTTP request (headers and `Content-Length` bytes of body),
+/// waits `delay`, answers [`LLM_ANSWER`] and closes the connection.
+fn answer(mut stream: TcpStream, delay: Duration) {
+    let _ = stream.set_nodelay(true);
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    let body_end = loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => request.extend_from_slice(&buf[..n]),
+        }
+        if let Some(end) = request_end(&request) {
+            break end;
+        }
+    };
+    if request.len() < body_end {
+        return;
+    }
+    thread::sleep(delay);
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{LLM_ANSWER}",
+        LLM_ANSWER.len()
+    );
+    let _ = stream.write_all(reply.as_bytes());
+}
+
+/// Where a complete HTTP request in `bytes` ends (headers, then
+/// `Content-Length` bytes), once its headers are in.
+fn request_end(bytes: &[u8]) -> Option<usize> {
+    let head = bytes.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let length = String::from_utf8_lossy(&bytes[..head])
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let end = head + length;
+    (bytes.len() >= end).then_some(end)
 }
 
 fn echo(mut stream: TcpStream) {
@@ -152,6 +239,36 @@ mod tests {
         let mut back = [0u8; 4];
         s.read_exact(&mut back).unwrap();
         assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn the_model_server_answers_a_request() {
+        let port = llm_server("127.0.0.1", 0).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"POST /v1/chat HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+            .unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert!(reply.ends_with(LLM_ANSWER), "{reply}");
+        assert!(reply.contains(&format!("Content-Length: {}\r\n", LLM_ANSWER.len())));
+    }
+
+    #[test]
+    fn requests_end_after_their_body() {
+        assert_eq!(request_end(b"GET / HTTP/1.1\r\n"), None);
+        assert_eq!(request_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
+        let post = b"POST / HTTP/1.1\r\ncontent-length: 3\r\n\r\nab";
+        assert_eq!(request_end(post), None, "body not complete");
+        let mut whole = post.to_vec();
+        whole.push(b'c');
+        assert_eq!(request_end(&whole), Some(whole.len()));
+    }
+
+    #[test]
+    fn qemu_guests_reach_the_model_through_the_user_network() {
+        let option = llm_option(Vmm::QemuMicrovm, 0).unwrap();
+        assert!(option.starts_with("llm=10.0.2.2:"), "{option}");
     }
 
     #[test]

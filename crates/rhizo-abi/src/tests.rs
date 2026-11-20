@@ -65,6 +65,7 @@ pub(crate) struct World {
     pub(crate) services: FakeServices,
     pub(crate) fs: rhizo_fs::Fs,
     pub(crate) net: rhizo_net::Net,
+    pub(crate) pages: PageCache,
     /// Deadline of the last blocked call (kept, as the kernel does).
     pub(crate) deadline: Option<u64>,
     /// The last call waits on descriptors: with this deadline.
@@ -94,6 +95,7 @@ impl World {
             services: FakeServices::default(),
             fs: rhizo_fs::Fs::new(),
             net: rhizo_net::Net::new(),
+            pages: PageCache::new(64),
             deadline: None,
             io: None,
         }
@@ -128,6 +130,7 @@ impl World {
             net: &mut self.net,
             deadline: self.deadline.take(),
             pager: &mut NoPager,
+            pages: &mut self.pages,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
         // A thread waiting on descriptors keeps its deadline and makes its
@@ -251,9 +254,11 @@ fn mmap_places_large_regions_on_large_pages_and_munmap_frees_them() {
     assert!(w.pt().translate(&w.mem, big).is_none());
 
     assert_eq!(w.call(MMAP, &[0, 0, 3, anon, u64::MAX, 0]).0, -EINVAL);
+    // Files can be mapped now (`add-dynamic-linking`): descriptor 3 is not
+    // open.
     assert_eq!(
         w.call(MMAP, &[0, 4096, 3, MAP_PRIVATE, 3, 0]).0,
-        -EINVAL,
+        -EBADF,
         "files"
     );
     assert_eq!(
@@ -266,6 +271,135 @@ fn mmap_places_large_regions_on_large_pages_and_munmap_frees_them() {
         -ENOMEM
     );
     assert_eq!(w.call(MUNMAP, &[small + 1, 10]).0, -EINVAL);
+}
+
+/// What a dynamic loader does with a library (spec `linux-abi`, file
+/// mappings): map it whole read-only, map its data over part of it with
+/// `MAP_FIXED`, its `.bss` anonymously, and make the gap inaccessible.
+/// File pages are shared by every mapping of the same bytes; writes stay
+/// private.
+#[test]
+fn files_map_privately_and_share_their_pages() {
+    let mut w = World::new(Arch::Aarch64);
+    let mut lib = vec![b'A'; 4096];
+    lib.extend([b'B'; 4096]);
+    lib.extend([b'C'; 100]);
+    w.fs.put_file(b"/lib/libx.so", &lib).unwrap();
+    let read = rhizo_fs::OpenFlags {
+        read: true,
+        ..Default::default()
+    };
+    let fd = u64::from(w.fs.open(None, b"/lib/libx.so", read, 0).unwrap());
+    let held = |w: &World| w.frames.outstanding() - w.pt().lower_half_tables(&w.mem);
+    let before = held(&w);
+    let private = MAP_PRIVATE;
+    let base = w.call(MMAP, &[0, 3 * 4096, 1, private, fd, 0]).0 as u64;
+    assert_eq!(base, MMAP_BASE);
+    assert_eq!(w.peek(base, 2), b"AA");
+    assert_eq!(w.peek(base + 4096, 2), b"BB");
+    assert_eq!(w.peek(base + 8192 + 98, 4), b"CC\0\0", "zero past the end");
+    let phys = |w: &World, at| w.pt().translate(&w.mem, at).unwrap();
+    assert!(!phys(&w, base).flags.is_writable());
+
+    // A second mapping of the same file (another cell loading it) shares.
+    let again = w.call(MMAP, &[0, 4096, 5, private, fd, 4096]).0 as u64;
+    assert_eq!(again, base + 3 * 4096);
+    assert_eq!(phys(&w, again).phys, phys(&w, base + 4096).phys);
+    assert!(phys(&w, again).flags.is_executable());
+
+    // Data over the middle page: the same frame, copy-on-write.
+    let data = w.call(MMAP, &[base + 4096, 4096, 3, private | MAP_FIXED, fd, 4096]);
+    assert_eq!(data.0 as u64, base + 4096);
+    let t = phys(&w, base + 4096);
+    assert_eq!(t.phys, phys(&w, again).phys);
+    assert!(t.flags.contains(PageFlags::COPY_ON_WRITE));
+    assert_eq!(
+        w.pt()
+            .resolve_write(&mut w.mem, &mut w.frames, &mut w.tlb, base + 4096),
+        Ok(true)
+    );
+    w.poke(base + 4096, b"mine");
+    assert_eq!(w.peek(again, 4), b"BBBB", "the file's page is unchanged");
+    // `.bss` over the last page, and an inaccessible gap.
+    let bss = w.call(
+        MMAP,
+        &[
+            base + 8192,
+            4096,
+            3,
+            MAP_ANONYMOUS | private | MAP_FIXED,
+            u64::MAX,
+            0,
+        ],
+    );
+    assert_eq!(bss.0 as u64, base + 8192);
+    assert_eq!(w.peek(base + 8192, 2), b"\0\0");
+    assert_eq!(w.call(MPROTECT, &[base, 4096, 0]).0, 0);
+    assert!(w.pt().translate(&w.mem, base).is_none(), "nothing kept");
+    assert_eq!(w.call(MPROTECT, &[base, 4096, 3]).0, 0, "reserved");
+    assert_eq!(w.peek(base, 2), b"\0\0");
+
+    // What cannot be mapped.
+    assert_eq!(w.call(MMAP, &[0, 4096, 1, private, fd, 100]).0, -EINVAL);
+    assert_eq!(w.call(MMAP, &[0, 4096, 6, private, fd, 0]).0, -EACCES);
+    assert_eq!(w.call(MMAP, &[0, 4096, 1, 1, fd, 0]).0, -ENODEV, "shared");
+    assert_eq!(w.call(MMAP, &[0, 4096, 1, private, 99, 0]).0, -EBADF);
+    assert_eq!(
+        w.call(MMAP, &[0, 4096, 1, private, 0, 0]).0,
+        -ENODEV,
+        "console"
+    );
+    let write_only = rhizo_fs::OpenFlags {
+        write: true,
+        ..Default::default()
+    };
+    let wo = u64::from(w.fs.open(None, b"/lib/libx.so", write_only, 1).unwrap());
+    assert_eq!(w.call(MMAP, &[0, 4096, 1, private, wo, 0]).0, -EACCES);
+    assert_eq!(
+        w.call(MMAP, &[0, 4096, 1, private | MAP_FIXED, fd, 0]).0,
+        -EPERM
+    );
+    let past = USER_END - 4096;
+    assert_eq!(
+        w.call(MMAP, &[past, 8192, 1, private | MAP_FIXED, fd, 0]).0,
+        -EINVAL
+    );
+
+    // The file written: a new mapping has its new bytes, the old ones keep
+    // theirs.
+    let rw = rhizo_fs::OpenFlags {
+        read: true,
+        write: true,
+        ..Default::default()
+    };
+    let wfd = w.fs.open(None, b"/lib/libx.so", rw, 2).unwrap();
+    w.fs.write(wfd, b"new", Some(4096)).unwrap();
+    let fresh = w.call(MMAP, &[0, 4096, 1, private, fd, 4096]).0 as u64;
+    assert_eq!(fresh, base + 4 * 4096);
+    assert_eq!(w.peek(fresh, 4), b"newB");
+    assert_eq!(w.peek(again, 4), b"BBBB");
+
+    // Unmapped and dropped from the cache: every frame is back.
+    assert_eq!(w.call(MUNMAP, &[base, 5 * 4096]).0, 0);
+    assert!(w.pages.clear(&mut w.frames));
+    assert_eq!(held(&w), before);
+}
+
+/// The calls coreutils ask before they start (spec `linux-abi`).
+#[test]
+fn sysinfo_affinity_and_advice() {
+    let mut w = World::new(Arch::Aarch64);
+    w.services.clock = 5_000_000_000;
+    assert_eq!(w.call(179, &[DATA]).0, 0);
+    let info = w.peek(DATA, 112);
+    assert_eq!(info[..8], 5u64.to_le_bytes(), "uptime");
+    assert_eq!(info[104..108], 1u32.to_le_bytes(), "mem_unit");
+    assert_eq!(w.call(179, &[RO]).0, -EFAULT);
+    assert_eq!(w.call(123, &[0, 128, DATA]).0, 8);
+    assert_eq!(w.peek(DATA, 8), 1u64.to_le_bytes(), "one CPU");
+    assert_eq!(w.call(123, &[0, 4, DATA]).0, -EINVAL);
+    assert_eq!(w.call(223, &[1, 0, 0, 2]).0, 0);
+    assert_eq!(w.call(223, &[99, 0, 0, 2]).0, -EBADF);
 }
 
 #[test]
@@ -507,9 +641,15 @@ fn directories_names_and_metadata() {
     let full = name(&mut w, "/work/a");
     assert_eq!(w.call(79, &[AT_FDCWD, full, DATA, 0]).0, 0);
     assert_eq!(w.peek(DATA + 48, 8), 5u64.to_le_bytes());
+    // statx (`add-dynamic-linking`): the same, in its own layout.
+    assert_eq!(w.call(291, &[AT_FDCWD, full, 0, 0x7ff, DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 28, 2), (0o100_644u16).to_le_bytes());
+    assert_eq!(w.peek(DATA + 40, 8), 5u64.to_le_bytes());
     // faccessat: exists, but cannot be executed.
     assert_eq!(w.call(48, &[AT_FDCWD, full, 4]).0, 0);
     assert_eq!(w.call(48, &[AT_FDCWD, full, 1]).0, -EACCES);
+    let missing = name(&mut w, "/work/none");
+    assert_eq!(w.call(291, &[AT_FDCWD, missing, 0, 0x7ff, DATA]).0, -2);
     // getdents64 lists ".", ".." and "a".
     let dot = name(&mut w, ".");
     let dir = w.call(OPENAT, &[AT_FDCWD, dot, 0x4000 /* O_DIRECTORY */]).0 as u64;

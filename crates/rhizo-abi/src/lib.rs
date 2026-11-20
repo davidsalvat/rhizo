@@ -9,10 +9,15 @@
 
 extern crate alloc;
 
+mod exec;
 mod files;
+mod pages;
 mod poll;
 mod sockets;
 mod threads;
+
+pub use exec::{ExecError, exec};
+pub use pages::{FilePages, PageCache};
 
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
@@ -33,6 +38,7 @@ pub mod errno {
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
     pub const EINVAL: i64 = 22;
+    pub const ENODEV: i64 = 19;
     pub const ENOTTY: i64 = 25;
     pub const ESPIPE: i64 = 29;
     pub const EPIPE: i64 = 32;
@@ -160,6 +166,10 @@ enum Sys {
     Recvmsg,
     Clone,
     Clone3,
+    Sysinfo,
+    Statx,
+    SchedGetaffinity,
+    Fadvise64,
 }
 
 impl Arch {
@@ -264,6 +274,10 @@ impl Arch {
             (Arch::Aarch64, 212) | (Arch::X86_64, 47) => Recvmsg,
             (Arch::Aarch64, 220) | (Arch::X86_64, 56) => Clone,
             (Arch::Aarch64, 435) | (Arch::X86_64, 435) => Clone3,
+            (Arch::Aarch64, 179) | (Arch::X86_64, 99) => Sysinfo,
+            (Arch::Aarch64, 291) | (Arch::X86_64, 332) => Statx,
+            (Arch::Aarch64, 123) | (Arch::X86_64, 204) => SchedGetaffinity,
+            (Arch::Aarch64, 223) | (Arch::X86_64, 221) => Fadvise64,
             _ => return None,
         })
     }
@@ -311,6 +325,11 @@ pub trait Services: Console {
     /// data such as file blocks, names and thread records) without eating
     /// into the memory the kernel keeps for itself.
     fn can_store(&mut self, bytes: u64) -> bool;
+    /// Memory in bytes for `sysinfo`: the total cells share and how much of
+    /// it is free.
+    fn memory(&mut self) -> (u64, u64) {
+        (0, 0)
+    }
     /// Brings `fp`, the calling thread's FP/SIMD state, up to date when the
     /// CPU's registers hold a newer copy (the kernel switches them lazily).
     fn save_fp(&mut self, fp: &mut FpState) {
@@ -356,6 +375,8 @@ pub struct Context<'a, F, M, T, A, S> {
     /// Brings in pages that are not mapped yet (lazy resume); [`NoPager`]
     /// otherwise.
     pub pager: &'a mut dyn Pager<F, M>,
+    /// The frames of mapped file pages.
+    pub pages: &'a mut dyn FilePages<M, A>,
 }
 
 impl<F, M, T, A, S> fmt::Debug for Context<'_, F, M, T, A, S> {
@@ -503,6 +524,20 @@ impl Abi {
             Some(Sys::Ioctl) => -ENOTTY,
             Some(Sys::ArchPrctl) => arch_prctl(cell, cx, a[0], a[1]),
             Some(Sys::Mprotect) => mprotect(cell, cx, a[0], a[1], a[2]),
+            Some(Sys::Sysinfo) => sysinfo(cx, a[0]),
+            Some(Sys::Statx) => files::statx(cx, a),
+            // One CPU: what a cell's threads may count on running at once.
+            Some(Sys::SchedGetaffinity) if a[1] < 8 => -EINVAL,
+            Some(Sys::SchedGetaffinity) => match put(cx, a[2], &1u64.to_le_bytes()) {
+                0 => 8,
+                e => e,
+            },
+            // Advice changes nothing for files in memory.
+            Some(Sys::Fadvise64) => match cx.fs.kind(a[0] as u32) {
+                Ok(rhizo_fs::Kind::Pipe | rhizo_fs::Kind::Socket) => -ESPIPE,
+                Ok(_) => 0,
+                Err(e) => -e.errno(),
+            },
             // Robust futex lists are never walked (no thread dies holding a
             // lock without its cell ending too: there are no signals).
             Some(Sys::SetRobustList) => 0,
@@ -710,16 +745,33 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell.brk as i64
 }
 
+/// The page permissions of `prot` (`PROT_READ` is implied).
+fn page_flags(prot: u64) -> PageFlags {
+    let mut pf = PageFlags::USER;
+    if prot & PROT_WRITE != 0 {
+        pf = pf | PageFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        pf = pf | PageFlags::NO_EXECUTE;
+    }
+    pf
+}
+
+/// `mmap`: anonymous private memory, or a private mapping of a file's
+/// pages (spec `linux-abi`, file mappings), at the next free address or,
+/// with `MAP_FIXED`, in place of whatever was mapped at the address given.
 fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     a: [u64; 6],
 ) -> i64 {
-    let (len, prot, flags) = (a[1], a[2], a[3]);
-    if len == 0 || flags & (MAP_ANONYMOUS | MAP_PRIVATE) != (MAP_ANONYMOUS | MAP_PRIVATE) {
-        return -EINVAL;
+    const MAP_SHARED: u64 = 0x01;
+    let (hint, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    let anonymous = flags & MAP_ANONYMOUS != 0;
+    if flags & MAP_SHARED != 0 && flags & MAP_PRIVATE == 0 && !anonymous {
+        return -ENODEV; // shared file mappings are not supported
     }
-    if flags & MAP_FIXED != 0 {
+    if len == 0 || flags & (MAP_SHARED | MAP_PRIVATE) != MAP_PRIVATE {
         return -EINVAL;
     }
     if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
@@ -731,31 +783,79 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     else {
         return -ENOMEM;
     };
-    let align = if len >= LARGE_PAGE_SIZE {
-        LARGE_PAGE_SIZE
+    // The file and its first page, checked before anything changes.
+    let file = if anonymous {
+        None
     } else {
-        FRAME_SIZE
+        if !offset.is_multiple_of(FRAME_SIZE) {
+            return -EINVAL;
+        }
+        match (cx.fs.kind(fd as u32), cx.fs.status_flags(fd as u32)) {
+            (Err(_), _) => return -EBADF,
+            (Ok(rhizo_fs::Kind::File), Ok(f)) if f & 3 != 1 => {}
+            (Ok(rhizo_fs::Kind::File), _) => return -EACCES, // write-only
+            _ => return -ENODEV,
+        }
+        match cx.fs.file(fd as u32) {
+            Ok((ino, _)) => Some((ino, offset / FRAME_SIZE)),
+            Err(e) => return -e.errno(),
+        }
     };
-    let addr = align_up(cell.mmap_next, align);
-    if addr.checked_add(len).is_none_or(|end| end > STACK_FLOOR) {
-        return -ENOMEM;
-    }
-    if prot != 0 {
-        if !cx.services.can_store(len) {
-            return -ENOMEM; // refused before any of it is zeroed
+    let fixed = flags & MAP_FIXED != 0;
+    let addr = if fixed {
+        if !hint.is_multiple_of(FRAME_SIZE) || hint.checked_add(len).is_none_or(|e| e > USER_END) {
+            return -EINVAL;
         }
-        let mut pf = PageFlags::USER;
-        if prot & PROT_WRITE != 0 {
-            pf = pf | PageFlags::WRITABLE;
+        if hint < FRAME_SIZE {
+            return -EPERM;
         }
-        if prot & PROT_EXEC == 0 {
-            pf = pf | PageFlags::NO_EXECUTE;
-        }
-        if space::map_anonymous(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, len, pf).is_err() {
+        hint
+    } else {
+        let align = if len >= LARGE_PAGE_SIZE && anonymous {
+            LARGE_PAGE_SIZE
+        } else {
+            FRAME_SIZE
+        };
+        let addr = align_up(cell.mmap_next, align);
+        if addr.checked_add(len).is_none_or(|end| end > STACK_FLOOR) {
             return -ENOMEM;
         }
+        addr
+    };
+    if prot != 0 && anonymous && !cx.services.can_store(len) {
+        return -ENOMEM; // refused before any of it is zeroed
     }
-    cell.mmap_next = addr + len;
+    if fixed {
+        // What was mapped there goes, as on Linux.
+        if space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, len).is_err() {
+            return -ENOMEM;
+        }
+        cx.pager.discard(addr, len);
+    }
+    let pf = page_flags(prot);
+    let mapped = match file {
+        _ if prot == 0 => Ok(()), // reserved (spec `linux-abi`)
+        None => space::map_anonymous(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, len, pf),
+        Some((ino, first)) => {
+            let (fs, pages) = (&*cx.fs, &mut *cx.pages);
+            space::map_frames(
+                &cx.pt,
+                cx.mem,
+                cx.tlb,
+                cx.frames,
+                addr,
+                len,
+                pf,
+                &mut |i, mem, frames| pages.frame(&fs.page(ino, first + i).ok()?, mem, frames),
+            )
+        }
+    };
+    if mapped.is_err() {
+        return -ENOMEM;
+    }
+    if !fixed || (addr >= MMAP_BASE && addr + len > cell.mmap_next && addr + len <= STACK_FLOOR) {
+        cell.mmap_next = addr + len;
+    }
     addr as i64
 }
 
@@ -775,6 +875,23 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         }
         Err(_) => -EINVAL,
     }
+}
+
+/// `sysinfo`: uptime, memory (from the kernel), one process; no swap, no
+/// load.
+fn sysinfo<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+) -> i64 {
+    let (total, free) = cx.services.memory();
+    let mut info = [0u8; 112];
+    let uptime = cx.services.monotonic_ns() / 1_000_000_000;
+    info[..8].copy_from_slice(&uptime.to_le_bytes());
+    info[32..40].copy_from_slice(&total.to_le_bytes());
+    info[40..48].copy_from_slice(&free.to_le_bytes());
+    info[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs
+    info[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
+    put(cx, addr, &info)
 }
 
 fn put<F: EntryFormat, M: PhysicalMemory, T, A, S>(
@@ -949,9 +1066,6 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
         return -EACCES; // cells are W^X
     }
-    if prot == 0 {
-        return -EINVAL; // inaccessible pages are not supported yet
-    }
     // Only the cell's own addresses (spec `isolation`): on x86_64 its table
     // also holds the kernel half, whose pages must never become the cell's.
     let Some(end) = addr
@@ -961,13 +1075,19 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     else {
         return -ENOMEM;
     };
-    let mut flags = PageFlags::USER;
-    if prot & PROT_WRITE != 0 {
-        flags = flags | PageFlags::WRITABLE;
+    if prot == 0 {
+        // Inaccessible pages hold nothing: their memory goes, and in the
+        // mapping area their addresses stay reserved (design D4 of
+        // `add-dynamic-linking`).
+        return match space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr) {
+            Ok(()) => {
+                cx.pager.discard(addr, end - addr);
+                0
+            }
+            Err(_) => -ENOMEM,
+        };
     }
-    if prot & PROT_EXEC == 0 {
-        flags = flags | PageFlags::NO_EXECUTE;
-    }
+    let flags = page_flags(prot);
     // Pages not in memory yet (lazy resume) are brought in first; holes
     // below the mapping cursor are reserved (`PROT_NONE`) addresses, backed
     // now (spec `linux-abi`, reserved mappings; design D6 of `add-threads`).
