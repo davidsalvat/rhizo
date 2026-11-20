@@ -11,7 +11,9 @@ use std::process::Command;
 mod expected {
     include!("../../cells/expected.rs");
 }
-use expected::{CPYTHON_ARGV, CPYTHON_STDOUT, Ending, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT};
+use expected::{
+    CPYTHON_ARGV, CPYTHON_STDOUT, DYNAMIC, Ending, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT,
+};
 
 /// Why the check cannot run on this host, if it cannot.
 pub fn unavailable_reason() -> Option<String> {
@@ -68,7 +70,51 @@ pub fn check(dir: &Path) -> Result {
         }
     }
     check_python(dir, &scratch)?;
-    check_cpython(&scratch)
+    check_cpython(&scratch)?;
+    check_dynamic()
+}
+
+/// The dynamically linked programs packed for cells (`crate::dynamic`), run
+/// natively from the top of their tree with an empty environment, as in a
+/// cell: each prints what `cells/expected.rs` says and exits with 0.
+fn check_dynamic() -> Result {
+    let roots = crate::dynamic::roots();
+    for &(path, argv, stdout) in DYNAMIC {
+        let Some(root) = roots.iter().find(|r| r.join(path).exists()) else {
+            crate::report::text(&format!("[xtask] {path} not packed: skipped"));
+            continue;
+        };
+        let program = root.join(path);
+        let out = Command::new(&program)
+            .arg0(argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", program.display()))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || text != stdout {
+            return Err(Failure::new(
+                "differential",
+                format!("`{path}` behaves differently on Linux"),
+            )
+            .location("cells/expected.rs (DYNAMIC)")
+            .expected(format!("exit 0, stdout {stdout:?}"))
+            .actual(format!(
+                "{:?}, stdout {text:?}, stderr {:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ))
+            .hint("Linux is the reference: fix the program or the expectation")
+            .reproduce(format!(
+                "cd {} && env -i {path} {}",
+                root.display(),
+                argv[1..].join(" ")
+            ))
+            .into_error());
+        }
+    }
+    Ok(())
 }
 
 /// CPython, when built: its files laid out on the host as in a cell

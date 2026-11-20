@@ -83,6 +83,68 @@ pub fn map_anonymous<F: EntryFormat>(
     result
 }
 
+/// Maps `len` bytes at `addr` (both 4 KiB aligned) with `flags`, page `i` to
+/// the frame `frame(i)` gives with a reference the mapping takes over
+/// (`None`: no memory). A frame another mapping still uses is mapped
+/// copy-on-write when `flags` is writable (spec `isolation`). On failure
+/// nothing stays mapped and every reference is returned.
+#[allow(clippy::too_many_arguments)]
+pub fn map_frames<F: EntryFormat, M: PhysicalMemory, A: Frames>(
+    pt: &PageTable<F>,
+    mem: &mut M,
+    tlb: &mut impl Tlb,
+    frames: &mut A,
+    addr: u64,
+    len: u64,
+    flags: PageFlags,
+    frame: &mut impl FnMut(u64, &mut M, &mut A) -> Option<u64>,
+) -> Result<(), MapError> {
+    if !addr.is_multiple_of(FRAME_SIZE) || !len.is_multiple_of(FRAME_SIZE) {
+        return Err(MapError::Misaligned);
+    }
+    if !is_user(addr, len) {
+        return Err(MapError::NonCanonical(addr));
+    }
+    let read_only = [PageFlags::USER, PageFlags::NO_EXECUTE]
+        .into_iter()
+        .filter(|&f| flags.contains(f))
+        .fold(PageFlags::empty(), PageFlags::union);
+    let mut done = 0;
+    let result = loop {
+        if done == len {
+            break Ok(());
+        }
+        let at = addr + done;
+        if let Err(e) = pt.unshare_path(mem, frames, at) {
+            break Err(e);
+        }
+        let Some(phys) = frame(done / FRAME_SIZE, mem, frames) else {
+            break Err(MapError::OutOfFrames);
+        };
+        let shared = frames.is_shared(phys);
+        let first = if shared { read_only } else { flags };
+        if let Err(e) = pt.map(
+            mem,
+            &mut || frames.alloc(),
+            at,
+            phys,
+            PageSize::Small,
+            first,
+        ) {
+            frames.free(phys, PageSize::Small);
+            break Err(e);
+        }
+        if shared && flags.is_writable() {
+            let _ = pt.protect(mem, tlb, at, flags | PageFlags::COPY_ON_WRITE);
+        }
+        done += FRAME_SIZE;
+    };
+    if result.is_err() {
+        let _ = unmap(pt, mem, tlb, frames, addr, done);
+    }
+    result
+}
+
 /// Grows the stack as Linux does on a fault: maps a zeroed, writable page at
 /// `addr` when it lies within [`STACK_LIMIT`] below [`STACK_TOP`] and is not
 /// mapped yet. Returns whether it did (`false` also when no frame is left).

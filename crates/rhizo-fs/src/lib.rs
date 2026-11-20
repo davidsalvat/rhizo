@@ -112,6 +112,32 @@ type Block = [u8; BLOCK];
 /// the kernel heap instead of spilling 16 bytes into a second one.
 type Shared = Arc<Box<Block>>;
 
+/// One page of a regular file as it is now, for mapping it into a cell
+/// (`mmap`, the loader): the file's block, held. While it is held, the
+/// block cannot change in place (a write to the file copies it first), so
+/// [`key`](Page::key) names these bytes and no others.
+#[derive(Debug, Clone)]
+pub struct Page {
+    block: Option<Shared>,
+    len: usize,
+}
+
+impl Page {
+    /// Identity of the page's contents: two pages alive at once have the
+    /// same key only if they hold the same bytes. `None` for a page with no
+    /// file data (a hole, or past the end), which reads as zeros.
+    pub fn key(&self) -> Option<(usize, usize)> {
+        let block = self.block.as_ref()?;
+        Some((Arc::as_ptr(block) as usize, self.len))
+    }
+
+    /// The file's bytes in this page (at most [`BLOCK`]); the rest of the
+    /// page reads as zero.
+    pub fn bytes(&self) -> &[u8] {
+        self.block.as_ref().map_or(&[], |b| &b[..self.len])
+    }
+}
+
 /// Contents of a regular file: blocks never written are holes (zeros).
 #[derive(Debug, Clone, Default)]
 struct File {
@@ -898,6 +924,44 @@ impl Tables {
             Target::Epoll(i) => object(i, Kind::Epoll),
             Target::Socket(h) => object(h, Kind::Socket),
         })
+    }
+
+    /// The regular file `fd` is open on, and its size, for mapping it.
+    pub fn file(&self, fd: Fd) -> Result<(Ino, u64)> {
+        let (ino, file, _) = self.file_of(fd)?;
+        Ok((ino, file.size))
+    }
+
+    /// The regular file `path` names, and its size (to start a program
+    /// from it).
+    pub fn file_at(&self, path: &[u8]) -> Result<(Ino, u64)> {
+        let ino = self.lookup(None, path)?;
+        match &self.inode(ino).node {
+            Node::File(f) => Ok((ino, f.size)),
+            Node::Dir { .. } => Err(Error::IsDir),
+            Node::Socket(_) => Err(Error::NoDevice),
+        }
+    }
+
+    /// Page `index` (of [`BLOCK`] bytes) of regular file `ino`, as it is
+    /// now; [`Error::BadFd`] if `ino` is no regular file.
+    pub fn page(&self, ino: Ino, index: u64) -> Result<Page> {
+        let Some(Node::File(file)) = self
+            .inodes
+            .get(ino as usize)
+            .and_then(Option::as_deref)
+            .map(|i| &i.node)
+        else {
+            return Err(Error::BadFd);
+        };
+        let at = index.saturating_mul(BLOCK as u64);
+        let len = file.size.saturating_sub(at).min(BLOCK as u64) as usize;
+        let block = usize::try_from(index)
+            .ok()
+            .and_then(|i| file.blocks.get(i))
+            .and_then(Clone::clone)
+            .filter(|_| len > 0);
+        Ok(Page { block, len })
     }
 
     /// `newfstatat` / `stat` by path.

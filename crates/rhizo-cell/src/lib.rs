@@ -12,7 +12,7 @@ pub mod memory;
 pub mod space;
 pub mod threads;
 
-use rhizo_hal::PhysicalMemory;
+use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageTable};
 use space::Frames;
 use threads::{Thread, Threads};
@@ -188,12 +188,131 @@ pub fn start<F: EntryFormat>(
     envp: &[&[u8]],
     random: [u8; 16],
 ) -> Result<Cell, elf::ElfError> {
+    let layout = Layout {
+        pc: image.entry,
+        aux: elf::Aux::of(image, 0),
+        brk_start: image.end(),
+        mmap_next: MMAP_BASE,
+    };
+    start_at(
+        id, &layout, machine, pt, kernel, mem, frames, argv, envp, random,
+    )
+}
+
+/// Where a position-independent executable is loaded (design D3 of
+/// `add-dynamic-linking`): low, so its heap grows a long way before the
+/// mappings at [`MMAP_BASE`], and a multiple of every segment alignment.
+pub const PIE_BASE: u64 = 0x0000_0001_0000_0000;
+
+/// Maps a program from its files' pages into a new hierarchy (spec `cells`,
+/// dynamically linked executables): the executable `main` at its own
+/// addresses, or at [`PIE_BASE`] if it is position independent, and its
+/// interpreter `interp` (position independent) at the first mapping
+/// address, aligned as it asks; mappings continue above it. Page `i` of
+/// the executable's file is `page(false, i)`, of the interpreter's
+/// `page(true, i)` (see [`elf::Image::map_file`], which also says what
+/// `code` is for). Returns the hierarchy (its user half only) and where the
+/// program starts. On failure every frame is returned.
+pub fn map_program<F: EntryFormat, M: PhysicalMemory, A: Frames>(
+    main: &elf::Image<'_>,
+    interp: Option<&elf::Image<'_>>,
+    mem: &mut M,
+    tlb: &mut impl Tlb,
+    frames: &mut A,
+    page: &mut impl FnMut(bool, u64, &mut M, &mut A) -> Option<u64>,
+    code: &mut impl FnMut(u64),
+) -> Result<(PageTable<F>, Layout), elf::ElfError> {
+    use rhizo_mm::{FRAME_SIZE, align_up};
+    if interp.is_some_and(|i| !i.relocatable || i.interpreter().is_some()) {
+        return Err(elf::ElfError::BadInterpreter);
+    }
+    let pt =
+        PageTable::<F>::new(mem, &mut || frames.alloc()).map_err(|_| elf::ElfError::OutOfMemory)?;
+    let bias = if main.relocatable { PIE_BASE } else { 0 };
+    let mut layout = Layout {
+        pc: main.entry + bias,
+        aux: elf::Aux::of(main, bias),
+        brk_start: main.end() + bias,
+        mmap_next: MMAP_BASE,
+    };
+    let mut mapped = main.map_file(
+        bias,
+        &pt,
+        mem,
+        tlb,
+        frames,
+        &mut |i, m, f| page(false, i, m, f),
+        code,
+    );
+    if let (Ok(()), Some(interp)) = (mapped, interp) {
+        // Its lowest page at the first mapping address.
+        let base = align_up(MMAP_BASE, interp.align).wrapping_sub(interp.span().start);
+        layout.pc = interp.entry.wrapping_add(base);
+        layout.aux.base = Some(base);
+        layout.mmap_next = align_up(interp.end().wrapping_add(base), FRAME_SIZE);
+        mapped = interp.map_file(
+            base,
+            &pt,
+            mem,
+            tlb,
+            frames,
+            &mut |i, m, f| page(true, i, m, f),
+            code,
+        );
+    }
+    match mapped {
+        Ok(()) => Ok((pt, layout)),
+        Err(e) => {
+            space::destroy(pt, mem, frames);
+            Err(e)
+        }
+    }
+}
+
+/// Where a program's images were loaded: what its first thread and its
+/// initial stack start from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// First instruction: the executable's entry, or its interpreter's.
+    pub pc: u64,
+    /// The auxiliary vector's account of the executable.
+    pub aux: elf::Aux,
+    /// Start of the heap: the end of the executable, page aligned.
+    pub brk_start: u64,
+    /// First address for mappings (above the interpreter, if any).
+    pub mmap_next: u64,
+}
+
+/// [`start`] for any `layout` of images loaded into `pt`.
+#[allow(clippy::too_many_arguments)]
+pub fn start_at<F: EntryFormat>(
+    id: u32,
+    layout: &Layout,
+    machine: elf::Machine,
+    pt: PageTable<F>,
+    kernel: Option<&PageTable<F>>,
+    mem: &mut impl PhysicalMemory,
+    frames: &mut impl Frames,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    random: [u8; 16],
+) -> Result<Cell, elf::ElfError> {
     if let Some(kernel) = kernel {
         pt.share_upper_half(mem, kernel);
     }
-    match elf::build_stack(&pt, mem, &mut || frames.alloc(), image, argv, envp, random) {
+    let stack = elf::build_stack(
+        &pt,
+        mem,
+        &mut || frames.alloc(),
+        &layout.aux,
+        argv,
+        envp,
+        random,
+    );
+    match stack {
         Ok(sp) => {
-            let mut cell = Cell::new(id, pt.root(), image.entry, sp, image.end());
+            let mut cell = Cell::new(id, pt.root(), layout.pc, sp, layout.brk_start);
+            cell.mmap_next = layout.mmap_next;
             cell.regs_mut().fp = FpState::initial(machine);
             Ok(cell)
         }
@@ -226,6 +345,54 @@ pub mod testing {
         live: BTreeMap<u64, (PageSize, u32)>,
         /// Allocations fail once this many are outstanding.
         pub limit: usize,
+    }
+
+    /// Builds an ELF file of `kind` (2: executable, 3: shared object) with
+    /// the given `(vaddr, flags, contents, mem_size)` segments, each placed
+    /// at file offset `0x1000 * (i + 1)`; entry at the first segment.
+    pub fn elf(machine: u16, kind: u16, segments: &[(u64, u32, &[u8], u64)]) -> Vec<u8> {
+        elf_with(machine, kind, segments, None)
+    }
+
+    /// [`elf`] with an interpreter path (`PT_INTERP`, stored at 0x800).
+    pub fn elf_with(
+        machine: u16,
+        kind: u16,
+        segments: &[(u64, u32, &[u8], u64)],
+        interp: Option<&[u8]>,
+    ) -> Vec<u8> {
+        const PT_LOAD: u32 = 1;
+        const PT_INTERP: u32 = 3;
+        let mut e = vec![0u8; 0x1000 * (segments.len() + 1)];
+        e[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        e[16..18].copy_from_slice(&kind.to_le_bytes());
+        e[18..20].copy_from_slice(&machine.to_le_bytes());
+        e[24..32].copy_from_slice(&segments[0].0.to_le_bytes());
+        e[32..40].copy_from_slice(&64u64.to_le_bytes());
+        e[54..56].copy_from_slice(&56u16.to_le_bytes());
+        e[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes());
+        for (i, &(vaddr, flags, data, mem_size)) in segments.iter().enumerate() {
+            let ph = 64 + i * 56;
+            let off = 0x1000 * (i + 1);
+            e[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+            e[ph + 4..ph + 8].copy_from_slice(&flags.to_le_bytes());
+            e[ph + 8..ph + 16].copy_from_slice(&(off as u64).to_le_bytes());
+            e[ph + 16..ph + 24].copy_from_slice(&vaddr.to_le_bytes());
+            e[ph + 32..ph + 40].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            e[ph + 40..ph + 48].copy_from_slice(&mem_size.to_le_bytes());
+            e.resize(e.len().max(off + data.len()), 0);
+            e[off..off + data.len()].copy_from_slice(data);
+        }
+        if let Some(path) = interp {
+            let ph = 64 + segments.len() * 56;
+            e[ph..ph + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+            e[ph + 8..ph + 16].copy_from_slice(&0x800u64.to_le_bytes());
+            let len = path.len() as u64 + 1;
+            e[ph + 32..ph + 40].copy_from_slice(&len.to_le_bytes());
+            e[0x800..0x800 + path.len()].copy_from_slice(path);
+            e[56..58].copy_from_slice(&(segments.len() as u16 + 1).to_le_bytes());
+        }
+        e
     }
 
     impl CountingFrames {
@@ -485,6 +652,156 @@ mod tests {
             space::destroy(PageTable::<X86_64>::from_root(root), &mut mem, &mut frames);
         }
         assert_eq!(frames.outstanding(), tables, "every frame returned");
+    }
+
+    /// A dynamically linked program mapped from its files' pages (designs
+    /// D2 and D3 of `add-dynamic-linking`): the executable at
+    /// [`PIE_BASE`], its interpreter at the first mapping address, whole
+    /// file pages shared (copy-on-write where writable), the page where
+    /// `.bss` starts private and cleared; started at the interpreter with
+    /// `AT_BASE`. Every frame comes back, also when memory runs out.
+    #[test]
+    fn a_program_and_its_interpreter_map_from_file_pages() {
+        use rhizo_hal::testing::RecordingTlb;
+        use std::collections::BTreeMap;
+        let mut main = elf::tests::elf_with(
+            62,
+            3,
+            &[
+                (0x1000, 5, b"CODE", 4),
+                (0x2000, 6, b"DATA", 0x1800),
+                (0x5000, 6, b"RELRO", 5),
+            ],
+            Some(b"/lib/ld.so"),
+        );
+        main[0x2004..0x2008].copy_from_slice(b"JUNK"); // past the data, in its page
+        let ld = elf::tests::elf_with(
+            62,
+            3,
+            &[(0, 5, b"LDSO", 4), (0x1000, 6, b"L", 0x3000)],
+            None,
+        );
+        let main_image =
+            elf::Image::parse_file(&main, main.len() as u64, elf::Machine::X86_64).unwrap();
+        let ld_image = elf::Image::parse_file(&ld, ld.len() as u64, elf::Machine::X86_64).unwrap();
+        let mut mem = FakePhysicalMemory::new();
+        let mut frames = CountingFrames::new(1024);
+        let mut tlb = RecordingTlb::default();
+        // A page cache: one frame per file page, a reference per mapping.
+        let cache = std::cell::RefCell::new(BTreeMap::new());
+        let files = [&main, &ld];
+        let mut page =
+            |interp: bool, i: u64, mem: &mut FakePhysicalMemory, frames: &mut CountingFrames| {
+                let known = cache.borrow().get(&(interp, i)).copied();
+                let phys = match known {
+                    Some(phys) => phys,
+                    None => {
+                        let phys = frames.alloc()?;
+                        mem.zero_frame(phys);
+                        let data = files[interp as usize];
+                        let lo = (i * 0x1000) as usize;
+                        let hi = (lo + 0x1000).min(data.len());
+                        memory::write_bytes(mem, phys, &data[lo..hi]);
+                        cache.borrow_mut().insert((interp, i), phys);
+                        phys
+                    }
+                };
+                frames.share(phys);
+                Some(phys)
+            };
+        let (pt, layout) = map_program::<X86_64, _, _>(
+            &main_image,
+            Some(&ld_image),
+            &mut mem,
+            &mut tlb,
+            &mut frames,
+            &mut page,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(layout.pc, MMAP_BASE, "the interpreter's entry");
+        assert_eq!(layout.aux.entry, PIE_BASE + 0x1000);
+        assert_eq!(layout.aux.base, Some(MMAP_BASE));
+        assert_eq!(layout.brk_start, PIE_BASE + 0x6000);
+        assert_eq!(layout.mmap_next, MMAP_BASE + 0x4000);
+        let at = |virt| pt.translate(&mem, virt).unwrap();
+        let cached = |interp, i| *cache.borrow().get(&(interp, i)).unwrap();
+        let code = at(PIE_BASE + 0x1000);
+        assert_eq!(code.phys, cached(false, 1));
+        assert!(code.flags.is_executable() && !code.flags.is_writable());
+        let data = at(PIE_BASE + 0x2000);
+        assert_ne!(data.phys, cached(false, 2), "private: its .bss is cleared");
+        assert!(data.flags.is_writable());
+        assert_eq!(
+            mem.read_u64(data.phys),
+            u64::from_le_bytes(*b"DATA\0\0\0\0")
+        );
+        assert_eq!(mem.read_u64(at(PIE_BASE + 0x3000).phys), 0, ".bss");
+        let relro = at(PIE_BASE + 0x5000);
+        assert_eq!(relro.phys, cached(false, 3), "shared until written");
+        assert!(relro.flags.contains(PageFlags::COPY_ON_WRITE) && !relro.flags.is_writable());
+        assert_eq!(at(MMAP_BASE).phys, cached(true, 1));
+        assert_eq!(mem.read_u64(at(MMAP_BASE + 0x1000).phys), u64::from(b'L'));
+        assert!(pt.translate(&mem, MMAP_BASE + 0x4000).is_none());
+
+        let kernel = PageTable::<X86_64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+        let cell = start_at(
+            9,
+            &layout,
+            elf::Machine::X86_64,
+            pt,
+            Some(&kernel),
+            &mut mem,
+            &mut frames,
+            &[b"prog"],
+            &[],
+            [0; 16],
+        )
+        .unwrap();
+        assert_eq!(
+            (cell.regs().pc, cell.brk, cell.mmap_next),
+            (MMAP_BASE, PIE_BASE + 0x6000, MMAP_BASE + 0x4000)
+        );
+        let mut aux = [0u8; 160]; // argc, argv, envp and the auxiliary vector
+        let pt = PageTable::<X86_64>::from_root(cell.root);
+        memory::copy_from(&pt, &mem, cell.regs().sp, &mut aux).unwrap();
+        let words: Vec<u64> = aux
+            .chunks(8)
+            .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert!(words.windows(2).any(|w| w == [7, MMAP_BASE]), "AT_BASE");
+        assert!(
+            words.windows(2).any(|w| w == [9, PIE_BASE + 0x1000]),
+            "AT_ENTRY"
+        );
+        space::destroy(pt, &mut mem, &mut frames);
+        let held = cache.borrow().len() + 1; // the cache's pages, the kernel's root
+        assert_eq!(
+            frames.outstanding(),
+            held,
+            "every frame of the cell returned"
+        );
+
+        // Out of memory part way: nothing is left behind but the cache.
+        for limit in 0..40 {
+            let before = frames.outstanding();
+            frames.limit = before + limit;
+            let r = map_program::<X86_64, _, _>(
+                &main_image,
+                Some(&ld_image),
+                &mut mem,
+                &mut tlb,
+                &mut frames,
+                &mut page,
+                &mut |_| {},
+            );
+            frames.limit = usize::MAX;
+            match r {
+                Ok((pt, _)) => space::destroy(pt, &mut mem, &mut frames),
+                Err(e) => assert_eq!(e, elf::ElfError::OutOfMemory),
+            }
+            assert_eq!(frames.outstanding(), before, "limit {limit}");
+        }
     }
 
     #[test]

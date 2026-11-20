@@ -1,10 +1,12 @@
-//! Static 64-bit ELF executables: validation, loading into a cell's address
-//! space, and the initial stack (System V ABI / Linux layout).
+//! 64-bit ELF executables: validation, loading into a cell's address
+//! space (static executables copied from their image, any executable or
+//! interpreter mapped from a file's pages), and the initial stack (System V
+//! ABI / Linux layout).
 
 use crate::memory::{self, write_bytes};
+use crate::space::{self, Frames};
 use crate::{STACK_PAGES, STACK_TOP, USER_END};
-use rhizo_hal::PhysicalMemory;
-use rhizo_mm::cow::Frames;
+use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_down, align_up};
 
@@ -38,9 +40,14 @@ pub enum ElfError {
     TooManySegments,
     /// No memory for the image or a page table.
     OutOfMemory,
+    /// The program's interpreter (`PT_INTERP`) is not in the cell's files,
+    /// or is not an interpreter that can be loaded.
+    BadInterpreter,
 }
 
 const MAX_SEGMENTS: usize = 8;
+/// Largest segment alignment a bias honors (larger ones get this).
+const LARGE_ALIGN: u64 = rhizo_mm::LARGE_PAGE_SIZE;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
@@ -58,9 +65,12 @@ pub struct Segment {
     pub flags: PageFlags,
 }
 
-/// A validated executable.
+/// A validated executable. Addresses are the file's own: a
+/// position-independent one ([`relocatable`](Self::relocatable)) is loaded
+/// at a bias added to each of them.
 #[derive(Debug, Clone, Copy)]
 pub struct Image<'a> {
+    /// The file, or its first bytes (headers and interpreter path).
     data: &'a [u8],
     /// Entry point.
     pub entry: u64,
@@ -69,6 +79,12 @@ pub struct Image<'a> {
     pub phdr_addr: u64,
     pub phnum: u64,
     pub phentsize: u64,
+    /// `ET_DYN`: a shared object or position-independent executable.
+    pub relocatable: bool,
+    /// Largest alignment a segment asks for (a bias is a multiple of it).
+    pub align: u64,
+    /// Where the interpreter's path (`PT_INTERP`) lies in `data`.
+    interp: Option<(usize, usize)>,
 }
 
 fn u16_at(d: &[u8], o: usize) -> Result<u16, ElfError> {
@@ -91,6 +107,26 @@ fn u64_at(d: &[u8], o: usize) -> Result<u64, ElfError> {
 impl<'a> Image<'a> {
     /// Validates `data` as a static executable for `machine`.
     pub fn parse(data: &'a [u8], machine: Machine) -> Result<Self, ElfError> {
+        Self::parse_with(data, data.len() as u64, machine, false)
+    }
+
+    /// Validates a file of `size` bytes starting with `head` as an
+    /// executable or shared object for `machine`, statically or dynamically
+    /// linked (spec `cells`, dynamically linked executables). Its program
+    /// headers and interpreter path must lie in `head`; its segments only in
+    /// the file.
+    pub fn parse_file(head: &'a [u8], size: u64, machine: Machine) -> Result<Self, ElfError> {
+        Self::parse_with(head, size, machine, true)
+    }
+
+    fn parse_with(
+        data: &'a [u8],
+        size: u64,
+        machine: Machine,
+        any: bool,
+    ) -> Result<Self, ElfError> {
+        const ET_EXEC: u16 = 2;
+        const ET_DYN: u16 = 3;
         if data.get(..6) != Some(b"\x7fELF\x02\x01") {
             return Err(ElfError::NotElf);
         }
@@ -102,9 +138,10 @@ impl<'a> Image<'a> {
             });
         }
         let kind = u16_at(data, 16)?;
-        if kind != 2 {
+        if kind != ET_EXEC && !(any && kind == ET_DYN) {
             return Err(ElfError::NotStaticExecutable(kind));
         }
+        let relocatable = kind == ET_DYN;
         let entry = u64_at(data, 24)?;
         let phoff = u64_at(data, 32)?;
         let phentsize = u16_at(data, 54)? as u64;
@@ -117,6 +154,8 @@ impl<'a> Image<'a> {
         let mut count = 0;
         let mut phdr_addr = None;
         let mut first_load = None;
+        let mut interp = None;
+        let mut align = FRAME_SIZE;
         for i in 0..phnum {
             let ph = i
                 .checked_mul(phentsize)
@@ -129,7 +168,17 @@ impl<'a> Image<'a> {
             let file_size = u64_at(data, ph + 32)?;
             let mem_size = u64_at(data, ph + 40)?;
             match p_type {
-                PT_INTERP | PT_DYNAMIC => return Err(ElfError::DynamicallyLinked),
+                PT_INTERP | PT_DYNAMIC if !any => return Err(ElfError::DynamicallyLinked),
+                PT_INTERP => {
+                    // A path ending in NUL, wholly in `data`.
+                    let path = usize::try_from(file_offset)
+                        .ok()
+                        .zip(usize::try_from(file_size).ok())
+                        .and_then(|(at, len)| Some((at, data.get(at..at.checked_add(len)?)?)))
+                        .ok_or(ElfError::Truncated)?;
+                    let len = path.1.iter().position(|&b| b == 0);
+                    interp = Some((path.0, len.ok_or(ElfError::BadInterpreter)?));
+                }
                 PT_PHDR => phdr_addr = Some(vaddr),
                 PT_LOAD => {
                     if p_flags & PF_W != 0 && p_flags & PF_X != 0 {
@@ -141,11 +190,22 @@ impl<'a> Image<'a> {
                     let file_end = file_offset
                         .checked_add(file_size)
                         .ok_or(ElfError::Truncated)?;
-                    if end > USER_END || vaddr < FRAME_SIZE || file_size > mem_size {
+                    // A relocatable image's addresses are checked once its
+                    // bias is known (`map_file`).
+                    let low = !relocatable && vaddr < FRAME_SIZE;
+                    if end > USER_END || low || file_size > mem_size {
                         return Err(ElfError::BadSegment { vaddr });
                     }
-                    if file_end > data.len() as u64 {
+                    // Pages map file pages: same offset within a page.
+                    if any && vaddr % FRAME_SIZE != file_offset % FRAME_SIZE {
+                        return Err(ElfError::BadSegment { vaddr });
+                    }
+                    if file_end > size {
                         return Err(ElfError::Truncated);
+                    }
+                    let p_align = u64_at(data, ph + 48)?;
+                    if p_align.is_power_of_two() && p_align <= LARGE_ALIGN {
+                        align = align.max(p_align);
                     }
                     let mut flags = PageFlags::USER;
                     if p_flags & PF_W != 0 {
@@ -197,7 +257,16 @@ impl<'a> Image<'a> {
                 .unwrap_or(0),
             phnum,
             phentsize,
+            relocatable,
+            align,
+            interp,
         })
+    }
+
+    /// The path of the program's interpreter (`PT_INTERP`), if it has one.
+    pub fn interpreter(&self) -> Option<&'a [u8]> {
+        let (at, len) = self.interp?;
+        self.data.get(at..at + len)
     }
 
     /// The loadable segments.
@@ -278,6 +347,116 @@ impl<'a> Image<'a> {
         }
         Ok(())
     }
+
+    /// Maps every segment, moved by `bias` (0 unless
+    /// [`relocatable`](Self::relocatable)), from the file's pages as Linux
+    /// does (design D2 of `add-dynamic-linking`): a page of the segment's
+    /// file part is the frame `page(i)` gives for page `i` of the file
+    /// (shared, copy-on-write where writable); the page where the file part
+    /// ends and `.bss` begins is a private copy with the `.bss` zeroed; the
+    /// pages of `.bss` alone are zeroed. `code(phys)` is called for each
+    /// private executable page written here. On failure the caller destroys
+    /// `pt`, which returns every frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_file<F: EntryFormat, M: PhysicalMemory, A: Frames>(
+        &self,
+        bias: u64,
+        pt: &PageTable<F>,
+        mem: &mut M,
+        tlb: &mut impl Tlb,
+        frames: &mut A,
+        page: &mut impl FnMut(u64, &mut M, &mut A) -> Option<u64>,
+        code: &mut impl FnMut(u64),
+    ) -> Result<(), ElfError> {
+        let span = self.span();
+        let fits = span
+            .start
+            .checked_add(bias)
+            .zip(span.end.checked_add(bias))
+            .is_some_and(|(lo, hi)| lo >= FRAME_SIZE && hi <= USER_END);
+        let moved = bias != 0 && (!self.relocatable || !bias.is_multiple_of(FRAME_SIZE));
+        if !fits || moved {
+            return Err(ElfError::BadSegment { vaddr: span.start });
+        }
+        let error = |vaddr| {
+            move |e| match e {
+                MapError::OutOfFrames => ElfError::OutOfMemory,
+                _ => ElfError::BadSegment { vaddr },
+            }
+        };
+        for s in self.segments() {
+            let start = bias + s.vaddr;
+            let first = align_down(start, FRAME_SIZE);
+            let file_end = start + s.file_size;
+            let end = align_up(start + s.mem_size, FRAME_SIZE);
+            // Page `first` holds file page `first_page`.
+            let first_page = s
+                .file_offset
+                .checked_sub(start - first)
+                .ok_or(ElfError::BadSegment { vaddr: s.vaddr })?
+                / FRAME_SIZE;
+            // Whole file pages: up to the page where `.bss` begins, or to
+            // the end of the last page when there is no `.bss`.
+            let shared_end = if s.file_size == 0 {
+                first
+            } else if s.mem_size > s.file_size {
+                align_down(file_end, FRAME_SIZE)
+            } else {
+                align_up(file_end, FRAME_SIZE)
+            };
+            if shared_end > first {
+                space::map_frames(
+                    pt,
+                    mem,
+                    tlb,
+                    frames,
+                    first,
+                    shared_end - first,
+                    s.flags,
+                    &mut |i, mem, frames| page(first_page + i, mem, frames),
+                )
+                .map_err(error(s.vaddr))?;
+            }
+            let mut zero_from = shared_end;
+            if zero_from < end && !file_end.is_multiple_of(FRAME_SIZE) && s.file_size > 0 {
+                // The page shared by the file's last bytes and `.bss`.
+                let index = first_page + (zero_from - first) / FRAME_SIZE;
+                let source = page(index, mem, frames).ok_or(ElfError::OutOfMemory)?;
+                let copy = frames.alloc();
+                if let Some(copy) = copy {
+                    let mut bytes = [0u8; FRAME_SIZE as usize];
+                    let keep = (file_end - zero_from) as usize;
+                    mem.read_bytes(source, &mut bytes[..keep]);
+                    mem.zero_frame(copy);
+                    write_bytes(mem, copy, &bytes[..keep]);
+                }
+                frames.free(source, PageSize::Small);
+                let copy = copy.ok_or(ElfError::OutOfMemory)?;
+                if let Err(e) = space::map_frames(
+                    pt,
+                    mem,
+                    tlb,
+                    frames,
+                    zero_from,
+                    FRAME_SIZE,
+                    s.flags,
+                    &mut |_, _, _| Some(copy),
+                ) {
+                    frames.free(copy, PageSize::Small);
+                    return Err(error(s.vaddr)(e));
+                }
+                if s.flags.is_executable() {
+                    code(copy);
+                }
+                zero_from += FRAME_SIZE;
+            }
+            if zero_from < end {
+                space::map_anonymous(pt, mem, tlb, frames, zero_from, end - zero_from, s.flags)
+                    .map_err(error(s.vaddr))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Auxiliary-vector keys used by Rhizo.
@@ -287,19 +466,47 @@ mod auxv {
     pub const AT_PHENT: u64 = 4;
     pub const AT_PHNUM: u64 = 5;
     pub const AT_PAGESZ: u64 = 6;
+    pub const AT_BASE: u64 = 7;
     pub const AT_ENTRY: u64 = 9;
     pub const AT_RANDOM: u64 = 25;
 }
 
+/// What the auxiliary vector tells a program about its executable, at the
+/// addresses it was loaded to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aux {
+    /// The executable's program headers (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`).
+    pub phdr: u64,
+    pub phent: u64,
+    pub phnum: u64,
+    /// The executable's entry point (`AT_ENTRY`).
+    pub entry: u64,
+    /// Where the interpreter was loaded (`AT_BASE`), if there is one.
+    pub base: Option<u64>,
+}
+
+impl Aux {
+    /// The values for `image` loaded at `bias`, without an interpreter.
+    pub fn of(image: &Image<'_>, bias: u64) -> Self {
+        Self {
+            phdr: image.phdr_addr.wrapping_add(bias),
+            phent: image.phentsize,
+            phnum: image.phnum,
+            entry: image.entry.wrapping_add(bias),
+            base: None,
+        }
+    }
+}
+
 /// Maps the stack below [`STACK_TOP`] (leaving the page under it unmapped as a
 /// guard) and writes the initial stack: `argc`, `argv`, `envp`, the auxiliary
-/// vector, the strings and 16 random bytes. Returns the initial stack pointer
-/// (16-byte aligned, pointing at `argc`).
+/// vector (`aux`), the strings and 16 random bytes. Returns the initial
+/// stack pointer (16-byte aligned, pointing at `argc`).
 pub fn build_stack<F: EntryFormat>(
     pt: &PageTable<F>,
     mem: &mut impl PhysicalMemory,
     alloc: &mut impl FnMut() -> Option<u64>,
-    image: &Image<'_>,
+    aux: &Aux,
     argv: &[&[u8]],
     envp: &[&[u8]],
     random: [u8; 16],
@@ -336,17 +543,24 @@ pub fn build_stack<F: EntryFormat>(
         string_addrs[i] = push_bytes(mem, s)?;
     }
 
-    let aux = [
-        (auxv::AT_PHDR, image.phdr_addr),
-        (auxv::AT_PHENT, image.phentsize),
-        (auxv::AT_PHNUM, image.phnum),
+    let all = [
+        (auxv::AT_PHDR, aux.phdr),
+        (auxv::AT_PHENT, aux.phent),
+        (auxv::AT_PHNUM, aux.phnum),
         (auxv::AT_PAGESZ, FRAME_SIZE),
-        (auxv::AT_ENTRY, image.entry),
+        (auxv::AT_BASE, aux.base.unwrap_or(0)),
+        (auxv::AT_ENTRY, aux.entry),
         (auxv::AT_RANDOM, random_addr),
         (auxv::AT_NULL, 0),
     ];
+    // `AT_BASE` only for a program with an interpreter (static ones keep
+    // the stack they had).
+    let aux = all
+        .iter()
+        .copied()
+        .filter(|&(key, _)| key != auxv::AT_BASE || aux.base.is_some());
     // argc + argv + NULL + envp + NULL + auxv pairs, as 8-byte words.
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + aux.len() * 2;
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + aux.clone().count() * 2;
     let sp = align_down(top - words as u64 * 8, 16);
     let mut at = sp;
     let mut put = |mem: &mut _, value: u64| -> Result<(), ElfError> {
@@ -377,31 +591,7 @@ pub(crate) mod tests {
     use rhizo_hal::testing::FakePhysicalMemory;
     use rhizo_mm::paging::Aarch64;
 
-    /// Builds a static ELF with the given `(vaddr, flags, contents, mem_size)`
-    /// segments, each placed at file offset `0x1000 * (i + 1)`.
-    pub(crate) fn elf(machine: u16, kind: u16, segments: &[(u64, u32, &[u8], u64)]) -> Vec<u8> {
-        let mut e = vec![0u8; 0x1000 * (segments.len() + 1)];
-        e[..6].copy_from_slice(b"\x7fELF\x02\x01");
-        e[16..18].copy_from_slice(&kind.to_le_bytes());
-        e[18..20].copy_from_slice(&machine.to_le_bytes());
-        e[24..32].copy_from_slice(&segments[0].0.to_le_bytes());
-        e[32..40].copy_from_slice(&64u64.to_le_bytes());
-        e[54..56].copy_from_slice(&56u16.to_le_bytes());
-        e[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes());
-        for (i, &(vaddr, flags, data, mem_size)) in segments.iter().enumerate() {
-            let ph = 64 + i * 56;
-            let off = 0x1000 * (i + 1);
-            e[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
-            e[ph + 4..ph + 8].copy_from_slice(&flags.to_le_bytes());
-            e[ph + 8..ph + 16].copy_from_slice(&(off as u64).to_le_bytes());
-            e[ph + 16..ph + 24].copy_from_slice(&vaddr.to_le_bytes());
-            e[ph + 32..ph + 40].copy_from_slice(&(data.len() as u64).to_le_bytes());
-            e[ph + 40..ph + 48].copy_from_slice(&mem_size.to_le_bytes());
-            e.resize(e.len().max(off + data.len()), 0);
-            e[off..off + data.len()].copy_from_slice(data);
-        }
-        e
-    }
+    pub(crate) use crate::testing::{elf, elf_with};
 
     const R_X: u32 = 5;
     const R_W: u32 = 6;
@@ -477,6 +667,58 @@ pub(crate) mod tests {
         (pt, mem, alloc)
     }
 
+    /// A dynamically linked program parses from its first bytes: position
+    /// independent, with its interpreter's path; a static parse still
+    /// refuses it, and a broken interpreter header is an error.
+    #[test]
+    fn programs_with_an_interpreter_parse_from_their_headers() {
+        let data = elf_with(
+            62,
+            3,
+            &[(0, R_X, b"CODE", 4), (0x1000, R_W, b"D", 0x1800)],
+            Some(b"/lib/ld.so"),
+        );
+        let head = &data[..0x1000];
+        let image = Image::parse_file(head, data.len() as u64, Machine::X86_64).unwrap();
+        assert!(image.relocatable);
+        assert_eq!(image.interpreter(), Some(&b"/lib/ld.so"[..]));
+        assert_eq!(image.span(), 0..0x3000);
+        assert_eq!(
+            Image::parse(&data, Machine::X86_64).unwrap_err(),
+            ElfError::NotStaticExecutable(3)
+        );
+        let exec = elf_with(62, 2, &[(0x40_0000, R_X, b"C", 1)], Some(b"/ld"));
+        assert_eq!(
+            Image::parse(&exec, Machine::X86_64).unwrap_err(),
+            ElfError::DynamicallyLinked
+        );
+        let image = Image::parse_file(&exec, exec.len() as u64, Machine::X86_64).unwrap();
+        assert!(!image.relocatable && image.interpreter() == Some(&b"/ld"[..]));
+
+        // The segments must be in the file, not in the head.
+        assert_eq!(
+            Image::parse_file(head, 0x1800, Machine::X86_64).unwrap_err(),
+            ElfError::Truncated
+        );
+        let mut unterminated = data.clone();
+        unterminated[0x800 + 10] = b'x';
+        assert_eq!(
+            Image::parse_file(&unterminated, data.len() as u64, Machine::X86_64).unwrap_err(),
+            ElfError::BadInterpreter
+        );
+        assert_eq!(
+            Image::parse_file(&data[..0x805], data.len() as u64, Machine::X86_64).unwrap_err(),
+            ElfError::Truncated,
+            "the path must be in the head"
+        );
+        // A page of the segment cannot be a page of the file.
+        let skewed = elf_with(62, 3, &[(0x10, R_X, b"C", 1)], None);
+        assert_eq!(
+            Image::parse_file(&skewed, skewed.len() as u64, Machine::X86_64).unwrap_err(),
+            ElfError::BadSegment { vaddr: 0x10 }
+        );
+    }
+
     /// Code may not end at the last canonical address: a `syscall` there
     /// returns to a non-canonical one (spec `isolation`).
     #[test]
@@ -509,6 +751,7 @@ pub(crate) mod tests {
             }
             bytes.splice(0..0, e);
             let _ = Image::parse(&bytes, Machine::Aarch64);
+            let _ = Image::parse_file(&bytes, phoff, Machine::Aarch64);
         }
     }
 
@@ -604,7 +847,7 @@ pub(crate) mod tests {
             &pt,
             &mut mem,
             &mut alloc,
-            &image,
+            &Aux::of(&image, 0),
             &[b"hello", b"-v"],
             &[b"A=1"],
             [7; 16],

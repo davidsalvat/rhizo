@@ -192,7 +192,7 @@ fn run(cmd: &mut Command, what: &str, log: &Path) -> Result {
         .into_error())
 }
 
-fn write_if_changed(path: &Path, data: &[u8]) -> Result {
+pub(crate) fn write_if_changed(path: &Path, data: &[u8]) -> Result {
     if std::fs::read(path).ok().as_deref() == Some(data) {
         return Ok(()); // unchanged: the kernel is not rebuilt for nothing
     }
@@ -214,7 +214,7 @@ fn encode(root: &Path) -> Result<Vec<u8>> {
 }
 
 /// Copies directory `dir` into `fs` at `at`, in name order.
-fn add_tree(fs: &mut rhizo_fs::Fs, dir: &Path, at: &str) -> Result {
+pub(crate) fn add_tree(fs: &mut rhizo_fs::Fs, dir: &Path, at: &str) -> Result {
     let failed = |e: rhizo_fs::Error| format!("cannot add {at} to the cell's files: {e:?}");
     fs.mkdir(None, at.as_bytes()).map_err(failed)?;
     let mut entries: Vec<_> = std::fs::read_dir(dir)
