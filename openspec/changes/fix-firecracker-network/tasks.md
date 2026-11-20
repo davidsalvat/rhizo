@@ -11,4 +11,4 @@
 
 ## 3. Verification
 
-- [ ] 3.1 CI green; the bench job measures `net.tcp_rtt_us/firecracker` and the Firecracker in-kernel steps run `a_cell_reaches_the_host`; verify the job log and `bench-results` annotations, and `openspec validate fix-firecracker-network --strict`
+- [x] 3.1 CI green; the bench job measures `net.tcp_rtt_us/firecracker` and the Firecracker in-kernel steps run `a_cell_reaches_the_host`; verify the job log and `bench-results` annotations, and `openspec validate fix-firecracker-network --strict`
