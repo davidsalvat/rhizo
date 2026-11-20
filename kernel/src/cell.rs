@@ -1723,7 +1723,18 @@ fn wire_rtt() -> Result<u64, alloc::string::String> {
         host.finished.clear();
         let t0 = Counter.cycles();
         let id = host.spawn(image, &argv, true, false).expect("spawn");
-        host.run(|h| h.finished(id).is_some());
+        // A connection that never answers must not stop the benchmarks.
+        let end = now_ns().saturating_add(10_000_000_000);
+        host.run(|h| h.finished(id).is_some() || now_ns() > end);
+        if host.finished(id).is_none() {
+            let said = alloc::string::String::from_utf8_lossy(host.output(id).unwrap_or_default())
+                .into_owned();
+            host.kill(id);
+            return Err(alloc::format!(
+                "no answer from the echo server in 10 s: {}",
+                said.trim().replace('\n', " | ")
+            ));
+        }
         match host.finished(id) {
             Some(f) if f.ending == Ending::Exit(0) => {}
             f => {
@@ -1731,7 +1742,7 @@ fn wire_rtt() -> Result<u64, alloc::string::String> {
                     f.map(|f| alloc::string::String::from_utf8_lossy(&f.output).into_owned());
                 return Err(alloc::format!(
                     "the echo server did not answer: {}",
-                    said.unwrap_or_default().trim()
+                    said.unwrap_or_default().trim().replace('\n', " | ")
                 ));
             }
         }
