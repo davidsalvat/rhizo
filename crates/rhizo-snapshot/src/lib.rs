@@ -31,7 +31,7 @@ use alloc::vec::Vec;
 use rhizo_cell::elf::Machine;
 use rhizo_cell::space::Frames;
 use rhizo_cell::threads::{Thread, Threads, Wait};
-use rhizo_cell::{Cell, Registers};
+use rhizo_cell::{Cell, Registers, USER_END};
 use rhizo_fs::Fs;
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
@@ -47,8 +47,6 @@ const THREAD: usize = THREAD_WORDS * 8;
 const RECORD: usize = 24;
 /// "No deadline" in a thread's time left.
 const NO_DEADLINE: u64 = u64::MAX;
-/// Highest user address + 1.
-const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Why bytes are not a snapshot this kernel can resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +67,10 @@ pub enum FormatError {
     BadThread { index: usize },
     /// The files section does not decode to a consistent file system.
     BadFiles,
+    /// Registers the kernel cannot enter safely: a program counter (or, on
+    /// x86_64, a thread pointer) outside the cell's addresses, or reserved
+    /// `MXCSR` bits, any of which would fault in the kernel itself.
+    BadState,
 }
 
 /// The plain state of a suspended cell besides its memory and threads.
@@ -240,7 +242,7 @@ impl Snapshot {
         if snapshot.bytes.len() < data_start {
             return Err(FormatError::Truncated);
         }
-        snapshot.check_threads()?;
+        snapshot.check_threads(machine)?;
         let mut expected_offset = 0u64;
         let mut prev_end = 0u64;
         for index in 0..pages {
@@ -310,7 +312,7 @@ impl Snapshot {
     }
 
     /// Validates the threads (`from_bytes`; the size was checked).
-    fn check_threads(&self) -> Result<(), FormatError> {
+    fn check_threads(&self, machine: Machine) -> Result<(), FormatError> {
         let next_tid = u64_at(&self.bytes, HEADER + 24);
         if self.thread_count() == 0 {
             return Err(FormatError::BadThread { index: 0 });
@@ -333,6 +335,16 @@ impl Snapshot {
             if !wait_ok || tid == 0 || tid >= next_tid || next_tid > 1 << 31 || tids.contains(&tid)
             {
                 return Err(FormatError::BadThread { index });
+            }
+            // Registers that would fault in the kernel on entry: a program
+            // counter (or, on x86_64, a thread pointer) outside the cell's
+            // addresses, or reserved MXCSR bits. MXCSR is bytes 24-27 of the
+            // FXSAVE image (bits 16-31 reserved); bytes 28-31 are
+            // MXCSR_MASK, which FXSAVE fills and FXRSTOR ignores.
+            let (pc, tls, mxcsr) = (w(6), w(39), w(41 + 3) as u32);
+            let x86 = machine == Machine::X86_64;
+            if pc >= USER_END || x86 && (tls >= USER_END || mxcsr >> 16 != 0) {
+                return Err(FormatError::BadState);
             }
             tids.push(tid);
         }

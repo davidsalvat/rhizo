@@ -264,6 +264,35 @@ fn file_data_is_limited_per_cell() {
     assert_eq!(fs.data_bytes(), 0);
 }
 
+/// A cell cannot nest or multiply names without bound (spec `isolation`):
+/// past `INODES_MAX` files and directories, creating fails with `ENOSPC`,
+/// and removing one makes room again.
+#[test]
+fn files_and_directories_are_limited_per_cell() {
+    let mut fs = Fs::new();
+    let name = [b'd'; NAME_MAX];
+    for _ in 1..INODES_MAX / 2 {
+        fs.mkdir(None, &name).unwrap();
+        fs.chdir(&name).unwrap();
+    }
+    for i in 0..=INODES_MAX / 2 {
+        let file = format!("f{i}");
+        match fs.open(None, file.as_bytes(), RW, 2) {
+            Ok(fd) => fs.close(fd).unwrap(),
+            Err(e) => {
+                assert_eq!(e, Error::NoSpace);
+                assert_eq!(e.errno(), 28);
+                assert_eq!(fs.mkdir(None, b"one more"), Err(Error::NoSpace));
+                fs.unlink(None, b"f0", false).unwrap();
+                fs.mkdir(None, b"one more").unwrap();
+                assert!(fs.getcwd().len() < INODES_MAX * (NAME_MAX + 1));
+                return;
+            }
+        }
+    }
+    panic!("no limit on files");
+}
+
 #[test]
 fn rename_replaces_and_refuses_cycles() {
     let mut fs = Fs::new();

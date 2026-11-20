@@ -16,8 +16,13 @@ use rhizo_mm::paging::{EntryFormat, PageTable};
 use space::Frames;
 use threads::{Thread, Threads};
 
+/// End (exclusive) of the addresses a cell may use or name in a system
+/// call (spec `isolation`): the lower half without its last page, as on
+/// Linux, so no instruction can end at the last canonical address (a
+/// `syscall` there would return to a non-canonical one).
+pub const USER_END: u64 = 0x0000_7fff_ffff_f000;
 /// Top of a cell's stack (exclusive); the stack grows down from here.
-pub const STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
+pub const STACK_TOP: u64 = USER_END;
 /// Stack pages mapped when a cell starts.
 pub const STACK_PAGES: u64 = 16;
 /// First address used for anonymous mappings (`mmap`).

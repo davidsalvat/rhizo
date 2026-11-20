@@ -1,6 +1,7 @@
 //! Access to a cell's memory through its page tables, with the permission
 //! checks the kernel needs for system calls (`EFAULT` instead of a crash).
 
+use crate::USER_END;
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 
@@ -26,7 +27,9 @@ fn user_phys<F: EntryFormat>(
 
 /// Calls `f(phys, offset, len)` for each page-contiguous piece of the user
 /// range `addr..addr + len`, translating once per page. Stops at the first
-/// address that is not accessible.
+/// address that is not accessible. A range reaching past [`USER_END`] is
+/// refused before any piece, whatever the page table says: kernel memory is
+/// never a cell's, even if a mapping were wrong (spec `isolation`).
 fn for_each_piece<F: EntryFormat, M: PhysicalMemory>(
     pt: &PageTable<F>,
     mem: &mut M,
@@ -35,9 +38,16 @@ fn for_each_piece<F: EntryFormat, M: PhysicalMemory>(
     write: bool,
     mut f: impl FnMut(&mut M, u64, usize, usize),
 ) -> Result<(), Fault> {
+    if len > 0
+        && addr
+            .checked_add(len as u64)
+            .is_none_or(|end| end > USER_END)
+    {
+        return Err(Fault(addr.max(USER_END)));
+    }
     let mut done = 0;
     while done < len {
-        let at = addr.checked_add(done as u64).ok_or(Fault(addr))?;
+        let at = addr + done as u64;
         let (phys, room) = user_phys(pt, mem, at, write)?;
         let n = (len - done).min(room as usize);
         f(mem, phys, done, n);
@@ -267,5 +277,51 @@ mod tests {
         let mut two = [0u8; 2];
         copy_from(&pt, &mem, 0x1ffe, &mut two).unwrap();
         assert_eq!(two, [0, 0]);
+    }
+
+    /// Kernel memory mapped as if it were the cell's (a wrong user entry, as
+    /// a bug in a mapping call could leave): still never copied.
+    fn kernel_mapped_for_the_user() -> (PageTable<Aarch64>, FakePhysicalMemory) {
+        let (pt, mut mem) = setup();
+        let mut next = 0x200_0000;
+        let mut alloc = || {
+            next += 0x1000;
+            Some(next)
+        };
+        let rw = PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+        for (virt, phys) in [
+            (0xffff_8000_0000_0000, 0x90_0000),
+            (USER_END, 0x91_0000),
+            (USER_END - 0x1000, 0x92_0000),
+        ] {
+            pt.map(&mut mem, &mut alloc, virt, phys, PageSize::Small, rw)
+                .unwrap();
+        }
+        (pt, mem)
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ranges_outside_the_user_half_are_refused(
+            addr in proptest::prop_oneof![
+                USER_END - 0x2000..USER_END + 0x2000,
+                0xffff_8000_0000_0000u64..0xffff_8000_0000_2000,
+                proptest::prelude::any::<u64>(),
+            ],
+            len in 1usize..0x3000,
+        ) {
+            let (pt, mut mem) = kernel_mapped_for_the_user();
+            let mut buf = vec![0x77u8; len];
+            let past = addr.checked_add(len as u64).is_none_or(|end| end > USER_END);
+            let read = copy_from(&pt, &mem, addr, &mut buf);
+            let wrote = copy_to(&pt, &mut mem, addr, &buf);
+            if past {
+                proptest::prop_assert_eq!(read, Err(Fault(addr.max(USER_END))));
+                proptest::prop_assert_eq!(wrote, Err(Fault(addr.max(USER_END))));
+            }
+            for phys in [0x90_0000, 0x91_0000] {
+                proptest::prop_assert_eq!(mem.read_u64(phys), 0, "kernel memory untouched");
+            }
+        }
     }
 }

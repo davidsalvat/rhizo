@@ -186,9 +186,47 @@ fn rejects_what_it_cannot_resume() {
     b[rec0 + 2 * RECORD + 16] = 1;
     b[rec0 + 2 * RECORD..rec0 + 2 * RECORD + 8].copy_from_slice(&0x4000_0000_1000u64.to_le_bytes());
     check(b, FormatError::BadPage { index: 2 }); // misaligned 2 MiB page
-    let mut b = good;
+    let mut b = good.clone();
     b[rec0..rec0 + 8].copy_from_slice(&0xffff_8000_0000_0000u64.to_le_bytes());
     check(b, FormatError::BadPage { index: 0 }); // kernel address
+    // Registers that would fault in the kernel when entered (spec
+    // `isolation`): a kernel or non-canonical program counter.
+    for pc in [USER_END, 0x0000_8000_0000_0000, 0xffff_8000_0000_0000] {
+        let mut b = good.clone();
+        let at = HEADER + STATE + 6 * 8; // the first thread's program counter
+        b[at..at + 8].copy_from_slice(&pc.to_le_bytes());
+        check(b, FormatError::BadState);
+    }
+}
+
+/// On x86_64 the thread pointer goes to the FS base and the FP image to
+/// `FXRSTOR`: a non-canonical base or reserved `MXCSR` bits would fault in
+/// the kernel, so such a snapshot is refused.
+#[test]
+fn x86_64_state_that_would_fault_in_the_kernel_is_refused() {
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let c = cell::<X86_64>(&mut mem, &mut frames);
+    let good = Snapshot::capture::<X86_64>(Machine::X86_64, &c, &Fs::new(), 0, &mem).into_bytes();
+    assert!(Snapshot::from_bytes(good.clone(), Machine::X86_64).is_ok());
+    // The first thread's words: tls is word 39, the FP image from word 41.
+    let tls = HEADER + STATE + 39 * 8;
+    let mxcsr = HEADER + STATE + (41 + 3) * 8;
+    for (at, value) in [
+        (tls, 0x8000_0000_0000_0000u64),
+        (tls, USER_END),
+        (mxcsr, 1 << 16),
+    ] {
+        let mut b = good.clone();
+        b[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        assert_eq!(
+            Snapshot::from_bytes(b, Machine::X86_64),
+            Err(FormatError::BadState)
+        );
+    }
+    // MXCSR_MASK (bytes 28-31), as a real FXSAVE writes it, is accepted.
+    let mut b = good;
+    b[mxcsr..mxcsr + 8].copy_from_slice(&(0xffbf_u64 << 32 | 0x1f80).to_le_bytes());
+    assert!(Snapshot::from_bytes(b, Machine::X86_64).is_ok());
 }
 
 #[test]

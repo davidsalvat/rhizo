@@ -314,3 +314,30 @@ proptest! {
         model_check::<X86_64>(&ops);
     }
 }
+
+/// A cell sharing the kernel half (x86_64): a write fault or a mapping change
+/// at a kernel address is never "resolved", and no kernel table changes.
+#[test]
+fn kernel_half_is_never_made_writable_or_private() {
+    let mut w = World::<X86_64>::new();
+    let kernel = w.table();
+    let kernel_rw = PageFlags::WRITABLE.union(PageFlags::NO_EXECUTE);
+    let read_only = PageFlags::empty();
+    w.map(&kernel, 0xffff_8000_0000_0000, PageSize::Small, kernel_rw);
+    w.map(&kernel, 0xffff_ffff_8000_0000, PageSize::Small, read_only);
+    let cell = w.table();
+    cell.share_upper_half(&mut w.mem, &kernel);
+    let before = w.mem.clone();
+    for virt in [
+        0xffff_8000_0000_0000,
+        0xffff_ffff_8000_0000,
+        0xffff_8000_0001_0000,
+    ] {
+        assert_eq!(
+            cell.resolve_write(&mut w.mem, &mut w.frames, virt),
+            Ok(false)
+        );
+        cell.unshare_path(&mut w.mem, &mut w.frames, virt).unwrap();
+    }
+    assert!(w.mem == before, "no kernel entry changed");
+}

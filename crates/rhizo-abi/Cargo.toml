@@ -16,6 +16,7 @@ rhizo-cell = { path = "../rhizo-cell" }
 rhizo-fs = { path = "../rhizo-fs" }
 
 [dev-dependencies]
+proptest = "1"
 rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
 rhizo-cell = { path = "../rhizo-cell", features = ["testing"] }
 

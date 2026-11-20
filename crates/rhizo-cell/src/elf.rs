@@ -2,7 +2,7 @@
 //! space, and the initial stack (System V ABI / Linux layout).
 
 use crate::memory::{self, write_bytes};
-use crate::{STACK_PAGES, STACK_TOP};
+use crate::{STACK_PAGES, STACK_TOP, USER_END};
 use rhizo_hal::PhysicalMemory;
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, align_down, align_up};
@@ -46,8 +46,6 @@ const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
-/// Highest user address + 1 (lower half of a 48-bit address space).
-const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// One loadable segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,17 +71,17 @@ pub struct Image<'a> {
 }
 
 fn u16_at(d: &[u8], o: usize) -> Result<u16, ElfError> {
-    let b = d.get(o..o + 2).ok_or(ElfError::Truncated)?;
+    let b = d.get(o..o.saturating_add(2)).ok_or(ElfError::Truncated)?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn u32_at(d: &[u8], o: usize) -> Result<u32, ElfError> {
-    let b = d.get(o..o + 4).ok_or(ElfError::Truncated)?;
+    let b = d.get(o..o.saturating_add(4)).ok_or(ElfError::Truncated)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn u64_at(d: &[u8], o: usize) -> Result<u64, ElfError> {
-    let b = d.get(o..o + 8).ok_or(ElfError::Truncated)?;
+    let b = d.get(o..o.saturating_add(8)).ok_or(ElfError::Truncated)?;
     Ok(u64::from_le_bytes([
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
     ]))
@@ -119,7 +117,10 @@ impl<'a> Image<'a> {
         let mut phdr_addr = None;
         let mut first_load = None;
         for i in 0..phnum {
-            let ph = (phoff + i * phentsize) as usize;
+            let ph = i
+                .checked_mul(phentsize)
+                .and_then(|at| at.checked_add(phoff))
+                .ok_or(ElfError::Truncated)? as usize;
             let p_type = u32_at(data, ph)?;
             let p_flags = u32_at(data, ph + 4)?;
             let file_offset = u64_at(data, ph + 8)?;
@@ -190,7 +191,9 @@ impl<'a> Image<'a> {
             data,
             entry,
             segments,
-            phdr_addr: phdr_addr.or(first_load.map(|v| v + phoff)).unwrap_or(0),
+            phdr_addr: phdr_addr
+                .or(first_load.map(|v| v.wrapping_add(phoff)))
+                .unwrap_or(0),
             phnum,
             phentsize,
         })
@@ -440,6 +443,41 @@ pub(crate) mod tests {
         };
         let pt = PageTable::new(&mut mem, &mut alloc).unwrap();
         (pt, mem, alloc)
+    }
+
+    /// Code may not end at the last canonical address: a `syscall` there
+    /// returns to a non-canonical one (spec `isolation`).
+    #[test]
+    fn the_last_page_of_the_lower_half_is_refused() {
+        let last = elf(62, 2, &[(USER_END, R_X, &[0x0f, 0x05], 0x1000)]);
+        assert_eq!(
+            Image::parse(&last, Machine::X86_64).unwrap_err(),
+            ElfError::BadSegment { vaddr: USER_END }
+        );
+        let below = elf(62, 2, &[(USER_END - 0x1000, R_X, &[0x0f, 0x05], 0x1000)]);
+        assert!(Image::parse(&below, Machine::X86_64).is_ok());
+    }
+
+    proptest::proptest! {
+        /// Any bytes, however broken their headers, parse to an image or an
+        /// error, never a panic.
+        #[test]
+        fn hostile_headers_never_panic(
+            mut bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..400),
+            phoff in proptest::prelude::any::<u64>(),
+            phnum in proptest::prelude::any::<u16>(),
+            phentsize in proptest::prelude::any::<u16>(),
+        ) {
+            let mut e = sample();
+            e.truncate(e.len().min(64 + bytes.len()));
+            if e.len() >= 64 {
+                e[32..40].copy_from_slice(&phoff.to_le_bytes());
+                e[54..56].copy_from_slice(&phentsize.to_le_bytes());
+                e[56..58].copy_from_slice(&phnum.to_le_bytes());
+            }
+            bytes.splice(0..0, e);
+            let _ = Image::parse(&bytes, Machine::Aarch64);
+        }
     }
 
     #[test]

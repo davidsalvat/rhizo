@@ -1,6 +1,7 @@
 //! A cell's address space: anonymous mappings (with 2 MiB pages when the
 //! region allows it), unmapping, and teardown that returns every frame.
 
+use crate::USER_END;
 use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
@@ -14,11 +15,20 @@ pub enum UnmapError {
     PartialLargePage(u64),
     /// No memory to make a shared page table private.
     OutOfMemory,
+    /// The range reaches past the cell's addresses ([`USER_END`]).
+    NotUser,
+}
+
+/// Whether `addr..addr + len` lies within the cell's addresses.
+fn is_user(addr: u64, len: u64) -> bool {
+    addr.checked_add(len).is_some_and(|end| end <= USER_END)
 }
 
 /// Maps `len` bytes at `addr` (both 4 KiB aligned) to fresh zeroed memory with
 /// `flags`. 2 MiB-aligned 2 MiB pieces use 2 MiB pages when a 2 MiB frame is
 /// available. On failure nothing stays mapped and every frame is returned.
+/// A range past [`USER_END`] is refused (`NonCanonical`): it would reach the
+/// kernel half.
 pub fn map_anonymous<F: EntryFormat>(
     pt: &PageTable<F>,
     mem: &mut impl PhysicalMemory,
@@ -30,6 +40,9 @@ pub fn map_anonymous<F: EntryFormat>(
 ) -> Result<(), MapError> {
     if !addr.is_multiple_of(FRAME_SIZE) || !len.is_multiple_of(FRAME_SIZE) {
         return Err(MapError::Misaligned);
+    }
+    if !is_user(addr, len) {
+        return Err(MapError::NonCanonical(addr));
     }
     let mut done = 0;
     let result = loop {
@@ -70,8 +83,9 @@ pub fn map_anonymous<F: EntryFormat>(
     result
 }
 
-/// Unmaps every page in `addr..addr + len` (holes are skipped) and returns its
-/// frames. Fails, changing nothing, if the range would split a 2 MiB page.
+/// Unmaps every page in `addr..addr + len` (holes are skipped, a whole empty
+/// table entry at a time) and returns its frames. Fails, changing nothing,
+/// if the range would split a 2 MiB page or reaches past [`USER_END`].
 pub fn unmap<F: EntryFormat>(
     pt: &PageTable<F>,
     mem: &mut impl PhysicalMemory,
@@ -80,7 +94,10 @@ pub fn unmap<F: EntryFormat>(
     addr: u64,
     len: u64,
 ) -> Result<(), UnmapError> {
-    let end = addr.saturating_add(len);
+    if !is_user(addr, len) {
+        return Err(UnmapError::NotUser);
+    }
+    let end = addr + len;
     // First pass: refuse ranges that would split a 2 MiB page.
     let mut at = addr;
     while at < end {
@@ -92,7 +109,7 @@ pub fn unmap<F: EntryFormat>(
                 }
                 at = base + t.size.bytes();
             }
-            None => at = (at & !(FRAME_SIZE - 1)) + FRAME_SIZE,
+            None => at = pt.hole_end(mem, at).unwrap_or(at + FRAME_SIZE),
         }
     }
     let mut at = addr;
@@ -106,7 +123,7 @@ pub fn unmap<F: EntryFormat>(
                 frames.free(phys, size);
                 at = (at & !(size.bytes() - 1)) + size.bytes();
             }
-            Err(_) => at = (at & !(FRAME_SIZE - 1)) + FRAME_SIZE,
+            Err(_) => at = pt.hole_end(mem, at).unwrap_or(at + FRAME_SIZE),
         }
     }
     Ok(())
@@ -114,7 +131,8 @@ pub fn unmap<F: EntryFormat>(
 
 /// Changes the permissions of every page in `addr..addr + len` (spec
 /// `linux-abi`, `mprotect`). Fails, changing nothing, if a page in the range
-/// is not mapped or the range splits a 2 MiB page.
+/// is not mapped (anything past [`USER_END`] counts as not mapped) or the
+/// range splits a 2 MiB page.
 pub fn protect<F: EntryFormat>(
     pt: &PageTable<F>,
     mem: &mut impl PhysicalMemory,
@@ -124,7 +142,10 @@ pub fn protect<F: EntryFormat>(
     len: u64,
     flags: PageFlags,
 ) -> Result<(), ProtectError> {
-    let end = addr.saturating_add(len);
+    if !is_user(addr, len) {
+        return Err(ProtectError::NotMapped(addr.max(USER_END)));
+    }
+    let end = addr + len;
     let mut at = addr;
     while at < end {
         let t = pt.translate(mem, at).ok_or(ProtectError::NotMapped(at))?;
@@ -138,6 +159,16 @@ pub fn protect<F: EntryFormat>(
     while at < end {
         pt.unshare_path(mem, frames, at)
             .map_err(|_| ProtectError::OutOfMemory)?;
+        // A frame other cells still use (a read-only page after a fork)
+        // becomes writable only through a private copy (spec `isolation`).
+        let shared = pt
+            .translate(mem, at)
+            .is_some_and(|t| frames.is_shared(t.phys & !(t.size.bytes() - 1)));
+        let flags = if shared && flags.is_writable() {
+            flags | PageFlags::COPY_ON_WRITE
+        } else {
+            flags
+        };
         let size = pt
             .protect(mem, tlb, at, flags)
             .map_err(|_| ProtectError::NotMapped(at))?;
@@ -266,6 +297,103 @@ mod tests {
         assert_eq!(frames.outstanding(), 0);
     }
 
+    /// A cell sharing a kernel half (as on x86_64): nothing here reaches it,
+    /// and a huge empty range costs one step per empty table entry.
+    fn the_kernel_half_is_out_of_reach<F: EntryFormat>() {
+        let (pt, mut mem, mut tlb, mut frames) = setup::<F>();
+        let kernel = PageTable::<F>::new(&mut mem, &mut || frames.alloc()).unwrap();
+        let k = frames.alloc().unwrap();
+        kernel
+            .map(
+                &mut mem,
+                &mut || frames.alloc(),
+                0xffff_8000_0000_0000,
+                k,
+                PageSize::Small,
+                PageFlags::WRITABLE,
+            )
+            .unwrap();
+        pt.share_upper_half(&mut mem, &kernel);
+        let before = mem.clone();
+        let kaddr = 0xffff_8000_0000_0000;
+        assert_eq!(
+            unmap(&pt, &mut mem, &mut tlb, &mut frames, kaddr, FRAME_SIZE),
+            Err(UnmapError::NotUser)
+        );
+        assert_eq!(
+            protect(&pt, &mut mem, &mut tlb, &mut frames, kaddr, FRAME_SIZE, RW),
+            Err(ProtectError::NotMapped(kaddr))
+        );
+        assert_eq!(
+            map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, kaddr, FRAME_SIZE, RW),
+            Err(MapError::NonCanonical(kaddr))
+        );
+        assert_eq!(
+            map_anonymous(
+                &pt,
+                &mut mem,
+                &mut tlb,
+                &mut frames,
+                USER_END,
+                FRAME_SIZE,
+                RW
+            ),
+            Err(MapError::NonCanonical(USER_END))
+        );
+        assert!(mem == before, "nothing changed");
+        // The whole user half, almost all of it empty: done at once.
+        map_anonymous(
+            &pt,
+            &mut mem,
+            &mut tlb,
+            &mut frames,
+            0x7000_0000,
+            0x3000,
+            RW,
+        )
+        .unwrap();
+        unmap(&pt, &mut mem, &mut tlb, &mut frames, 0, USER_END).unwrap();
+        assert!(pt.translate(&mem, 0x7000_1000).is_none());
+    }
+
+    /// A read-only page shared with a fork (code, constants) made writable by
+    /// one cell stays shared until written: the write lands in a private
+    /// copy, never in the page the other cells still use (spec `isolation`).
+    fn protect_never_hands_out_a_shared_page<F: EntryFormat>() {
+        let (pt, mut mem, mut tlb, mut frames) = setup::<F>();
+        let ro = PageFlags::USER;
+        map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, 0x40_0000, 0x1000, ro).unwrap();
+        let page = pt.translate(&mem, 0x40_0000).unwrap().phys;
+        mem.write_u64(page, 0xc0de);
+        let child = pt.fork_lower_half(&mut mem, &mut frames).unwrap();
+        protect(
+            &child,
+            &mut mem,
+            &mut tlb,
+            &mut frames,
+            0x40_0000,
+            0x1000,
+            RW,
+        )
+        .unwrap();
+        // A write as the kernel makes it: resolve the fault if refused.
+        let t = child.translate(&mem, 0x40_0000).unwrap();
+        if !t.flags.is_writable() {
+            assert_eq!(
+                child.resolve_write(&mut mem, &mut frames, 0x40_0000),
+                Ok(true)
+            );
+        }
+        let t = child.translate(&mem, 0x40_0000).unwrap();
+        assert!(t.flags.is_writable());
+        mem.write_u64(t.phys, 0xbad);
+        assert_eq!(mem.read_u64(page), 0xc0de, "the other cell's page");
+        assert_eq!(pt.translate(&mem, 0x40_0000).unwrap().phys, page);
+        destroy(child, &mut mem, &mut frames);
+        destroy(pt, &mut mem, &mut frames);
+        assert_eq!(frames.outstanding(), 0);
+    }
+
     macro_rules! both_formats {
         ($($name:ident),*) => {
             mod aarch64 { $(#[test] fn $name() { super::$name::<super::Aarch64>(); })* }
@@ -290,6 +418,8 @@ mod tests {
     }
 
     both_formats!(
+        the_kernel_half_is_out_of_reach,
+        protect_never_hands_out_a_shared_page,
         protect_needs_every_page_mapped,
         large_regions_use_large_pages,
         teardown_returns_every_frame,
