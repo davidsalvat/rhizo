@@ -21,13 +21,27 @@ modules = dict(sys.modules)
 import os  # noqa: E402 (after the snapshot of what the script imported)
 import py_compile  # noqa: E402
 
+# CPython finds its standard library by `os` (the landmark), which a run
+# with `-S` does not import.
+modules.setdefault("os", os)
+
+import shutil  # noqa: E402
+
 lib = os.path.dirname(os.__file__)
 for name in sorted(modules):
     path = getattr(modules[name], "__file__", None) or ""
-    if not path.startswith(lib + os.sep) or not path.endswith(".py"):
+    if not path.startswith(lib + os.sep):
         continue
     rel = os.path.relpath(path, lib)
     if rel.startswith("site-packages"):
+        continue
+    if path.endswith(".so"):
+        # An extension module (a dynamically linked interpreter's
+        # `lib-dynload`): copied as it is.
+        os.makedirs(os.path.dirname(os.path.join(out, rel)), exist_ok=True)
+        shutil.copyfile(path, os.path.join(out, rel))
+        continue
+    if not path.endswith(".py"):
         continue
     py_compile.compile(
         path,

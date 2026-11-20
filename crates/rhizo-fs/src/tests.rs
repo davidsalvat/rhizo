@@ -52,6 +52,59 @@ fn names(fs: &mut Fs, path: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// A page of a file names its bytes for as long as it is held: a later
+/// write to the file goes to a copy, and the page keeps what it held.
+#[test]
+fn pages_name_their_bytes_while_held() {
+    let mut fs = Fs::new();
+    let mut data = vec![7u8; BLOCK + 100];
+    data[BLOCK] = 1;
+    fs.put_file(b"/lib/a.so", &data).unwrap();
+    let (ino, size) = fs.file_at(b"/lib/a.so").unwrap();
+    assert_eq!(size, BLOCK as u64 + 100);
+    let first = fs.page(ino, 0).unwrap();
+    let last = fs.page(ino, 1).unwrap();
+    assert_eq!(first.bytes(), &data[..BLOCK]);
+    assert_eq!(last.bytes(), &data[BLOCK..], "only the file's bytes");
+    assert_eq!(fs.page(ino, 2).unwrap().key(), None, "past the end");
+    assert!(fs.page(ino, 2).unwrap().bytes().is_empty());
+    assert_eq!(first.key(), fs.page(ino, 0).unwrap().key(), "same block");
+    assert_ne!(first.key(), last.key());
+
+    // A fork shares the block, so the same key; a write copies it.
+    let fork = fs.clone();
+    assert_eq!(fork.page(ino, 1).unwrap().key(), last.key());
+    let fd = fs.open(None, b"/lib/a.so", RW, 2).unwrap();
+    fs.write(fd, b"new", Some(BLOCK as u64)).unwrap();
+    assert_eq!(last.bytes(), &data[BLOCK..], "the held page is unchanged");
+    let now = fs.page(ino, 1).unwrap();
+    assert_eq!(&now.bytes()[..3], b"new");
+    assert_ne!(now.key(), last.key());
+    assert_eq!(fs.file(fd).unwrap(), (ino, size));
+
+    // A shorter file: other length, other key.
+    fs.truncate(fd, BLOCK as u64 + 3).unwrap();
+    assert_eq!(fs.page(ino, 1).unwrap().bytes(), b"new");
+    assert_ne!(fs.page(ino, 1).unwrap().key(), now.key());
+
+    // A hole has no data.
+    fs.put_file(b"/sparse", b"").unwrap();
+    let fd = fs.open(None, b"/sparse", RW, 2).unwrap();
+    fs.write(fd, b"x", Some(3 * BLOCK as u64)).unwrap();
+    let (sparse, _) = fs.file(fd).unwrap();
+    assert_eq!(fs.page(sparse, 1).unwrap().key(), None);
+    assert_eq!(fs.page(sparse, 3).unwrap().bytes(), b"x");
+
+    assert_eq!(fs.file_at(b"/lib").unwrap_err(), Error::IsDir);
+    assert_eq!(fs.file_at(b"/nope").unwrap_err(), Error::NotFound);
+    assert_eq!(
+        fs.page(0, 0).unwrap_err(),
+        Error::BadFd,
+        "the root is no file"
+    );
+    assert_eq!(fs.file(0).unwrap_err(), Error::Invalid, "the console");
+}
+
 #[test]
 fn console_is_open_and_lowest_fd_is_reused() {
     let mut fs = Fs::new();

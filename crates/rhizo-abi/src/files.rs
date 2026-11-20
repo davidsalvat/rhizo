@@ -341,13 +341,15 @@ pub(crate) fn fcntl<F, M, T, A, S>(
 }
 
 /// `struct stat` in each architecture's layout; `None` is the console.
-fn stat_bytes(arch: Arch, stat: Option<Stat>) -> ([u8; 144], usize) {
+/// Inode number, mode, links and size of what `stat` describes (`None`:
+/// the console).
+fn stat_fields(stat: Option<Stat>) -> (u64, u64, u32, u64) {
     const S_IFIFO: u64 = 0o010_000;
     const S_IFCHR: u64 = 0o020_000;
     const S_IFDIR: u64 = 0o040_000;
     const S_IFREG: u64 = 0o100_000;
     const S_IFSOCK: u64 = 0o140_000;
-    let (ino, mode, links, size) = match stat {
+    match stat {
         None => (1, S_IFCHR | 0o620, 1, 0),
         Some(s) => match s.kind {
             Kind::Dir => (s.ino, S_IFDIR | 0o755, s.links, s.size),
@@ -356,7 +358,11 @@ fn stat_bytes(arch: Arch, stat: Option<Stat>) -> ([u8; 144], usize) {
             Kind::Event | Kind::Epoll => (s.ino, 0o600, s.links, s.size),
             _ => (s.ino, S_IFREG | 0o644, s.links, s.size),
         },
-    };
+    }
+}
+
+fn stat_bytes(arch: Arch, stat: Option<Stat>) -> ([u8; 144], usize) {
+    let (ino, mode, links, size) = stat_fields(stat);
     let blocks = size.div_ceil(512);
     let mut st = [0u8; 144];
     let mut set =
@@ -409,18 +415,50 @@ pub(crate) fn newfstatat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     flags: u64,
 ) -> i64 {
     let mut run = || -> Result<i64, i64> {
-        let dir = dirfd(dir)?;
-        let name = path(cx, addr)?;
-        let stat = if name.is_empty() && flags & AT_EMPTY_PATH != 0 {
-            match dir {
-                Some(fd) => cx.fs.fstat(fd).map_err(err)?,
-                None => Some(cx.fs.stat(None, b".").map_err(err)?),
-            }
-        } else {
-            Some(cx.fs.stat(dir, &name).map_err(err)?)
-        };
+        let stat = stat_at(cx, dir, addr, flags)?;
         let (st, len) = stat_bytes(arch, stat);
         Ok(put(cx, out, &st[..len]))
+    };
+    run().unwrap_or_else(|e| e)
+}
+
+/// What `dir` and the path at `addr` name (`AT_EMPTY_PATH` in `flags`:
+/// `dir` itself).
+fn stat_at<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    dir: u64,
+    addr: u64,
+    flags: u64,
+) -> Result<Option<Stat>, i64> {
+    let dir = dirfd(dir)?;
+    let name = path(cx, addr)?;
+    if name.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return match dir {
+            Some(fd) => cx.fs.fstat(fd).map_err(err),
+            None => Ok(Some(cx.fs.stat(None, b".").map_err(err)?)),
+        };
+    }
+    Ok(Some(cx.fs.stat(dir, &name).map_err(err)?))
+}
+
+/// `statx`: the fields of `newfstatat` (`STATX_BASIC_STATS`); times are
+/// zero, as there, and no attribute is known.
+pub(crate) fn statx<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    a: [u64; 6],
+) -> i64 {
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    let mut run = || -> Result<i64, i64> {
+        let (ino, mode, links, size) = stat_fields(stat_at(cx, a[0], a[1], a[2])?);
+        let mut stx = [0u8; 256];
+        stx[..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+        stx[4..8].copy_from_slice(&4096u32.to_le_bytes()); // stx_blksize
+        stx[16..20].copy_from_slice(&links.to_le_bytes());
+        stx[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
+        stx[32..40].copy_from_slice(&ino.to_le_bytes());
+        stx[40..48].copy_from_slice(&size.to_le_bytes());
+        stx[48..56].copy_from_slice(&size.div_ceil(512).to_le_bytes());
+        Ok(put(cx, a[4], &stx))
     };
     run().unwrap_or_else(|e| e)
 }

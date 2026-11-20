@@ -13,7 +13,7 @@ use crate::sync::Global;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use rhizo_abi::{Abi, Context, Outcome, Services};
+use rhizo_abi::{Abi, Context, ExecError, FilePages, Outcome, PageCache, Services};
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::images::{self, Images};
 use rhizo_cell::memory::Pager;
@@ -186,14 +186,48 @@ const KEPT_IMAGES: usize = 4;
 /// reserve) and given back before any cell is refused memory (D4).
 static IMAGES: Global<Images<KEPT_IMAGES>> = Global::new(Images::new());
 
-/// Drops every image kept loaded; returns whether there was one. Pages that
-/// cells still share stay theirs.
+/// Most file pages kept (design D1 of `add-dynamic-linking`): 64 MiB.
+const KEPT_PAGES: usize = 16384;
+
+/// Pages of files mapped into cells, kept by content (spec `cells`, file
+/// pages shared between cells): one read-only frame for every mapping of the
+/// same bytes. Its frames are taken and given back like those of
+/// [`IMAGES`].
+static PAGES: Global<PageCache> = Global::new(PageCache::new(KEPT_PAGES));
+
+/// The frames of mapped file pages, from [`PAGES`]; a page written now is
+/// made visible to instruction fetch.
+struct KernelPages;
+
+impl FilePages<DirectMap, KernelFrames> for KernelPages {
+    fn frame(
+        &mut self,
+        page: &rhizo_fs::Page,
+        _: &mut DirectMap,
+        _: &mut KernelFrames,
+    ) -> Option<u64> {
+        // Short of frames, what is kept goes first (outside the lock).
+        let get = || PAGES.with(|pages| pages.get(page, &mut DirectMap, &mut ImageFrames));
+        let (phys, fresh) = get().or_else(|| drop_images().then(get).flatten())?;
+        if fresh {
+            self.code(phys);
+        }
+        Some(phys)
+    }
+
+    fn code(&mut self, phys: u64) {
+        user::sync_code(DirectMap::virt(phys), FRAME_SIZE);
+    }
+}
+
+/// Drops every image kept loaded and every file page kept; returns whether
+/// there was one. Pages that cells still share stay theirs.
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "also used by in-kernel tests")
 )]
 pub fn drop_images() -> bool {
-    IMAGES.with(|images| {
+    let any = IMAGES.with(|images| {
         let mut any = false;
         while let Some(root) = images.pop() {
             space::destroy(
@@ -204,7 +238,8 @@ pub fn drop_images() -> bool {
             any = true;
         }
         any
-    })
+    });
+    PAGES.with(|pages| pages.clear(&mut ImageFrames)) || any
 }
 
 /// Whether cells may take `bytes` more, dropping the images kept loaded if
@@ -388,6 +423,13 @@ impl Services for KernelServices<'_> {
         cells_may_take(bytes)
     }
 
+    fn memory(&mut self) -> (u64, u64) {
+        memory::with_frames(|f| (f.usable_frames() as u64, f.free_frames() as u64))
+            .map_or((0, 0), |(total, free)| {
+                (total * FRAME_SIZE, free * FRAME_SIZE)
+            })
+    }
+
     fn save_fp(&mut self, fp: &mut FpState) {
         if self.fp_in_cpu {
             user::fp_save(fp);
@@ -404,6 +446,28 @@ impl Services for KernelServices<'_> {
             *byte = (self.random.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 56) as u8;
         }
     }
+}
+
+/// The 16 random bytes of a new cell's stack (`AT_RANDOM`) and the seed of
+/// its random numbers after them.
+fn start_random() -> ([u8; 16], u64) {
+    let mut services = KernelServices {
+        capture: None,
+        echo: false,
+        random: Counter.cycles() | 1,
+        fp_in_cpu: false,
+    };
+    let mut random = [0u8; 16];
+    services.random(&mut random);
+    (random, services.random)
+}
+
+/// The TLB of a hierarchy no CPU has used yet: nothing to flush (its tag's
+/// old translations go on its first entry on each CPU).
+struct NewSpace;
+
+impl Tlb for NewSpace {
+    fn flush_page(&mut self, _: u64) {}
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -947,6 +1011,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64)
                                 net,
                                 deadline,
                                 pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
+                                pages: &mut KernelPages,
                             };
                             let outcome = live.abi.handle(&mut live.cell, &mut cx);
                             let deadline = cx.deadline;
@@ -1175,14 +1240,7 @@ impl Host {
         echo: bool,
     ) -> Result<u32, ElfError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let mut services = KernelServices {
-            capture: None,
-            echo: false,
-            random: Counter.cycles() | 1,
-            fp_in_cpu: false,
-        };
-        let mut random = [0u8; 16];
-        services.random(&mut random);
+        let (random, seed) = start_random();
         let kernel = memory::kernel_tables();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
         let parsed = Image::parse(image, user::MACHINE)?;
@@ -1198,7 +1256,49 @@ impl Host {
             &[],
             random,
         )?;
-        let live = self.new_live(cell, capture, echo, services.random, files);
+        let live = self.new_live(cell, capture, echo, seed, files);
+        self.state().sched.place(live);
+        Ok(id)
+    }
+
+    /// Creates a cell running the executable at `path` in `files`, its
+    /// file system, with `argv` and `envp` (spec `cells`, dynamically
+    /// linked executables): the executable and its interpreter are mapped
+    /// from the files' pages, which every cell mapping the same bytes shares
+    /// (design D1 of `add-dynamic-linking`). Output as for
+    /// [`spawn`](Self::spawn).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn spawn_file(
+        &mut self,
+        files: Fs,
+        path: &[u8],
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        capture: bool,
+        echo: bool,
+    ) -> Result<u32, ExecError> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (random, seed) = start_random();
+        let kernel = memory::kernel_tables();
+        let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
+        let cell = rhizo_abi::exec::<Format, _, _>(
+            id,
+            user::MACHINE,
+            &files,
+            path,
+            kernel_half,
+            &mut DirectMap,
+            &mut NewSpace,
+            &mut KernelFrames,
+            &mut KernelPages,
+            argv,
+            envp,
+            random,
+        )?;
+        let live = self.new_live(cell, capture, echo, seed, files);
         self.state().sched.place(live);
         Ok(id)
     }
@@ -1802,6 +1902,61 @@ pub fn bench(console: &mut impl Console) {
         s[3],
         s[4]
     );
+    // Last: its files stay decoded in the kernel heap.
+    if let Some((run, template)) = dynamic() {
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-dynamic run_ns={run} template_ns={template}"
+        );
+    }
+}
+
+/// The dynamically linked `hello` (design D8 of `add-dynamic-linking`):
+/// started from the cell's files and run to its exit, its interpreter
+/// mapping `libc` and relocating, after a first run that keeps the file
+/// pages; and forked from a template frozen once it printed `ready`, the
+/// relocations done. Robust figures over 25 runs; `None` when the files
+/// were not packed.
+#[cfg(feature = "bench-cell")]
+fn dynamic() -> Option<(u64, u64)> {
+    const RUNS: usize = 25;
+    const PATH: &[u8] = b"/usr/bin/hello";
+    let files = dynamic_files()?;
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let mut run = Vec::with_capacity(RUNS);
+    for i in 0..=RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_file(files.clone(), PATH, &[b"hello"], &[], true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        let t = ns(t0, Counter.cycles());
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        if i > 0 {
+            run.push(t);
+        }
+    }
+    let template = host
+        .spawn_file(files, PATH, &[b"hello", b"wait"], &[], true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"ready\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let mut warm = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    Some((robust(&mut run), robust(&mut warm)))
 }
 
 /// A real program (`libc_warm`, static glibc) answering one request: started
@@ -1979,6 +2134,27 @@ fn python() -> Option<(u64, u64)> {
 pub fn cpython_files() -> Option<Fs> {
     static FILES: Global<Option<Fs>> = Global::new(None);
     let bytes = test_image("cpython-files");
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(FILES.with(|files| {
+        files
+            .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
+            .clone()
+    }))
+}
+
+/// The files of the dynamically linked programs (`dynamic-files`, packed by
+/// `xtask`: their interpreter, libraries and data; change
+/// `add-dynamic-linking`), decoded once and then shared copy-on-write by
+/// every cell given them; `None` when they were not packed.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+pub fn dynamic_files() -> Option<Fs> {
+    static FILES: Global<Option<Fs>> = Global::new(None);
+    let bytes = test_image("dynamic-files");
     if bytes.is_empty() {
         return None;
     }

@@ -1,7 +1,7 @@
 use std::path::Path;
 
-/// Cells built only when their source is given.
-const OPTIONAL: [&str; 3] = ["micropython", "cpython", "cpython-files"];
+/// Cells built only when their source is given, or by `xtask` only.
+const OPTIONAL: [&str; 4] = ["micropython", "cpython", "cpython-files", "dynamic-files"];
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
@@ -42,7 +42,8 @@ fn embed_cells() {
     }
     // MicroPython and CPython (its executable and its files), built by
     // `xtask` only when their source is given (`RHIZO_MICROPYTHON_SRC`,
-    // `RHIZO_CPYTHON_SRC`); an empty image means "not built".
+    // `RHIZO_CPYTHON_SRC`), and the files of the dynamically linked
+    // programs; an empty image means "not built".
     names.extend(OPTIONAL.iter().map(|n| n.to_string()));
     names.sort();
 
