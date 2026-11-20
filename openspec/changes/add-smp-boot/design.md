@@ -146,6 +146,12 @@ a megabyte of contiguous heap taken from the kernel's reserve when memory is
 nearly all given to cells (`a_thousand_idle_cells` failed on that once heap
 pages moved to the top).
 
+Fragmentation must not kill a cell either: a write to a shared 2 MiB page
+that finds no free 2 MiB block now copies the page into 512 small pages
+under a new table (`resolve_write`, with break-before-make on the block
+entry, so `resolve_write` takes the TLB and flushes itself). It costs the
+same memory, only more TLB entries for that region of that cell.
+
 Lost: returning empty heap pages to the allocator (the heap keeps them by
 design, `add-memory-accounting`), and mapping large heap allocations from
 scattered frames into a virtual window (unmapping them would need TLB

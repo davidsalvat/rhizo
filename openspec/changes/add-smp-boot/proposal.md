@@ -40,7 +40,9 @@ on all of them.
   again still panics (reentrance is a bug, as before).
 - **Heap pages from the top of memory**, so the pages the heap keeps do
   not split the free runs that copy-on-write large pages and snapshots
-  need (with several CPUs, a template child lost a 2 MiB copy-on-write).
+  need (with several CPUs, a template child lost a 2 MiB copy-on-write);
+  and a copy-on-write large page that finds no free 2 MiB block is copied
+  into small pages instead of killing the cell.
 - **Tests**: host tests for the MADT reader, the CPU list of the device
   tree, CPU selection (property test) and the lock (threads as CPUs); in
   kernel, every CPU's number and stack, and four CPUs hammering a global
@@ -67,11 +69,13 @@ in xAPIC mode; more than 16 CPUs.
 
 - `device-tree`: the CPUs come from `/cpus` too.
 - `kernel-testing`: the in-kernel suite also runs on 4 vCPUs (`ktest-smp`).
+- `fork`: copy-on-write of a large page without a free large frame.
 
 ## Impact
 
 `crates/rhizo-core` (`acpi`, `smp`, `sync`, `fdt::cpus`, `smp=` option,
-`boot::report_cpus`), `crates/rhizo-mm` (`FrameAllocator::alloc_high`),
+`boot::report_cpus`), `crates/rhizo-mm` (`FrameAllocator::alloc_high`,
+`resolve_write` fallback),
 `kernel/src/heap.rs`, `kernel/src/sync.rs`, `kernel/src/smp.rs` (new),
 `kernel/src/arch/aarch64/{boot,cpu,irq,platform,smp}.rs`,
 `kernel/src/arch/x86_64/{boot,cpu,irq,user,smp}.rs`, `kernel/src/cell.rs`

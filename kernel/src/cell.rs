@@ -19,7 +19,7 @@ use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::{Cell, FpState};
 use rhizo_fs::Fs;
-use rhizo_hal::{Console, CycleCounter, Tlb};
+use rhizo_hal::{Console, CycleCounter};
 use rhizo_mm::paging::{PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_sched::{SLICE_NS, Scheduler, TagPool};
@@ -322,11 +322,7 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
 
 /// Resolves a write refused because the page is shared (copy-on-write).
 fn resolve_write(pt: &PageTable<Format>, addr: u64) -> bool {
-    let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, addr) == Ok(true);
-    if resolved {
-        CpuTlb.flush_page(addr);
-    }
-    resolved
+    pt.resolve_write(&mut DirectMap, &mut KernelFrames, &mut CpuTlb, addr) == Ok(true)
 }
 
 /// How [`Host::resume`] restores memory.

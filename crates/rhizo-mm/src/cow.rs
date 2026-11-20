@@ -8,8 +8,8 @@
 //! and a write fault copies only what it must, on the path to the page.
 
 use crate::FRAME_SIZE;
-use crate::paging::{EntryFormat, MapError, PageSize, PageTable};
-use rhizo_hal::PhysicalMemory;
+use crate::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
+use rhizo_hal::{PhysicalMemory, Tlb};
 
 /// Where a cell's frames come from and go back to, with reference counts so
 /// a frame (a page or a page table) can belong to several cells.
@@ -78,13 +78,18 @@ impl<F: EntryFormat> PageTable<F> {
 
     /// Resolves a write to `virt` refused only because of sharing: copies the
     /// shared tables on the path and the page if it still has other
-    /// references, or makes it writable again if not. Returns `false` if the
-    /// write is refused for a real reason (no page, or a read-only one). The
-    /// caller flushes the TLB entry for `virt`.
+    /// references, or makes it writable again if not, and flushes the TLB
+    /// entry for `virt`. Returns `false` if the write is refused for a real
+    /// reason (no page, or a read-only one).
+    ///
+    /// A shared large page is copied into a large page, or, when no large
+    /// frame is free (memory too fragmented for a 2 MiB block), into 512
+    /// small pages under a new table: fragmentation never fails a write.
     pub fn resolve_write(
         &self,
         mem: &mut impl PhysicalMemory,
         frames: &mut impl Frames,
+        tlb: &mut impl Tlb,
         virt: u64,
     ) -> Result<bool, MapError> {
         let Some((slot, level)) = self.walk_private(mem, frames, virt)? else {
@@ -109,14 +114,26 @@ impl<F: EntryFormat> PageTable<F> {
             let copy = match size {
                 PageSize::Small => frames.alloc(),
                 _ => frames.alloc_large(),
+            };
+            match copy {
+                Some(copy) => {
+                    copy_frames(mem, page, copy, size.bytes());
+                    mem.write_u64(slot, F::with_address(writable, copy));
+                }
+                None if size == PageSize::Large => {
+                    let table = split_copy::<F>(mem, frames, page, F::flags(writable))?;
+                    // Break before make: a block becomes a table.
+                    mem.write_u64(slot, 0);
+                    tlb.flush_page(virt);
+                    mem.write_u64(slot, F::with_table_writable(F::table(table), true));
+                }
+                None => return Err(MapError::OutOfFrames),
             }
-            .ok_or(MapError::OutOfFrames)?;
-            copy_frames(mem, page, copy, size.bytes());
-            mem.write_u64(slot, F::with_address(writable, copy));
             frames.free(page, size);
         } else {
             mem.write_u64(slot, writable);
         }
+        tlb.flush_page(virt);
         Ok(true)
     }
 
@@ -222,6 +239,30 @@ impl<F: EntryFormat> PageTable<F> {
         walk::<F>(mem, frames, self.root(), 3, ENTRIES / 2);
         frames.free(self.root(), PageSize::Small);
     }
+}
+
+/// Copies the large page at `page` into 512 small pages with `flags`, and
+/// returns a new table mapping them in order (frees everything it took if
+/// memory runs out).
+fn split_copy<F: EntryFormat>(
+    mem: &mut impl PhysicalMemory,
+    frames: &mut impl Frames,
+    page: u64,
+    flags: PageFlags,
+) -> Result<u64, MapError> {
+    let table = frames.alloc().ok_or(MapError::OutOfFrames)?;
+    for i in 0..ENTRIES {
+        let Some(frame) = frames.alloc() else {
+            for j in 0..i {
+                frames.free(F::address(mem.read_u64(table + j * 8)), PageSize::Small);
+            }
+            frames.free(table, PageSize::Small);
+            return Err(MapError::OutOfFrames);
+        };
+        copy_frames(mem, page + i * FRAME_SIZE, frame, FRAME_SIZE);
+        mem.write_u64(table + i * 8, F::leaf(frame, PageSize::Small, flags));
+    }
+    Ok(table)
 }
 
 /// Bytes mapped by entry `e` at `level` if it is a leaf, else one frame.
