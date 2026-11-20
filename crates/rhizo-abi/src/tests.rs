@@ -717,6 +717,31 @@ fn descriptors_dup_and_fcntl() {
 }
 
 #[test]
+fn ioctl_sets_non_blocking_and_close_on_exec() {
+    const IOCTL: u64 = 16;
+    const FCNTL: u64 = 72;
+    let mut w = World::new(Arch::X86_64);
+    let p = name(&mut w, "/x");
+    let fd = w
+        .call(2 /* open */, &[p, 0x42 /* O_CREAT|O_RDWR */, 0o644])
+        .0 as u64;
+    w.poke(DATA, &1u32.to_le_bytes());
+    assert_eq!(w.call(IOCTL, &[fd, 0x5421 /* FIONBIO */, DATA]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 3 /* F_GETFL */]).0, 0x802, "O_NONBLOCK");
+    w.poke(DATA, &0u32.to_le_bytes());
+    assert_eq!(w.call(IOCTL, &[fd, 0x5421, DATA]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 3]).0, 2, "blocking again");
+    assert_eq!(w.call(IOCTL, &[fd, 0x5421, 0xdead_0000]).0, -EFAULT);
+    assert_eq!(w.call(IOCTL, &[fd, 0x5451 /* FIOCLEX */, 0]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 1 /* F_GETFD */]).0, 1);
+    assert_eq!(w.call(IOCTL, &[fd, 0x5450 /* FIONCLEX */, 0]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 1]).0, 0);
+    assert_eq!(w.call(IOCTL, &[77, 0x5451, 0]).0, -EBADF);
+    assert_eq!(w.call(IOCTL, &[77, 0x5421, DATA]).0, -EBADF);
+    assert_eq!(w.call(IOCTL, &[fd, 0x5401 /* TCGETS */, DATA]).0, -ENOTTY);
+}
+
+#[test]
 fn x86_64_path_calls() {
     let mut w = World::new(Arch::X86_64);
     let p = name(&mut w, "/x");

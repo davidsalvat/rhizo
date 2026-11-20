@@ -269,6 +269,12 @@ pub enum Bench {
     Laptop { idle_secs: u16, llm_delay_ms: u32 },
     /// `bench=server cells=N secs=S`.
     Server { cells: u16, secs: u16 },
+    /// `bench=agent-demo model=NAME llm=ADDR`: the CPython agent's live
+    /// demo against a model at `ADDR` (`IP:PORT` as the guest sees it).
+    AgentDemo {
+        llm: &'static str,
+        model: &'static str,
+    },
 }
 
 impl Bench {
@@ -285,6 +291,9 @@ impl Bench {
                 format!(" bench=laptop secs={idle_secs}{llm}")
             }
             Bench::Server { cells, secs } => format!(" bench=server cells={cells} secs={secs}"),
+            Bench::AgentDemo { llm, model } => {
+                format!(" bench=agent-demo model={model} llm={llm}")
+            }
         }
     }
 }

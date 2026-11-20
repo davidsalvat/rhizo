@@ -401,7 +401,7 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("linux-process/firecracker".into(), e)),
         }
-        match crate::compare::cpython_in_vm(opts.accel, &scratch) {
+        match crate::compare::cpython_in_vm(opts.accel, &scratch, skipped) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
         }
@@ -467,6 +467,9 @@ fn measure_cells(
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
+        let (mut agent_turn, mut agent_model) = (Vec::new(), Vec::new());
+        let (mut agent_suspend_resume, mut agent_fork) = (Vec::new(), Vec::new());
+        let mut agent_skipped = None;
         let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
@@ -503,6 +506,16 @@ fn measure_cells(
                     if let Some((c, w)) = parse_cpython_line(&out.output) {
                         cpy_cold.push(c as f64 / 1000.0);
                         cpy_warm.push(w as f64 / 1000.0);
+                    }
+                    match parse_agent_line(&out.output) {
+                        Some(Ok([turn, model, suspend_resume, fork])) => {
+                            agent_turn.push(turn as f64 / 1000.0);
+                            agent_model.push(model as f64 / 1000.0);
+                            agent_suspend_resume.push(suspend_resume as f64 / 1000.0);
+                            agent_fork.push(fork as f64 / 1000.0);
+                        }
+                        Some(Err(why)) => agent_skipped = Some(why),
+                        None => {}
                     }
                     if let Some((r, t)) = parse_dynamic_line(&out.output) {
                         dyn_run.push(r as f64 / 1000.0);
@@ -606,6 +619,14 @@ fn measure_cells(
             ("workload.python_warm_us", "us", &mut py_warm),
             ("workload.cpython_cold_us", "us", &mut cpy_cold),
             ("workload.cpython_warm_us", "us", &mut cpy_warm),
+            ("workload.agent_cpython_turn_us", "us", &mut agent_turn),
+            ("workload.agent_cpython_model_us", "us", &mut agent_model),
+            (
+                "workload.agent_suspend_resume_us",
+                "us",
+                &mut agent_suspend_resume,
+            ),
+            ("workload.agent_fork_us", "us", &mut agent_fork),
             ("workload.dynamic_run_us", "us", &mut dyn_run),
             ("workload.dynamic_template_us", "us", &mut dyn_template),
             ("cell.thread_create_us", "us", &mut thread_create),
@@ -624,6 +645,12 @@ fn measure_cells(
                         .unwrap_or_else(|| "not measured".into()),
                 };
                 skipped.push((format!("{name}/{}", vmm.id()), why));
+            }
+            if values.is_empty()
+                && name == "workload.agent_cpython_turn_us"
+                && let Some(why) = &agent_skipped
+            {
+                skipped.push((format!("workload.agent_*/{}", vmm.id()), why.clone()));
             }
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -687,6 +714,30 @@ fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("cold_ns")?, field("warm_ns")?))
+}
+
+/// `[turn_ns, model_ns, suspend_resume_ns, fork_ns]` of the CPython agent's line of
+/// a `bench-cell` kernel, or why the kernel skipped it.
+fn parse_agent_line(output: &str) -> Option<Result<[u64; 4]>> {
+    let line = output
+        .lines()
+        .find_map(|l| l.strip_prefix("rhizo-agent "))?;
+    if let Some(why) = line.strip_prefix("skipped: ") {
+        return Some(Err(why.to_string()));
+    }
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    let figures = [
+        field("turn_ns")?,
+        field("model_ns")?,
+        field("suspend_resume_ns")?,
+        field("fork_ns")?,
+    ];
+    Some(Ok(figures))
 }
 
 /// `(run_ns, template_ns)` of the dynamic linking line of a `bench-cell`
@@ -2004,6 +2055,21 @@ mod tests {
             Some((900_000, 40_000))
         );
         assert_eq!(parse_python_line("no python here"), None);
+    }
+
+    #[test]
+    fn agent_line_is_parsed() {
+        let out = "rhizo-cpython cold_ns=1 warm_ns=2\n\
+                   rhizo-agent turn_ns=900000 model_ns=300000 suspend_resume_ns=400000 fork_ns=700000\n";
+        assert_eq!(
+            parse_agent_line(out),
+            Some(Ok([900_000, 300_000, 400_000, 700_000]))
+        );
+        assert_eq!(
+            parse_agent_line("rhizo-agent skipped: CPython not built\n"),
+            Some(Err("CPython not built".into()))
+        );
+        assert_eq!(parse_agent_line("rhizo-cpython cold_ns=1 warm_ns=2"), None);
     }
 
     #[test]

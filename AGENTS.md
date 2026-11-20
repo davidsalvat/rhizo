@@ -87,7 +87,9 @@ This repository uses spec-driven development with
 Requires the Rust toolchain (via rustup), `qemu-system-aarch64` and, for the
 second architecture, `qemu-system-x86_64`, plus gcc with a static glibc for
 the C cells (`gcc`, `libc6-dev`; to cross-build, `gcc-aarch64-linux-gnu` or
-`gcc-x86-64-linux-gnu`). Every `cargo xtask` command takes
+`gcc-x86-64-linux-gnu`), and `zlib1g-dev` to build the CPython cell
+(when `RHIZO_CPYTHON_SRC` names its tarball; it is built natively on each
+architecture). Every `cargo xtask` command takes
 `--arch aarch64` (default) or `--arch x86_64` right after `xtask`.
 
 The feedback loop, fastest first:
