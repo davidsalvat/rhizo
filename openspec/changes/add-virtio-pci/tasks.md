@@ -14,4 +14,4 @@
 
 ## 3. Documentation
 
-- [ ] 3.1 AGENTS.md (VMM notes), `bench/README.md`; verify `cargo xtask ci` on both architectures and `openspec validate add-virtio-pci --strict`
+- [x] 3.1 AGENTS.md (VMM notes), `bench/README.md`; verify `cargo xtask ci` on both architectures and `openspec validate add-virtio-pci --strict`
