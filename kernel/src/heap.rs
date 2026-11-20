@@ -44,3 +44,12 @@ unsafe impl GlobalAlloc for KernelAllocator {
 static ALLOCATOR: KernelAllocator = KernelAllocator {
     heap: Global::new(Heap::new(FramePages)),
 };
+
+/// Pages the kernel heap holds and its live allocations.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn stats() -> rhizo_mm::heap::HeapStats {
+    ALLOCATOR.heap.with(|heap| heap.stats())
+}
