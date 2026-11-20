@@ -227,7 +227,10 @@ pub fn alloc_for_cell(count: usize) -> Option<u64> {
             return None;
         }
         match count {
-            1 => f.alloc(),
+            // From a 2 MiB block already in use where one has room, so
+            // whole blocks stay free for large pages (design D7 of
+            // `add-virtio-net`).
+            1 => f.alloc_contiguous_sparing_large(1),
             _ => f.alloc_large(),
         }
     })

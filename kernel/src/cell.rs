@@ -670,6 +670,17 @@ impl Host {
             self.poll_wire(now);
             self.wake_on_changes();
             let Some(live) = self.sched.next(now) else {
+                // Nothing to run: poll the card now (a cell may just have
+                // opened a connection), and run what that woke.
+                if self.wire_delay.is_some() && self.sched.waiting() > 0 {
+                    self.wire_due = 0;
+                    self.poll_wire(now);
+                    self.wake_on_changes();
+                    if let Some(live) = self.sched.next(now) {
+                        self.run_slice(live);
+                        continue;
+                    }
+                }
                 let mut wake = self.sched.next_wake();
                 // Waiting cells may wait for the wire: look again when it
                 // wants (design D4 of `add-virtio-net`).

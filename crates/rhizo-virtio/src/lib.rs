@@ -67,6 +67,8 @@ const HDR: usize = 12;
 /// Largest frame sent or received (without the header).
 pub const FRAME_MAX: usize = BUF as usize - HDR;
 const FRAME: u64 = 4096;
+/// Frames [`VirtioNet::probe`] takes: per queue, its rings and its buffers.
+pub const FRAMES: usize = 2 * (1 + (QUEUE_SIZE as u64 * BUF / FRAME) as usize);
 /// Layout of a queue in its frame: descriptors, then the available ring,
 /// then the used ring.
 const AVAIL_AT: u64 = 1024;

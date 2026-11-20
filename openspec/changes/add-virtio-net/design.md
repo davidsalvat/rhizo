@@ -76,3 +76,19 @@ sends messages and checks the echoes. Firecracker gets a tap device
 (`sudo -n ip tuntap`), its host end 172.16.0.1/24 and the guest
 172.16.0.2/24; without `sudo` the run reports why it has no card.
 `net.tcp_rtt_us` is a cell's 64-byte round trip to that echo server.
+
+### D7. Single frames spare free 2 MiB blocks
+
+A copy-on-write write to a 2 MiB page needs a whole free 2 MiB block. The
+in-kernel tests left only four such blocks free before the MicroPython
+test (of 64; about 200 long-lived frames, four per block, held the rest),
+and the card's 34 frames, placed by next fit, took two of them: the third
+MicroPython fork faulted. The frame allocator gains
+`alloc_contiguous_sparing_large`: frames from the lowest 2 MiB block
+already in use that has room, falling back to next fit. The card's rings
+and buffers, the heap's single pages (small-object pages it keeps, file
+blocks) and cells' 4 KiB frames use it; larger, short-lived heap runs keep
+next fit so they do not spread among kept pages. With it the same tests
+leave four blocks free with the card. One frame is found word by word
+(eight words per block), so the hot paths (page faults, copy-on-write)
+stay O(1) in the usual case.

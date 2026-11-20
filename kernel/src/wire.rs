@@ -25,11 +25,27 @@ pub fn options() -> BootOptions {
 /// `net` with the address the command line gives (none: no address).
 pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
     let mut card = None;
+    // One run of frames for the card's rings and buffers, taken where it
+    // breaks no free 2 MiB block that cells' large pages need.
+    let mut run: Option<(u64, usize)> = None;
     platform::for_each_virtio_mmio(|base| {
         if card.is_some() {
             return;
         }
-        let alloc = &mut || memory::with_frames(|f| f.alloc()).flatten();
+        let alloc = &mut || {
+            if run.is_none() {
+                let start =
+                    memory::with_frames(|f| f.alloc_contiguous_sparing_large(rhizo_virtio::FRAMES))
+                        .flatten()?;
+                run = Some((start, 0));
+            }
+            let (start, used) = run.as_mut()?;
+            if *used == rhizo_virtio::FRAMES {
+                return None;
+            }
+            *used += 1;
+            Some(*start + (*used as u64 - 1) * rhizo_mm::FRAME_SIZE)
+        };
         match VirtioNet::probe(Mmio::new(base), DirectMap, alloc) {
             Ok(c) => card = Some((base, c)),
             Err(ProbeError::NotNet(_)) => {}
