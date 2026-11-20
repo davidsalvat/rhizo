@@ -318,9 +318,12 @@ fn checked(cmd: &mut Command, what: &str, logs: &Path) -> Result<String> {
     // Output goes to files, not pipes: the sandbox and gofer `runsc` starts
     // inherit them, and a pipe would stay open (and `output()` wait) for as
     // long as they live, even after `timeout` killed `runsc` itself.
-    // In the system temporary directory: runsc, run as root, takes over the
-    // permissions of the directories it is given.
-    let base = std::env::temp_dir().join(format!("rhizo-runsc-{}", std::process::id()));
+    // New files for every command: runsc hands its standard output and error
+    // to the container's user (root), so a file it was given cannot be
+    // reopened by this process afterwards. Read back with `sudo cat` if needed.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("rhizo-runsc-{}-{n}", std::process::id()));
     let (out_path, err_path) = (base.with_extension("out"), base.with_extension("err"));
     let file = |p: &Path| std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()));
     let status = cmd
@@ -328,10 +331,20 @@ fn checked(cmd: &mut Command, what: &str, logs: &Path) -> Result<String> {
         .stderr(file(&err_path)?)
         .status()
         .map_err(|e| format!("cannot run runsc ({what}): {e}"))?;
+    let read = |p: &Path| {
+        std::fs::read(p).unwrap_or_else(|_| {
+            Command::new("sudo")
+                .args(["-n", "cat"])
+                .arg(p)
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default()
+        })
+    };
     let out = Output {
         status,
-        stdout: std::fs::read(&out_path).unwrap_or_default(),
-        stderr: std::fs::read(&err_path).unwrap_or_default(),
+        stdout: read(&out_path),
+        stderr: read(&err_path),
     };
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
