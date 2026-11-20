@@ -126,6 +126,11 @@ impl Threads {
         core::iter::once(&self.current).chain(&self.others)
     }
 
+    /// The thread `tid`.
+    pub fn get(&self, tid: u32) -> Option<&Thread> {
+        self.iter().find(|t| t.tid == tid)
+    }
+
     /// The thread `tid`, mutably.
     pub fn get_mut(&mut self, tid: u32) -> Option<&mut Thread> {
         core::iter::once(&mut self.current)
@@ -203,6 +208,48 @@ impl Threads {
             }
         }
         woken
+    }
+
+    /// Makes thread `tid` the current one (the caller of a system call, when
+    /// threads of the cell run on several CPUs: design D4 of
+    /// `add-parallel-threads`); the previous current thread takes its place
+    /// in the order. Returns whether `tid` exists.
+    pub fn make_current(&mut self, tid: u32) -> bool {
+        if self.current.tid == tid {
+            return true;
+        }
+        match self.others.iter_mut().find(|t| t.tid == tid) {
+            Some(t) => {
+                core::mem::swap(&mut self.current, t);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Wakes the threads whose deadline is at or before `now` among those
+    /// `busy` does not name (threads running on other CPUs), then returns
+    /// the runnable one with the lowest identifier above `after`, or else
+    /// the lowest of all: turns by identifier among several CPUs (design D5
+    /// of `add-parallel-threads`). Leaves the current thread as it is.
+    pub fn pick(&mut self, now: u64, after: u32, busy: impl Fn(u32) -> bool) -> Option<u32> {
+        let (mut next, mut first) = (None::<u32>, None::<u32>);
+        for t in core::iter::once(&mut self.current).chain(&mut self.others) {
+            if busy(t.tid) {
+                continue;
+            }
+            t.expire(now);
+            if t.wait != Wait::Ready {
+                continue;
+            }
+            if t.tid > after && next.is_none_or(|n| t.tid < n) {
+                next = Some(t.tid);
+            }
+            if first.is_none_or(|f| t.tid < f) {
+                first = Some(t.tid);
+            }
+        }
+        next.or(first)
     }
 
     /// Wakes the threads whose deadline is at or before `now`, then makes
@@ -451,7 +498,79 @@ mod tests {
         assert!(Threads::from_parts(Vec::new(), 1).is_none());
     }
 
+    #[test]
+    fn a_thread_made_current_keeps_its_state() {
+        let mut t = three();
+        t.get_mut(9).unwrap().regs.gpr[1] = 99;
+        assert!(t.make_current(9));
+        assert_eq!(t.current().tid, 9);
+        assert_eq!(t.current().regs.gpr[1], 99);
+        assert_eq!(t.current().clear_tid, 0x1000);
+        assert_eq!(order(&t), [9, 8, 7], "7 takes 9's place");
+        assert!(t.make_current(9), "already current");
+        assert!(!t.make_current(4), "no such thread");
+        assert_eq!(t.get(8).map(|t| t.regs.gpr[0]), Some(1));
+        assert!(t.get(4).is_none());
+    }
+
+    #[test]
+    fn picks_go_by_identifier_skipping_busy_and_waiting_threads() {
+        let mut t = three(); // 7, 8, 9
+        let none = |_| false;
+        assert_eq!(t.pick(0, 0, none), Some(7));
+        assert_eq!(t.pick(0, 7, none), Some(8));
+        assert_eq!(t.pick(0, 9, none), Some(7), "wraps around");
+        assert_eq!(t.pick(0, 7, |tid| tid == 8), Some(9), "8 runs elsewhere");
+        t.get_mut(9).unwrap().wait = futex(0x10, 1, Some(50));
+        assert_eq!(t.pick(0, 8, none), Some(7), "9 waits");
+        assert_eq!(t.pick(50, 8, none), Some(9), "until its deadline");
+        assert_eq!(t.get(9).unwrap().regs.gpr[0], ETIMEDOUT);
+        assert_eq!(t.current().tid, 7, "the current thread stays");
+        t.get_mut(7).unwrap().wait = Wait::Sleep(10);
+        assert_eq!(t.pick(5, 0, |tid| tid != 7), None, "7 sleeps, others busy");
+        t.get_mut(8).unwrap().wait = Wait::Sleep(3);
+        assert_eq!(
+            t.pick(5, 0, |tid| tid >= 8),
+            None,
+            "a busy thread is left alone"
+        );
+        assert_eq!(t.get(8).unwrap().wait, Wait::Sleep(3));
+    }
+
     proptest! {
+        /// Several CPUs taking turns: whatever threads are busy elsewhere or
+        /// blocked, a pick returns a free runnable thread whenever one
+        /// exists, and successive picks visit every free runnable thread
+        /// before any twice.
+        #[test]
+        fn picks_visit_every_free_runnable_thread_in_turn(
+            states in proptest::collection::vec(0u8..3, 1..8),
+        ) {
+            // 0: runnable, 1: blocked, 2: busy on another CPU.
+            let mut t = Threads::new(Thread::new(1, regs(0)));
+            for _ in 1..states.len() {
+                t.spawn(regs(0), 0);
+            }
+            for (i, &s) in states.iter().enumerate() {
+                if s == 1 {
+                    t.get_mut(1 + i as u32).unwrap().wait = futex(0x10, 1, None);
+                }
+            }
+            let busy = |tid: u32| states[tid as usize - 1] == 2;
+            let free = states.iter().filter(|&&s| s == 0).count();
+            let mut seen = std::collections::BTreeSet::new();
+            let mut after = 0;
+            for _ in 0..free {
+                let tid = t.pick(0, after, busy);
+                prop_assert!(tid.is_some());
+                let tid = tid.unwrap();
+                prop_assert_eq!(states[tid as usize - 1], 0);
+                prop_assert!(seen.insert(tid), "{} picked twice in a turn", tid);
+                after = tid;
+            }
+            prop_assert_eq!(t.pick(0, after, busy).is_some(), free > 0);
+        }
+
         /// Whatever threads block and wake, every runnable thread runs
         /// within one turn of all the others, and no blocked thread runs.
         #[test]
