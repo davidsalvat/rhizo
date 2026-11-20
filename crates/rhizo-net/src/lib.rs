@@ -1103,7 +1103,13 @@ impl Net {
 
     /// Changes the options of `h`.
     pub fn set_options(&mut self, h: Handle, opts: Options) -> Result<()> {
-        self.get_mut(h)?.opts = opts;
+        let s = self.get_mut(h)?;
+        s.opts = opts;
+        // A connection already on the card: `TCP_NODELAY` applies at once,
+        // as it does on Linux (HTTP clients set it after connecting).
+        if let State::Wire { handle, .. } = s.state {
+            self.wire_no_delay(handle, opts.no_delay);
+        }
         Ok(())
     }
 

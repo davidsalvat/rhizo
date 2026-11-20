@@ -9,6 +9,7 @@ use crate::arch::irq;
 use crate::arch::platform::Format;
 use crate::arch::timer::{self, Counter};
 use crate::arch::user::{self, Trap, UserFault};
+use crate::cost;
 use crate::memory::{self, DirectMap};
 use crate::prof::{self, Count, Ready};
 use crate::sync::Global;
@@ -29,6 +30,7 @@ use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::paging::{PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_net::Net;
+use rhizo_prof::Part;
 use rhizo_sched::{Gangs, SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::Snapshot;
 
@@ -99,6 +101,17 @@ fn fork_files(fs: &Fs) -> Fs {
 )]
 pub fn open_sockets() -> usize {
     NET.with(|net| net.open())
+}
+
+/// Whether connections through the network card are still open or
+/// closing (`smoltcp` keeps a closed connection until its peer has
+/// acknowledged the close).
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn wire_busy() -> bool {
+    NET.with(|net| net.wire_busy())
 }
 
 /// Closes the connections parked for `snapshot`, which the host drops
@@ -310,10 +323,12 @@ struct ImageFrames;
 
 impl Frames for ImageFrames {
     fn alloc(&mut self) -> Option<u64> {
+        let _p = cost::scope(Part::Frames);
         memory::alloc_for_cell(1)
     }
 
     fn alloc_large(&mut self) -> Option<u64> {
+        let _p = cost::scope(Part::Frames);
         memory::alloc_for_cell((LARGE_PAGE_SIZE / FRAME_SIZE) as usize)
     }
 
@@ -346,6 +361,7 @@ impl Frames for KernelFrames {
     }
 
     fn free(&mut self, phys: u64, size: PageSize) {
+        let _p = cost::scope(Part::Frames);
         let index = (phys / FRAME_SIZE) as usize;
         let shared = SHARED.with(|s| match s.get_mut(index) {
             Some(extra) if *extra > 0 => {
@@ -361,6 +377,7 @@ impl Frames for KernelFrames {
     }
 
     fn share(&mut self, phys: u64) {
+        let _p = cost::scope(Part::Frames);
         let index = (phys / FRAME_SIZE) as usize;
         SHARED.with(|s| {
             if s.len() <= index {
@@ -373,6 +390,7 @@ impl Frames for KernelFrames {
     }
 
     fn is_shared(&self, phys: u64) -> bool {
+        let _p = cost::scope(Part::Frames);
         SHARED.with(|s| s.get((phys / FRAME_SIZE) as usize).is_some_and(|&e| e > 0))
     }
 }
@@ -478,7 +496,6 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 static WIRE_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Shortest time between two polls of the network card while cells run.
 const WIRE_PERIOD_NS: u64 = 20_000;
-static WIRE_READY: AtomicBool = AtomicBool::new(false);
 /// Highest address-space tag (set by [`init`]).
 static MAX_TAG: AtomicU16 = AtomicU16::new(0);
 
@@ -489,12 +506,20 @@ pub fn init(smp: Option<u16>) -> usize {
     crate::heap::window::init();
     irq::init(SLICE_NS);
     MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
+    // The network card comes up once, at boot, rather than with the first
+    // host: what it allocates is never charged to a cell or a test.
+    NET.with(|net| {
+        // Parked connections re-attach only in this boot (design D2 of
+        // `keep-tcp-across-suspend`).
+        net.set_boot(Counter.cycles());
+        crate::wire::init(net, now_ns(), Counter.cycles());
+    });
     crate::smp::start(smp)
 }
 
 /// Monotonic time in nanoseconds since boot (0 if the counter frequency is
 /// unknown).
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     timer::cycles_to_ns(Counter.cycles()).unwrap_or(0)
 }
 
@@ -602,10 +627,14 @@ impl Lazy {
             return false;
         }
         let page = self.snapshot.page(i);
-        if page.flags.is_executable()
-            && let Some(t) = pt.translate(&DirectMap, page.virt)
+        // A 2 MiB page may have come back as 4 KiB pages: each its own.
+        let mut at = page.virt;
+        while page.flags.is_executable()
+            && at < page.virt + page.size.bytes()
+            && let Some(t) = pt.translate(&DirectMap, at)
         {
-            user::sync_code(DirectMap::virt(t.phys), page.size.bytes());
+            user::sync_code(DirectMap::virt(t.phys), t.size.bytes());
+            at += t.size.bytes();
         }
         self.pending[i] = false;
         self.left -= 1;
@@ -698,12 +727,14 @@ impl Pager<Format, DirectMap> for CellPager<'_, '_> {
 /// Grows the stack of the cell with tables `pt` to cover `addr` (design D5
 /// of `add-cpython`), if memory allows.
 fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
+    let _p = cost::scope(Part::Fault);
     cells_may_take(FRAME_SIZE)
         && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, &mut KernelFrames, addr)
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
 fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bool {
+    let _p = cost::scope(Part::Cow);
     let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, tlb, addr) == Ok(true);
     if resolved {
         tlb.flush_page(addr);
@@ -814,6 +845,7 @@ enum Back {
 /// (`oldest`: the one that has waited longest anywhere, for a single CPU
 /// stepping through every cell).
 fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
+    let _p = cost::scope(Part::Sched);
     let _timed = prof::Timed::new(Count::SchedCycles);
     shared.with(|s| {
         if s.stopping {
@@ -877,6 +909,7 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
 
 /// Waits for work: until `wake`, or a wake-up interrupt.
 fn wait(wake: Option<u64>) {
+    let _p = cost::scope(Part::Idle);
     match wake {
         // With several CPUs, look again at least every slice: what wakes a
         // cell may happen on another CPU (a safety net; wake-ups are sent).
@@ -890,6 +923,7 @@ fn wait(wake: Option<u64>) {
 /// idle CPU that has something to do because of it: another runnable cell
 /// to take, or the boot CPU to see a cell end or the last one stop.
 fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, how: Back) {
+    let _p = cost::scope(Part::Sched);
     let _timed = prof::Timed::new(Count::SchedCycles);
     let ended = match how {
         Back::End(ending) => Some(end(live, ending)),
@@ -975,6 +1009,7 @@ fn ready_now() -> Ready {
 /// state, frees its memory, and returns what the host keeps of it and the
 /// tag to free.
 fn end(live: Box<Live>, ending: Ending) -> (Finished, u16) {
+    let _p = cost::scope(Part::Teardown);
     let live = *live;
     if fp_owner() >> 32 == live.cell.id as u64 {
         set_fp_owner(0);
@@ -1064,6 +1099,7 @@ fn syscall(
     // Lock order: the cell's (when shared), `SHARING`, then the sockets.
     let (outcome, deadline) = sharing(live.shares, || {
         NET.with(|net| {
+            let _call = cost::syscall(&live.cell);
             let changes = net.changes();
             let mut cx = Context {
                 pt,
@@ -1125,7 +1161,10 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
         user::fp_trap(fp_owner() != key);
         loop {
             let flush = live.clean & (1 << cpu) == 0;
-            let trap = user::enter_user(live.cell.root, live.tag, flush, live.cell.regs_mut());
+            let trap = {
+                let _p = cost::scope(Part::Cell);
+                user::enter_user(live.cell.root, live.tag, flush, live.cell.regs_mut())
+            };
             live.clean |= flushed_on(cpu);
             match trap {
                 Trap::Syscall => {
@@ -1165,7 +1204,10 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                 }
                 Trap::Fault(fault)
                     if fault.missing_page().is_some_and(|addr| {
-                        live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr))
+                        live.lazy.as_mut().is_some_and(|l| {
+                            let _p = cost::scope(Part::Fault);
+                            l.page_in(&pt, addr)
+                        })
                     }) =>
                 {
                     prof::add(Count::LazyFaults, 1);
@@ -1348,6 +1390,7 @@ impl Gang {
             if flush {
                 self.clean.fetch_or(flushed_on(cpu), Ordering::SeqCst);
             }
+            let _p = cost::scope(Part::Cell);
             Some(user::enter_user(self.root, self.tag, flush, regs))
         };
         if inside != 0 {
@@ -1460,7 +1503,10 @@ impl GangCell {
         let live = &mut *self.live;
         let pt = PageTable::<Format>::from_root(gang.root);
         if let Some(addr) = fault.missing_page() {
-            if live.lazy.as_mut().is_some_and(|l| l.page_in(&pt, addr)) {
+            if live.lazy.as_mut().is_some_and(|l| {
+                let _p = cost::scope(Part::Fault);
+                l.page_in(&pt, addr)
+            }) {
                 if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
                     live.lazy = None;
                 }
@@ -1714,14 +1760,6 @@ fn sync_fp(live: &mut Live, leaving: bool) {
 impl Host {
     /// An empty host for every CPU online.
     pub fn new() -> Self {
-        if !WIRE_READY.swap(true, Ordering::Relaxed) {
-            NET.with(|net| {
-                // Parked connections re-attach only in this boot (design D2
-                // of `keep-tcp-across-suspend`).
-                net.set_boot(Counter.cycles());
-                crate::wire::init(net, now_ns(), Counter.cycles());
-            });
-        }
         Self {
             shared: Global::new(Shared {
                 sched: Scheduler::new(crate::smp::count()),
@@ -1814,6 +1852,7 @@ impl Host {
         capture: bool,
         echo: bool,
     ) -> Result<u32, ElfError> {
+        let _p = cost::scope(Part::Spawn);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (random, seed) = start_random();
         let kernel = memory::kernel_tables();
@@ -1881,6 +1920,7 @@ impl Host {
     /// Suspends live cell `id` into a snapshot and frees all its memory
     /// (spec `snapshots`). Its captured output stays with the host.
     pub fn suspend(&mut self, id: u32) -> Option<Snapshot> {
+        let _p = cost::scope(Part::Spawn);
         // The snapshot lives in the kernel heap, and pages still pending from
         // a lazy resume need frames first: refuse what would not fit
         // (design D2 of `add-memory-accounting`); the cell keeps running.
@@ -1923,6 +1963,7 @@ impl Host {
         capture: bool,
         echo: bool,
     ) -> Result<u32, Snapshot> {
+        let _p = cost::scope(Part::Spawn);
         if mode == Resume::Eager {
             let bytes = (0..snapshot.pages())
                 .map(|i| snapshot.page(i).size.bytes())
@@ -2103,6 +2144,7 @@ impl Host {
         if now < self.wire_due {
             return;
         }
+        let _p = cost::scope(Part::Net);
         let (delay, addr) = NET.with(|net| (crate::wire::poll(net, now), net.wire_addr()));
         // As often as the wire needs, but not more than once per period,
         // and at least every millisecond for frames nobody waits for yet.
@@ -2152,6 +2194,7 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn fork(&mut self, id: u32, n: usize) -> Option<Vec<u32>> {
+        let _p = cost::scope(Part::Spawn);
         let (mut parent, wake) = self.state().sched.remove_with_wake(|l| l.cell.id == id)?;
         let pt = PageTable::<Format>::from_root(parent.cell.root);
         if let Some(lazy) = parent.lazy.as_mut() {
@@ -2233,6 +2276,7 @@ impl Host {
     /// Freezes live cell `id` into a template: it never runs again, and
     /// [`spawn_from_template`](Self::spawn_from_template) forks it.
     pub fn freeze(&mut self, id: u32) -> bool {
+        let _p = cost::scope(Part::Spawn);
         let Some(mut live) = self.state().sched.remove(|l| l.cell.id == id) else {
             return false;
         };
@@ -2254,6 +2298,7 @@ impl Host {
     /// every deadline of its threads expired (spec `fork`, templates keep no
     /// time).
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
+        let _p = cost::scope(Part::Spawn);
         let index = self.templates.iter().position(|(c, _)| c.id == id)?;
         let (cell, fs) = &self.templates[index];
         let (cell, fs) = (cell.clone(), fs.clone());
@@ -2262,6 +2307,37 @@ impl Host {
         let child_id = child.cell.id;
         file(&mut self.state().sched, None, child);
         Some(child_id)
+    }
+
+    /// Whether live cell `id` sleeps: none of its threads can run, and one
+    /// waits for a deadline, not for a descriptor (a host's safe point to
+    /// suspend or freeze it, design D3 of `add-agent-workload`).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn asleep(&mut self, id: u32) -> bool {
+        self.state()
+            .sched
+            .find(|l| l.cell.id == id)
+            .is_some_and(|l| {
+                let threads = &l.cell.threads;
+                !threads.is_runnable() && !threads.waits_on_io() && threads.wake_at().is_some()
+            })
+    }
+
+    /// Creates or replaces file `path` with `data` in live cell `id`'s
+    /// files; returns whether it could (how a host hands a forked cell its
+    /// part, design D3 of `add-agent-workload`).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn write_file(&mut self, id: u32, path: &[u8], data: &[u8]) -> bool {
+        self.state()
+            .sched
+            .find_mut(|l| l.cell.id == id)
+            .is_some_and(|l| l.fs.put_file(path, data).is_ok())
     }
 
     /// Ends the sleeps of live cell `id`'s threads and times out their timed
@@ -2391,9 +2467,14 @@ pub fn run(image: &'static [u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), El
 /// median spawn time, the median time to run it to its exit (spawn
 /// included), and its page-table frames.
 #[cfg(feature = "bench-cell")]
+#[cfg_attr(
+    feature = "profile",
+    allow(unreachable_code, reason = "a profile build runs other measures")
+)]
 pub fn bench(console: &mut impl Console) {
     use core::fmt::Write;
-    const RUNS: usize = 101;
+    #[cfg(feature = "profile")]
+    return profiled(console);
     if let Some(workload) = crate::wire::options().bench {
         crate::workloads::run(console, workload);
         return;
@@ -2409,6 +2490,77 @@ pub fn bench(console: &mut impl Console) {
         );
         return; // the other metrics are measured with one CPU
     }
+    benchmarks(console);
+    // Again in retired instructions and in core cycles where the PMU counts
+    // them (spec `profiling`): the same code measures, so the figures
+    // compare.
+    let mut w = rhizo_hal::ConsoleWriter(console);
+    let Some(pmu) = crate::arch::pmu::init() else {
+        let _ = writeln!(w, "rhizo-pmu none");
+        return;
+    };
+    let _ = writeln!(
+        w,
+        "rhizo-pmu {} counters={} instructions={}",
+        pmu.kind,
+        pmu.counters,
+        if pmu.instructions { "yes" } else { "no" }
+    );
+    for (clock, name) in [
+        (CLOCK_INSTRUCTIONS, "instructions"),
+        (CLOCK_CYCLES, "cycles"),
+    ] {
+        if clock == CLOCK_INSTRUCTIONS && !pmu.instructions {
+            continue;
+        }
+        let _ = writeln!(rhizo_hal::ConsoleWriter(console), "rhizo-pass {name}");
+        CLOCK.store(clock, Ordering::Relaxed);
+        benchmarks(console);
+    }
+    CLOCK.store(CLOCK_TIME, Ordering::Relaxed);
+}
+
+/// What the benchmarks' clock counts (spec `profiling`).
+#[cfg(feature = "bench-cell")]
+static CLOCK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(CLOCK_TIME);
+#[cfg(feature = "bench-cell")]
+const CLOCK_TIME: u8 = 0;
+#[cfg(feature = "bench-cell")]
+const CLOCK_INSTRUCTIONS: u8 = 1;
+#[cfg(feature = "bench-cell")]
+const CLOCK_CYCLES: u8 = 2;
+
+/// The benchmarks' clock: the counter, or the PMU's retired instructions or
+/// core cycles.
+#[cfg(feature = "bench-cell")]
+fn bench_clock() -> u64 {
+    match CLOCK.load(Ordering::Relaxed) {
+        CLOCK_TIME => Counter.cycles(),
+        clock => crate::arch::pmu::read().map_or(0, |c| {
+            if clock == CLOCK_INSTRUCTIONS {
+                c.instructions.unwrap_or(0)
+            } else {
+                c.cycles
+            }
+        }),
+    }
+}
+
+/// [`bench_clock`] ticks in the unit the benchmarks print: nanoseconds, or
+/// instructions or cycles as counted.
+#[cfg(feature = "bench-cell")]
+fn bench_ns(ticks: u64) -> Option<u64> {
+    match CLOCK.load(Ordering::Relaxed) {
+        CLOCK_TIME => timer::cycles_to_ns(ticks),
+        _ => Some(ticks),
+    }
+}
+
+/// The benchmarks of one CPU, each printed as a `rhizo-…` line.
+#[cfg(feature = "bench-cell")]
+fn benchmarks(console: &mut impl Console) {
+    use core::fmt::Write;
+    const RUNS: usize = 101;
     let image = test_image("hello");
     let mut spawn_ns = Vec::with_capacity(RUNS);
     let mut run_ns = Vec::with_capacity(RUNS);
@@ -2416,19 +2568,19 @@ pub fn bench(console: &mut impl Console) {
     let mut host = Host::new();
     for _ in 0..RUNS {
         host.finished.clear();
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn(image, &[b"hello"], true, false)
             .expect("the hello cell spawns");
-        let t1 = Counter.cycles();
+        let t1 = bench_clock();
         tables = host.table_frames(id).unwrap_or(0);
         host.run(|_| false);
-        let t2 = Counter.cycles();
+        let t2 = bench_clock();
         let done = host.finished(id).expect("the hello cell ended");
         assert_eq!(done.ending, Ending::Exit(0), "the hello cell exits with 0");
         assert_eq!(done.output, b"hello from a cell\n");
-        spawn_ns.push(timer::cycles_to_ns(t1 - t0).unwrap_or(0));
-        run_ns.push(timer::cycles_to_ns(t2 - t0).unwrap_or(0));
+        spawn_ns.push(bench_ns(t1 - t0).unwrap_or(0));
+        run_ns.push(bench_ns(t2 - t0).unwrap_or(0));
     }
     let tagged = switch_ns(Host::new());
     let untagged = switch_ns(Host::new_untagged());
@@ -2439,15 +2591,19 @@ pub fn bench(console: &mut impl Console) {
         robust(&mut spawn_ns),
         robust(&mut run_ns)
     );
-    let f = fork_and_templates();
-    let _ = writeln!(
-        rhizo_hal::ConsoleWriter(console),
-        "rhizo-fork fork_ns={} fork_touch_ns={} fork_pt_frames={} spawn_from_template_ns={}",
-        f[0],
-        f[1],
-        f[2],
-        f[3]
-    );
+    // The first pass only: forking 50 MiB and writing it needs most of
+    // the memory, which the kernel heap grown by the first pass keeps.
+    if CLOCK.load(Ordering::Relaxed) == CLOCK_TIME {
+        let f = fork_and_templates();
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-fork fork_ns={} fork_touch_ns={} fork_pt_frames={} spawn_from_template_ns={}",
+            f[0],
+            f[1],
+            f[2],
+            f[3]
+        );
+    }
     let (cold, warm) = workload();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -2467,6 +2623,21 @@ pub fn bench(console: &mut impl Console) {
             rhizo_hal::ConsoleWriter(console),
             "rhizo-cpython cold_ns={cold} warm_ns={warm}"
         );
+    }
+    match agent_figures() {
+        Ok([turn, model, suspend_resume, fork]) => {
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-agent turn_ns={turn} model_ns={model} suspend_resume_ns={suspend_resume} \
+                 fork_ns={fork}"
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-agent skipped: {why}"
+            );
+        }
     }
     let (idle, suspended) = density();
     let _ = writeln!(
@@ -2512,6 +2683,11 @@ pub fn bench(console: &mut impl Console) {
         s[3],
         s[4]
     );
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-ops syscall_ns={}",
+        bench_ns(syscall_ticks()).unwrap_or(0)
+    );
     // Last: its files stay decoded in the kernel heap.
     if let Some((run, template)) = dynamic() {
         let _ = writeln!(
@@ -2519,6 +2695,24 @@ pub fn bench(console: &mut impl Console) {
             "rhizo-dynamic run_ns={run} template_ns={template}"
         );
     }
+}
+
+/// `bench-cell` with `profile`: the cost of a copy-on-write fault and the
+/// breakdowns of the workloads (spec `profiling`), measured apart from the
+/// other benchmarks, which run without the accounting hooks.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+fn profiled(console: &mut impl Console) {
+    use core::fmt::Write;
+    if crate::smp::count() > 1 {
+        parallel_breakdown(console);
+        return;
+    }
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-ops cow_fault_ns={}",
+        bench_ns(cow_fault_ticks()).unwrap_or(0)
+    );
+    breakdowns(console);
 }
 
 /// The dynamically linked `hello` (design D8 of `add-dynamic-linking`):
@@ -2576,16 +2770,16 @@ fn dynamic() -> Option<(u64, u64)> {
 fn workload() -> (u64, u64) {
     const ROUNDS: usize = 7;
     let image = test_image("libc_warm");
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
     let (mut cold, mut warm) = (Vec::new(), Vec::new());
     for _ in 0..ROUNDS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn(image, &[b"libc_warm"], true, false)
             .expect("spawn");
         host.run(|h| h.finished(id).is_some());
-        cold.push(ns(t0, Counter.cycles()));
+        cold.push(ns(t0, bench_clock()));
     }
     let template = host
         .spawn(image, &[b"libc_warm"], true, false)
@@ -2595,12 +2789,12 @@ fn workload() -> (u64, u64) {
     }
     assert!(host.freeze(template));
     for _ in 0..ROUNDS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn_from_template(template, true, false)
             .expect("fork");
         host.run(|h| h.finished(id).is_some());
-        warm.push(ns(t0, Counter.cycles()));
+        warm.push(ns(t0, bench_clock()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     cold.sort_unstable();
@@ -2615,7 +2809,7 @@ fn workload() -> (u64, u64) {
 #[cfg(feature = "bench-cell")]
 fn fork_and_templates() -> [u64; 4] {
     const ROUNDS: usize = 7;
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
     let big = host
         .spawn(
@@ -2633,12 +2827,12 @@ fn fork_and_templates() -> [u64; 4] {
     let mut frames = 0;
     for _ in 0..ROUNDS {
         let before = memory::free_bytes();
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let child = host.spawn_from_template(big, true, false).expect("fork");
-        let t1 = Counter.cycles();
+        let t1 = bench_clock();
         frames = (before - memory::free_bytes()) / FRAME_SIZE;
         host.run(|h| h.finished(child).is_some());
-        let t2 = Counter.cycles();
+        let t2 = bench_clock();
         assert_eq!(
             host.finished(child).map(|f| f.ending),
             Some(Ending::Exit(0))
@@ -2654,11 +2848,11 @@ fn fork_and_templates() -> [u64; 4] {
     assert!(host.freeze(hello));
     let mut template = Vec::new();
     for _ in 0..101 {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn_from_template(hello, true, false)
             .expect("spawn from template");
-        let t1 = Counter.cycles();
+        let t1 = bench_clock();
         host.run(|h| h.finished(id).is_some());
         template.push(ns(t0, t1));
     }
@@ -2700,16 +2894,16 @@ fn python() -> Option<(u64, u64)> {
         fs
     };
     let argv: [&[u8]; 3] = [b"micropython", b"-c", COMMAND];
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
     let (mut cold, mut warm) = (Vec::new(), Vec::new());
     for _ in 0..ROUNDS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn_with_files(image, &argv, files(), true, false)
             .expect("spawn");
         host.run(|h| h.finished(id).is_some());
-        cold.push(ns(t0, Counter.cycles()));
+        cold.push(ns(t0, bench_clock()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     let template = host
@@ -2720,12 +2914,12 @@ fn python() -> Option<(u64, u64)> {
     }
     assert!(host.freeze(template));
     for _ in 0..ROUNDS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn_from_template(template, true, false)
             .expect("fork");
         host.run(|h| h.finished(id).is_some());
-        warm.push(ns(t0, Counter.cycles()));
+        warm.push(ns(t0, bench_clock()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     cold.sort_unstable();
@@ -2809,16 +3003,16 @@ fn cpython() -> Option<(u64, u64)> {
     const ARGV: [&[u8]; 2] = [b"/usr/bin/python3", b"/app/agent_demo.py"];
     let image = test_image("cpython");
     let files = cpython_files()?;
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
     let (mut cold, mut warm) = (Vec::new(), Vec::new());
     for _ in 0..ROUNDS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn_with_files(image, &ARGV, files.clone(), true, false)
             .expect("spawn");
         host.run(|h| h.finished(id).is_some());
-        cold.push(ns(t0, Counter.cycles()));
+        cold.push(ns(t0, bench_clock()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     let template = host
@@ -2829,17 +3023,263 @@ fn cpython() -> Option<(u64, u64)> {
     }
     assert!(host.freeze(template));
     for _ in 0..ROUNDS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn_from_template(template, true, false)
             .expect("fork");
         host.run(|h| h.finished(id).is_some());
-        warm.push(ns(t0, Counter.cycles()));
+        warm.push(ns(t0, bench_clock()));
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     cold.sort_unstable();
     warm.sort_unstable();
     Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
+}
+
+/// One run of the CPython agent (`cells/python/agent_loop.py`, change
+/// `add-agent-workload`).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[derive(Debug)]
+pub struct AgentRun {
+    /// Everything the agent printed: its turns, then each branch in order.
+    pub transcript: Vec<u8>,
+    /// Each suspend plus resume between turns.
+    pub suspend_resume_ns: Vec<u64>,
+    /// From freezing the agent at its decision point until every branch
+    /// forked from it runs (has printed its first line).
+    pub fork_ns: u64,
+}
+
+/// Branches the agent forks into at its decision point.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+const AGENT_BRANCHES: u8 = 3;
+
+/// How the agent reports ([`agent`]).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "each build uses its own: tests, benchmarks or the demo"
+)]
+pub enum AgentOutput {
+    /// Its transcript only.
+    Transcript,
+    /// Its transcript and its turn times.
+    Timed,
+    /// A readable account on the console as it goes, with the host's own
+    /// times (the live demo, design D7 of `add-agent-workload`).
+    Live,
+}
+
+/// Runs the CPython agent (model `model`) for `turns` turns against the
+/// host's model server (`llm=` on the command line), suspending and
+/// resuming it in its pause after every turn (unless `mode` is `None`);
+/// then, where it prints a line ending in `fork` and sleeps, freezes it as
+/// a template and starts one cell per branch from it, each told its branch
+/// in `/branch` (design D3 of `add-agent-workload`), and runs them to their
+/// end. An error says why the agent could not run or finish.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn agent(
+    host: &mut Host,
+    turns: usize,
+    mode: Option<Resume>,
+    model: &[u8],
+    output: AgentOutput,
+) -> Result<AgentRun, alloc::string::String> {
+    use alloc::format;
+    use core::fmt::Write;
+    let live = output == AgentOutput::Live;
+    let say = |text: core::fmt::Arguments<'_>| {
+        if live {
+            let _ = writeln!(rhizo_hal::ConsoleWriter(&mut BootConsole), "[rhizo] {text}");
+        }
+    };
+    let files = cpython_files().ok_or("CPython not built")?;
+    let (ip, port) = crate::wire::options()
+        .llm
+        .ok_or("no network card and model server on this VMM")?;
+    host.wire_address(10_000_000_000)
+        .ok_or("the network card got no address")?;
+    let url = format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+    let turns_arg = format!("{turns}");
+    let mut argv: Vec<&[u8]> = alloc::vec![
+        b"/usr/bin/python3",
+        b"/app/agent_loop.py",
+        url.as_bytes(),
+        model,
+        b"cell",
+        turns_arg.as_bytes(),
+    ];
+    match output {
+        AgentOutput::Transcript => {}
+        AgentOutput::Timed => argv.push(b"timed"),
+        AgentOutput::Live => argv.push(b"live"),
+    }
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    // Under emulation CPython is slow, and a real model can be slower; a
+    // model that never answers must still end the run.
+    let limit_s = if live { 3600 } else { 600 };
+    let end = now_ns().saturating_add(limit_s * 1_000_000_000);
+    let said = |host: &Host, id: u32| match host.finished(id) {
+        Some(f) => format!(
+            "it ended ({:?}) after: {}",
+            f.ending,
+            alloc::string::String::from_utf8_lossy(&f.output)
+                .trim()
+                .replace('\n', " | ")
+        ),
+        None => format!("not done in {limit_s} s"),
+    };
+    say(format_args!(
+        "cell: CPython with `agent_loop.py`, model `{url}`"
+    ));
+    let mut id = host
+        .spawn_with_files(test_image("cpython"), &argv, files, true, live)
+        .map_err(|e| format!("cannot spawn CPython: {e:?}"))?;
+    let mut run = AgentRun {
+        transcript: Vec::new(),
+        suspend_resume_ns: Vec::new(),
+        fork_ns: 0,
+    };
+    // Its turns: after each, it pauses in a sleep, where the host suspends
+    // and resumes it; the last pause before the fork is its long sleep.
+    let mut seen = 0;
+    loop {
+        let printed = |host: &mut Host, id: u32| {
+            host.output(id)
+                .is_some_and(|o| o.len() > seen && o.ends_with(b"\n"))
+        };
+        while !(host.asleep(id) && printed(host, id)) {
+            if host.finished(id).is_some() || now_ns() > end {
+                return Err(said(host, id));
+            }
+            host.step();
+        }
+        if host.output(id).is_some_and(|o| o.ends_with(b"fork\n")) {
+            break;
+        }
+        let Some(mode) = mode else {
+            seen = host.output(id).map_or(0, <[u8]>::len);
+            continue;
+        };
+        let t0 = Counter.cycles();
+        let snapshot = host.suspend(id).ok_or("cannot suspend the agent")?;
+        let (t1, bytes) = (Counter.cycles(), snapshot.as_bytes().len());
+        let resumed = host.resume(snapshot, mode, true, live);
+        let t2 = Counter.cycles();
+        run.suspend_resume_ns.push(ns(t0, t2));
+        let resumed = resumed.map_err(|_| "cannot resume the agent")?;
+        say(format_args!(
+            "suspended between turns in {} us ({} KiB snapshot, connection parked), \
+             resumed ({mode:?}) in {} us",
+            ns(t0, t1) / 1000,
+            bytes / 1024,
+            ns(t1, t2) / 1000
+        ));
+        run.transcript
+            .extend_from_slice(&host.finished(id).expect("suspended").output);
+        id = resumed;
+        seen = 0;
+    }
+    run.transcript
+        .extend_from_slice(host.output(id).unwrap_or_default());
+    // The decision point: one cell per branch, from the frozen agent.
+    let t0 = Counter.cycles();
+    if !host.freeze(id) {
+        return Err("cannot freeze the agent".into());
+    }
+    let mut branches = Vec::new();
+    for b in 0..AGENT_BRANCHES {
+        let child = host
+            .spawn_from_template(id, true, live)
+            .ok_or("cannot fork the agent")?;
+        if !host.write_file(child, b"/branch", &[b'0' + b]) {
+            return Err("cannot give a branch its number".into());
+        }
+        branches.push(child);
+    }
+    let running = |host: &mut Host, child: u32| {
+        let out = match host.finished(child) {
+            Some(f) => Some(f.output.as_slice()),
+            None => host.output(child),
+        };
+        out.is_some_and(|o| o.contains(&b'\n'))
+    };
+    while !branches.iter().all(|&c| running(host, c)) {
+        if now_ns() > end {
+            return Err("the branches do not run".into());
+        }
+        host.step();
+    }
+    run.fork_ns = ns(t0, Counter.cycles());
+    say(format_args!(
+        "froze the agent at its decision point and forked {AGENT_BRANCHES} branches \
+         (copy-on-write, own connections): all running after {} us",
+        run.fork_ns / 1000
+    ));
+    host.run(|h| branches.iter().all(|&c| h.finished(c).is_some()) || now_ns() > end);
+    for &child in &branches {
+        match host.finished(child) {
+            Some(f) if f.ending == Ending::Exit(0) => {
+                run.transcript.extend_from_slice(&f.output);
+            }
+            _ => {
+                let why = said(host, child);
+                host.kill(child);
+                return Err(format!("branch {child}: {why}"));
+            }
+        }
+    }
+    Ok(run)
+}
+
+/// The CPython agent's figures (design D4 of `add-agent-workload`), over 3
+/// pairs of runs of 8 turns: medians of a turn as the agent times it and of
+/// the part of it spent on the model's answer (the first turn, which
+/// connects and runs cold, left out) from runs that are not suspended, as
+/// the Linux process is not; of a suspend plus eager resume after every
+/// turn of the other runs; and of a fork into the branches until they run,
+/// from both.
+#[cfg(feature = "bench-cell")]
+fn agent_figures() -> Result<[u64; 4], alloc::string::String> {
+    const ROUNDS: usize = 3;
+    const TURNS: usize = 8;
+    let mut samples: [Vec<u64>; 4] = Default::default();
+    for _ in 0..ROUNDS {
+        let mut host = Host::new();
+        let suspended = agent(
+            &mut host,
+            TURNS,
+            Some(Resume::Eager),
+            b"fake",
+            AgentOutput::Timed,
+        )?;
+        samples[2].extend(suspended.suspend_resume_ns);
+        samples[3].push(suspended.fork_ns);
+        drop(host);
+        let mut host = Host::new();
+        let run = agent(&mut host, TURNS, None, b"fake", AgentOutput::Timed)?;
+        let text = alloc::string::String::from_utf8_lossy(&run.transcript);
+        for (key, slot) in [("agent turn_ns=", 0), ("agent model_ns=", 1)] {
+            let times = text
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .ok_or("the agent printed no turn times")?;
+            samples[slot].extend(
+                times
+                    .split(',')
+                    .skip(1)
+                    .filter_map(|t| t.parse::<u64>().ok()),
+            );
+        }
+        samples[3].push(run.fork_ns);
+    }
+    let mut out = [0; 4];
+    for (o, s) in out.iter_mut().zip(&mut samples) {
+        s.sort_unstable();
+        *o = s.get(s.len() / 2).copied().unwrap_or(0);
+    }
+    Ok(out)
 }
 
 /// Memory per idle cell, from 1000 forks of a template of `idle` each run
@@ -2919,7 +3359,7 @@ fn threads() -> (u64, u64) {
 fn multi_core() -> (u64, u64, u64) {
     const ROUNDS: usize = 3;
     let image = test_image("spin");
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let batch = |parallel: bool| {
         let mut host = Host::new();
         let ids: Vec<u32> = (0..4 * crate::smp::count())
@@ -2928,13 +3368,13 @@ fn multi_core() -> (u64, u64, u64) {
                     .expect("spawn")
             })
             .collect();
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         if parallel {
             host.run(|_| false);
         } else {
             while host.step() {}
         }
-        let t1 = Counter.cycles();
+        let t1 = bench_clock();
         for id in ids {
             assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
         }
@@ -2949,10 +3389,10 @@ fn multi_core() -> (u64, u64, u64) {
     }
     let mut wake: Vec<u64> = (0..105)
         .map(|_| {
-            let t0 = Counter.cycles();
+            let t0 = bench_clock();
             crate::smp::post(1, nothing, 0);
             crate::smp::join(1);
-            ns(t0, Counter.cycles())
+            ns(t0, bench_clock())
         })
         .collect();
     (serial[ROUNDS / 2], parallel[ROUNDS / 2], robust(&mut wake))
@@ -3018,15 +3458,15 @@ fn robust(samples: &mut [u64]) -> u64 {
 fn files() -> (u64, u64) {
     const RUNS: usize = 5 * ROUNDS;
     let image = test_image("filer");
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
     let mut write_read = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         host.finished.clear();
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host.spawn(image, &[b"filer"], true, false).expect("spawn");
         host.run(|h| h.finished(id).is_some());
-        write_read.push(ns(t0, Counter.cycles()));
+        write_read.push(ns(t0, bench_clock()));
         let done = host.finished(id).expect("ended");
         assert_eq!(done.ending, Ending::Exit(0), "filer exits with 0");
         assert_eq!(done.output, b"files ok\n");
@@ -3040,9 +3480,9 @@ fn files() -> (u64, u64) {
     assert!(host.freeze(holder));
     let mut fork = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let child = host.spawn_from_template(holder, true, false).expect("fork");
-        fork.push(ns(t0, Counter.cycles()));
+        fork.push(ns(t0, bench_clock()));
         assert!(host.kill(child));
     }
     (robust(&mut write_read), robust(&mut fork))
@@ -3059,17 +3499,17 @@ fn net() -> (u64, u64, u64) {
     const RUNS: usize = 3 * ROUNDS;
     const PIPE_TRIPS: u64 = 2000;
     const NET_TRIPS: u64 = 200;
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
     let mut pipe = Vec::with_capacity(RUNS);
     let trips = b"2000";
     for _ in 0..RUNS {
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host
             .spawn(test_image("piper"), &[b"piper", trips], true, false)
             .expect("spawn piper");
         host.run(|h| h.finished(id).is_some());
-        pipe.push(ns(t0, Counter.cycles()) / PIPE_TRIPS);
+        pipe.push(ns(t0, bench_clock()) / PIPE_TRIPS);
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     let image = test_image("loopback");
@@ -3085,12 +3525,12 @@ fn net() -> (u64, u64, u64) {
             )
             .expect("spawn server");
         host.step(); // listening, waiting in `accept`
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let client = host
             .spawn(image, &[b"loopback", b"ping", b"7400", b"200"], true, false)
             .expect("spawn client");
         host.run(|h| h.finished(server).is_some() && h.finished(client).is_some());
-        loopback.push(ns(t0, Counter.cycles()) / NET_TRIPS);
+        loopback.push(ns(t0, bench_clock()) / NET_TRIPS);
         for id in [server, client] {
             assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
         }
@@ -3109,12 +3549,12 @@ fn net() -> (u64, u64, u64) {
             host.step();
         }
         let snapshot = host.suspend(client).expect("live");
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let client = host
             .resume(snapshot, Resume::Lazy, true, false)
             .expect("resume");
         host.run(|h| h.finished(client).is_some());
-        resume.push(ns(t0, Counter.cycles()));
+        resume.push(ns(t0, bench_clock()));
         host.run(|h| h.finished(server).is_some());
         for id in [server, client] {
             assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
@@ -3147,7 +3587,7 @@ fn wire_rtt() -> Result<u64, alloc::string::String> {
     let mut samples = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         host.finished.clear();
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         let id = host.spawn(image, &argv, true, false).expect("spawn");
         // A connection that never answers must not stop the benchmarks.
         let end = now_ns().saturating_add(10_000_000_000);
@@ -3172,7 +3612,7 @@ fn wire_rtt() -> Result<u64, alloc::string::String> {
                 ));
             }
         }
-        samples.push(timer::cycles_to_ns(Counter.cycles() - t0).unwrap_or(0) / TRIPS);
+        samples.push(bench_ns(bench_clock() - t0).unwrap_or(0) / TRIPS);
     }
     Ok(robust(&mut samples))
 }
@@ -3184,7 +3624,7 @@ fn wire_rtt() -> Result<u64, alloc::string::String> {
 fn suspend_resume() -> [u64; 5] {
     const ROUNDS: usize = 7;
     let image = test_image("ballast");
-    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut samples: [Vec<u64>; 4] = Default::default();
     let mut bytes = 0;
     let mut host = Host::new();
@@ -3196,16 +3636,16 @@ fn suspend_resume() -> [u64; 5] {
             while host.output(id) != Some(b"filled\n") {
                 host.step();
             }
-            let t0 = Counter.cycles();
+            let t0 = bench_clock();
             let snapshot = host.suspend(id).expect("live");
-            let t1 = Counter.cycles();
+            let t1 = bench_clock();
             bytes = snapshot.as_bytes().len();
             let mode = if eager { Resume::Eager } else { Resume::Lazy };
-            let t2 = Counter.cycles();
+            let t2 = bench_clock();
             let id = host.resume(snapshot, mode, true, false).expect("resume");
-            let t3 = Counter.cycles();
+            let t3 = bench_clock();
             host.run(|h| h.finished(id).is_some());
-            let t4 = Counter.cycles();
+            let t4 = bench_clock();
             assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
             samples[0].push(ns(t0, t1));
             samples[slot].push(ns(t2, t3));
@@ -3238,13 +3678,185 @@ fn switch_ns(mut host: Host) -> u64 {
         let b = host
             .spawn(image, &[b"yielder"], false, false)
             .expect("spawn yielder");
-        let t0 = Counter.cycles();
+        let t0 = bench_clock();
         host.run(|h| h.finished(a).is_some() && h.finished(b).is_some());
-        let t1 = Counter.cycles();
-        *round = timer::cycles_to_ns(t1 - t0).unwrap_or(0) / (2 * YIELDS);
+        let t1 = bench_clock();
+        *round = bench_ns(t1 - t0).unwrap_or(0) / (2 * YIELDS);
     }
     rounds.sort_unstable();
     rounds[2]
+}
+
+/// Counter ticks of one `getpid` round trip (cell to kernel and back):
+/// `yielder getpid 20000` run to its exit, minus `yielder getpid 0` (robust
+/// over rounds, see [`robust`]).
+#[cfg(feature = "bench-cell")]
+fn syscall_ticks() -> u64 {
+    const CALLS: u64 = 20_000;
+    let mut host = Host::new();
+    let mut run = |n: &[u8]| {
+        let argv: [&[u8]; 3] = [b"yielder", b"getpid", n];
+        let id = host
+            .spawn(test_image("yielder"), &argv, false, false)
+            .expect("spawn yielder");
+        let t0 = bench_clock();
+        host.run(|h| h.finished(id).is_some());
+        bench_clock() - t0
+    };
+    let mut samples: Vec<u64> = (0..3 * ROUNDS)
+        .map(|_| {
+            let empty = run(b"0");
+            run(b"20000").saturating_sub(empty)
+        })
+        .collect();
+    robust(&mut samples) / CALLS
+}
+
+/// A frozen `ballast` cell holding `mib` MiB written, on `host`.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+fn ballast_template(host: &mut Host, mib: &[u8]) -> u32 {
+    let big = host
+        .spawn(
+            test_image("ballast"),
+            &[b"ballast", b"write", mib],
+            true,
+            false,
+        )
+        .expect("spawn ballast");
+    while host.output(big) != Some(b"filled\n") {
+        host.step();
+    }
+    assert!(host.freeze(big));
+    big
+}
+
+/// Counter ticks the kernel spends resolving one copy-on-write fault of a
+/// 4 KiB page (frame, copy, entry and TLB flush; the trap itself is the
+/// system call's round trip): that part accounted alone while a fork of a
+/// cell holding 1 MiB (small pages) writes every page.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+fn cow_fault_ticks() -> u64 {
+    let mut host = Host::new();
+    let big = ballast_template(&mut host, b"1");
+    let mut samples: Vec<u64> = (0..ROUNDS)
+        .map(|_| {
+            let child = host.spawn_from_template(big, true, false).expect("fork");
+            cost::start(1 << Part::Cow as u16);
+            host.run(|h| h.finished(child).is_some());
+            cost::stop(|a, _| a.inclusive(Part::Cow) / a.count(Part::Cow).max(1))
+        })
+        .collect();
+    samples.sort_unstable();
+    samples[ROUNDS / 2]
+}
+
+/// Runs `f` with every part accounted and prints its breakdown (spec
+/// `profiling`): the parts, the scopes entered, and the system calls that
+/// took most time. `per_trap` is the cost of one entry into cell code and
+/// back, in counter ticks.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+fn breakdown(console: &mut impl Console, workload: &str, per_trap: u64, f: impl FnOnce()) {
+    use core::fmt::Write;
+    cost::start(cost::ALL);
+    f();
+    cost::stop(|account, calls| {
+        let ns = |t: u64| timer::cycles_to_ns(t).unwrap_or(0);
+        let mut w = rhizo_hal::ConsoleWriter(console);
+        let _ = rhizo_prof::Breakdown {
+            workload,
+            account,
+            per_trap,
+        }
+        .write(&mut w, ns);
+        let _ = write!(w, "rhizo-breakdown-calls {workload}");
+        let (top, n) = calls.top::<8>();
+        for &(nr, count, ticks) in &top[..n] {
+            let _ = match user::ABI.call_name(nr) {
+                Some(name) => write!(w, " {name:?}={count}/{}", ns(ticks)),
+                None => write!(w, " {nr}={count}/{}", ns(ticks)),
+            };
+        }
+        let _ = writeln!(w);
+    });
+}
+
+/// The breakdowns of the workloads (spec `profiling`): the cell benchmark
+/// loop (`hello` spawned and run 101 times), a fork of a 50 MiB cell
+/// writing every page, and CPython answering one request from cold.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+fn breakdowns(console: &mut impl Console) {
+    // One trap's cost: cell time per entry of a cell doing nothing but
+    // system calls.
+    let per_trap = {
+        let mut host = Host::new();
+        let argv: [&[u8]; 3] = [b"yielder", b"getpid", b"20000"];
+        let id = host
+            .spawn(test_image("yielder"), &argv, false, false)
+            .expect("spawn yielder");
+        cost::start(cost::ALL);
+        host.run(|h| h.finished(id).is_some());
+        cost::stop(|a, _| a.time(Part::Cell) / a.count(Part::Cell).max(1))
+    };
+    let mut host = Host::new();
+    breakdown(console, "cell_loop", per_trap, || {
+        for _ in 0..101 {
+            let id = host
+                .spawn(test_image("hello"), &[b"hello"], true, false)
+                .expect("spawn");
+            host.run(|h| h.finished(id).is_some());
+        }
+    });
+    let big = ballast_template(&mut host, b"50");
+    breakdown(console, "fork_touch", per_trap, || {
+        let id = host.spawn_from_template(big, true, false).expect("fork");
+        host.run(|h| h.finished(id).is_some());
+    });
+    if let Some(files) = cpython_files() {
+        const ARGV: [&[u8]; 2] = [b"/usr/bin/python3", b"/app/agent_demo.py"];
+        breakdown(console, "cpython_cold", per_trap, || {
+            let id = host
+                .spawn_with_files(test_image("cpython"), &ARGV, files, true, false)
+                .expect("spawn");
+            host.run(|h| h.finished(id).is_some());
+        });
+    }
+}
+
+/// With several CPUs: the breakdown of sixteen CPU-bound cells on every CPU
+/// (time waiting on locks included), and how often each kernel lock made a
+/// CPU wait meanwhile.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+fn parallel_breakdown(console: &mut impl Console) {
+    use core::fmt::Write;
+    let locks = |host: &Host| {
+        [
+            ("frames", memory::contention()),
+            ("heap", crate::heap::contention()),
+            ("refs", SHARED.contention()),
+            ("sharing", SHARING.contention()),
+            ("net", NET.contention()),
+            ("sched", host.shared.contention()),
+        ]
+    };
+    let mut host = Host::new();
+    let ids: Vec<u32> = (0..4 * crate::smp::count())
+        .map(|_| {
+            host.spawn(test_image("spin"), &[b"spin", b"5"], false, false)
+                .expect("spawn")
+        })
+        .collect();
+    let before = locks(&host);
+    breakdown(console, "parallel", 0, || host.run(|_| false));
+    let after = locks(&host);
+    for id in ids {
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    let mut w = rhizo_hal::ConsoleWriter(console);
+    let _ = write!(w, "rhizo-locks");
+    for ((name, a), (_, b)) in after.iter().zip(&before) {
+        let _ = write!(w, " {name}={}/{}", a.waits - b.waits, a.spins - b.spins);
+    }
+    let _ = writeln!(w);
 }
 
 /// Makes the executable pages just written through the direct map visible to

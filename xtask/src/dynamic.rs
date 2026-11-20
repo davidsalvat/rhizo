@@ -163,8 +163,8 @@ fn pack_python(root: &Path) -> Result {
     let out = Command::new(&python)
         .arg("-S")
         .arg(&pack)
-        .arg(&script)
         .arg(&stdlib)
+        .arg(&script)
         .env_clear()
         .output()
         .map_err(|e| e.to_string())?;
@@ -183,8 +183,8 @@ fn pack_python(root: &Path) -> Result {
                 "{} -S {} {} {}",
                 python.display(),
                 pack.display(),
-                script.display(),
-                stdlib.display()
+                stdlib.display(),
+                script.display()
             ))
             .into_error(),
     )

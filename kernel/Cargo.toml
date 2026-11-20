@@ -15,8 +15,9 @@ test = false
 bench = false
 
 [features]
-# Test build: run the in-kernel test suite instead of the normal boot path.
-ktest = []
+# Test build: run the in-kernel test suite instead of the normal boot path
+# (with cost accounting built in, which it tests).
+ktest = ["profile"]
 # Harness self-checks used by `cargo xtask test`: each adds one failing test
 # to prove panics, hangs, exceptions and out-of-memory are detected.
 ktest-should-panic = ["ktest"]
@@ -28,6 +29,10 @@ ktest-oom = ["ktest"]
 # Benchmark build: spawn and run the hello cell repeatedly and print
 # `rhizo-cell spawn_ns=<median>` (`cargo xtask bench`).
 bench-cell = []
+# Cost accounting (spec `profiling`): the kernel's hooks, compiled out
+# otherwise; with `bench-cell`, print the breakdowns of the workloads
+# instead of the benchmarks.
+profile = []
 
 [dependencies]
 rhizo-hal = { path = "../crates/rhizo-hal" }
@@ -40,6 +45,7 @@ rhizo-snapshot = { path = "../crates/rhizo-snapshot" }
 rhizo-fs = { path = "../crates/rhizo-fs" }
 rhizo-net = { path = "../crates/rhizo-net" }
 rhizo-virtio = { path = "../crates/rhizo-virtio" }
+rhizo-prof = { path = "../crates/rhizo-prof" }
 
 [lints]
 workspace = true
