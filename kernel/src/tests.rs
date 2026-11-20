@@ -1599,7 +1599,7 @@ fn a_cpython_agent_talks_forks_and_survives_suspend() {
         return;
     }
     let mut host = Host::new();
-    let run = crate::cell::agent(&mut host, expected::AGENT_TURNS, Resume::Lazy, false)
+    let run = crate::cell::agent(&mut host, expected::AGENT_TURNS, Some(Resume::Lazy), false)
         .unwrap_or_else(|why| panic!("the agent did not finish: {why}"));
     assert_eq!(
         run.suspend_resume_ns.len(),

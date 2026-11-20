@@ -2636,8 +2636,9 @@ pub struct AgentRun {
 const AGENT_BRANCHES: u8 = 3;
 
 /// Runs the CPython agent for `turns` turns against the host's model
-/// server (`llm=` on the command line), suspending and resuming it (`mode`)
-/// in its pause after every turn; then, where it prints `fork` and sleeps,
+/// server (`llm=` on the command line), suspending and resuming it in its
+/// pause after every turn (unless `mode` is `None`); then, where it prints
+/// `fork` and sleeps,
 /// freezes it as a template and starts one cell per branch from it, each
 /// told its branch in `/branch` (design D3 of `add-agent-workload`), and
 /// runs them to their end. `timed`: the agent also prints its turn times.
@@ -2646,7 +2647,7 @@ const AGENT_BRANCHES: u8 = 3;
 pub fn agent(
     host: &mut Host,
     turns: usize,
-    mode: Resume,
+    mode: Option<Resume>,
     timed: bool,
 ) -> Result<AgentRun, alloc::string::String> {
     use alloc::format;
@@ -2693,8 +2694,13 @@ pub fn agent(
     };
     // Its turns: after each, it pauses in a sleep, where the host suspends
     // and resumes it; the last pause before the fork is its long sleep.
+    let mut seen = 0;
     loop {
-        while !(host.asleep(id) && host.output(id).is_some_and(|o| o.ends_with(b"\n"))) {
+        let printed = |host: &mut Host, id: u32| {
+            host.output(id)
+                .is_some_and(|o| o.len() > seen && o.ends_with(b"\n"))
+        };
+        while !(host.asleep(id) && printed(host, id)) {
             if host.finished(id).is_some() || now_ns() > end {
                 return Err(said(host, id));
             }
@@ -2703,6 +2709,10 @@ pub fn agent(
         if host.output(id).is_some_and(|o| o.ends_with(b"fork\n")) {
             break;
         }
+        let Some(mode) = mode else {
+            seen = host.output(id).map_or(0, <[u8]>::len);
+            continue;
+        };
         let t0 = Counter.cycles();
         let snapshot = host.suspend(id).ok_or("cannot suspend the agent")?;
         let resumed = host.resume(snapshot, mode, true, false);
@@ -2711,6 +2721,7 @@ pub fn agent(
         run.transcript
             .extend_from_slice(&host.finished(id).expect("suspended").output);
         id = resumed;
+        seen = 0;
     }
     run.transcript
         .extend_from_slice(host.output(id).unwrap_or_default());
@@ -2758,11 +2769,12 @@ pub fn agent(
 }
 
 /// The CPython agent's figures (design D4 of `add-agent-workload`), over 3
-/// runs of 8 turns, each suspended and eagerly resumed after every turn:
-/// medians of a turn as the agent times it and of the part of it spent on
-/// the model's answer (the first turn, which connects and runs cold, left
-/// out), of a suspend plus resume, and of a fork into the branches until
-/// they run.
+/// pairs of runs of 8 turns: medians of a turn as the agent times it and of
+/// the part of it spent on the model's answer (the first turn, which
+/// connects and runs cold, left out) from runs that are not suspended, as
+/// the Linux process is not; of a suspend plus eager resume after every
+/// turn of the other runs; and of a fork into the branches until they run,
+/// from both.
 #[cfg(feature = "bench-cell")]
 fn agent_figures() -> Result<[u64; 4], alloc::string::String> {
     const ROUNDS: usize = 3;
@@ -2770,7 +2782,12 @@ fn agent_figures() -> Result<[u64; 4], alloc::string::String> {
     let mut samples: [Vec<u64>; 4] = Default::default();
     for _ in 0..ROUNDS {
         let mut host = Host::new();
-        let run = agent(&mut host, TURNS, Resume::Eager, true)?;
+        let suspended = agent(&mut host, TURNS, Some(Resume::Eager), true)?;
+        samples[2].extend(suspended.suspend_resume_ns);
+        samples[3].push(suspended.fork_ns);
+        drop(host);
+        let mut host = Host::new();
+        let run = agent(&mut host, TURNS, None, true)?;
         let text = alloc::string::String::from_utf8_lossy(&run.transcript);
         for (key, slot) in [("agent turn_ns=", 0), ("agent model_ns=", 1)] {
             let times = text
@@ -2784,7 +2801,6 @@ fn agent_figures() -> Result<[u64; 4], alloc::string::String> {
                     .filter_map(|t| t.parse::<u64>().ok()),
             );
         }
-        samples[2].extend(run.suspend_resume_ns);
         samples[3].push(run.fork_ns);
     }
     let mut out = [0; 4];

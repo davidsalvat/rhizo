@@ -193,17 +193,17 @@ pub const CPYTHON_STDOUT: &str = "warm\n\
 pub const AGENT_TURNS: usize = 3;
 #[allow(dead_code)]
 pub const AGENT_TRANSCRIPT: &str = "\
-turn 1 call_1c7990ea n=930 seed=783 value=350705 notes=1 crc=08f15329 conn_requests=1
-turn 2 call_c4ff4ba0 n=824 seed=999 value=402872 notes=2 crc=5b8d69ac conn_requests=2
-turn 3 call_ab9ee1a0 n=820 seed=481 value=184870 notes=3 crc=2a65944d conn_requests=3
+turn 1 call_37dd1708 n=804 seed=565 value=209594 notes=1 crc=222a551f conn_requests=1
+turn 2 call_bf87f223 n=571 seed=432 value=115270 notes=2 crc=387ba637 conn_requests=2
+turn 3 call_3bfe6f93 n=711 seed=719 value=254433 notes=3 crc=e911e45d conn_requests=3
 fork
 branch 0
-branch 0 value=184870
-branch 0 turn call_bfe901d6 n=642 seed=998 value=312881 notes=5 crc=adcea7c2 conn_requests=1
+branch 0 value=254433
+branch 0 turn call_f0936d84 n=592 seed=473 value=114136 notes=5 crc=af998648 conn_requests=1
 branch 1
-branch 1 value=200031
-branch 1 turn call_d67ece69 n=833 seed=263 value=102750 notes=5 crc=fa1ef667 conn_requests=1
+branch 1 value=252954
+branch 1 turn call_9e0dfecc n=956 seed=760 value=339638 notes=5 crc=89f62a97 conn_requests=1
 branch 2
-branch 2 value=196700
-branch 2 turn call_78d9a019 n=949 seed=765 value=360186 notes=5 crc=780d122b conn_requests=1
+branch 2 value=236635
+branch 2 turn call_8f48e0a0 n=608 seed=116 value=35940 notes=5 crc=415d1f0e conn_requests=1
 ";

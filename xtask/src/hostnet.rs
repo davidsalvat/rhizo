@@ -158,39 +158,28 @@ fn request_end(bytes: &[u8]) -> Option<(usize, bool)> {
 
 /// The fake model's chat completion for `request` (the `served`-th on its
 /// connection): always a call to the agent's `compute` tool, with arguments
-/// derived from the whole conversation (FNV-1a of its canonical JSON), so
-/// the same conversation always gets the same answer.
+/// derived from the whole request body (FNV-1a), so the same conversation
+/// always gets the same answer. Built without parsing JSON: the server's
+/// own time is part of every turn the benchmark measures, on both sides.
 fn model_answer(request: &[u8], served: u32) -> String {
     let head = request
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(0, |p| p + 4);
-    let canonical = serde_json::from_slice::<serde_json::Value>(&request[head..])
-        .map(|v| v.to_string())
-        .unwrap_or_default();
-    let hash = canonical.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
-    });
-    let arguments = serde_json::json!({ "n": 500 + hash % 500, "seed": (hash >> 20) % 1000 });
-    serde_json::json!({
-        "object": "chat.completion",
-        "model": "rhizo-fake",
-        "choices": [{
-            "index": 0,
-            "finish_reason": "tool_calls",
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": format!("call_{:08x}", hash as u32),
-                    "type": "function",
-                    "function": { "name": "compute", "arguments": arguments.to_string() },
-                }],
-            },
-        }],
-        "x_requests_on_connection": served,
-    })
-    .to_string()
+    let hash = request[head..]
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+    let (n, seed, id) = (500 + hash % 500, (hash >> 20) % 1000, hash as u32);
+    format!(
+        "{{\"object\": \"chat.completion\", \"model\": \"rhizo-fake\", \"choices\": [{{\
+         \"index\": 0, \"finish_reason\": \"tool_calls\", \"message\": {{\"role\": \"assistant\", \
+         \"content\": null, \"tool_calls\": [{{\"id\": \"call_{id:08x}\", \"type\": \"function\", \
+         \"function\": {{\"name\": \"compute\", \
+         \"arguments\": \"{{\\\"n\\\": {n}, \\\"seed\\\": {seed}}}\"}}}}]}}}}], \
+         \"x_requests_on_connection\": {served}}}"
+    )
 }
 
 /// The port of a TCP echo server listening on `addr` (started once).
@@ -324,10 +313,10 @@ mod tests {
             r#"{"messages": [{"role": "user", "content": "hi"}]}"#,
             false,
         );
-        // Same conversation, other spacing and key order: same answer.
+        // Same conversation, same answer; another, another.
         let b = chat(
             &mut s,
-            r#"{"messages":[{"content":"hi","role":"user"}]}"#,
+            r#"{"messages": [{"role": "user", "content": "hi"}]}"#,
             false,
         );
         let c = chat(

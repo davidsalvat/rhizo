@@ -10,9 +10,12 @@ thread per connection reads HTTP/1.1 requests (headers, then
 `Content-Length` bytes), waits `RHIZO_LLM_DELAY_MS` (0 by default: the
 benchmark measures Rhizo, not a sleep), and answers a chat completion that
 calls the `compute` tool. The tool's arguments and the call's identifier
-are an FNV-1a hash of the request's JSON in canonical form (`serde_json`,
-already a dependency of `xtask`), so the same conversation always gets the
-same answer whatever its spacing. The connection stays open unless the
+are an FNV-1a hash of the request body, so the same conversation always
+gets the same answer. The answer is formatted without parsing the request
+as JSON: `xtask` runs as a debug build, and the server's own time is part
+of every turn measured, on both sides (`serde_json` parsing a 3 KiB
+conversation in a debug build cost more than the kernel's part of a turn).
+The connection stays open unless the
 request says `Connection: close` (so a client that reads to the end of the
 stream works too, as the laptop workload of `add-reference-workloads`
 does); each answer carries `x_requests_on_connection`, which lets the
@@ -83,14 +86,16 @@ resumes it once `Host::asleep` holds, never in the middle of a request.
 spawn CPython with the agent, step until each pause, suspend and resume,
 freeze at `fork`, start the branches, run them to their end; it returns
 the transcript, each suspend-plus-resume time and the fork time. The
-`bench-cell` kernel runs it three times with 8 turns and prints
-`rhizo-agent turn_ns=... suspend_resume_ns=... fork_ns=...` (or
+`bench-cell` kernel runs it three times with 8 turns suspended after
+each, and three times without suspending it, and prints
+`rhizo-agent turn_ns=... model_ns=... suspend_resume_ns=... fork_ns=...` (or
 `rhizo-agent skipped: <why>`):
 
 - `workload.agent_turn_us`: one turn as the agent itself times it with
   `time.perf_counter_ns` (request, answer, JSON, tool, append), the same
   code on both sides; median of turns 2 to 8 (the first connects and runs
-  cold code).
+  cold code) of runs that are not suspended, as the Linux process is not
+  (a turn right after a resume runs with cold caches and TLB).
 - `workload.agent_model_us`: the part of those turns spent on the model,
   from sending the request until the whole answer is read (network card,
   TCP stack, the host's server), so a gap in the turn can be told apart
