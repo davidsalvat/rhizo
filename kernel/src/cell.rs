@@ -472,7 +472,6 @@ static RANDOM: Global<Generator> = Global::new(Generator::from_key([0; 32]));
 static WIRE_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Shortest time between two polls of the network card while cells run.
 const WIRE_PERIOD_NS: u64 = 20_000;
-static WIRE_READY: AtomicBool = AtomicBool::new(false);
 /// Highest address-space tag (set by [`init`]).
 static MAX_TAG: AtomicU16 = AtomicU16::new(0);
 
@@ -493,6 +492,16 @@ pub fn init(smp: Option<u16>) -> usize {
     }
     irq::init(SLICE_NS);
     MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
+    // The network card comes up once, at boot, rather than with the first
+    // host: what it allocates is never charged to a cell or a test.
+    let mut seed = [0; 8];
+    RANDOM.with(|g| g.fill(&mut seed));
+    NET.with(|net| {
+        // Parked connections re-attach only in this boot (design D2 of
+        // `keep-tcp-across-suspend`).
+        net.set_boot(Counter.cycles());
+        crate::wire::init(net, now_ns(), u64::from_le_bytes(seed));
+    });
     crate::smp::start(smp)
 }
 
@@ -1720,16 +1729,6 @@ fn sync_fp(live: &mut Live, leaving: bool) {
 impl Host {
     /// An empty host for every CPU online.
     pub fn new() -> Self {
-        if !WIRE_READY.swap(true, Ordering::Relaxed) {
-            let mut seed = [0; 8];
-            RANDOM.with(|g| g.fill(&mut seed));
-            NET.with(|net| {
-                // Parked connections re-attach only in this boot (design D2
-                // of `keep-tcp-across-suspend`).
-                net.set_boot(Counter.cycles());
-                crate::wire::init(net, now_ns(), u64::from_le_bytes(seed));
-            });
-        }
         Self {
             shared: Global::new(Shared {
                 sched: Scheduler::new(crate::smp::count()),
