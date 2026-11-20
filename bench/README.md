@@ -154,7 +154,8 @@ was stripped); the Rust test cells are stripped, so their addresses fold by
 
 Where the guest has performance counters (`rhizo-pmu` in the output), the
 `bench-cell` kernel runs its single-CPU benchmarks again with the PMU as
-their clock, once counting retired instructions and once core cycles:
+their clock (all but the fork benchmarks, which need memory the first pass
+keeps), once counting retired instructions and once core cycles:
 `<metric>_insns` and `<metric>_cycles`. Where it has none, these are listed
 as skipped (`pmu/<vmm>`).
 
@@ -170,7 +171,8 @@ network card, the only input from outside). These are the
 |---|---|
 | QEMU TCG, x86_64 | None (QEMU emulates no x86 PMU): `-icount` gives the instruction counts |
 | QEMU TCG, AArch64 | PMUv3: cycles; instructions only under `-icount` |
-| QEMU, Firecracker, Cloud Hypervisor with KVM | What KVM gives the guest, if the host has counters for it (see the `rhizo-pmu` line of each VMM in the benchmark output) |
+| QEMU (`microvm`, `q35`) and Cloud Hypervisor with KVM | What KVM gives the guest: on the GitHub-hosted x86_64 runners, Intel architectural performance monitoring with 8 counters, instructions and cycles |
+| Firecracker with KVM | None: Firecracker hides the PMU from its guests (CPUID leaf 0xA cleared on x86_64) |
 
 ## Comparisons with existing mechanisms
 
@@ -266,8 +268,10 @@ A baseline changes only on purpose, in a pull request that explains why:
 cargo xtask bench --env dedicated --update-baseline
 ```
 
-CI publishes its measured results as an annotation named `bench-results` on
-the `bench` job; to adopt them as the `ci` baseline, save that JSON to a file
+CI publishes its measured results, compact JSON in 3000-character pieces,
+as annotations `bench-results-1`, `-2`… of the benchmark job (nine per step,
+by `.github/publish-bench.sh`); to adopt them as the `ci` baseline, join
+the pieces in order into a file
 and run:
 
 ```bash

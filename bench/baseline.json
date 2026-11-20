@@ -51,7 +51,7 @@
       "cell.switch_untagged_ns/rhizo/firecracker": 441.0,
       "cell.switch_untagged_ns/rhizo/qemu-microvm": 445.0,
       "cell.switch_untagged_ns/rhizo/qemu-q35": 444.0,
-      "image.size_bytes": 46280.0,
+      "image.size_bytes": 47312.0,
       "memory.kernel_pt_frames": 5.0,
       "workload.cpython_cold_us/rhizo/cloud-hypervisor": 19336.251,
       "workload.cpython_cold_us/rhizo/firecracker": 19934.281,
