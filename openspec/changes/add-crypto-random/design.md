@@ -10,7 +10,10 @@ so reading the kernel's memory later does not reveal bytes already handed
 out (backtracking resistance), and nothing but the key is kept.
 
 About seventy lines, tested on the host against the RFC's vectors
-(section 2.3.2 and appendix A.1), no `unsafe`, no dependency.
+(section 2.3.2 and appendix A.1), no `unsafe`, no dependency. `rhizo-core`
+is compiled optimized in test builds too (`[profile.dev.package]`): the
+in-kernel tests run under emulation, and an unoptimized ChaCha20 doubled
+the suite's time (the syscall fuzzer asks for megabytes of random bytes).
 
 Alternative: the `rand_chacha` crate (MIT/Apache-2.0). Rejected: it brings
 `rand_core` and `ppv-lite86` for one function the kernel can carry, and
