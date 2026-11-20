@@ -57,6 +57,12 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.scaling_pct/rhizo/<vmm>` | timing | That batch's time on every CPU, times the number of CPUs, over its time stepping on one CPU, in percent: 100 is perfect scaling (lower is better) |
 | `cell.ipi_wake_us/rhizo/<vmm>` | timing | Handing work to an idle CPU: post it, wake the CPU with an inter-processor interrupt, see it done (robust figure over 105) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
+| `cell.syscall_ns/rhizo/<vmm>` | timing | One system call round trip: `yielder getpid 20000` run to its exit minus `yielder getpid 0`, per call (robust figure) |
+| `cell.cow_fault_ns/rhizo/<vmm>` | timing | The kernel's side of one copy-on-write fault of a 4 KiB page (frame, copy, entry, TLB flush; the trap itself is about `cell.syscall_ns`), accounted alone (`profile` build) while a fork of a cell holding 1 MiB writes every page |
+| `<metric>_insns/rhizo/<vmm>-icount` | instructions | Every timed figure above, and every breakdown, counted in retired instructions under QEMU with `-icount` (see below) |
+| `<metric>_insns/rhizo/<vmm>`, `<metric>_cycles/rhizo/<vmm>` | counts | Every single-CPU timed figure counted by the guest's PMU in retired instructions and core cycles, where the guest has one (see below) |
+| `breakdown.<workload>.<part>_us/rhizo/<vmm>` | timing, not gated | Where a workload's time goes (see below) |
+| `lock.<name>_waits/rhizo/<vmm>` | count, not gated | During the four-CPU breakdown: acquisitions that found the lock held by another CPU, for `frames` (frame allocator), `heap`, `refs` (frame reference counts), `sharing` (memory shared by forks), `net` (sockets), `sched` (run queues) |
 
 Figures the kernel repeats a hundred times or more (`cell.spawn_us`,
 `cell.run_us`, `cell.spawn_from_template_us`, the file and network
@@ -66,6 +72,69 @@ moment of the host does not decide them.
 
 Each timing is the median (and p90) of `--runs` boots after one discarded
 warm-up boot. Lower is better for every metric.
+
+## Where the time goes (spec `profiling`)
+
+### Breakdowns
+
+A second kernel, built with the `profile` feature, has hooks at every
+transition of the kernel and charges each CPU's time to one part at a time
+(`crates/rhizo-prof`). The parts are exclusive: a part nested in another (a
+copy inside a copy-on-write fault) is not counted in it, and the parts add
+up to `total`. `cargo xtask bench` boots it three times per VMM and
+publishes the medians as `breakdown.<workload>.<part>_us`:
+
+| Workload | What |
+|---|---|
+| `cell_loop` | The cell benchmark loop: `hello` spawned and run to its exit 101 times |
+| `fork_touch` | A fork of a cell holding 50 MiB written (a template), the child writing every page until it exits |
+| `cpython_cold` | CPython answering one request from cold (where CPython is built) |
+| `parallel` | With 4 vCPUs: sixteen CPU-bound cells (`spin 5`) on every CPU |
+
+| Part | Time spent |
+|---|---|
+| `user` | In the cell's own code |
+| `entry_exit` | Entering and leaving cell code: entries times the cost of one, measured on a cell that only calls `getpid` (an estimate; the rest of the cell's time is `user`) |
+| `syscall` | Handling system calls other than socket calls |
+| `fault` | Page faults: lazily resumed pages coming back, stacks growing |
+| `cow` | Resolving copy-on-write faults |
+| `frames` | The frame allocator and frame reference counts |
+| `copy` | Copying and zeroing memory through the direct map |
+| `net` | Socket calls and polling the network card |
+| `sched` | Taking a cell to run and giving it back |
+| `idle` | Waiting for work |
+| `lock` | Waiting for a lock another CPU holds |
+| `spawn` | Cell operations: spawn (loading included), fork, suspend, resume |
+| `teardown` | Ending a cell: its address space and frames freed |
+| `other` | The rest of the kernel |
+| `total` | All of the above, summed over the CPUs |
+
+The kernel also prints the scopes entered per part
+(`rhizo-breakdown-counts`) and the eight system calls that took most time
+(`rhizo-breakdown-calls`, `name=count/ns`). Without `profile` the hooks
+compile to nothing, so no other figure is measured with them.
+
+### Instructions and cycles
+
+Where the guest has performance counters (`rhizo-pmu` in the output), the
+`bench-cell` kernel runs its single-CPU benchmarks again with the PMU as
+their clock, once counting retired instructions and once core cycles:
+`<metric>_insns` and `<metric>_cycles`. Where it has none, these are listed
+as skipped (`pmu/<vmm>`).
+
+`cargo xtask bench` also runs both kernels once under QEMU's TCG with
+`-icount shift=0,sleep=off` (`--accel icount`): the guest's clock advances
+one nanosecond per instruction, so every figure the kernel times is a count
+of retired instructions, the same on every run and every host (without the
+network card, the only input from outside). These are the
+`<metric>_insns/rhizo/<vmm>-icount` metrics, gated at +2 %
+(`thresholds_pct.instructions`). `--no-icount` skips them.
+
+| VMM | Performance counters in the guest |
+|---|---|
+| QEMU TCG, x86_64 | None (QEMU emulates no x86 PMU): `-icount` gives the instruction counts |
+| QEMU TCG, AArch64 | PMUv3: cycles; instructions only under `-icount` |
+| QEMU, Firecracker, Cloud Hypervisor with KVM | What KVM gives the guest, if the host has counters for it (see the `rhizo-pmu` line of each VMM in the benchmark output) |
 
 ## Comparisons with existing mechanisms
 
@@ -107,8 +176,11 @@ baseline by more than its threshold:
 
 | Environment | Where | Timing threshold | Deterministic threshold |
 |---|---|---|---|
-| `ci` | GitHub-hosted runners (shared, noisy) | +100 % on time to ready; TSC cycles recorded but not gated | +1 % |
-| `dedicated` | A self-hosted runner labelled `rhizo-bench`: bare metal or a pinned VM with KVM, fixed CPU frequency, nothing else running | +5 % | +1 % |
+| `ci` | GitHub-hosted runners (shared, noisy) | +100 % on time to ready; TSC cycles recorded but not gated | +1 %; instructions under `-icount` +2 % |
+| `dedicated` | A self-hosted runner labelled `rhizo-bench`: bare metal or a pinned VM with KVM, fixed CPU frequency, nothing else running | +5 % | +1 %; instructions under `-icount` +2 % |
+
+Breakdowns (`breakdown.`) and lock waits (`lock.`) are recorded but not gated
+(entries of `ungated` that end in `.` cover every metric they start).
 
 Why so wide: two CI runs of identical code differed by up to +41 % in time to
 ready and +53 % in kernel cycles. Hosted runners land on different physical

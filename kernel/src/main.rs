@@ -15,6 +15,8 @@ mod cell;
 mod heap;
 mod memory;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod prof;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod smp;
 mod sync;
 #[cfg(feature = "ktest")]

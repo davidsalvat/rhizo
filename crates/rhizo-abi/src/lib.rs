@@ -278,6 +278,44 @@ impl Arch {
         }
     }
 
+    /// The number of the system call saved in `cell`'s registers.
+    pub fn call_number(self, cell: &Cell) -> u64 {
+        self.call(cell).0
+    }
+
+    /// Whether call `nr` is a socket call: its time is network time in the
+    /// kernel's cost accounting (spec `profiling`).
+    pub fn is_socket_call(self, nr: u64) -> bool {
+        use Sys::*;
+        matches!(
+            self.decode(nr),
+            Some(
+                Socket
+                    | Socketpair
+                    | Bind
+                    | Listen
+                    | Accept
+                    | Accept4
+                    | Connect
+                    | Getsockname
+                    | Getpeername
+                    | Sendto
+                    | Recvfrom
+                    | Setsockopt
+                    | Getsockopt
+                    | Shutdown
+                    | Sendmsg
+                    | Recvmsg
+            )
+        )
+    }
+
+    /// The name of call `nr` (`Read`, `Mmap`…), for reports; `None` for a
+    /// call Rhizo does not implement.
+    pub fn call_name(self, nr: u64) -> Option<impl core::fmt::Debug> {
+        self.decode(nr)
+    }
+
     const fn machine(self) -> &'static [u8] {
         match self {
             Arch::Aarch64 => b"aarch64",

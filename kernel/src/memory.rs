@@ -37,12 +37,14 @@ impl PhysicalMemory for DirectMap {
     }
 
     fn zero_frame(&mut self, frame: u64) {
+        let _copy = copying();
         // SAFETY: the frame is RAM, mapped through the direct map, and owned
         // by the caller.
         unsafe { core::ptr::write_bytes(Self::virt(frame) as *mut u8, 0, FRAME_SIZE as usize) }
     }
 
     fn read_bytes(&self, phys: u64, out: &mut [u8]) {
+        let _copy = copying();
         // SAFETY: as for `read_u64`; the range is RAM owned by the caller and
         // does not overlap `out` (kernel heap or stack).
         unsafe {
@@ -55,12 +57,36 @@ impl PhysicalMemory for DirectMap {
     }
 
     fn write_bytes(&mut self, phys: u64, data: &[u8]) {
+        let _copy = copying();
         // SAFETY: as for `write_u64`; the range is RAM owned by the caller and
         // does not overlap `data`.
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), Self::virt(phys) as *mut u8, data.len())
         }
     }
+
+    fn copy(&mut self, from: u64, to: u64, len: u64) {
+        let _copy = copying();
+        // SAFETY: both ranges are RAM mapped through the direct map, owned by
+        // the caller, and do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                Self::virt(from) as *const u8,
+                Self::virt(to) as *mut u8,
+                len as usize,
+            )
+        }
+    }
+}
+
+/// Accounts the time of a copy as such (spec `profiling`) in profile
+/// builds, until the returned value is dropped.
+#[inline]
+fn copying() -> impl Sized {
+    #[cfg(feature = "profile")]
+    return crate::prof::scope(rhizo_prof::Part::Copy);
+    #[cfg(not(feature = "profile"))]
+    ()
 }
 
 static BITMAP: Global<[u64; BITMAP_WORDS]> = Global::new([0; BITMAP_WORDS]);
@@ -197,6 +223,12 @@ pub fn kernel_tables() -> PageTable<Format> {
 /// Runs `f` with the frame allocator, or returns `None` before memory setup.
 pub fn with_frames<R>(f: impl FnOnce(&mut FrameAllocator<'static>) -> R) -> Option<R> {
     FRAMES.with(|slot| slot.as_mut().map(f))
+}
+
+/// How often CPUs waited for the frame allocator (spec `profiling`).
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+pub fn contention() -> rhizo_core::sync::Contention {
+    FRAMES.contention()
 }
 
 /// Bytes currently free in the frame allocator.

@@ -13,7 +13,7 @@ use std::time::Duration;
 const BASELINE: &str = "bench/baseline.json";
 const README_START: &str = "<!-- bench:start -->";
 const README_END: &str = "<!-- bench:end -->";
-const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Metrics whose value does not depend on machine noise.
 const DETERMINISTIC: [&str; 3] = [
@@ -35,6 +35,8 @@ pub struct Options {
     pub update_baseline: bool,
     pub readme: bool,
     pub reference: bool,
+    /// Also count instructions under QEMU with `-icount` (spec `profiling`).
+    pub icount: bool,
 }
 
 impl Default for Options {
@@ -50,6 +52,7 @@ impl Default for Options {
             update_baseline: false,
             readme: false,
             reference: true,
+            icount: true,
         }
     }
 }
@@ -88,6 +91,7 @@ impl Options {
                 "--update-baseline" => o.update_baseline = true,
                 "--readme" => o.readme = true,
                 "--no-reference" => o.reference = false,
+                "--no-icount" => o.icount = false,
                 other => return Err(format!("unknown bench option `{other}`")),
             }
         }
@@ -313,6 +317,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     measure_comparisons(opts, &mut metrics, &mut skipped)?;
     Ok(Results {
         environment: opts.env.clone(),
@@ -402,6 +407,10 @@ fn measure_cells(
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
+        let mut syscall = Vec::new();
+        // The PMU's passes, where the guest has one (spec `profiling`).
+        let mut counted = crate::profile::Samples::default();
+        let mut pmu = None;
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -457,6 +466,19 @@ fn measure_cells(
                         thread_create.push(c as f64 / 1000.0);
                         futex_wake.push(w as f64);
                     }
+                    if let Some(ns) = crate::profile::field(&out.output, "rhizo-ops", "syscall_ns")
+                    {
+                        syscall.push(ns as f64);
+                    }
+                    for (name, value) in crate::profile::pmu_passes(&out.output) {
+                        let unit = if name.ends_with("_insns") {
+                            "insns"
+                        } else {
+                            "cycles"
+                        };
+                        counted.add(name, unit, value);
+                    }
+                    pmu = crate::profile::pmu_line(&out.output).map(str::to_string);
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
                         resume.push(snap.resume_ns as f64 / 1000.0);
@@ -532,6 +554,7 @@ fn measure_cells(
             ("cell.parallel_us", "us", &mut parallel),
             ("cell.scaling_pct", "%", &mut scaling),
             ("cell.ipi_wake_us", "us", &mut ipi_wake),
+            ("cell.syscall_ns", "ns", &mut syscall),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
                 let why = match crate::hostnet::for_vmm(vmm) {
@@ -553,6 +576,16 @@ fn measure_cells(
                     p90,
                     runs: values.len(),
                 });
+            }
+        }
+        metrics.extend(counted.metrics(vmm.id()));
+        if let Some(pmu) = pmu {
+            report::text(&format!("performance counters on {}: {pmu}", vmm.id()));
+            if pmu == "none" {
+                skipped.push((
+                    format!("pmu/{}", vmm.id()),
+                    "the guest has no performance counters: no instruction or cycle counts".into(),
+                ));
             }
         }
     }
@@ -930,18 +963,26 @@ fn load_baseline() -> Result<Value> {
 
 /// Whether `metric` is gated in `env`. Metrics listed under `ungated.<env>`
 /// are recorded but never fail the gate (for example, TSC cycles on shared CI
-/// runners, whose hosts run at different TSC frequencies).
+/// runners, whose hosts run at different TSC frequencies); an entry ending
+/// in `.` covers every metric it starts (`breakdown.`).
 fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
-    !baseline["ungated"][env]
-        .as_array()
-        .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(metric)))
+    !baseline["ungated"][env].as_array().is_some_and(|names| {
+        names
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|n| n == metric || (n.ends_with('.') && metric.starts_with(n)))
+    })
 }
 
-/// Allowed regression, in percent, for `metric` in `env`.
-fn threshold_pct(baseline: &Value, env: &str, metric: &str) -> f64 {
+/// Allowed regression, in percent, for `m` in `env`: instructions counted
+/// under QEMU's `-icount` are exact, so their threshold is narrow (spec
+/// `profiling`).
+fn threshold_pct(baseline: &Value, env: &str, m: &Metric) -> f64 {
     let t = &baseline["thresholds_pct"];
-    if DETERMINISTIC.contains(&metric) {
+    if DETERMINISTIC.contains(&m.name.as_str()) {
         t["deterministic"].as_f64().unwrap_or(1.0)
+    } else if m.vmm.as_deref().is_some_and(|v| v.ends_with("-icount")) {
+        t["instructions"].as_f64().unwrap_or(2.0)
     } else {
         t["timing"][env].as_f64().unwrap_or(50.0)
     }
@@ -974,7 +1015,7 @@ pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regres
         let Some(base) = stored[m.key()].as_f64() else {
             continue;
         };
-        let allowed = threshold_pct(baseline, env, &m.name);
+        let allowed = threshold_pct(baseline, env, m);
         if m.median > base * (1.0 + allowed / 100.0) {
             out.push(Regression {
                 key: m.key(),
@@ -1539,6 +1580,62 @@ mod tests {
                 "image.size_bytes"
             ]
         );
+    }
+
+    #[test]
+    fn instruction_counts_have_their_own_threshold() {
+        let baseline = json!({
+            "thresholds_pct": {"deterministic": 1, "instructions": 2, "timing": {"ci": 100}},
+            "environments": {"ci": {
+                "cell.switch_insns/rhizo/qemu-microvm-icount": 1000.0,
+                "cell.switch_ns/rhizo/qemu-microvm": 100.0
+            }}
+        });
+        let within = results(vec![
+            metric(
+                "cell.switch_insns",
+                "rhizo",
+                Some("qemu-microvm-icount"),
+                1019.0,
+            ),
+            metric("cell.switch_ns", "rhizo", Some("qemu-microvm"), 150.0),
+        ]);
+        assert!(regressions(&baseline, "ci", &within).is_empty());
+        let worse = results(vec![metric(
+            "cell.switch_insns",
+            "rhizo",
+            Some("qemu-microvm-icount"),
+            1021.0,
+        )]);
+        let found = regressions(&baseline, "ci", &worse);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].allowed_pct, 2.0);
+    }
+
+    #[test]
+    fn an_ungated_prefix_covers_its_metrics() {
+        let baseline = json!({
+            "thresholds_pct": {"timing": {"ci": 10}},
+            "ungated": {"ci": ["breakdown."]},
+            "environments": {"ci": {
+                "breakdown.fork_touch.cow_us/rhizo/qemu-q35": 1.0,
+                "breakdowns_us/rhizo/qemu-q35": 1.0
+            }}
+        });
+        let r = results(vec![
+            metric(
+                "breakdown.fork_touch.cow_us",
+                "rhizo",
+                Some("qemu-q35"),
+                9.0,
+            ),
+            metric("breakdowns_us", "rhizo", Some("qemu-q35"), 9.0),
+        ]);
+        let keys: Vec<_> = regressions(&baseline, "ci", &r)
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["breakdowns_us/rhizo/qemu-q35"]);
     }
 
     #[test]

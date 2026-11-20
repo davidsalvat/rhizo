@@ -120,6 +120,8 @@ macro_rules! suite {
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
+            ktest_case!(performance_counters_count_where_present),
+            ktest_case!(cost_accounting_adds_up_over_a_cell),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1963,4 +1965,64 @@ fn suspend_between_parallel_runs_is_invisible() {
     for id in spinners {
         assert!(host.kill(id));
     }
+}
+
+/// Where the CPU or hypervisor has performance counters, they count cycles
+/// (and retired instructions where counted) in kernel code; without them
+/// there is nothing to read (spec `profiling`).
+fn performance_counters_count_where_present() {
+    let Some(_) = arch::pmu::init() else {
+        assert!(arch::pmu::read().is_none());
+        return;
+    };
+    let before = arch::pmu::read().expect("counters on");
+    let mut x = 0u64;
+    for i in 0..10_000u64 {
+        x = core::hint::black_box(x.wrapping_add(i));
+    }
+    let counted = arch::pmu::read().expect("counters on").since(before);
+    assert!(counted.cycles > 0, "cycles did not advance");
+    if let Some(instructions) = counted.instructions {
+        assert!(instructions >= 10_000, "{instructions} instructions");
+    }
+}
+
+/// With every part accounted, a cell making 100 `getpid` calls shows up as
+/// cell time, system calls (100 of them `getpid`), spawn, teardown, frames
+/// and copies, and the parts add up to no more than the time it took
+/// (spec `profiling`).
+fn cost_accounting_adds_up_over_a_cell() {
+    use rhizo_prof::Part;
+    let t0 = arch::timer::Counter.cycles();
+    crate::prof::start(crate::prof::ALL);
+    let (ending, _) = crate::cell::run(
+        crate::cell::test_image("yielder"),
+        &[b"yielder", b"getpid", b"100"],
+    )
+    .expect("spawn yielder");
+    crate::prof::stop(|account, calls| {
+        let elapsed = arch::timer::Counter.cycles() - t0;
+        assert_eq!(ending, Ending::Exit(0));
+        assert!(account.total() <= elapsed, "more time than elapsed");
+        assert!(account.count(Part::Syscall) >= 101, "100 getpid and exit");
+        assert!(account.count(Part::Cell) >= account.count(Part::Syscall));
+        for part in [
+            Part::Cell,
+            Part::Syscall,
+            Part::Spawn,
+            Part::Teardown,
+            Part::Frames,
+            Part::Copy,
+        ] {
+            assert!(account.time(part) > 0, "no time in {}", part.name());
+        }
+        let (top, n) = calls.top::<8>();
+        let getpid = top[..n]
+            .iter()
+            .find(|c| {
+                alloc::format!("{:?}", arch::user::ABI.call_name(c.0).expect("known")) == "Getpid"
+            })
+            .expect("getpid recorded");
+        assert_eq!(getpid.1, 100);
+    });
 }

@@ -77,11 +77,18 @@
     "timing": {
       "ci": 100,
       "dedicated": 5
-    }
+    },
+    "instructions": 2
   },
   "ungated": {
     "ci": [
-      "boot.kernel_cycles"
+      "boot.kernel_cycles",
+      "breakdown.",
+      "lock."
+    ],
+    "dedicated": [
+      "breakdown.",
+      "lock."
     ]
   }
 }
