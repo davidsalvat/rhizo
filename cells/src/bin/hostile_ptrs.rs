@@ -88,8 +88,10 @@ fn main() -> i32 {
     );
     print(b"huge ranges ok\n");
 
+    // Only the first three: with 5-level paging, Linux takes the last two
+    // as user addresses.
     #[cfg(target_arch = "x86_64")]
-    for p in BAD {
+    for &p in &BAD[..3] {
         const ARCH_SET_FS: usize = 0x1002;
         check(
             syscall(call::ARCH_PRCTL, [ARCH_SET_FS, p, 0, 0, 0, 0]) == EPERM,
