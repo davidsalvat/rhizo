@@ -22,7 +22,7 @@ mod wire;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-pub use record::{DecodeError, Record, Saved, decode_records, encode_records};
+pub use record::{DecodeError, Park, Record, Saved, decode_records, encode_records};
 use smoltcp::iface::SocketHandle;
 pub use wire::WireConfig;
 use wire::{Progress, Wire};
@@ -281,6 +281,13 @@ pub struct Net {
     next_name: u64,
     /// The network card, once attached.
     wire: Option<Wire>,
+    /// Identity of this boot, in parked records (design D2 of
+    /// `keep-tcp-across-suspend`).
+    boot: u64,
+    next_key: u64,
+    /// Listeners and connections of suspended cells, by key, each holding
+    /// one reference.
+    parked: Vec<(u64, Handle)>,
 }
 
 impl Default for Net {
@@ -312,7 +319,16 @@ impl Net {
             next_port: *EPHEMERAL.start(),
             next_name: 1,
             wire: None,
+            boot: 0,
+            next_key: 1,
+            parked: Vec::new(),
         }
+    }
+
+    /// Sets the identity of this boot (the caller's randomness, never read
+    /// here): sockets parked in another boot do not re-attach.
+    pub fn set_boot(&mut self, boot: u64) {
+        self.boot = boot;
     }
 
     /// Counts every change a waiting cell may wait for (data, connections,
@@ -1104,8 +1120,11 @@ impl Net {
         self.insert(copy)
     }
 
-    /// What a snapshot keeps of `h` (design D4).
-    pub fn export(&self, h: Handle) -> Result<Record> {
+    /// What a snapshot keeps of `h` (design D4 of `add-sockets-and-poll`):
+    /// a listener or a connection is also parked, with one more reference,
+    /// until [`import`](Self::import) or [`unpark`](Self::unpark) takes it
+    /// back (design D1 of `keep-tcp-across-suspend`).
+    pub fn export(&mut self, h: Handle) -> Result<Record> {
         let s = self.get(h)?;
         let (state, local) = match &s.state {
             State::Open => (Saved::Open, s.local.clone()),
@@ -1114,19 +1133,53 @@ impl Net {
             }
             _ => (Saved::Reset, None),
         };
-        Ok(Record {
+        let mut record = Record {
             family: s.family,
             ty: s.ty,
             state,
             local,
             opts: s.opts,
-        })
+            parked: None,
+        };
+        if matches!(
+            s.state,
+            State::Listening { .. } | State::Connected { .. } | State::Wire { .. }
+        ) {
+            let key = self.next_key;
+            self.next_key += 1;
+            self.parked.push((key, h));
+            self.retain(h);
+            record.parked = Some(Park {
+                boot: self.boot,
+                key,
+            });
+        }
+        Ok(record)
     }
 
-    /// A socket made from snapshot record `r`, bound and listening again
-    /// where it was (reset if its address is taken). A Unix name gets a new
-    /// number: returned as `(old, new)` so the cell's files can follow.
+    /// The socket parked under `r` in this boot, taken out of the parked
+    /// ones with its reference.
+    fn take_parked(&mut self, r: &Record) -> Option<Handle> {
+        let park = r.parked?;
+        let i = self.parked.iter().position(|p| p.0 == park.key)?;
+        (park.boot == self.boot).then(|| self.parked.swap_remove(i).1)
+    }
+
+    /// A socket made from snapshot record `r`: one parked in this boot
+    /// comes back as it is now (once); otherwise a connection is reset and
+    /// others are bound and listening again where they were (reset if
+    /// their address is taken). A Unix name gets a new number: returned as
+    /// `(old, new)` so the cell's files can follow (the same number for a
+    /// listener that came back).
     pub fn import(&mut self, r: &Record) -> Result<(Handle, Option<(u64, u64)>)> {
+        if let Some(h) = self.take_parked(r) {
+            let s = self.get(h)?;
+            let name = match (&s.state, &s.local) {
+                (State::Listening { .. }, Some(Addr::Unix { name, .. })) => Some((*name, *name)),
+                _ => None,
+            };
+            return Ok((h, name));
+        }
         let mut s = Socket::new(r.family, r.ty, r.opts);
         if r.state == Saved::Reset {
             s.state = State::Reset { pending: true };
@@ -1155,6 +1208,14 @@ impl Net {
             self.get_mut(h)?.state = State::Reset { pending: true };
         }
         Ok((h, renamed))
+    }
+
+    /// A snapshot holding record `r` is dropped: a socket parked under it
+    /// closes.
+    pub fn unpark(&mut self, r: &Record) {
+        if let Some(h) = self.take_parked(r) {
+            self.release(h);
+        }
     }
 }
 

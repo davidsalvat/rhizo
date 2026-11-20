@@ -50,8 +50,9 @@ listener; accepts one connection and echoes until it closes) and `ping`
 
 The workers run 3 s (600 s in the soak) at 200 ms per operation: an
 offered load of 50,000 operations per second at 10,000 cells. Every 10 ms
-the host suspends and lazily resumes one `cpu` or `file` worker (sockets
-do not survive a suspend yet) and forks one, killing the previous child:
+the host suspends and lazily resumes the next worker (connections stay
+open across a suspend, `keep-tcp-across-suspend`) and forks a `cpu`
+worker (a fork's connections are reset), killing the previous child:
 `Host` operations happen between runs, which with several CPUs would stop
 them all, so the workload uses one vCPU. `density.ops_per_s` counts the
 operations of workers that exited with 0 over the load's wall time; any

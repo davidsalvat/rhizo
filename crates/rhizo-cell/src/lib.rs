@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod elf;
+pub mod images;
 pub mod memory;
 pub mod space;
 pub mod threads;
@@ -129,9 +130,8 @@ impl Cell {
     }
 }
 
-/// Creates cell `id` from the static executable `data`: a new hierarchy
-/// (sharing the kernel half of `kernel` when given, as x86_64 needs), the
-/// loaded image and the initial stack. On failure every frame is returned.
+/// Creates cell `id` from the static executable `data`: [`load`] then
+/// [`start`]. On failure every frame is returned.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn<F: EntryFormat>(
     id: u32,
@@ -145,15 +145,53 @@ pub fn spawn<F: EntryFormat>(
     random: [u8; 16],
 ) -> Result<Cell, elf::ElfError> {
     let image = elf::Image::parse(data, machine)?;
+    let pt = load(&image, mem, frames)?;
+    start(
+        id, &image, machine, pt, kernel, mem, frames, argv, envp, random,
+    )
+}
+
+/// The part of a spawn that depends only on the executable (design D1 of
+/// `add-image-cache`): a new hierarchy holding `image`'s segments and
+/// nothing else (no stack, no kernel half). On failure every frame is
+/// returned.
+pub fn load<F: EntryFormat>(
+    image: &elf::Image<'_>,
+    mem: &mut impl PhysicalMemory,
+    frames: &mut impl Frames,
+) -> Result<PageTable<F>, elf::ElfError> {
     let pt =
         PageTable::<F>::new(mem, &mut || frames.alloc()).map_err(|_| elf::ElfError::OutOfMemory)?;
+    match image.load(&pt, mem, &mut || frames.alloc()) {
+        Ok(()) => Ok(pt),
+        Err(e) => {
+            space::destroy(pt, mem, frames);
+            Err(e)
+        }
+    }
+}
+
+/// Starts cell `id` on `pt`, a hierarchy that holds `image`'s segments
+/// (from [`load`], or a copy of one): shares the kernel half of `kernel`
+/// when given (as x86_64 needs), builds the initial stack and the first
+/// thread. On failure every frame of `pt` is returned.
+#[allow(clippy::too_many_arguments)]
+pub fn start<F: EntryFormat>(
+    id: u32,
+    image: &elf::Image<'_>,
+    machine: elf::Machine,
+    pt: PageTable<F>,
+    kernel: Option<&PageTable<F>>,
+    mem: &mut impl PhysicalMemory,
+    frames: &mut impl Frames,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    random: [u8; 16],
+) -> Result<Cell, elf::ElfError> {
     if let Some(kernel) = kernel {
         pt.share_upper_half(mem, kernel);
     }
-    let built = image.load(&pt, mem, &mut || frames.alloc()).and_then(|()| {
-        elf::build_stack(&pt, mem, &mut || frames.alloc(), &image, argv, envp, random)
-    });
-    match built {
+    match elf::build_stack(&pt, mem, &mut || frames.alloc(), image, argv, envp, random) {
         Ok(sp) => {
             let mut cell = Cell::new(id, pt.root(), image.entry, sp, image.end());
             cell.regs_mut().fp = FpState::initial(machine);
@@ -284,7 +322,7 @@ mod tests {
 
     use crate::testing::CountingFrames;
     use rhizo_hal::testing::FakePhysicalMemory;
-    use rhizo_mm::paging::X86_64;
+    use rhizo_mm::paging::{PageFlags, PageSize, X86_64};
 
     #[test]
     fn spawn_builds_a_runnable_cell_and_failures_leak_nothing() {
@@ -347,6 +385,106 @@ mod tests {
         );
         assert_eq!(err, Err(elf::ElfError::OutOfMemory));
         assert_eq!(frames.outstanding(), tables);
+    }
+
+    /// Every page of the user half: address, size, permissions, contents.
+    fn pages(mem: &FakePhysicalMemory, root: u64) -> Vec<(u64, PageSize, PageFlags, Vec<u8>)> {
+        let mut out = Vec::new();
+        PageTable::<X86_64>::from_root(root).for_each_lower_leaf(mem, &mut |v, p, s, f| {
+            let mut bytes = vec![0; s.bytes() as usize];
+            mem.read_bytes(p, &mut bytes);
+            out.push((v, s, f, bytes));
+        });
+        out
+    }
+
+    /// A cell started on a copy of a loaded space (design D2 of
+    /// `add-image-cache`) is the cell a direct spawn makes, and cells
+    /// started from one loaded space keep their writes to themselves.
+    #[test]
+    fn a_cell_on_a_loaded_space_is_a_spawned_cell() {
+        let data = elf::tests::elf(
+            62,
+            2,
+            &[(0x40_0000, 5, b"CODE", 4), (0x40_1000, 6, b"DATA", 0x1800)],
+        );
+        let image = elf::Image::parse(&data, elf::Machine::X86_64).unwrap();
+        let mut mem = FakePhysicalMemory::new();
+        let mut frames = CountingFrames::new(1024);
+        let kernel = PageTable::<X86_64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+        mem.write_u64(kernel.root() + 511 * 8, 0x1234_5003);
+        let tables = frames.outstanding();
+        let argv: &[&[u8]] = &[b"a", b"b"];
+        let direct = spawn(
+            3,
+            &data,
+            elf::Machine::X86_64,
+            Some(&kernel),
+            &mut mem,
+            &mut frames,
+            argv,
+            &[b"E=1"],
+            [7; 16],
+        )
+        .unwrap();
+
+        let loaded = load::<X86_64>(&image, &mut mem, &mut frames).unwrap();
+        let start_copy = |id, mem: &mut FakePhysicalMemory, frames: &mut CountingFrames| {
+            let pt = loaded.clone_lower_half(mem, frames, image.span()).unwrap();
+            start(
+                id,
+                &image,
+                elf::Machine::X86_64,
+                pt,
+                Some(&kernel),
+                mem,
+                frames,
+                argv,
+                &[b"E=1"],
+                [7; 16],
+            )
+            .unwrap()
+        };
+        let a = start_copy(3, &mut mem, &mut frames);
+        let b = start_copy(4, &mut mem, &mut frames);
+        assert_eq!(
+            a,
+            Cell {
+                root: a.root,
+                ..direct.clone()
+            },
+            "same registers, threads, break"
+        );
+        assert_eq!(pages(&mem, a.root), pages(&mem, direct.root));
+        assert_eq!(
+            mem.read_u64(a.root + 511 * 8),
+            0x1234_5003,
+            "kernel half shared"
+        );
+
+        // A write in one cell's data is seen by no other cell of the image.
+        let at = |root, virt| {
+            PageTable::<X86_64>::from_root(root)
+                .translate(&mem, virt)
+                .unwrap()
+        };
+        let (mine, theirs, pristine) = (
+            at(a.root, 0x40_1000),
+            at(b.root, 0x40_1000),
+            at(loaded.root(), 0x40_1000),
+        );
+        let code = [a.root, b.root, loaded.root()].map(|r| at(r, 0x40_0000).phys);
+        assert!(mine.flags.contains(PageFlags::WRITABLE));
+        mem.write_u64(mine.phys, 0xbad);
+        let data = u64::from_le_bytes(*b"DATA\0\0\0\0");
+        assert_eq!(mem.read_u64(theirs.phys), data);
+        assert_eq!(mem.read_u64(pristine.phys), data);
+        assert!(code.iter().all(|&c| c == code[0]), "code is shared");
+
+        for root in [direct.root, a.root, b.root, loaded.root()] {
+            space::destroy(PageTable::<X86_64>::from_root(root), &mut mem, &mut frames);
+        }
+        assert_eq!(frames.outstanding(), tables, "every frame returned");
     }
 
     #[test]

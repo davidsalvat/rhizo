@@ -291,9 +291,10 @@ fn server(console: &mut impl Console) {
     let cells = workers.len();
     let mut peak = start - memory::free_bytes();
 
-    // Load: the workers run for `secs`; meanwhile the host suspends and
-    // resumes a worker that computes or writes files, and forks one, at a
-    // constant rate (sockets do not survive a suspend yet).
+    // Load: the workers run for `secs`; meanwhile, at a constant rate, the
+    // host suspends and resumes the next worker (its connections stay), and
+    // forks the next one that computes or writes files (a fork's
+    // connections are reset).
     prof::start();
     let t0 = now_ns();
     let stop_ops = t0 + secs * 1_000_000_000;
@@ -310,13 +311,7 @@ fn server(console: &mut impl Console) {
             if let Some(id) = child.take() {
                 host.kill(id);
             }
-            // The next worker that computes or writes files.
-            for _ in 0..workers.len() {
-                turn = (turn + 1) % workers.len();
-                if workers[turn].1 <= 1 {
-                    break;
-                }
-            }
+            turn = (turn + 1) % workers.len();
             let (id, kind) = workers[turn];
             let c1 = Counter.cycles();
             if let Some(snapshot) = host.suspend(id) {
@@ -329,8 +324,9 @@ fn server(console: &mut impl Console) {
                 resume_ns.push(Counter.cycles() - c2);
                 host_ops += 2;
             }
+            let parent = workers[turn - turn % MIX.len()].0; // computes
             let c3 = Counter.cycles();
-            if let Some(ids) = host.fork(workers[turn].0, 1) {
+            if let Some(ids) = host.fork(parent, 1) {
                 fork_ns.push(Counter.cycles() - c3);
                 child = ids.first().copied();
                 host_ops += 1;
