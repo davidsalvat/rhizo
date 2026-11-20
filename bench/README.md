@@ -67,9 +67,12 @@ same clock as the cells (spec `comparisons`):
 | `snapshot.restore_api_ms/linux/firecracker` | The `PUT /snapshot/load` request alone |
 | `process.fork_us/linux-process/host` | `fork` of a host process holding 50 MiB written, child exits, parent waits (`bench/host/linux_process.c`) |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
+| `sandbox.run_ms/gvisor/runsc` | `runsc run` of a gVisor sandbox (systrap platform, no network) running the same static `hello`, until it exits. First run dropped |
+| `snapshot.restore_ms/gvisor/runsc` | `runsc restore --detach` of a checkpointed sandbox running the idle cell program, until `runsc state` reports it running. First restore dropped |
 
-Firecracker needs KVM for the guest's architecture; elsewhere it is listed as
-skipped with the reason. Process baselines need a Linux host of the target
+Firecracker needs KVM for the guest's architecture, and gVisor needs `runsc`
+(the benchmark job installs a pinned release, checksum verified); elsewhere
+each is listed as skipped with the reason. Process baselines need a Linux host of the target
 architecture. The README table puts each cell operation next to these figures;
 a column not measured in that run shows "—", never a quoted number.
 
