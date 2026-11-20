@@ -144,6 +144,23 @@ impl<F: EntryFormat> World<F> {
         true
     }
 
+    /// The page `virt` lies in.
+    fn page(&self, pt: &PageTable<F>, virt: u64) -> u64 {
+        let t = pt.translate(&self.mem, virt).unwrap();
+        t.phys & !(t.size.bytes() - 1)
+    }
+
+    fn flags(&self, pt: &PageTable<F>, virt: u64) -> PageFlags {
+        pt.translate(&self.mem, virt).unwrap().flags
+    }
+
+    /// Every page of the user half and how it is mapped.
+    fn leaves(&self, pt: &PageTable<F>) -> Vec<(u64, u64, PageSize, PageFlags)> {
+        let mut out = Vec::new();
+        pt.for_each_lower_leaf(&self.mem, &mut |v, p, s, f| out.push((v, p, s, f)));
+        out
+    }
+
     fn read(&self, pt: &PageTable<F>, virt: u64) -> u64 {
         self.mem
             .read_u64(pt.translate(&self.mem, virt).unwrap().phys & !7)
@@ -274,8 +291,77 @@ fn copies_are_break_before_make<F: EntryFormat>() {
     assert_eq!(w.frames.live(), 0, "every frame returned once");
 }
 
+/// A clone (design D2 of `add-image-cache`) has tables of its own, shares
+/// read-only pages and starts with a private copy of every writable one:
+/// neither side sees the other's writes, and the source is not changed.
+fn clone_shares_read_only_pages_and_copies_the_rest<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let source = w.table();
+    w.map(&source, 0x40_0000, PageSize::Small, RO);
+    w.map(&source, 0x60_0000, PageSize::Small, RW);
+    w.map(&source, 0x4000_0000_0000, PageSize::Large, RW);
+    w.write(&source, 0x60_0000, 11);
+    w.write(&source, 0x4000_0000_0008, 22);
+    let ro = w.page(&source, 0x40_0000);
+    w.mem.write_u64(ro, 33);
+    let before = w.frames.live();
+    let tables = source.lower_half_tables(&w.mem);
+    let source_leaves = w.leaves(&source);
+
+    let copy = source
+        .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
+        .unwrap();
+    assert_eq!(w.leaves(&source), source_leaves, "the source is only read");
+    assert_eq!(copy.lower_half_tables(&w.mem), tables);
+    assert_eq!(
+        w.frames.live(),
+        before + tables + 2,
+        "own tables and the two writable pages, nothing else"
+    );
+    assert_eq!(w.page(&copy, 0x40_0000), ro, "read-only: shared");
+    assert_eq!(w.read(&copy, 0x40_0000), 33);
+    assert!(!w.write(&copy, 0x40_0000, 1), "and still read-only");
+    for (at, value) in [(0x60_0000, 11), (0x4000_0000_0008, 22)] {
+        assert_ne!(w.page(&copy, at), w.page(&source, at));
+        assert_eq!(w.read(&copy, at), value, "a private copy");
+        assert!(w.flags(&copy, at).is_writable(), "writable at once");
+    }
+    assert!(w.write(&copy, 0x60_0000, 44));
+    assert!(w.write(&source, 0x4000_0000_0008, 55));
+    assert_eq!(
+        (w.read(&source, 0x60_0000), w.read(&copy, 0x60_0000)),
+        (11, 44)
+    );
+    assert_eq!(w.read(&copy, 0x4000_0000_0008), 22);
+    w.map(&copy, 0x7f00_0000_0000, PageSize::Small, RW);
+    assert!(source.translate(&w.mem, 0x7f00_0000_0000).is_none());
+
+    source.destroy_lower_half(&mut w.mem, &mut w.frames);
+    assert_eq!(w.read(&copy, 0x40_0000), 33, "the copy outlives its source");
+    copy.destroy_lower_half(&mut w.mem, &mut w.frames);
+    assert_eq!(w.frames.live(), 0, "every frame returned once");
+
+    // Out of frames halfway: everything taken is given back.
+    let source = w.table();
+    w.map(&source, 0x40_0000, PageSize::Small, RO);
+    w.map(&source, 0x4000_0000_0000, PageSize::Large, RW);
+    let before = w.frames.live();
+    w.frames.no_large = true;
+    assert_eq!(
+        source
+            .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
+            .err(),
+        Some(MapError::OutOfFrames)
+    );
+    assert_eq!(w.frames.live(), before);
+    assert!(!w.frames.is_shared(w.page(&source, 0x40_0000)));
+    source.destroy_lower_half(&mut w.mem, &mut w.frames);
+    assert_eq!(w.frames.live(), 0);
+}
+
 #[test]
 fn fork_aarch64() {
+    clone_shares_read_only_pages_and_copies_the_rest::<Aarch64>();
     fork_shares_everything_and_writes_stay_private::<Aarch64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<Aarch64>();
     large_page_copied_as_small_pages::<Aarch64>();
@@ -284,6 +370,7 @@ fn fork_aarch64() {
 
 #[test]
 fn fork_x86_64() {
+    clone_shares_read_only_pages_and_copies_the_rest::<X86_64>();
     fork_shares_everything_and_writes_stay_private::<X86_64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<X86_64>();
     large_page_copied_as_small_pages::<X86_64>();
@@ -306,6 +393,7 @@ enum Op {
     Write(usize, usize, u64),
     Unmap(usize, usize),
     Fork(usize),
+    Clone(usize),
     Destroy(usize),
 }
 
@@ -315,6 +403,7 @@ fn op() -> impl Strategy<Value = Op> {
         (0..4usize, 0..ADDRS.len(), 1..1000u64).prop_map(|(c, a, v)| Op::Write(c, a, v)),
         (0..4usize, 0..ADDRS.len()).prop_map(|(c, a)| Op::Unmap(c, a)),
         (0..4usize).prop_map(Op::Fork),
+        (0..4usize).prop_map(Op::Clone),
         (0..4usize).prop_map(Op::Destroy),
     ]
 }
@@ -350,6 +439,14 @@ fn model_check<F: EntryFormat>(ops: &[Op]) {
                     .unwrap();
                 let model = cells[c].1.clone();
                 cells.push((child, model));
+            }
+            Op::Clone(c) if c < n && n < 4 => {
+                let copy = cells[c]
+                    .0
+                    .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
+                    .unwrap();
+                let model = cells[c].1.clone();
+                cells.push((copy, model));
             }
             Op::Destroy(c) if c < n && n > 1 => {
                 let (pt, _) = cells.remove(c);

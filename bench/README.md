@@ -25,7 +25,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `boot.kernel_cycles/rhizo/<vmm>` | timing | TSC cycles from the first kernel instruction to ready |
 | `image.size_bytes` | deterministic | Size of the release kernel image |
 | `memory.kernel_pt_frames` | deterministic | Frames used by the kernel's page tables |
-| `cell.spawn_us/rhizo/<vmm>` | timing | Time to create the `hello` cell (tables, image, stack), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
+| `cell.spawn_us/rhizo/<vmm>` | timing | Time to create the `hello` cell (tables, image, stack; the image copied from its executable kept loaded, see below), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
 | `cell.run_us/rhizo/<vmm>` | timing | Median time from spawn to the cell's exit and teardown (every frame returned) |
 | `cell.pt_frames` | deterministic | Page-table frames of the `hello` cell's own half |
 | `cell.switch_ns/rhizo/<vmm>` | timing | Time per switch between two cells yielding to each other (system call in, scheduler, system call out), with address-space tags (ASID/PCID) |
@@ -59,6 +59,14 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.thread_scaling_pct/rhizo/<vmm>` | timing | With 4 vCPUs: `parsum` summing 24 million rounds with 4 threads of one cell, times 4, over the same sum with 1 thread, in percent (each the time the cell reports, median of 3): 100 is perfect scaling (lower is better) |
 | `cell.shootdown_us/rhizo/<vmm>` | timing | With 4 vCPUs: one `munmap` of a written page by a thread of the `shootdown` cell while its three other threads run on the other CPUs, median of 200 (x86_64: interrupts the other CPUs and waits until they left the cell's code; AArch64: broadcast invalidation, no interrupt) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
+
+The kernel keeps the executables it spawned loaded (spec `cells`): from the
+second spawn of an executable on, a cell starts on a copy of its loaded
+segments (own tables and writable pages, shared read-only pages) instead of
+loading the file again. The figures started from the executable
+(`cell.spawn_us`, `cell.run_us`, the `workload.*cold_us` metrics) measure
+that, as the Linux processes they are compared with start from an
+executable in the page cache.
 
 Figures the kernel repeats a hundred times or more (`cell.spawn_us`,
 `cell.run_us`, `cell.spawn_from_template_us`, the file and network
