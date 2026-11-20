@@ -507,8 +507,9 @@ pub fn cmd(args: &ProfileArgs) -> Result {
         network: false,
         pci_card: false,
         cpus: 1,
-        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
         bench: None,
+        shard: None,
     };
     let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
     if run.result == VmResult::Failed {
