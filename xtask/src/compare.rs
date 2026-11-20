@@ -404,11 +404,17 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let logs = dir.join("logs");
     std::fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+    // The whole comparison stays well inside the CI job's time limit.
+    const BUDGET: Duration = Duration::from_secs(300);
+    let started = Instant::now();
     let result = (|| {
         // A sandbox running `hello` to its exit.
         let hello = gvisor_bundle(&runsc, &dir.join("hello"), &cells.join("hello"), &logs)?;
         let mut run = Vec::new();
         for i in 0..=runs {
+            if started.elapsed() > BUDGET {
+                return Err(format!("over {BUDGET:?} after {i} hello runs: {run:?} ms"));
+            }
             let id = format!("rz-hello-{i}");
             let t0 = Instant::now();
             let out = checked(
@@ -450,6 +456,11 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
             .output();
         let mut restore = Vec::new();
         for i in 0..=runs {
+            if started.elapsed() > BUDGET {
+                return Err(format!(
+                    "over {BUDGET:?} after {i} restores: {restore:?} ms"
+                ));
+            }
             let id = format!("rz-{i}");
             let t0 = Instant::now();
             checked(
