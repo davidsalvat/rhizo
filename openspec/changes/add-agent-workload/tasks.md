@@ -15,7 +15,7 @@
 
 - [x] 3.1 `rhizo-agent` line in `bench-cell`, metrics `workload.agent_cpython_turn_us`, `workload.agent_cpython_model_us`, `workload.agent_suspend_resume_us`, `workload.agent_fork_us` in `xtask/src/bench.rs`; verify `cargo test -p xtask bench` and the CI benchmark job
 - [x] 3.2 The agent as a Linux process in Firecracker (`linux_cpython.c` with a network card, `compare::cpython_in_vm`); verify `cargo test -p xtask compare` and the CI benchmark job's `linux-process` figures
-- [ ] 3.3 `bench/README.md` documents the metrics; the `ci` baseline gains the agent metrics from a CI run; verify `cargo xtask ci` and `openspec validate add-agent-workload --strict`
+- [x] 3.3 `bench/README.md` documents the metrics; the `ci` baseline gains the agent metrics from a CI run; verify `cargo xtask ci` and `openspec validate add-agent-workload --strict`
 
 ## 4. Live demo
 
