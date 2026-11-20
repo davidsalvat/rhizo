@@ -1,6 +1,7 @@
 //! Scheduling of cells: a run queue per CPU, a sleep list (design decision
 //! D1 of `add-scheduler`, D2 of `add-smp-scheduling`) and a waiting set
-//! (design D3 of `add-sockets-and-poll`).
+//! (design D3 of `add-sockets-and-poll`); and the cells running on several
+//! CPUs at once ([`Gangs`], design D1 of `add-parallel-threads`).
 //!
 //! The scheduler never reads a clock and never asks which CPU runs it:
 //! every operation that depends on time takes `now` in nanoseconds, and
@@ -14,6 +15,9 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+
+mod gangs;
+pub use gangs::Gangs;
 
 /// Length of a time slice: how long a cell runs before it is preempted.
 pub const SLICE_NS: u64 = 10_000_000;

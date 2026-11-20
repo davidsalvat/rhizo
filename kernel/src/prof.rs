@@ -123,12 +123,12 @@ pub fn syscall_start() -> u64 {
     if on() { Counter.cycles() } else { 0 }
 }
 
-/// The end of a system call started at `t0` on `cpu`.
+/// The end of a system call started at `t0` on this CPU.
 #[inline]
-pub fn syscall_end(cpu: usize, t0: u64) {
+pub fn syscall_end(t0: u64) {
     if t0 != 0 {
         let t = Counter.cycles().saturating_sub(t0);
-        SYSCALLS[cpu].with(|s| {
+        SYSCALLS[crate::arch::cpu::index()].with(|s| {
             if let Some(h) = s {
                 h.record(t);
             }

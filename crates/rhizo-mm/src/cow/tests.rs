@@ -128,7 +128,12 @@ impl<F: EntryFormat> World<F> {
         let t = pt.translate(&self.mem, virt).unwrap();
         if !t.flags.is_writable()
             && !pt
-                .resolve_write(&mut self.mem, &mut self.frames, virt)
+                .resolve_write(
+                    &mut self.mem,
+                    &mut self.frames,
+                    &mut RecordingTlb::default(),
+                    virt,
+                )
                 .unwrap()
         {
             return false;
@@ -255,6 +260,37 @@ fn large_page_copied_as_small_pages<F: EntryFormat>() {
     assert_eq!(w.frames.live(), 0, "every frame returned once");
 }
 
+/// A page copied for a write replaces the shared one break-before-make:
+/// its entry is flushed once, between the two; a page made writable in
+/// place (its last owner) is left for the caller to flush.
+fn copies_are_break_before_make<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let parent = w.table();
+    w.map(&parent, 0x1000, PageSize::Small, RW);
+    w.map(&parent, 0x3000, PageSize::Small, RW);
+    w.map(&parent, 0x4000_0000_0000, PageSize::Large, RW);
+    let child = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    for (virt, page) in [(0x1008, 0x1000), (0x4000_0000_1000, 0x4000_0000_0000)] {
+        let mut tlb = RecordingTlb::default();
+        assert_eq!(
+            child.resolve_write(&mut w.mem, &mut w.frames, &mut tlb, virt),
+            Ok(true)
+        );
+        assert_eq!(tlb.flushed, [page], "one flush between the entries");
+    }
+    parent.destroy_lower_half(&mut w.mem, &mut w.frames);
+    let mut tlb = RecordingTlb::default();
+    let before = child.translate(&w.mem, 0x3000).unwrap().phys;
+    assert_eq!(
+        child.resolve_write(&mut w.mem, &mut w.frames, &mut tlb, 0x3000),
+        Ok(true)
+    );
+    assert_eq!(child.translate(&w.mem, 0x3000).unwrap().phys, before);
+    assert!(tlb.flushed.is_empty(), "made writable in place");
+    child.destroy_lower_half(&mut w.mem, &mut w.frames);
+    assert_eq!(w.frames.live(), 0, "every frame returned once");
+}
+
 /// A clone (design D2 of `add-image-cache`) has tables of its own, shares
 /// read-only pages and starts with a private copy of every writable one:
 /// neither side sees the other's writes, and the source is not changed.
@@ -329,6 +365,7 @@ fn fork_aarch64() {
     fork_shares_everything_and_writes_stay_private::<Aarch64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<Aarch64>();
     large_page_copied_as_small_pages::<Aarch64>();
+    copies_are_break_before_make::<Aarch64>();
 }
 
 #[test]
@@ -337,6 +374,7 @@ fn fork_x86_64() {
     fork_shares_everything_and_writes_stay_private::<X86_64>();
     mapping_in_a_child_is_not_seen_by_the_parent::<X86_64>();
     large_page_copied_as_small_pages::<X86_64>();
+    copies_are_break_before_make::<X86_64>();
 }
 
 /// Addresses spread over different tables at every level.
@@ -462,7 +500,12 @@ fn kernel_half_is_never_made_writable_or_private() {
         0xffff_8000_0001_0000,
     ] {
         assert_eq!(
-            cell.resolve_write(&mut w.mem, &mut w.frames, virt),
+            cell.resolve_write(
+                &mut w.mem,
+                &mut w.frames,
+                &mut RecordingTlb::default(),
+                virt
+            ),
             Ok(false)
         );
         cell.unshare_path(&mut w.mem, &mut w.frames, virt).unwrap();
