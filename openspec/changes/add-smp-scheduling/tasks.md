@@ -19,4 +19,4 @@
 ## 3. Benchmarks and documentation
 
 - [x] 3.1 `rhizo-smp` line of `bench-cell` with several CPUs, `cell.parallel_us`, `cell.scaling_pct`, `cell.ipi_wake_us` parsed by `xtask` with a unit test, `bench/README.md` (D8); verify `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference` locally
-- [ ] 3.2 `AGENTS.md`, `docs/security.md`; `cargo xtask ci` on both architectures; CI green with the bench gate
+- [x] 3.2 `AGENTS.md`, `docs/security.md`; `cargo xtask ci` on both architectures; CI green with the bench gate
