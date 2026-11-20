@@ -9,13 +9,13 @@
 ## 2. Kernel
 
 - [x] 2.1 `Host::spawn_file`, the kept file pages (`PAGES`, `KernelPages`: instruction cache made coherent once per page) dropped with the kept executables, `Services::memory`; verify `cargo xtask check`
-- [ ] 2.2 In-kernel tests `dynamically_linked_programs_behave_as_on_linux` and `a_dynamically_linked_cell_suspends_resumes_and_forks`; verify `cargo xtask test` and `cargo xtask test --only ktest-smp` on both architectures
+- [x] 2.2 In-kernel tests `dynamically_linked_programs_behave_as_on_linux` and `a_dynamically_linked_cell_suspends_resumes_and_forks`; verify `cargo xtask test` and `cargo xtask test --only ktest-smp` on both architectures
 
 ## 3. Test inputs
 
-- [ ] 3.1 `cells/c/dynamic/hello.c`, `cells/python/dynamic_demo.py`, `pack_stdlib.py` copying extension modules and `os`, `xtask/src/dynamic.rs` packing `dynamic-files` and `distro-files` (D5, the latter in test kernels only), the AArch64 boot tables covering images past 32 MiB, `DYNAMIC` in `cells/expected.rs` and the differential check running them natively; verify `cargo xtask test --only differential` on x86_64 and `cargo xtask test --only ktest` on both architectures
+- [x] 3.1 `cells/c/dynamic/hello.c`, `cells/python/dynamic_demo.py`, `pack_stdlib.py` copying extension modules and `os`, `xtask/src/dynamic.rs` packing `dynamic-files` and `distro-files` (D5, the latter in test kernels only), the AArch64 boot tables covering images past 32 MiB, `DYNAMIC` in `cells/expected.rs` and the differential check running them natively; verify `cargo xtask test --only differential` on x86_64 and `cargo xtask test --only ktest` on both architectures
 
 ## 4. Benchmarks and documentation
 
-- [ ] 4.1 `rhizo-dynamic` line of the `bench-cell` kernel and `workload.dynamic_run_us`, `workload.dynamic_template_us` in `xtask/src/bench.rs` with a parser test; the dynamic `hello` as a Linux process (`linux_process.c`, in the Firecracker guest and on the host) with a parser test; `bench/README.md` describes them (D8); verify `cargo test -p xtask` and the CI benchmark gate passes with both metrics present and no metric worse
-- [ ] 4.2 `AGENTS.md` code map names the new parts of `rhizo-cell`, `rhizo-abi` and `xtask`; verify `openspec validate add-dynamic-linking --strict`
+- [x] 4.1 `rhizo-dynamic` line of the `bench-cell` kernel and `workload.dynamic_run_us`, `workload.dynamic_template_us` in `xtask/src/bench.rs` with a parser test; the dynamic `hello` as a Linux process (`linux_process.c`, in the Firecracker guest and on the host) with a parser test; `bench/README.md` describes them (D8); verify `cargo test -p xtask` and the CI benchmark gate passes with both metrics present and no metric worse
+- [x] 4.2 `AGENTS.md` code map names the new parts of `rhizo-cell`, `rhizo-abi` and `xtask`; verify `openspec validate add-dynamic-linking --strict`
