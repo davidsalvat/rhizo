@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 488" width="800" height="488" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Simple on top, deep below</title>
+<desc>Layers of Rhizo. On top, what the user sees: a two-click app and a template catalog (both planned) and their agents. A line separates it from what the user does not see: agent cells that are created, suspended, resumed and forked in microseconds (fork 1.37 µs, resume 1.31 µs, measured), and below them the Rhizo kernel, which rebuilds the foundations: memory, scheduler, isolation, network and snapshots.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="487" rx="12" fill="#0d1117" stroke="#30363d"/>
+<text x="24" y="40" font-size="20" fill="#e6edf3" font-weight="700">Simple on top, deep below</text>
+<text x="24" y="64" font-size="14" fill="#9ba7b3">The user sees two clicks; the kernel does the hard work.</text>
+<rect x="24" y="92" width="240" height="72" rx="8" fill="#161b22" stroke="#3d444d" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="40" y="122" font-size="16" fill="#e6edf3" font-weight="700">Two-click app</text>
+<text x="40" y="146" font-size="14" fill="#9ba7b3">pick, open, done</text>
+<text x="252" y="122" font-size="12" fill="#9ba7b3" font-weight="700" text-anchor="end">planned</text>
+<rect x="280" y="92" width="240" height="72" rx="8" fill="#161b22" stroke="#3d444d" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="296" y="122" font-size="16" fill="#e6edf3" font-weight="700">Template catalog</text>
+<text x="296" y="146" font-size="14" fill="#9ba7b3">ready environments</text>
+<text x="508" y="122" font-size="12" fill="#9ba7b3" font-weight="700" text-anchor="end">planned</text>
+<rect x="536" y="92" width="240" height="72" rx="8" fill="#161b22" stroke="#3d444d" stroke-width="1.5"/>
+<text x="552" y="122" font-size="16" fill="#e6edf3" font-weight="700">Your agents</text>
+<text x="552" y="146" font-size="14" fill="#9ba7b3">Python, tools, files</text>
+<text x="764" y="122" font-size="12" fill="#63d4a0" font-weight="700" text-anchor="end">built</text>
+<line x1="24" y1="192" x2="776" y2="192" stroke="#3d444d" stroke-width="1.5" stroke-dasharray="4 4"/>
+<text x="24" y="184" font-size="13" fill="#9ba7b3" font-weight="600">what you see</text>
+<text x="24" y="210" font-size="13" fill="#9ba7b3" font-weight="600">what you don't</text>
+<rect x="24" y="224" width="752" height="84" rx="24" fill="#0f2a1f" stroke="#63d4a0" stroke-width="2"/>
+<text x="48" y="258" font-size="18" fill="#e6edf3" font-weight="700">Agent cells</text>
+<text x="48" y="284" font-size="14" fill="#9ba7b3">create · suspend · resume · fork</text>
+<text x="752" y="258" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">fork 1.37 µs · resume 1.31 µs</text>
+<text x="752" y="284" font-size="12" fill="#63d4a0" font-weight="700" text-anchor="end">measured</text>
+<line x1="400" y1="310" x2="400" y2="332" stroke="#8b98a5" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="24" y="334" width="752" height="116" rx="8" fill="#161b22" stroke="#3d444d" stroke-width="1.5"/>
+<text x="48" y="364" font-size="17" fill="#e6edf3" font-weight="700">Rhizo kernel: the foundations, rebuilt for agents</text>
+<rect x="40.0" y="380" width="134.4" height="52" rx="6" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
+<text x="107.2" y="412" font-size="15" fill="#e6edf3" text-anchor="middle">Memory</text>
+<rect x="186.4" y="380" width="134.4" height="52" rx="6" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
+<text x="253.6" y="412" font-size="15" fill="#e6edf3" text-anchor="middle">Scheduler</text>
+<rect x="332.8" y="380" width="134.4" height="52" rx="6" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
+<text x="400.0" y="412" font-size="15" fill="#e6edf3" text-anchor="middle">Isolation</text>
+<rect x="479.2" y="380" width="134.4" height="52" rx="6" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
+<text x="546.4" y="412" font-size="15" fill="#e6edf3" text-anchor="middle">Network</text>
+<rect x="625.6" y="380" width="134.4" height="52" rx="6" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
+<text x="692.8" y="412" font-size="15" fill="#e6edf3" text-anchor="middle">Snapshots</text>
+<text x="24" y="476" font-size="13" fill="#9ba7b3">Solid: built and measured. Dashed: planned.</text>
+</svg>

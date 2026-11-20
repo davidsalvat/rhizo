@@ -1,6 +1,6 @@
 [package]
 name = "rhizo-virtio"
-description = "virtio-mmio network device driver for Rhizo"
+description = "virtio network device driver (virtio-mmio and virtio-pci) for Rhizo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
