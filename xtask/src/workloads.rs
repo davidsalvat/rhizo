@@ -181,6 +181,9 @@ fn laptop(
         }
         match parse_laptop(&out) {
             Ok(l) => {
+                if let Some(line) = out.output.lines().find(|l| l.starts_with("rhizo-laptop ")) {
+                    report::text(line);
+                }
                 for (name, unit, v) in l.values {
                     samples.entry((name, unit)).or_default().push(v);
                 }

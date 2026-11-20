@@ -40,9 +40,12 @@ pub enum Count {
     LazyFaults,
     /// Cycles spent in scheduling decisions (taking and giving back cells).
     SchedCycles,
+    /// Cells made with no address-space tag left: every switch to them
+    /// flushes the TLB.
+    Untagged,
 }
 
-const COUNTS: usize = 8;
+const COUNTS: usize = 9;
 static COUNTERS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 /// When a system call last changed a socket (nanoseconds since boot).
 static NET_CHANGED_AT: AtomicU64 = AtomicU64::new(0);

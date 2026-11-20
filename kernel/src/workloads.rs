@@ -271,6 +271,7 @@ fn server(console: &mut impl Console) {
     // Fill: whole groups of the mix while memory keeps its headroom.
     let mut workers: Vec<(u32, usize)> = Vec::with_capacity(target);
     let mut limit = "none";
+    prof::start(); // counts the cells made without a tag
     let fill = Counter.cycles();
     'fill: while workers.len() < target {
         if !memory::cells_may_take(HEADROOM) {
@@ -288,6 +289,7 @@ fn server(console: &mut impl Console) {
         }
     }
     let fill_ns = timer::cycles_to_ns(Counter.cycles() - fill).unwrap_or(0);
+    let untagged = prof::stop().count(Count::Untagged);
     let cells = workers.len();
     let mut peak = start - memory::free_bytes();
 
@@ -398,7 +400,7 @@ fn server(console: &mut impl Console) {
         out,
         "rhizo-server-breakdown elapsed_ns={elapsed} idle_ns={} syscall_ns={} sched_ns={} \
          host_ns={} syscalls={} runs={} wakes={} io_woken={} net_changes={} cow_faults={} \
-         lazy_faults={} interrupts={} host_ops={host_ops} suspend_ns={} resume_ns={} fork_ns={} \
+         lazy_faults={} interrupts={} untagged={untagged} host_ops={host_ops} suspend_ns={} resume_ns={} fork_ns={} \
          sched_max_ns={} wake_max_ns={}",
         cyc(report.count(Count::IdleCycles)),
         cyc(sys.sum()),

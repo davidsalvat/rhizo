@@ -1168,9 +1168,13 @@ impl Host {
 
     /// A new live cell's record: its tag, nothing flushed yet.
     fn new_live(&mut self, cell: Cell, output: bool, echo: bool, random: u64, fs: Fs) -> Box<Live> {
+        let tag = self.state().tags.alloc();
+        if tag.is_none() {
+            prof::add(Count::Untagged, 1);
+        }
         Box::new(Live {
             cell,
-            tag: self.state().tags.alloc().unwrap_or(0),
+            tag: tag.unwrap_or(0),
             clean: 0,
             cpus: 0,
             shares: false,
