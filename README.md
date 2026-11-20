@@ -134,10 +134,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 8.2 | 8.8 | 194.9 | 196.9 | 20 |
-| Cloud Hypervisor | 7.6 | 16.8 | 102.3 | 109.2 | 20 |
-| QEMU microvm | 44.2 | 45.8 | — | — | 20 |
-| QEMU q35 | 62.3 | 63.2 | 180.6 | 183.4 | 20 |
+| Firecracker | 9.1 | 10.3 | 197.3 | 199.7 | 20 |
+| Cloud Hypervisor | 7.4 | 14.4 | 108.4 | 111.6 | 20 |
+| QEMU microvm | 45.5 | 46.2 | — | — | 20 |
+| QEMU q35 | 64.5 | 68.1 | 187.5 | 191.6 | 20 |
 
 ### Cells against existing mechanisms
 
@@ -145,10 +145,10 @@ Same machine, same run. Rhizo runs inside Firecracker; the sandbox column is a L
 
 | Operation | Rhizo cell | Firecracker microVM | Linux process |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 7.2 µs | 194.87 ms | 112.4 µs |
-| Resume a suspended environment until it runs | 1.1 µs | 3.70 ms | — |
-| Fork an environment holding 50 MiB | 1.2 µs | 3.70 ms | 1.51 ms |
-| Serve a request from a warm template | 15.8 µs | 3.70 ms | — |
+| Start a program and run it to its exit (`hello`) | 7.2 µs | 197.34 ms | 102.8 µs |
+| Resume a suspended environment until it runs | 0.9 µs | 4.19 ms | — |
+| Fork an environment holding 50 MiB | 1.1 µs | 4.19 ms | 1.54 ms |
+| Serve a request from a warm template | 15.7 µs | 4.19 ms | — |
 
 ### A real interpreter
 
@@ -156,8 +156,8 @@ MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 3.65 ms |
-| Forked from a template frozen after the warm-up | 529.0 µs (6.9× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.63 ms |
+| Forked from a template frozen after the warm-up | 506.1 µs (7.2× faster) |
 
 Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 `cargo xtask bench --readme`.
