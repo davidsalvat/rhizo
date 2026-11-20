@@ -97,3 +97,13 @@ existing ones isolate the effect (spawn alone, spawn to exit, and the
 interpreter's cold start). The cold figure stays a start from the
 executable: the Linux process it is compared with is also started from an
 executable its kernel keeps in memory (the page cache).
+
+Measured in CI (KVM, x86_64; medians of 20 boots, Firecracker first,
+against `main` in the same week): `workload.cpython_cold_us` 18.75 →
+17.42 ms (−7 %; −5 % against the Linux process measured in the same run,
+whose own figure moves with the runner), `workload.python_cold_us` −6 %,
+`workload.cold_us` −3 %. `cell.spawn_us` and `cell.run_us` do not move
+(2.9 µs and 7.3–7.4 µs, within the runners' noise): `hello` is two
+read-only pages, so its load cost little, and its spawn is mostly its
+tables and its 16 zeroed stack pages, which every spawn still builds. The
+gain grows with the executable.

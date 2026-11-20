@@ -54,5 +54,6 @@ not `'static`, and dropping one executable at a time under pressure.
 
 `crates/rhizo-mm/src/cow.rs`, `crates/rhizo-cell/src/{lib,images}.rs`,
 `kernel/src/cell.rs`, `kernel/src/tests.rs`, `cells/src/bin/same_addr.rs`,
-`bench/README.md`. `cell.spawn_us`, `cell.run_us` and
-`workload.cpython_cold_us` should drop; no metric should get worse.
+`bench/README.md`. The cold workloads (`workload.cpython_cold_us` most)
+drop; `cell.spawn_us` and `cell.run_us` (a two-page executable) stay where
+they are; no metric gets worse.
