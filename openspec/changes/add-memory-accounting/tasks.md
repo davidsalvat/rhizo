@@ -9,7 +9,7 @@
 ## 2. Density
 
 - [x] 2.1 `idle` cell (endless, so not in the differential run) and the 1000-cell in-kernel test
-- [ ] 2.2 `cell.idle_bytes` and `cell.suspended_bytes` (D3)
+- [x] 2.2 `cell.idle_bytes` and `cell.suspended_bytes` (D3)
 
 ## 3. Documentation
 

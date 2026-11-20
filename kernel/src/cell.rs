@@ -918,6 +918,11 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-workload cold_ns={cold} warm_ns={warm}"
     );
+    let (idle, suspended) = density();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-density idle_bytes={idle} suspended_bytes={suspended}"
+    );
     let (write_read, fork_files) = files();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -1038,6 +1043,48 @@ fn fork_and_templates() -> [u64; 4] {
         frames,
         robust(&mut template),
     ]
+}
+
+/// Memory per idle cell, from 1000 forks of a template of `idle` each run
+/// into its sleep (the second of two identical rounds, so the heap has
+/// grown its tables already), and the snapshot size of one idle cell
+/// (design D3 of `add-memory-accounting`).
+#[cfg(feature = "bench-cell")]
+fn density() -> (u64, u64) {
+    const N: usize = 1000;
+    let image = test_image("idle");
+    let round = || {
+        let mut host = Host::new();
+        let template = host.spawn(image, &[b"idle"], true, false).expect("spawn");
+        while host.output(template) != Some(b"idle\n") {
+            host.step();
+        }
+        assert!(host.freeze(template));
+        let before = memory::free_bytes();
+        let ids: Vec<u32> = (0..N)
+            .map(|_| {
+                host.spawn_from_template(template, false, false)
+                    .expect("fork")
+            })
+            .collect();
+        for _ in 0..N {
+            host.step(); // each child runs into its sleep
+        }
+        let per_cell = (before - memory::free_bytes()) / N as u64;
+        for id in ids {
+            host.kill(id);
+        }
+        per_cell
+    };
+    round();
+    let idle = round();
+    let mut host = Host::new();
+    let id = host.spawn(image, &[b"idle"], true, false).expect("spawn");
+    while host.output(id) != Some(b"idle\n") {
+        host.step();
+    }
+    let suspended = host.suspend(id).map_or(0, |s| s.as_bytes().len() as u64);
+    (idle, suspended)
 }
 
 /// Rounds of a repeated measure (design D4 of `add-cell-files`).
