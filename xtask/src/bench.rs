@@ -462,6 +462,7 @@ fn measure_cells(
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
+        let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
@@ -497,6 +498,10 @@ fn measure_cells(
                     if let Some((c, w)) = parse_cpython_line(&out.output) {
                         cpy_cold.push(c as f64 / 1000.0);
                         cpy_warm.push(w as f64 / 1000.0);
+                    }
+                    if let Some((r, t)) = parse_dynamic_line(&out.output) {
+                        dyn_run.push(r as f64 / 1000.0);
+                        dyn_template.push(t as f64 / 1000.0);
                     }
                     if let Some(d) = parse_density_line(&out.output) {
                         density = Some(d);
@@ -596,6 +601,8 @@ fn measure_cells(
             ("workload.python_warm_us", "us", &mut py_warm),
             ("workload.cpython_cold_us", "us", &mut cpy_cold),
             ("workload.cpython_warm_us", "us", &mut cpy_warm),
+            ("workload.dynamic_run_us", "us", &mut dyn_run),
+            ("workload.dynamic_template_us", "us", &mut dyn_template),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
             ("cell.parallel_us", "us", &mut parallel),
@@ -675,6 +682,19 @@ fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("cold_ns")?, field("warm_ns")?))
+}
+
+/// `(run_ns, template_ns)` of the dynamic linking line of a `bench-cell`
+/// kernel (absent when the dynamic programs were not packed).
+fn parse_dynamic_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-dynamic "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("run_ns")?, field("template_ns")?))
 }
 
 /// `(idle_bytes, suspended_bytes)` of the density line of a `bench-cell`
@@ -1891,6 +1911,14 @@ mod tests {
             "rhizo-python cold_ns=1 warm_ns=2\nrhizo-cpython cold_ns=30000000 warm_ns=900000\n";
         assert_eq!(parse_cpython_line(out), Some((30_000_000, 900_000)));
         assert_eq!(parse_cpython_line("rhizo-python cold_ns=1 warm_ns=2"), None);
+    }
+
+    #[test]
+    fn dynamic_line_is_parsed() {
+        let out =
+            "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-dynamic run_ns=812000 template_ns=95000\n";
+        assert_eq!(parse_dynamic_line(out), Some((812_000, 95_000)));
+        assert_eq!(parse_dynamic_line("rhizo-dynamic run_ns=1"), None);
     }
 
     #[test]

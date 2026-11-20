@@ -44,6 +44,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.python_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off MicroPython frozen after its warm-up |
 | `workload.cpython_cold_us/rhizo/<vmm>` | timing | CPython (static, pinned 3.13.18) answering one agent tool call (`cells/python/agent_demo.py`: JSON, regular expressions, dates, a CRC) started from its executable, with the standard library it imports as compiled modules in the cell's files: interpreter start, imports, warm-up, answer, exit. Measured only where CPython is built (`RHIZO_CPYTHON_SRC`, set in CI) |
 | `workload.cpython_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off CPython frozen after its warm-up |
+| `workload.dynamic_run_us/rhizo/<vmm>` | timing | The dynamically linked `hello` (`cells/c/dynamic/hello.c`, glibc) started from the cell's files and run to its exit: the kernel maps it and `ld.so`, `ld.so` maps `libc.so.6` with `mmap` of files, relocates and runs `main`; file pages come from frames kept by content after a first run (change `add-dynamic-linking`). Robust figure over 25 runs; compare with `cell.run_us` (a static `hello`) |
+| `workload.dynamic_template_us/rhizo/<vmm>` | timing | The same program forked from a template frozen once it printed `ready` (`hello wait`), its libraries mapped and relocated: what a dynamically linked program costs once a template absorbs the dynamic linking |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
@@ -167,6 +169,8 @@ same clock as the cells (spec `comparisons`):
 | `workload.cpython_cold_us/linux-process/firecracker` | The same static CPython, files and script in a Linux guest in Firecracker: `fork` and `execve` of `python3 /app/agent_demo.py`, output read from a pipe, until it exits (`bench/host/linux_cpython.c` as `/init`). Pairs with `workload.cpython_cold_us/rhizo/firecracker` |
 | `workload.cpython_warm_us/linux-process/firecracker` | In the same guest, a CPython process that imported and warmed up the script forks one child per request; the child answers and exits normally, the parent waits (`bench/host/cpython_forkserver.py`, the pre-fork pattern). Pairs with `workload.cpython_warm_us/rhizo/firecracker` |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
+| `workload.dynamic_run_us/linux-process/firecracker` | `posix_spawn` of the same dynamically linked `hello` the cell benchmark runs, with the same `ld.so` and `libc.so.6` at their paths in the guest's initramfs, until it exits (`bench/host/linux_process.c` as `/init`). Pairs with `workload.dynamic_run_us/rhizo/firecracker` |
+| `workload.dynamic_run_us/linux-process/host` | The same on the benchmark host, with the host's own `ld.so` and `libc` |
 | `sandbox.run_ms/gvisor/runsc` | `runsc run` of a gVisor sandbox (systrap platform, no network) running the same static `hello`, until it exits. First run dropped |
 | `snapshot.restore_ms/gvisor/runsc` | `runsc restore --detach` of a checkpointed sandbox running the idle cell program, until `runsc state` reports it running. First restore dropped |
 
