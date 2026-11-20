@@ -128,6 +128,7 @@ macro_rules! suite {
             ktest_case!(template_of_a_threaded_program),
             ktest_case!(every_cpu_has_its_number_and_own_stack),
             ktest_case!(kernel_globals_are_safe_across_cpus),
+            ktest_case!(timed_waits_last_as_long_on_every_cpu),
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
@@ -2196,6 +2197,32 @@ fn kernel_globals_are_safe_across_cpus() {
         heap_before.live,
         "every allocation freed"
     );
+}
+
+/// A 20 ms wait on each CPU's own timer lasts 20 ms by the counter, on
+/// the secondary CPUs as on the boot CPU (spec `multi-core`: x86_64
+/// secondary CPUs once kept the local APIC timer's reset divider, and
+/// such a wait ended after 1.3 ms on QEMU). The longest of three tries, as
+/// another interrupt may end a wait early.
+fn timed_waits_last_as_long_on_every_cpu() {
+    const WAIT_NS: u64 = 20_000_000;
+    for cpu in 0..crate::smp::count() {
+        let took = (0..3)
+            .map(|_| {
+                if cpu == 0 {
+                    crate::cell::timed_wait(WAIT_NS)
+                } else {
+                    crate::smp::post(cpu, crate::cell::timed_wait, WAIT_NS);
+                    crate::smp::join(cpu)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (WAIT_NS * 9 / 10..WAIT_NS * 10).contains(&took),
+            "CPU {cpu}: a {WAIT_NS} ns wait took {took} ns"
+        );
+    }
 }
 
 /// Every CPU online, as a mask.

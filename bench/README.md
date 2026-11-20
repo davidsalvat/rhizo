@@ -62,6 +62,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.thread_scaling_pct/rhizo/<vmm>` | timing | With 4 vCPUs: `parsum` summing 24 million rounds with 4 threads of one cell, times 4, over the same sum with 1 thread, in percent (each the time the cell reports, median of 3): 100 is perfect scaling (lower is better) |
 | `cell.shootdown_us/rhizo/<vmm>` | timing | With 4 vCPUs: one `munmap` of a written page by a thread of the `shootdown` cell while its three other threads run on the other CPUs, median of 200 (x86_64: interrupts the other CPUs and waits until they left the cell's code; AArch64: broadcast invalidation, no interrupt) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
+| `cell.timer_error_us/rhizo/<vmm>` | timing | With 4 vCPUs: a 10 ms wait on a secondary CPU's own timer (as an idle CPU waits), the median of five per CPU, its distance from 10 ms by the counter, the worst CPU's (change `fix-secondary-cpu-timer`: x86_64 secondary CPUs once woke after about 1.3 ms) |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded

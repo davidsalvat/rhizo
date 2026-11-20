@@ -144,11 +144,13 @@ pub fn init(tick_ns: u64) {
 }
 
 /// Enables a secondary CPU's local APIC like the boot CPU's, its timer
-/// masked (an idle CPU takes no ticks).
+/// masked (an idle CPU takes no ticks) and counting at the boot CPU's rate
+/// (the divider resets to 2, not [`init`]'s 16).
 pub fn init_cpu() {
     enable(APIC.load(Ordering::Relaxed) == 1);
     write(SVR, 0x100 | SPURIOUS_VECTOR as u32);
     write(LVT_TIMER, (1 << 16) | TIMER_VECTOR as u32);
+    write(DIVIDE, 0b0011);
 }
 
 /// This CPU's local APIC identifier (the boot CPU's before `init`).
