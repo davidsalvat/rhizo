@@ -20,7 +20,8 @@
 #
 # The transcript is the same in both modes and on every run. With `timed`,
 # the agent also prints `agent turn_ns=...` (each turn: request, answer,
-# tool, append) and, in `linux` mode, `agent fork_ns=...` (from the first
+# tool, append), `agent model_ns=...` (each turn's request sent until its
+# answer is read) and, in `linux` mode, `agent fork_ns=...` (from the first
 # `os.fork` until every branch runs; in `cell` mode the host measures it).
 # Without arguments it runs one turn offline (how its standard library is
 # packed, cells/python/pack_stdlib.py).
@@ -56,6 +57,7 @@ class Model:
         self.addr = (host, port)
         self.sock = None
         self.buf = b""
+        self.waited = []
 
     def connect(self):
         if self.sock is not None:
@@ -77,6 +79,7 @@ class Model:
             "POST /v1/chat/completions HTTP/1.1\r\nHost: model\r\n"
             "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body)
         )
+        t0 = time.perf_counter_ns()
         self.sock.sendall(head.encode() + body)
         while b"\r\n\r\n" not in self.buf:
             self.recv()
@@ -92,6 +95,7 @@ class Model:
         while len(self.buf) < length:
             self.recv()
         answer, self.buf = self.buf[:length], self.buf[length:]
+        self.waited.append(time.perf_counter_ns() - t0)
         return json.loads(answer)
 
 
@@ -198,6 +202,7 @@ def run(model, mode, turns, timed):
         time.sleep(PAUSE)  # between turns: the host may suspend the cell here
     if timed:
         print("agent turn_ns=%s" % ",".join(map(str, spent)), flush=True)
+        print("agent model_ns=%s" % ",".join(map(str, model.waited)), flush=True)
     print("fork", flush=True)
     if mode == "linux":
         fork_linux(model, messages, timed)

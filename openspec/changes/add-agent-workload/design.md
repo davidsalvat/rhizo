@@ -91,13 +91,17 @@ the transcript, each suspend-plus-resume time and the fork time. The
   `time.perf_counter_ns` (request, answer, JSON, tool, append), the same
   code on both sides; median of turns 2 to 8 (the first connects and runs
   cold code).
+- `workload.agent_model_us`: the part of those turns spent on the model,
+  from sending the request until the whole answer is read (network card,
+  TCP stack, the host's server), so a gap in the turn can be told apart
+  from a gap in the interpreter.
 - `workload.agent_suspend_resume_us`: suspend plus **eager** resume
   between two turns, so no restoring is deferred to page faults the figure
   would not count (the in-kernel test resumes lazily, the default).
 - `workload.agent_fork_us`: from freezing the agent at its decision point
   to all three branches having printed their first line.
 
-The Linux side measures the same turn, and its fork from the first
+The Linux side measures the same turn and model part, and its fork from the first
 `os.fork` until every branch wrote its first line to its pipe.
 
 ## D5. The Linux process in the same VM; no CRIU figure

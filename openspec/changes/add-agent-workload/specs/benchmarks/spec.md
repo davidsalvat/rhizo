@@ -5,7 +5,8 @@
 ### Requirement: Agent metrics
 `cargo xtask bench` SHALL report, where the CPython agent can run, one of
 its turns as the agent times it, the first left out
-(`workload.agent_turn_us`), a suspend plus eager resume between two turns
+(`workload.agent_turn_us`) and its part spent on the model's answer
+(`workload.agent_model_us`), a suspend plus eager resume between two turns
 (`workload.agent_suspend_resume_us`) and a fork from its decision point
 until its three branches run (`workload.agent_fork_us`); elsewhere it SHALL
 list them as skipped with the reason.

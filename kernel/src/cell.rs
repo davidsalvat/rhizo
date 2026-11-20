@@ -2328,10 +2328,11 @@ pub fn bench(console: &mut impl Console) {
         );
     }
     match agent_figures() {
-        Ok([turn, suspend_resume, fork]) => {
+        Ok([turn, model, suspend_resume, fork]) => {
             let _ = writeln!(
                 rhizo_hal::ConsoleWriter(console),
-                "rhizo-agent turn_ns={turn} suspend_resume_ns={suspend_resume} fork_ns={fork}"
+                "rhizo-agent turn_ns={turn} model_ns={model} suspend_resume_ns={suspend_resume} \
+                 fork_ns={fork}"
             );
         }
         Err(why) => {
@@ -2758,32 +2759,35 @@ pub fn agent(
 
 /// The CPython agent's figures (design D4 of `add-agent-workload`), over 3
 /// runs of 8 turns, each suspended and eagerly resumed after every turn:
-/// medians of a turn as the agent times it (the first, which connects and
-/// runs cold, left out), of a suspend plus resume, and of a fork into the
-/// branches until they run.
+/// medians of a turn as the agent times it and of the part of it spent on
+/// the model's answer (the first turn, which connects and runs cold, left
+/// out), of a suspend plus resume, and of a fork into the branches until
+/// they run.
 #[cfg(feature = "bench-cell")]
-fn agent_figures() -> Result<[u64; 3], alloc::string::String> {
+fn agent_figures() -> Result<[u64; 4], alloc::string::String> {
     const ROUNDS: usize = 3;
     const TURNS: usize = 8;
-    let mut samples: [Vec<u64>; 3] = Default::default();
+    let mut samples: [Vec<u64>; 4] = Default::default();
     for _ in 0..ROUNDS {
         let mut host = Host::new();
         let run = agent(&mut host, TURNS, Resume::Eager, true)?;
         let text = alloc::string::String::from_utf8_lossy(&run.transcript);
-        let turns = text
-            .lines()
-            .find_map(|l| l.strip_prefix("agent turn_ns="))
-            .ok_or("the agent printed no turn times")?;
-        samples[0].extend(
-            turns
-                .split(',')
-                .skip(1)
-                .filter_map(|t| t.parse::<u64>().ok()),
-        );
-        samples[1].extend(run.suspend_resume_ns);
-        samples[2].push(run.fork_ns);
+        for (key, slot) in [("agent turn_ns=", 0), ("agent model_ns=", 1)] {
+            let times = text
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .ok_or("the agent printed no turn times")?;
+            samples[slot].extend(
+                times
+                    .split(',')
+                    .skip(1)
+                    .filter_map(|t| t.parse::<u64>().ok()),
+            );
+        }
+        samples[2].extend(run.suspend_resume_ns);
+        samples[3].push(run.fork_ns);
     }
-    let mut out = [0; 3];
+    let mut out = [0; 4];
     for (o, s) in out.iter_mut().zip(&mut samples) {
         s.sort_unstable();
         *o = s.get(s.len() / 2).copied().unwrap_or(0);

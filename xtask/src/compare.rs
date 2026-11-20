@@ -219,12 +219,13 @@ fn boot_guest<T: Send + 'static>(
 }
 
 /// What `bench/host/linux_cpython.c` prints: cold and warm CPython, and
-/// the agent's turn and fork when it ran (else why not).
+/// the agent's turn, its model part and its fork when it ran (else why
+/// not).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CpythonLine {
     pub cold_us: f64,
     pub warm_us: f64,
-    pub agent: std::result::Result<[f64; 2], String>,
+    pub agent: std::result::Result<[f64; 3], String>,
 }
 
 /// Parses a `linux-cpython cold_us=<x> warm_us=<y> agent...` line.
@@ -235,8 +236,12 @@ pub fn parse_cpython_line(text: &str) -> Option<CpythonLine> {
             .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
     };
     let field = |key: &str| -> Option<f64> { value(key)?.parse().ok() };
-    let agent = match (field("agent_turn_us"), field("agent_fork_us")) {
-        (Some(turn), Some(fork)) => Ok([turn, fork]),
+    let agent = match (
+        field("agent_turn_us"),
+        field("agent_model_us"),
+        field("agent_fork_us"),
+    ) {
+        (Some(turn), Some(model), Some(fork)) => Ok([turn, model, fork]),
         _ => Err(value("agent").unwrap_or("no agent figures").to_string()),
     };
     Some(CpythonLine {
@@ -302,7 +307,7 @@ pub fn cpython_in_vm(
         arch::current().id(),
         samples.len()
     ));
-    let agent: Vec<[f64; 2]> = samples
+    let agent: Vec<[f64; 3]> = samples
         .iter()
         .filter_map(|s| s.agent.clone().ok())
         .collect();
@@ -322,8 +327,12 @@ pub fn cpython_in_vm(
             agent.iter().map(|a| a[0]).collect(),
         ));
         columns.push((
-            "workload.agent_fork_us",
+            "workload.agent_model_us",
             agent.iter().map(|a| a[1]).collect(),
+        ));
+        columns.push((
+            "workload.agent_fork_us",
+            agent.iter().map(|a| a[2]).collect(),
         ));
     } else {
         let why = match (&network, samples.iter().find_map(|s| s.agent.clone().err())) {
@@ -1009,13 +1018,13 @@ mod tests {
     #[test]
     fn cpython_line_is_found_among_console_noise() {
         let line = "[  1.2] junk linux-cpython cold_us=31000.5 warm_us=2100.25 \
-                    agent_turn_us=900.5 agent_fork_us=4000\r\n";
+                    agent_turn_us=900.5 agent_model_us=300 agent_fork_us=4000\r\n";
         assert_eq!(
             parse_cpython_line(line),
             Some(CpythonLine {
                 cold_us: 31000.5,
                 warm_us: 2100.25,
-                agent: Ok([900.5, 4000.0]),
+                agent: Ok([900.5, 300.0, 4000.0]),
             })
         );
         let line = "linux-cpython cold_us=1 warm_us=2 agent=failed:no-network";

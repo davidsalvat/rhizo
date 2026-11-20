@@ -16,8 +16,10 @@
 //   process talking to the host's fake model through the VM's network card
 //   (`rhizo_ip` and `rhizo_llm=ADDR:PORT` in the environment, from the
 //   kernel command line): `agent_turn_us=<median>` (each turn but the first,
-//   as the agent times it) and `agent_fork_us=<median>` (its `os.fork` into
-//   branches until they run), or `agent=skipped` / `agent=failed`.
+//   as the agent times it), `agent_model_us=<median>` (the part of those
+//   turns spent on the model's answer) and `agent_fork_us=<median>` (its
+//   `os.fork` into branches until they run), or `agent=skipped` /
+//   `agent=failed`.
 // Then it pauses: the host reads the line and stops the VM.
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -102,8 +104,9 @@ static int interface_up(const char *name, const char *addr) {
     return failed ? -1 : 0;
 }
 
-// The median of the comma-separated numbers after `key` in `text`, the
-// first one left out when `skip_first`; < 0 when absent.
+// Appends to `all` (in microseconds) the comma-separated nanoseconds after
+// `key` in `text`, the first one left out when `skip_first`; < 0 when
+// absent.
 static double median_of(const char *text, const char *key, int skip_first, double *all, int *n) {
     const char *at = strstr(text, key);
     if (!at) return -1;
@@ -135,11 +138,12 @@ static void agent(char *line, size_t size, char *out, size_t out_size) {
     char *port = strchr(llm, ':') + 1;
     char *const run[] = {"/usr/bin/python3", "/app/agent_loop.py", host, port,
                          "linux", "8", "timed", NULL};
-    double turns[AGENT_RUNS * 8], forks[AGENT_RUNS];
-    int n_turns = 0, n_forks = 0;
+    double turns[AGENT_RUNS * 8], model[AGENT_RUNS * 8], forks[AGENT_RUNS];
+    int n_turns = 0, n_model = 0, n_forks = 0;
     for (int i = 0; i < AGENT_RUNS; i++) {
         if (python(run, out, out_size) != 0 ||
             median_of(out, "agent turn_ns=", 1, turns, &n_turns) < 0 ||
+            median_of(out, "agent model_ns=", 1, model, &n_model) < 0 ||
             median_of(out, "agent fork_ns=", 0, forks, &n_forks) < 0) {
             for (char *c = out; *c; c++)
                 if (*c == '\n' || *c == ' ') *c = '|';
@@ -148,9 +152,10 @@ static void agent(char *line, size_t size, char *out, size_t out_size) {
         }
     }
     qsort(turns, n_turns, sizeof *turns, by_value);
+    qsort(model, n_model, sizeof *model, by_value);
     qsort(forks, n_forks, sizeof *forks, by_value);
-    snprintf(line, size, "agent_turn_us=%.1f agent_fork_us=%.1f", turns[n_turns / 2],
-             forks[n_forks / 2]);
+    snprintf(line, size, "agent_turn_us=%.1f agent_model_us=%.1f agent_fork_us=%.1f",
+             turns[n_turns / 2], model[n_model / 2], forks[n_forks / 2]);
 }
 
 int main(void) {
