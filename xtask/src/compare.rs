@@ -273,20 +273,23 @@ fn runsc() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-/// A `runsc` command run as root (`sudo -n` unless already root): gVisor
-/// needs root for `do`, `run`, `checkpoint` and `restore`.
+/// A `runsc` command run as root (`sudo -n` unless already root), stopped
+/// after 60 s: gVisor needs root for `do`, `run`, `checkpoint` and `restore`.
 fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
     let as_root = Command::new("id")
         .arg("-u")
         .output()
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+    // Every command is bounded: a gVisor that hangs on this host becomes a
+    // skipped comparison with the reason, not a stuck benchmark.
     let mut cmd = if as_root {
-        Command::new(runsc)
+        Command::new("timeout")
     } else {
         let mut c = Command::new("sudo");
-        c.arg("-n").arg(runsc);
+        c.arg("-n").arg("timeout");
         c
     };
+    cmd.args(["--kill-after=5", "60"]).arg(runsc);
     cmd.arg("--root").arg(root).arg("--network=none");
     cmd.stdin(Stdio::null());
     cmd
@@ -297,6 +300,9 @@ fn checked(cmd: &mut Command, what: &str) -> Result<String> {
     let out = cmd
         .output()
         .map_err(|e| format!("cannot run runsc ({what}): {e}"))?;
+    if out.status.code() == Some(124) {
+        return Err(format!("runsc {what} did not finish within 60 s"));
+    }
     if !out.status.success() {
         return Err(format!(
             "runsc {what} failed ({}): {}{}",
