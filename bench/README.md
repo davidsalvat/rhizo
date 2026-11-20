@@ -245,7 +245,7 @@ network card, the only input from outside). These are the
 |---|---|
 | QEMU TCG, x86_64 | None (QEMU emulates no x86 PMU): `-icount` gives the instruction counts |
 | QEMU TCG, AArch64 | PMUv3: cycles; instructions only under `-icount` |
-| QEMU (`microvm`, `q35`) and Cloud Hypervisor with KVM | What KVM gives the guest: on the GitHub-hosted x86_64 runners, Intel architectural performance monitoring with 8 counters, instructions and cycles |
+| QEMU (`microvm`, `q35`) and Cloud Hypervisor with KVM | What KVM gives the guest: on GitHub-hosted x86_64 runners it depends on the machine: some give Intel architectural performance monitoring with 8 counters, others none. So the PMU counts are recorded but not in the `ci` baseline (a gated figure missing on a VMM that ran fails the gate) |
 | Firecracker with KVM | None: Firecracker hides the PMU from its guests (CPUID leaf 0xA cleared on x86_64) |
 
 ## Comparisons with existing mechanisms
