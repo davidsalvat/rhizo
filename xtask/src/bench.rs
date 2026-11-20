@@ -423,6 +423,10 @@ fn measure_comparisons(
 
 /// Cell metrics: a `bench-cell` kernel spawns and runs the hello cell many
 /// times per boot and prints medians; each VMM boots it a few times.
+///
+/// The VM gets [`CELL_BENCH_MEMORY_MIB`]: forking a 50 MiB cell whose child
+/// writes every page needs 100 MiB for cells alone, more than the default
+/// 128 MiB VM leaves once the kernel image holds every benchmark program.
 fn measure_cells(
     opts: &Options,
     metrics: &mut Vec<Metric>,
@@ -439,8 +443,9 @@ fn measure_cells(
         network: true,
         pci_card: false,
         cpus: 1,
-        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        memory_mib: CELL_BENCH_MEMORY_MIB,
         bench: None,
+        shard: None,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -953,6 +958,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         cpus: 1,
         memory_mib: vmm::DEFAULT_MEMORY_MIB,
         bench: None,
+        shard: None,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),
@@ -1049,6 +1055,9 @@ fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
         .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(metric)))
 }
 
+/// Memory of the cell benchmark VM, in MiB.
+const CELL_BENCH_MEMORY_MIB: u32 = 256;
+
 /// Allowed regression, in percent, for `metric` in `env`.
 fn threshold_pct(baseline: &Value, env: &str, metric: &str) -> f64 {
     let t = &baseline["thresholds_pct"];
@@ -1122,6 +1131,35 @@ pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regres
     out
 }
 
+/// Gated `rhizo` metrics stored for `env` that this run did not measure
+/// although it measured something on their VMM: a figure lost to a crash
+/// or a skipped step must fail the gate, not pass it (spec `benchmarks`).
+pub fn missing(baseline: &Value, env: &str, results: &Results) -> Vec<String> {
+    let measured: std::collections::BTreeSet<String> =
+        results.metrics.iter().map(Metric::key).collect();
+    let vmms: std::collections::BTreeSet<&str> = results
+        .metrics
+        .iter()
+        .filter(|m| m.guest == "rhizo")
+        .filter_map(|m| m.vmm.as_deref())
+        .collect();
+    let Some(stored) = baseline["environments"][env].as_object() else {
+        return Vec::new();
+    };
+    stored
+        .keys()
+        .filter(|key| {
+            let mut parts = key.split('/');
+            let (name, guest, vmm) = (parts.next(), parts.next(), parts.next());
+            guest == Some("rhizo")
+                && vmm.is_some_and(|v| vmms.contains(v))
+                && name.is_some_and(|n| is_gated(baseline, env, n))
+                && !measured.contains(key.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 fn check_baseline(env: &str, results: &Results) -> Result {
     let baseline = load_baseline()?;
     if baseline["environments"][env]
@@ -1134,7 +1172,8 @@ fn check_baseline(env: &str, results: &Results) -> Result {
         return Ok(());
     }
     let found = regressions(&baseline, env, results);
-    if found.is_empty() {
+    let lost = missing(&baseline, env, results);
+    if found.is_empty() && lost.is_empty() {
         report::text(&format!(
             "benchmark gate: every metric is within its threshold for `{env}`"
         ));
@@ -1164,6 +1203,33 @@ fn check_baseline(env: &str, results: &Results) -> Result {
                 .reproduce(format!("cargo xtask bench --env {env} --check"))
                 .into_error()
         })
+        .chain(lost.iter().map(|key| {
+            let why: Vec<String> = results
+                .skipped
+                .iter()
+                .map(|(what, reason)| {
+                    format!(
+                        "{what}: {}",
+                        reason.lines().take(12).collect::<Vec<_>>().join(" | ")
+                    )
+                })
+                .collect();
+            Failure::new("bench", format!("benchmark not measured: {key}"))
+                .location(format!("{BASELINE} (environment `{env}`)"))
+                .expected("a value, as the baseline has one")
+                .actual(if why.is_empty() {
+                    "missing from the results".to_string()
+                } else {
+                    format!("missing; skipped steps: {}", why.join("; "))
+                })
+                .hint(
+                    "a benchmark that crashed or was skipped is a failure: fix it; if the \
+                     metric was removed on purpose, remove it from the baseline in the same \
+                     pull request",
+                )
+                .reproduce(format!("cargo xtask bench --env {env} --check"))
+                .into_error()
+        }))
         .collect();
     Err(errors.join("\n"))
 }
@@ -1643,6 +1709,41 @@ mod tests {
         assert_eq!(summarize(&mut [4.0, 1.0, 3.0, 2.0]), (2.5, 4.0));
         let mut ten: Vec<f64> = (1..=10).map(f64::from).collect();
         assert_eq!(summarize(&mut ten), (5.5, 9.0));
+    }
+
+    #[test]
+    fn a_lost_figure_fails_the_gate() {
+        let baseline = json!({
+            "environments": {"ci": {
+                "cell.run_us/rhizo/qemu-microvm": 7.0,
+                "cell.fork_us/rhizo/qemu-microvm": 1.4,
+                "cell.fork_us/rhizo/firecracker": 1.4,
+                "boot.time_to_ready_ms/rhizo/qemu-microvm": 40.0
+            }},
+            "ungated": {"ci": ["boot.time_to_ready_ms"]}
+        });
+        let metric = |name: &str, vmm: &str| Metric {
+            name: name.into(),
+            guest: "rhizo".into(),
+            vmm: Some(vmm.into()),
+            unit: "us".into(),
+            median: 1.0,
+            p90: 1.0,
+            runs: 1,
+        };
+        let results = Results {
+            environment: "ci".into(),
+            date: String::new(),
+            kvm: true,
+            metrics: vec![metric("cell.run_us", "qemu-microvm")],
+            skipped: vec![("cells/qemu-microvm".into(), "PANIC".into())],
+        };
+        // Lost on a VMM that ran; not on one this run did not measure, and
+        // not for an ungated metric.
+        assert_eq!(
+            missing(&baseline, "ci", &results),
+            ["cell.fork_us/rhizo/qemu-microvm"]
+        );
     }
 
     #[test]

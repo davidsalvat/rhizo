@@ -316,6 +316,15 @@ pub struct RunOptions {
     pub memory_mib: u32,
     /// A reference workload for a `bench-cell` Rhizo kernel.
     pub bench: Option<Bench>,
+    /// The share of the in-kernel tests this VM runs (`shard=I/N`).
+    pub shard: Option<(u16, u16)>,
+}
+
+/// The `shard=I/N` option for a Rhizo command line, if any.
+fn shard_arg(opts: &RunOptions) -> String {
+    opts.shard
+        .map(|(i, n)| format!(" shard={i}/{n}"))
+        .unwrap_or_default()
 }
 
 /// Parses `rhizo-ready cycles=<n>` from console output.
@@ -422,6 +431,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(vmm);
             }
+            args += &shard_arg(opts);
             cmd.arg("-kernel").arg(kernel).args(["-append", &args]);
         }
         Guest::ReferenceLinux { kernel, initramfs } => {
@@ -467,6 +477,9 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     if let (Some(bench), Guest::Rhizo(_)) = (opts.bench, guest) {
         args += &bench.cmdline(Vmm::Firecracker);
     }
+    if matches!(guest, Guest::Rhizo(_)) {
+        args += &shard_arg(opts);
+    }
     let initrd_json = match &initrd {
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
         None => String::new(),
@@ -510,6 +523,7 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(Vmm::CloudHypervisor);
             }
+            args += &shard_arg(opts);
             cmd.arg("--kernel").arg(kernel).args(["--cmdline", &args]);
             if arch::current() == Arch::X86_64 {
                 cmd.args(["--serial", "off", "--debug-console", "tty"]);
