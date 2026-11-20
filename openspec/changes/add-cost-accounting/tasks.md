@@ -17,4 +17,4 @@
 
 - [x] 3.1 `--accel icount`, `profile.rs` (counted figures, PMU passes, breakdowns, the icount run), `--no-icount`, `thresholds_pct.instructions` and ungated prefixes; unit tests; verify `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference --accel tcg`
 - [x] 3.2 `bench/README.md`, `AGENTS.md` (crate row), `xtask/src/deps.rs`; `cargo xtask ci` on both architectures
-- [x] 3.3 CI green; note which VMMs give the guest a PMU (`rhizo-pmu` lines); add the `-icount` counts and the new timings to the `ci` baseline from that run's results
+- [ ] 3.3 CI green; note which VMMs give the guest a PMU (`rhizo-pmu` lines); add the `-icount` counts and the new timings to the `ci` baseline from that run's results (done once on 555ca43; dropped when merging main, whose `fork_touch` benchmark now faults for want of memory on every VMM, so no cell figures are measured: to redo once main measures them again)
