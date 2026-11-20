@@ -115,18 +115,37 @@ pub fn linux_process_in_vm(cells: &Path, accel: Accel, scratch: &Path) -> Result
     if let Some(reason) = Vmm::Firecracker.unavailable_reason(accel) {
         return Err(reason);
     }
-    let binary = tools::firecracker()?;
-    let kernel = tools::reference_kernel()?;
     let program = scratch.join("linux_process_static");
     build_linux_process(crate::c_compiler(), &["-static"], &program)?;
-    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
-    let initramfs = scratch.join(format!("linux-process-{}.cpio", std::process::id()));
-    std::fs::write(
-        &initramfs,
-        refguest::initramfs_with(&read(&program)?, &[("hello", &read(&cells.join("hello"))?)]),
-    )
-    .map_err(|e| e.to_string())?;
-    let config = scratch.join(format!("linux-process-{}.json", std::process::id()));
+    let initramfs =
+        refguest::initramfs_with(&read(&program)?, &[("hello", &read(&cells.join("hello"))?)]);
+    let samples = boot_guest(&initramfs, scratch, "linux-process", parse_process_line)?;
+    report::text(&format!(
+        "linux processes inside firecracker on {}: {} boots",
+        arch::current().id(),
+        samples.len()
+    ));
+    Ok(process_metrics("firecracker", &samples))
+}
+
+fn read(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// Boots a Linux guest in Firecracker with `initramfs` three times and
+/// returns what `parse` finds in the first console line it accepts, per
+/// boot (`what` names the line in errors).
+fn boot_guest<T: Send + 'static>(
+    initramfs: &[u8],
+    scratch: &Path,
+    what: &str,
+    parse: fn(&str) -> Option<T>,
+) -> Result<Vec<T>> {
+    let binary = tools::firecracker()?;
+    let kernel = tools::reference_kernel()?;
+    let image = scratch.join(format!("{what}-{}.cpio", std::process::id()));
+    std::fs::write(&image, initramfs).map_err(|e| e.to_string())?;
+    let config = scratch.join(format!("{what}-{}.json", std::process::id()));
     std::fs::write(
         &config,
         format!(
@@ -135,7 +154,7 @@ pub fn linux_process_in_vm(cells: &Path, accel: Accel, scratch: &Path) -> Result
              \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": 256}}}}",
             kernel.display().to_string(),
             crate::vmm::linux_cmdline(Vmm::Firecracker),
-            initramfs.display().to_string()
+            image.display().to_string()
         ),
     )
     .map_err(|e| e.to_string())?;
@@ -154,25 +173,110 @@ pub fn linux_process_in_vm(cells: &Path, accel: Accel, scratch: &Path) -> Result
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-                if let Some(sample) = parse_process_line(&line) {
+                if let Some(sample) = parse(&line) {
                     let _ = tx.send(sample);
                 }
             }
         });
         let sample = rx.recv_timeout(Duration::from_secs(120));
         stop(child);
-        samples.push(sample.map_err(|_| {
-            format!("boot {boot}: the guest printed no linux-process line within 120 s")
-        })?);
+        samples.push(
+            sample.map_err(|_| {
+                format!("boot {boot}: the guest printed no {what} line within 120 s")
+            })?,
+        );
     }
-    let _ = std::fs::remove_file(&initramfs);
+    let _ = std::fs::remove_file(&image);
     let _ = std::fs::remove_file(&config);
+    Ok(samples)
+}
+
+/// Parses a `linux-cpython cold_us=<x> warm_us=<y>` line.
+pub fn parse_cpython_line(text: &str) -> Option<[f64; 2]> {
+    let line = &text[text.find("linux-cpython ")?..];
+    let field = |key: &str| -> Option<f64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some([field("cold_us")?, field("warm_us")?])
+}
+
+/// CPython on Linux in the same Firecracker VM as the cells (design D4 of
+/// `add-cpython`): the static CPython, its standard library and the script
+/// of the CPython cell in the guest's initramfs, `bench/host/linux_cpython.c`
+/// as `/init`. Cold: fork and exec of the script; warm: a fork of a CPython
+/// process that imported and warmed it up (`cpython_forkserver.py`).
+pub fn cpython_in_vm(accel: Accel, scratch: &Path) -> Result<Vec<Metric>> {
+    let root = crate::cpython::root();
+    if !root.join("bin/python3").exists() {
+        return Err("CPython not built (RHIZO_CPYTHON_SRC unset)".into());
+    }
+    if let Some(reason) = Vmm::Firecracker.unavailable_reason(accel) {
+        return Err(reason);
+    }
+    let program = scratch.join("linux_cpython_static");
+    let source = workspace_root().join("bench/host/linux_cpython.c");
+    let status = Command::new(crate::c_compiler())
+        .args(["-static", "-O2", "-o"])
+        .arg(&program)
+        .arg(&source)
+        .status()
+        .map_err(|e| format!("cannot run the C compiler: {e}"))?;
+    if !status.success() {
+        return Err(format!("cannot compile {}", source.display()));
+    }
+    let mut files = Vec::new();
+    collect(&root, "", &mut files)?;
+    let server = workspace_root().join("bench/host/cpython_forkserver.py");
+    files.push(("app/cpython_forkserver.py".into(), read(&server)?));
+    let entries: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let initramfs = refguest::initramfs_with(&read(&program)?, &entries);
+    let samples = boot_guest(&initramfs, scratch, "linux-cpython", parse_cpython_line)?;
     report::text(&format!(
-        "linux processes inside firecracker on {}: {} boots",
+        "cpython inside firecracker on {}: {} boots",
         arch::current().id(),
         samples.len()
     ));
-    Ok(process_metrics("firecracker", &samples))
+    let mut out = Vec::new();
+    for (i, name) in ["workload.cpython_cold_us", "workload.cpython_warm_us"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut values: Vec<f64> = samples.iter().map(|s| s[i]).collect();
+        out.push(metric(
+            name,
+            "linux-process",
+            "firecracker",
+            "us",
+            &mut values,
+        ));
+    }
+    Ok(out)
+}
+
+/// Every file and directory under `dir` as initramfs entries named from
+/// `at` (directories end in `/`), in name order.
+fn collect(dir: &Path, at: &str, out: &mut Vec<(String, Vec<u8>)>) -> Result {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = format!("{at}{}", entry.file_name().to_string_lossy());
+        if entry.path().is_dir() {
+            out.push((format!("{name}/"), Vec::new()));
+            collect(&entry.path(), &format!("{name}/"), out)?;
+        } else {
+            out.push((name, read(&entry.path())?));
+        }
+    }
+    Ok(())
 }
 
 /// One HTTP/1.1 request to Firecracker's API socket; returns the status.
@@ -820,6 +924,17 @@ mod tests {
             (00.012345) Restore finished successfully. Tasks resumed.\n\n";
         assert_eq!(criu_log_seconds(log), Some(0.012345));
         assert_eq!(criu_log_seconds("no timestamps"), None);
+    }
+
+    #[test]
+    fn cpython_line_is_found_among_console_noise() {
+        let line = "[  1.2] junk linux-cpython cold_us=31000.5 warm_us=2100.25\r\n";
+        assert_eq!(parse_cpython_line(line), Some([31000.5, 2100.25]));
+        assert_eq!(
+            parse_cpython_line("linux-cpython cold_us=1 warm_us=failed"),
+            None
+        );
+        assert_eq!(parse_cpython_line("linux-process fork_us=1"), None);
     }
 
     #[test]

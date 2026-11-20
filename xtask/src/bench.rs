@@ -342,6 +342,10 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("linux-process/firecracker".into(), e)),
         }
+        match crate::compare::cpython_in_vm(opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
+        }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
@@ -391,6 +395,7 @@ fn measure_cells(
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
+        let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
@@ -422,6 +427,10 @@ fn measure_cells(
                     if let Some((c, w)) = parse_python_line(&out.output) {
                         py_cold.push(c as f64 / 1000.0);
                         py_warm.push(w as f64 / 1000.0);
+                    }
+                    if let Some((c, w)) = parse_cpython_line(&out.output) {
+                        cpy_cold.push(c as f64 / 1000.0);
+                        cpy_warm.push(w as f64 / 1000.0);
                     }
                     if let Some(d) = parse_density_line(&out.output) {
                         density = Some(d);
@@ -473,6 +482,8 @@ fn measure_cells(
             ("cell.fork_with_files_us", "us", &mut fork_files),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
+            ("workload.cpython_cold_us", "us", &mut cpy_cold),
+            ("workload.cpython_warm_us", "us", &mut cpy_warm),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
         ] {
@@ -518,6 +529,19 @@ fn measure_cells(
 /// (absent when MicroPython was not built).
 fn parse_python_line(output: &str) -> Option<(u64, u64)> {
     let line = output.lines().find(|l| l.starts_with("rhizo-python "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("cold_ns")?, field("warm_ns")?))
+}
+
+/// `(cold_ns, warm_ns)` of the CPython line of a `bench-cell` kernel
+/// (absent when CPython was not built).
+fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-cpython "))?;
     let field = |key: &str| -> Option<u64> {
         line.split_whitespace()
             .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
@@ -1535,6 +1559,14 @@ mod tests {
             Some((900_000, 40_000))
         );
         assert_eq!(parse_python_line("no python here"), None);
+    }
+
+    #[test]
+    fn cpython_line_is_parsed() {
+        let out =
+            "rhizo-python cold_ns=1 warm_ns=2\nrhizo-cpython cold_ns=30000000 warm_ns=900000\n";
+        assert_eq!(parse_cpython_line(out), Some((30_000_000, 900_000)));
+        assert_eq!(parse_cpython_line("rhizo-python cold_ns=1 warm_ns=2"), None);
     }
 
     #[test]
