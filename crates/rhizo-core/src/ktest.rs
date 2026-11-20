@@ -29,7 +29,9 @@ macro_rules! ktest_case {
 }
 
 /// Runs every test case of every suite, in order, and returns the status to
-/// exit the VM with.
+/// exit the VM with. With `shard = Some((i, n))` only the cases whose
+/// position (counting across the suites) is `i` modulo `n` run, so `n` VMs
+/// together run each case once.
 ///
 /// Output format, one line per test:
 ///
@@ -39,10 +41,17 @@ macro_rules! ktest_case {
 /// test second ... ok
 /// test result: ok. 2 passed
 /// ```
-pub fn run(console: &mut impl Console, suites: &[&[TestCase]]) -> ExitStatus {
-    let total: usize = suites.iter().map(|s| s.len()).sum();
+pub fn run(
+    console: &mut impl Console,
+    suites: &[&[TestCase]],
+    shard: Option<(u16, u16)>,
+) -> ExitStatus {
+    let (i, n) = shard.map_or((0, 1), |(i, n)| (usize::from(i), usize::from(n)));
+    let mine = |k: &usize| k % n == i;
+    let all = || suites.iter().flat_map(|s| s.iter()).enumerate();
+    let total = all().filter(|(k, _)| mine(k)).count();
     let _ = writeln!(ConsoleWriter(console), "running {total} tests");
-    for case in suites.iter().flat_map(|s| s.iter()) {
+    for (_, case) in all().filter(|(k, _)| mine(k)) {
         let _ = write!(ConsoleWriter(console), "test {} ... ", case.name);
         (case.run)();
         let _ = writeln!(ConsoleWriter(console), "ok");
@@ -78,7 +87,7 @@ mod tests {
         let mut console = RecordingConsole::new();
         let cases = [ktest_case!(counted), ktest_case!(counted)];
 
-        let status = run(&mut console, &[&cases]);
+        let status = run(&mut console, &[&cases], None);
 
         assert_eq!(status, ExitStatus::Success);
         assert_eq!(CALLS.load(Ordering::SeqCst) - before, 2);
@@ -92,9 +101,38 @@ mod tests {
     }
 
     #[test]
+    fn shards_run_every_case_exactly_once() {
+        fn a() {}
+        fn b() {}
+        fn c() {}
+        fn d() {}
+        fn e() {}
+        let first = [ktest_case!(a), ktest_case!(b)];
+        let second = [ktest_case!(c), ktest_case!(d), ktest_case!(e)];
+        let mut names = Vec::new();
+        for i in 0..3 {
+            let mut console = RecordingConsole::new();
+            assert_eq!(
+                run(&mut console, &[&first, &second], Some((i, 3))),
+                ExitStatus::Success
+            );
+            let text = console.text();
+            let ran: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... ok"))
+                .collect();
+            assert!(text.starts_with(&format!("running {} tests\n", ran.len())));
+            assert!(text.ends_with(&format!("test result: ok. {} passed\n", ran.len())));
+            names.extend(ran.iter().map(|n| n.to_string()));
+        }
+        names.sort();
+        assert_eq!(names, ["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
     fn empty_suite_succeeds() {
         let mut console = RecordingConsole::new();
-        assert_eq!(run(&mut console, &[]), ExitStatus::Success);
+        assert_eq!(run(&mut console, &[], None), ExitStatus::Success);
         assert_eq!(
             console.text(),
             "running 0 tests\ntest result: ok. 0 passed\n"
@@ -107,7 +145,7 @@ mod tests {
         let cases = [ktest_case!(passing), ktest_case!(failing)];
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run(&mut console, &[&cases])
+            run(&mut console, &[&cases], None)
         }));
 
         assert!(result.is_err(), "a failing case must not report success");
