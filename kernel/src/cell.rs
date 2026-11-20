@@ -83,12 +83,48 @@ fn files_of(snapshot: &Snapshot) -> Fs {
 /// over its loopback network.
 static NET: Global<Net> = Global::new(Net::new());
 
+/// Set, under the sockets' lock, when a change woke waiters that nobody
+/// drained yet: the CPUs take the lock to drain them only then, not at
+/// every scheduling step (design D2 of `split-sockets-lock`).
+static WOKEN: AtomicBool = AtomicBool::new(false);
+
+/// Runs `f` on the sockets, noting woken waiters for [`wake_woken`].
+fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
+    NET.with(|net| {
+        let r = f(net);
+        if net.has_woken() {
+            WOKEN.store(true, Ordering::Release);
+        }
+        r
+    })
+}
+
+/// The sockets as a system call reaches them (design D1 of
+/// `split-sockets-lock`): locked the first time the call uses them, until
+/// the call ends, with their change count then; a call that uses no socket
+/// never waits for another CPU's socket calls.
+#[derive(Default)]
+struct CallNet(Option<(rhizo_core::sync::Guard<'static, Net>, u64)>);
+
+impl rhizo_abi::Sockets for CallNet {
+    fn net(&mut self) -> &mut Net {
+        &mut self
+            .0
+            .get_or_insert_with(|| {
+                let net = NET.lock();
+                let changes = net.changes();
+                (net, changes)
+            })
+            .0
+    }
+}
+
 /// The files of a fork of a cell with `fs`: its sockets as design D4 of
 /// `add-sockets-and-poll` says (listeners shared, connections reset).
 fn fork_files(fs: &Fs) -> Fs {
     let mut child = fs.clone();
     if fs.sockets().next().is_some() {
-        NET.with(|net| child.map_sockets(|h| net.fork(h).unwrap_or(h)));
+        with_net(|net| child.map_sockets(|h| net.fork(h).unwrap_or(h)));
     }
     child
 }
@@ -99,7 +135,7 @@ fn fork_files(fs: &Fs) -> Fs {
     allow(dead_code, reason = "used by in-kernel tests")
 )]
 pub fn open_sockets() -> usize {
-    NET.with(|net| net.open())
+    with_net(|net| net.open())
 }
 
 /// Closes the connections parked for `snapshot`, which the host drops
@@ -112,7 +148,7 @@ pub fn open_sockets() -> usize {
 pub fn close_parked(snapshot: &Snapshot) {
     let records = snapshot.sockets();
     if !records.is_empty() {
-        NET.with(|net| records.iter().for_each(|r| net.unpark(r)));
+        with_net(|net| records.iter().for_each(|r| net.unpark(r)));
     }
 }
 
@@ -120,7 +156,7 @@ pub fn close_parked(snapshot: &Snapshot) {
 /// suspended), leaving their wait queues first.
 fn release_sockets(fs: &Fs, id: u32) {
     if fs.sockets().next().is_some() {
-        NET.with(|net| {
+        with_net(|net| {
             fs.sockets().for_each(|h| {
                 net.forget(h, id);
                 net.release(h);
@@ -138,7 +174,7 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
         return (fs.clone(), records);
     }
     let mut out = fs.clone();
-    NET.with(|net| {
+    with_net(|net| {
         out.map_sockets(|h| {
             let record = net.export(h).unwrap_or(rhizo_net::Record {
                 family: rhizo_net::Family::Inet,
@@ -165,7 +201,7 @@ fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
     }
     let mut handles = Vec::with_capacity(records.len());
     let mut renamed = Vec::new();
-    NET.with(|net| {
+    with_net(|net| {
         for r in records {
             let reset = rhizo_net::Record {
                 state: rhizo_net::Saved::Reset,
@@ -497,7 +533,7 @@ pub fn init(smp: Option<u16>) -> usize {
     MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
     // The network card comes up once, at boot, rather than with the first
     // host: what it allocates is never charged to a cell or a test.
-    NET.with(|net| {
+    with_net(|net| {
         // Parked connections re-attach only in this boot (design D2 of
         // `keep-tcp-across-suspend`).
         net.set_boot(Counter.cycles());
@@ -888,6 +924,12 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
 /// its calls again; any other is nudged ([`Shared::nudged`]). Called under
 /// the host's lock, so a cell filed to wait cannot miss its wake-up.
 fn wake_woken(s: &mut Shared, cpu: usize, now: u64) {
+    // Set under the sockets' lock after a change woke waiters: when it is
+    // clear, nothing waits to be drained (any change after this load sets
+    // it again, for the next drain).
+    if !WOKEN.swap(false, Ordering::Acquire) {
+        return;
+    }
     // Lock order: the host's, then the sockets.
     NET.with(|net| {
         net.drain_woken(|id| {
@@ -1109,36 +1151,38 @@ fn syscall(
     let woken = core::mem::take(&mut live.io_woken);
     // Lock order: the cell's (when shared), `SHARING`, then the sockets.
     let (outcome, deadline) = sharing(live.shares, || {
-        NET.with(|net| {
-            let changes = net.changes();
-            let mut cx = Context {
-                pt,
-                mem: &mut DirectMap,
-                tlb: &mut tlb,
-                frames: &mut KernelFrames,
-                services: &mut services,
-                fs: &mut live.fs,
-                net,
-                deadline,
-                pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
-                pages: &mut KernelPages,
-            };
-            let outcome = live.abi.handle(&mut live.cell, &mut cx);
-            let deadline = cx.deadline;
+        let mut sockets = CallNet::default();
+        let mut cx = Context {
+            pt,
+            mem: &mut DirectMap,
+            tlb: &mut tlb,
+            frames: &mut KernelFrames,
+            services: &mut services,
+            fs: &mut live.fs,
+            net: &mut sockets,
+            deadline,
+            pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
+            pages: &mut KernelPages,
+        };
+        let outcome = live.abi.handle(&mut live.cell, &mut cx);
+        let deadline = cx.deadline;
+        let waits = matches!(live.cell.threads.current().wait, Wait::Io { .. });
+        if let Some((net, changes)) = sockets.0.as_mut() {
             // A call that waits on descriptors joins the wait queues of the
-            // sockets it looked at (design D1 of `add-socket-wait-queues`).
-            let waits = matches!(live.cell.threads.current().wait, Wait::Io { .. });
+            // sockets it looked at (design D1 of `add-socket-wait-queues`),
+            // under the lock it looked at them with.
             net.end_call(waits.then_some(live.cell.id));
-            if prof::on() {
-                if net.changes() != changes {
-                    prof::net_changed(now_ns());
-                }
-                if woken && waits {
-                    prof::add(Count::IoWasted, 1);
-                }
+            if net.has_woken() {
+                WOKEN.store(true, Ordering::Release);
             }
-            (outcome, deadline)
-        })
+            if prof::on() && net.changes() != *changes {
+                prof::net_changed(now_ns());
+            }
+        }
+        if prof::on() && woken && waits {
+            prof::add(Count::IoWasted, 1);
+        }
+        (outcome, deadline)
     });
     prof::syscall_end(t0);
     live.random = services.random;
@@ -2135,7 +2179,7 @@ impl Host {
         if waiting && self.wire_delay.is_some() {
             self.wire_due = 0;
             self.poll_wire(now);
-            if NET.with(|net| net.has_woken()) {
+            if WOKEN.load(Ordering::Acquire) {
                 return true; // the next take wakes them
             }
             if let Some(delay) = self.wire_delay.filter(|&d| d != u64::MAX) {
@@ -2162,7 +2206,7 @@ impl Host {
         if now < self.wire_due {
             return;
         }
-        let (delay, addr) = NET.with(|net| (crate::wire::poll(net, now), net.wire_addr()));
+        let (delay, addr) = with_net(|net| (crate::wire::poll(net, now), net.wire_addr()));
         // As often as the wire needs, but not more than once per period,
         // and at least every millisecond for frames nobody waits for yet.
         self.wire_due = now + delay.unwrap_or(u64::MAX).clamp(WIRE_PERIOD_NS, 1_000_000);
@@ -2462,12 +2506,13 @@ pub fn bench(console: &mut impl Console) {
         return;
     }
     if crate::smp::count() > 1 {
-        let (serial, parallel, wake) = multi_core();
+        let (serial, parallel, wake, calls_serial, calls_parallel) = multi_core();
         let (one, four, shootdown) = parallel_threads();
         let _ = writeln!(
             rhizo_hal::ConsoleWriter(console),
             "rhizo-smp cpus={} serial_ns={serial} parallel_ns={parallel} ipi_wake_ns={wake} \
-             threads1_ns={one} threads4_ns={four} shootdown_ns={shootdown}",
+             threads1_ns={one} threads4_ns={four} shootdown_ns={shootdown} \
+             syscalls_serial_ns={calls_serial} syscalls_parallel_ns={calls_parallel}",
             crate::smp::count()
         );
         return; // the other metrics are measured with one CPU
@@ -2979,17 +3024,14 @@ fn threads() -> (u64, u64) {
 /// round trip to an idle CPU (wake it, run nothing, see it done), robust
 /// figure over 105.
 #[cfg(feature = "bench-cell")]
-fn multi_core() -> (u64, u64, u64) {
+fn multi_core() -> (u64, u64, u64, u64, u64) {
     const ROUNDS: usize = 3;
-    let image = test_image("spin");
     let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
-    let batch = |parallel: bool| {
+    let batch = |argv: &[&[u8]], parallel: bool| {
+        let image = test_image(core::str::from_utf8(argv[0]).unwrap_or("spin"));
         let mut host = Host::new();
         let ids: Vec<u32> = (0..4 * crate::smp::count())
-            .map(|_| {
-                host.spawn(image, &[b"spin", b"5"], false, false)
-                    .expect("spawn")
-            })
+            .map(|_| host.spawn(image, argv, false, false).expect("spawn"))
             .collect();
         let t0 = Counter.cycles();
         if parallel {
@@ -3003,10 +3045,17 @@ fn multi_core() -> (u64, u64, u64) {
         }
         ns(t0, t1)
     };
-    let mut serial: Vec<u64> = (0..ROUNDS).map(|_| batch(false)).collect();
-    let mut parallel: Vec<u64> = (0..ROUNDS).map(|_| batch(true)).collect();
-    serial.sort_unstable();
-    parallel.sort_unstable();
+    let median = |argv: &[&[u8]], parallel: bool| {
+        let mut t: Vec<u64> = (0..ROUNDS).map(|_| batch(argv, parallel)).collect();
+        t.sort_unstable();
+        t[ROUNDS / 2]
+    };
+    let spin: [&[u8]; 2] = [b"spin", b"5"];
+    let (serial, parallel) = (median(&spin, false), median(&spin, true));
+    // System calls of different cells (design D3 of `split-sockets-lock`):
+    // each `piper` writes and reads a byte through its pipe 20,000 times.
+    let piper: [&[u8]; 2] = [b"piper", b"20000"];
+    let (calls_serial, calls_parallel) = (median(&piper, false), median(&piper, true));
     fn nothing(x: u64) -> u64 {
         x
     }
@@ -3018,7 +3067,13 @@ fn multi_core() -> (u64, u64, u64) {
             ns(t0, Counter.cycles())
         })
         .collect();
-    (serial[ROUNDS / 2], parallel[ROUNDS / 2], robust(&mut wake))
+    (
+        serial,
+        parallel,
+        robust(&mut wake),
+        calls_serial,
+        calls_parallel,
+    )
 }
 
 /// With several CPUs (design D9 of `add-parallel-threads`): `parsum` with 1

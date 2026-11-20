@@ -26,6 +26,15 @@ impl<T> Global<T> {
         self.0.with(crate::arch::cpu::index(), f)
     }
 
+    /// Exclusive access to the value until the guard is dropped (taken by
+    /// a holder only once it turns out to need it).
+    ///
+    /// # Panics
+    /// If this CPU holds it already.
+    pub fn lock(&self) -> rhizo_core::sync::Guard<'_, T> {
+        self.0.lock(crate::arch::cpu::index())
+    }
+
     /// The value, without locking: `&mut self` proves nobody else has it.
     #[cfg(any(feature = "ktest", feature = "bench-cell"))]
     pub fn get_mut(&mut self) -> &mut T {

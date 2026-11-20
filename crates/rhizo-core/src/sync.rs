@@ -38,6 +38,17 @@ impl<T> SpinLock<T> {
     /// # Panics
     /// If `cpu` already holds it (reentrance).
     pub fn with<R>(&self, cpu: usize, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut guard = self.lock(cpu);
+        f(&mut guard)
+    }
+
+    /// Exclusive access to the value, on behalf of CPU `cpu`, until the
+    /// guard is dropped (for a holder that takes the lock only when it
+    /// turns out to need it, then keeps it).
+    ///
+    /// # Panics
+    /// If `cpu` already holds it (reentrance).
+    pub fn lock(&self, cpu: usize) -> Guard<'_, T> {
         let me = cpu as u32 + 1;
         loop {
             match self
@@ -55,10 +66,7 @@ impl<T> SpinLock<T> {
                 }
             }
         }
-        // SAFETY: `holder` is ours, so no other reference to the value exists.
-        let result = f(unsafe { &mut *self.value.get() });
-        self.holder.store(0, Ordering::Release);
-        result
+        Guard(self)
     }
 
     /// The value, without locking: `&mut self` proves nobody else has it.
@@ -69,6 +77,34 @@ impl<T> SpinLock<T> {
     /// The value, the lock gone: owning it proves nobody else has it.
     pub fn into_inner(self) -> T {
         self.value.into_inner()
+    }
+}
+
+/// Exclusive access to a [`SpinLock`]'s value; dropping it releases the
+/// lock.
+#[derive(Debug)]
+pub struct Guard<'a, T>(&'a SpinLock<T>);
+
+impl<T> core::ops::Deref for Guard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists only while `holder` is ours, so no other
+        // reference to the value exists.
+        unsafe { &*self.0.value.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for Guard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, and `&mut self` makes this the only
+        // reference through the guard.
+        unsafe { &mut *self.0.value.get() }
+    }
+}
+
+impl<T> Drop for Guard<'_, T> {
+    fn drop(&mut self) {
+        self.0.holder.store(0, Ordering::Release);
     }
 }
 
@@ -130,5 +166,23 @@ mod tests {
         let lock = SpinLock::new(1);
         assert_eq!(lock.with(0, |v| *v + 1), 2);
         assert_eq!(lock.with(1, |v| *v), 1, "another CPU gets it");
+    }
+
+    #[test]
+    fn a_guard_holds_the_lock_until_dropped() {
+        let lock = SpinLock::new(1);
+        let mut guard = lock.lock(0);
+        *guard += 1;
+        assert_eq!(lock.holder.load(Ordering::Relaxed), 1, "held by CPU 0");
+        drop(guard);
+        assert_eq!(lock.with(1, |v| *v), 2, "released, with the change");
+    }
+
+    #[test]
+    #[should_panic(expected = "reentrant access")]
+    fn a_guard_is_reentrance_too() {
+        let lock = SpinLock::new(0);
+        let _held = lock.lock(1);
+        lock.with(1, |_| ());
     }
 }
