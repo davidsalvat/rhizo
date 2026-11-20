@@ -81,8 +81,10 @@ pages), `kernel/src/tests.rs`, `cells/c/dynamic/hello.c`,
 `cells/python/{dynamic_demo,pack_stdlib}.py`, `cells/expected.rs`,
 `xtask/src/{dynamic,differential,bench,compare}.rs`,
 `bench/host/linux_process.c`, `kernel/build.rs` (images
-embedded in test kernels only), `kernel/src/arch/aarch64/boot.rs` (the
+embedded in test kernels only: the distribution's programs and the static
+C cells no benchmark runs), `kernel/src/arch/aarch64/boot.rs` (the
 early tables map the whole image: test kernels now pass 32 MiB),
 `bench/README.md`. The `bench-cell` kernel embeds the dynamic `hello`
-with its interpreter and `libc` (about 2.5 MiB). No existing metric changes
-by design.
+with its interpreter and `libc` (2.4 MiB) and no longer the C cells only
+tests run (5.6 MiB), so its cells have a little more memory than before. No
+existing metric changes by design.

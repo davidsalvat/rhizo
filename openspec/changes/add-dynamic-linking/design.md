@@ -91,9 +91,13 @@ system, embedded like `cpython-files`:
 - `dynamic-files`: `usr/bin/hello`, `cells/c/dynamic/hello.c` built with
   the cells' C compiler without `-static`; it prints whether the auxiliary
   vector gave it an interpreter base, and with `wait` pauses after
-  `ready` (for suspend, fork and templates). About 2.5 MiB with `ld.so`
+  `ready` (for suspend, fork and templates). About 2.4 MiB with `ld.so`
   and `libc`: every kernel that runs cells embeds it, the benchmark
-  kernel included.
+  kernel included. The benchmark guest has 128 MiB and the 50 MiB fork
+  benchmark (a template and a child that writes all of it) needs nearly
+  all that cells may take, so the benchmark kernel pays for it by no
+  longer embedding the static C cells only the tests run (`libc_hello`,
+  `libc_files`, ...: 5.6 MiB; `kernel/build.rs`, `TEST_ONLY`).
 - `distro-files`, natively only (as the differential check, and as
   CPython), embedded in test kernels only (`ktest`): 17 MiB embedded
   and as much again decoded would leave the benchmark kernel's cells, in a

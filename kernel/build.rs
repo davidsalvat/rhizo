@@ -9,8 +9,19 @@ const OPTIONAL: [&str; 5] = [
     "distro-files",
 ];
 /// Cells embedded in test kernels only (`ktest`): elsewhere they read as
-/// not built, and take no memory from the cells a benchmark runs.
-const TEST_ONLY: [&str; 1] = ["distro-files"];
+/// not built, and take no memory from the cells a benchmark runs (its guest
+/// has 128 MiB, and the 50 MiB fork benchmark needs most of it). The C
+/// cells here are those no benchmark runs.
+const TEST_ONLY: [&str; 8] = [
+    "distro-files",
+    "libc_alloc",
+    "libc_deep_stack",
+    "libc_files",
+    "libc_float",
+    "libc_hello",
+    "libc_net",
+    "libc_threads",
+];
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
