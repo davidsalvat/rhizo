@@ -36,6 +36,10 @@ binascii binascii.c
 math mathmodule.c
 zlib zlibmodule.c
 ";
+/// Linked statically, with its segments on 2 MiB boundaries so the kernel
+/// maps whole 2 MiB pieces of them with 2 MiB pages (design D2 of
+/// `add-large-image-pages`).
+const LDFLAGS: &str = "-static -Wl,-z,max-page-size=0x200000";
 const CONFIGURE: [&str; 3] = [
     "--disable-shared",
     "--without-ensurepip",
@@ -118,7 +122,7 @@ fn build_interpreter(tarball: &Path) -> Result<PathBuf> {
     let dir = dir();
     let src = dir.join(format!("Python-{VERSION}"));
     let python = interpreter();
-    let recipe = format!("{VERSION} {}\n{SETUP_LOCAL}", CONFIGURE.join(" "));
+    let recipe = format!("{VERSION} {}\n{SETUP_LOCAL}", CONFIGURE.join(" ")) + LDFLAGS;
     let stamp = dir.join("recipe");
     if python.exists() && std::fs::read_to_string(&stamp).ok().as_deref() == Some(&recipe) {
         return Ok(python);
@@ -133,7 +137,7 @@ fn build_interpreter(tarball: &Path) -> Result<PathBuf> {
     let mut configure = Command::new("./configure");
     configure
         .args(CONFIGURE)
-        .env("LDFLAGS", "-static")
+        .env("LDFLAGS", LDFLAGS)
         .current_dir(&src);
     run(
         &mut configure,
@@ -194,7 +198,7 @@ fn run(cmd: &mut Command, what: &str, log: &Path) -> Result {
         .into_error())
 }
 
-fn write_if_changed(path: &Path, data: &[u8]) -> Result {
+pub(crate) fn write_if_changed(path: &Path, data: &[u8]) -> Result {
     if std::fs::read(path).ok().as_deref() == Some(data) {
         return Ok(()); // unchanged: the kernel is not rebuilt for nothing
     }
@@ -216,7 +220,7 @@ fn encode(root: &Path) -> Result<Vec<u8>> {
 }
 
 /// Copies directory `dir` into `fs` at `at`, in name order.
-fn add_tree(fs: &mut rhizo_fs::Fs, dir: &Path, at: &str) -> Result {
+pub(crate) fn add_tree(fs: &mut rhizo_fs::Fs, dir: &Path, at: &str) -> Result {
     let failed = |e: rhizo_fs::Error| format!("cannot add {at} to the cell's files: {e:?}");
     fs.mkdir(None, at.as_bytes()).map_err(failed)?;
     let mut entries: Vec<_> = std::fs::read_dir(dir)

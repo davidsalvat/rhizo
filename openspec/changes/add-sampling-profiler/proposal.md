@@ -49,7 +49,7 @@ tools read.
 ## Impact
 
 `crates/rhizo-prof` (`samples`), `crates/rhizo-core` (`fdt`), kernel
-`arch/*/{pmu,irq,user}.rs`, `arch/x86_64/cpu.rs` (vector 34), `prof.rs`,
+`arch/*/{pmu,irq,user}.rs`, `arch/x86_64/cpu.rs` (vector 34), `cost.rs`,
 `cell.rs` (samples on `Trap::Sample` and timer ticks), `tests.rs`, the
 `sampling` feature; `xtask` (`profile`, `cpython::interpreter`);
 `bench/README.md`. Depends on `add-cost-accounting`.

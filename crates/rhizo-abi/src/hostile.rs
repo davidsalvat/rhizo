@@ -89,6 +89,7 @@ struct Machine<F> {
     services: Quiet,
     fs: rhizo_fs::Fs,
     net: rhizo_net::Net,
+    pages: PageCache,
     /// Every kernel frame: its tables, data, code and both ends of its
     /// 2 MiB page.
     kernel: Vec<u64>,
@@ -187,6 +188,7 @@ impl<F: EntryFormat> Machine<F> {
             },
             fs,
             net: rhizo_net::Net::new(),
+            pages: PageCache::new(16),
             kernel: kernel_frames,
             format: core::marker::PhantomData,
         }
@@ -227,6 +229,7 @@ impl<F: EntryFormat> Machine<F> {
             net: &mut self.net,
             deadline: None,
             pager: &mut NoPager,
+            pages: &mut self.pages,
         };
         let outcome = self.abi.handle(&mut self.cell, &mut cx);
         // A call waiting on descriptors runs again as the next one.
@@ -244,6 +247,7 @@ impl<F: EntryFormat> Machine<F> {
     fn end(mut self) {
         let pt = PageTable::<F>::from_root(self.cell.root);
         space::destroy(pt, &mut self.mem, &mut self.frames);
+        self.pages.clear(&mut self.frames);
         assert_eq!(
             self.frames.outstanding(),
             0,

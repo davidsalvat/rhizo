@@ -51,7 +51,7 @@ QEMU emulates no x86 PMU, and a hypervisor may give the guest none. Then
 the periodic tick runs every 100 µs while sampling (`irq::set_tick_ns`) and
 each tick taken from cell code is a sample; the host preempts a cell after
 101 ticks instead of 2, so a slice still lasts 10 ms. Without `sampling`,
-`prof::ticks_per_slice` is the constant 2 and the code is the same as
+`cost::ticks_per_slice` is the constant 2 and the code is the same as
 before.
 
 ## D4. Buffers and folding

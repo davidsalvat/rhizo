@@ -1,329 +1,249 @@
-//! Cost accounting (spec `profiling`): while it is on, each CPU charges the
-//! counter ticks between two hooks to the part of the kernel it was in
-//! (`rhizo_prof::Account`), and system calls to their number. Accounting can
-//! be on for some parts only: the other parts' hooks then do nothing, so they
-//! cost the parts measured nothing.
-//!
-//! The hooks exist only in `profile` builds; elsewhere they are empty and
-//! compile to nothing, so accounting costs the kernel nothing when it is
-//! not built in (design D1 of `add-cost-accounting`).
-//!
-//! Accounts are behind plain spinlocks, not `Global`: `Global` itself calls
-//! the lock-wait hook, and only the CPU that owns an account takes its lock
-//! while accounting runs.
+//! Counters and latency histograms for the reference workloads (design D4
+//! of `add-reference-workloads`): when a cell becomes runnable and when it
+//! runs, how long system calls take, how often the CPUs wake from idle, and
+//! a few counts that say where the time goes. Off (one relaxed load per
+//! system call) unless a workload turns them on. Simple counters, meant to
+//! give way to the permanent per-workload breakdown of F.1.
 
-#[cfg(feature = "profile")]
-pub use on::*;
+use crate::arch::timer::Counter;
+use crate::sync::Global;
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use rhizo_core::smp::MAX_CPUS;
+use rhizo_core::stats::Histogram;
+use rhizo_hal::CycleCounter;
 
-#[cfg(not(feature = "profile"))]
-pub use off::*;
+static ON: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "profile"))]
-mod off {
-    use rhizo_prof::Part;
+/// Runnable to running, and event to running (nanoseconds).
+static LATENCY: Global<Option<Box<[Histogram; 2]>>> = Global::new(None);
+/// Time in the system-call handler, per CPU (counter cycles).
+static SYSCALLS: [Global<Option<Box<Histogram>>>; MAX_CPUS] =
+    [const { Global::new(None) }; MAX_CPUS];
 
-    /// An open part (nothing without `profile`).
-    #[derive(Debug)]
-    pub struct Scope;
-
-    /// Enters `part` (nothing without `profile`).
-    #[inline(always)]
-    pub fn scope(_: Part) -> Scope {
-        Scope
-    }
-
-    /// A system call being handled (nothing without `profile`).
-    #[derive(Debug)]
-    pub struct Call;
-
-    /// Enters a system call's part (nothing without `profile`).
-    #[inline(always)]
-    pub fn syscall(_: &rhizo_cell::Cell) -> Call {
-        Call
-    }
-
-    /// Records a sample (nothing without `profile`).
-    #[inline(always)]
-    pub fn sample(_: u32, _: u64) {}
-
-    /// Whether timer interrupts are samples (never without `profile`).
-    #[inline(always)]
-    pub fn timer_sampling() -> bool {
-        false
-    }
-
-    /// Timer interrupts in a time slice, the first one included.
-    #[inline(always)]
-    pub fn ticks_per_slice() -> u32 {
-        2
-    }
-
-    /// After a CPU idled (nothing without `profile`).
-    #[inline(always)]
-    pub fn after_idle() {}
+/// Counts kept always (a relaxed add each, off any hot path) or while on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Count {
+    /// A CPU came back from waiting for an interrupt (always counted).
+    IdleWakeups,
+    /// Cycles CPUs spent waiting for an interrupt (always counted).
+    IdleCycles,
+    /// Interrupts taken while cell code ran (preemption ticks, wake-ups).
+    Interrupts,
+    /// Cells made runnable because a socket changed (all waiters wake).
+    IoWoken,
+    /// Socket changes made by system calls.
+    NetChanges,
+    /// Writes to copy-on-write pages resolved.
+    CowFaults,
+    /// Pages restored from a snapshot on first touch.
+    LazyFaults,
+    /// Cycles spent in scheduling decisions (taking and giving back cells).
+    SchedCycles,
+    /// Cells made with no address-space tag left: every switch to them
+    /// flushes the TLB.
+    Untagged,
 }
 
-#[cfg(feature = "profile")]
-mod on {
-    use crate::arch::timer::Counter;
-    use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
-    use rhizo_core::smp::MAX_CPUS;
-    use rhizo_core::sync::SpinLock;
-    use rhizo_hal::CycleCounter;
-    use rhizo_prof::samples::{Sample, Samples};
-    use rhizo_prof::{Account, Calls, Part};
+const COUNTS: usize = 9;
+static COUNTERS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
+/// When a system call last changed a socket (nanoseconds since boot).
+static NET_CHANGED_AT: AtomicU64 = AtomicU64::new(0);
 
-    /// The parts accounted (bit `n` for part `n`).
-    static ON: AtomicU16 = AtomicU16::new(0);
+/// Whether counting is on.
+#[inline]
+pub fn on() -> bool {
+    ON.load(Ordering::Relaxed)
+}
 
-    /// Every part.
-    pub const ALL: u16 = (1 << rhizo_prof::PARTS) - 1;
-
-    static ACCOUNTS: [SpinLock<Account>; MAX_CPUS] =
-        [const { SpinLock::new(Account::new()) }; MAX_CPUS];
-    static CALLS: [SpinLock<Calls>; MAX_CPUS] = [const { SpinLock::new(Calls::new()) }; MAX_CPUS];
-
-    fn cpu() -> usize {
-        crate::arch::cpu::index()
+/// Clears every histogram and count, then counts until [`stop`].
+pub fn start() {
+    LATENCY.with(|l| match l {
+        Some(h) => h.iter_mut().for_each(Histogram::clear),
+        None => *l = Some(Box::new([Histogram::new(), Histogram::new()])),
+    });
+    for slot in &SYSCALLS {
+        slot.with(|s| match s {
+            Some(h) => h.clear(),
+            None => *s = Some(Box::new(Histogram::new())),
+        });
     }
+    COUNTERS.iter().for_each(|c| c.store(0, Ordering::Relaxed));
+    NET_CHANGED_AT.store(0, Ordering::Relaxed);
+    ON.store(true, Ordering::Release);
+}
 
-    fn now() -> u64 {
-        Counter.cycles()
-    }
-
-    /// Whether `part` is accounted.
-    #[inline]
-    fn on(part: Part) -> bool {
-        ON.load(Ordering::Relaxed) & (1 << part as u16) != 0
-    }
-
-    /// An open part, closed when dropped.
-    #[must_use]
-    #[derive(Debug)]
-    pub struct Scope(bool);
-
-    /// Enters `part` on this CPU until the returned scope is dropped.
-    #[inline]
-    pub fn scope(part: Part) -> Scope {
-        if !on(part) {
-            return Scope(false);
-        }
-        let cpu = cpu();
-        ACCOUNTS[cpu].with(cpu, |a| a.enter(part, now()));
-        Scope(true)
-    }
-
-    /// Leaves the innermost part; returns how long it was open.
-    fn leave() -> u64 {
-        let cpu = cpu();
-        ACCOUNTS[cpu].with(cpu, |a| a.leave(now()))
-    }
-
-    impl Drop for Scope {
-        #[inline]
-        fn drop(&mut self) {
-            if self.0 {
-                leave();
+/// Stops counting; returns what was counted since [`start`].
+pub fn stop() -> Report {
+    ON.store(false, Ordering::Release);
+    let (sched, wake) = LATENCY.with(|l| {
+        l.as_deref()
+            .map_or_else(Default::default, |[s, w]| (s.clone(), w.clone()))
+    });
+    let mut syscalls = Histogram::new();
+    for slot in &SYSCALLS {
+        slot.with(|s| {
+            if let Some(h) = s {
+                syscalls.merge(h);
             }
+        });
+    }
+    Report {
+        sched,
+        wake,
+        syscall_cycles: syscalls,
+        counts: core::array::from_fn(|i| COUNTERS[i].load(Ordering::Relaxed)),
+    }
+}
+
+/// Adds `n` to a count (only while on, except the idle counts).
+#[inline]
+pub fn add(count: Count, n: u64) {
+    if on() || matches!(count, Count::IdleWakeups | Count::IdleCycles) {
+        COUNTERS[count as usize].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// The value of a count kept always.
+pub fn get(count: Count) -> u64 {
+    COUNTERS[count as usize].load(Ordering::Relaxed)
+}
+
+/// Runs `wait` (a wait for an interrupt) and counts the wake-up.
+pub fn idle(wait: impl FnOnce()) {
+    let t0 = Counter.cycles();
+    wait();
+    add(Count::IdleCycles, Counter.cycles().saturating_sub(t0));
+    add(Count::IdleWakeups, 1);
+}
+
+/// The start of a system call (cycles; 0 while off).
+#[inline]
+pub fn syscall_start() -> u64 {
+    if on() { Counter.cycles() } else { 0 }
+}
+
+/// The end of a system call started at `t0` on this CPU.
+#[inline]
+pub fn syscall_end(t0: u64) {
+    if t0 != 0 {
+        let t = Counter.cycles().saturating_sub(t0);
+        SYSCALLS[crate::arch::cpu::index()].with(|s| {
+            if let Some(h) = s {
+                h.record(t);
+            }
+        });
+    }
+}
+
+/// A system call changed a socket at `now` (nanoseconds).
+pub fn net_changed(now: u64) {
+    NET_CHANGED_AT.store(now, Ordering::Relaxed);
+    add(Count::NetChanges, 1);
+}
+
+/// When a cell's event happened (its deadline passed, a socket it waits
+/// on changed) and when it joined a run queue, in nanoseconds since boot
+/// (0: not known).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ready {
+    event: u64,
+    queued: u64,
+}
+
+impl Ready {
+    /// Runnable since `now` (preempted, yielding, new), with no event.
+    pub fn queued(now: u64) -> Self {
+        Self {
+            event: 0,
+            queued: now,
         }
     }
 
-    /// A system call being handled ([`syscall`]).
-    #[must_use]
-    #[derive(Debug)]
-    pub struct Call(Option<u64>);
-
-    /// Enters the part of the system call saved in `cell`'s registers
-    /// (socket calls are network time) until the returned value is dropped,
-    /// and records the call's time under its number.
-    #[inline]
-    pub fn syscall(cell: &rhizo_cell::Cell) -> Call {
-        if ON.load(Ordering::Relaxed) == 0 {
-            return Call(None);
+    /// Not runnable until an event at `at` (its deadline; 0: none).
+    pub fn event(at: u64) -> Self {
+        Self {
+            event: at,
+            queued: 0,
         }
-        let abi = crate::arch::user::ABI;
-        let nr = abi.call_number(cell);
-        let part = if abi.is_socket_call(nr) {
-            Part::Net
-        } else {
-            Part::Syscall
+    }
+
+    /// Its deadline passed: it joins a run queue at `now`.
+    pub fn due(self, now: u64) -> Self {
+        Self {
+            queued: now,
+            ..self
+        }
+    }
+
+    /// The last socket change woke it (or its deadline, if earlier): it
+    /// joins a run queue at `now`.
+    pub fn net_change(self, now: u64) -> Self {
+        add(Count::IoWoken, 1);
+        let changed = NET_CHANGED_AT.load(Ordering::Relaxed);
+        let event = match self.event {
+            0 => changed,
+            d if changed == 0 => d,
+            d => d.min(changed),
         };
-        if !on(part) {
-            return Call(None);
+        Self { event, queued: now }
+    }
+
+    /// The cell runs at `now`: records how long it waited for a CPU, and
+    /// since its event.
+    pub fn ran(self, now: u64) {
+        if !on() {
+            return;
         }
-        core::mem::forget(scope(part)); // left when the call is dropped
-        Call(Some(nr))
-    }
-
-    impl Drop for Call {
-        #[inline]
-        fn drop(&mut self) {
-            if let Some(nr) = self.0 {
-                let ticks = leave();
-                let cpu = cpu();
-                CALLS[cpu].with(cpu, |c| c.add(nr, ticks));
-            }
-        }
-    }
-
-    /// Clears every CPU's account and accounts `parts` (bit `n` for part
-    /// `n`; [`ALL`] for a breakdown).
-    pub fn start(parts: u16) {
-        let (me, t) = (cpu(), now());
-        for (account, calls) in ACCOUNTS.iter().zip(&CALLS).take(crate::smp::count()) {
-            account.with(me, |a| a.start(t));
-            calls.with(me, Calls::clear);
-        }
-        ON.store(parts, Ordering::Relaxed);
-    }
-
-    /// Turns accounting off and gives `f` the accounts and calls of every
-    /// CPU, merged.
-    pub fn stop<R>(f: impl FnOnce(&Account, &Calls) -> R) -> R {
-        ON.store(0, Ordering::Relaxed);
-        let (me, t) = (cpu(), now());
-        let mut total = Account::new();
-        for account in &ACCOUNTS[..crate::smp::count()] {
-            account.with(me, |a| {
-                a.charge(t);
-                total.merge(a);
-            });
-        }
-        CALLS[0].with(me, |first| {
-            for calls in &CALLS[1..crate::smp::count()] {
-                calls.with(me, |c| first.merge(c));
-            }
-            f(&total, first)
-        })
-    }
-
-    /// How samples are taken (spec `profiling`, sampling).
-    const OFF: u8 = 0;
-    const BY_PMU: u8 = 1;
-    const BY_TIMER: u8 = 2;
-    static SAMPLER: AtomicU8 = AtomicU8::new(OFF);
-    /// Cycles of cell code between two samples taken by the PMU.
-    #[cfg(feature = "sampling")]
-    pub const PMU_PERIOD: u64 = 100_000;
-    /// Nanoseconds between two samples taken by the timer.
-    #[cfg(feature = "sampling")]
-    pub const TIMER_PERIOD_NS: u64 = 100_000;
-    /// Timer interrupts in a time slice (the first may predate the slice).
-    static TICKS: AtomicU32 = AtomicU32::new(2);
-    static SAMPLES: [SpinLock<Option<Samples>>; MAX_CPUS] =
-        [const { SpinLock::new(None) }; MAX_CPUS];
-
-    /// Gives this CPU room for `capacity` samples and starts its PMU's
-    /// sampling; returns whether the PMU can (1) or not (0).
-    #[cfg(feature = "sampling")]
-    fn start_here(capacity: u64) -> u64 {
-        let cpu = cpu();
-        SAMPLES[cpu].with(cpu, |s| {
-            *s = Some(Samples::with_capacity(capacity as usize))
-        });
-        use crate::arch::pmu;
-        (pmu::init().is_some() && pmu::start_sampling(PMU_PERIOD)) as u64
-    }
-
-    #[cfg(feature = "sampling")]
-    fn stop_here(_: u64) -> u64 {
-        crate::arch::pmu::stop_sampling();
-        0
-    }
-
-    /// Starts sampling where cell code is, on every CPU, with room for
-    /// `capacity` samples on each: with the PMU's overflow interrupt where
-    /// the boot CPU has one, else with the timer, ticking every
-    /// [`TIMER_PERIOD_NS`] meanwhile. Returns how (`pmu` or `timer`) and the
-    /// period (cycles or ns). Call between runs (the other CPUs idle).
-    #[cfg(feature = "sampling")]
-    pub fn start_sampling(capacity: usize) -> (&'static str, u64) {
-        let cpus = crate::smp::count();
-        if start_here(capacity as u64) == 1 {
-            for other in 1..cpus {
-                crate::smp::post(other, start_here, capacity as u64);
-                crate::smp::join(other);
-            }
-            SAMPLER.store(BY_PMU, Ordering::Relaxed);
-            return ("pmu", PMU_PERIOD);
-        }
-        for other in 1..cpus {
-            // Room only: their ticks start with their next run.
-            crate::smp::post(other, start_here, capacity as u64);
-            crate::smp::join(other);
-            crate::smp::post(other, stop_here, 0);
-            crate::smp::join(other);
-        }
-        let ticks = (rhizo_sched::SLICE_NS / TIMER_PERIOD_NS) as u32 + 1;
-        TICKS.store(ticks, Ordering::Relaxed);
-        SAMPLER.store(BY_TIMER, Ordering::Relaxed);
-        crate::arch::irq::set_tick_ns(TIMER_PERIOD_NS);
-        ("timer", TIMER_PERIOD_NS)
-    }
-
-    /// Stops sampling and gives `f` the samples of every CPU.
-    #[cfg(feature = "sampling")]
-    pub fn stop_sampling<R>(f: impl FnOnce(&mut Samples) -> R) -> R {
-        let cpus = crate::smp::count();
-        match SAMPLER.swap(OFF, Ordering::Relaxed) {
-            BY_PMU => {
-                stop_here(0);
-                for other in 1..cpus {
-                    crate::smp::post(other, stop_here, 0);
-                    crate::smp::join(other);
+        LATENCY.with(|l| {
+            if let Some([sched, wake]) = l.as_deref_mut() {
+                if self.queued != 0 && self.queued <= now {
+                    sched.record(now - self.queued);
                 }
-            }
-            BY_TIMER => {
-                crate::arch::irq::set_tick_ns(rhizo_sched::SLICE_NS);
-                TICKS.store(2, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-        let me = cpu();
-        let mut all = Samples::with_capacity(
-            SAMPLES[..cpus]
-                .iter()
-                .map(|s| s.with(me, |s| s.as_ref().map_or(0, Samples::len)))
-                .sum(),
-        );
-        for s in &SAMPLES[..cpus] {
-            s.with(me, |s| {
-                if let Some(s) = s.take() {
-                    all.append(&s);
+                if self.event != 0 && self.event <= now {
+                    wake.record(now - self.event);
                 }
-            });
-        }
-        f(&mut all)
-    }
-
-    /// Records that cell `cell` was at `pc` when a sample was taken.
-    pub fn sample(cell: u32, pc: u64) {
-        let cpu = cpu();
-        SAMPLES[cpu].with(cpu, |s| {
-            if let Some(s) = s {
-                s.push(Sample { cell, pc });
             }
         });
     }
+}
 
-    /// Whether timer interrupts are samples.
-    #[inline]
-    pub fn timer_sampling() -> bool {
-        SAMPLER.load(Ordering::Relaxed) == BY_TIMER
+/// What was counted between [`start`] and [`stop`].
+#[derive(Debug, Default)]
+pub struct Report {
+    /// Joined a run queue to running, in nanoseconds.
+    pub sched: Histogram,
+    /// Event (deadline, socket change) to running, in nanoseconds.
+    pub wake: Histogram,
+    /// Time in the system-call handler, in counter cycles.
+    pub syscall_cycles: Histogram,
+    /// Every [`Count`], by its number.
+    pub counts: [u64; COUNTS],
+}
+
+impl Report {
+    /// A count.
+    pub fn count(&self, c: Count) -> u64 {
+        self.counts[c as usize]
     }
+}
 
-    /// Timer interrupts in a time slice, the first one included.
+/// Adds the cycles from its creation to its drop to a count, while on.
+pub struct Timed(Count, u64);
+
+impl Timed {
+    /// Starts timing for `count`.
     #[inline]
-    pub fn ticks_per_slice() -> u32 {
-        TICKS.load(Ordering::Relaxed)
+    pub fn new(count: Count) -> Self {
+        Self(count, if on() { Counter.cycles() } else { 0 })
     }
+}
 
-    /// After a CPU idled: an overflow taken while it waited (and lost) does
-    /// not stop the PMU's sampling.
+impl Drop for Timed {
     #[inline]
-    pub fn after_idle() {
-        if SAMPLER.load(Ordering::Relaxed) == BY_PMU {
-            crate::arch::pmu::rearm();
+    fn drop(&mut self) {
+        if self.1 != 0 {
+            add(self.0, Counter.cycles().saturating_sub(self.1));
         }
     }
 }

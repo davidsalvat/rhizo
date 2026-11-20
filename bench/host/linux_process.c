@@ -3,20 +3,23 @@
 // `linux-process`). Processes are not sandboxes: these numbers bound from
 // below what an isolation layer built on Linux processes can do.
 //
-//   linux_process <static executable>
+//   linux_process <static executable> [<dynamically linked executable>]
 //
 // prints `linux-process fork_us=<median> fork_call_us=<median>
-// fork_touch_us=<median> spawn_us=<median>`:
+// fork_touch_us=<median> spawn_us=<median> [dynamic_spawn_us=<median>]`:
 // - fork_us: a process with 50 MiB written forks; the child exits at once;
 //   the parent waits for it (fork + exit + wait).
 // - fork_call_us: the parent's fork() call alone (pairs with cell.fork_us).
 // - fork_touch_us: fork, the child writes every page, exits, the parent
 //   waits (pairs with cell.fork_touch_us).
 // - spawn_us: posix_spawn of the executable, run until it exits.
+// - dynamic_spawn_us: the same for the dynamically linked one, when given
+//   (pairs with workload.dynamic_run_us).
 //
 // Run as process 1 (the `/init` of a guest, design D1 of
-// `add-fair-comparisons`), it runs `/hello`, prints the same line on the
-// console and then pauses: the host reads the line and stops the VM.
+// `add-fair-comparisons`), it runs `/hello` (and `/usr/bin/hello`, if
+// there), prints the same line on the console and then pauses: the host
+// reads the line and stops the VM.
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +46,22 @@ static int by_value(const void *a, const void *b) {
 static double median(double *v) {
     qsort(v, RUNS, sizeof *v, by_value);
     return v[RUNS / 2];
+}
+
+// posix_spawn of `program`, run until it exits, RUNS times; 0 if every run
+// exited with 0.
+static int spawn_all(char *program, double *us) {
+    for (int i = 0; i < RUNS; i++) {
+        char *args[] = {program, NULL};
+        double t0 = now_us();
+        pid_t pid;
+        if (posix_spawn(&pid, program, NULL, NULL, args, environ) != 0) return -1;
+        int status;
+        waitpid(pid, &status, 0);
+        us[i] = now_us() - t0;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -87,17 +106,16 @@ int main(int argc, char **argv) {
         touch_us[i] = now_us() - t0;
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 4;
     }
-    for (int i = 0; i < RUNS; i++) {
-        char *args[] = {program, NULL};
-        double t0 = now_us();
-        pid_t pid;
-        if (posix_spawn(&pid, program, NULL, NULL, args, environ) != 0) return 5;
-        int status;
-        waitpid(pid, &status, 0);
-        spawn_us[i] = now_us() - t0;
-    }
-    printf("linux-process fork_us=%.3f fork_call_us=%.3f fork_touch_us=%.3f spawn_us=%.3f\n",
+    if (spawn_all(program, spawn_us) != 0) return 5;
+    printf("linux-process fork_us=%.3f fork_call_us=%.3f fork_touch_us=%.3f spawn_us=%.3f",
            median(fork_us), median(call_us), median(touch_us), median(spawn_us));
+    char *dynamic = init ? "/usr/bin/hello" : argc > 2 ? argv[2] : NULL;
+    if (dynamic && access(dynamic, X_OK) == 0) {
+        double dynamic_us[RUNS];
+        if (spawn_all(dynamic, dynamic_us) != 0) return 6;
+        printf(" dynamic_spawn_us=%.3f", median(dynamic_us));
+    }
+    printf("\n");
     fflush(stdout);
     // Process 1 must not exit (the kernel would panic): wait for the host.
     while (init) pause();

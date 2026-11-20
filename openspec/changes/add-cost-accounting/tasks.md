@@ -10,7 +10,7 @@
 ## 2. Kernel
 
 - [x] 2.1 `arch::pmu` on both architectures (D5); in-kernel test `performance_counters_count_where_present`; verify `cargo xtask test --only ktest` on both architectures
-- [x] 2.2 `prof` module, `profile` feature (in `ktest`), hooks (D1, D2); in-kernel test `cost_accounting_adds_up_over_a_cell`; verify `cargo xtask test --only ktest` on both architectures
+- [x] 2.2 `cost` module, `profile` feature (in `ktest`), hooks (D1, D2); in-kernel test `cost_accounting_adds_up_over_a_cell`; verify `cargo xtask test --only ktest` on both architectures
 - [x] 2.3 `bench-cell`: `cell.syscall_ns` (`yielder getpid`), PMU passes with `bench_clock` (D5); `profile` build: `cow_fault_ns`, breakdowns, `parallel` breakdown and lock waits; verify a run under `-icount` matches the kernel without hooks (D1)
 
 ## 3. xtask and documentation

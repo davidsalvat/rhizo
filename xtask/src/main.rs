@@ -10,12 +10,14 @@ mod compare;
 mod cpython;
 mod deps;
 mod differential;
+mod dynamic;
 mod hostnet;
 mod profile;
 mod refguest;
 mod report;
 mod tools;
 mod vmm;
+mod workloads;
 
 use report::Failure;
 use std::env;
@@ -67,6 +69,12 @@ Commands:
       --readme               Regenerate the README benchmark section
       --no-reference         Skip the reference Linux guest
       --no-icount            Skip the instruction counts under QEMU -icount
+      --workload <laptop|server>
+                             Only this reference workload (both run by
+                             default, after the cell figures)
+      --soak                 The long versions of the workloads (weekly)
+      --cells <n>            Cells of the server workload (default 10000)
+      --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
   profile [options]          Run the workloads (cell loop, fork_touch, CPython
                              cold) sampled and accounted; write folded stacks
                              per workload (cells' functions, kernel parts) and
@@ -262,6 +270,8 @@ impl RunArgs {
             network: false,
             pci_card: false,
             cpus: 1,
+            memory_mib: vmm::DEFAULT_MEMORY_MIB,
+            bench: None,
         }
     }
 }
@@ -833,6 +843,7 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     build_c_cells(&out)?;
     build_micropython(&out)?;
     cpython::build(&out)?;
+    dynamic::build(&out)?;
     Ok(out)
 }
 
