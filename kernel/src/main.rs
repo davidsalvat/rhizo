@@ -15,12 +15,16 @@ mod cell;
 mod heap;
 mod memory;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod prof;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod smp;
 mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod wire;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod workloads;
 
 use arch::console::BootConsole;
 use arch::power::Machine;

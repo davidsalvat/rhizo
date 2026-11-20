@@ -122,8 +122,10 @@ impl<T> Scheduler<T> {
 
     /// Moves the sleepers and waiters whose time has come to the end of
     /// `cpu`'s queue (sleepers in wake-time order, then waiters in the order
-    /// they started waiting).
-    fn wake(&mut self, cpu: usize, now: u64) {
+    /// they started waiting), after `f` has seen each: what
+    /// [`next`](Self::next) does first, for a caller that wants to know
+    /// when an entry became runnable.
+    pub fn wake_due(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
         let due = self.sleeping.partition_point(|&(t, _)| t <= now);
         let Self {
             queues,
@@ -131,7 +133,8 @@ impl<T> Scheduler<T> {
             sleeping,
             waiting,
         } = self;
-        for (_, entry) in sleeping.drain(..due) {
+        for (_, mut entry) in sleeping.drain(..due) {
+            f(&mut entry);
             queues[cpu].push_back((*arrivals, entry));
             *arrivals += 1;
         }
@@ -140,7 +143,8 @@ impl<T> Scheduler<T> {
                 .into_iter()
                 .partition(|&(d, _)| d.is_some_and(|d| d <= now));
             *waiting = rest;
-            for (_, entry) in due {
+            for (_, mut entry) in due {
+                f(&mut entry);
                 queues[cpu].push_back((*arrivals, entry));
                 *arrivals += 1;
             }
@@ -161,7 +165,7 @@ impl<T> Scheduler<T> {
     /// returns the next entry for `cpu` to run: the first of its queue, or
     /// else the one that has waited longest in another CPU's queue.
     pub fn next(&mut self, cpu: usize, now: u64) -> Option<T> {
-        self.wake(cpu, now);
+        self.wake_due(cpu, now, |_| {});
         let from = if self.queues[cpu].is_empty() {
             self.oldest(Some(cpu))?
         } else {
@@ -173,7 +177,7 @@ impl<T> Scheduler<T> {
     /// Wakes the sleepers whose time has come (onto CPU 0's queue) and
     /// returns the entry that has waited longest in any queue.
     pub fn next_oldest(&mut self, now: u64) -> Option<T> {
-        self.wake(0, now);
+        self.wake_due(0, now, |_| {});
         let from = self.oldest(None)?;
         self.queues[from].pop_front().map(|(_, e)| e)
     }
@@ -592,6 +596,22 @@ mod tests {
         *s.find_mut(|&e| e == 1).unwrap() = 2;
         assert_eq!(s.remove_with_wake(|&e| e == 2), Some((2, None)));
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn due_entries_are_shown_as_they_become_runnable() {
+        let mut s = Scheduler::new(2);
+        s.sleep(1, 50);
+        s.sleep(2, 70);
+        s.wait(3, Some(60));
+        s.wait(4, None);
+        let mut seen = Vec::new();
+        s.wake_due(1, 65, |&mut e| seen.push(e));
+        assert_eq!(seen, [1, 3], "the sleeper, then the waiter, both due");
+        assert_eq!((s.runnable(), s.waiting()), (2, 1));
+        assert_eq!(s.next(1, 65), Some(1), "on the waking CPU's queue");
+        assert_eq!(s.next(1, 65), Some(3));
+        assert_eq!(s.next(1, 65), None);
     }
 
     #[test]

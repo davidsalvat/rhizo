@@ -1,7 +1,27 @@
 use std::path::Path;
 
-/// Cells built only when their source is given.
-const OPTIONAL: [&str; 3] = ["micropython", "cpython", "cpython-files"];
+/// Cells built only when their source is given, or by `xtask` only.
+const OPTIONAL: [&str; 5] = [
+    "micropython",
+    "cpython",
+    "cpython-files",
+    "dynamic-files",
+    "distro-files",
+];
+/// Cells embedded in test kernels only (`ktest`): elsewhere they read as
+/// not built, and take no memory from the cells a benchmark runs (its guest
+/// has 128 MiB, and the 50 MiB fork benchmark needs most of it). The C
+/// cells here are those no benchmark runs.
+const TEST_ONLY: [&str; 8] = [
+    "distro-files",
+    "libc_alloc",
+    "libc_deep_stack",
+    "libc_files",
+    "libc_float",
+    "libc_hello",
+    "libc_net",
+    "libc_threads",
+];
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
@@ -42,7 +62,8 @@ fn embed_cells() {
     }
     // MicroPython and CPython (its executable and its files), built by
     // `xtask` only when their source is given (`RHIZO_MICROPYTHON_SRC`,
-    // `RHIZO_CPYTHON_SRC`); an empty image means "not built".
+    // `RHIZO_CPYTHON_SRC`), and the files of the dynamically linked
+    // programs; an empty image means "not built".
     names.extend(OPTIONAL.iter().map(|n| n.to_string()));
     names.sort();
 
@@ -55,7 +76,9 @@ fn embed_cells() {
          pub fn test_image(name: &str) -> &'static [u8] {\n    match name {\n",
     );
     for name in &names {
+        let ktest = std::env::var_os("CARGO_FEATURE_KTEST").is_some();
         let data = match &from {
+            Some(_) if TEST_ONLY.contains(&name.as_str()) && !ktest => Vec::new(),
             Some(dir) => {
                 let path = Path::new(dir).join(name);
                 println!("cargo:rerun-if-changed={}", path.display());

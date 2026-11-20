@@ -52,6 +52,32 @@ pub fn parse_process_line(text: &str) -> Option<[f64; 4]> {
     Some(out)
 }
 
+/// A `linux-process` line: its [`PROCESS_FIELDS`] and, when it measured a
+/// dynamically linked program, `dynamic_spawn_us`.
+type ProcessSample = ([f64; 4], Option<f64>);
+
+fn parse_process_sample(text: &str) -> Option<ProcessSample> {
+    let fields = parse_process_line(text)?;
+    let line = &text[text.find("linux-process ")?..];
+    let dynamic = line
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("dynamic_spawn_us=")?.parse().ok());
+    Some((fields, dynamic))
+}
+
+/// The process metrics of `samples`, and `workload.dynamic_run_us` (the
+/// dynamically linked `hello` spawned until it exits, change
+/// `add-dynamic-linking`) when every sample measured it.
+fn sample_metrics(vmm: &str, samples: &[ProcessSample]) -> Vec<Metric> {
+    let fields: Vec<[f64; 4]> = samples.iter().map(|s| s.0).collect();
+    let mut metrics = process_metrics(vmm, &fields);
+    if let Some(mut dynamic) = samples.iter().map(|s| s.1).collect::<Option<Vec<f64>>>() {
+        let name = "workload.dynamic_run_us";
+        metrics.push(metric(name, "linux-process", vmm, "us", &mut dynamic));
+    }
+    metrics
+}
+
 /// One metric per [`PROCESS_FIELDS`] entry, from several result lines.
 fn process_metrics(vmm: &str, samples: &[[f64; 4]]) -> Vec<Metric> {
     PROCESS_FIELDS
@@ -99,13 +125,14 @@ pub fn linux_process(cells: &Path, scratch: &Path) -> Result<Vec<Metric>> {
     for _ in 0..3 {
         let out = Command::new(&binary)
             .arg(cells.join("hello"))
+            .arg(crate::dynamic::roots()[0].join("usr/bin/hello"))
             .stderr(Stdio::inherit())
             .output()
             .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
         let text = String::from_utf8_lossy(&out.stdout);
-        samples.push(parse_process_line(&text).ok_or("linux_process printed no result line")?);
+        samples.push(parse_process_sample(&text).ok_or("linux_process printed no result line")?);
     }
-    Ok(process_metrics("host", &samples))
+    Ok(sample_metrics("host", &samples))
 }
 
 /// The same Linux process baselines inside a Firecracker guest: the VM
@@ -117,15 +144,22 @@ pub fn linux_process_in_vm(cells: &Path, accel: Accel, scratch: &Path) -> Result
     }
     let program = scratch.join("linux_process_static");
     build_linux_process(crate::c_compiler(), &["-static"], &program)?;
-    let initramfs =
-        refguest::initramfs_with(&read(&program)?, &[("hello", &read(&cells.join("hello"))?)]);
-    let samples = boot_guest(&initramfs, scratch, "linux-process", parse_process_line)?;
+    // The dynamic `hello` with its interpreter and `libc`, at their paths.
+    let tree = &crate::dynamic::roots()[0];
+    let mut files = vec![("hello".to_string(), read(&cells.join("hello"))?)];
+    for path in crate::dynamic::files(tree)? {
+        let name = path.strip_prefix(tree).map_err(|e| e.to_string())?;
+        files.push((name.display().to_string(), read(&path)?));
+    }
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (n.as_str(), &d[..])).collect();
+    let initramfs = refguest::initramfs_with(&read(&program)?, &files);
+    let samples = boot_guest(&initramfs, scratch, "linux-process", parse_process_sample)?;
     report::text(&format!(
         "linux processes inside firecracker on {}: {} boots",
         arch::current().id(),
         samples.len()
     ));
-    Ok(process_metrics("firecracker", &samples))
+    Ok(sample_metrics("firecracker", &samples))
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {
@@ -954,6 +988,25 @@ mod tests {
         assert_eq!(
             parse_process_line("linux-process fork_us=1 spawn_us=4"),
             None
+        );
+        let dynamic = console.replace("spawn_us=4", "spawn_us=4 dynamic_spawn_us=9");
+        assert_eq!(
+            parse_process_sample(console),
+            Some(([1.5, 2.0, 3.25, 4.0], None))
+        );
+        assert_eq!(
+            parse_process_sample(&dynamic),
+            Some(([1.5, 2.0, 3.25, 4.0], Some(9.0)))
+        );
+        let both = [([1.0; 4], Some(9.0)), ([1.0; 4], Some(7.0))];
+        let m = sample_metrics("host", &both);
+        assert_eq!(
+            m.last().map(|m| (m.name.as_str(), m.runs)),
+            Some(("workload.dynamic_run_us", 2))
+        );
+        assert_eq!(
+            sample_metrics("host", &[both[0], ([1.0; 4], None)]).len(),
+            4
         );
         let m = process_metrics("firecracker", &[[1.0, 2.0, 3.0, 4.0], [3.0, 2.0, 3.0, 4.0]]);
         let names: Vec<_> = m.iter().map(|m| m.name.as_str()).collect();

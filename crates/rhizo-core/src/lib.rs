@@ -14,6 +14,7 @@ pub mod options;
 pub mod panic;
 pub mod random;
 pub mod smp;
+pub mod stats;
 pub mod sync;
 
 /// The kernel version, taken from the workspace version.
