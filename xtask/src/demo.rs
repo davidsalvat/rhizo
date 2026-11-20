@@ -112,6 +112,7 @@ pub fn cmd(args: &[String]) -> Result {
             llm: Box::leak(llm.into_boxed_str()),
             model: Box::leak(opts.model.into_boxed_str()),
         }),
+        shard: None,
     };
     let out = vmm::run(opts.vmm, &Guest::Rhizo(kernel), run)?;
     match out.output.lines().find(|l| l.starts_with("rhizo-demo ")) {
