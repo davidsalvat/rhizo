@@ -1,20 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 250" width="800" height="250" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Thesis targets and where they stand</title>
-<desc>Fork a 50 MB cell: target under 1 ms, measured 1.5–1.9 µs, met. Resume from memory: target under 100 µs, measured 1.2–1.3 µs with lazy restore, met (598 µs eager). Overhead per idle cell: target a few KB plus its own pages, measured 21 KB with 1,000 idle cells live, met.</desc>
+<desc>Fork a 50 MB cell: target under 1 ms, measured 1.0–1.4 µs, met. Resume from memory: target under 100 µs, measured 1.1–1.3 µs with lazy restore, met (589 µs eager). Overhead per idle cell: target a few KB plus its own pages, measured 21 KB with 1,000 idle cells live, met.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="249" rx="12" fill="#0d1117" stroke="#30363d"/>
 <rect x="24" y="24" width="240" height="202" rx="12" fill="#0f2a1f" stroke="#63d4a0" stroke-width="1.5"/>
 <text x="42" y="56" font-size="16" fill="#e6edf3" font-weight="700">Fork a ~50 MB cell</text>
 <text x="42" y="80" font-size="14" fill="#9ba7b3">target &lt; 1 ms</text>
-<text x="42" y="134" font-size="30" fill="#63d4a0" font-weight="700">1.5–1.9 µs</text>
+<text x="42" y="134" font-size="30" fill="#63d4a0" font-weight="700">1.0–1.4 µs</text>
 <text x="42" y="160" font-size="14" fill="#9ba7b3">copy-on-write</text>
 <rect x="42" y="180" width="74" height="28" rx="14" fill="#63d4a0" stroke="#63d4a0" stroke-width="0"/>
 <text x="79" y="199" font-size="14" fill="#0e2a20" font-weight="700" text-anchor="middle">✓ Met</text>
 <rect x="280" y="24" width="240" height="202" rx="12" fill="#0f2a1f" stroke="#63d4a0" stroke-width="1.5"/>
 <text x="298" y="56" font-size="16" fill="#e6edf3" font-weight="700">Resume from memory</text>
 <text x="298" y="80" font-size="14" fill="#9ba7b3">target &lt; 100 µs</text>
-<text x="298" y="134" font-size="30" fill="#63d4a0" font-weight="700">1.2–1.3 µs</text>
-<text x="298" y="160" font-size="14" fill="#9ba7b3">lazy; eager 598 µs</text>
+<text x="298" y="134" font-size="30" fill="#63d4a0" font-weight="700">1.1–1.3 µs</text>
+<text x="298" y="160" font-size="14" fill="#9ba7b3">lazy; eager 589 µs</text>
 <rect x="298" y="180" width="74" height="28" rx="14" fill="#63d4a0" stroke="#63d4a0" stroke-width="0"/>
 <text x="335" y="199" font-size="14" fill="#0e2a20" font-weight="700" text-anchor="middle">✓ Met</text>
 <rect x="536" y="24" width="240" height="202" rx="12" fill="#0f2a1f" stroke="#63d4a0" stroke-width="1.5"/>
