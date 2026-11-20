@@ -19,5 +19,5 @@
 
 ## 3. Tooling and documentation
 
-- [ ] 3.1 `xtask`: `RunOptions::cpus` for every VMM, `ktest-smp` step; CI runs it on Firecracker and Cloud Hypervisor; verify `cargo xtask check` and CI
-- [ ] 3.2 `AGENTS.md` (code map, memory layout, arch interface); `cargo xtask ci` on both architectures; CI green
+- [x] 3.1 `xtask`: `RunOptions::cpus` for every VMM, `ktest-smp` step; CI runs it on Firecracker and Cloud Hypervisor; verify `cargo xtask check` and CI
+- [x] 3.2 `AGENTS.md` (code map, memory layout, arch interface); `cargo xtask ci` on both architectures; CI green
