@@ -78,18 +78,18 @@ pub fn check(dir: &Path) -> Result {
 /// natively from the top of their tree with an empty environment, as in a
 /// cell: each prints what `cells/expected.rs` says and exits with 0.
 fn check_dynamic() -> Result {
-    let root = crate::dynamic::root();
+    let roots = crate::dynamic::roots();
     for &(path, argv, stdout) in DYNAMIC {
-        let program = root.join(path);
-        if !program.exists() {
+        let Some(root) = roots.iter().find(|r| r.join(path).exists()) else {
             crate::report::text(&format!("[xtask] {path} not packed: skipped"));
             continue;
-        }
+        };
+        let program = root.join(path);
         let out = Command::new(&program)
             .arg0(argv[0])
             .args(&argv[1..])
             .env_clear()
-            .current_dir(&root)
+            .current_dir(root)
             .output()
             .map_err(|e| format!("cannot run {}: {e}", program.display()))?;
         let text = String::from_utf8_lossy(&out.stdout);

@@ -1600,16 +1600,18 @@ fn spawn_dynamic(host: &mut Host, files: &rhizo_fs::Fs, path: &str, argv: &[&str
 /// the differential check) and exits with 0. Their file pages are kept for
 /// later cells, and once dropped every frame and heap allocation is back.
 fn dynamically_linked_programs_behave_as_on_linux() {
-    let files = crate::cell::dynamic_files().expect("xtask packs the dynamic programs");
+    let packed = [crate::cell::dynamic_files(), crate::cell::distro_files()];
+    assert!(packed[0].is_some(), "xtask packs the dynamic hello");
     let before = memory_balance();
     for &(path, argv, stdout) in expected::DYNAMIC {
-        if files.file_at(path.as_bytes()).is_err() {
+        let held = |f: &&rhizo_fs::Fs| f.file_at(path.as_bytes()).is_ok();
+        let Some(files) = packed.iter().flatten().find(held) else {
             let note = alloc::format!("({path} not packed: not run) ");
             arch::console::BootConsole.write_bytes(note.as_bytes());
             continue;
-        }
+        };
         let mut host = Host::new();
-        let id = spawn_dynamic(&mut host, &files, path, argv);
+        let id = spawn_dynamic(&mut host, files, path, argv);
         host.run(|_| false);
         assert_eq!(ended(&host, id), (Ending::Exit(0), stdout.into()), "{path}");
     }
@@ -1622,7 +1624,7 @@ fn dynamically_linked_programs_behave_as_on_linux() {
 /// snapshot's bytes, forked, and frozen as a template, every copy finishes
 /// the program.
 fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
-    let files = crate::cell::dynamic_files().expect("xtask packs the dynamic programs");
+    let files = crate::cell::dynamic_files().expect("xtask packs the dynamic hello");
     let &(path, argv, stdout) = expected::DYNAMIC
         .iter()
         .find(|p| p.1 == ["hello", "wait"])

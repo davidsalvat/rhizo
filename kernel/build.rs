@@ -1,7 +1,16 @@
 use std::path::Path;
 
 /// Cells built only when their source is given, or by `xtask` only.
-const OPTIONAL: [&str; 4] = ["micropython", "cpython", "cpython-files", "dynamic-files"];
+const OPTIONAL: [&str; 5] = [
+    "micropython",
+    "cpython",
+    "cpython-files",
+    "dynamic-files",
+    "distro-files",
+];
+/// Cells embedded in test kernels only (`ktest`): elsewhere they read as
+/// not built, and take no memory from the cells a benchmark runs.
+const TEST_ONLY: [&str; 1] = ["distro-files"];
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
@@ -56,7 +65,9 @@ fn embed_cells() {
          pub fn test_image(name: &str) -> &'static [u8] {\n    match name {\n",
     );
     for name in &names {
+        let ktest = std::env::var_os("CARGO_FEATURE_KTEST").is_some();
         let data = match &from {
+            Some(_) if TEST_ONLY.contains(&name.as_str()) && !ktest => Vec::new(),
             Some(dir) => {
                 let path = Path::new(dir).join(name);
                 println!("cargo:rerun-if-changed={}", path.display());

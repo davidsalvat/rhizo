@@ -2682,8 +2682,8 @@ pub fn cpython_files() -> Option<Fs> {
     }))
 }
 
-/// The files of the dynamically linked programs (`dynamic-files`, packed by
-/// `xtask`: their interpreter, libraries and data; change
+/// The files of the dynamically linked `hello` (`dynamic-files`, packed by
+/// `xtask` with its interpreter and libraries; change
 /// `add-dynamic-linking`), decoded once and then shared copy-on-write by
 /// every cell given them; `None` when they were not packed.
 #[cfg_attr(
@@ -2692,11 +2692,34 @@ pub fn cpython_files() -> Option<Fs> {
 )]
 pub fn dynamic_files() -> Option<Fs> {
     static FILES: Global<Option<Fs>> = Global::new(None);
-    let bytes = test_image("dynamic-files");
+    decoded(&FILES, "dynamic-files")
+}
+
+/// The files of the distribution's programs (`distro-files`: `ls`, `sort`,
+/// `python3`, their interpreter, libraries and data), as
+/// [`dynamic_files`]; packed natively only, and embedded in test kernels
+/// only.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn distro_files() -> Option<Fs> {
+    static FILES: Global<Option<Fs>> = Global::new(None);
+    decoded(&FILES, "distro-files")
+}
+
+/// The file system packed as test image `name`, decoded into `slot` the
+/// first time; `None` when it was not packed.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+fn decoded(slot: &Global<Option<Fs>>, name: &str) -> Option<Fs> {
+    let bytes = test_image(name);
     if bytes.is_empty() {
         return None;
     }
-    Some(FILES.with(|files| {
+    Some(slot.with(|files| {
         files
             .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
             .clone()

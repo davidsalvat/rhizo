@@ -1,10 +1,13 @@
 //! Dynamically linked programs as cells (spec `workloads`, change
-//! `add-dynamic-linking`): the dynamic `hello` C cell
-//! (`cells/c/dynamic/hello.c`) and, where the cells' architecture is the
-//! host's, the distribution's own `ls`, `sort` and `python3`, packed with
-//! the interpreter (`ld.so`) and the shared libraries they need into one
-//! cell file system (`dynamic-files`), laid out as the distribution lays
-//! them out.
+//! `add-dynamic-linking`), each tree packed with the interpreter (`ld.so`)
+//! and the shared libraries its programs need into a cell file system, laid
+//! out as the distribution lays them out:
+//!
+//! - `dynamic-files`: the dynamic `hello` C cell (`cells/c/dynamic/hello.c`),
+//!   small, for every kernel that runs cells (tests and benchmarks);
+//! - `distro-files`: where the cells' architecture is the host's, the
+//!   distribution's own `ls`, `sort` and `python3`, embedded in test
+//!   kernels only (the benchmark kernel keeps its memory for cells).
 //!
 //! The interpreter, libraries and programs are the build host's (glibc:
 //! LGPL-2.1-or-later; coreutils: GPL-3.0-or-later; libselinux: public
@@ -33,12 +36,12 @@ const PROGRAMS: [(&str, &str); 3] = [
     ("/usr/bin/python3", "usr/bin/python3"),
 ];
 
-/// The tree the cell's files are made from, as a directory on the host.
-pub fn root() -> PathBuf {
-    crate::target_dir()
+/// The trees the cells' files are made from, as directories on the host.
+pub fn roots() -> [PathBuf; 2] {
+    let dir = crate::target_dir()
         .join("dynamic")
-        .join(crate::arch::current().id())
-        .join("root")
+        .join(crate::arch::current().id());
+    [dir.join("dynamic"), dir.join("distro")]
 }
 
 /// GNU triple of the cells' architecture (the distribution's library
@@ -47,34 +50,48 @@ fn triple() -> String {
     format!("{}-linux-gnu", crate::arch::current().id())
 }
 
-/// Builds the tree ([`root`]) and writes it, encoded as a cell file system,
-/// to `out/dynamic-files`.
+/// Builds the trees ([`roots`]) and writes them, encoded as cell file
+/// systems, to `out/dynamic-files` and (natively) `out/distro-files`.
 pub fn build(out: &Path) -> Result {
-    let root = root();
-    let _ = std::fs::remove_dir_all(&root);
-    let mkdir = |d: &Path| {
-        std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))
-    };
-    mkdir(&root.join("usr/bin"))?;
-    mkdir(&root.join("data"))?;
-    for (path, text) in DATA {
-        std::fs::write(root.join(path), text).map_err(|e| e.to_string())?;
-    }
-    compile_hello(&root.join("usr/bin/hello"))?;
+    let [hello, distro] = roots();
     let native = crate::differential::unavailable_reason().is_none();
-    if native {
-        for (host, cell) in PROGRAMS {
-            if Path::new(host).exists() {
-                copy(Path::new(host), &root.join(cell))?;
-            }
-        }
-        if root.join("usr/bin/python3").exists() {
-            pack_python(&root)?;
+    fresh(&hello, "usr/bin")?;
+    compile_hello(&hello.join("usr/bin/hello"))?;
+    pack(&hello, native, &out.join("dynamic-files"))?;
+    let files = out.join("distro-files");
+    if !native {
+        let _ = std::fs::remove_dir_all(&distro);
+        let _ = std::fs::remove_file(&files);
+        return Ok(());
+    }
+    fresh(&distro, "data")?;
+    for (path, text) in DATA {
+        std::fs::write(distro.join(path), text).map_err(|e| e.to_string())?;
+    }
+    for (host, cell) in PROGRAMS {
+        if Path::new(host).exists() {
+            copy(Path::new(host), &distro.join(cell))?;
         }
     }
-    add_libraries(&root, native)?;
+    if distro.join("usr/bin/python3").exists() {
+        pack_python(&distro)?;
+    }
+    pack(&distro, native, &files)
+}
+
+/// Empties the tree `root` and makes its directory `sub`.
+fn fresh(root: &Path, sub: &str) -> Result {
+    let _ = std::fs::remove_dir_all(root);
+    let dir = root.join(sub);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))
+}
+
+/// Adds the interpreter and libraries to the tree `root`, then writes it
+/// to `file` as a cell file system.
+fn pack(root: &Path, native: bool, file: &Path) -> Result {
+    add_libraries(root, native)?;
     let mut fs = rhizo_fs::Fs::new();
-    let mut tops: Vec<_> = std::fs::read_dir(&root)
+    let mut tops: Vec<_> = std::fs::read_dir(root)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
         .collect();
@@ -85,7 +102,7 @@ pub fn build(out: &Path) -> Result {
     }
     let mut bytes = Vec::new();
     fs.encode(&mut bytes);
-    crate::cpython::write_if_changed(&out.join("dynamic-files"), &bytes)
+    crate::cpython::write_if_changed(file, &bytes)
 }
 
 fn copy(from: &Path, to: &Path) -> Result {

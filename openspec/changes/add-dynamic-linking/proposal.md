@@ -33,8 +33,9 @@ refuses such executables, and its `mmap` knows neither files nor
 - **Test inputs**: `xtask` packs a dynamic `hello` (a C cell linked
   without `-static`) and, natively, the runner's own `ls`, `sort` and
   `python3` (with the standard-library modules it uses and its extension
-  modules), with `ld.so` and every library they need, into a cell file
-  system, as it does for CPython. They are the build host's binaries, run
+  modules), with `ld.so` and every library they need, into cell file
+  systems, as it does for CPython (the distribution's programs in test
+  kernels only). They are the build host's binaries, run
   unmodified as test inputs; nothing of them enters the repository.
 - **Tests**: host tests of the file-page loader, the page cache, file
   mappings, `MAP_FIXED`, `PROT_NONE` and `exec`; in-kernel tests that the
@@ -78,7 +79,9 @@ file's first bytes, mapping from file pages, `AT_BASE`; `map_program`,
 `fadvise64`), `kernel/src/cell.rs` (`Host::spawn_file`, the kept file
 pages), `kernel/src/tests.rs`, `cells/c/dynamic/hello.c`,
 `cells/python/{dynamic_demo,pack_stdlib}.py`, `cells/expected.rs`,
-`xtask/src/{dynamic,differential,bench}.rs`, `bench/README.md`. The
-`bench-cell` kernel embeds the packed files (17 MiB natively on x86_64), so
-it boots a larger image; no boot metric uses it. No existing metric changes
+`xtask/src/{dynamic,differential,bench}.rs`, `kernel/build.rs` (images
+embedded in test kernels only), `kernel/src/arch/aarch64/boot.rs` (the
+early tables map the whole image: test kernels now pass 32 MiB),
+`bench/README.md`. The `bench-cell` kernel embeds the dynamic `hello`
+with its interpreter and `libc` (about 2.5 MiB). No existing metric changes
 by design.

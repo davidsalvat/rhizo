@@ -85,21 +85,26 @@ itself).
 
 ## D5. Test inputs: the runner's own distribution
 
-`xtask/src/dynamic.rs` builds a tree and encodes it (`dynamic-files`,
-embedded like `cpython-files`):
+`xtask/src/dynamic.rs` builds two trees and encodes each as a cell file
+system, embedded like `cpython-files`:
 
-- `usr/bin/hello`: `cells/c/dynamic/hello.c` built with the cells' C
-  compiler without `-static`; it prints whether the auxiliary vector gave
-  it an interpreter base, and with `wait` pauses after `ready` (for
-  suspend, fork and templates).
-- Natively only (as the differential check, and as CPython): the host's
-  `/usr/bin/ls`, `/usr/bin/sort` and the interpreter `/usr/bin/python3`
-  names, with `cells/python/dynamic_demo.py` as `app/demo.py` and the
+- `dynamic-files`: `usr/bin/hello`, `cells/c/dynamic/hello.c` built with
+  the cells' C compiler without `-static`; it prints whether the auxiliary
+  vector gave it an interpreter base, and with `wait` pauses after
+  `ready` (for suspend, fork and templates). About 2.5 MiB with `ld.so`
+  and `libc`: every kernel that runs cells embeds it, the benchmark
+  kernel included.
+- `distro-files`, natively only (as the differential check, and as
+  CPython), embedded in test kernels only (`ktest`): 17 MiB embedded
+  and as much again decoded would leave the benchmark kernel's cells, in a
+  128 MiB guest, too little memory for the 50 MiB fork benchmark. It holds
+  the host's `/usr/bin/ls`, `/usr/bin/sort` and the interpreter
+  `/usr/bin/python3` names, with `cells/python/dynamic_demo.py` as `app/demo.py` and the
   standard-library modules it uses compiled by that interpreter
   (`pack_stdlib.py`, now also copying extension modules such as `_json`,
   which `python3` opens with `dlopen`, and always `os`, the landmark by
   which CPython finds its library), and `data/` for `ls` and `sort`.
-- For every ELF file in the tree, its interpreter at the path `PT_INTERP`
+- For every ELF file in a tree, its interpreter at the path `PT_INTERP`
   names and its `DT_NEEDED` libraries (and theirs) under `lib/<triple>`, a
   directory `ld.so` searches by default (no `/etc/ld.so.cache`: its absence
   makes `ld.so` search those directories), found with `readelf` in the

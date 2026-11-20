@@ -183,11 +183,12 @@ pub const CPYTHON_STDOUT: &str = "warm\n\
      cpython ok\n";
 
 /// Dynamically linked programs (change `add-dynamic-linking`) in the files
-/// `xtask` packs (`dynamic-files`): the executable's path in them, its
-/// `argv` and what it prints; each exits with 0. They run from the top of
-/// those files (`/` in a cell; on Linux, a directory laid out the same
-/// way). The dynamic `hello` is always packed; the distribution's `ls`,
-/// `sort` and `python3` only where the cells' architecture is the host's.
+/// `xtask` packs: the executable's path in them, its `argv` and what it
+/// prints; each exits with 0. They run from the top of those files (`/` in
+/// a cell; on Linux, a directory laid out the same way). The dynamic
+/// `hello` is always packed (`dynamic-files`); the distribution's `ls`,
+/// `sort` and `python3` only where the cells' architecture is the host's
+/// (`distro-files`).
 #[allow(dead_code)]
 pub const DYNAMIC: &[(&str, &[&str], &str)] = &[
     (
