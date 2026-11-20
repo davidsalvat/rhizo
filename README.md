@@ -77,7 +77,7 @@ The targets are hypotheses the proof of concept must validate. Where they stand:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/scorecard-dark.svg">
-    <img src="docs/img/scorecard.svg" alt="Fork a 50 MB cell: target under 1 ms, measured 1.4 to 1.5 µs, met. Resume from memory: target under 100 µs, measured 1.2 to 1.3 µs with lazy restore, met. Idle cell overhead: target a few KB, being measured in milestone H9." width="800">
+    <img src="docs/img/scorecard.svg" alt="Fork a 50 MB cell: target under 1 ms, measured 1.4 to 1.5 µs, met. Resume from memory: target under 100 µs, measured 1.2 to 1.3 µs with lazy restore, met. Idle cell overhead: target a few KB plus its own pages, measured 22 KB with 1,000 idle cells live, met." width="800">
   </picture>
 </p>
 
@@ -161,7 +161,7 @@ Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 boot and test harness, H1 memory, paging and heap, H1.5 fast boot and benchmarks, H1.6 AArch64 as primary, H2 first cell, H3 scheduler and isolation, H4 suspend and resume, H5 fork and templates, H6 real glibc programs, H7 comparisons, H8 files per cell. In progress: H9 memory accounting and density. Next: gVisor comparison, MicroPython workload, dedicated benchmark machine." width="800">
+    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 boot and test harness, H1 memory, paging and heap, H1.5 fast boot and benchmarks, H1.6 AArch64 as primary, H2 first cell, H3 scheduler and isolation, H4 suspend and resume, H5 fork and templates, H6 real glibc programs, H7 comparisons, H8 files per cell, H9 memory accounting and density. Next: gVisor comparison, MicroPython workload, dedicated benchmark machine." width="800">
   </picture>
 </p>
 

@@ -1,17 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 622" width="800" height="622" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Roadmap status</title>
-<desc>Milestones H0 to H8 are done. H9, memory accounting and density, is in progress. Next: a gVisor comparison, a MicroPython workload and a dedicated benchmark machine.</desc>
+<desc>Milestones H0 to H9 are done. Next: a gVisor comparison, a MicroPython workload and a dedicated benchmark machine.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="621" rx="12" fill="#0d1117" stroke="#30363d"/>
-<text x="24" y="40" font-size="20" fill="#e6edf3" font-weight="700">Proof of concept: 11 milestones done, 1 in progress</text>
+<text x="24" y="40" font-size="20" fill="#e6edf3" font-weight="700">Proof of concept: 12 milestones done</text>
 <circle cx="33" cy="66" r="9" fill="#63d4a0"/>
 <path d="M28.5 66l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="48" y="71" font-size="14" fill="#9ba7b3">Done</text>
-<circle cx="119" cy="66" r="9" fill="#2e2513" stroke="#e3b341" stroke-width="2"/>
-<path d="M119 59A7 7 0 0 1 119 73z" fill="#e3b341"/>
-<text x="134" y="71" font-size="14" fill="#9ba7b3">In progress</text>
-<circle cx="259" cy="66" r="8" fill="#0d1117" stroke="#768390" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="274" y="71" font-size="14" fill="#9ba7b3">Next</text>
+<circle cx="119" cy="66" r="8" fill="#0d1117" stroke="#768390" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="134" y="71" font-size="14" fill="#9ba7b3">Next</text>
 <line x1="52" y1="109.0" x2="52" y2="585.0" stroke="#30363d" stroke-width="2"/>
 <circle cx="52" cy="109.0" r="9" fill="#63d4a0"/>
 <path d="M47.5 109.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -68,11 +65,11 @@
 <text x="76" y="454.5" font-size="15" fill="#63d4a0" font-weight="700">H8</text>
 <text x="128" y="454.5" font-size="15" fill="#e6edf3">Files per cell</text>
 <text x="416" y="454.5" font-size="14" fill="#9ba7b3">carried by snapshots, forks and templates</text>
-<circle cx="52" cy="483.0" r="9" fill="#2e2513" stroke="#e3b341" stroke-width="2"/>
-<path d="M52 476.0A7 7 0 0 1 52 490.0z" fill="#e3b341"/>
-<text x="76" y="488.5" font-size="15" fill="#e3b341" font-weight="700">H9</text>
-<text x="128" y="488.5" font-size="15" fill="#e6edf3" font-weight="700">Memory accounting and density</text>
-<text x="416" y="488.5" font-size="14" fill="#9ba7b3">goal: 1,000 idle cells</text>
+<circle cx="52" cy="483.0" r="9" fill="#63d4a0"/>
+<path d="M47.5 483.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="76" y="488.5" font-size="15" fill="#63d4a0" font-weight="700">H9</text>
+<text x="128" y="488.5" font-size="15" fill="#e6edf3">Memory accounting, density</text>
+<text x="416" y="488.5" font-size="14" fill="#9ba7b3">1,000 idle cells, 22 KB each</text>
 <circle cx="52" cy="517.0" r="8" fill="#0d1117" stroke="#768390" stroke-width="2" stroke-dasharray="3 2.5"/>
 <text x="76" y="522.5" font-size="15" fill="#9ba7b3">gVisor comparison</text>
 <circle cx="52" cy="551.0" r="8" fill="#0d1117" stroke="#768390" stroke-width="2" stroke-dasharray="3 2.5"/>
