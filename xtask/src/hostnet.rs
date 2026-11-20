@@ -78,6 +78,17 @@ pub fn linux_guest_network() -> Result<(&'static str, String), String> {
     ))
 }
 
+/// The host's address as a guest on `vmm` sees it: QEMU's user network
+/// shows the host's loopback at 10.0.2.2, the tap devices give the host an
+/// address of its own.
+pub fn host_address(vmm: Vmm) -> &'static str {
+    match vmm {
+        Vmm::QemuMicrovm | Vmm::QemuVirt | Vmm::QemuQ35 => SLIRP_HOST,
+        Vmm::Firecracker => TAP_HOST,
+        Vmm::CloudHypervisor => CH_TAP_HOST,
+    }
+}
+
 /// The port of a TCP echo server listening on `addr` (started once).
 fn echo_server(addr: &str) -> Result<u16, String> {
     static SERVERS: OnceLock<Mutex<BTreeMap<String, Result<u16, String>>>> = OnceLock::new();

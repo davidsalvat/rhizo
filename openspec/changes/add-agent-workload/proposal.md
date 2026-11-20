@@ -40,6 +40,12 @@ costs on Rhizo against Linux.
 - **The same agent as a Linux process** in the same Firecracker VM: the
   guest's `/init` brings its network card up, and the agent forks its
   branches with `os.fork`.
+- **Any OpenAI-compatible model**: the agent takes the API's base URL and
+  model name as arguments, reads chunked answers and survives answers that
+  call no tool, so the fake model and Ollama or `llama-server` are
+  interchangeable.
+- **A live demo**, `cargo xtask demo agent --llm URL --model NAME [--vmm]`
+  (not run in CI), and `docs/demo.md`, linked from the README.
 - **Metrics** in `cargo xtask bench`: `workload.agent_cpython_turn_us`,
   `workload.agent_suspend_resume_us`, `workload.agent_fork_us` for Rhizo on
   every VMM with a network card, and `workload.agent_cpython_turn_us` and

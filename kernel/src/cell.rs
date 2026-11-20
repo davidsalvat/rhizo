@@ -2707,45 +2707,72 @@ pub struct AgentRun {
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 const AGENT_BRANCHES: u8 = 3;
 
-/// Runs the CPython agent for `turns` turns against the host's model
-/// server (`llm=` on the command line), suspending and resuming it in its
-/// pause after every turn (unless `mode` is `None`); then, where it prints
-/// `fork` and sleeps,
-/// freezes it as a template and starts one cell per branch from it, each
-/// told its branch in `/branch` (design D3 of `add-agent-workload`), and
-/// runs them to their end. `timed`: the agent also prints its turn times.
-/// An error says why the agent could not run or finish.
+/// How the agent reports ([`agent`]).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "each build uses its own: tests, benchmarks or the demo"
+)]
+pub enum AgentOutput {
+    /// Its transcript only.
+    Transcript,
+    /// Its transcript and its turn times.
+    Timed,
+    /// A readable account on the console as it goes, with the host's own
+    /// times (the live demo, design D7 of `add-agent-workload`).
+    Live,
+}
+
+/// Runs the CPython agent (model `model`) for `turns` turns against the
+/// host's model server (`llm=` on the command line), suspending and
+/// resuming it in its pause after every turn (unless `mode` is `None`);
+/// then, where it prints a line ending in `fork` and sleeps, freezes it as
+/// a template and starts one cell per branch from it, each told its branch
+/// in `/branch` (design D3 of `add-agent-workload`), and runs them to their
+/// end. An error says why the agent could not run or finish.
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub fn agent(
     host: &mut Host,
     turns: usize,
     mode: Option<Resume>,
-    timed: bool,
+    model: &[u8],
+    output: AgentOutput,
 ) -> Result<AgentRun, alloc::string::String> {
     use alloc::format;
+    use core::fmt::Write;
+    let live = output == AgentOutput::Live;
+    let say = |text: core::fmt::Arguments<'_>| {
+        if live {
+            let _ = writeln!(rhizo_hal::ConsoleWriter(&mut BootConsole), "[rhizo] {text}");
+        }
+    };
     let files = cpython_files().ok_or("CPython not built")?;
     let (ip, port) = crate::wire::options()
         .llm
         .ok_or("no network card and model server on this VMM")?;
     host.wire_address(10_000_000_000)
         .ok_or("the network card got no address")?;
-    let ip = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-    let (port, turns_arg) = (format!("{port}"), format!("{turns}"));
+    let url = format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+    let turns_arg = format!("{turns}");
     let mut argv: Vec<&[u8]> = alloc::vec![
         b"/usr/bin/python3",
         b"/app/agent_loop.py",
-        ip.as_bytes(),
-        port.as_bytes(),
+        url.as_bytes(),
+        model,
         b"cell",
         turns_arg.as_bytes(),
     ];
-    if timed {
-        argv.push(b"timed");
+    match output {
+        AgentOutput::Transcript => {}
+        AgentOutput::Timed => argv.push(b"timed"),
+        AgentOutput::Live => argv.push(b"live"),
     }
     let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
-    // Under emulation CPython is slow; a model that never answers must
-    // still end the run.
-    let end = now_ns().saturating_add(600_000_000_000);
+    // Under emulation CPython is slow, and a real model can be slower; a
+    // model that never answers must still end the run.
+    let limit_s = if live { 3600 } else { 600 };
+    let end = now_ns().saturating_add(limit_s * 1_000_000_000);
     let said = |host: &Host, id: u32| match host.finished(id) {
         Some(f) => format!(
             "it ended ({:?}) after: {}",
@@ -2754,10 +2781,13 @@ pub fn agent(
                 .trim()
                 .replace('\n', " | ")
         ),
-        None => "no progress in 600 s".into(),
+        None => format!("not done in {limit_s} s"),
     };
+    say(format_args!(
+        "cell: CPython with `agent_loop.py`, model `{url}`"
+    ));
     let mut id = host
-        .spawn_with_files(test_image("cpython"), &argv, files, true, false)
+        .spawn_with_files(test_image("cpython"), &argv, files, true, live)
         .map_err(|e| format!("cannot spawn CPython: {e:?}"))?;
     let mut run = AgentRun {
         transcript: Vec::new(),
@@ -2787,9 +2817,18 @@ pub fn agent(
         };
         let t0 = Counter.cycles();
         let snapshot = host.suspend(id).ok_or("cannot suspend the agent")?;
-        let resumed = host.resume(snapshot, mode, true, false);
-        run.suspend_resume_ns.push(ns(t0, Counter.cycles()));
+        let (t1, bytes) = (Counter.cycles(), snapshot.as_bytes().len());
+        let resumed = host.resume(snapshot, mode, true, live);
+        let t2 = Counter.cycles();
+        run.suspend_resume_ns.push(ns(t0, t2));
         let resumed = resumed.map_err(|_| "cannot resume the agent")?;
+        say(format_args!(
+            "suspended between turns in {} us ({} KiB snapshot, connection parked), \
+             resumed ({mode:?}) in {} us",
+            ns(t0, t1) / 1000,
+            bytes / 1024,
+            ns(t1, t2) / 1000
+        ));
         run.transcript
             .extend_from_slice(&host.finished(id).expect("suspended").output);
         id = resumed;
@@ -2805,7 +2844,7 @@ pub fn agent(
     let mut branches = Vec::new();
     for b in 0..AGENT_BRANCHES {
         let child = host
-            .spawn_from_template(id, true, false)
+            .spawn_from_template(id, true, live)
             .ok_or("cannot fork the agent")?;
         if !host.write_file(child, b"/branch", &[b'0' + b]) {
             return Err("cannot give a branch its number".into());
@@ -2826,10 +2865,17 @@ pub fn agent(
         host.step();
     }
     run.fork_ns = ns(t0, Counter.cycles());
+    say(format_args!(
+        "froze the agent at its decision point and forked {AGENT_BRANCHES} branches \
+         (copy-on-write, own connections): all running after {} us",
+        run.fork_ns / 1000
+    ));
     host.run(|h| branches.iter().all(|&c| h.finished(c).is_some()) || now_ns() > end);
     for &child in &branches {
         match host.finished(child) {
-            Some(f) if f.ending == Ending::Exit(0) => run.transcript.extend_from_slice(&f.output),
+            Some(f) if f.ending == Ending::Exit(0) => {
+                run.transcript.extend_from_slice(&f.output);
+            }
             _ => {
                 let why = said(host, child);
                 host.kill(child);
@@ -2854,12 +2900,18 @@ fn agent_figures() -> Result<[u64; 4], alloc::string::String> {
     let mut samples: [Vec<u64>; 4] = Default::default();
     for _ in 0..ROUNDS {
         let mut host = Host::new();
-        let suspended = agent(&mut host, TURNS, Some(Resume::Eager), true)?;
+        let suspended = agent(
+            &mut host,
+            TURNS,
+            Some(Resume::Eager),
+            b"fake",
+            AgentOutput::Timed,
+        )?;
         samples[2].extend(suspended.suspend_resume_ns);
         samples[3].push(suspended.fork_ns);
         drop(host);
         let mut host = Host::new();
-        let run = agent(&mut host, TURNS, None, true)?;
+        let run = agent(&mut host, TURNS, None, b"fake", AgentOutput::Timed)?;
         let text = alloc::string::String::from_utf8_lossy(&run.transcript);
         for (key, slot) in [("agent turn_ns=", 0), ("agent model_ns=", 1)] {
             let times = text

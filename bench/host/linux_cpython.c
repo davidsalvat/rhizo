@@ -133,10 +133,9 @@ static void agent(char *line, size_t size, char *out, size_t out_size) {
         snprintf(line, size, "agent=failed:no-network");
         return;
     }
-    char host[64];
-    snprintf(host, sizeof host, "%.*s", (int)(strchr(llm, ':') - llm), llm);
-    char *port = strchr(llm, ':') + 1;
-    char *const run[] = {"/usr/bin/python3", "/app/agent_loop.py", host, port,
+    char url[96];
+    snprintf(url, sizeof url, "http://%s", llm);
+    char *const run[] = {"/usr/bin/python3", "/app/agent_loop.py", url, "fake",
                          "linux", "8", "timed", NULL};
     double turns[AGENT_RUNS * 8], model[AGENT_RUNS * 8], forks[AGENT_RUNS];
     int n_turns = 0, n_model = 0, n_forks = 0;

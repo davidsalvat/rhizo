@@ -149,3 +149,34 @@ CPython is built natively on each CI runner, the AArch64 one included
 test runs on AArch64 QEMU `virt` (emulated: no KVM on GitHub's ARM
 runners), functionally only. The emulated run is slow, so the agent driver
 gives a run ten minutes before it fails it.
+
+## D7. The same agent against a real model: `cargo xtask demo agent`
+
+The agent speaks the OpenAI-compatible API that Ollama and llama.cpp's
+`llama-server` both serve: its first two arguments are the API's base URL
+and the model's name, so the fake model and a real one are interchangeable
+(CI passes `fake`). What a real model needs that the fake one does not:
+answers in chunks (`Transfer-Encoding: chunked`), tool arguments that are
+strings, missing or out of range (clamped), and answers that call no tool
+(small models do): that turn ends with the model's text, the agent asks
+again, and a branch whose last answer had no tool call explores its variant
+as a user message. The differential check runs the agent against a model
+that only ever answers text, in chunks.
+
+The demo is a benchmark kernel booted with `bench=agent-demo model=NAME
+llm=IP:PORT` (one more reference workload, so no new build), which runs
+`cell::agent` with three turns, a lazy resume after each, and the agent's
+`live` output: readable lines with each answer's model time and the rest of
+the turn's time, echoed to the console as the cell prints them, between the
+host's own lines for each suspend, resume and the fork. `xtask demo agent`
+maps a loopback `--llm` to the host's address as the guest sees it (10.0.2.2
+on QEMU's user network, the tap device's host address on Firecracker and
+Cloud Hypervisor) and waits up to 30 minutes without output, as a CPU-bound
+model under an emulated guest can be slow. It is not run in CI: it needs a
+model. `docs/demo.md` says how to run it with Ollama and `llama-server`.
+
+The demo drives the cell from the host in the kernel, like the benchmark:
+the agent asks for a fork by printing a line ending in `fork` and sleeping,
+and the host suspends it whenever it sleeps between turns. A control plane
+outside the kernel (a host API to suspend, fork and resume cells on
+request) is a product change, not this proof of concept's.

@@ -8,6 +8,7 @@ mod arch;
 mod bench;
 mod compare;
 mod cpython;
+mod demo;
 mod deps;
 mod differential;
 mod hostnet;
@@ -71,6 +72,11 @@ Commands:
       --cells <n>            Cells of the server workload (default 10000)
       --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
   ci                         Everything CI runs: fmt, clippy, test
+  demo agent --llm <url> --model <name> [--vmm <name>] [--accel <a>]
+                             The CPython agent in a cell against a real
+                             OpenAI-compatible model (Ollama, llama-server),
+                             shown live; needs RHIZO_CPYTHON_SRC
+                             (docs/demo.md)
   mutants                    Mutation testing of rhizo-mm and rhizo-core
                              (needs cargo-mutants; slow, runs weekly in CI)
   help                       Show this message
@@ -115,6 +121,7 @@ fn main() -> ExitCode {
         Some("test") => RunArgs::parse(rest).and_then(|a| cmd_test(&a)),
         Some("bench") => bench::Options::parse(rest).and_then(|o| bench::cmd(&o)),
         Some("ci") => cmd_ci(),
+        Some("demo") => demo::cmd(rest),
         Some("mutants") => cmd_mutants(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{HELP}");

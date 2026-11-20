@@ -33,3 +33,23 @@ to create or replace a file in a live cell's own files.
 #### Scenario: Branch number
 - **WHEN** the host writes `/branch` into a cell started from a template and the cell reads it
 - **THEN** the cell reads what the host wrote, and the template and the other cells started from it do not see it
+
+### Requirement: Any OpenAI-compatible model
+The agent SHALL take the model's base URL and name as arguments, speak
+`/v1/chat/completions` with tools, read answers sent whole or in chunks,
+and complete a turn whose answer calls no tool by asking again.
+
+#### Scenario: A model that does not call the tool
+- **WHEN** the agent runs as a Linux process against a model that answers every request with text, in chunks
+- **THEN** every turn and branch completes with that reply and the agent exits with 0
+
+### Requirement: Live demo with a real model
+`cargo xtask demo agent --llm URL --model NAME` SHALL boot the kernel with a
+network card on the chosen VMM, under KVM or emulation, and run the agent
+against that model for three turns with a suspend and resume between turns
+and a fork into three branches, printing each step as it happens with the
+model's time apart from the time spent in the cell and by the host.
+
+#### Scenario: Demo against a local model
+- **WHEN** a developer runs the demo against a model listening on the host's loopback, on QEMU
+- **THEN** the guest reaches it at 10.0.2.2, each turn and branch is printed with its model and Python times, each suspend, resume and the fork with the host's times, and the run ends with `rhizo-demo done`

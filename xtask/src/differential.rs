@@ -120,25 +120,8 @@ fn check_cpython(scratch: &Path) -> Result {
 /// with `fork`) against the host's fake model prints [`AGENT_TRANSCRIPT`],
 /// the transcript the cell must print (change `add-agent-workload`).
 fn check_agent(python: &Path, root: &Path, scratch: &Path) -> Result {
-    let port = crate::hostnet::llm_server("127.0.0.1", 0)?.to_string();
-    let _ = std::fs::remove_dir_all(scratch);
-    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
-    let script = root.join("app/agent_loop.py");
-    let turns = AGENT_TURNS.to_string();
-    let args = [
-        script.display().to_string(),
-        "127.0.0.1".into(),
-        port,
-        "linux".into(),
-        turns,
-    ];
-    let out = Command::new(python)
-        .args(&args)
-        .env_clear()
-        .current_dir(scratch)
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", python.display()))?;
-    let _ = std::fs::remove_dir_all(scratch);
+    let port = crate::hostnet::llm_server("127.0.0.1", 0)?;
+    let out = run_agent(python, root, scratch, port)?;
     let text = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() || text != AGENT_TRANSCRIPT || !out.stderr.is_empty() {
         return Err(Failure::new(
@@ -158,7 +141,102 @@ fn check_agent(python: &Path, root: &Path, scratch: &Path) -> Result {
         .reproduce("cargo xtask check (the model server runs inside xtask)")
         .into_error());
     }
+    // A real model may answer without calling the tool, in chunks.
+    let out = run_agent(python, root, scratch, chatty_model()?)?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let turns = text.lines().filter(|l| l.contains("turn")).count();
+    let replies = text
+        .lines()
+        .filter(|l| l.contains("reply chars=12"))
+        .count();
+    if !out.status.success() || turns != AGENT_TURNS + 3 || replies != turns {
+        return Err(Failure::new(
+            "differential",
+            "the CPython agent fails with a model that does not call its tool",
+        )
+        .location("cells/python/agent_loop.py")
+        .expected(format!(
+            "exit 0, {} turns each answered `reply chars=12`",
+            AGENT_TURNS + 3
+        ))
+        .actual(format!(
+            "{:?}, stdout {text:?}, stderr {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ))
+        .hint("the agent must take a text answer as a turn and ask again")
+        .reproduce("cargo xtask check")
+        .into_error());
+    }
     Ok(())
+}
+
+/// Runs the agent in `linux` mode for [`AGENT_TURNS`] turns against a
+/// model on 127.0.0.1:`port`, in an empty `scratch` directory.
+fn run_agent(
+    python: &Path,
+    root: &Path,
+    scratch: &Path,
+    port: u16,
+) -> Result<std::process::Output> {
+    let _ = std::fs::remove_dir_all(scratch);
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let out = Command::new(python)
+        .arg(root.join("app/agent_loop.py"))
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["fake", "linux", &AGENT_TURNS.to_string()])
+        .env_clear()
+        .current_dir(scratch)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", python.display()));
+    let _ = std::fs::remove_dir_all(scratch);
+    out
+}
+
+/// The port of a model on 127.0.0.1 that answers every request with text
+/// and no tool call, in two chunks (`Transfer-Encoding: chunked`), as a
+/// small real model may.
+fn chatty_model() -> Result<u16> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut length = 0;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                        line.clear();
+                    }
+                    let mut body = vec![0; length];
+                    if line.is_empty() || reader.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    let (a, b) = (
+                        r#"{"choices": [{"message": {"#,
+                        r#""content": "no tool, sir"}}]}"#,
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                         {:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n",
+                        a.len(),
+                        b.len()
+                    );
+                    if reader.get_mut().write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    Ok(port)
 }
 
 /// MicroPython, when built (`micropython` in `dir`): run natively in an
