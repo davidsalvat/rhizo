@@ -63,10 +63,12 @@ What makes the boundary hold:
   a cell cannot pick its privilege level or mask interrupts.
 - **Address spaces.** Each cell has its own page-table root for the lower
   half. On AArch64 the kernel lives in `TTBR1_EL1` and is never in a
-  cell's table; on x86_64 the cell's root shares the kernel's upper-half
-  entries, all without the user bit. Address-space tags (ASID / PCID) are
-  flushed when a tag changes hands. User pages are never executable by the
-  kernel on AArch64 (`PXN`).
+  cell's table, and `TCR_EL1.E0PD1` (where the CPU has FEAT_E0PD) makes
+  cell accesses to it fault in constant time; on x86_64 the cell's root
+  shares the kernel's upper-half entries, all without the user bit, or,
+  with KPTI (see *Speculation*), only the entry pages. Address-space tags
+  (ASID / PCID) are flushed when a tag changes hands. User pages are never
+  executable by the kernel on AArch64 (`PXN`).
 - **Copies.** The kernel never dereferences a cell address. Every copy
   translates the address in the cell's own table, requires the user bit
   (and writability for writes) on the effective permissions, and copies
@@ -97,6 +99,35 @@ What makes the boundary hold:
   pages and the stack (`zero_frame` before copying), page tables, private
   copies of shared pages (whole-page copy), resumed pages (whole-page
   copy), new file blocks (`[0; 4096]`).
+
+## Speculation (Meltdown)
+
+`add-kpti` closed the Meltdown part of O3.
+
+- **x86_64: KPTI.** On CPUs open to rogue data cache load (Intel CPUs
+  without `IA32_ARCH_CAPABILITIES.RDCL_NO`, unknown vendors; not AMD or
+  Hygon), the kernel half of a cell's tables maps only the entry pages:
+  the entry code (two page-aligned sections), per-CPU data, GDTs, TSSs,
+  IDT and trap and double-fault stacks, supervisor only. Nothing of the
+  direct map, heap, kernel data, code or page tables is mapped while a
+  cell runs. The entry code switches to the kernel's tables first thing
+  on every system call, exception or interrupt from a cell, and back last
+  thing before `SYSRETQ`/`IRETQ` (the frame for `IRETQ` is built on the
+  mapped trap stack). The kernel keeps PCID 0 and each cell its own, so
+  neither switch flushes the TLB; an untagged cell's CR3 always flushes
+  PCID 0. Kernel flushes of a cell's translations cannot reach its PCID,
+  so the cell flushes it on its next entry on every CPU. The test build
+  runs every in-kernel test with KPTI on.
+- **AArch64: E0PD.** Where the CPU has FEAT_E0PD, `TCR_EL1.E0PD1` is set:
+  what KPTI buys, for free. A CPU with neither E0PD nor `CSV3` (Cortex-A75)
+  is reported at start (`may be open to Meltdown`); there is no trampoline.
+- **Cost.** Every benchmark run measures `cell.syscall_ns` and, with KPTI
+  forced on, `cell.syscall_kpti_ns`, `cell.switch_kpti_ns` and
+  `cell.run_kpti_us` (`bench/README.md`), so the price is known even on
+  runners whose CPUs do not need it.
+- **Left open.** Spectre v1/v2, L1TF, MDS and their mitigations; the entry
+  pages themselves are readable by speculation (they hold per-CPU stack
+  pointers and the cell's own saved RDI, no other cell's data).
 
 ## System calls
 
@@ -302,7 +333,7 @@ These are not fixed by this change; each needs its own design.
 |---|---|---|
 | O1 | Medium | **No per-cell quota.** One cell may take all memory down to the kernel's reserve; others are then refused (`ENOMEM`, `ENOSPC`), and the kernel survives (spec `cells`). Host-set quotas need per-cell accounting of frames and heap. |
 | O2 | Medium | **Kernel time proportional to what a cell holds.** A call runs without preemption: reading or writing up to 64 MiB of file data, `getrandom` or `write` over gigabytes of the cell's own memory, or mapping and zeroing a large region delays every other cell for as long as it takes. Bounded by the cell's own memory, not by a time slice. |
-| O3 | High on affected CPUs | **Side channels are out of scope.** Caches, branch predictors, speculation and timing are not reviewed. On x86_64 the kernel half is mapped (supervisor only) in every cell's table, with no KPTI: on CPUs vulnerable to Meltdown a cell could read kernel memory. Cells see a nanosecond clock. |
+| O3 | Medium | **Side channels other than Meltdown are out of scope.** Meltdown is closed by `add-kpti` (KPTI on x86_64 where needed, E0PD on AArch64; see *Speculation*). Caches, branch predictors, other speculation attacks (Spectre, L1TF, MDS) and timing are not reviewed. An AArch64 CPU with neither E0PD nor CSV3 is reported, not protected. Cells see a nanosecond clock. |
 | O4 | Medium | **Randomness is not cryptographic.** `getrandom` and `AT_RANDOM` come from xorshift seeded by the cycle counter: predictable. Cells that need secrets must not rely on it. |
 | O5 | Low | **Hardening not enabled.** x86_64 does not turn on SMEP or SMAP, AArch64 not PAN. The kernel never touches cell addresses directly (copies go through the direct map), so they would only defend against kernel bugs. On x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
 | O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. |
@@ -319,6 +350,9 @@ These are not fixed by this change; each needs its own design.
   tables, data and code unchanged, console reports bounded, every frame
   back), `pointers_outside_the_cell_give_efault` (property, 27 calls taking
   a pointer), and one test per finding.
+- KPTI: `kpti_leaves_cells_only_the_entry_pages` (x86_64),
+  `e0pd_is_on_where_present` (AArch64), `cells_run_alike_with_and_without_kpti`;
+  every other in-kernel test runs with KPTI on.
 - Host, elsewhere: `ranges_outside_the_user_half_are_refused` (property,
   `rhizo-cell`), `the_kernel_half_is_out_of_reach` (`space`, both formats),
   `hostile_headers_never_panic` (ELF), `kernel_half_is_never_made_writable_or_private`

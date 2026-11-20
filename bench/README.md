@@ -57,6 +57,10 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.scaling_pct/rhizo/<vmm>` | timing | That batch's time on every CPU, times the number of CPUs, over its time stepping on one CPU, in percent: 100 is perfect scaling (lower is better) |
 | `cell.ipi_wake_us/rhizo/<vmm>` | timing | Handing work to an idle CPU: post it, wake the CPU with an inter-processor interrupt, see it done (robust figure over 105) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
+| `cell.syscall_ns/rhizo/<vmm>` | timing | Round trip of the cheapest system call (`getpid`), timed by the `syscalls` cell over 20000 calls, in the kernel's default mode (KPTI only on CPUs open to Meltdown); median of 5 |
+| `cell.syscall_kpti_ns/rhizo/<vmm>` | timing | The same with KPTI forced on (spec `isolation`): two CR3 switches per call |
+| `cell.switch_kpti_ns/rhizo/<vmm>` | timing | `cell.switch_ns` with KPTI forced on |
+| `cell.run_kpti_us/rhizo/<vmm>` | timing | `cell.run_us` with KPTI forced on |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded

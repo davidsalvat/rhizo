@@ -195,7 +195,14 @@ fn load_cr3(value: u64) {
 pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Trap {
     let cr3 = root | tag as u64;
     let cpu = index();
-    if USER_CR3[cpu].swap(cr3, Ordering::Relaxed) != cr3 || flush {
+    if KPTI.load(Ordering::Relaxed) {
+        // The entry code loads it last, and the kernel's tables first on
+        // the way back (design D2 of `add-kpti`). An untagged cell shares
+        // PCID 0 with the kernel: its CR3 always flushes it, so no kernel
+        // translation stays cached while it runs.
+        let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
+        super::cpu::PERCPU.0[cpu].set_user_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
+    } else if USER_CR3[cpu].swap(cr3, Ordering::Relaxed) != cr3 || flush {
         let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
         load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
     }
@@ -254,6 +261,9 @@ pub fn release_user(_root: u64, _tag: u16) {
 /// translations (another CPU may run it next, or free it; design D4 of
 /// `add-smp-scheduling`).
 pub fn leave_user() {
+    if KPTI.load(Ordering::Relaxed) {
+        return; // the kernel's tables are loaded already
+    }
     let pcid = PCID.load(Ordering::Relaxed);
     let kernel = crate::memory::kernel_tables().root();
     USER_CR3[index()].store(kernel, Ordering::Relaxed);
@@ -264,10 +274,126 @@ pub fn leave_user() {
 /// shrank, as after a fork); the next entry reloads its tables.
 pub fn flush_user(root: u64, tag: u16) {
     let pcid = PCID.load(Ordering::Relaxed);
-    if pcid && tag != 0 {
+    // With KPTI the cell's tables cannot be loaded in the kernel (they map
+    // no kernel code): the caller marks it stale everywhere
+    // ([`stale_everywhere`]) and its next entry flushes its PCID.
+    if pcid && tag != 0 && !KPTI.load(Ordering::Relaxed) {
         load_cr3(root | tag as u64); // without bit 63: flushes this PCID
     }
     release_user(root, tag);
+}
+
+/// Whether a TLB flush done in the kernel leaves every CPU, this one
+/// included, with stale translations of the cell: yes with KPTI, where the
+/// kernel runs on its own PCID and `INVLPG` cannot reach the cell's.
+pub fn stale_everywhere() -> bool {
+    KPTI.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// KPTI (design D1-D3 of `add-kpti`)
+// ---------------------------------------------------------------------------
+
+/// Whether cells' tables carry only the entry pages of the kernel half.
+static KPTI: AtomicBool = AtomicBool::new(false);
+/// The kernel half of cells' tables with KPTI ([`init_kpti`]).
+static ENTRY_ROOT: AtomicU64 = AtomicU64::new(0);
+const IA32_ARCH_CAPABILITIES: u32 = 0x10a;
+
+/// Whether this CPU needs KPTI against Meltdown (rogue data cache load):
+/// not on AMD or Hygon CPUs, which are not affected, nor on Intel CPUs
+/// that say so (`IA32_ARCH_CAPABILITIES.RDCL_NO`); yes otherwise, as Linux
+/// decides.
+pub fn kpti_needed() -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let vendor = __cpuid(0);
+    let name = [vendor.ebx, vendor.edx, vendor.ecx];
+    // "AuthenticAMD", "HygonGenuine"
+    if name == [0x6874_7541, 0x6974_6e65, 0x444d_4163]
+        || name == [0x6f67_7948, 0x6e65_476e, 0x656e_6975]
+    {
+        return false;
+    }
+    if vendor.eax >= 7 && __cpuid_count(7, 0).edx & (1 << 29) != 0 {
+        // SAFETY: CPUID.7.0:EDX[29] says the MSR exists.
+        let caps = unsafe { super::cpu::rdmsr(IA32_ARCH_CAPABILITIES) };
+        return caps & 1 == 0;
+    }
+    true
+}
+
+/// Whether KPTI is on.
+pub fn kpti() -> bool {
+    KPTI.load(Ordering::Relaxed)
+}
+
+/// Builds the kernel half cells' tables carry with KPTI: the entry code,
+/// per-CPU data, GDTs, TSSs, IDT and trap stacks of the `cpus` CPUs online,
+/// at their kernel addresses, supervisor only; nothing else of the kernel.
+/// Call once, after the other CPUs started.
+pub fn init_kpti(cpus: usize) {
+    use rhizo_mm::paging::{PageFlags, PageSize, PageTable};
+    let mut alloc = || crate::memory::with_frames(|f| f.alloc()).flatten();
+    let pt = PageTable::<super::platform::Format>::new(&mut crate::memory::DirectMap, &mut alloc)
+        .expect("a frame for the entry tables");
+    let mut ranges: alloc::vec::Vec<_> = super::cpu::entry_ranges().into();
+    for cpu in 1..cpus {
+        let stacks = crate::smp::stacks(cpu);
+        for top in [stacks.exception, stacks.double_fault] {
+            ranges.push((top - 16 * 1024, top, false));
+        }
+    }
+    for (start, end, code) in ranges {
+        let flags = if code {
+            PageFlags::empty()
+        } else {
+            PageFlags::WRITABLE | PageFlags::NO_EXECUTE
+        };
+        for virt in (start & !0xfff..end).step_by(4096) {
+            let phys = crate::memory::translate(virt)
+                .expect("entry page is mapped")
+                .phys;
+            pt.map(
+                &mut crate::memory::DirectMap,
+                &mut alloc,
+                virt,
+                phys & !0xfff,
+                PageSize::Small,
+                flags,
+            )
+            .expect("entry page mapped once");
+        }
+    }
+    ENTRY_ROOT.store(pt.root(), Ordering::Relaxed);
+}
+
+/// Turns KPTI on or off for the cells created from now on: none may be
+/// live. With it, every CPU's entry code loads the kernel's tables first.
+pub fn set_kpti(on: bool) {
+    leave_user();
+    KPTI.store(on, Ordering::Relaxed);
+    let root = crate::memory::kernel_tables().root();
+    let kernel = match (on, PCID.load(Ordering::Relaxed)) {
+        (false, _) => 0,
+        (true, true) => root | NO_FLUSH,
+        (true, false) => root,
+    };
+    for (percpu, user) in super::cpu::PERCPU.0.iter().zip(&USER_CR3) {
+        percpu.set_kernel_cr3(kernel);
+        percpu.set_user_cr3(0);
+        user.store(root, Ordering::Relaxed); // every CPU is on the kernel's
+    }
+}
+
+/// The kernel half a new cell's root carries: all of it, or with KPTI only
+/// the entry pages.
+pub fn cell_kernel_half() -> rhizo_mm::paging::PageTable<super::platform::Format> {
+    match ENTRY_ROOT.load(Ordering::Relaxed) {
+        root if KPTI.load(Ordering::Relaxed) && root != 0 => {
+            rhizo_mm::paging::PageTable::from_root(root)
+        }
+        _ => crate::memory::kernel_tables(),
+    }
 }
 
 /// Nothing to do on x86_64: instruction fetch sees data writes.

@@ -402,6 +402,8 @@ fn measure_cells(
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
+        let (mut syscall, mut syscall_kpti) = (Vec::new(), Vec::new());
+        let (mut switch_kpti, mut run_kpti) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -456,6 +458,12 @@ fn measure_cells(
                     if let Some((c, w)) = parse_threads_line(&out.output) {
                         thread_create.push(c as f64 / 1000.0);
                         futex_wake.push(w as f64);
+                    }
+                    if let Some(k) = parse_kpti_line(&out.output) {
+                        syscall.push(k[0] as f64);
+                        syscall_kpti.push(k[1] as f64);
+                        switch_kpti.push(k[2] as f64);
+                        run_kpti.push(k[3] as f64 / 1000.0);
                     }
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
@@ -529,6 +537,10 @@ fn measure_cells(
             ("workload.cpython_warm_us", "us", &mut cpy_warm),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
+            ("cell.syscall_ns", "ns", &mut syscall),
+            ("cell.syscall_kpti_ns", "ns", &mut syscall_kpti),
+            ("cell.switch_kpti_ns", "ns", &mut switch_kpti),
+            ("cell.run_kpti_us", "us", &mut run_kpti),
             ("cell.parallel_us", "us", &mut parallel),
             ("cell.scaling_pct", "%", &mut scaling),
             ("cell.ipi_wake_us", "us", &mut ipi_wake),
@@ -666,6 +678,24 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         parallel_ns: field("parallel_ns")?,
         ipi_wake_ns: field("ipi_wake_ns")?,
     })
+}
+
+/// `[syscall_ns, syscall_kpti_ns, switch_kpti_ns, run_kpti_ns]` of the KPTI
+/// line of a `bench-cell` kernel (design D5 of `add-kpti`).
+fn parse_kpti_line(output: &str) -> Option<[u64; 4]> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-kpti "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some([
+        field("syscall_ns")?,
+        field("syscall_kpti_ns")?,
+        field("switch_kpti_ns")?,
+        field("run_kpti_ns")?,
+    ])
 }
 
 /// `(create_ns, futex_wake_ns)` of the threads line of a `bench-cell`
@@ -1768,6 +1798,18 @@ mod tests {
             Some((310, 4200))
         );
         assert_eq!(parse_net_line("rhizo-net pipe_rtt_ns=1\n"), None);
+    }
+
+    #[test]
+    fn kpti_line_is_parsed() {
+        assert_eq!(
+            parse_kpti_line(
+                "x\nrhizo-kpti default=0 syscall_ns=90 syscall_kpti_ns=300 \
+                 switch_kpti_ns=700 run_kpti_ns=9000\n"
+            ),
+            Some([90, 300, 700, 9000])
+        );
+        assert_eq!(parse_kpti_line("rhizo-kpti syscall_ns=1\n"), None);
     }
 
     #[test]

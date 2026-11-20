@@ -19,6 +19,22 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
 /// Stack the CPU switches to (TSS `RSP0`) on an exception from a cell.
 const TRAP_STACK_SIZE: usize = 16 * 1024;
 
+/// Page alignment around the entry code in builds that run cells, where
+/// KPTI maps those pages for cells (design D2 of `add-kpti`); nothing in
+/// the boot-only build, whose image stays as small as it was.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+macro_rules! entry_page {
+    () => {
+        ".balign 4096"
+    };
+}
+#[cfg(not(any(feature = "ktest", feature = "bench-cell")))]
+macro_rules! entry_page {
+    () => {
+        ""
+    };
+}
+
 // ---------------------------------------------------------------------------
 // GDT and TSS
 // ---------------------------------------------------------------------------
@@ -35,7 +51,13 @@ struct TaskStateSegment {
     iomap_base: u16,
 }
 
-#[repr(C, align(16))]
+/// Page-aligned, whole pages: with KPTI the cells' tables map it (the CPU
+/// pushes there on an exception from a cell) and nothing else beside it.
+#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(C, align(4096)))]
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    repr(C, align(16))
+)]
 struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
 /// The boot CPU's stacks (the other CPUs' are mapped by `smp`).
@@ -63,20 +85,29 @@ struct Tables {
     tss: TaskStateSegment,
 }
 
-static TABLES: [Global<Tables>; MAX_CPUS] = [const {
-    Global::new(Tables {
-        gdt: [0; 7],
-        tss: TaskStateSegment {
-            reserved0: 0,
-            rsp: [0; 3],
-            reserved1: 0,
-            ist: [0; 7],
-            reserved2: 0,
-            reserved3: 0,
-            iomap_base: 0,
-        },
-    })
-}; MAX_CPUS];
+/// Every CPU's GDT and TSS, alone on their pages: with KPTI the cells'
+/// tables map them (the CPU reads them on an exception from a cell, and
+/// `IRETQ` reads the GDT).
+#[repr(C)]
+#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(align(4096)))]
+struct AllTables([Global<Tables>; MAX_CPUS]);
+
+static TABLES: AllTables = AllTables(
+    [const {
+        Global::new(Tables {
+            gdt: [0; 7],
+            tss: TaskStateSegment {
+                reserved0: 0,
+                rsp: [0; 3],
+                reserved1: 0,
+                ist: [0; 7],
+                reserved2: 0,
+                reserved3: 0,
+                iomap_base: 0,
+            },
+        })
+    }; MAX_CPUS],
+);
 
 /// What each CPU keeps for itself, at its kernel GS base (the boot entry
 /// code sets the boot CPU's; `smp` the others'). Cell code runs with its
@@ -95,19 +126,58 @@ pub struct PerCpu {
     user_rsp: AtomicU64,
     /// Error code of the last exception from a cell.
     trap_error: AtomicU64,
+    /// With KPTI, the CR3 the entry code loads first (the kernel's tables);
+    /// 0 without (design D2 of `add-kpti`).
+    kernel_cr3: AtomicU64,
+    /// With KPTI, the CR3 loaded last before returning to the cell (its own
+    /// tables); 0 without.
+    user_cr3: AtomicU64,
+    /// The cell's RDI while the return path needs a register for CR3.
+    scratch: AtomicU64,
+    /// Top of this CPU's trap stack (TSS `RSP0`), where `IRETQ` to a cell
+    /// finds its frame (mapped for cells with KPTI).
+    trap_top: AtomicU64,
 }
+
+/// Every CPU's per-CPU data, alone on its pages: with KPTI the cells'
+/// tables map them (the entry code reads them before switching tables).
+#[repr(C)]
+#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(align(4096)))]
+pub(super) struct AllPerCpu(pub(super) [PerCpu; MAX_CPUS]);
 
 /// Per-CPU data of every CPU, by number.
 #[unsafe(export_name = "rhizo_percpu")]
-static PERCPU: [PerCpu; MAX_CPUS] = [const {
-    PerCpu {
-        index: AtomicU64::new(0),
-        kernel_rsp: AtomicU64::new(0),
-        cell_regs: AtomicU64::new(0),
-        user_rsp: AtomicU64::new(0),
-        trap_error: AtomicU64::new(0),
+pub(super) static PERCPU: AllPerCpu = AllPerCpu(
+    [const {
+        PerCpu {
+            index: AtomicU64::new(0),
+            kernel_rsp: AtomicU64::new(0),
+            cell_regs: AtomicU64::new(0),
+            user_rsp: AtomicU64::new(0),
+            trap_error: AtomicU64::new(0),
+            kernel_cr3: AtomicU64::new(0),
+            user_cr3: AtomicU64::new(0),
+            scratch: AtomicU64::new(0),
+            trap_top: AtomicU64::new(0),
+        }
+    }; MAX_CPUS],
+);
+
+impl PerCpu {
+    /// Sets the CR3 the entry code loads on entry from a cell (0: none).
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    pub(super) fn set_kernel_cr3(&self, cr3: u64) {
+        self.kernel_cr3
+            .store(cr3, core::sync::atomic::Ordering::Relaxed);
     }
-}; MAX_CPUS];
+
+    /// Sets the CR3 loaded just before returning to a cell (0: none).
+    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    pub(super) fn set_user_cr3(&self, cr3: u64) {
+        self.user_cr3
+            .store(cr3, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The number of the CPU running this code.
 pub fn index() -> usize {
@@ -121,7 +191,7 @@ pub fn index() -> usize {
 /// Error code of the last exception from a cell on this CPU.
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub(super) fn trap_error() -> u64 {
-    PERCPU[index()]
+    PERCPU.0[index()]
         .trap_error
         .load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -130,10 +200,10 @@ pub(super) fn trap_error() -> u64 {
 /// (for its GS base).
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub(super) fn percpu(cpu: usize) -> u64 {
-    PERCPU[cpu]
+    PERCPU.0[cpu]
         .index
         .store(cpu as u64, core::sync::atomic::Ordering::Relaxed);
-    &PERCPU[cpu] as *const PerCpu as u64
+    &PERCPU.0[cpu] as *const PerCpu as u64
 }
 
 #[repr(C, packed)]
@@ -154,7 +224,10 @@ fn tss_descriptor(base: u64) -> [u64; 2] {
 
 /// Loads this CPU's GDT and TSS, with its double-fault and trap stacks.
 fn load_gdt_and_tss(stack_top: u64, trap_top: u64) {
-    let pointer = TABLES[index()].with(|t| {
+    PERCPU.0[index()]
+        .trap_top
+        .store(trap_top, core::sync::atomic::Ordering::Relaxed);
+    let pointer = TABLES.0[index()].with(|t| {
         t.gdt = GDT;
         t.tss.iomap_base = size_of::<TaskStateSegment>() as u16;
         t.tss.ist[(DOUBLE_FAULT_IST - 1) as usize] = stack_top;
@@ -235,7 +308,12 @@ impl IdtEntry {
     }
 }
 
-static IDT: Global<[IdtEntry; 256]> = Global::new([IdtEntry::MISSING; 256]);
+/// The IDT, alone on its pages (with KPTI the cells' tables map it).
+#[repr(C)]
+#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(align(4096)))]
+struct Idt(Global<[IdtEntry; 256]>);
+
+static IDT: Idt = Idt(Global::new([IdtEntry::MISSING; 256]));
 
 // Exception stubs: each pushes the error code (or 0) and the vector, then
 // jumps to a common path that calls `rhizo_exception_handler` with a pointer
@@ -255,7 +333,15 @@ rhizo_isr_\n:
     jmp rhizo_isr_common
     .endm
 
-    .text
+    // With KPTI, cells' tables map these pages (design D2 of `add-kpti`):
+    // the code that runs before the switch to the kernel's tables, alone
+    // on whole pages.
+    .section .text.rhizo_entry_a,"ax",@progbits
+    "#,
+    entry_page!(),
+    r#"
+    .global rhizo_entry_a_start
+rhizo_entry_a_start:
     .irp n, 0,1,2,3,4,5,6,7,9,15,16,18,19,20,22,23,24,25,26,27,28,31
     RHIZO_ISR_NOERR \n
     .endr
@@ -277,6 +363,11 @@ rhizo_isr_common:
     ud2
 3:  addq $16, %rsp
     iretq
+    "#,
+    entry_page!(),
+    r#"
+    .global rhizo_entry_a_end
+rhizo_entry_a_end:
 
     .section .rodata
     .balign 8
@@ -330,7 +421,7 @@ fn load_idt() {
     // SAFETY: `rhizo_isr_table` is a read-only table of 32 stub addresses
     // emitted by the assembly above.
     let stubs = unsafe { &*core::ptr::addr_of!(rhizo_isr_table) };
-    let pointer = IDT.with(|idt| {
+    let pointer = IDT.0.with(|idt| {
         for (vector, &stub) in stubs.iter().enumerate() {
             let ist = if vector == exception::DOUBLE_FAULT as usize {
                 DOUBLE_FAULT_IST
@@ -365,6 +456,49 @@ pub fn init() {
 
 /// Installs this CPU's GDT and TSS (with its double-fault and trap
 /// stacks), the IDT, and enables `SYSCALL`.
+/// What cells' tables map of the kernel with KPTI, besides the other CPUs'
+/// stacks: `(start, end, code)` virtual ranges, each on whole pages of its
+/// own (design D2 of `add-kpti`).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub(super) fn entry_ranges() -> [(u64, u64, bool); 7] {
+    unsafe extern "C" {
+        static rhizo_entry_a_start: u8;
+        static rhizo_entry_a_end: u8;
+        static rhizo_entry_b_start: u8;
+        static rhizo_entry_b_end: u8;
+    }
+    fn span<T>(value: &T) -> (u64, u64, bool) {
+        let start = value as *const T as u64;
+        (start, start + size_of::<T>() as u64, false)
+    }
+    // Only the addresses of the symbols are taken: no `unsafe` needed.
+    let code = [
+        (
+            core::ptr::addr_of!(rhizo_entry_a_start) as u64,
+            core::ptr::addr_of!(rhizo_entry_a_end) as u64,
+            true,
+        ),
+        (
+            core::ptr::addr_of!(rhizo_entry_b_start) as u64,
+            core::ptr::addr_of!(rhizo_entry_b_end) as u64,
+            true,
+        ),
+    ];
+    let stack = |s: &Global<Stack>| {
+        let r = s.with(|s| s.0.as_ptr_range());
+        (r.start as u64, r.end as u64, false)
+    };
+    [
+        code[0],
+        code[1],
+        span(&PERCPU),
+        span(&TABLES),
+        span(&IDT),
+        stack(&TRAP_STACK),
+        stack(&DOUBLE_FAULT_STACK),
+    ]
+}
+
 pub(super) fn init_cpu(double_fault_stack: u64, trap_stack: u64) {
     load_gdt_and_tss(double_fault_stack, trap_stack);
     load_idt();
@@ -414,14 +548,23 @@ pub(super) unsafe fn wrmsr(msr: u32, value: u64) {
 // (returns 256) or an exception from ring 3 (returns the vector): both save
 // its registers into `regs` and resume the kernel where it called in.
 // What the paths share lives in this CPU's `PerCpu` (GS: index 0, kernel
-// RSP 8, cell registers 16, user RSP 24, trap error 32), and `SWAPGS`
-// brackets cell code.
+// RSP 8, cell registers 16, user RSP 24, trap error 32, kernel CR3 40,
+// user CR3 48, scratch 56, trap stack top 64), and `SWAPGS` brackets cell
+// code. With KPTI (design D2 of `add-kpti`) a cell's tables map only these
+// pages of code, the per-CPU data, GDT, TSS, IDT and trap stacks: entries
+// load the kernel's CR3 first, and returns load the cell's last, through
+// a register stashed in per-CPU data; a zero CR3 means no switch.
 //
 // `Registers` layout: pc 0, sp 8, gpr 16 + 8n (rax rbx rcx rdx rsi rdi rbp
 // r8-r15), tls 264, flags 272.
 core::arch::global_asm!(
     r#"
-    .text
+    .section .text.rhizo_entry_b,"ax",@progbits
+    "#,
+    entry_page!(),
+    r#"
+    .global rhizo_entry_b_start
+rhizo_entry_b_start:
     .global rhizo_enter_cell
 rhizo_enter_cell:
     push rbx
@@ -432,6 +575,8 @@ rhizo_enter_cell:
     push r15
     mov gs:[8], rsp
     mov gs:[16], rdi
+    mov rax, [rdi + 56]             // the cell's RDI, loaded last
+    mov gs:[56], rax
     mov rax, [rdi + 272]
     and eax, 0xdd5                  // user flags only: CF PF AF ZF SF DF OF
     or eax, 0x202                   // reserved bit, IF: preemptible
@@ -452,10 +597,15 @@ rhizo_enter_cell:
     mov r13, [rdi + 112]
     mov r14, [rdi + 120]
     mov r15, [rdi + 128]
-    mov rdi, [rdi + 56]
+    mov rdi, gs:[48]                // KPTI: the cell's CR3
+    test rdi, rdi
+    jz 1f
+    mov cr3, rdi
+1:  mov rdi, gs:[56]
     swapgs
     sysretq
-2:  push 0x2b                       // user SS
+2:  mov rsp, gs:[64]                // the trap stack, mapped for the cell
+    push 0x2b                       // user SS
     push qword ptr [rdi + 8]
     push rax
     push 0x33                       // user CS
@@ -474,7 +624,11 @@ rhizo_enter_cell:
     mov r13, [rdi + 112]
     mov r14, [rdi + 120]
     mov r15, [rdi + 128]
-    mov rdi, [rdi + 56]
+    mov rdi, gs:[48]                // KPTI: the cell's CR3
+    test rdi, rdi
+    jz 1f
+    mov cr3, rdi
+1:  mov rdi, gs:[56]
     swapgs
     iretq
 
@@ -483,7 +637,11 @@ rhizo_enter_cell:
 rhizo_syscall_entry:
     swapgs
     mov gs:[24], rsp
-    mov rsp, gs:[16]
+    mov rsp, gs:[40]                // KPTI: the kernel's CR3
+    test rsp, rsp
+    jz 1f
+    mov cr3, rsp
+1:  mov rsp, gs:[16]
     mov [rsp + 16], rax
     mov [rsp + 24], rbx
     mov [rsp + 32], rcx
@@ -511,7 +669,11 @@ rhizo_syscall_entry:
 rhizo_user_trap:
     swapgs
     push rax
-    mov rax, gs:[16]
+    mov rax, gs:[40]                // KPTI: the kernel's CR3
+    test rax, rax
+    jz 1f
+    mov cr3, rax
+1:  mov rax, gs:[16]
     mov [rax + 24], rbx
     mov [rax + 32], rcx
     mov [rax + 40], rdx
@@ -546,6 +708,12 @@ rhizo_back_to_kernel:
     pop rbp
     pop rbx
     ret
+    "#,
+    entry_page!(),
+    r#"
+    .global rhizo_entry_b_end
+rhizo_entry_b_end:
+    .text
     "#
 );
 
