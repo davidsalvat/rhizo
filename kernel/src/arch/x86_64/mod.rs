@@ -3,18 +3,18 @@
 pub mod boot;
 pub mod console;
 pub mod cpu;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod irq;
 pub mod platform;
 pub mod port;
 pub mod power;
 pub mod serial;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod smp;
 #[cfg(feature = "ktest")]
 pub mod tests;
 pub mod timer;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod user;
 
 /// Stops the CPU forever with interrupts disabled.

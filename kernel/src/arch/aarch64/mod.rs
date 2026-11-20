@@ -3,16 +3,16 @@
 pub mod boot;
 pub mod console;
 pub mod cpu;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod irq;
 pub mod platform;
 pub mod power;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod smp;
 #[cfg(feature = "ktest")]
 pub mod tests;
 pub mod timer;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod user;
 
 /// Virtual window where physical 0–4 GiB is mapped as device memory.

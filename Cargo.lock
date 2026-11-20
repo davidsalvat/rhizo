@@ -380,6 +380,13 @@ name = "rhizo-cells"
 version = "0.1.0"
 
 [[package]]
+name = "rhizo-control"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "rhizo-core"
 version = "0.1.0"
 dependencies = [
@@ -404,6 +411,7 @@ version = "0.1.0"
 dependencies = [
  "rhizo-abi",
  "rhizo-cell",
+ "rhizo-control",
  "rhizo-core",
  "rhizo-fs",
  "rhizo-hal",

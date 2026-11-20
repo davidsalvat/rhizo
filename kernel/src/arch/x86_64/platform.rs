@@ -3,7 +3,7 @@
 use crate::memory::DirectMap;
 use rhizo_mm::memmap::{BootInfo, RegionKind};
 use rhizo_mm::paging::{MapError, PageTable};
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 use rhizo_mm::paging::{PageFlags, PageSize};
 
 /// Page-table entry format of this architecture.
@@ -45,14 +45,14 @@ pub fn for_each_reserved(mut f: impl FnMut(u64, u64)) {
 /// that run cells map the virtio-mmio transports, uncached, where the
 /// direct map would have them.
 #[cfg_attr(
-    not(any(feature = "ktest", feature = "bench-cell")),
+    not(feature = "cells"),
     allow(unused_variables, reason = "nothing to map without cells")
 )]
 pub fn map_devices(
     pt: &PageTable<Format>,
     alloc: &mut impl FnMut() -> Option<u64>,
 ) -> Result<(), MapError> {
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     {
         let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
         // Transports share pages: map each page once.
@@ -79,7 +79,7 @@ pub fn map_devices(
 /// Calls `f` with the physical base of every virtio-mmio transport the
 /// command line lists (`virtio_mmio.device=`, from QEMU `microvm` and
 /// Firecracker).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
     let mut buf = [0u8; 1024];
     rhizo_core::options::virtio_mmio_devices(cmdline(&mut buf), |base, _| f(base));
@@ -87,7 +87,7 @@ pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
 
 /// The ECAM base of PCI bus 0 from the ACPI MCFG (QEMU `q35`, Cloud
 /// Hypervisor; none on QEMU `microvm` and Firecracker).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn pci_ecam() -> Option<u64> {
     use super::smp::Firmware;
     let hint = rhizo_core::acpi::pvh_rsdp(&DirectMap, super::boot::boot_arg());
@@ -98,7 +98,7 @@ pub fn pci_ecam() -> Option<u64> {
 /// Addresses for PCI memory BARs left unassigned: none, the firmware
 /// (SeaBIOS on `q35`) or the VMM (Cloud Hypervisor) assigns them all
 /// (design D3 of `add-virtio-pci`).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn pci_window() -> Option<rhizo_virtio::pci::Window> {
     None
 }
@@ -107,7 +107,7 @@ pub fn pci_window() -> Option<rhizo_virtio::pci::Window> {
 /// where [`Mmio::new`] reaches them (pages the direct map already covers
 /// are left as they are). Call before the first cell exists: cell roots
 /// copy the kernel's top-level entries.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn map_device(phys: u64, len: u64) -> Result<(), MapError> {
     use crate::memory;
     let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
@@ -127,18 +127,18 @@ pub fn map_device(phys: u64, len: u64) -> Result<(), MapError> {
 
 /// The registers of a device at physical address `base`, mapped uncached
 /// by [`map_devices`] or [`map_device`].
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 #[derive(Debug)]
 pub struct Mmio(u64);
 
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 impl Mmio {
     pub fn new(base: u64) -> Self {
         Self(DirectMap::virt(base))
     }
 }
 
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 impl rhizo_hal::DeviceRegisters for Mmio {
     fn read32(&mut self, offset: usize) -> u32 {
         // SAFETY: `map_devices` or `map_device` mapped the device's
