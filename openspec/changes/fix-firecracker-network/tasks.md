@@ -7,7 +7,7 @@
 ## 2. Fix
 
 - [x] 2.1 `rhizo-virtio`: 64 descriptors per queue, compile-time checks of the queue layout and of Firecracker's minimum (D1); host test with a device that delivers as Firecracker does (D2), failing with 32 descriptors; verify `cargo test -p rhizo-virtio`
-- [ ] 2.2 `xtask` and CI: host network for `ktest-smp` on Firecracker, a one-CPU `ktest` step on Firecracker in CI, temporary diagnostics removed; verify `cargo xtask check`, `cargo xtask test` on both architectures
+- [x] 2.2 `xtask` and CI: host network for `ktest-smp` on Firecracker, a one-CPU `ktest` step on Firecracker in CI, temporary diagnostics removed; verify `cargo xtask check`, `cargo xtask test` on both architectures
 
 ## 3. Verification
 
