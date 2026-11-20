@@ -122,6 +122,15 @@ come back, or the benchmark fails.
 | `density.syscall_p50_ns`, `_p99_ns`, `_p999_ns` | timing | Time in the system-call handler, locks included |
 | `density.oom_cells/rhizo/<vmm>` | count, higher is better | Idle cells memory held before the kernel refused one |
 
+In the `ci` environment (from two CI runs that agreed within the
+threshold) every workload metric is gated except these, recorded but
+listed under `ungated.ci`: `workload.agent_turn_us` and
+`laptop.resume_turn_us` (bimodal: about 0.3 ms, or 1 s when the answer
+arrives after the guest stopped polling its card and only smoltcp's
+retransmission timer wakes it), `laptop.idle_host_cpu_pct` (the host's
+own load on a shared runner), and the p99.9 latencies (`*_p999_*`: a
+handful of samples per run).
+
 The `rhizo-server-breakdown` line printed with the results says where the
 load's time went (idle, system calls, scheduling decisions, host
 operations; runs, socket wake-ups, faults): simple counters in
