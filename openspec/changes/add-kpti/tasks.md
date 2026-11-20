@@ -17,4 +17,4 @@
 
 ## 4. CI
 
-- [ ] 4.1 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
+- [x] 4.1 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
