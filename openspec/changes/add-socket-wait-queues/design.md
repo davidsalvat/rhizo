@@ -118,7 +118,50 @@ listed under `ungated.ci`: its value is near 0, where a relative threshold
 means nothing; the in-kernel test `only_the_cells_waiting_on_a_socket_wake`
 requires none on a ping-pong between two cells next to an idle server.
 
+The latencies count only cells that joined a queue, or whose event came,
+after counting started (`prof::start`). The server's 10,000 workers are
+made, runnable, before its load starts, and all run in its first tenth
+of a second: before this change, their waits were under 1 % of the
+1.8 million samples, but with 200,000 samples they were 5 % of them, and
+`density.sched_p99_us` read 88 ms, the time it takes to make the cells, not
+a scheduling delay of the load.
+
+The system-call latencies change for the same reason. The 1.6 million
+re-checks that found nothing were the cheapest calls (a `recv` that
+returns `EAGAIN`). Without them the mix holds mostly calls that do work:
+the total time in system calls halves (404 ms to 191 ms in CI), but the
+percentiles of what is left go up (`density.syscall_p99_ns` from 0.8 to
+1.5 µs on QEMU, 1.2 to 3.0 µs on Firecracker). Their baseline is updated
+from this change's runs, with this justification. Changes allocate
+nothing in the system call: woken keys are drained, and the list keeps
+its room (`Net::drain_woken`).
+
 `density.sched_p99_us` and `density.wake_p99_us` were ungated because
 every socket change woke every waiting cell, which made their tails move
 up to 5x between runners. Once two CI runs of this change agree, they are
 gated, with the values of those runs in the `ci` baseline.
+
+## D5. A wake from the host is not lost
+
+`Host::wake` (a user's message, in the laptop workload) ended the sleeps of
+the cell's threads. A cell still on its way to its sleep (preempted by a
+tick between printing `ready` or `turn` and calling `nanosleep`) had none
+to end: the wake was lost, and the cell slept for its hour. This is how
+`a_woken_cell_runs_at_once` hung, in about one run in four of `ktest-smp`
+under host load. It ended with `ready` as the last line. It was not a
+missed wake-up between CPUs.
+
+Now, when none of the cell's threads waits with a deadline, the wake is
+kept on the live cell (`host_wake`), and the first system call after
+which one of its threads waits with a deadline ends those waits at once.
+The regression test `a_wake_before_the_sleep_is_kept` does not depend on
+timing: `sleeper 3600000 yield` prints `ready`, yields, then sleeps for an
+hour. The host wakes it at the yield, and two steps must see it end. Before
+the fix, the test hangs exactly as the old one did.
+
+The kept wake is host state: it is not part of a snapshot or a fork, like
+the wake itself.
+
+Lost: telling the caller the wake found nothing, so that it retries.
+Every caller would need a retry loop, and the race is the kernel's to
+close.

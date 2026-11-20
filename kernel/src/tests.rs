@@ -94,6 +94,7 @@ macro_rules! suite {
             ktest_case!(a_thousand_idle_cells),
             ktest_case!(memory_full_of_cells_is_refused_cleanly),
             ktest_case!(a_woken_cell_runs_at_once),
+            ktest_case!(a_wake_before_the_sleep_is_kept),
             ktest_case!(hostile_pointers_get_efault),
             ktest_case!(cell_cannot_write_kernel_memory),
             ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
@@ -1294,6 +1295,28 @@ fn a_woken_cell_runs_at_once() {
     let (ending, output) = ended(&host, id);
     assert_eq!(ending, Ending::Exit(0), "{output}");
     assert!(output.starts_with("ready\nops="), "{output}");
+}
+
+/// A wake from the host that comes while the cell is still on its way to
+/// its sleep is kept for that sleep (design D5 of `add-socket-wait-queues`):
+/// `a_woken_cell_runs_at_once` hung when a tick preempted the cell between
+/// printing `ready` and sleeping, and the wake found nothing to end. Here
+/// the cell yields between the two, so the wake always comes first.
+fn a_wake_before_the_sleep_is_kept() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "sleeper", &[b"3600000", b"yield"]);
+    while host.output(id) != Some(b"ready\n") {
+        host.step();
+    }
+    // Before or at its yield: runnable, not asleep.
+    assert!(host.wake(id));
+    // At most its yield, then its sleep of an hour, which ends at once.
+    for _ in 0..2 {
+        if host.finished(id).is_none() {
+            host.step();
+        }
+    }
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "ready\nwoken\n".into()));
 }
 
 // --- H13: isolation under attack (spec `isolation`) -------------------------

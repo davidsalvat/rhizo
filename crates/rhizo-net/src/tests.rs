@@ -761,6 +761,13 @@ proptest! {
     }
 }
 
+/// The waiters woken since the last call.
+pub(crate) fn woken(net: &mut Net) -> Vec<u32> {
+    let mut out = Vec::new();
+    net.drain_woken(|k| out.push(k));
+    out
+}
+
 /// Waiter `key` looks at `h` and blocks, as a call that would wait does.
 fn wait_on(net: &mut Net, key: u32, h: Handle) {
     net.end_call(None);
@@ -779,16 +786,16 @@ fn a_change_wakes_only_the_waiters_of_its_socket() {
     assert!(!net.has_woken());
     net.send(c1, b"x", None).unwrap();
     net.end_call(None);
-    assert_eq!(net.take_woken(), [1]);
+    assert_eq!(woken(&mut net), [1]);
     net.send(c1, b"y", None).unwrap();
     net.end_call(None);
     assert_eq!(
-        net.take_woken(),
+        woken(&mut net),
         [],
         "woken once: it looks again when it runs"
     );
     net.release(c2);
-    assert_eq!(net.take_woken(), [2], "once, for the end of the stream");
+    assert_eq!(woken(&mut net), [2], "once, for the end of the stream");
 }
 
 #[test]
@@ -812,19 +819,19 @@ fn accept_waits_for_a_connection_and_a_writer_for_room() {
     let c = net.socket(Family::Inet, Type::Stream).unwrap();
     net.connect(c, &inet(LOOPBACK, 23)).unwrap();
     net.end_call(None);
-    assert_eq!(net.take_woken(), [5], "a connection to accept");
+    assert_eq!(woken(&mut net), [5], "a connection to accept");
     let s = net.accept(l).unwrap();
     net.end_call(None);
     let big = vec![1u8; STREAM_BUF];
     assert_eq!(net.send(c, &big, None), Ok(STREAM_BUF));
     assert_eq!(net.send(c, b"x", None), Err(Error::Again));
     net.end_call(Some(6));
-    assert_eq!(net.take_woken(), [], "the reader is not waiting");
+    assert_eq!(woken(&mut net), [], "the reader is not waiting");
     net.recv(s, 10, false, &mut |_| true).unwrap();
-    assert_eq!(net.take_woken(), [6], "room for the writer");
+    assert_eq!(woken(&mut net), [6], "room for the writer");
     wait_on(&mut net, 6, c);
     net.recv(s, 10, false, &mut |_| true).unwrap();
-    assert_eq!(net.take_woken(), [], "the queue was not full");
+    assert_eq!(woken(&mut net), [], "the queue was not full");
 }
 
 #[test]
@@ -834,7 +841,7 @@ fn closing_wakes_the_waiters_of_the_socket_and_its_peer() {
     wait_on(&mut net, 7, s);
     wait_on(&mut net, 8, c);
     net.release(s);
-    let mut woken = net.take_woken();
+    let mut woken = woken(&mut net);
     woken.sort_unstable();
     assert_eq!(woken, [7, 8]);
 }

@@ -35,6 +35,12 @@ up to 400 ms on Firecracker). The benchmark shows it.
   this change, such a thread only woke when some socket somewhere changed.)
 - **A cell new to the scheduler** (forked, resumed, a template's child,
   woken by the host) makes its waiting calls again, joining the queues.
+- **A wake from the host is kept** when the cell is not asleep yet: its
+  next sleep ends at once. Without this, a cell preempted between its
+  last output and its sleep missed the wake and slept on, which is how
+  `a_woken_cell_runs_at_once` hung under load.
+- **Latencies of the load only**: the server workload's latencies leave
+  out cells queued before the load started.
 - **Metric**: `density.wasted_wakeups_pct`, the share of wake-ups by a
   socket change after which the cell's first system call waited on
   descriptors again, from the server workload; with the existing

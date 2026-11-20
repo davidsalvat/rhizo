@@ -558,6 +558,9 @@ struct Live {
     /// A socket it waited on changed since its last system call, for the
     /// workloads' count of wake-ups that found nothing ([`prof`]).
     io_woken: bool,
+    /// [`Host::wake`] came while no thread waited with a deadline: the next
+    /// wait with one ends at once.
+    host_wake: bool,
     /// Since when it can run, for the workloads' latencies ([`prof`]).
     ready: Ready,
     /// The thread chosen last while it ran on several CPUs: turns go on
@@ -878,17 +881,19 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
 /// its calls again; any other is nudged ([`Shared::nudged`]). Called under
 /// the host's lock, so a cell filed to wait cannot miss its wake-up.
 fn wake_woken(s: &mut Shared, cpu: usize, now: u64) {
-    let woken = NET.with(|net| net.has_woken().then(|| net.take_woken()));
-    for id in woken.into_iter().flatten() {
-        let waited = s.sched.wake(cpu, id, |live| {
-            live.cell.threads.wake_io();
-            live.ready = live.ready.net_change(now);
-            live.io_woken = true;
-        });
-        if !waited {
-            s.nudged.insert(id);
-        }
-    }
+    // Lock order: the host's, then the sockets.
+    NET.with(|net| {
+        net.drain_woken(|id| {
+            let waited = s.sched.wake(cpu, id, |live| {
+                live.cell.threads.wake_io();
+                live.ready = live.ready.net_change(now);
+                live.io_woken = true;
+            });
+            if !waited {
+                s.nudged.insert(id);
+            }
+        })
+    });
 }
 
 /// Lets the threads of `live` waiting on descriptors look again if a
@@ -1130,6 +1135,10 @@ fn syscall(
     });
     prof::syscall_end(t0);
     live.random = services.random;
+    if live.host_wake && live.cell.threads.wake_at().is_some() {
+        live.host_wake = false;
+        live.cell.threads.expire_timers();
+    }
     // A call waiting on descriptors keeps its deadline for when it is made
     // again (design D3 of `add-sockets-and-poll`).
     if let Wait::Io { until: Some(_) } = live.cell.threads.current().wait
@@ -1824,6 +1833,7 @@ impl Host {
             fs,
             deadlines: Vec::new(),
             io_woken: false,
+            host_wake: false,
             ready: Ready::default(),
             last: 0,
             peak: 1,
@@ -2317,7 +2327,9 @@ impl Host {
     /// Ends the sleeps of live cell `id`'s threads and times out their timed
     /// waits, as an event from outside would (the benchmark host's stand-in
     /// for a user's message, design D1 of `add-reference-workloads`);
-    /// returns whether the cell exists.
+    /// returns whether the cell exists. A cell none of whose threads waits
+    /// with a deadline yet (it is still on its way to its sleep) keeps the
+    /// wake-up for its next one (design D5 of `add-socket-wait-queues`).
     #[cfg_attr(
         not(feature = "bench-cell"),
         allow(dead_code, reason = "used by the reference workloads")
@@ -2326,6 +2338,7 @@ impl Host {
         let Some(mut live) = self.state().sched.remove(|l| l.cell.id == id) else {
             return false;
         };
+        live.host_wake = live.cell.threads.wake_at().is_none();
         live.cell.threads.expire_timers();
         file(self.state(), None, live);
         true

@@ -25,3 +25,15 @@ read a clock.
 #### Scenario: Waking one waiter
 - **WHEN** several cells wait and one of them is woken by its key
 - **THEN** only that one becomes runnable, and the others keep waiting until their own wake-up or deadline
+
+## ADDED Requirements
+
+### Requirement: Host wake-ups are not lost
+A wake from the host (`Host::wake`) SHALL end the sleeps and time out the
+timed waits of the cell's threads; when none of them waits with a
+deadline yet, the next wait with a deadline of one of its threads SHALL end
+at once.
+
+#### Scenario: Woken on the way to its sleep
+- **WHEN** the host wakes a cell that printed `ready` and yielded, and that will then sleep for an hour
+- **THEN** its sleep ends at once and it exits within two scheduling steps

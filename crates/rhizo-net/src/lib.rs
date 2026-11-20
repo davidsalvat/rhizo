@@ -12,7 +12,7 @@
 //! [`rhizo_hal::NetLink`], and blocking is the caller's business
 //! ([`Error::Again`]): each socket keeps a wait queue of the waiters that
 //! looked at it before they blocked, and a change to a socket hands its
-//! waiters to the caller ([`Net::end_call`], [`Net::take_woken`]; design D1
+//! waiters to the caller ([`Net::end_call`], [`Net::drain_woken`]; design D1
 //! of `add-socket-wait-queues`).
 
 #![cfg_attr(not(test), no_std)]
@@ -297,7 +297,7 @@ pub struct Net {
     /// one reference.
     parked: Vec<(u64, Handle)>,
     /// Waiters taken off the wait queues of sockets that changed, for the
-    /// caller to wake ([`take_woken`](Self::take_woken)).
+    /// caller to wake ([`drain_woken`](Self::drain_woken)).
     woken: Vec<u32>,
     /// The sockets the current call looked at: its waiter joins their wait
     /// queues if it blocks ([`end_call`](Self::end_call)).
@@ -391,15 +391,16 @@ impl Net {
     }
 
     /// Whether waiters were woken since the last
-    /// [`take_woken`](Self::take_woken).
+    /// [`drain_woken`](Self::drain_woken).
     pub fn has_woken(&self) -> bool {
         !self.woken.is_empty()
     }
 
-    /// The waiters woken by changes since the last call, in the order they
-    /// were woken (a waiter may appear more than once).
-    pub fn take_woken(&mut self) -> Vec<u32> {
-        core::mem::take(&mut self.woken)
+    /// Hands `f` the waiters woken by changes since the last call, in the
+    /// order they were woken (a waiter may come more than once); the list
+    /// keeps its room, so a change allocates nothing.
+    pub fn drain_woken(&mut self, f: impl FnMut(u32)) {
+        self.woken.drain(..).for_each(f);
     }
 
     /// Sockets open.

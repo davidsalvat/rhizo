@@ -1,6 +1,7 @@
 //! Host tests of the network card path: a [`Net`] on a [`QueueLink`]
 //! talks to a `smoltcp` peer (10.0.0.1) over an in-memory wire.
 
+use super::tests::woken;
 use super::wire::Phy;
 use super::*;
 use rhizo_hal::testing::QueueLink;
@@ -340,9 +341,9 @@ fn frames_from_the_wire_wake_the_waiters_of_its_sockets() {
     w.net.end_call(Some(2));
     w.net.send(s, b"echo", None).unwrap();
     w.net.end_call(None);
-    w.net.take_woken();
+    woken(&mut w.net);
     w.run(20);
-    let woken = w.net.take_woken();
+    let woken = woken(&mut w.net);
     assert!(woken.contains(&1), "the echo arrived");
     assert!(!woken.contains(&2), "nothing for a loopback socket");
 }
