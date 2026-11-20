@@ -7,5 +7,5 @@
 
 ## 2. Metric
 
-- [ ] 2.1 `timer_error_ns` in the `rhizo-smp` line and `cell.timer_error_us` (D3); verify `cargo test -p xtask smp_line` and the metric in the CI benchmark job
-- [ ] 2.2 `bench/README.md` documents it; the `ci` baseline takes it and the lower laptop wake-ups from a CI run; verify `cargo xtask bench --from <run> --env ci --check`
+- [x] 2.1 `timer_error_ns` in the `rhizo-smp` line and `cell.timer_error_us` (D3); verify `cargo test -p xtask smp_line` and the metric in the CI benchmark job
+- [x] 2.2 `bench/README.md` documents it; the `ci` baseline takes it and the lower laptop wake-ups from a CI run; verify `cargo xtask bench --from <run> --env ci --check`
