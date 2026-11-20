@@ -39,6 +39,16 @@ impl Samples {
         }
     }
 
+    /// Samples kept.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Whether no sample was kept.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     /// Samples dropped because the buffer was full.
     pub fn lost(&self) -> u64 {
         self.lost

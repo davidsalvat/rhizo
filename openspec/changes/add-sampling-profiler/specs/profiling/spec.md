@@ -1,8 +1,8 @@
 ## ADDED Requirements
 
 ### Requirement: Sampling where cell code runs
-A kernel built with the `sampling` feature SHALL be able to sample, on the
-CPU that starts it, which cell runs and at which address: with the PMU
+A kernel built with the `sampling` feature SHALL be able to sample, on every
+CPU, which cell runs and at which address: with the PMU
 counting cycles of cell code only and interrupting every 100,000 of them
 where the guest has a PMU and its interrupt, else with the timer ticking
 every 100 µs while a time slice still lasts 10 ms.

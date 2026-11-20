@@ -39,7 +39,6 @@ tools read.
   in the entry code another change is reworking for KPTI) and pseudo-NMIs
   (GICv3 priorities) or `FEAT_NMI` on AArch64. The kernel's time is covered
   exactly, per part and per system call, by the accounting instead.
-- Sampling on every CPU: the boot CPU samples, which runs the workloads.
 
 ## Capabilities
 
