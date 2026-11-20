@@ -70,6 +70,21 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
         Ending::Exit(0),
     ),
     (
+        "threads",
+        "tids ok\nfutex ok\nmutex ok\nping-pong ok\nregs ok\n",
+        Ending::Exit(0),
+    ),
+    (
+        "libc_threads",
+        "ready\n\
+         pool: 500500 2001000 4501500\n\
+         queue: 400 items, sum 240200\n\
+         mutex: 400 increments\n\
+         fp: 210.0 20190.0\n\
+         threads: 13, distinct ids yes\n",
+        Ending::Exit(0),
+    ),
+    (
         "counter",
         "step 07 digest 6b4e24cdafe14e6b\nstep 15 digest c93f1c055e5410cf\nstep 23 digest 65632246df41d107\nstep 31 digest a7c1ff878b0627df\nstep 39 digest 9a1ea881edd8f792\n",
         Ending::Exit(0),

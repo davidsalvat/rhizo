@@ -202,7 +202,7 @@ impl<F: EntryFormat> Machine<F> {
     /// Runs call `nr` with `args`; returns how it ended and the result
     /// register.
     fn call(&mut self, nr: u64, args: [u64; 6]) -> (Outcome, i64) {
-        let regs = &mut self.cell.regs.gpr;
+        let regs = &mut self.cell.regs_mut().gpr;
         match self.abi.arch {
             Arch::Aarch64 => {
                 regs[8] = nr;
@@ -225,7 +225,7 @@ impl<F: EntryFormat> Machine<F> {
             pager: &mut NoPager,
         };
         let outcome = self.abi.handle(&mut self.cell, &mut cx);
-        (outcome, self.cell.regs.gpr[0] as i64)
+        (outcome, self.cell.regs().gpr[0] as i64)
     }
 
     fn pt_translate(&self, virt: u64) -> Option<rhizo_mm::paging::Translation> {
@@ -475,9 +475,9 @@ fn the_thread_pointer_stays_in_the_cell() {
             -EPERM
         );
     }
-    assert_eq!(m.cell.regs.tls, 0, "unchanged");
+    assert_eq!(m.cell.regs().tls, 0, "unchanged");
     assert_eq!(m.call(X_ARCH_PRCTL, [ARCH_SET_FS, DATA, 0, 0, 0, 0]).1, 0);
-    assert_eq!(m.cell.regs.tls, DATA);
+    assert_eq!(m.cell.regs().tls, DATA);
     m.end();
 }
 

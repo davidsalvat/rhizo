@@ -22,6 +22,10 @@ pub mod nr {
     pub const CLOSE: usize = 57;
     pub const READ: usize = 63;
     pub const PREAD64: usize = 67;
+    pub const CLONE: usize = 220;
+    pub const EXIT: usize = 93;
+    pub const FUTEX: usize = 98;
+    pub const GETTID: usize = 178;
 }
 
 /// Linux system-call numbers for the target architecture.
@@ -42,6 +46,11 @@ pub mod nr {
     pub const CLOSE: usize = 3;
     pub const READ: usize = 0;
     pub const PREAD64: usize = 17;
+    pub const CLONE: usize = 56;
+    pub const EXIT: usize = 60;
+    pub const FUTEX: usize = 202;
+    pub const GETTID: usize = 186;
+    pub const ARCH_PRCTL: usize = 158;
 }
 
 /// Raw system call with up to six arguments; returns the kernel's value
@@ -178,4 +187,145 @@ macro_rules! entry {
             "    call rhizo_cell_main",
         );
     };
+}
+
+/// Monotonic time in nanoseconds.
+pub fn now_ns() -> u64 {
+    let mut ts = [0u64; 2];
+    syscall(nr::CLOCK_GETTIME, [1, ts.as_mut_ptr() as usize, 0, 0, 0, 0]);
+    ts[0] * 1_000_000_000 + ts[1]
+}
+
+/// The flags glibc's `pthread_create` passes to `clone`: `CLONE_VM`, `FS`,
+/// `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID` and
+/// `CHILD_CLEARTID`.
+pub const THREAD_FLAGS: usize = 0x3d_0f00;
+
+/// Starts a thread running `f(arg)` on the stack whose top is `stack_top`
+/// (16-byte aligned), with thread pointer `tls`. The thread's identifier is
+/// written to `*tid`, which the kernel clears and wakes when the thread
+/// exits (see [`join`]); the thread exits with `f`'s result. Returns the
+/// identifier, or a negative `errno`.
+pub fn spawn_thread(
+    f: extern "C" fn(usize) -> usize,
+    arg: usize,
+    stack_top: usize,
+    tls: usize,
+    tid: &core::sync::atomic::AtomicU32,
+) -> isize {
+    let tid = tid.as_ptr() as usize;
+    let ret: isize;
+    // SAFETY: `clone` with `CLONE_VM` starts a thread in this address space
+    // on the given stack; the child (result 0) never returns into Rust code:
+    // it calls `f(arg)` on its own stack and exits with its result. The
+    // parent continues with the new identifier, its registers as declared.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            "cbnz x0, 2f",
+            "mov x0, x10",
+            "blr x9",
+            "mov x8, #93",
+            "svc #0",
+            "2:",
+            in("x8") nr::CLONE,
+            inlateout("x0") THREAD_FLAGS => ret,
+            in("x1") stack_top, in("x2") tid, in("x3") tls, in("x4") tid,
+            in("x9") f, in("x10") arg,
+            options(nostack)
+        );
+    }
+    // SAFETY: as above.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "mov rdi, r13",
+            "call r12",
+            "mov edi, eax",
+            "mov eax, 60",
+            "syscall",
+            "ud2",
+            "2:",
+            inlateout("rax") nr::CLONE as isize => ret,
+            in("rdi") THREAD_FLAGS, in("rsi") stack_top, in("rdx") tid,
+            in("r10") tid, in("r8") tls, in("r12") f, in("r13") arg,
+            out("rcx") _, out("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
+const FUTEX_PRIVATE: usize = 128;
+
+/// `FUTEX_WAIT_BITSET` (private) on `word` while it holds `val`, with an
+/// optional relative timeout in nanoseconds (`FUTEX_WAIT`, then); returns
+/// the call's result.
+pub fn futex_wait(
+    word: &core::sync::atomic::AtomicU32,
+    val: u32,
+    timeout_ns: Option<u64>,
+    bitset: u32,
+) -> isize {
+    let ts = timeout_ns.map(|ns| [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64]);
+    let (op, ts_ptr) = match &ts {
+        Some(ts) => (FUTEX_PRIVATE, ts.as_ptr() as usize), // FUTEX_WAIT
+        None => (9 | FUTEX_PRIVATE, 0),                    // FUTEX_WAIT_BITSET
+    };
+    syscall(
+        nr::FUTEX,
+        [
+            word.as_ptr() as usize,
+            op,
+            val as usize,
+            ts_ptr,
+            0,
+            bitset as usize,
+        ],
+    )
+}
+
+/// `FUTEX_WAKE_BITSET` (private): wakes up to `n` waiters on `word` whose
+/// bitset intersects `bitset`; returns how many it woke.
+pub fn futex_wake(word: &core::sync::atomic::AtomicU32, n: u32, bitset: u32) -> isize {
+    syscall(
+        nr::FUTEX,
+        [
+            word.as_ptr() as usize,
+            10 | FUTEX_PRIVATE,
+            n as usize,
+            0,
+            0,
+            bitset as usize,
+        ],
+    )
+}
+
+/// Waits until the thread whose identifier is in `tid` has exited (the
+/// kernel clears the word and wakes it), as `pthread_join` does: with a
+/// shared futex wait, because Linux wakes the word with a shared wake.
+pub fn join(tid: &core::sync::atomic::AtomicU32) {
+    use core::sync::atomic::Ordering;
+    loop {
+        let t = tid.load(Ordering::Acquire);
+        if t == 0 {
+            return;
+        }
+        // FUTEX_WAIT_BITSET, not private.
+        syscall(
+            nr::FUTEX,
+            [
+                tid.as_ptr() as usize,
+                9,
+                t as usize,
+                0,
+                0,
+                u32::MAX as usize,
+            ],
+        );
+    }
 }
