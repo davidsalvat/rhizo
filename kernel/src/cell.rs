@@ -1499,7 +1499,7 @@ fn net() -> (u64, u64) {
 /// between a `loopback` cell and the host's echo server, through the
 /// network card (`echo=` on the command line).
 #[cfg(feature = "bench-cell")]
-fn wire_rtt() -> Result<u64, &'static str> {
+fn wire_rtt() -> Result<u64, alloc::string::String> {
     const RUNS: usize = 3 * ROUNDS;
     const TRIPS: u64 = 100;
     let (ip, port) = crate::wire::options()
@@ -1518,8 +1518,16 @@ fn wire_rtt() -> Result<u64, &'static str> {
         let t0 = Counter.cycles();
         let id = host.spawn(image, &argv, true, false).expect("spawn");
         host.run(|h| h.finished(id).is_some());
-        if host.finished(id).map(|f| f.ending) != Some(Ending::Exit(0)) {
-            return Err("the echo server did not answer");
+        match host.finished(id) {
+            Some(f) if f.ending == Ending::Exit(0) => {}
+            f => {
+                let said =
+                    f.map(|f| alloc::string::String::from_utf8_lossy(&f.output).into_owned());
+                return Err(alloc::format!(
+                    "the echo server did not answer: {}",
+                    said.unwrap_or_default().trim()
+                ));
+            }
         }
         samples.push(timer::cycles_to_ns(Counter.cycles() - t0).unwrap_or(0) / TRIPS);
     }
