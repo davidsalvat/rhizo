@@ -10,8 +10,8 @@ for a descriptor that is not open and `EFAULT` for an unreadable argument;
 any other request SHALL return `ENOTTY`.
 
 #### Scenario: Socket with a timeout
-- **WHEN** CPython creates a socket with a timeout (`socket.create_connection(..., timeout=...)`), which switches it to non-blocking mode with `FIONBIO`
-- **THEN** the call succeeds and `fcntl(F_GETFL)` reports `O_NONBLOCK`
+- **WHEN** a cell switches a descriptor to non-blocking mode with `FIONBIO`, as CPython does for a socket with a timeout
+- **THEN** the call succeeds and `fcntl(F_GETFL)` reports `O_NONBLOCK`; switched back, it does not
 
 #### Scenario: Close-on-exec
 - **WHEN** a cell calls `FIOCLEX` then `FIONCLEX` on a descriptor

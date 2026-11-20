@@ -91,10 +91,13 @@ class Model:
     def connect(self):
         if self.sock is not None:
             self.sock.close()
-        # As HTTP clients do: name resolution (the `idna` codec), and a
-        # timeout, which puts the socket in non-blocking mode (`FIONBIO`).
-        # Long: a real model on a CPU may think for minutes.
-        self.sock = socket.create_connection(self.addr, timeout=600)
+        # As HTTP clients do: name resolution (the `idna` codec). Without a
+        # timeout (the default of `requests` and `http.client`): a real
+        # model on a CPU may think for minutes, and the kernel bounds the
+        # run. A timeout makes CPython wait in `poll` with a deadline, which
+        # costs a turn the card's polling period today (design D2 of
+        # `add-agent-workload`).
+        self.sock = socket.create_connection(self.addr)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.buf = b""
 

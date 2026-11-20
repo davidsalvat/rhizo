@@ -36,12 +36,19 @@ in CI (a download, and it measures the model).
 The agent uses CPython's `socket` module (`_socket`, and `select` and
 `array`, which `socket.py` imports), built into the static executable like
 the other C modules, and connects as HTTP clients do:
-`socket.create_connection` with a timeout. That resolves the host through
-`getaddrinfo`, whose host name CPython encodes with the `idna` codec
-(`unicodedata`), and puts the socket in non-blocking mode with
-`ioctl(FIONBIO)`, which the kernel now implements with `FIOCLEX` and
-`FIONCLEX` (`os.set_inheritable`) instead of refusing every `ioctl` with
-`ENOTTY`. Its tool hashes its notes with `hashlib`, so the hash modules
+`socket.create_connection`, which resolves the host through `getaddrinfo`,
+whose host name CPython encodes with the `idna` codec (`unicodedata`). A
+socket with a timeout is put in non-blocking mode with `ioctl(FIONBIO)`,
+which the kernel now implements with `FIOCLEX` and `FIONCLEX`
+(`os.set_inheritable`) instead of refusing every `ioctl` with `ENOTTY`.
+The agent itself uses no timeout (the default of `requests` and
+`http.client`; the kernel bounds the run): with one, CPython waits for the
+answer in `poll` with a deadline, and a cell waiting so is woken by the
+card's polling period, not by the answer: in CI a turn took 2.4 ms on
+QEMU and 41 ms on Firecracker and Cloud Hypervisor instead of 0.2 ms, the
+same polling problem `add-reference-workloads` found (turns of 1 s). Its
+fix is a change of its own; this one measures the path that does not hit
+it. Its tool hashes its notes with `hashlib`, so the hash modules
 `hashlib` imports are built in too (`_md5`, `_sha1`, `_sha2`, `_sha3`,
 `_blake2`: HACL* and BLAKE2 code in CPython's tree, no OpenSSL); without
 them `hashlib` prints an error for every algorithm at import. Its HTTP/1.1 client is twenty lines in the script
