@@ -409,71 +409,242 @@ def scorecard(t):
 
 
 # ---------------------------------------------------------------- roadmap
+BOOT_MS = median("boot.time_to_ready_ms")
+
+
+def has(name, vmm="firecracker"):
+    return median(name, vmm=vmm, required=False) is not None
+
+
+# Stages a newcomer can follow. Each lists the internal milestones it groups
+# (not drawn): a stage is done when every one of them has its metric (or
+# document) in the results; otherwise it shows its planned state. Metric names
+# of milestones still in progress are the ones their changes add.
+STAGES = [
+    ("The foundations", "Boots in milliseconds on Arm and x86, tested on every change",
+     [True], "next", (f"{BOOT_MS:.0f} ms", "to boot (Firecracker)")),
+    ("The cell", "Runs ordinary Linux programs, each sealed off from the rest",
+     [True], "next", (f"{IDLE_KB:.0f} KB", "per idle cell")),
+    ("Native operations", "Pause, resume or copy a running agent in microseconds",
+     [True], "next", (us(FORK), "to fork a 50 MiB agent")),
+    ("Real programs", "Threads, networking, Python and every processor core",
+     [THREADS, LOOPBACK, CPY_WARM, SCALING], "next",
+     (us(CPY_WARM), "a Python request, warm") if CPY_WARM else None),
+    ("Proven with numbers", "Compared fairly with Linux, VMs and sandboxes; reviewed",
+     [GV_RUN, CALL_AT == "same VM", SECURITY], "next",
+     (times(RUN, LINUX_SPAWN).replace("≈ ", "") if LINUX_SPAWN else "",
+      "to start a program")),
+    ("A real agent", "Calls a model, explores branches, pauses between turns",
+     [has("net.tcp_rtt_us"), has("net.tcp_rtt_us", "cloud-hypervisor"),
+      has("cell.tcp_resume_us"), has("workload.agent_turn_us")], "now", None),
+    ("Scale and compatibility", "Thousands of busy agents and everyday software, safely shared",
+     [has("cell.shootdown_us"), has("density.wake_p99_us"),
+      has("workload.dynamic_run_us"), has("workload.node_warm_us")], "next", None),
+    ("The product", "Download a ready agent in two clicks, bring your own model",
+     [False], "vision", None),
+]
+
+
 def roadmap(t):
-    done = [
-        ("H0", "Boot and test harness", "QEMU, serial console, in-kernel tests"),
-        ("H1", "Memory, paging and heap", "higher half, W^X, CPU exceptions"),
-        ("H1.5", "Fast boot and benchmarks", "Firecracker, Cloud Hypervisor, CI gates"),
-        ("H1.6", "AArch64 as primary", "x86_64 kept as the second architecture"),
-        ("H2", "First cell", "user mode, ELF loader, Linux system calls"),
-        ("H3", "Scheduler and isolation", "address-space tags (ASIDs, PCIDs)"),
-        ("H4", "Suspend and resume", "lazy restore, pages back on first touch"),
-        ("H5", "Fork and templates", "copy-on-write down to the page tables"),
-        ("H6", "Real glibc programs", "differential tests against Linux"),
-        ("H7", "Comparisons", "against Firecracker and Linux, same machine"),
-        ("H8", "Files per cell", "carried by snapshots, forks and templates"),
-        ("H9", "Memory accounting, density", f"1,000 idle cells, {IDLE_KB:.0f} KB each"),
-        ("H10", "A real interpreter", "MicroPython as a cell, warm templates"),
-    ] + ([("H11", "gVisor comparison", "userspace-kernel sandboxes, same machine")]
-         if GV_RUN else []) + \
-        ([("H12", "Fair comparisons", "Linux processes in the same VM, CRIU")]
-         if CALL_AT == "same VM" else []) + \
-        ([("H13", "Adversarial security review", "12 findings fixed, docs/security.md")]
-         if SECURITY else []) + \
-        ([("H14", "Threads", f"pthreads, futexes; a thread in {us(THREADS)}")]
-         if THREADS else []) + \
-        ([("H15", "Sockets and network", "poll, epoll, TCP/UDP, virtio-net")]
-         if LOOPBACK else []) + \
-        ([("H16", "CPython in a cell", "CPython 3.13, warm templates")]
-         if CPY_WARM else []) + \
-        ([("H17", "Multi-core", f"up to 16 CPUs; cells {400 / SCALING:.1f}x faster on 4 vCPUs")]
-         if SCALING else [])
-    now = []
-    nxt = [("next", name, "") for name, done_ in [
-        ("gVisor comparison", GV_RUN), ("Fair comparisons", CALL_AT == "same VM"),
-        ("Adversarial security review", SECURITY), ("Threads", THREADS),
-        ("Sockets and network", LOOPBACK), ("CPython in a cell", CPY_WARM),
-        ("Multi-core", SCALING),
-        ("Dedicated benchmark machine", None)] if not done_]
-    rows = [(r, "done") for r in done] + [(r, "now") for r in now] + \
-        [(r, "next") for r in nxt]
-    rh, top = 34, 92
-    h = top + rh * len(rows) + 20
-    s = Svg(t, h, "Roadmap status",
-            f"{len(done)} milestones done, from the boot and test harness to "
-            f"{done[-1][1].lower()}. Next: "
-            + ", ".join(n for _, n, _ in nxt).lower() + ".")
-    s.text(24, 40, f"Proof of concept: {len(done)} milestones done", 20, weight=700)
-    # legend
-    for lx, kind, lab in [(24, "done", "Done"), (110, "next", "Next")]:
-        dot(s, t, lx + 9, 66, kind)
-        s.text(lx + 24, 71, lab, 14, fill=t["muted"])
+    rows = [(name, line, "done" if all(parts) else planned, fig)
+            for name, line, parts, planned, fig in STAGES]
+    ndone = sum(1 for r in rows if r[2] == "done")
+    rh, top = 62, 100
+    h = top + rh * len(rows) + 16
+    s = Svg(t, h, "Where Rhizo stands",
+            f"{ndone} of {len(rows)} stages done. " + " ".join(
+                f"{name} ({ {'done': 'done', 'now': 'in progress', 'next': 'next', 'vision': 'vision'}[k]}): "
+                f"{line.lower()}" + (f", {f[0]} {f[1]}" if f and k == "done" else "") + "."
+                for name, line, k, f in rows))
+    s.text(24, 40, f"Proof of concept: {ndone} of {len(rows)} stages done", 20, weight=700)
+    for lx, kind, lab in [(24, "done", "Done"), (110, "now", "In progress"),
+                          (236, "next", "Next"), (318, "vision", "Vision")]:
+        dot(s, t, lx + 9, 70, kind)
+        s.text(lx + 24, 75, lab, 14, fill=t["muted"])
     rail = 52
     s.line(rail, top + rh / 2, rail, top + rh * (len(rows) - 0.5), color=t["border"],
            arrow=False, sw=2)
     y = top
-    for (code, name, note), kind in rows:
+    for name, line, kind, fig in rows:
         cy = y + rh / 2
         dot(s, t, rail, cy, kind)
-        if code != "next":
-            s.text(76, cy + 5.5, code, 15, weight=700,
-                   fill=t["warn"] if kind == "now" else t["accent"])
-        s.text(76 if code == "next" else 128, cy + 5.5, name, 15,
-               weight=700 if kind == "now" else 400,
-               fill=t["muted"] if kind == "next" else t["text"])
-        if note:
-            s.text(416, cy + 5.5, note, 14, fill=t["muted"])
+        s.text(80, cy - 4, name, 16, weight=700,
+               fill=t["warn"] if kind == "now" else
+               t["muted"] if kind in ("next", "vision") else t["text"])
+        s.text(80, cy + 17, line, 14, fill=t["muted"])
+        if fig and kind == "done" and fig[0]:
+            s.text(776, cy - 4, fig[0], 16, weight=700, fill=t["accent"], anchor="end")
+            s.text(776, cy + 17, fig[1], 13, fill=t["muted"], anchor="end")
+        elif kind == "now":
+            s.text(776, cy - 4, "in progress", 14, weight=700, fill=t["warn"], anchor="end")
+        elif kind == "vision":
+            s.text(776, cy - 4, "vision", 14, weight=700, fill=t["muted"], anchor="end")
         y += rh
+    return s
+
+
+# ---------------------------------------------------------------- vision
+def tag(s, t, x, y, planned, word="measured"):
+    """A small 'planned' (or `word`) label ending at x."""
+    s.text(x, y, "planned" if planned else word, 12, weight=700,
+           fill=t["muted"] if planned else t["accent"], anchor="end")
+
+
+def layers(t):
+    s = Svg(t, 488, "Simple on top, deep below",
+            "Layers of Rhizo. On top, what the user sees: a two-click app and a "
+            "template catalog (both planned) and their agents. A line separates "
+            "it from what the user does not see: agent cells that are created, "
+            f"suspended, resumed and forked in microseconds (fork {us(FORK)}, "
+            f"resume {us(RESUME)}, measured), and below them the Rhizo kernel, "
+            "which rebuilds the foundations: memory, scheduler, isolation, "
+            "network and snapshots.")
+    s.text(24, 40, "Simple on top, deep below", 20, weight=700)
+    s.text(24, 64, "The user sees two clicks; the kernel does the hard work.", 14,
+           fill=t["muted"])
+    boxes = [("Two-click app", "pick, open, done", True),
+             ("Template catalog", "ready environments", True),
+             ("Your agents", "Python, tools, files", False)]
+    for i, (name, sub, planned) in enumerate(boxes):
+        x = 24 + i * 256
+        s.rect(x, 92, 240, 72, t["box"], t["boxline"], dash=planned)
+        s.text(x + 16, 122, name, 16, weight=700)
+        s.text(x + 16, 146, sub, 14, fill=t["muted"])
+        tag(s, t, x + 228, 122, planned, "built")
+    s.line(24, 192, 776, 192, color=t["boxline"], arrow=False, sw=1.5, dash=True)
+    s.text(24, 184, "what you see", 13, fill=t["muted"], weight=600)
+    s.text(24, 210, "what you don't", 13, fill=t["muted"], weight=600)
+    s.rect(24, 224, 752, 84, t["cell"], t["cellline"], rx=24, sw=2)
+    s.text(48, 258, "Agent cells", 18, weight=700)
+    s.text(48, 284, "create · suspend · resume · fork", 14, fill=t["muted"])
+    s.text(752, 258, f"fork {us(FORK)} · resume {us(RESUME)}", 16, weight=700,
+           fill=t["accent"], anchor="end")
+    tag(s, t, 752, 284, False)
+    s.line(400, 310, 400, 332)
+    s.rect(24, 334, 752, 116, t["box"], t["boxline"])
+    s.text(48, 364, "Rhizo kernel: the foundations, rebuilt for agents", 17, weight=700)
+    parts = ["Memory", "Scheduler", "Isolation", "Network", "Snapshots"]
+    bw = (720 - 4 * 12) / 5
+    for i, name in enumerate(parts):
+        x = 40 + i * (bw + 12)
+        s.rect(round(x, 1), 380, round(bw, 1), 52, t["bg"], t["boxline"], rx=6)
+        s.text(round(x + bw / 2, 1), 412, name, 15, anchor="middle")
+    s.text(24, 476, "Solid: built and measured. Dashed: planned.", 13, fill=t["muted"])
+    return s
+
+
+def clicks(t):
+    steps = [
+        ("Pick a template", "a ready Python, data or Node agent", None, None),
+        ("Download it", "one compressed snapshot", None, None),
+        ("Open an agent", "the snapshot resumes", us(RESUME), "resume from memory"),
+        ("Open ten more", "ten forks, no extra memory until they write",
+         us(FORK), "per fork"),
+        ("Suspend, come back later", "the agent waits as a snapshot",
+         f"{IDLE_KB:.0f} KB", "per idle agent"),
+    ]
+    rh, top = 76, 92
+    h = top + rh * len(steps) + 40
+    s = Svg(t, h, "Two clicks",
+            "The user's path: " + " ".join(
+                f"{i + 1}. {n}: {d}" + (f" ({v} {c}, measured)." if v else " (planned).")
+                for i, (n, d, v, c) in enumerate(steps)))
+    s.text(24, 40, "Two clicks", 20, weight=700)
+    s.text(24, 64, "What opening agents looks like for the user.", 14, fill=t["muted"])
+    s.line(52, top + 32, 52, top + rh * (len(steps) - 1) + 32, color=t["border"],
+           arrow=False, sw=2)
+    for i, (name, desc, value, cap) in enumerate(steps):
+        y = top + i * rh
+        s.rect(88, y, 688, 64, t["box"] if value is None else t["cell"],
+               t["boxline"] if value is None else t["cellline"], dash=value is None)
+        s.add(f'<circle cx="52" cy="{y + 32}" r="15" fill="{t["bg"]}" '
+              f'stroke="{t["cellline"] if value else t["pending"]}" stroke-width="2"/>')
+        s.text(52, y + 37, str(i + 1), 14, weight=700, anchor="middle")
+        s.text(108, y + 28, name, 16, weight=700)
+        s.text(108, y + 50, desc, 14, fill=t["muted"])
+        if value:
+            s.text(756, y + 28, value, 16, weight=700, fill=t["accent"], anchor="end")
+            s.text(756, y + 50, cap, 13, fill=t["muted"], anchor="end")
+        else:
+            tag(s, t, 756, y + 28, True)
+    s.text(24, h - 16, "Solid: built and measured. Dashed: planned.", 13, fill=t["muted"])
+    return s
+
+
+def model(t):
+    s = Svg(t, 470, "The model beside Rhizo",
+            "Local architecture. On the user's computer, any model runtime "
+            "(Ollama, llama.cpp, vLLM) runs on the host GPU or NPU with one shared "
+            "copy of the weights. Next to it, the Rhizo VM runs agent cells, "
+            "including a fork, and each agent keeps its own state in its cell. "
+            "Cells talk to the model over a local socket, and the Rhizo app "
+            "coordinates both. The app and the socket are planned.")
+    s.text(24, 40, "The model beside Rhizo", 20, weight=700)
+    s.text(24, 64, "Any model, any runtime, full GPU speed; agents in cells.", 14,
+           fill=t["muted"])
+    s.rect(24, 80, 752, 360, t["bg"], t["border"], rx=12)
+    s.text(40, 104, "Your computer (Linux, macOS or Windows)", 14, fill=t["muted"],
+           weight=600)
+    s.rect(40, 118, 720, 50, t["box"], t["boxline"], dash=True)
+    s.text(60, 149, "Rhizo app: starts the VM, picks the model, manages agents", 15,
+           weight=600)
+    tag(s, t, 744, 149, True)
+    s.line(160, 168, 160, 196)
+    s.line(580, 168, 580, 196)
+    # model side
+    s.rect(40, 198, 240, 88, t["box"], t["boxline"])
+    s.text(56, 226, "Model runtime", 16, weight=700)
+    s.text(56, 248, "Ollama, llama.cpp, vLLM…", 14, fill=t["muted"])
+    s.text(56, 270, "weights: one shared copy", 14, fill=t["muted"])
+    s.line(160, 286, 160, 316, arrow=False)
+    s.rect(40, 318, 240, 56, t["box"], t["boxline"])
+    s.text(160, 351, "GPU / NPU", 16, weight=700, anchor="middle")
+    # socket
+    s.line(290, 242, 398, 242, dash=True)
+    s.line(398, 262, 290, 262, dash=True)
+    s.text(344, 230, "local socket", 13, fill=t["muted"], anchor="middle", weight=600)
+    s.text(344, 284, "planned", 12, fill=t["muted"], anchor="middle", weight=700)
+    # Rhizo VM
+    s.rect(400, 198, 360, 226, t["cell"], t["cellline"], rx=16, sw=2)
+    s.text(416, 224, "Rhizo VM", 16, weight=700)
+    s.text(416, 246, "on KVM today; macOS and Windows planned", 13, fill=t["muted"])
+    for i, (name, sub) in enumerate([("agent A", "cell"), ("agent B", "cell"),
+                                     ("agent B′", "fork of B")]):
+        x = 416 + i * 112
+        s.rect(x, 262, 104, 64, t["bg"], t["cellline"], rx=28)
+        s.text(x + 52, 290, name, 15, weight=700, anchor="middle")
+        s.text(x + 52, 310, sub, 13, fill=t["muted"], anchor="middle")
+    s.text(416, 356, "Each agent's state (program, history,", 13, fill=t["muted"])
+    s.text(416, 376, "files) lives in its cell: that is what", 13, fill=t["muted"])
+    s.text(416, 396, "Rhizo suspends, resumes and forks.", 13, fill=t["muted"])
+    s.text(24, 460, "Solid: built today. Dashed: planned.", 13, fill=t["muted"])
+    return s
+
+
+def markets(t):
+    s = Svg(t, 340, "Two markets, one engine",
+            "Servers (B2B): density, cost per agent, an API. Local AI (B2C): an "
+            "app, downloadable templates, your own model. Both products are "
+            "planned; they run on the same engine, the Rhizo kernel and its "
+            "agent cells, which is built today.")
+    s.text(24, 40, "Two markets, one engine", 20, weight=700)
+    for x, title, lines in [
+            (24, "Servers (B2B)", ["many agents per machine", "low cost per agent",
+                                   "an API to create, fork, resume"]),
+            (412, "Your computer (B2C)", ["a two-click app", "downloadable templates",
+                                          "your own local model"])]:
+        s.rect(x, 64, 364, 140, t["box"], t["boxline"], dash=True)
+        s.text(x + 20, 94, title, 17, weight=700)
+        tag(s, t, x + 348, 94, True)
+        for i, ln in enumerate(lines):
+            s.text(x + 20, 124 + i * 24, "· " + ln, 14, fill=t["muted"])
+        s.line(x + 182, 204, x + 182, 236)
+    s.rect(24, 238, 752, 68, t["cell"], t["cellline"], rx=20, sw=2)
+    s.text(400, 268, "One engine: the Rhizo kernel and its agent cells", 17, weight=700,
+           anchor="middle")
+    s.text(400, 291, "density, security and compatibility serve both", 14,
+           fill=t["muted"], anchor="middle")
+    s.text(24, 322, "Solid: built today. Dashed: planned.", 13, fill=t["muted"])
     return s
 
 
@@ -486,13 +657,18 @@ def dot(s, t, x, y, kind):
         s.add(f'<circle cx="{x}" cy="{y}" r="9" fill="{t["warnfill"]}" '
               f'stroke="{t["warn"]}" stroke-width="2"/>')
         s.add(f'<path d="M{x} {y-7}A7 7 0 0 1 {x} {y+7}z" fill="{t["warn"]}"/>')
+    elif kind == "vision":
+        s.add(f'<circle cx="{x}" cy="{y}" r="8" fill="{t["bg"]}" '
+              f'stroke="{t["pending"]}" stroke-width="1.5" stroke-dasharray="1.5 2.5"/>')
+        s.add(f'<circle cx="{x}" cy="{y}" r="2.5" fill="{t["pending"]}"/>')
     else:
         s.add(f'<circle cx="{x}" cy="{y}" r="8" fill="{t["bg"]}" '
               f'stroke="{t["pending"]}" stroke-width="2" stroke-dasharray="3 2.5"/>')
 
 
 for name, fn in [("stack", stack), ("lifecycle", lifecycle), ("measured", chart),
-                 ("scorecard", scorecard), ("roadmap", roadmap)]:
+                 ("scorecard", scorecard), ("roadmap", roadmap), ("layers", layers),
+                 ("clicks", clicks), ("model", model), ("markets", markets)]:
     for theme, t in THEMES.items():
         fn(t).save(f"{name}{'-dark' if theme == 'dark' else ''}.svg")
 print("ok")

@@ -1,115 +1,62 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 826" width="800" height="826" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
-<title>Roadmap status</title>
-<desc>20 milestones done, from the boot and test harness to multi-core. Next: dedicated benchmark machine.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 612" width="800" height="612" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Where Rhizo stands</title>
+<desc>5 of 8 stages done. The foundations (done): boots in milliseconds on arm and x86, tested on every change, 8 ms to boot (Firecracker). The cell (done): runs ordinary linux programs, each sealed off from the rest, 21 KB per idle cell. Native operations (done): pause, resume or copy a running agent in microseconds, 1.37 µs to fork a 50 MiB agent. Real programs (done): threads, networking, python and every processor core, 3.71 ms a Python request, warm. Proven with numbers (done): compared fairly with linux, vms and sandboxes; reviewed, 73× faster to start a program. A real agent (in progress): calls a model, explores branches, pauses between turns. Scale and compatibility (next): thousands of busy agents and everyday software, safely shared. The product (vision): download a ready agent in two clicks, bring your own model.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
-<rect class="bg" x="0.5" y="0.5" width="799" height="825" rx="12" fill="#ffffff" stroke="#d0d7de"/>
-<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 20 milestones done</text>
-<circle cx="33" cy="66" r="9" fill="#16784f"/>
-<path d="M28.5 66l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="48" y="71" font-size="14" fill="#4b5c55">Done</text>
-<circle cx="119" cy="66" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="134" y="71" font-size="14" fill="#4b5c55">Next</text>
-<line x1="52" y1="109.0" x2="52" y2="789.0" stroke="#d0d7de" stroke-width="2"/>
-<circle cx="52" cy="109.0" r="9" fill="#16784f"/>
-<path d="M47.5 109.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="114.5" font-size="15" fill="#146c4a" font-weight="700">H0</text>
-<text x="128" y="114.5" font-size="15" fill="#0e2a20">Boot and test harness</text>
-<text x="416" y="114.5" font-size="14" fill="#4b5c55">QEMU, serial console, in-kernel tests</text>
-<circle cx="52" cy="143.0" r="9" fill="#16784f"/>
-<path d="M47.5 143.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="148.5" font-size="15" fill="#146c4a" font-weight="700">H1</text>
-<text x="128" y="148.5" font-size="15" fill="#0e2a20">Memory, paging and heap</text>
-<text x="416" y="148.5" font-size="14" fill="#4b5c55">higher half, W^X, CPU exceptions</text>
-<circle cx="52" cy="177.0" r="9" fill="#16784f"/>
-<path d="M47.5 177.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="182.5" font-size="15" fill="#146c4a" font-weight="700">H1.5</text>
-<text x="128" y="182.5" font-size="15" fill="#0e2a20">Fast boot and benchmarks</text>
-<text x="416" y="182.5" font-size="14" fill="#4b5c55">Firecracker, Cloud Hypervisor, CI gates</text>
-<circle cx="52" cy="211.0" r="9" fill="#16784f"/>
-<path d="M47.5 211.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="216.5" font-size="15" fill="#146c4a" font-weight="700">H1.6</text>
-<text x="128" y="216.5" font-size="15" fill="#0e2a20">AArch64 as primary</text>
-<text x="416" y="216.5" font-size="14" fill="#4b5c55">x86_64 kept as the second architecture</text>
-<circle cx="52" cy="245.0" r="9" fill="#16784f"/>
-<path d="M47.5 245.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="250.5" font-size="15" fill="#146c4a" font-weight="700">H2</text>
-<text x="128" y="250.5" font-size="15" fill="#0e2a20">First cell</text>
-<text x="416" y="250.5" font-size="14" fill="#4b5c55">user mode, ELF loader, Linux system calls</text>
-<circle cx="52" cy="279.0" r="9" fill="#16784f"/>
-<path d="M47.5 279.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="284.5" font-size="15" fill="#146c4a" font-weight="700">H3</text>
-<text x="128" y="284.5" font-size="15" fill="#0e2a20">Scheduler and isolation</text>
-<text x="416" y="284.5" font-size="14" fill="#4b5c55">address-space tags (ASIDs, PCIDs)</text>
-<circle cx="52" cy="313.0" r="9" fill="#16784f"/>
-<path d="M47.5 313.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="318.5" font-size="15" fill="#146c4a" font-weight="700">H4</text>
-<text x="128" y="318.5" font-size="15" fill="#0e2a20">Suspend and resume</text>
-<text x="416" y="318.5" font-size="14" fill="#4b5c55">lazy restore, pages back on first touch</text>
-<circle cx="52" cy="347.0" r="9" fill="#16784f"/>
-<path d="M47.5 347.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="352.5" font-size="15" fill="#146c4a" font-weight="700">H5</text>
-<text x="128" y="352.5" font-size="15" fill="#0e2a20">Fork and templates</text>
-<text x="416" y="352.5" font-size="14" fill="#4b5c55">copy-on-write down to the page tables</text>
-<circle cx="52" cy="381.0" r="9" fill="#16784f"/>
-<path d="M47.5 381.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="386.5" font-size="15" fill="#146c4a" font-weight="700">H6</text>
-<text x="128" y="386.5" font-size="15" fill="#0e2a20">Real glibc programs</text>
-<text x="416" y="386.5" font-size="14" fill="#4b5c55">differential tests against Linux</text>
-<circle cx="52" cy="415.0" r="9" fill="#16784f"/>
-<path d="M47.5 415.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="420.5" font-size="15" fill="#146c4a" font-weight="700">H7</text>
-<text x="128" y="420.5" font-size="15" fill="#0e2a20">Comparisons</text>
-<text x="416" y="420.5" font-size="14" fill="#4b5c55">against Firecracker and Linux, same machine</text>
-<circle cx="52" cy="449.0" r="9" fill="#16784f"/>
-<path d="M47.5 449.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="454.5" font-size="15" fill="#146c4a" font-weight="700">H8</text>
-<text x="128" y="454.5" font-size="15" fill="#0e2a20">Files per cell</text>
-<text x="416" y="454.5" font-size="14" fill="#4b5c55">carried by snapshots, forks and templates</text>
-<circle cx="52" cy="483.0" r="9" fill="#16784f"/>
-<path d="M47.5 483.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="488.5" font-size="15" fill="#146c4a" font-weight="700">H9</text>
-<text x="128" y="488.5" font-size="15" fill="#0e2a20">Memory accounting, density</text>
-<text x="416" y="488.5" font-size="14" fill="#4b5c55">1,000 idle cells, 21 KB each</text>
-<circle cx="52" cy="517.0" r="9" fill="#16784f"/>
-<path d="M47.5 517.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="522.5" font-size="15" fill="#146c4a" font-weight="700">H10</text>
-<text x="128" y="522.5" font-size="15" fill="#0e2a20">A real interpreter</text>
-<text x="416" y="522.5" font-size="14" fill="#4b5c55">MicroPython as a cell, warm templates</text>
-<circle cx="52" cy="551.0" r="9" fill="#16784f"/>
-<path d="M47.5 551.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="556.5" font-size="15" fill="#146c4a" font-weight="700">H11</text>
-<text x="128" y="556.5" font-size="15" fill="#0e2a20">gVisor comparison</text>
-<text x="416" y="556.5" font-size="14" fill="#4b5c55">userspace-kernel sandboxes, same machine</text>
-<circle cx="52" cy="585.0" r="9" fill="#16784f"/>
-<path d="M47.5 585.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="590.5" font-size="15" fill="#146c4a" font-weight="700">H12</text>
-<text x="128" y="590.5" font-size="15" fill="#0e2a20">Fair comparisons</text>
-<text x="416" y="590.5" font-size="14" fill="#4b5c55">Linux processes in the same VM, CRIU</text>
-<circle cx="52" cy="619.0" r="9" fill="#16784f"/>
-<path d="M47.5 619.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="624.5" font-size="15" fill="#146c4a" font-weight="700">H13</text>
-<text x="128" y="624.5" font-size="15" fill="#0e2a20">Adversarial security review</text>
-<text x="416" y="624.5" font-size="14" fill="#4b5c55">12 findings fixed, docs/security.md</text>
-<circle cx="52" cy="653.0" r="9" fill="#16784f"/>
-<path d="M47.5 653.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="658.5" font-size="15" fill="#146c4a" font-weight="700">H14</text>
-<text x="128" y="658.5" font-size="15" fill="#0e2a20">Threads</text>
-<text x="416" y="658.5" font-size="14" fill="#4b5c55">pthreads, futexes; a thread in 0.74 µs</text>
-<circle cx="52" cy="687.0" r="9" fill="#16784f"/>
-<path d="M47.5 687.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="692.5" font-size="15" fill="#146c4a" font-weight="700">H15</text>
-<text x="128" y="692.5" font-size="15" fill="#0e2a20">Sockets and network</text>
-<text x="416" y="692.5" font-size="14" fill="#4b5c55">poll, epoll, TCP/UDP, virtio-net</text>
-<circle cx="52" cy="721.0" r="9" fill="#16784f"/>
-<path d="M47.5 721.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="726.5" font-size="15" fill="#146c4a" font-weight="700">H16</text>
-<text x="128" y="726.5" font-size="15" fill="#0e2a20">CPython in a cell</text>
-<text x="416" y="726.5" font-size="14" fill="#4b5c55">CPython 3.13, warm templates</text>
-<circle cx="52" cy="755.0" r="9" fill="#16784f"/>
-<path d="M47.5 755.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="76" y="760.5" font-size="15" fill="#146c4a" font-weight="700">H17</text>
-<text x="128" y="760.5" font-size="15" fill="#0e2a20">Multi-core</text>
-<text x="416" y="760.5" font-size="14" fill="#4b5c55">up to 16 CPUs; cells 1.9x faster on 4 vCPUs</text>
-<circle cx="52" cy="789.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
-<text x="76" y="794.5" font-size="15" fill="#4b5c55">Dedicated benchmark machine</text>
+<rect class="bg" x="0.5" y="0.5" width="799" height="611" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Proof of concept: 5 of 8 stages done</text>
+<circle cx="33" cy="70" r="9" fill="#16784f"/>
+<path d="M28.5 70l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="48" y="75" font-size="14" fill="#4b5c55">Done</text>
+<circle cx="119" cy="70" r="9" fill="#fff4d6" stroke="#875a00" stroke-width="2"/>
+<path d="M119 63A7 7 0 0 1 119 77z" fill="#875a00"/>
+<text x="134" y="75" font-size="14" fill="#4b5c55">In progress</text>
+<circle cx="245" cy="70" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="260" y="75" font-size="14" fill="#4b5c55">Next</text>
+<circle cx="327" cy="70" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="1.5 2.5"/>
+<circle cx="327" cy="70" r="2.5" fill="#8c959f"/>
+<text x="342" y="75" font-size="14" fill="#4b5c55">Vision</text>
+<line x1="52" y1="131.0" x2="52" y2="565.0" stroke="#d0d7de" stroke-width="2"/>
+<circle cx="52" cy="131.0" r="9" fill="#16784f"/>
+<path d="M47.5 131.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="80" y="127.0" font-size="16" fill="#0e2a20" font-weight="700">The foundations</text>
+<text x="80" y="148.0" font-size="14" fill="#4b5c55">Boots in milliseconds on Arm and x86, tested on every change</text>
+<text x="776" y="127.0" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">8 ms</text>
+<text x="776" y="148.0" font-size="13" fill="#4b5c55" text-anchor="end">to boot (Firecracker)</text>
+<circle cx="52" cy="193.0" r="9" fill="#16784f"/>
+<path d="M47.5 193.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="80" y="189.0" font-size="16" fill="#0e2a20" font-weight="700">The cell</text>
+<text x="80" y="210.0" font-size="14" fill="#4b5c55">Runs ordinary Linux programs, each sealed off from the rest</text>
+<text x="776" y="189.0" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">21 KB</text>
+<text x="776" y="210.0" font-size="13" fill="#4b5c55" text-anchor="end">per idle cell</text>
+<circle cx="52" cy="255.0" r="9" fill="#16784f"/>
+<path d="M47.5 255.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="80" y="251.0" font-size="16" fill="#0e2a20" font-weight="700">Native operations</text>
+<text x="80" y="272.0" font-size="14" fill="#4b5c55">Pause, resume or copy a running agent in microseconds</text>
+<text x="776" y="251.0" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">1.37 µs</text>
+<text x="776" y="272.0" font-size="13" fill="#4b5c55" text-anchor="end">to fork a 50 MiB agent</text>
+<circle cx="52" cy="317.0" r="9" fill="#16784f"/>
+<path d="M47.5 317.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="80" y="313.0" font-size="16" fill="#0e2a20" font-weight="700">Real programs</text>
+<text x="80" y="334.0" font-size="14" fill="#4b5c55">Threads, networking, Python and every processor core</text>
+<text x="776" y="313.0" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">3.71 ms</text>
+<text x="776" y="334.0" font-size="13" fill="#4b5c55" text-anchor="end">a Python request, warm</text>
+<circle cx="52" cy="379.0" r="9" fill="#16784f"/>
+<path d="M47.5 379.0l3 3l6-6" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="80" y="375.0" font-size="16" fill="#0e2a20" font-weight="700">Proven with numbers</text>
+<text x="80" y="396.0" font-size="14" fill="#4b5c55">Compared fairly with Linux, VMs and sandboxes; reviewed</text>
+<text x="776" y="375.0" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">73× faster</text>
+<text x="776" y="396.0" font-size="13" fill="#4b5c55" text-anchor="end">to start a program</text>
+<circle cx="52" cy="441.0" r="9" fill="#fff4d6" stroke="#875a00" stroke-width="2"/>
+<path d="M52 434.0A7 7 0 0 1 52 448.0z" fill="#875a00"/>
+<text x="80" y="437.0" font-size="16" fill="#875a00" font-weight="700">A real agent</text>
+<text x="80" y="458.0" font-size="14" fill="#4b5c55">Calls a model, explores branches, pauses between turns</text>
+<text x="776" y="437.0" font-size="14" fill="#875a00" font-weight="700" text-anchor="end">in progress</text>
+<circle cx="52" cy="503.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="2" stroke-dasharray="3 2.5"/>
+<text x="80" y="499.0" font-size="16" fill="#4b5c55" font-weight="700">Scale and compatibility</text>
+<text x="80" y="520.0" font-size="14" fill="#4b5c55">Thousands of busy agents and everyday software, safely shared</text>
+<circle cx="52" cy="565.0" r="8" fill="#ffffff" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="1.5 2.5"/>
+<circle cx="52" cy="565.0" r="2.5" fill="#8c959f"/>
+<text x="80" y="561.0" font-size="16" fill="#4b5c55" font-weight="700">The product</text>
+<text x="80" y="582.0" font-size="14" fill="#4b5c55">Download a ready agent in two clicks, bring your own model</text>
+<text x="776" y="561.0" font-size="14" fill="#4b5c55" font-weight="700" text-anchor="end">vision</text>
 </svg>
