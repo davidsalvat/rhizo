@@ -213,6 +213,9 @@ pub trait Services: Console {
     fn realtime_ns(&mut self) -> u64;
     /// Fills `out` with random bytes.
     fn random(&mut self, out: &mut [u8]);
+    /// Whether the cell may store `bytes` more of kernel-held data (file
+    /// blocks) without eating into the memory the kernel keeps for itself.
+    fn can_store(&mut self, bytes: u64) -> bool;
 }
 
 /// What the cell does after a system call.
