@@ -1,7 +1,7 @@
 # multi-core Specification
 
 ## Purpose
-TBD - created by archiving change add-smp-boot. Update Purpose after archive.
+How the kernel brings every CPU the firmware lists online and runs cells on all of them in parallel, each cell on one CPU at a time, with the same behavior as one CPU.
 
 ## Requirements
 

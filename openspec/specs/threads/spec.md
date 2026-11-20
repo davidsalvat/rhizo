@@ -1,7 +1,7 @@
 # threads Specification
 
 ## Purpose
-TBD - created by archiving change add-threads. Update Purpose after archive.
+How a cell runs several threads (`clone`, futexes, thread pointers) with Linux semantics, and how snapshots, forks and templates carry every thread.
 
 ## Requirements
 
