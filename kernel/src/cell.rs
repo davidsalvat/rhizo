@@ -19,8 +19,8 @@ use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
-use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{PageSize, PageTable};
+use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_sched::{SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::Snapshot;
 
@@ -72,11 +72,11 @@ fn files_of(snapshot: &Snapshot) -> Fs {
 
 impl Frames for KernelFrames {
     fn alloc(&mut self) -> Option<u64> {
-        memory::with_frames(|f| f.alloc()).flatten()
+        memory::alloc_for_cell(1)
     }
 
     fn alloc_large(&mut self) -> Option<u64> {
-        memory::with_frames(|f| f.alloc_large()).flatten()
+        memory::alloc_for_cell((LARGE_PAGE_SIZE / FRAME_SIZE) as usize)
     }
 
     fn free(&mut self, phys: u64, size: PageSize) {
@@ -143,6 +143,10 @@ impl Services for KernelServices<'_> {
     fn realtime_ns(&mut self) -> u64 {
         // No real-time clock yet: the epoch is the boot.
         self.monotonic_ns()
+    }
+
+    fn can_store(&mut self, bytes: u64) -> bool {
+        memory::cells_may_take(bytes)
     }
 
     fn random(&mut self, out: &mut [u8]) {
@@ -227,6 +231,14 @@ impl Lazy {
         self.pending[i] = false;
         self.left -= 1;
         true
+    }
+
+    /// Bytes of the pages still pending.
+    fn pending_bytes(&self) -> u64 {
+        (0..self.pending.len())
+            .filter(|&i| self.pending[i])
+            .map(|i| self.snapshot.page(i).size.bytes())
+            .sum()
     }
 
     /// Drops pending pages inside `addr..addr + len` (the cell unmapped them).
@@ -415,6 +427,19 @@ impl Host {
     /// Suspends live cell `id` into a snapshot and frees all its memory
     /// (spec `snapshots`). Its captured output stays with the host.
     pub fn suspend(&mut self, id: u32) -> Option<Snapshot> {
+        // The snapshot lives in the kernel heap, and pages still pending from
+        // a lazy resume need frames first: refuse what would not fit
+        // (design D2 of `add-memory-accounting`); the cell keeps running.
+        let live = self.sched.find(|l| l.cell.id == id)?;
+        let mut bytes = 0;
+        PageTable::<Format>::from_root(live.cell.root)
+            .for_each_lower_leaf(&DirectMap, &mut |_, _, size, _| bytes += size.bytes());
+        if let Some(lazy) = &live.lazy {
+            bytes += 2 * lazy.pending_bytes();
+        }
+        if !memory::cells_may_take(bytes) {
+            return None;
+        }
         let (mut live, wake) = self.sched.remove_with_wake(|l| l.cell.id == id)?;
         let pt = PageTable::<Format>::from_root(live.cell.root);
         if let Some(lazy) = live.lazy.as_mut() {
@@ -429,16 +454,27 @@ impl Host {
     }
 
     /// Resumes `snapshot` as a new live cell (new identifier and tag) that
-    /// continues exactly where the snapshot was taken.
+    /// continues exactly where the snapshot was taken. Gives the snapshot
+    /// back if memory cannot hold the cell (eagerly: all its pages).
     pub fn resume(
         &mut self,
         snapshot: Snapshot,
         mode: Resume,
         capture: bool,
         echo: bool,
-    ) -> Option<u32> {
+    ) -> Result<u32, Snapshot> {
+        if mode == Resume::Eager {
+            let bytes = (0..snapshot.pages())
+                .map(|i| snapshot.page(i).size.bytes())
+                .sum();
+            if !memory::cells_may_take(bytes) {
+                return Err(snapshot);
+            }
+        }
+        let Ok(pt) = PageTable::<Format>::new(&mut DirectMap, &mut || KernelFrames.alloc()) else {
+            return Err(snapshot);
+        };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let pt = PageTable::<Format>::new(&mut DirectMap, &mut || KernelFrames.alloc()).ok()?;
         if user::CELL_ROOT_HAS_KERNEL_HALF {
             pt.share_upper_half(&mut DirectMap, &memory::kernel_tables());
         }
@@ -464,7 +500,7 @@ impl Host {
             0 => self.sched.add(live),
             ns => self.sched.sleep(live, now_ns() + ns),
         }
-        Some(id)
+        Ok(id)
     }
 
     /// Page-table frames of the own half of live cell `id`.
@@ -641,14 +677,37 @@ impl Host {
             ) else {
                 break;
             };
-            children.push(child.cell.id);
-            self.requeue(child, wake);
+            children.push(child);
         }
         // The parent lost write access to everything it shares: drop what its
         // TLB still caches.
         user::flush_user(parent.cell.root, parent.tag);
         self.requeue(parent, wake);
-        (children.len() == n).then_some(children)
+        if children.len() < n {
+            // All or nothing: the children made so far never ran.
+            for child in &children {
+                self.discard(child);
+            }
+            return None;
+        }
+        let ids = children.iter().map(|c| c.cell.id).collect();
+        for child in children {
+            self.requeue(child, wake);
+        }
+        Some(ids)
+    }
+
+    /// Frees the memory and tag of a cell that never ran, leaving no trace
+    /// (no [`Finished`]); the caller drops it.
+    fn discard(&mut self, live: &Live) {
+        if live.tag != 0 {
+            self.tags.free(live.tag);
+        }
+        space::destroy(
+            PageTable::<Format>::from_root(live.cell.root),
+            &mut DirectMap,
+            &mut KernelFrames,
+        );
     }
 
     /// A new live cell sharing `cell`'s memory copy-on-write.
@@ -859,6 +918,11 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-workload cold_ns={cold} warm_ns={warm}"
     );
+    let (idle, suspended) = density();
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-density idle_bytes={idle} suspended_bytes={suspended}"
+    );
     let (write_read, fork_files) = files();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -979,6 +1043,48 @@ fn fork_and_templates() -> [u64; 4] {
         frames,
         robust(&mut template),
     ]
+}
+
+/// Memory per idle cell, from 1000 forks of a template of `idle` each run
+/// into its sleep (the second of two identical rounds, so the heap has
+/// grown its tables already), and the snapshot size of one idle cell
+/// (design D3 of `add-memory-accounting`).
+#[cfg(feature = "bench-cell")]
+fn density() -> (u64, u64) {
+    const N: usize = 1000;
+    let image = test_image("idle");
+    let round = || {
+        let mut host = Host::new();
+        let template = host.spawn(image, &[b"idle"], true, false).expect("spawn");
+        while host.output(template) != Some(b"idle\n") {
+            host.step();
+        }
+        assert!(host.freeze(template));
+        let before = memory::free_bytes();
+        let ids: Vec<u32> = (0..N)
+            .map(|_| {
+                host.spawn_from_template(template, false, false)
+                    .expect("fork")
+            })
+            .collect();
+        for _ in 0..N {
+            host.step(); // each child runs into its sleep
+        }
+        let per_cell = (before - memory::free_bytes()) / N as u64;
+        for id in ids {
+            host.kill(id);
+        }
+        per_cell
+    };
+    round();
+    let idle = round();
+    let mut host = Host::new();
+    let id = host.spawn(image, &[b"idle"], true, false).expect("spawn");
+    while host.output(id) != Some(b"idle\n") {
+        host.step();
+    }
+    let suspended = host.suspend(id).map_or(0, |s| s.as_bytes().len() as u64);
+    (idle, suspended)
 }
 
 /// Rounds of a repeated measure (design D4 of `add-cell-files`).

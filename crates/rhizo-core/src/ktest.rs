@@ -57,11 +57,16 @@ mod tests {
     use rhizo_hal::testing::RecordingConsole;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Calls of `counted`, which only `all_passing_tests_report_ok_and_success`
+    /// runs: tests run in parallel, so a counter shared with other tests
+    /// would race.
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    fn passing() {
+    fn counted() {
         CALLS.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn passing() {}
 
     fn failing() {
         panic!("assertion failed");
@@ -71,7 +76,7 @@ mod tests {
     fn all_passing_tests_report_ok_and_success() {
         let before = CALLS.load(Ordering::SeqCst);
         let mut console = RecordingConsole::new();
-        let cases = [ktest_case!(passing), ktest_case!(passing)];
+        let cases = [ktest_case!(counted), ktest_case!(counted)];
 
         let status = run(&mut console, &[&cases]);
 
@@ -80,8 +85,8 @@ mod tests {
         assert_eq!(
             console.text(),
             "running 2 tests\n\
-             test passing ... ok\n\
-             test passing ... ok\n\
+             test counted ... ok\n\
+             test counted ... ok\n\
              test result: ok. 2 passed\n"
         );
     }

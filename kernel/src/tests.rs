@@ -85,6 +85,8 @@ macro_rules! suite {
             ktest_case!(forked_cells_have_their_own_files),
             ktest_case!(template_files_are_inherited),
             ktest_case!(file_data_takes_its_own_size),
+            ktest_case!(memory_pressure_fails_cells_not_the_kernel),
+            ktest_case!(a_thousand_idle_cells),
             $(ktest_case!($extra),)*
         ]
     };
@@ -1025,4 +1027,88 @@ fn file_data_takes_its_own_size() {
     assert!(used >= 16 << 20, "the file is held: {used} bytes");
     assert!(used < 17 << 20, "{used} bytes for 16 MiB of file data");
     host.run(|_| false);
+}
+
+// --- H9: memory accounting and density -------------------------------------
+
+/// Memory that is not leaked: frames free in the allocator plus frames the
+/// kernel heap holds (it keeps small-object pages for reuse, by design), and
+/// the heap's live allocations.
+fn memory_balance() -> (u64, usize) {
+    let heap = crate::heap::stats();
+    (
+        memory::free_bytes() + heap.pages as u64 * FRAME_SIZE,
+        heap.live,
+    )
+}
+
+/// Twenty cells each wanting 8 MiB of memory, or 16 MiB of files, at once:
+/// more than memory holds. Some are refused (`FAIL` from their own checks,
+/// or a fault), the rest finish, the kernel keeps running, and nothing
+/// leaks: every frame is back in the allocator or in the heap, and every
+/// heap allocation is freed.
+fn memory_pressure_fails_cells_not_the_kernel() {
+    fn flood(name: &str, args: &[&[u8]]) -> (usize, usize) {
+        let mut host = Host::new();
+        let ids: Vec<u32> = (0..20).map(|_| spawn(&mut host, name, args)).collect();
+        host.run(|_| false);
+        let (mut done, mut refused) = (0, 0);
+        for id in ids {
+            match ended(&host, id) {
+                (Ending::Exit(0), _) => done += 1,
+                (Ending::Exit(1), out) if out.contains("FAIL") => refused += 1,
+                (Ending::Fault, _) => refused += 1,
+                other => panic!("{name}: unexpected ending {other:?}"),
+            }
+        }
+        (done, refused)
+    }
+    for (name, args) in [
+        ("ballast", &[&b"all"[..], b"8"][..]),
+        ("filer", &[&b"16"[..]][..]),
+    ] {
+        let before = memory_balance();
+        let (done, refused) = flood(name, args);
+        assert!(
+            done > 0 && refused > 0,
+            "{name}: {done} finished, {refused} refused"
+        );
+        assert_eq!(memory_balance(), before, "{name}: nothing leaked");
+    }
+}
+
+/// 1000 idle cells forked from one template, all live at once, each costing
+/// a few pages beyond what it shares; killing them returns all of it.
+fn a_thousand_idle_cells() {
+    const N: usize = 1000;
+    fn round() -> u64 {
+        let mut host = Host::new();
+        let template = spawn(&mut host, "idle", &[]);
+        while host.output(template) != Some(b"idle\n") {
+            host.step();
+        }
+        assert!(host.freeze(template));
+        let before = memory::free_bytes();
+        let ids: Vec<u32> = (0..N)
+            .map(|_| {
+                host.spawn_from_template(template, false, false)
+                    .expect("fork")
+            })
+            .collect();
+        // Each child runs once, into its sleep (one more step would wait an
+        // hour for the first to wake).
+        for _ in 0..N {
+            host.step();
+        }
+        assert_eq!(host.live(), N);
+        let per_cell = (before - memory::free_bytes()) / N as u64;
+        for id in ids {
+            assert!(host.kill(id));
+        }
+        per_cell
+    }
+    let before = memory_balance();
+    let per_cell = round();
+    assert!(per_cell < 64 << 10, "{per_cell} bytes per idle cell");
+    assert_eq!(memory_balance(), before, "nothing leaked");
 }

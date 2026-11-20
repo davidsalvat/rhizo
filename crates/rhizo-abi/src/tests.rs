@@ -11,6 +11,8 @@ struct FakeServices {
     console: RecordingConsole,
     log: String,
     clock: u64,
+    /// Bytes the cell may still store (`None`: unlimited).
+    room: Option<u64>,
 }
 
 impl Console for FakeServices {
@@ -31,6 +33,16 @@ impl Services for FakeServices {
     }
     fn random(&mut self, out: &mut [u8]) {
         out.fill(0xa5);
+    }
+    fn can_store(&mut self, bytes: u64) -> bool {
+        match &mut self.room {
+            None => true,
+            Some(room) if *room >= bytes => {
+                *room -= bytes;
+                true
+            }
+            Some(_) => false,
+        }
     }
 }
 
@@ -554,4 +566,23 @@ fn x86_64_path_calls() {
     assert_eq!(w.call(21, &[to, 0]).0, -ENOENT);
     // A path that never ends faults.
     assert_eq!(w.call(2, &[0xdead_0000, 0]).0, -EFAULT);
+}
+
+#[test]
+fn file_writes_stop_when_the_kernel_refuses_memory() {
+    let mut w = World::new(Arch::Aarch64);
+    let p = name(&mut w, "/f");
+    let fd = w.call(OPENAT, &[AT_FDCWD, p, 0x42]).0 as u64;
+    w.services.room = Some(4096);
+    w.poke(DATA, &[1; 4000]);
+    assert_eq!(w.call(WRITE, &[fd, DATA, 4000]).0, 4000);
+    assert_eq!(w.call(WRITE, &[fd, DATA, 4000]).0, -28, "ENOSPC");
+    w.services.room = Some(100);
+    assert_eq!(w.call(WRITE, &[fd, DATA, 4000]).0, -28);
+    assert_eq!(w.call(80, &[fd, DATA + 0x800]).0, 0);
+    assert_eq!(
+        w.peek(DATA + 0x800 + 48, 8),
+        4000u64.to_le_bytes(),
+        "nothing more written"
+    );
 }

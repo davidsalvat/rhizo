@@ -19,6 +19,7 @@ const O_CLOEXEC: u64 = 0x8_0000;
 const PATH_MAX: usize = 4096;
 const ESPIPE: i64 = 29;
 const ERANGE: i64 = 34;
+const ENOSPC: i64 = 28;
 
 fn err(e: Error) -> i64 {
     -e.errno()
@@ -140,6 +141,12 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     while done < len {
         let at = addr.wrapping_add(done);
         let n = piece(at, len - done);
+        if !cx.services.can_store(n as u64) {
+            if done == 0 {
+                return -ENOSPC;
+            }
+            break;
+        }
         let (pt, mem, pager) = (&cx.pt, &mut *cx.mem, &mut *cx.pager);
         let wrote = cx.fs.write_with(fd, start + done, n, |dst| {
             memory::read(pt, mem, pager, at, dst).is_ok()

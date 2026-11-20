@@ -365,6 +365,7 @@ fn measure_cells(
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
     let mut fork_pt_frames = None;
+    let mut density = None;
     for &vmm in &opts.vmms {
         if vmm.unavailable_reason(opts.accel).is_some() {
             continue; // already reported by the boot benchmark
@@ -403,6 +404,9 @@ fn measure_cells(
                         fork_touch.push(f.fork_touch_ns as f64 / 1000.0);
                         template.push(f.spawn_from_template_ns as f64 / 1000.0);
                         fork_pt_frames = Some(f.fork_pt_frames);
+                    }
+                    if let Some(d) = parse_density_line(&out.output) {
+                        density = Some(d);
                     }
                     if let Some((w, f)) = parse_files_line(&out.output) {
                         file_write_read.push(w as f64 / 1000.0);
@@ -466,6 +470,14 @@ fn measure_cells(
     if let Some(bytes) = snapshot_bytes {
         metrics.push(deterministic("cell.snapshot_bytes", "bytes", bytes as f64));
     }
+    if let Some((idle, suspended)) = density {
+        metrics.push(deterministic("cell.idle_bytes", "bytes", idle as f64));
+        metrics.push(deterministic(
+            "cell.suspended_bytes",
+            "bytes",
+            suspended as f64,
+        ));
+    }
     if let Some(frames) = fork_pt_frames {
         metrics.push(deterministic(
             "cell.fork_pt_frames",
@@ -474,6 +486,19 @@ fn measure_cells(
         ));
     }
     Ok(())
+}
+
+/// `(idle_bytes, suspended_bytes)` of the density line of a `bench-cell`
+/// kernel.
+fn parse_density_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-density "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("idle_bytes")?, field("suspended_bytes")?))
 }
 
 /// `(write_read_ns, fork_ns)` of the files line of a `bench-cell` kernel.
@@ -1345,6 +1370,15 @@ mod tests {
             parse_workload_line("x\nrhizo-workload cold_ns=900 warm_ns=30\n"),
             Some((900, 30))
         );
+    }
+
+    #[test]
+    fn density_line_is_parsed() {
+        assert_eq!(
+            parse_density_line("rhizo-density idle_bytes=20480 suspended_bytes=40000\n"),
+            Some((20_480, 40_000))
+        );
+        assert_eq!(parse_density_line("rhizo-density idle_bytes=1\n"), None);
     }
 
     #[test]

@@ -79,4 +79,4 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
 /// Test cells that never end on their own (they are killed by the tests):
 /// not run by the differential check.
 #[allow(dead_code)]
-pub const ENDLESS: &[&str] = &["spin", "mapper"];
+pub const ENDLESS: &[&str] = &["spin", "mapper", "idle"];

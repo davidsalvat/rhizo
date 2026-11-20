@@ -204,6 +204,36 @@ pub fn free_bytes() -> u64 {
     with_frames(|f| f.free_frames() as u64 * FRAME_SIZE).unwrap_or(0)
 }
 
+/// Frames kept for the kernel heap (design D1 of `add-memory-accounting`):
+/// 8 MiB, or an eighth of memory if that is less.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+fn reserve_frames(f: &FrameAllocator<'_>) -> usize {
+    (f.usable_frames() / 8).min((8 << 20) / FRAME_SIZE as usize)
+}
+
+/// Whether cells may take `bytes` more (frames or heap) and still leave the
+/// kernel its reserve.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn cells_may_take(bytes: u64) -> bool {
+    with_frames(|f| f.free_frames() as u64 >= reserve_frames(f) as u64 + bytes.div_ceil(FRAME_SIZE))
+        .unwrap_or(false)
+}
+
+/// Allocates `count` contiguous frames for a cell, keeping the reserve.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn alloc_for_cell(count: usize) -> Option<u64> {
+    with_frames(|f| {
+        if f.free_frames() < reserve_frames(f) + count {
+            return None;
+        }
+        match count {
+            1 => f.alloc(),
+            _ => f.alloc_large(),
+        }
+    })
+    .flatten()
+}
+
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "used by in-kernel tests; cells use it from H2")
