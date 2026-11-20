@@ -290,37 +290,82 @@ fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
         c
     };
     cmd.args(["--kill-after=5", "60"]).arg(runsc);
-    cmd.arg("--root").arg(root).arg("--network=none");
+    // Cgroups are left alone (CI runners differ), and every command logs to
+    // `<root>/../logs/`, quoted when a command fails.
+    let mut logs = root
+        .parent()
+        .unwrap_or(root)
+        .join("logs")
+        .display()
+        .to_string();
+    logs.push('/');
+    cmd.arg("--root")
+        .arg(root)
+        .args(["--network=none", "--ignore-cgroups", "--debug"])
+        .arg(format!("--debug-log={logs}"));
     cmd.stdin(Stdio::null());
     cmd
 }
 
-/// Runs `cmd`; its output on failure, as the error.
-fn checked(cmd: &mut Command, what: &str) -> Result<String> {
+/// Runs `cmd`; on failure, its output and the end of gVisor's newest debug
+/// logs (in `logs`) as the error.
+fn checked(cmd: &mut Command, what: &str, logs: &Path) -> Result<String> {
     let out = cmd
         .output()
         .map_err(|e| format!("cannot run runsc ({what}): {e}"))?;
-    if out.status.code() == Some(124) {
-        return Err(format!("runsc {what} did not finish within 60 s"));
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
-    if !out.status.success() {
-        return Err(format!(
-            "runsc {what} failed ({}): {}{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    let mut files: Vec<_> = std::fs::read_dir(logs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort();
+    let mut tail = String::new();
+    for (_, path) in files.iter().rev().take(2) {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let start = text.len().saturating_sub(1200);
+        let start = (start..text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        tail += &format!("\n--- {}:\n{}", path.display(), &text[start..]);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let how = if matches!(out.status.code(), Some(124 | 137)) || out.status.code().is_none() {
+        "did not finish within 60 s".to_string()
+    } else {
+        format!("failed ({})", out.status)
+    };
+    Err(format!(
+        "runsc {what} {how}: {}{}{tail}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
 }
 
-/// The OCI configuration for a bundle running `/idle`: no terminal (it runs
-/// detached), read-only root, no network.
+/// An OCI bundle in `dir` whose root holds `program` as `/prog`.
+fn gvisor_bundle(runsc: &Path, dir: &Path, program: &Path, logs: &Path) -> Result<String> {
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).map_err(|e| e.to_string())?;
+    std::fs::copy(program, rootfs.join("prog")).map_err(|e| e.to_string())?;
+    checked(
+        Command::new(runsc).arg("spec").current_dir(dir),
+        "spec",
+        logs,
+    )?;
+    let spec = std::fs::read_to_string(dir.join("config.json")).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("config.json"), gvisor_config(&spec)?).map_err(|e| e.to_string())?;
+    Ok(dir.display().to_string())
+}
+
+/// The OCI configuration for a bundle running `/prog`: no terminal (it may
+/// run detached), read-only root.
 pub fn gvisor_config(spec: &str) -> Result<String> {
     let mut v: serde_json::Value =
         serde_json::from_str(spec).map_err(|e| format!("bad runsc spec output: {e}"))?;
     v["process"]["terminal"] = serde_json::Value::Bool(false);
-    v["process"]["args"] = serde_json::json!(["/idle"]);
+    v["process"]["args"] = serde_json::json!(["/prog"]);
     v["root"]["readonly"] = serde_json::Value::Bool(true);
     serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
 }
@@ -331,46 +376,43 @@ pub fn gvisor_config(spec: &str) -> Result<String> {
 /// runs), each over `runs` runs after one warm-up.
 pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> {
     let runsc = runsc()?;
-    let version = checked(Command::new(&runsc).arg("--version"), "--version")?;
     let dir = scratch.join(format!("gvisor-{}", std::process::id()));
+    let version = checked(Command::new(&runsc).arg("--version"), "--version", &dir)?;
     let root = dir.join("state");
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let logs = dir.join("logs");
+    std::fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
     let result = (|| {
         // A sandbox running `hello` to its exit.
+        let hello = gvisor_bundle(&runsc, &dir.join("hello"), &cells.join("hello"), &logs)?;
         let mut run = Vec::new();
         for i in 0..=runs {
+            let id = format!("rz-hello-{i}");
             let t0 = Instant::now();
             let out = checked(
-                runsc_cmd(&runsc, &root).arg("do").arg(cells.join("hello")),
-                "do",
+                runsc_cmd(&runsc, &root).args(["run", "--bundle", &hello, &id]),
+                "run (hello)",
+                &logs,
             )?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let _ = runsc_cmd(&runsc, &root)
+                .args(["delete", "--force", &id])
+                .output();
             if !out.contains("hello from a cell") {
-                return Err(format!("runsc do printed {out:?}"));
+                return Err(format!("runsc run printed {out:?}"));
             }
             if i > 0 {
                 run.push(ms);
             }
         }
         // Checkpoint a sandbox of `idle` once, then restore new ones from it.
-        let bundle = dir.join("bundle");
-        let rootfs = bundle.join("rootfs");
-        std::fs::create_dir_all(&rootfs).map_err(|e| e.to_string())?;
-        std::fs::copy(cells.join("idle"), rootfs.join("idle")).map_err(|e| e.to_string())?;
-        checked(
-            Command::new(&runsc).arg("spec").current_dir(&bundle),
-            "spec",
-        )?;
-        let spec =
-            std::fs::read_to_string(bundle.join("config.json")).map_err(|e| e.to_string())?;
-        std::fs::write(bundle.join("config.json"), gvisor_config(&spec)?)
-            .map_err(|e| e.to_string())?;
+        let bundle_arg = gvisor_bundle(&runsc, &dir.join("idle"), &cells.join("idle"), &logs)?;
         let image = dir.join("image");
         std::fs::create_dir_all(&image).map_err(|e| e.to_string())?;
-        let bundle_arg = bundle.display().to_string();
         checked(
             runsc_cmd(&runsc, &root).args(["run", "--detach", "--bundle", &bundle_arg, "rz-base"]),
-            "run",
+            "run --detach (idle)",
+            &logs,
         )?;
         checked(
             runsc_cmd(&runsc, &root)
@@ -379,6 +421,7 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
                 .arg(&image)
                 .arg("rz-base"),
             "checkpoint",
+            &logs,
         )?;
         let _ = runsc_cmd(&runsc, &root)
             .args(["delete", "--force", "rz-base"])
@@ -395,8 +438,13 @@ pub fn gvisor(cells: &Path, runs: usize, scratch: &Path) -> Result<Vec<Metric>> 
                     .arg(&image)
                     .args(["--bundle", &bundle_arg, &id]),
                 "restore",
+                &logs,
             )?;
-            let state = checked(runsc_cmd(&runsc, &root).args(["state", &id]), "state")?;
+            let state = checked(
+                runsc_cmd(&runsc, &root).args(["state", &id]),
+                "state",
+                &logs,
+            )?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let _ = runsc_cmd(&runsc, &root)
                 .args(["delete", "--force", &id])
@@ -428,12 +476,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gvisor_bundle_runs_idle_detached_without_a_terminal() {
+    fn gvisor_bundle_runs_its_program_without_a_terminal() {
         let spec = r#"{"ociVersion":"1.0.0","process":{"terminal":true,"args":["sh"],"cwd":"/"},
             "root":{"path":"rootfs","readonly":false}}"#;
         let v: serde_json::Value = serde_json::from_str(&gvisor_config(spec).unwrap()).unwrap();
         assert_eq!(v["process"]["terminal"], false);
-        assert_eq!(v["process"]["args"], serde_json::json!(["/idle"]));
+        assert_eq!(v["process"]["args"], serde_json::json!(["/prog"]));
         assert_eq!(v["root"]["readonly"], true);
         assert_eq!(v["root"]["path"], "rootfs", "the rest is kept");
         assert!(gvisor_config("not json").is_err());
