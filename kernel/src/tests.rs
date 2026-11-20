@@ -2026,6 +2026,7 @@ fn a_cell_on_several_cpus_survives_suspend_and_fork() {
     let mut host = Host::new();
     let mut id = spawn(&mut host, "parsum", &[b"4", b"96"]);
     let mut children = Vec::new();
+    let mut output = Vec::new();
     let mut round = 0;
     loop {
         // Asked before the run starts, then after each slice.
@@ -2040,7 +2041,7 @@ fn a_cell_on_several_cpus_survives_suspend_and_fork() {
             continue;
         }
         let snapshot = host.suspend(id).expect("live");
-        assert_eq!(ended(&host, id), (Ending::Suspended, "".into()));
+        output.extend_from_slice(&host.finished(id).expect("suspended").output);
         let snapshot =
             Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE).expect("valid");
         id = host
@@ -2049,8 +2050,16 @@ fn a_cell_on_several_cpus_survives_suspend_and_fork() {
     }
     assert!(round >= 2, "stopped only {round} times");
     host.run(|_| false);
-    for id in children.iter().copied().chain([id]) {
-        assert_eq!(ended(&host, id), (Ending::Exit(0), SUM.into()), "cell {id}");
+    let (ending, last) = ended(&host, id);
+    assert_eq!(ending, Ending::Exit(0));
+    output.extend_from_slice(last.as_bytes());
+    assert_eq!(alloc::string::String::from_utf8_lossy(&output), SUM);
+    for id in children {
+        assert_eq!(
+            ended(&host, id),
+            (Ending::Exit(0), SUM.into()),
+            "child {id}"
+        );
     }
     assert_eq!(host.live(), 0);
 }
