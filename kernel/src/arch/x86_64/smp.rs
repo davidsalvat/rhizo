@@ -66,8 +66,9 @@ rhizo_ap_pm:
     rdmsr
     orl $((1 << 0) | (1 << 8) | (1 << 11)), %eax
     wrmsr
-    movl %cr0, %eax                     /* PG, WP */
-    orl $0x80010001, %eax
+    movl %cr0, %eax                     /* PG, WP; caches on (CD, NW */
+    orl $0x80010001, %eax               /* are set after INIT) */
+    andl $0x9fffffff, %eax
     movl %eax, %cr0
     ljmpl *(rhizo_ap_lm_target - rhizo_ap_trampoline)(%ebx)
 
@@ -89,13 +90,15 @@ rhizo_ap_lm:
     hlt
     jmp 1b
 
+    /* Accessed bits preset: loading a selector would otherwise write
+       the descriptor, and the page is read-only once paging is on. */
     .balign 8
     .global rhizo_ap_gdt
 rhizo_ap_gdt:
     .quad 0
-    .quad 0x00cf9a000000ffff            /* 0x08: 32-bit code */
-    .quad 0x00cf92000000ffff            /* 0x10: data */
-    .quad 0x00af9a000000ffff            /* 0x18: 64-bit code */
+    .quad 0x00cf9b000000ffff            /* 0x08: 32-bit code */
+    .quad 0x00cf93000000ffff            /* 0x10: data */
+    .quad 0x00af9b000000ffff            /* 0x18: 64-bit code */
     .global rhizo_ap_gdt_ptr
 rhizo_ap_gdt_ptr:
     .word 31
