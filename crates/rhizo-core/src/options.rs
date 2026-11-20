@@ -155,9 +155,10 @@ fn endpoint(value: &[u8]) -> Option<([u8; 4], u16)> {
     Some((ipv4(&value[..colon])?, port))
 }
 
-/// Calls `f(base, size)` for every `virtio_mmio.device=SIZE@BASE:IRQ` of
-/// `cmdline` (`SIZE` in bytes, or with a `K` or `M` suffix).
-pub fn virtio_mmio_devices(cmdline: &[u8], mut f: impl FnMut(u64, u64)) {
+/// Calls `f(base, size, irq)` for every `virtio_mmio.device=SIZE@BASE:IRQ`
+/// of `cmdline` (`SIZE` in bytes, or with a `K` or `M` suffix; `irq` the
+/// interrupt line, if given and valid).
+pub fn virtio_mmio_devices(cmdline: &[u8], mut f: impl FnMut(u64, u64, Option<u32>)) {
     for word in cmdline.split(|b| b.is_ascii_whitespace()) {
         let Some(value) = word.strip_prefix(b"virtio_mmio.device=") else {
             continue;
@@ -166,14 +167,19 @@ pub fn virtio_mmio_devices(cmdline: &[u8], mut f: impl FnMut(u64, u64)) {
             continue;
         };
         let (size, rest) = (&value[..at], &value[at + 1..]);
-        let base = &rest[..rest.iter().position(|&b| b == b':').unwrap_or(rest.len())];
+        let colon = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+        let base = &rest[..colon];
+        let irq = rest
+            .get(colon + 1..)
+            .and_then(number)
+            .and_then(|n| u32::try_from(n).ok());
         let (size, unit) = match size.last() {
             Some(b'K' | b'k') => (&size[..size.len() - 1], 1 << 10),
             Some(b'M' | b'm') => (&size[..size.len() - 1], 1 << 20),
             _ => (size, 1),
         };
         if let (Some(size), Some(base)) = (number(size), number(base)) {
-            f(base, size * unit);
+            f(base, size * unit, irq);
         }
     }
 }
@@ -361,10 +367,17 @@ mod tests {
         let mut found = Vec::new();
         virtio_mmio_devices(
             b"console=e9 virtio_mmio.device=512@0xfeb00e00:12 virtio_mmio.device=4K@0xd0000000:5 \
-              virtio_mmio.device=bad",
-            |base, size| found.push((base, size)),
+              virtio_mmio.device=1K@0x1000 virtio_mmio.device=bad",
+            |base, size, irq| found.push((base, size, irq)),
         );
-        assert_eq!(found, [(0xfeb0_0e00, 512), (0xd000_0000, 4096)]);
+        assert_eq!(
+            found,
+            [
+                (0xfeb0_0e00, 512, Some(12)),
+                (0xd000_0000, 4096, Some(5)),
+                (0x1000, 1024, None)
+            ]
+        );
     }
 
     fn write_str(mem: &mut FakePhysicalMemory, addr: u64, bytes: &[u8]) {

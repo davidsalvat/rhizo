@@ -31,6 +31,9 @@ struct Device {
     queues: [QueueState; 2],
     sent: Vec<Vec<u8>>,
     notifies: [usize; 2],
+    /// Interrupt status (bit 0: a used buffer), and interrupts raised.
+    isr: u32,
+    interrupts: usize,
 }
 
 impl Device {
@@ -48,6 +51,8 @@ impl Device {
             queues: [QueueState::default(); 2],
             sent: Vec::new(),
             notifies: [0; 2],
+            isr: 0,
+            interrupts: 0,
         }
     }
 
@@ -134,6 +139,15 @@ impl Device {
         self.mem.write_bytes(addr, &[0; HDR]);
         self.mem.write_bytes(addr + HDR as u64, frame);
         self.give_back(0, id, (HDR + frame.len()) as u32);
+        // An interrupt, unless the driver asked for none (an edge only when
+        // the status was clear: the line was low).
+        let s = self.queues[0];
+        if self.read16(s.avail) & AVAIL_F_NO_INTERRUPT == 0 {
+            if self.isr == 0 {
+                self.interrupts += 1;
+            }
+            self.isr |= 1;
+        }
         true
     }
 }
@@ -152,6 +166,7 @@ impl DeviceRegisters for Regs {
             reg::QUEUE_NUM_MAX => 64,
             reg::QUEUE_READY => d.queues[d.queue_sel].ready,
             reg::STATUS => d.status,
+            reg::INTERRUPT_STATUS => d.isr,
             reg::CONFIG => {
                 u32::from_le_bytes([0x52, 0x54, 0, 0x12, 0x34, 0x56][..4].try_into().unwrap())
             }
@@ -183,6 +198,7 @@ impl DeviceRegisters for Regs {
             reg::QUEUE_DEVICE_LOW => set_low(&mut d.queues[q].used, value),
             reg::QUEUE_DEVICE_HIGH => set_high(&mut d.queues[q].used, value),
             reg::QUEUE_NOTIFY => d.notify(value as usize),
+            reg::INTERRUPT_ACK => d.isr &= !value,
             _ => {}
         }
     }
@@ -415,6 +431,28 @@ fn received_frames_come_in_order_and_buffers_are_reused() {
     assert_eq!(got.len(), 200, "more frames than buffers");
     assert_eq!(got[199], [9, 19, 1, 2, 3]);
     assert_eq!(got[0], [0, 0, 1, 2, 3]);
+}
+
+#[test]
+fn received_frames_interrupt_once_asked_and_until_acknowledged() {
+    let (card, dev) = card(Device::new());
+    let mut card = card.unwrap();
+    let mut got = 0;
+    assert!(dev.borrow_mut().deliver(&[1; 60]));
+    assert_eq!(dev.borrow().interrupts, 0, "polling: no interrupt");
+    card.enable_interrupts();
+    assert!(dev.borrow_mut().deliver(&[2; 60]));
+    assert!(dev.borrow_mut().deliver(&[3; 60]));
+    assert_eq!(dev.borrow().interrupts, 1, "the line stays up");
+    card.acknowledge();
+    assert_eq!(dev.borrow().isr, 0);
+    while card.recv(&mut |_| got += 1) {}
+    assert_eq!(got, 3);
+    assert!(dev.borrow_mut().deliver(&[4; 60]));
+    assert_eq!(dev.borrow().interrupts, 2, "a frame after the acknowledgment");
+    card.acknowledge();
+    card.acknowledge();
+    assert_eq!(dev.borrow().isr, 0, "acknowledging nothing changes nothing");
 }
 
 #[test]

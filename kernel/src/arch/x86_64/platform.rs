@@ -82,7 +82,7 @@ pub fn map_devices(
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
     let mut buf = [0u8; 1024];
-    rhizo_core::options::virtio_mmio_devices(cmdline(&mut buf), |base, _| f(base));
+    rhizo_core::options::virtio_mmio_devices(cmdline(&mut buf), |base, _, _| f(base));
 }
 
 /// The ECAM base of PCI bus 0 from the ACPI MCFG (QEMU `q35`, Cloud

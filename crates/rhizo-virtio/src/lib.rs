@@ -7,7 +7,9 @@
 //! split virtqueue, and the result is a [`NetLink`]. Registers are reached
 //! through [`DeviceRegisters`] and the rings and buffers through
 //! [`PhysicalMemory`]: the driver runs on the host against a simulated
-//! device. It polls: the device is asked for no interrupts.
+//! device. It polls; [`VirtioNet::enable_interrupts`] also asks the device
+//! to interrupt when a frame arrives, so a waiting CPU wakes for it (design
+//! D1 of `add-virtio-interrupts`).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -33,6 +35,8 @@ pub mod reg {
     pub const QUEUE_NUM: usize = 0x038;
     pub const QUEUE_READY: usize = 0x044;
     pub const QUEUE_NOTIFY: usize = 0x050;
+    pub const INTERRUPT_STATUS: usize = 0x060;
+    pub const INTERRUPT_ACK: usize = 0x064;
     pub const STATUS: usize = 0x070;
     pub const QUEUE_DESC_LOW: usize = 0x080;
     pub const QUEUE_DESC_HIGH: usize = 0x084;
@@ -434,6 +438,30 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
             used: 0,
             bufs,
         })
+    }
+}
+
+impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
+    /// Asks the device to interrupt when it hands over a received frame
+    /// (the transmit queue stays silent: its buffers come back as frames
+    /// are sent).
+    pub fn enable_interrupts(&mut self) {
+        let flags = self.rx.frame + AVAIL_AT;
+        self.mem.write_bytes(flags, &0u16.to_le_bytes());
+        self.regs.barrier();
+    }
+
+    /// Acknowledges the device's interrupt, before the driver looks at the
+    /// rings: a frame that arrives later raises it again. A virtio-mmio
+    /// device holds its line until its status is acknowledged; an MSI-X
+    /// message needs nothing.
+    pub fn acknowledge(&mut self) {
+        if let Transport::Mmio(r) = &mut self.regs {
+            let status = r.read32(reg::INTERRUPT_STATUS);
+            if status != 0 {
+                r.write32(reg::INTERRUPT_ACK, status);
+            }
+        }
     }
 }
 

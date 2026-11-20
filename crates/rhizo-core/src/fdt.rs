@@ -333,8 +333,31 @@ impl<'a> Fdt<'a> {
         compatible: &[u8],
         mut f: impl FnMut(Region),
     ) -> Result<(), FdtError> {
-        self.compatible_regs(compatible, 0, |r| {
+        self.compatible_regs(compatible, 0, |r, _| {
             f(r);
+            true
+        })
+    }
+
+    /// Like [`for_each_compatible`](Self::for_each_compatible), with the
+    /// node's first interrupt as a GIC interrupt identifier (`interrupts`
+    /// with three cells: an SPI `n` is 32 + `n`, a PPI 16 + `n`), if any.
+    pub fn for_each_compatible_irq(
+        &self,
+        compatible: &[u8],
+        mut f: impl FnMut(Region, Option<u32>),
+    ) -> Result<(), FdtError> {
+        self.compatible_regs(compatible, 0, |r, irqs| {
+            let cell = |i: usize| {
+                let b = irqs?.get(i * 4..i * 4 + 4)?;
+                Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            let irq = match (cell(0), cell(1)) {
+                (Some(0), Some(n)) => n.checked_add(32),
+                (Some(1), Some(n)) => n.checked_add(16),
+                _ => None,
+            };
+            f(r, irq);
             true
         })
     }
@@ -348,7 +371,7 @@ impl<'a> Fdt<'a> {
         index: usize,
     ) -> Result<Option<Region>, FdtError> {
         let mut found = None;
-        self.compatible_regs(compatible, index, |r| {
+        self.compatible_regs(compatible, index, |r, _| {
             found = Some(r);
             false
         })?;
@@ -409,11 +432,12 @@ impl<'a> Fdt<'a> {
         &self,
         compatible: &[u8],
         index: usize,
-        mut f: impl FnMut(Region) -> bool,
+        mut f: impl FnMut(Region, Option<&'a [u8]>) -> bool,
     ) -> Result<(), FdtError> {
         let mut cells = [DEFAULT_CELLS; MAX_DEPTH + 1];
         let mut matches = [false; MAX_DEPTH + 1];
         let mut regs: [Option<&'a [u8]>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
+        let mut irqs: [Option<&'a [u8]>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
         self.walk(|event| {
             match event {
                 Event::Begin { depth, .. } => {
@@ -422,6 +446,7 @@ impl<'a> Fdt<'a> {
                     cells[depth + 1] = DEFAULT_CELLS;
                     matches[depth + 1] = false;
                     regs[depth + 1] = None;
+                    irqs[depth + 1] = None;
                 }
                 Event::Prop { depth, name, value } => match name {
                     b"#address-cells" => {
@@ -430,6 +455,7 @@ impl<'a> Fdt<'a> {
                     b"#size-cells" => cells[depth].size = read_cells(value, 1).unwrap_or(1) as u32,
                     b"compatible" => matches[depth] = list_contains(value, compatible),
                     b"reg" => regs[depth] = Some(value),
+                    b"interrupts" => irqs[depth] = Some(value),
                     _ => {}
                 },
                 Event::End { depth } => {
@@ -439,7 +465,7 @@ impl<'a> Fdt<'a> {
                     {
                         let parent = cells[depth];
                         if let Some(region) = nth_reg(reg, parent.address, parent.size, index)
-                            && !f(region)
+                            && !f(region, irqs[node])
                         {
                             return false;
                         }
@@ -475,6 +501,20 @@ mod tests {
             base: 0x0a00_0000,
             size: 0x200
         }));
+    }
+
+    #[test]
+    fn gives_the_interrupt_of_each_virtio_mmio_transport() {
+        let dt = Fdt::new(QEMU_VIRT).unwrap();
+        let mut found = Vec::new();
+        dt.for_each_compatible_irq(b"virtio,mmio", |r, irq| found.push((r.base, irq)))
+            .unwrap();
+        assert_eq!(found.len(), 32);
+        // QEMU `virt`: transport n at 0x0a00_0000 + n * 0x200 on SPI 16 + n.
+        for (base, irq) in found {
+            let n = ((base - 0x0a00_0000) / 0x200) as u32;
+            assert_eq!(irq, Some(32 + 16 + n), "transport at {base:#x}");
+        }
     }
 
     #[test]
