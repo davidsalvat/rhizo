@@ -133,7 +133,9 @@ What makes the boundary hold:
 - **Cost.** Every benchmark run measures `cell.syscall_ns` and, with KPTI
   forced on, `cell.syscall_kpti_ns`, `cell.switch_kpti_ns` and
   `cell.run_kpti_us` (`bench/README.md`), so the price is known even on
-  runners whose CPUs do not need it.
+  runners whose CPUs do not need it. On CI's KVM runners (nested
+  virtualization, PCIDs): a system call 70 → 187 ns, a switch between
+  cells 234 → 281 ns (+20 %), spawn to exit of `hello` 7.0 → 7.2 µs.
 - **Left open.** Spectre v1/v2, L1TF, MDS and their mitigations; the entry
   pages themselves are readable by speculation (they hold per-CPU stack
   pointers and the cell's own saved RDI, no other cell's data).
