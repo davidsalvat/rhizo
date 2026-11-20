@@ -3,13 +3,20 @@
 //! refused instead of trusted.
 //!
 //! Layout: `cwd: u32`, then the inode table (`count: u32`, per slot a
-//! present byte, then `kind: u8` (0 directory, 1 file), `links: u32`, and
-//! for a directory `parent: u32`, `entries: u32`, each `len: u16, name,
-//! ino: u32`; for a file `size: u64`, `blocks: u32`, each a present byte and
-//! 4096 bytes when present), the descriptions (`count: u32`, per slot a
-//! present byte, then `target: u32` (`u32::MAX` for the console),
-//! `offset: u64`, `flags: u32`, `refs: u32`) and the descriptors (`count:
-//! u32`, per slot a present byte, then `desc: u32`, `cloexec: u8`).
+//! present byte, then `kind: u8` (0 directory, 1 file, 2 socket),
+//! `links: u32`, and for a directory `parent: u32`, `entries: u32`, each
+//! `len: u16, name, ino: u32`; for a file `size: u64`, `blocks: u32`, each
+//! a present byte and 4096 bytes when present; for a socket `name: u64`),
+//! the descriptions (`count: u32`, per slot a present byte, then the target
+//! (`tag: u8`: 0 console, 1 inode, 2 pipe read end, 3 pipe write end,
+//! 4 event counter, 5 `epoll`, 6 socket; then `index: u32` but for the
+//! console), `offset: u64`, `flags: u32`, `refs: u32`), the descriptors
+//! (`count: u32`, per slot a present byte, then `desc: u32`, `cloexec: u8`)
+//! and the objects (`count: u32`, per slot a present byte, then `kind: u8`:
+//! 0 pipe, `readers: u32`, `writers: u32`, `len: u32`, bytes; 1 event
+//! counter, `count: u64`, `semaphore: u8`; 2 `epoll`, `entries: u32`, each
+//! `fd: u32`, `events: u32`, `data: u64`). A socket target's index is the
+//! kernel's business (a snapshot's socket record).
 
 use super::*;
 
@@ -22,7 +29,7 @@ pub enum DecodeError {
     Corrupt,
 }
 
-const CONSOLE: u32 = u32::MAX;
+use io::Object;
 
 struct Reader<'a>(&'a [u8]);
 
@@ -108,6 +115,11 @@ impl Tables {
                         out.extend_from_slice(&ino.to_le_bytes());
                     }
                 }
+                Node::Socket(name) => {
+                    out.push(2);
+                    out.extend_from_slice(&inode.links.to_le_bytes());
+                    out.extend_from_slice(&name.to_le_bytes());
+                }
                 Node::File(file) => {
                     out.push(1);
                     out.extend_from_slice(&inode.links.to_le_bytes());
@@ -132,7 +144,19 @@ impl Tables {
                 continue;
             };
             out.push(1);
-            out.extend_from_slice(&d.target.unwrap_or(CONSOLE).to_le_bytes());
+            let (tag, index) = match d.target {
+                Target::Console => (0, None),
+                Target::Inode(i) => (1, Some(i)),
+                Target::Pipe(i, false) => (2, Some(i)),
+                Target::Pipe(i, true) => (3, Some(i)),
+                Target::Event(i) => (4, Some(i)),
+                Target::Epoll(i) => (5, Some(i)),
+                Target::Socket(h) => (6, Some(h)),
+            };
+            out.push(tag);
+            if let Some(i) = index {
+                out.extend_from_slice(&i.to_le_bytes());
+            }
             out.extend_from_slice(&d.offset.to_le_bytes());
             out.extend_from_slice(&d.flags.to_le_bytes());
             out.extend_from_slice(&d.refs.to_le_bytes());
@@ -146,6 +170,43 @@ impl Tables {
                     out.push(*cloexec as u8);
                 }
                 None => out.push(0),
+            }
+        }
+        out.extend_from_slice(&(self.objects.len() as u32).to_le_bytes());
+        for slot in &self.objects {
+            let Some(object) = slot else {
+                out.push(0);
+                continue;
+            };
+            out.push(1);
+            match &**object {
+                Object::Pipe {
+                    data,
+                    readers,
+                    writers,
+                } => {
+                    out.push(0);
+                    out.extend_from_slice(&readers.to_le_bytes());
+                    out.extend_from_slice(&writers.to_le_bytes());
+                    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    let (a, b) = data.as_slices();
+                    out.extend_from_slice(a);
+                    out.extend_from_slice(b);
+                }
+                Object::Event { count, semaphore } => {
+                    out.push(1);
+                    out.extend_from_slice(&count.to_le_bytes());
+                    out.push(*semaphore as u8);
+                }
+                Object::Epoll(list) => {
+                    out.push(2);
+                    out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+                    for e in list {
+                        out.extend_from_slice(&e.fd.to_le_bytes());
+                        out.extend_from_slice(&e.events.to_le_bytes());
+                        out.extend_from_slice(&e.data.to_le_bytes());
+                    }
+                }
             }
         }
     }
@@ -201,6 +262,7 @@ impl Tables {
                     }
                     Node::File(File { size, blocks })
                 }
+                2 => Node::Socket(r.u64()?),
                 _ => return Err(DecodeError::Corrupt),
             };
             inodes.push(Some(Arc::new(Inode { links, node })));
@@ -212,9 +274,15 @@ impl Tables {
                 descs.push(None);
                 continue;
             }
-            let target = match r.u32()? {
-                CONSOLE => None,
-                ino => Some(ino),
+            let target = match r.u8()? {
+                0 => Target::Console,
+                1 => Target::Inode(r.u32()?),
+                2 => Target::Pipe(r.u32()?, false),
+                3 => Target::Pipe(r.u32()?, true),
+                4 => Target::Event(r.u32()?),
+                5 => Target::Epoll(r.u32()?),
+                6 => Target::Socket(r.u32()?),
+                _ => return Err(DecodeError::Corrupt),
             };
             descs.push(Some(Desc {
                 target,
@@ -232,6 +300,46 @@ impl Tables {
                 None
             });
         }
+        let count = r.count()?;
+        let mut objects = Vec::with_capacity(count);
+        for _ in 0..count {
+            if !r.flag()? {
+                objects.push(None);
+                continue;
+            }
+            let object = match r.u8()? {
+                0 => {
+                    let (readers, writers) = (r.u32()?, r.u32()?);
+                    let len = r.u32()? as usize;
+                    if len > io::PIPE_CAP {
+                        return Err(DecodeError::Corrupt);
+                    }
+                    let data = r.take(len)?.iter().copied().collect();
+                    Object::Pipe {
+                        data,
+                        readers,
+                        writers,
+                    }
+                }
+                1 => Object::Event {
+                    count: r.u64()?,
+                    semaphore: r.flag()?,
+                },
+                2 => {
+                    let mut list = Vec::new();
+                    for _ in 0..r.count()? {
+                        list.push(Interest {
+                            fd: r.u32()?,
+                            events: r.u32()?,
+                            data: r.u64()?,
+                        });
+                    }
+                    Object::Epoll(list)
+                }
+                _ => return Err(DecodeError::Corrupt),
+            };
+            objects.push(Some(Arc::new(object)));
+        }
         if !r.0.is_empty() {
             return Err(DecodeError::Truncated);
         }
@@ -240,7 +348,7 @@ impl Tables {
             .flatten()
             .map(|i| match &i.node {
                 Node::File(f) => f.held(),
-                Node::Dir { .. } => 0,
+                _ => 0,
             })
             .sum();
         Ok(Tables {
@@ -249,6 +357,8 @@ impl Tables {
             fds,
             cwd,
             used,
+            objects,
+            released: Vec::new(),
         })
     }
 
@@ -290,6 +400,7 @@ impl Tables {
             }
         }
         let mut open = vec![false; self.inodes.len()];
+        let mut ends = vec![[0u32; 2]; self.objects.len()];
         let mut refs = vec![0u32; self.descs.len()];
         for &(d, _) in self.fds.iter().flatten() {
             match refs.get_mut(d as usize) {
@@ -302,11 +413,60 @@ impl Tables {
             if desc.refs == 0 || desc.refs != refs[d] {
                 return false;
             }
-            if let Some(ino) = desc.target {
-                match self.inodes.get(ino as usize) {
-                    Some(Some(_)) => open[ino as usize] = true,
+            match desc.target {
+                Target::Inode(ino) => match self.inodes.get(ino as usize) {
+                    Some(Some(i)) if !matches!(i.node, Node::Socket(_)) => {
+                        open[ino as usize] = true;
+                    }
                     _ => return false,
+                },
+                Target::Pipe(i, write) => match ends.get_mut(i as usize) {
+                    Some(e) => e[write as usize] += 1,
+                    None => return false,
+                },
+                Target::Event(i) | Target::Epoll(i) => match ends.get_mut(i as usize) {
+                    Some(e) => e[0] += 1,
+                    None => return false,
+                },
+                Target::Console | Target::Socket(_) => {}
+            }
+            let kind_ok = match (desc.target, self.objects.get(desc_object(desc.target))) {
+                (Target::Pipe(..), Some(Some(o))) => matches!(**o, Object::Pipe { .. }),
+                (Target::Event(_), Some(Some(o))) => matches!(**o, Object::Event { .. }),
+                (Target::Epoll(_), Some(Some(o))) => matches!(**o, Object::Epoll(_)),
+                (Target::Pipe(..) | Target::Event(_) | Target::Epoll(_), _) => false,
+                _ => true,
+            };
+            if !kind_ok {
+                return false;
+            }
+        }
+        // Each object is held by its descriptions, and only by them.
+        for (i, slot) in self.objects.iter().enumerate() {
+            let held = ends[i];
+            let ok = match slot.as_deref() {
+                None => held == [0, 0],
+                Some(Object::Pipe {
+                    data,
+                    readers,
+                    writers,
+                }) => {
+                    [*readers, *writers] == held
+                        && readers + writers > 0
+                        && data.len() <= io::PIPE_CAP
                 }
+                Some(Object::Event { count, .. }) => held == [1, 0] && *count < u64::MAX,
+                Some(Object::Epoll(list)) => {
+                    held == [1, 0]
+                        && list.iter().all(|e| (e.fd as usize) < FD_MAX)
+                        && list
+                            .iter()
+                            .enumerate()
+                            .all(|(n, e)| list[..n].iter().all(|o| o.fd != e.fd))
+                }
+            };
+            if !ok {
+                return false;
             }
         }
         // Every inode is reachable by name or held open; a name count matches.
@@ -317,6 +477,7 @@ impl Tables {
             let links_ok = match inode.node {
                 Node::Dir { .. } => inode.links == u32::from(root) || (!root && inode.links <= 1),
                 Node::File(_) => true,
+                Node::Socket(_) => !root,
             };
             if names[ino] != expected || !links_ok || (names[ino] == 0 && !root && !open[ino]) {
                 return false;
@@ -339,5 +500,14 @@ impl Tables {
             }
         }
         true
+    }
+}
+
+/// The object a description refers to (an out-of-range index for other
+/// targets).
+fn desc_object(target: Target) -> usize {
+    match target {
+        Target::Pipe(i, _) | Target::Event(i) | Target::Epoll(i) => i as usize,
+        _ => usize::MAX,
     }
 }

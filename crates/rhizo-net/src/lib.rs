@@ -1,0 +1,981 @@
+//! The sockets of a kernel's cells (spec `networking`, design D1, D2, D4 and
+//! D6 of `add-sockets-and-poll`).
+//!
+//! [`Net`] holds every socket of every cell; a cell's descriptors hold
+//! [`Handle`]s, counted once per file description. On the loopback network
+//! (127.0.0.0/8) a TCP connection is a pair of byte queues joined here and a
+//! UDP datagram goes straight into the queue of the socket bound at its
+//! destination; a Unix stream socket is reached by its name number, which a
+//! file of type socket in the cell's tree holds. Nothing here reads a clock
+//! or touches hardware: blocking is the caller's business ([`Error::Again`]
+//! and [`Net::changes`]).
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+mod record;
+
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
+pub use record::{DecodeError, Record, Saved, decode_records, encode_records};
+
+/// A socket, as a descriptor holds it.
+pub type Handle = u32;
+
+/// Bytes a stream socket may hold unread.
+pub const STREAM_BUF: usize = 256 << 10;
+/// Bytes of datagrams a socket may hold unread.
+pub const DGRAM_BUF: usize = 256 << 10;
+/// Largest UDP payload.
+pub const DGRAM_MAX: usize = 65_507;
+/// Most sockets open at once in the kernel.
+pub const SOCKETS_MAX: usize = 4096;
+/// Largest accepted `listen` backlog.
+pub const BACKLOG_MAX: usize = 4096;
+/// Longest Unix socket path (`sun_path` without its NUL).
+pub const UNIX_PATH_MAX: usize = 107;
+/// Ports handed out by `bind` to port 0 and by implicit binds.
+pub const EPHEMERAL: core::ops::RangeInclusive<u16> = 32768..=60999;
+/// `INADDR_ANY`.
+pub const ANY: [u8; 4] = [0; 4];
+/// `INADDR_LOOPBACK`.
+pub const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+
+/// `poll` event bits (the same values as `EPOLL*`).
+pub mod events {
+    pub const IN: u32 = 0x1;
+    pub const OUT: u32 = 0x4;
+    pub const ERR: u32 = 0x8;
+    pub const HUP: u32 = 0x10;
+    pub const RDHUP: u32 = 0x2000;
+}
+use events::*;
+
+/// Address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Inet,
+    Unix,
+}
+
+/// Socket type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    Stream,
+    Dgram,
+}
+
+/// A socket address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Addr {
+    /// IPv4 address and port.
+    Inet { ip: [u8; 4], port: u16 },
+    /// A named Unix socket: its name number (held by the file of type
+    /// socket) and the path it was bound with.
+    Unix { name: u64, path: Vec<u8> },
+    /// A Unix socket without a name.
+    UnixUnnamed,
+}
+
+/// Why a socket operation failed, with its Linux error number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Error {
+    /// It would wait (`EAGAIN`).
+    Again,
+    AddrInUse,
+    AddrNotAvail,
+    NetUnreach,
+    ConnRefused,
+    ConnReset,
+    NotConn,
+    IsConn,
+    /// Writing to a connection closed for writing (`EPIPE`).
+    Pipe,
+    Invalid,
+    OpNotSupp,
+    DestAddrReq,
+    MsgSize,
+    /// [`SOCKETS_MAX`] sockets are open (`ENFILE`).
+    TooMany,
+}
+
+impl Error {
+    /// The Linux `errno` value.
+    pub const fn errno(self) -> i64 {
+        match self {
+            Error::Again => 11,
+            Error::TooMany => 23,
+            Error::Pipe => 32,
+            Error::Invalid => 22,
+            Error::DestAddrReq => 89,
+            Error::MsgSize => 90,
+            Error::OpNotSupp => 95,
+            Error::AddrInUse => 98,
+            Error::AddrNotAvail => 99,
+            Error::NetUnreach => 101,
+            Error::ConnReset => 104,
+            Error::IsConn => 106,
+            Error::NotConn => 107,
+            Error::ConnRefused => 111,
+        }
+    }
+}
+
+/// Result of a socket operation.
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// Socket options, as `getsockopt` reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    pub reuse_addr: bool,
+    pub reuse_port: bool,
+    pub keepalive: bool,
+    pub no_delay: bool,
+    pub broadcast: bool,
+    /// `SO_LINGER`: seconds, when on.
+    pub linger: Option<u32>,
+    pub rcvbuf: u32,
+    pub sndbuf: u32,
+    /// `SO_RCVTIMEO` in nanoseconds (0: none).
+    pub rcv_timeout_ns: u64,
+    /// `SO_SNDTIMEO` in nanoseconds (0: none).
+    pub snd_timeout_ns: u64,
+    pub keep_idle: u32,
+    pub keep_intvl: u32,
+    pub keep_cnt: u32,
+}
+
+impl Default for Options {
+    /// Linux's defaults.
+    fn default() -> Self {
+        Self {
+            reuse_addr: false,
+            reuse_port: false,
+            keepalive: false,
+            no_delay: false,
+            broadcast: false,
+            linger: None,
+            rcvbuf: 131_072,
+            sndbuf: 16_384,
+            rcv_timeout_ns: 0,
+            snd_timeout_ns: 0,
+            keep_idle: 7200,
+            keep_intvl: 75,
+            keep_cnt: 9,
+        }
+    }
+}
+
+/// Which directions `shutdown` closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    Read,
+    Write,
+    Both,
+}
+
+/// What a receive handed over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Received {
+    /// Bytes handed to the caller.
+    pub len: usize,
+    /// Length of the whole datagram (stream: `len`).
+    pub full: usize,
+    /// Sender of a datagram.
+    pub from: Option<Addr>,
+}
+
+#[derive(Debug, Clone)]
+enum State {
+    /// Not connected or listening (every datagram socket).
+    Open,
+    Listening {
+        backlog: usize,
+        /// Connected server ends not accepted yet (no references).
+        queue: VecDeque<Handle>,
+    },
+    /// A stream connection; `peer` is gone once the peer closed.
+    Connected { peer: Option<Handle> },
+    /// Reset: the next call reports `ECONNRESET` while `pending`; later
+    /// ones see a closed connection.
+    Reset { pending: bool },
+}
+
+#[derive(Debug, Clone)]
+struct Socket {
+    refs: u32,
+    family: Family,
+    ty: Type,
+    local: Option<Addr>,
+    /// Peer of a connection, or default destination of a datagram socket.
+    remote: Option<Addr>,
+    opts: Options,
+    state: State,
+    rx: VecDeque<u8>,
+    /// No more stream bytes will arrive (peer shut down writing or closed).
+    eof: bool,
+    shut_rd: bool,
+    shut_wr: bool,
+    dgrams: VecDeque<(Addr, Vec<u8>)>,
+    dgram_bytes: usize,
+}
+
+impl Socket {
+    fn new(family: Family, ty: Type, opts: Options) -> Self {
+        Self {
+            refs: 1,
+            family,
+            ty,
+            local: None,
+            remote: None,
+            opts,
+            state: State::Open,
+            rx: VecDeque::new(),
+            eof: false,
+            shut_rd: false,
+            shut_wr: false,
+            dgrams: VecDeque::new(),
+            dgram_bytes: 0,
+        }
+    }
+
+    fn port(&self) -> Option<([u8; 4], u16)> {
+        match self.local {
+            Some(Addr::Inet { ip, port }) => Some((ip, port)),
+            _ => None,
+        }
+    }
+}
+
+/// Every socket of the kernel.
+#[derive(Debug)]
+pub struct Net {
+    sockets: Vec<Option<Socket>>,
+    open: usize,
+    changes: u64,
+    next_port: u16,
+    next_name: u64,
+}
+
+impl Default for Net {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// For a reset socket, whether its reset is still to be reported (and it
+/// is reported now); `None` for any other state.
+fn reset_pending(state: &mut State) -> Option<bool> {
+    match state {
+        State::Reset { pending } => Some(core::mem::replace(pending, false)),
+        _ => None,
+    }
+}
+
+fn is_loopback(ip: [u8; 4]) -> bool {
+    ip[0] == 127
+}
+
+impl Net {
+    /// No sockets.
+    pub const fn new() -> Self {
+        Self {
+            sockets: Vec::new(),
+            open: 0,
+            changes: 0,
+            next_port: *EPHEMERAL.start(),
+            next_name: 1,
+        }
+    }
+
+    /// Counts every change a waiting cell may wait for (data, connections,
+    /// closes): when it moves, waiting cells try again (design D3).
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    /// Sockets open.
+    pub fn open(&self) -> usize {
+        self.open
+    }
+
+    fn get(&self, h: Handle) -> Result<&Socket> {
+        self.sockets
+            .get(h as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::Invalid)
+    }
+
+    fn get_mut(&mut self, h: Handle) -> Result<&mut Socket> {
+        self.sockets
+            .get_mut(h as usize)
+            .and_then(Option::as_mut)
+            .ok_or(Error::Invalid)
+    }
+
+    fn insert(&mut self, socket: Socket) -> Result<Handle> {
+        if self.open >= SOCKETS_MAX {
+            return Err(Error::TooMany);
+        }
+        self.open += 1;
+        match self.sockets.iter().position(Option::is_none) {
+            Some(i) => {
+                self.sockets[i] = Some(socket);
+                Ok(i as Handle)
+            }
+            None => {
+                self.sockets.push(Some(socket));
+                Ok((self.sockets.len() - 1) as Handle)
+            }
+        }
+    }
+
+    /// A new socket with one reference. Unix sockets are streams only.
+    pub fn socket(&mut self, family: Family, ty: Type) -> Result<Handle> {
+        if family == Family::Unix && ty == Type::Dgram {
+            return Err(Error::OpNotSupp);
+        }
+        self.insert(Socket::new(family, ty, Options::default()))
+    }
+
+    /// Two connected unnamed Unix stream sockets (`socketpair`).
+    pub fn pair(&mut self) -> Result<(Handle, Handle)> {
+        let a = self.socket(Family::Unix, Type::Stream)?;
+        let b = match self.socket(Family::Unix, Type::Stream) {
+            Ok(b) => b,
+            Err(e) => {
+                self.release(a);
+                return Err(e);
+            }
+        };
+        for (me, peer) in [(a, b), (b, a)] {
+            let s = self.get_mut(me)?;
+            s.local = Some(Addr::UnixUnnamed);
+            s.remote = Some(Addr::UnixUnnamed);
+            s.state = State::Connected { peer: Some(peer) };
+        }
+        Ok((a, b))
+    }
+
+    /// One more file description refers to `h`.
+    pub fn retain(&mut self, h: Handle) {
+        if let Ok(s) = self.get_mut(h) {
+            s.refs += 1;
+        }
+    }
+
+    /// One file description less refers to `h`; the last one closes it.
+    pub fn release(&mut self, h: Handle) {
+        let Ok(s) = self.get_mut(h) else { return };
+        s.refs -= 1;
+        if s.refs == 0 {
+            self.close(h);
+        }
+    }
+
+    /// Closes `h`: a connection's peer sees the end of the stream (or a
+    /// reset if bytes were left unread), connections never accepted are
+    /// reset.
+    fn close(&mut self, h: Handle) {
+        let Some(s) = self.sockets.get_mut(h as usize).and_then(Option::take) else {
+            return;
+        };
+        self.open -= 1;
+        self.changes += 1;
+        match s.state {
+            State::Listening { queue, .. } => {
+                for q in queue {
+                    if let Ok(State::Connected { peer: Some(p) }) = self.get(q).map(|q| &q.state) {
+                        let p = *p;
+                        self.reset(p);
+                    }
+                    if self.sockets[q as usize].take().is_some() {
+                        self.open -= 1;
+                    }
+                }
+            }
+            State::Connected { peer: Some(p) } => {
+                if !s.rx.is_empty() {
+                    self.reset(p);
+                } else if let Ok(peer) = self.get_mut(p) {
+                    peer.eof = true;
+                    peer.state = State::Connected { peer: None };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Makes `h` a reset connection.
+    fn reset(&mut self, h: Handle) {
+        if let Ok(s) = self.get_mut(h) {
+            s.state = State::Reset { pending: true };
+            s.rx.clear();
+            s.eof = true;
+            self.changes += 1;
+        }
+    }
+
+    /// Family and type of `h`.
+    pub fn kind(&self, h: Handle) -> Result<(Family, Type)> {
+        let s = self.get(h)?;
+        Ok((s.family, s.ty))
+    }
+
+    /// A new Unix name number, never handed out before by this kernel.
+    pub fn new_name(&mut self) -> u64 {
+        self.next_name += 1;
+        self.next_name - 1
+    }
+
+    /// Whether another socket of `ty` holds `ip:port` in a way `opts`
+    /// cannot share.
+    fn port_taken(&self, me: Handle, ty: Type, ip: [u8; 4], port: u16, opts: &Options) -> bool {
+        self.sockets.iter().enumerate().any(|(i, s)| {
+            let Some(s) = s else { return false };
+            let Some((ip2, port2)) = s.port() else {
+                return false;
+            };
+            let overlaps = port2 == port && (ip2 == ip || ip2 == ANY || ip == ANY);
+            let listening = matches!(s.state, State::Listening { .. });
+            let shared = (opts.reuse_port && s.opts.reuse_port)
+                || (opts.reuse_addr && s.opts.reuse_addr && !listening);
+            i != me as usize && s.ty == ty && s.family == Family::Inet && overlaps && !shared
+        })
+    }
+
+    /// A free ephemeral port for `ty`.
+    fn ephemeral(&mut self, me: Handle, ty: Type) -> Result<u16> {
+        let span = (EPHEMERAL.end() - EPHEMERAL.start()) as u32 + 1;
+        for _ in 0..span {
+            let port = self.next_port;
+            self.next_port = if port == *EPHEMERAL.end() {
+                *EPHEMERAL.start()
+            } else {
+                port + 1
+            };
+            if !self.port_taken(me, ty, ANY, port, &Options::default()) {
+                return Ok(port);
+            }
+        }
+        Err(Error::AddrInUse)
+    }
+
+    /// `bind`. An Inet address must be on the loopback network or
+    /// `INADDR_ANY`; port 0 picks a free port.
+    pub fn bind(&mut self, h: Handle, addr: &Addr) -> Result<()> {
+        let s = self.get(h)?;
+        if s.local.is_some() {
+            return Err(Error::Invalid);
+        }
+        let (ty, opts) = (s.ty, s.opts);
+        let local = match (s.family, addr) {
+            (Family::Inet, &Addr::Inet { ip, port }) => {
+                if ip != ANY && !is_loopback(ip) {
+                    return Err(Error::AddrNotAvail);
+                }
+                let port = match port {
+                    0 => self.ephemeral(h, ty)?,
+                    p if self.port_taken(h, ty, ip, p, &opts) => return Err(Error::AddrInUse),
+                    p => p,
+                };
+                Addr::Inet { ip, port }
+            }
+            (Family::Unix, Addr::Unix { name, path }) if *name != 0 => Addr::Unix {
+                name: *name,
+                path: path.clone(),
+            },
+            _ => return Err(Error::Invalid),
+        };
+        self.get_mut(h)?.local = Some(local);
+        Ok(())
+    }
+
+    /// Binds an Inet socket that has no address to an ephemeral port.
+    fn autobind(&mut self, h: Handle, ip: [u8; 4]) -> Result<()> {
+        let s = self.get(h)?;
+        if s.local.is_some() || s.family != Family::Inet {
+            return Ok(());
+        }
+        let port = self.ephemeral(h, s.ty)?;
+        self.get_mut(h)?.local = Some(Addr::Inet { ip, port });
+        Ok(())
+    }
+
+    /// `listen`: an Inet stream socket without an address gets an
+    /// ephemeral port. A listening socket may change its backlog.
+    pub fn listen(&mut self, h: Handle, backlog: usize) -> Result<()> {
+        let s = self.get(h)?;
+        if s.ty != Type::Stream {
+            return Err(Error::OpNotSupp);
+        }
+        match s.state {
+            State::Open => {}
+            State::Listening { .. } => {}
+            _ => return Err(Error::Invalid),
+        }
+        if s.local.is_none() {
+            if s.family == Family::Unix {
+                return Err(Error::Invalid);
+            }
+            self.autobind(h, ANY)?;
+        }
+        let backlog = backlog.min(BACKLOG_MAX);
+        let s = self.get_mut(h)?;
+        match &mut s.state {
+            State::Listening { backlog: b, .. } => *b = backlog,
+            state => {
+                *state = State::Listening {
+                    backlog,
+                    queue: VecDeque::new(),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `h` listens.
+    pub fn is_listening(&self, h: Handle) -> bool {
+        matches!(self.get(h).map(|s| &s.state), Ok(State::Listening { .. }))
+    }
+
+    /// `accept`: the oldest connection waiting on listener `h`, with one
+    /// reference.
+    pub fn accept(&mut self, h: Handle) -> Result<Handle> {
+        let s = self.get_mut(h)?;
+        let State::Listening { queue, .. } = &mut s.state else {
+            return Err(Error::Invalid);
+        };
+        let conn = queue.pop_front().ok_or(Error::Again)?;
+        self.get_mut(conn)?.refs = 1;
+        Ok(conn)
+    }
+
+    /// The listener a stream connection to `addr` reaches.
+    fn listener(&self, family: Family, addr: &Addr) -> Result<Handle> {
+        let found = self.sockets.iter().position(|s| {
+            let Some(s) = s else { return false };
+            let listening = matches!(s.state, State::Listening { .. });
+            listening
+                && s.family == family
+                && match (&s.local, addr) {
+                    (Some(Addr::Inet { ip, port }), Addr::Inet { ip: to, port: p }) => {
+                        port == p && (*ip == ANY || ip == to)
+                    }
+                    (Some(Addr::Unix { name, .. }), Addr::Unix { name: to, .. }) => name == to,
+                    _ => false,
+                }
+        });
+        found.map(|i| i as Handle).ok_or(Error::ConnRefused)
+    }
+
+    /// `connect`. A stream connection is established at once (queued on the
+    /// listener); a datagram socket only records its default destination.
+    pub fn connect(&mut self, h: Handle, addr: &Addr) -> Result<()> {
+        let s = self.get(h)?;
+        let (family, ty) = (s.family, s.ty);
+        let addr = match (family, addr) {
+            (Family::Inet, &Addr::Inet { ip, port }) => {
+                let ip = if ip == ANY { LOOPBACK } else { ip };
+                if !is_loopback(ip) {
+                    return Err(Error::NetUnreach);
+                }
+                Addr::Inet { ip, port }
+            }
+            (Family::Unix, Addr::Unix { .. }) => addr.clone(),
+            _ => return Err(Error::Invalid),
+        };
+        if ty == Type::Dgram {
+            if let Addr::Inet { ip, .. } = addr {
+                self.autobind(h, ip)?;
+            }
+            self.get_mut(h)?.remote = Some(addr);
+            return Ok(());
+        }
+        match s.state {
+            State::Open => {}
+            State::Listening { .. } => return Err(Error::Invalid),
+            _ => return Err(Error::IsConn),
+        }
+        let listener = self.listener(family, &addr)?;
+        let l = self.get(listener)?;
+        let State::Listening { backlog, queue } = &l.state else {
+            return Err(Error::ConnRefused);
+        };
+        if queue.len() > *backlog {
+            return Err(Error::ConnRefused);
+        }
+        let (server_local, opts) = (
+            match (&l.local, &addr) {
+                (Some(Addr::Inet { .. }), Addr::Inet { ip, port }) => Addr::Inet {
+                    ip: *ip,
+                    port: *port,
+                },
+                (local, _) => local.clone().unwrap_or(Addr::UnixUnnamed),
+            },
+            l.opts,
+        );
+        match addr {
+            Addr::Inet { ip, .. } => {
+                self.autobind(h, ip)?;
+                // Bound to any address: the connection leaves from `ip`.
+                if let Some(Addr::Inet { ip: mine, .. }) = &mut self.get_mut(h)?.local
+                    && *mine == ANY
+                {
+                    *mine = ip;
+                }
+            }
+            _ => {
+                let s = self.get_mut(h)?;
+                if s.local.is_none() {
+                    s.local = Some(Addr::UnixUnnamed);
+                }
+            }
+        }
+        let mut server = Socket::new(family, Type::Stream, opts);
+        server.refs = 0;
+        server.local = Some(server_local);
+        server.remote = self.get(h)?.local.clone();
+        server.state = State::Connected { peer: Some(h) };
+        let server = self.insert(server)?;
+        let s = self.get_mut(h)?;
+        s.state = State::Connected { peer: Some(server) };
+        s.remote = Some(addr);
+        if let State::Listening { queue, .. } = &mut self.get_mut(listener)?.state {
+            queue.push_back(server);
+        }
+        self.changes += 1;
+        Ok(())
+    }
+
+    /// `send`/`sendto`: queues bytes of `data` for the peer (a stream:
+    /// as many as fit, `Again` if none fits) or one datagram to `to` or the
+    /// default destination (dropped if nobody is bound there or its queue is
+    /// full, as UDP does).
+    pub fn send(&mut self, h: Handle, data: &[u8], to: Option<&Addr>) -> Result<usize> {
+        let s = self.get_mut(h)?;
+        if s.ty == Type::Dgram {
+            return self.send_datagram(h, data, to);
+        }
+        if s.shut_wr {
+            return Err(Error::Pipe);
+        }
+        let peer = match (reset_pending(&mut s.state), &s.state) {
+            (Some(true), _) => return Err(Error::ConnReset),
+            (Some(false), _) => return Err(Error::Pipe),
+            (None, State::Connected { peer }) => peer.ok_or(Error::Pipe)?,
+            _ => return Err(Error::NotConn),
+        };
+        let p = self.get_mut(peer)?;
+        let room = STREAM_BUF - p.rx.len();
+        if room == 0 {
+            return Err(Error::Again);
+        }
+        let n = room.min(data.len());
+        p.rx.extend(&data[..n]);
+        self.changes += 1;
+        Ok(n)
+    }
+
+    fn send_datagram(&mut self, h: Handle, data: &[u8], to: Option<&Addr>) -> Result<usize> {
+        let s = self.get(h)?;
+        if s.shut_wr {
+            return Err(Error::Pipe);
+        }
+        let (ip, port) = match to.or(s.remote.as_ref()) {
+            Some(&Addr::Inet { ip, port }) => (if ip == ANY { LOOPBACK } else { ip }, port),
+            Some(_) => return Err(Error::Invalid),
+            None => return Err(Error::DestAddrReq),
+        };
+        if !is_loopback(ip) {
+            return Err(Error::NetUnreach);
+        }
+        if data.len() > DGRAM_MAX {
+            return Err(Error::MsgSize);
+        }
+        self.autobind(h, ANY)?;
+        let from = match self.get(h)?.local {
+            Some(Addr::Inet { ip: mine, port }) => Addr::Inet {
+                ip: if mine == ANY { ip } else { mine },
+                port,
+            },
+            _ => return Err(Error::Invalid),
+        };
+        let receiver = self.sockets.iter_mut().flatten().find(|r| {
+            r.ty == Type::Dgram
+                && r.port()
+                    .is_some_and(|(rip, rport)| rport == port && (rip == ANY || rip == ip))
+                && r.remote.as_ref().is_none_or(|only| *only == from)
+        });
+        if let Some(r) = receiver
+            && r.dgram_bytes + data.len() <= DGRAM_BUF
+            && !r.shut_rd
+        {
+            r.dgram_bytes += data.len();
+            r.dgrams.push_back((from, data.to_vec()));
+            self.changes += 1;
+        }
+        Ok(data.len())
+    }
+
+    /// `recv`/`recvfrom`: hands `take` up to `len` bytes, in pieces (a
+    /// stream) or the front datagram cut to `len`; what `take` accepts is
+    /// consumed unless `peek`. An empty stream is `Ok` with 0 at its end,
+    /// `Again` before.
+    pub fn recv(
+        &mut self,
+        h: Handle,
+        len: usize,
+        peek: bool,
+        take: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<Received> {
+        let s = self.get_mut(h)?;
+        if s.ty == Type::Dgram {
+            let Some((from, data)) = s.dgrams.front() else {
+                return if s.shut_rd {
+                    Ok(Received {
+                        len: 0,
+                        full: 0,
+                        from: None,
+                    })
+                } else {
+                    Err(Error::Again)
+                };
+            };
+            let n = len.min(data.len());
+            if !take(&data[..n]) {
+                return Ok(Received {
+                    len: 0,
+                    full: 0,
+                    from: None,
+                });
+            }
+            let got = Received {
+                len: n,
+                full: data.len(),
+                from: Some(from.clone()),
+            };
+            if !peek {
+                s.dgram_bytes -= data.len();
+                s.dgrams.pop_front();
+            }
+            return Ok(got);
+        }
+        match (reset_pending(&mut s.state), &s.state) {
+            (Some(true), _) => return Err(Error::ConnReset),
+            (Some(false), _) => {
+                return Ok(Received {
+                    len: 0,
+                    full: 0,
+                    from: None,
+                });
+            }
+            (None, State::Connected { .. }) => {}
+            _ => return Err(Error::NotConn),
+        }
+        if s.rx.is_empty() {
+            return if s.eof || s.shut_rd {
+                Ok(Received {
+                    len: 0,
+                    full: 0,
+                    from: None,
+                })
+            } else {
+                Err(Error::Again)
+            };
+        }
+        let mut done = 0;
+        let (a, b) = s.rx.as_slices();
+        for piece in [a, b] {
+            let n = piece.len().min(len - done);
+            if n == 0 || !take(&piece[..n]) {
+                break;
+            }
+            done += n;
+        }
+        if !peek && done > 0 {
+            s.rx.drain(..done);
+            self.changes += 1; // room for a writer
+        }
+        Ok(Received {
+            len: done,
+            full: done,
+            from: None,
+        })
+    }
+
+    /// `shutdown`.
+    pub fn shutdown(&mut self, h: Handle, how: Shutdown) -> Result<()> {
+        let s = self.get_mut(h)?;
+        let peer = match s.state {
+            State::Connected { peer } => peer,
+            State::Open if s.ty == Type::Dgram => None,
+            _ => return Err(Error::NotConn),
+        };
+        if how != Shutdown::Write {
+            s.shut_rd = true;
+        }
+        if how != Shutdown::Read {
+            s.shut_wr = true;
+            if let Some(p) = peer
+                && let Ok(p) = self.get_mut(p)
+            {
+                p.eof = true;
+            }
+        }
+        self.changes += 1;
+        Ok(())
+    }
+
+    /// The `poll` events of `h` (`events::*`).
+    pub fn poll(&self, h: Handle) -> u32 {
+        let Ok(s) = self.get(h) else {
+            return ERR | HUP;
+        };
+        match &s.state {
+            State::Open if s.ty == Type::Dgram => {
+                OUT | if s.dgrams.is_empty() && !s.shut_rd {
+                    0
+                } else {
+                    IN
+                }
+            }
+            State::Open => OUT | HUP,
+            State::Listening { queue, .. } => {
+                if queue.is_empty() {
+                    0
+                } else {
+                    IN
+                }
+            }
+            State::Reset { pending } => IN | OUT | HUP | RDHUP | if *pending { ERR } else { 0 },
+            State::Connected { peer } => {
+                let mut ev = 0;
+                if !s.rx.is_empty() || s.eof || s.shut_rd {
+                    ev |= IN;
+                }
+                if s.eof {
+                    ev |= RDHUP;
+                }
+                if s.eof && (s.shut_wr || peer.is_none()) {
+                    ev |= HUP;
+                }
+                let room = peer.is_none_or(|p| self.get(p).is_ok_and(|p| p.rx.len() < STREAM_BUF));
+                if !s.shut_wr && room {
+                    ev |= OUT;
+                }
+                ev
+            }
+        }
+    }
+
+    /// The address `h` is bound to (`getsockname`).
+    pub fn local_addr(&self, h: Handle) -> Result<Option<Addr>> {
+        Ok(self.get(h)?.local.clone())
+    }
+
+    /// The address of `h`'s peer (`getpeername`).
+    pub fn peer_addr(&self, h: Handle) -> Result<Addr> {
+        let s = self.get(h)?;
+        match (&s.state, &s.remote) {
+            (State::Connected { .. }, Some(a)) => Ok(a.clone()),
+            (State::Open, Some(a)) if s.ty == Type::Dgram => Ok(a.clone()),
+            _ => Err(Error::NotConn),
+        }
+    }
+
+    /// The options of `h`.
+    pub fn options(&self, h: Handle) -> Result<Options> {
+        Ok(self.get(h)?.opts)
+    }
+
+    /// Changes the options of `h`.
+    pub fn set_options(&mut self, h: Handle, opts: Options) -> Result<()> {
+        self.get_mut(h)?.opts = opts;
+        Ok(())
+    }
+
+    /// `SO_ERROR`: the pending error of `h`, cleared by reading it.
+    pub fn take_error(&mut self, h: Handle) -> Result<Option<Error>> {
+        let reset = reset_pending(&mut self.get_mut(h)?.state);
+        Ok((reset == Some(true)).then_some(Error::ConnReset))
+    }
+
+    /// The socket a forked cell gets for `h` (design D4): the same one if it
+    /// is bound or listening (shared), a copy if it is a fresh one, a reset
+    /// one if it is (or was) a connection.
+    pub fn fork(&mut self, h: Handle) -> Result<Handle> {
+        let s = self.get(h)?;
+        let (family, ty, opts) = (s.family, s.ty, s.opts);
+        let state = match (&s.state, &s.local) {
+            (State::Listening { .. }, _) | (State::Open, Some(_)) => {
+                self.retain(h);
+                return Ok(h);
+            }
+            (State::Open, None) => State::Open,
+            _ => State::Reset { pending: true },
+        };
+        let mut copy = Socket::new(family, ty, opts);
+        copy.state = state;
+        copy.eof = matches!(copy.state, State::Reset { .. });
+        self.insert(copy)
+    }
+
+    /// What a snapshot keeps of `h` (design D4).
+    pub fn export(&self, h: Handle) -> Result<Record> {
+        let s = self.get(h)?;
+        let (state, local) = match &s.state {
+            State::Open => (Saved::Open, s.local.clone()),
+            State::Listening { backlog, .. } => {
+                (Saved::Listening(*backlog as u32), s.local.clone())
+            }
+            _ => (Saved::Reset, None),
+        };
+        Ok(Record {
+            family: s.family,
+            ty: s.ty,
+            state,
+            local,
+            opts: s.opts,
+        })
+    }
+
+    /// A socket made from snapshot record `r`, bound and listening again
+    /// where it was (reset if its address is taken). A Unix name gets a new
+    /// number: returned as `(old, new)` so the cell's files can follow.
+    pub fn import(&mut self, r: &Record) -> Result<(Handle, Option<(u64, u64)>)> {
+        let mut s = Socket::new(r.family, r.ty, r.opts);
+        if r.state == Saved::Reset {
+            s.state = State::Reset { pending: true };
+            s.eof = true;
+        }
+        let h = self.insert(s)?;
+        let mut renamed = None;
+        let bound = match &r.local {
+            Some(Addr::Unix { name, path }) => {
+                let new = self.new_name();
+                renamed = Some((*name, new));
+                let addr = Addr::Unix {
+                    name: new,
+                    path: path.clone(),
+                };
+                self.bind(h, &addr)
+            }
+            Some(Addr::UnixUnnamed) | None => Ok(()),
+            Some(addr) => self.bind(h, addr),
+        };
+        let ready = bound.and_then(|()| match r.state {
+            Saved::Listening(backlog) => self.listen(h, backlog as usize),
+            _ => Ok(()),
+        });
+        if ready.is_err() {
+            self.get_mut(h)?.state = State::Reset { pending: true };
+        }
+        Ok((h, renamed))
+    }
+}
+
+#[cfg(test)]
+mod tests;

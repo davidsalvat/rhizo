@@ -109,10 +109,18 @@ impl<F: EntryFormat> PageTable<F> {
             let copy = match size {
                 PageSize::Small => frames.alloc(),
                 _ => frames.alloc_large(),
+            };
+            match copy {
+                Some(copy) => {
+                    copy_frames(mem, page, copy, size.bytes());
+                    mem.write_u64(slot, F::with_address(writable, copy));
+                }
+                None if size == PageSize::Large => {
+                    let table = copy_as_small_pages::<F>(mem, frames, page, writable)?;
+                    mem.write_u64(slot, F::table(table));
+                }
+                None => return Err(MapError::OutOfFrames),
             }
-            .ok_or(MapError::OutOfFrames)?;
-            copy_frames(mem, page, copy, size.bytes());
-            mem.write_u64(slot, F::with_address(writable, copy));
             frames.free(page, size);
         } else {
             mem.write_u64(slot, writable);
@@ -235,6 +243,33 @@ fn leaf_bytes<F: EntryFormat>(e: u64, level: u32) -> u64 {
     } else {
         FRAME_SIZE
     }
+}
+
+/// Copies the 2 MiB page at `page` into 512 private 4 KiB frames, when no
+/// whole 2 MiB block is free, and returns a table mapping them with the
+/// permissions of the large entry `writable` (design D8 of
+/// `add-sockets-and-poll`). Gives everything back if frames run out.
+fn copy_as_small_pages<F: EntryFormat>(
+    mem: &mut impl PhysicalMemory,
+    frames: &mut impl Frames,
+    page: u64,
+    writable: u64,
+) -> Result<u64, MapError> {
+    let table = frames.alloc().ok_or(MapError::OutOfFrames)?;
+    let flags = F::flags(writable);
+    for i in 0..ENTRIES {
+        let Some(copy) = frames.alloc() else {
+            for j in 0..i {
+                frames.free(F::address(mem.read_u64(table + j * 8)), PageSize::Small);
+            }
+            frames.free(table, PageSize::Small);
+            return Err(MapError::OutOfFrames);
+        };
+        copy_frames(mem, page + i * FRAME_SIZE, copy, FRAME_SIZE);
+        let leaf = F::with_cow(F::leaf(copy, PageSize::Small, flags), false);
+        mem.write_u64(table + i * 8, leaf);
+    }
+    Ok(table)
 }
 
 fn copy_frames(mem: &mut impl PhysicalMemory, from: u64, to: u64, bytes: u64) {

@@ -88,6 +88,7 @@ struct Machine<F> {
     frames: CountingFrames,
     services: Quiet,
     fs: rhizo_fs::Fs,
+    net: rhizo_net::Net,
     /// Every kernel frame: its tables, data, code and both ends of its
     /// 2 MiB page.
     kernel: Vec<u64>,
@@ -185,6 +186,7 @@ impl<F: EntryFormat> Machine<F> {
                 ..Quiet::default()
             },
             fs,
+            net: rhizo_net::Net::new(),
             kernel: kernel_frames,
             format: core::marker::PhantomData,
         }
@@ -222,9 +224,15 @@ impl<F: EntryFormat> Machine<F> {
             frames: &mut self.frames,
             services: &mut self.services,
             fs: &mut self.fs,
+            net: &mut self.net,
+            deadline: None,
             pager: &mut NoPager,
         };
         let outcome = self.abi.handle(&mut self.cell, &mut cx);
+        // A call waiting on descriptors runs again as the next one.
+        if let rhizo_cell::threads::Wait::Io { .. } = self.cell.threads.current().wait {
+            self.cell.threads.current_mut().wait = rhizo_cell::threads::Wait::Ready;
+        }
         (outcome, self.cell.regs().gpr[0] as i64)
     }
 
