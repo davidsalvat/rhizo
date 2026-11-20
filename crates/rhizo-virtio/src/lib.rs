@@ -61,12 +61,20 @@ const DESC_F_WRITE: u16 = 2;
 const AVAIL_F_NO_INTERRUPT: u16 = 1;
 const USED_F_NO_NOTIFY: u16 = 1;
 
-/// Entries per queue.
-pub const QUEUE_SIZE: u16 = 32;
+/// Entries per queue. The receive queue offers `QUEUE_SIZE * BUF` bytes,
+/// which stay above [`RX_MIN_OFFERED`] while up to 31 frames wait to be
+/// taken.
+pub const QUEUE_SIZE: u16 = 64;
 /// Bytes per buffer: a header and a full Ethernet frame fit.
 const BUF: u64 = 2048;
 /// `struct virtio_net_hdr` with `VIRTIO_F_VERSION_1`.
 const HDR: usize = 12;
+/// Receive buffer bytes a device may wait for before it hands over a frame:
+/// the largest frame it takes from the host and its header. Firecracker
+/// (`MAX_BUFFER_SIZE`) reads from its tap only while the receive buffers
+/// offered add up to this much, whatever features were negotiated.
+const RX_MIN_OFFERED: u64 = 65_562;
+const _: () = assert!((QUEUE_SIZE as u64 - 1) * BUF >= RX_MIN_OFFERED);
 /// Largest frame sent or received (without the header).
 pub const FRAME_MAX: usize = BUF as usize - HDR;
 const FRAME: u64 = 4096;
@@ -76,6 +84,9 @@ pub const FRAMES: usize = 2 * (1 + (QUEUE_SIZE as u64 * BUF / FRAME) as usize);
 /// then the used ring.
 const AVAIL_AT: u64 = 1024;
 const USED_AT: u64 = 2048;
+const _: () = assert!(QUEUE_SIZE as u64 * 16 <= AVAIL_AT);
+const _: () = assert!(AVAIL_AT + 6 + QUEUE_SIZE as u64 * 2 <= USED_AT);
+const _: () = assert!(USED_AT + 6 + QUEUE_SIZE as u64 * 8 <= FRAME);
 
 /// Why a device was not brought up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

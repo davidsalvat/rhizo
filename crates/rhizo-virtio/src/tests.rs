@@ -103,6 +103,28 @@ impl Device {
         self.status = if refused { value & !FEATURES_OK } else { value };
     }
 
+    /// Bytes of the receive buffers offered and not yet taken.
+    fn rx_offered(&self) -> u64 {
+        let s = self.queues[0];
+        let mut next = s.next;
+        let mut bytes = 0;
+        while next != self.read16(s.avail + 2) {
+            let id = self.read16(s.avail + 4 + u64::from(next % s.num as u16) * 2);
+            let mut len = [0u8; 4];
+            self.mem
+                .read_bytes(s.desc + u64::from(id) * 16 + 8, &mut len);
+            bytes += u64::from(u32::from_le_bytes(len));
+            next = next.wrapping_add(1);
+        }
+        bytes
+    }
+
+    /// Delivers `frame` as Firecracker does: only while the receive buffers
+    /// offered add up to its largest frame and header.
+    fn deliver_like_firecracker(&mut self, frame: &[u8]) -> bool {
+        self.rx_offered() >= RX_MIN_OFFERED && self.deliver(frame)
+    }
+
     /// Puts `frame` in the next receive buffer; `false` if none is offered.
     fn deliver(&mut self, frame: &[u8]) -> bool {
         let Some((id, addr, len)) = self.next_buffer(0) else {
@@ -452,4 +474,25 @@ fn a_pci_card_is_refused_without_version_1() {
     let mut d = Device::new();
     d.features = [F_MAC, 0];
     assert_eq!(pci_card(d).0.err(), Some(ProbeError::Features));
+}
+
+#[test]
+fn firecracker_gets_enough_receive_buffers() {
+    let (card, dev) = card(Device::new());
+    let mut card = card.unwrap();
+    let (mut sent, mut got) = (0, 0);
+    for _ in 0..10 {
+        // A burst arrives before the kernel polls the card.
+        let mut burst = 0;
+        while burst < 64 && dev.borrow_mut().deliver_like_firecracker(&[7; 60]) {
+            burst += 1;
+        }
+        assert!(burst >= 16, "a burst of {burst} frames only");
+        sent += burst;
+        while card.recv(&mut |f| {
+            assert_eq!(f, [7; 60]);
+            got += 1;
+        }) {}
+    }
+    assert_eq!(got, sent, "every frame delivered is received");
 }
