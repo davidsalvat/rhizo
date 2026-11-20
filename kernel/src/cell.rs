@@ -10,6 +10,7 @@ use crate::arch::timer::{self, Counter};
 use crate::arch::user::{self, Trap};
 use crate::memory::{self, DirectMap};
 use crate::sync::Global;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
@@ -349,7 +350,10 @@ pub struct Finished {
 /// `scheduling`); ended ones are kept until the caller looks at them.
 #[derive(Debug)]
 pub struct Host {
-    sched: Scheduler<Live>,
+    /// Boxed: the queues move pointers, and a thousand cells need a few
+    /// KiB of queue, not a megabyte of contiguous heap (design D8 of
+    /// `add-smp-boot`).
+    sched: Scheduler<Box<Live>>,
     tags: TagPool,
     finished: Vec<Finished>,
     /// Frozen cells and their files: never run, only forked (spec `fork`,
@@ -429,7 +433,7 @@ impl Host {
             random,
         )?;
         sync_code(&PageTable::<Format>::from_root(cell.root), image);
-        self.sched.add(Live {
+        self.sched.add(Box::new(Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
             fresh: true,
@@ -439,7 +443,7 @@ impl Host {
             random: services.random,
             lazy: None,
             fs: files,
-        });
+        }));
         Ok(id)
     }
 
@@ -477,7 +481,7 @@ impl Host {
     /// Puts `live` back in the scheduler: runnable if one of its threads can
     /// run, else asleep until its earliest deadline, or parked for good
     /// when none of its threads has one (design D2 of `add-threads`).
-    fn file(&mut self, live: Live) {
+    fn file(&mut self, live: Box<Live>) {
         if live.cell.threads.is_runnable() {
             self.sched.add(live);
         } else {
@@ -545,7 +549,7 @@ impl Host {
         if mode == Resume::Eager {
             lazy.finish(&pt);
         }
-        let live = Live {
+        let live = Box::new(Live {
             cell,
             tag: self.tags.alloc().unwrap_or(0),
             fresh: true,
@@ -555,7 +559,7 @@ impl Host {
             random: Counter.cycles() | 1,
             lazy: (lazy.left > 0).then_some(lazy),
             fs,
-        };
+        });
         self.file(live);
         Ok(id)
     }
@@ -623,7 +627,7 @@ impl Host {
 
     /// Runs `live`'s threads until the cell ends, yields, has no thread that
     /// can run, or is preempted, and files it accordingly.
-    fn run_slice(&mut self, mut live: Live, now: u64) {
+    fn run_slice(&mut self, mut live: Box<Live>, now: u64) {
         if !live.cell.threads.next(now) {
             self.file(live); // nothing due yet after all
             return;
@@ -780,10 +784,10 @@ impl Host {
     }
 
     /// A new live cell sharing `cell`'s memory copy-on-write.
-    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Live> {
+    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Box<Live>> {
         let pt = PageTable::<Format>::from_root(cell.root);
         let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
-        Some(Live {
+        Some(Box::new(Live {
             cell: Cell {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 root: child.root(),
@@ -797,11 +801,11 @@ impl Host {
             random: Counter.cycles() | 1,
             lazy: None,
             fs: fs.clone(),
-        })
+        }))
     }
 
     #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "used by `fork`"))]
-    fn requeue(&mut self, live: Live, wake: Option<u64>) {
+    fn requeue(&mut self, live: Box<Live>, wake: Option<u64>) {
         match wake {
             Some(at) => self.sched.sleep(live, at),
             None => self.sched.add(live),
@@ -823,7 +827,8 @@ impl Host {
         if live.tag != 0 {
             self.tags.free(live.tag);
         }
-        self.templates.push((live.cell, live.fs));
+        let Live { cell, fs, .. } = *live;
+        self.templates.push((cell, fs));
         true
     }
 
@@ -870,7 +875,7 @@ impl Host {
         self.sched.len()
     }
 
-    fn end(&mut self, live: Live, ending: Ending) {
+    fn end(&mut self, live: Box<Live>, ending: Ending) {
         if self.fp_owner >> 32 == live.cell.id as u64 {
             self.fp_owner = 0;
         }

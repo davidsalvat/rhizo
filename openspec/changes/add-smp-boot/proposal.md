@@ -38,6 +38,9 @@ on all of them.
 - **Locks**: `sync::Global` becomes a spinlock that knows its holder
   (`rhizo_core::sync::SpinLock`): another CPU waits, the same CPU asking
   again still panics (reentrance is a bug, as before).
+- **Heap pages from the top of memory**, so the pages the heap keeps do
+  not split the free runs that copy-on-write large pages and snapshots
+  need (with several CPUs, a template child lost a 2 MiB copy-on-write).
 - **Tests**: host tests for the MADT reader, the CPU list of the device
   tree, CPU selection (property test) and the lock (threads as CPUs); in
   kernel, every CPU's number and stack, and four CPUs hammering a global
@@ -68,7 +71,8 @@ in xAPIC mode; more than 16 CPUs.
 ## Impact
 
 `crates/rhizo-core` (`acpi`, `smp`, `sync`, `fdt::cpus`, `smp=` option,
-`boot::report_cpus`), `kernel/src/sync.rs`, `kernel/src/smp.rs` (new),
+`boot::report_cpus`), `crates/rhizo-mm` (`FrameAllocator::alloc_high`),
+`kernel/src/heap.rs`, `kernel/src/sync.rs`, `kernel/src/smp.rs` (new),
 `kernel/src/arch/aarch64/{boot,cpu,irq,platform,smp}.rs`,
 `kernel/src/arch/x86_64/{boot,cpu,irq,user,smp}.rs`, `kernel/src/cell.rs`
 (interrupts and tags set up once at boot), `kernel/src/tests.rs`,
