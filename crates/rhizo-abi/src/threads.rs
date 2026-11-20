@@ -30,6 +30,8 @@ const ALLOWED: u64 = THREAD
     | CLONE_CHILD_CLEARTID
     | CLONE_DETACHED
     | CLONE_CHILD_SETTID;
+/// The first address above the lower half, where cells live.
+const LOWER_HALF_END: u64 = 0x0000_8000_0000_0000;
 /// The exit signal in the low byte of `clone`'s flags.
 const CSIGNAL: u64 = 0xff;
 
@@ -56,6 +58,11 @@ pub(crate) fn clone<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     }
     if args.flags & !ALLOWED != 0 {
         return -EINVAL;
+    }
+    // A thread pointer in the kernel half, or non-canonical, would fault
+    // when loaded into the x86_64 FS base, in the kernel (Linux: `EPERM`).
+    if args.flags & CLONE_SETTLS != 0 && args.tls >= LOWER_HALF_END {
+        return -EPERM;
     }
     if !cx.services.can_store(size_of::<Thread>() as u64) {
         return -EAGAIN;

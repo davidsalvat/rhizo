@@ -23,6 +23,7 @@ use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
 
 /// Linux `errno` values used here.
 pub mod errno {
+    pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
     pub const EBADF: i64 = 9;
     pub const EAGAIN: i64 = 11;

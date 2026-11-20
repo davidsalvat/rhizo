@@ -45,6 +45,15 @@ call SHALL return `-EAGAIN`.
 - **WHEN** a cell calls `clone` without `CLONE_VM`
 - **THEN** it receives `-ENOSYS` and no thread is created
 
+### Requirement: Thread pointers stay in the lower half
+A `clone` or `clone3` with `CLONE_SETTLS` and a thread pointer outside the
+lower half SHALL return `-EPERM`: it would fault in the kernel when loaded
+into the x86_64 FS base.
+
+#### Scenario: Kernel thread pointer
+- **WHEN** a cell calls `clone` with `CLONE_SETTLS` and a thread pointer at or above `0x0000_8000_0000_0000`
+- **THEN** it receives `-EPERM` and no thread is created
+
 ### Requirement: Thread identifiers
 `gettid` SHALL return the calling thread's identifier. The first thread's
 identifier SHALL be the cell's identifier at spawn; each new thread SHALL

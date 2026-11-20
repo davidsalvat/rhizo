@@ -770,6 +770,15 @@ fn clones_that_are_not_threads_are_refused() {
         -EINVAL,
         "CLONE_NEWUTS"
     );
+    // A kernel-half or non-canonical thread pointer would fault in the
+    // kernel when loaded into the FS base.
+    for tls in [0xffff_8000_0000_0000, 0x0000_8000_0000_0000, u64::MAX] {
+        assert_eq!(
+            w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, tls, 0]).0,
+            -EPERM,
+            "tls {tls:#x}"
+        );
+    }
     assert_eq!(w.cell.threads.len(), 1);
     assert_eq!(w.services.log, "", "refusals are not missing calls");
     w.services.room = Some(100);
