@@ -14,5 +14,5 @@
 
 ## 3. Benchmarks and documentation
 
-- [ ] 3.1 `cell.thread_scaling_pct` and `cell.shootdown_us` in the `rhizo-smp` line, parsed by `xtask` with a unit test, `bench/README.md` (D8); verify `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference` locally
+- [x] 3.1 `cell.thread_scaling_pct` and `cell.shootdown_us` in the `rhizo-smp` line, parsed by `xtask` with a unit test, `bench/README.md` (D8); verify `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference` locally
 - [ ] 3.2 `AGENTS.md`, `README.md` feature list; `cargo xtask ci` on both architectures; CI green with the bench gate
