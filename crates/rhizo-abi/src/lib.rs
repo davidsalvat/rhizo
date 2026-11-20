@@ -18,7 +18,7 @@ use core::fmt;
 use rhizo_cell::memory::{self, Pager};
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
-use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_PAGES, STACK_TOP, USER_END};
+use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_LIMIT, STACK_TOP, USER_END};
 use rhizo_hal::{Console, PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
@@ -76,6 +76,7 @@ enum Sys {
     SetTidAddress,
     Uname,
     ClockGettime,
+    Time,
     Getrandom,
     RtSigaction,
     RtSigprocmask,
@@ -200,6 +201,7 @@ impl Arch {
             (Arch::Aarch64, 101) | (Arch::X86_64, 35) => Nanosleep,
             (Arch::Aarch64, 115) | (Arch::X86_64, 230) => ClockNanosleep,
             (Arch::X86_64, 158) => ArchPrctl,
+            (Arch::X86_64, 201) => Time,
             (Arch::X86_64, 4) => Stat,
             (Arch::X86_64, 6) => Lstat,
             (Arch::Aarch64, 56) | (Arch::X86_64, 257) => Openat,
@@ -391,8 +393,9 @@ const AT_FDCWD: u64 = -100i64 as u64;
 const BLOCK: i64 = i64::MIN;
 /// Bytes copied per step when moving data between a cell and the kernel.
 const CHUNK: usize = 256;
-/// Lowest address the stack region (with its guard page) may reach.
-const STACK_FLOOR: u64 = STACK_TOP - (STACK_PAGES + 1) * FRAME_SIZE;
+/// Lowest address the stack region (grown to its limit, with a guard page)
+/// may reach.
+const STACK_FLOOR: u64 = STACK_TOP - STACK_LIMIT - FRAME_SIZE;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
@@ -492,6 +495,7 @@ impl Abi {
             }
             Some(Sys::Uname) => uname(cx, self.arch, a[0]),
             Some(Sys::ClockGettime) => clock_gettime(cx, a[0], a[1]),
+            Some(Sys::Time) => time(cx, a[0]),
             Some(Sys::Getrandom) => getrandom(cx, a[0], a[1]),
             // Signals are not delivered yet: accept, report no previous state.
             Some(Sys::RtSigaction) => zero_out(cx, a[2], 32),
@@ -832,6 +836,19 @@ fn clock_gettime<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     put(cx, addr, &ts)
 }
 
+/// `time` (x86_64): whole seconds since the epoch, also stored at `addr`
+/// unless it is null.
+fn time<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+) -> i64 {
+    let now = (cx.services.realtime_ns() / 1_000_000_000) as i64;
+    if addr != 0 && cx.write(addr, &now.to_le_bytes()).is_err() {
+        return -EFAULT;
+    }
+    now
+}
+
 fn getrandom<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     addr: u64,
@@ -1018,8 +1035,8 @@ fn rlimit<F: EntryFormat, M: PhysicalMemory, T, A, S>(
 ) -> i64 {
     const INFINITY: u64 = u64::MAX;
     let (cur, max) = match resource {
-        3 => (8 << 20, INFINITY), // RLIMIT_STACK
-        7 => (1024, 1024),        // RLIMIT_NOFILE
+        3 => (STACK_LIMIT, INFINITY), // RLIMIT_STACK
+        7 => (1024, 1024),            // RLIMIT_NOFILE
         0..=15 => (INFINITY, INFINITY),
         _ => return -EINVAL,
     };

@@ -397,7 +397,7 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
         if self.0.as_mut().is_some_and(|lazy| lazy.page_in(pt, addr)) {
             return true;
         }
-        write && resolve_write(pt, addr)
+        (write && resolve_write(pt, addr)) || grow_stack(pt, addr)
     }
 
     fn discard(&mut self, addr: u64, len: u64) {
@@ -405,6 +405,13 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
             lazy.discard(addr, len);
         }
     }
+}
+
+/// Grows the stack of the cell with tables `pt` to cover `addr` (design D5
+/// of `add-cpython`), if memory allows.
+fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
+    memory::cells_may_take(FRAME_SIZE)
+        && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, &mut KernelFrames, addr)
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
@@ -837,6 +844,13 @@ impl Host {
                     }
                     Trap::Fault(fault)
                         if fault
+                            .missing_page()
+                            .is_some_and(|addr| grow_stack(&pt, addr)) =>
+                    {
+                        continue;
+                    }
+                    Trap::Fault(fault)
+                        if fault
                             .write_denied()
                             .is_some_and(|addr| resolve_write(&pt, addr)) =>
                     {
@@ -1149,6 +1163,12 @@ pub fn bench(console: &mut impl Console) {
             "rhizo-python cold_ns={cold} warm_ns={warm}"
         );
     }
+    if let Some((cold, warm)) = cpython() {
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-cpython cold_ns={cold} warm_ns={warm}"
+        );
+    }
     let (idle, suspended) = density();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -1326,6 +1346,71 @@ fn python() -> Option<(u64, u64)> {
     }
     let template = host
         .spawn_with_files(image, &argv, files(), true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"warm\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    cold.sort_unstable();
+    warm.sort_unstable();
+    Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
+}
+
+/// The files a CPython cell starts with (`cpython-files`, packed by `xtask`:
+/// the standard library under `/usr/lib/python3.13` and `/app/agent_demo.py`;
+/// design D2 of `add-cpython`), decoded once and then shared copy-on-write
+/// by every CPython cell; `None` when CPython was not built.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+pub fn cpython_files() -> Option<Fs> {
+    static FILES: Global<Option<Fs>> = Global::new(None);
+    let bytes = test_image("cpython-files");
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(FILES.with(|files| {
+        files
+            .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
+            .clone()
+    }))
+}
+
+/// CPython answering one tool call (`cells/python/agent_demo.py`, design D3
+/// of `add-cpython`): started cold from its executable (interpreter start,
+/// imports, warm-up) with the standard library in its files, and forked from
+/// a template frozen after the warm-up. Medians over 7 rounds; `None` when
+/// CPython was not built.
+#[cfg(feature = "bench-cell")]
+fn cpython() -> Option<(u64, u64)> {
+    const ROUNDS: usize = 7;
+    const ARGV: [&[u8]; 2] = [b"/usr/bin/python3", b"/app/agent_demo.py"];
+    let image = test_image("cpython");
+    let files = cpython_files()?;
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let (mut cold, mut warm) = (Vec::new(), Vec::new());
+    for _ in 0..ROUNDS {
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_with_files(image, &ARGV, files.clone(), true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        cold.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    let template = host
+        .spawn_with_files(image, &ARGV, files, true, false)
         .expect("spawn");
     while host.output(template) != Some(b"warm\n") {
         host.step();

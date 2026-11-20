@@ -342,6 +342,10 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("linux-process/firecracker".into(), e)),
         }
+        match crate::compare::cpython_in_vm(opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
+        }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
@@ -392,6 +396,7 @@ fn measure_cells(
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
         let (mut pipe_rtt, mut loopback_rtt) = (Vec::new(), Vec::new());
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
+        let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
@@ -423,6 +428,10 @@ fn measure_cells(
                     if let Some((c, w)) = parse_python_line(&out.output) {
                         py_cold.push(c as f64 / 1000.0);
                         py_warm.push(w as f64 / 1000.0);
+                    }
+                    if let Some((c, w)) = parse_cpython_line(&out.output) {
+                        cpy_cold.push(c as f64 / 1000.0);
+                        cpy_warm.push(w as f64 / 1000.0);
                     }
                     if let Some(d) = parse_density_line(&out.output) {
                         density = Some(d);
@@ -480,6 +489,8 @@ fn measure_cells(
             ("cell.loopback_rtt_us", "us", &mut loopback_rtt),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
+            ("workload.cpython_cold_us", "us", &mut cpy_cold),
+            ("workload.cpython_warm_us", "us", &mut cpy_warm),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
         ] {
@@ -525,6 +536,19 @@ fn measure_cells(
 /// (absent when MicroPython was not built).
 fn parse_python_line(output: &str) -> Option<(u64, u64)> {
     let line = output.lines().find(|l| l.starts_with("rhizo-python "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("cold_ns")?, field("warm_ns")?))
+}
+
+/// `(cold_ns, warm_ns)` of the CPython line of a `bench-cell` kernel
+/// (absent when CPython was not built).
+fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-cpython "))?;
     let field = |key: &str| -> Option<u64> {
         line.split_whitespace()
             .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
@@ -1234,10 +1258,37 @@ pub fn comparison_table(results: &Results) -> String {
         find("workload.python_cold_us", "rhizo", "firecracker"),
         find("workload.python_warm_us", "rhizo", "firecracker"),
     );
+    let cpython = |guest: &str| {
+        (
+            find("workload.cpython_cold_us", guest, "firecracker"),
+            find("workload.cpython_warm_us", guest, "firecracker"),
+        )
+    };
+    let (cpy_cold, cpy_warm) = cpython("rhizo");
+    let (linux_cold, linux_warm) = cpython("linux-process");
+    if (cold.is_some() && warm.is_some()) || (cpy_cold.is_some() && cpy_warm.is_some()) {
+        s += "\n### A real interpreter\n";
+    }
+    if let (Some(c), Some(w)) = (cpy_cold, cpy_warm) {
+        s += &format!(
+            "\nCPython (static, 3.13.18) answering one agent tool call \
+             (`cells/python/agent_demo.py`: JSON, regular expressions, dates; the standard \
+             library it imports compiled in the cell's own files), in a cell and as a Linux \
+             process in the same Firecracker VM:\n\n\
+             | Started | Rhizo cell | Linux process |\n|---|---:|---:|\n\
+             | Cold, from its executable (interpreter start, imports, warm-up) | {} | {} |\n\
+             | Forked from an interpreter frozen (cell) or kept (process) after the warm-up \
+             | {} ({:.1}× faster) | {} |\n",
+            time(cpy_cold),
+            time(linux_cold),
+            time(cpy_warm),
+            c.median / w.median,
+            time(linux_warm)
+        );
+    }
     if let (Some(c), Some(w)) = (cold, warm) {
         s += &format!(
-            "\n### A real interpreter\n\n\
-             MicroPython (static, v1.24.1) answering one request \
+            "\nMicroPython (static, v1.24.1) answering one request \
              (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell \
              in Firecracker:\n\n\
              | Started | Time |\n|---|---:|\n\
@@ -1549,12 +1600,47 @@ mod tests {
     }
 
     #[test]
+    fn comparison_table_shows_cpython_next_to_linux() {
+        let us = |name: &str, guest: &str, v: f64| {
+            let mut m = metric(name, guest, Some("firecracker"), v);
+            m.unit = "us".into();
+            m
+        };
+        let run = us("cell.run_us", "rhizo", 7.2);
+        let t = comparison_table(&results(vec![
+            run.clone(),
+            us("workload.cpython_cold_us", "rhizo", 30000.0),
+            us("workload.cpython_warm_us", "rhizo", 1500.0),
+            us("workload.cpython_cold_us", "linux-process", 40000.0),
+            us("workload.cpython_warm_us", "linux-process", 3000.0),
+        ]));
+        assert!(t.contains("### A real interpreter"), "{t}");
+        assert!(t.contains("| Cold, from its executable (interpreter start, imports, warm-up) | 30.00 ms | 40.00 ms |"), "{t}");
+        assert!(t.contains("| 1.50 ms (20.0× faster) | 3.00 ms |"), "{t}");
+        assert!(!t.contains("MicroPython"));
+        let only_cell = comparison_table(&results(vec![
+            run,
+            us("workload.cpython_cold_us", "rhizo", 30000.0),
+            us("workload.cpython_warm_us", "rhizo", 1500.0),
+        ]));
+        assert!(only_cell.contains("| 30.00 ms | — |"), "{only_cell}");
+    }
+
+    #[test]
     fn python_line_is_parsed() {
         assert_eq!(
             parse_python_line("rhizo-python cold_ns=900000 warm_ns=40000\n"),
             Some((900_000, 40_000))
         );
         assert_eq!(parse_python_line("no python here"), None);
+    }
+
+    #[test]
+    fn cpython_line_is_parsed() {
+        let out =
+            "rhizo-python cold_ns=1 warm_ns=2\nrhizo-cpython cold_ns=30000000 warm_ns=900000\n";
+        assert_eq!(parse_cpython_line(out), Some((30_000_000, 900_000)));
+        assert_eq!(parse_cpython_line("rhizo-python cold_ns=1 warm_ns=2"), None);
     }
 
     #[test]

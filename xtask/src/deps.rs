@@ -53,7 +53,7 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("rhizo-cells", &[]),
-    ("xtask", &[]),
+    ("xtask", &["rhizo-fs"]),
 ];
 
 /// Workspace-internal edges `(from, to)` found in `cargo metadata` output.
