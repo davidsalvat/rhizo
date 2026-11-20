@@ -2390,6 +2390,10 @@ impl Host {
     /// Sets the quotas of live cell `id` (spec `isolation`); returns whether
     /// it exists. Memory, descriptors and sockets it holds already stay; it
     /// gets no more past the new limits.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
     pub fn set_quota(&mut self, id: u32, quota: Quota) -> bool {
         let Some(live) = self.state().sched.find_mut(|l| l.cell.id == id) else {
             return false;
