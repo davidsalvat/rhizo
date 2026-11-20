@@ -1,7 +1,7 @@
 # isolation Specification
 
 ## Purpose
-TBD - created by archiving change add-security-review. Update Purpose after archive.
+What keeps one cell from reaching the kernel, another cell or memory it was not given, under hostile input: the threat model reviewed in `docs/security.md` and the checks that hold it.
 
 ## Requirements
 

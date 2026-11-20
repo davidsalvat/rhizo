@@ -89,6 +89,7 @@ GV_RESTORE = median("snapshot.restore_ms", "gvisor", "runsc", required=False)
 GV_RUN = GV_RUN and GV_RUN * 1000
 GV_RESTORE = GV_RESTORE and GV_RESTORE * 1000
 THREADS = median("cell.thread_create_us", required=False)
+SCALING = median("cell.scaling_pct", required=False)
 LOOPBACK = median("cell.loopback_rtt_us", required=False)
 CPY_COLD = median("workload.cpython_cold_us", required=False)
 CPY_WARM = median("workload.cpython_warm_us", required=False)
@@ -443,13 +444,15 @@ def roadmap(t):
         ([("H15", "Sockets and network", "poll, epoll, TCP/UDP, virtio-net")]
          if LOOPBACK else []) + \
         ([("H16", "CPython in a cell", "CPython 3.13, warm templates")]
-         if CPY_WARM else [])
+         if CPY_WARM else []) + \
+        ([("H17", "Multi-core", f"up to 16 CPUs; cells {400 / SCALING:.1f}x faster on 4 vCPUs")]
+         if SCALING else [])
     now = []
     nxt = [("next", name, "") for name, done_ in [
         ("gVisor comparison", GV_RUN), ("Fair comparisons", CALL_AT == "same VM"),
         ("Adversarial security review", SECURITY), ("Threads", THREADS),
         ("Sockets and network", LOOPBACK), ("CPython in a cell", CPY_WARM),
-        ("Multi-core", None),
+        ("Multi-core", SCALING),
         ("Dedicated benchmark machine", None)] if not done_]
     rows = [(r, "done") for r in done] + [(r, "now") for r in now] + \
         [(r, "next") for r in nxt]

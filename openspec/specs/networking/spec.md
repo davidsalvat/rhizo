@@ -1,7 +1,7 @@
 # networking Specification
 
 ## Purpose
-TBD - created by archiving change add-sockets-and-poll. Update Purpose after archive.
+How cells talk: pipes, event counters, `poll`/`select`/`epoll`, Unix and TCP/UDP sockets between cells, and a virtio-net card to reach other addresses, all carried by snapshots and forks.
 
 ## Requirements
 
