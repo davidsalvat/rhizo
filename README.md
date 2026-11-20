@@ -72,6 +72,13 @@ The proof of concept must demonstrate one measurable claim:
 > cells running real Linux programs orders of magnitude faster than today's
 > microVM- and userspace-kernel-based sandboxes.
 
+A cell is born inside a kernel that is already running, so it is closer to a
+process than to a VM. The measurements below therefore come in two tiers: a
+cell against a Linux process doing the same operation in the same kind of VM
+(the like-for-like gain, and the smaller one), and whole microVMs and
+sandboxes, shown for scale. Resume is shown lazy (pages come back on first
+touch) and eager (every page restored first).
+
 The targets are hypotheses the proof of concept must validate. Where they stand:
 
 <p align="center">
@@ -134,21 +141,30 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 6.5 | 7.0 | 206.9 | 211.0 | 20 |
-| Cloud Hypervisor | 10.1 | 12.4 | 121.1 | 137.0 | 20 |
-| QEMU microvm | 46.3 | 49.9 | — | — | 20 |
-| QEMU q35 | 61.7 | 63.5 | 192.1 | 200.8 | 20 |
+| Firecracker | 9.0 | 9.5 | 196.1 | 197.1 | 20 |
+| Cloud Hypervisor | 7.3 | 15.0 | 99.5 | 105.9 | 20 |
+| QEMU microvm | 44.2 | 45.2 | — | — | 20 |
+| QEMU q35 | 62.6 | 66.7 | 181.7 | 183.1 | 20 |
 
-### Cells against existing mechanisms
+### A cell against a Linux process, in the same kind of VM
 
-Same machine, same run. Rhizo runs inside Firecracker. The microVM column is a Linux guest in Firecracker (boot to its first output, or a snapshot restored by a new Firecracker process until the VM runs: the way such sandboxes resume and clone); the gVisor column is a gVisor sandbox on the host (the same static program in a new sandbox, or a checkpointed sandbox restored until it runs); the last column is plain Linux processes on the host, which isolate far less.
+Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux guest of the middle column (the same static programs, as its `/init`): both sides pay the same virtualization. The last column is the same program on the host, one layer of virtualization less. Lazy resume brings pages back on first touch; eager restores every page before the program runs.
 
-| Operation | Rhizo cell | Firecracker microVM | gVisor sandbox | Linux process |
-|---|---:|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 12.1 µs | 206.90 ms | 90.11 ms | 179.3 µs |
-| Resume a suspended environment until it runs | 0.9 µs | 3.68 ms | 123.53 ms | — |
-| Fork an environment holding 50 MiB | 1.1 µs | 3.68 ms | 123.53 ms | 2.17 ms |
-| Serve a request from a warm template | 17.1 µs | 3.68 ms | 123.53 ms | — |
+| Operation | Rhizo cell | Linux process, same VM | Linux process, host |
+|---|---:|---:|---:|
+| The `fork` call, holding 50 MiB written | 0.9 µs | 87.5 µs | 627.2 µs |
+| Fork, then the child writes all 50 MiB and exits | 5.55 ms | 23.61 ms | 21.79 ms |
+| Start a program and run it to its exit (`hello`) | 7.2 µs | 594.9 µs | 95.7 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 0.9 µs / 601.4 µs | — | 2.51 ms (CRIU) |
+
+### Whole VMs and sandboxes, for scale
+
+A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbox process with its own kernel), a larger scope than a cell: these figures show the scale, not a like-for-like speed-up. The microVM is a Linux guest in Firecracker (boot to its first output, or a snapshot restored by a new Firecracker process); the gVisor sandbox runs on the host.
+
+| Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
+|---|---:|---:|---:|
+| Start a program and run it to its exit (`hello`) | 7.2 µs | 196.15 ms | 72.15 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 601.4 µs | 3.74 ms | 93.65 ms |
 
 ### A real interpreter
 
@@ -156,8 +172,8 @@ MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 4.37 ms |
-| Forked from a template frozen after the warm-up | 631.3 µs (6.9× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.56 ms |
+| Forked from a template frozen after the warm-up | 470.9 µs (7.6× faster) |
 
 Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 `cargo xtask bench --readme`.
