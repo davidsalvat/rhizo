@@ -45,7 +45,7 @@ a time.
 
 #### Scenario: Four threads, four CPUs
 - **WHEN** a cell with four CPU-bound threads runs alone on 4 vCPUs
-- **THEN** its threads run on several CPUs at once and it finishes in less time than with one thread
+- **THEN** the kernel records that its threads ran on at least two CPUs at the same time, and `cell.thread_scaling_pct` measures how much sooner it finishes than with one thread
 
 ### Requirement: Leaving a running cell
 A CPU SHALL leave a cell it runs with other CPUs when its thread blocks and

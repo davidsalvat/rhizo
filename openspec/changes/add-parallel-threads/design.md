@@ -153,7 +153,18 @@ Lost: lazy shootdowns by generation numbers (would leave freed frames
 reachable until the next switch); deferred frees with one interrupt at the
 end (frames of a large unmap kept until then, a list per call).
 
-## D8. Benchmarks
+## D8. Tests check parallelism, benchmarks the speed-up
+
+Whether four threads finish sooner than one depends on the host's spare
+cores (a loaded runner gives four vCPUs one core), so the in-kernel test
+checks what the kernel did instead: each running cell records the most
+CPUs that held one of its threads at the same time (a CPU holds a thread
+from the moment it chooses it until it puts it back), reported in
+`Finished::peak`, and `parsum` with 4 threads on 4 vCPUs must reach at
+least 2, with the sum of 1 thread. How much sooner is
+`cell.thread_scaling_pct`.
+
+## D9. Benchmarks
 
 `multi_core` in `bench-cell` (4 vCPUs) adds `parsum` with 1 and 4 threads
 (the cell measures its own computation with `clock_gettime`; median of 3

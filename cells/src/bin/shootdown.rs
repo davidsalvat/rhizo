@@ -5,7 +5,7 @@
 //! `stale read` and exits with 1. Otherwise its next read faults and the
 //! cell ends with the fault (on Linux: `SIGSEGV`), printing nothing.
 //!
-//! With `bench [rounds]` it measures instead (design D8 of
+//! With `bench [rounds]` it measures instead (design D9 of
 //! `add-parallel-threads`): three threads spin, writing their own memory,
 //! while the first maps, writes and unmaps one page `rounds` times (200 by
 //! default), and it prints `shootdown_ns=<median munmap>`.

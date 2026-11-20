@@ -47,7 +47,9 @@ stops before it is suspended, forked or frozen.
   call.
 - **Tests**: `parsum`, a static glibc program summing in parallel with
   mutexes and condition variables (checked against Linux), runs with 4
-  threads on 4 vCPUs faster than with one; `shootdown`, a cell where one
+  threads on 4 vCPUs with its threads on at least two CPUs at the same
+  time (the kernel records the most CPUs a cell's threads ran on at once;
+  the speed-up is the benchmark's); `shootdown`, a cell where one
   thread keeps reading a page that another unmaps, must fault and never
   read it after the unmap; a cell computing on several CPUs, suspended,
   resumed and forked between runs, gives the uninterrupted result.

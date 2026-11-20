@@ -665,7 +665,7 @@ struct SmpLine {
     parallel_ns: u64,
     ipi_wake_ns: u64,
     /// `parsum` with 1 and with 4 threads, and one `munmap` while the
-    /// cell's other threads run (design D8 of `add-parallel-threads`).
+    /// cell's other threads run (design D9 of `add-parallel-threads`).
     threads1_ns: u64,
     threads4_ns: u64,
     shootdown_ns: u64,

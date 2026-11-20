@@ -490,6 +490,9 @@ struct Live {
     /// The thread chosen last while it ran on several CPUs: turns go on
     /// from there the next time (design D5 of `add-parallel-threads`).
     last: u32,
+    /// Most CPUs that ran its threads at the same time (design D5 of
+    /// `add-parallel-threads`).
+    peak: u32,
 }
 
 impl Live {
@@ -659,6 +662,9 @@ pub struct Finished {
     /// The CPUs it ran on (bit `n` for CPU `n`).
     #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "in-kernel tests"))]
     pub cpus: u32,
+    /// Most CPUs that ran its threads at the same time.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "in-kernel tests"))]
+    pub peak: u32,
 }
 
 /// What the CPUs running a host's cells share (design D3 of
@@ -895,6 +901,7 @@ fn end(live: Box<Live>, ending: Ending) -> (Finished, u16) {
         ending,
         output: live.output.unwrap_or_default(),
         cpus: live.cpus,
+        peak: live.peak,
     };
     (finished, live.tag)
 }
@@ -1249,6 +1256,14 @@ impl Gang {
 }
 
 impl GangCell {
+    /// Records how many CPUs run the cell's threads now, if that is the
+    /// most so far: each holds its thread from the moment it is chosen until
+    /// it is put back, so those stints overlap.
+    fn count_busy(&mut self) {
+        let busy = self.busy.iter().filter(|&&tid| tid != 0).count() as u32;
+        self.live.peak = self.live.peak.max(busy);
+    }
+
     /// Chooses the next thread for `cpu` (turns by identifier, skipping the
     /// threads other CPUs run; design D5) and copies its registers into
     /// `regs`, the CPU's; `None` if there is none.
@@ -1262,6 +1277,7 @@ impl GangCell {
         *regs = threads.get(tid)?.regs;
         self.busy[cpu] = tid;
         self.live.last = tid;
+        self.count_busy();
         self.live.cpus |= 1 << cpu;
         Some(tid)
     }
@@ -1450,6 +1466,7 @@ fn start_gang(shared: &Global<Shared>, cpu: usize, live: Box<Live>, keep: bool) 
         regs = current.regs;
         cell.busy[cpu] = tid;
         cell.live.last = tid;
+        cell.count_busy();
         Some(tid)
     });
     run_gang(shared, cpu, ptr, first, regs);
@@ -1660,6 +1677,7 @@ impl Host {
             deadlines: Vec::new(),
             io_seen: 0,
             last: 0,
+            peak: 1,
         })
     }
 
@@ -2669,7 +2687,7 @@ fn multi_core() -> (u64, u64, u64) {
     (serial[ROUNDS / 2], parallel[ROUNDS / 2], robust(&mut wake))
 }
 
-/// With several CPUs (design D8 of `add-parallel-threads`): `parsum` with 1
+/// With several CPUs (design D9 of `add-parallel-threads`): `parsum` with 1
 /// and with 4 threads, alone on every CPU (the time it reports, medians
 /// over 3 rounds), and the median `munmap` of `shootdown bench` while its
 /// other threads run on the other CPUs.

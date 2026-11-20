@@ -11,7 +11,7 @@ freed.
 
 #### Scenario: Parallel sum
 - **WHEN** `parsum` sums with 4 threads, under a mutex and a condition variable, on 4 vCPUs
-- **THEN** it prints the sum it prints with 1 thread and on Linux, in less time than with 1 thread
+- **THEN** it prints the sum it prints with 1 thread and on Linux, and its threads ran on at least two CPUs at the same time
 
 #### Scenario: Exit while siblings run elsewhere
 - **WHEN** one thread of a cell calls `exit_group(0)` while another spins on another CPU

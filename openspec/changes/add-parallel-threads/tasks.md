@@ -10,9 +10,9 @@
 - [x] 2.1 Gangs in `kernel/src/cell.rs`: going shared, joining, the cell lock, per-CPU registers, eager FP put-back, offering threads and waking idle CPUs, leaving, ending on every CPU (D2–D6); single-CPU path unchanged; verify `cargo xtask test` and `cargo xtask test --only ktest-smp` on both architectures
 - [x] 2.2 x86_64 shootdowns: per-CPU user-mode words, hold flag, interrupts, clean set (D7); none on AArch64; verify `cargo xtask --arch x86_64 test --only ktest-smp`
 - [x] 2.3 Cells `parsum` (C, pthreads) and `shootdown` (Rust), in `cells/expected.rs`; verify `cargo xtask test --only differential`
-- [x] 2.4 In-kernel tests: parallel speed-up and result of `parsum`, unmap under a reader, suspend, resume and fork of a cell on several CPUs, futex ping-pong between CPUs; verify `cargo xtask test` and `ktest-smp` on both architectures, `ktest-smp` three times in a row
+- [x] 2.4 In-kernel tests: `parsum` result and its threads on several CPUs at the same time (D8), unmap under a reader, suspend, resume and fork of a cell on several CPUs, futex ping-pong between CPUs; verify `cargo xtask test` and `ktest-smp` on both architectures, `ktest-smp` three times in a row
 
 ## 3. Benchmarks and documentation
 
-- [x] 3.1 `cell.thread_scaling_pct` and `cell.shootdown_us` in the `rhizo-smp` line, parsed by `xtask` with a unit test, `bench/README.md` (D8); verify `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference` locally
+- [x] 3.1 `cell.thread_scaling_pct` and `cell.shootdown_us` in the `rhizo-smp` line, parsed by `xtask` with a unit test, `bench/README.md` (D9); verify `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference` locally
 - [x] 3.2 `AGENTS.md`, `README.md` feature list; `cargo xtask ci` on both architectures; CI green with the bench gate

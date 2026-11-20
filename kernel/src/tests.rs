@@ -2197,36 +2197,34 @@ fn suspend_between_parallel_runs_is_invisible() {
     }
 }
 
-/// `parsum` with `threads` threads summing `millions` million rounds, timed,
-/// alone on every CPU: its output's sum line, the nanoseconds it reports,
-/// and the CPUs it ran on.
-fn parsum(threads: &[u8], millions: &[u8]) -> (alloc::string::String, u64, u32) {
+/// `parsum` with `threads` threads summing `millions` million rounds,
+/// alone on every CPU: its output, and the most CPUs that ran its threads
+/// at the same time.
+fn parsum(threads: &[u8], millions: &[u8]) -> (alloc::string::String, u32) {
     let mut host = Host::new();
-    let id = spawn(&mut host, "parsum", &[threads, millions, b"time"]);
+    let id = spawn(&mut host, "parsum", &[threads, millions]);
     host.run(|h| h.finished(id).is_some());
     let (ending, output) = ended(&host, id);
     assert_eq!(ending, Ending::Exit(0), "{output}");
-    let (sum, ns) = output.split_once("ns ").expect("a time");
-    let ns = ns.trim().parse().expect("nanoseconds");
-    (sum.into(), ns, host.finished(id).expect("ended").cpus)
+    (output, host.finished(id).expect("ended").peak)
 }
 
 /// Four threads of one cell on four CPUs: the same sum as one thread (and
-/// as Linux, `cells/expected.rs`), sooner (spec `threads`, threads of a
-/// cell in parallel; `scheduling`, idle CPUs run threads of running cells).
+/// as Linux, `cells/expected.rs`), with threads of the cell running on
+/// several CPUs at the same time (spec `threads`, threads of a cell in
+/// parallel; `scheduling`, idle CPUs run threads of running cells). The
+/// speed-up itself is measured by `cell.thread_scaling_pct`, not here: it
+/// depends on the host's spare cores.
 fn threads_of_a_cell_run_on_several_cpus_at_once() {
     run_expected("parsum");
-    let (one, serial, _) = parsum(b"1", b"24");
-    let (four, parallel, cpus) = parsum(b"4", b"24");
+    let (one, _) = parsum(b"1", b"24");
+    let (four, peak) = parsum(b"4", b"24");
     assert_eq!(four, one, "the sum does not depend on the threads");
     assert_eq!(one, "sum 2868a16807fecd08\n");
-    if crate::smp::count() >= 4 {
-        assert!(cpus.count_ones() >= 2, "ran on CPUs {cpus:#b}");
-        // At least 1.5 times faster (4 on an idle machine).
-        assert!(
-            3 * parallel < 2 * serial,
-            "4 threads took {parallel} ns, 1 thread {serial} ns"
-        );
+    if crate::smp::count() >= 2 {
+        assert!(peak >= 2, "its threads ran on {peak} CPU at a time");
+    } else {
+        assert_eq!(peak, 1, "one CPU: one thread at a time");
     }
 }
 
