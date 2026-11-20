@@ -19,4 +19,4 @@
 
 - [x] 3.1 Host property tests in `rhizo-abi/src/hostile.rs` (D7); verify `cargo xtask check`
 - [x] 3.2 Hostile cells and in-kernel tests on both architectures; verify `cargo xtask test --only ktest` and `cargo xtask --arch x86_64 test --only ktest`
-- [ ] 3.3 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
+- [x] 3.3 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
