@@ -92,6 +92,15 @@ What makes the boundary hold:
   or left by a previous holder of the tag, is never used. A CPU lets go of
   a cell's tables when it gives the cell back, so tables are never freed
   while a CPU still has them loaded.
+- **Threads of a cell on several CPUs** (`add-parallel-threads`). While a
+  cell's threads run on several CPUs, its system calls and the faults that
+  change its tables take its lock, one at a time. On x86_64 a call or
+  fault that shrinks its translations first interrupts the other CPUs
+  running its code and keeps them out until it is complete (they drop the
+  PCID when they enter again), so a frame it frees is never reachable
+  through another CPU's TLB; AArch64 invalidations stay broadcast. The
+  cell is freed only by the last CPU to leave it, after `exit_group` or a
+  fault interrupted the others.
 - **Zeroed memory.** Every frame a cell is given is zeroed or fully
   written first: anonymous mappings and the heap (`map_anonymous`), ELF
   pages and the stack (`zero_frame` before copying), page tables, private

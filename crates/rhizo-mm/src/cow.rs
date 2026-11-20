@@ -9,7 +9,7 @@
 
 use crate::FRAME_SIZE;
 use crate::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
-use rhizo_hal::PhysicalMemory;
+use rhizo_hal::{PhysicalMemory, Tlb};
 
 /// Where a cell's frames come from and go back to, with reference counts so
 /// a frame (a page or a page table) can belong to several cells.
@@ -165,10 +165,16 @@ impl<F: EntryFormat> PageTable<F> {
     /// references, or makes it writable again if not. Returns `false` if the
     /// write is refused for a real reason (no page, or a read-only one). The
     /// caller flushes the TLB entry for `virt`.
+    ///
+    /// A copied page replaces the old one break-before-make: the entry is
+    /// cleared and flushed through `tlb` before it points at the copy, so
+    /// no CPU running the same tables holds both (AArch64 requires it when
+    /// the output address changes; design D7 of `add-parallel-threads`).
     pub fn resolve_write(
         &self,
         mem: &mut impl PhysicalMemory,
         frames: &mut impl Frames,
+        tlb: &mut impl Tlb,
         virt: u64,
     ) -> Result<bool, MapError> {
         let Some((slot, level)) = self.walk_private(mem, frames, virt)? else {
@@ -194,17 +200,19 @@ impl<F: EntryFormat> PageTable<F> {
                 PageSize::Small => frames.alloc(),
                 _ => frames.alloc_large(),
             };
-            match copy {
+            let new = match copy {
                 Some(copy) => {
                     copy_frames(mem, page, copy, size.bytes());
-                    mem.write_u64(slot, F::with_address(writable, copy));
+                    F::with_address(writable, copy)
                 }
                 None if size == PageSize::Large => {
-                    let table = copy_as_small_pages::<F>(mem, frames, page, writable)?;
-                    mem.write_u64(slot, F::table(table));
+                    F::table(copy_as_small_pages::<F>(mem, frames, page, writable)?)
                 }
                 None => return Err(MapError::OutOfFrames),
-            }
+            };
+            mem.write_u64(slot, 0);
+            tlb.flush_page(virt & !(size.bytes() - 1));
+            mem.write_u64(slot, new);
             frames.free(page, size);
         } else {
             mem.write_u64(slot, writable);
