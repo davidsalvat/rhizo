@@ -16,4 +16,4 @@
 ## 3. Documentation and CI
 
 - [x] 3.1 `docs/security.md` (O1 closed, quotas, what they do not cover); verify by reading
-- [ ] 3.2 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
+- [x] 3.2 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
