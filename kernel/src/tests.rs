@@ -132,6 +132,7 @@ macro_rules! suite {
             ktest_case!(threads_of_a_cell_run_on_several_cpus_at_once),
             ktest_case!(performance_counters_count_where_present),
             ktest_case!(cost_accounting_adds_up_over_a_cell),
+            ktest_case!(samples_show_where_a_cell_spins),
             $(ktest_case!($extra),)*
         ]
     };
@@ -2356,4 +2357,21 @@ fn cost_accounting_adds_up_over_a_cell() {
             .expect("getpid recorded");
         assert_eq!(getpid.1, 100);
     });
+}
+
+/// Sampling (spec `profiling`): while a cell spins, every sample taken is
+/// that cell's, at an address of its code, with the PMU's overflow
+/// interrupt or, without one, the timer.
+fn samples_show_where_a_cell_spins() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "spin", &[b"20"]);
+    let (sampler, _) = crate::prof::start_sampling(4096);
+    host.run(|h| h.finished(id).is_some());
+    let samples = crate::prof::stop_sampling(|s| s.sorted().to_vec());
+    assert_eq!(ended(&host, id).0, Ending::Exit(0));
+    assert!(!samples.is_empty(), "no sample ({sampler})");
+    for s in &samples {
+        assert_eq!(s.cell, id, "{sampler}");
+        assert!(s.pc < 0x0000_8000_0000_0000, "{:#x} ({sampler})", s.pc);
+    }
 }

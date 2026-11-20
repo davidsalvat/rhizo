@@ -106,12 +106,18 @@ pub fn build(out: &Path) -> Result {
     write_if_changed(&files, &encode(&root)?)
 }
 
+/// The interpreter as built, with its symbols (the cell runs a stripped
+/// copy; spec `profiling` names the functions of its samples from this).
+pub fn interpreter() -> PathBuf {
+    dir().join(format!("Python-{VERSION}")).join("python")
+}
+
 /// Builds `python` from the tarball unless the build directory already
 /// holds one built with the same recipe; returns its path.
 fn build_interpreter(tarball: &Path) -> Result<PathBuf> {
     let dir = dir();
     let src = dir.join(format!("Python-{VERSION}"));
-    let python = src.join("python");
+    let python = interpreter();
     let recipe = format!("{VERSION} {}\n{SETUP_LOCAL}", CONFIGURE.join(" "));
     let stamp = dir.join("recipe");
     if python.exists() && std::fs::read_to_string(&stamp).ok().as_deref() == Some(&recipe) {
