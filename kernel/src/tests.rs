@@ -50,6 +50,7 @@ macro_rules! suite {
             ktest_case!(box_and_vec_work),
             ktest_case!(heap_alignment_is_honored),
             ktest_case!(heap_memory_is_reused),
+            ktest_case!(large_heap_allocations_survive_fragmentation),
             ktest_case!(cell_says_hello),
             ktest_case!(cell_exit_status_and_frames_return),
             ktest_case!(cell_system_calls),
@@ -345,6 +346,39 @@ fn heap_memory_is_reused() {
         free_before,
         "reuse must not take new frames"
     );
+}
+
+/// With no two free frames next to each other, a large heap allocation
+/// still succeeds (mapped from single frames), holds what is written, and
+/// gives every frame back.
+fn large_heap_allocations_survive_fragmentation() {
+    let before = memory::free_bytes();
+    let mut taken: Vec<u64> = Vec::with_capacity((before / FRAME_SIZE) as usize);
+    let mut kept = Vec::with_capacity(taken.capacity() / 2 + 1);
+    while let Some(phys) = memory::with_frames(|f| f.alloc()).flatten() {
+        taken.push(phys);
+    }
+    // Give back every other frame: plenty of memory, no run of two.
+    taken.sort_unstable();
+    for (i, phys) in taken.into_iter().enumerate() {
+        if i % 2 == 0 {
+            memory::with_frames(|f| f.free(phys));
+        } else {
+            kept.push(phys);
+        }
+    }
+    let mut big = alloc::vec![0u64; (1 << 20) / 8];
+    for (i, word) in big.iter_mut().enumerate() {
+        *word = i as u64 * 3;
+    }
+    assert!(big.iter().enumerate().all(|(i, &w)| w == i as u64 * 3));
+    drop(big);
+    for phys in kept {
+        memory::with_frames(|f| f.free(phys));
+    }
+    // Back, but for the window's page tables (made once).
+    let lost = before - memory::free_bytes();
+    assert!(lost <= 2 * FRAME_SIZE, "{lost} bytes not returned");
 }
 
 // --- Self-checks ------------------------------------------------------------
@@ -1087,7 +1121,9 @@ fn memory_pressure_fails_cells_not_the_kernel() {
         (done, refused)
     }
     for (name, args) in [
-        ("ballast", &[&b"all"[..], b"8"][..]),
+        // 16 MiB each: more than memory holds even when, on several
+        // CPUs, some cells end before others start.
+        ("ballast", &[&b"all"[..], b"16"][..]),
         ("filer", &[&b"16"[..]][..]),
     ] {
         let before = memory_balance();

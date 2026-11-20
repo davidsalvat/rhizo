@@ -76,6 +76,7 @@ None.
 state, run on every CPU, per-CPU FP owner, TLB sets, sharing lock),
 `kernel/src/arch/*/{user,irq,smp}.rs` (per-CPU state, tick start/stop,
 `leave_user`), `kernel/src/smp.rs`, `kernel/src/sync.rs`,
-`crates/rhizo-core/src/sync.rs` (`get_mut`), `cells/src/bin/spin.rs`
+`crates/rhizo-core/src/sync.rs` (`get_mut`), `kernel/src/heap.rs` (a
+mapped window for large allocations when memory is fragmented), `cells/src/bin/spin.rs`
 (optional round count), `kernel/src/tests.rs`, `xtask/src/bench.rs`,
 `bench/README.md`, `AGENTS.md`, `docs/security.md`.

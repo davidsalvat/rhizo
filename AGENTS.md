@@ -165,6 +165,9 @@ Memory layout, the same on both architectures (see
   memory only through `PhysicalMemory` (kernel: `memory::DirectMap`).
 - `0xffff_ffff_8000_0000 + phys`: kernel image with W^X; the page under the
   kernel stack is an unmapped guard page.
+- `0xffff_9000_0000_0000` (512 GiB, builds that run cells): large kernel
+  heap allocations mapped from single frames when no contiguous run is
+  free; addresses never reused.
 - `0xffff_ffff_c000_0000 + n * 128 KiB`: stacks of secondary CPU `n`
   (kernel, exception, double fault), each above an unmapped guard page.
 - AArch64 only: `0xffff_c000_0000_0000 + phys` is a device-memory window

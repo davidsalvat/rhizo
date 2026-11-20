@@ -105,10 +105,24 @@ Lost: a lock per sharing group (cells forked from one ancestor), which
 needs the group as state that survives forks and templates; and making the
 copy-on-write walk lock-free.
 
-## D7. Large run-queue entries and memory
+## D7. Large heap allocations without contiguous frames
+
+Cells running in parallel interleave their frame allocations, and memory
+ends up fragmented in ways one CPU never produced: on x86_64 with four
+vCPUs a 2.4 MB snapshot found no run of free frames with 100 MiB free. The
+kernel heap's large allocations still take a contiguous run first (the
+direct map, no mapping work); when none is left they take single frames
+and map them one after the other in a window of the kernel half
+(`heap::window`, one top-level entry, 512 GiB), whose tables exist before
+any cell (x86_64 cell roots copy the kernel's top-level entries). Window
+addresses are never reused, so a stale translation on another CPU can
+never reach memory handed out later, and freeing needs no shootdown.
 
 Moving cells between queues and CPUs moves `Box<Live>` (`add-smp-boot`
 D8), so a slice moves a pointer, not 1.2 KiB.
+
+Lost: reusing window addresses (needs kernel TLB shootdowns), and mapping
+every large allocation (slower than the direct map for the common case).
 
 ## D8. Multi-core benchmark in the same `bench-cell` image
 

@@ -52,3 +52,11 @@ not wait for each other.
 #### Scenario: Children of one parent at once
 - **WHEN** children forked from one cell write to and free shared pages on several CPUs at the same time, then exit
 - **THEN** every shared frame and table is returned
+
+### Requirement: Kernel allocations survive fragmentation
+A large kernel heap allocation SHALL succeed whenever enough frames are
+free, contiguous or not.
+
+#### Scenario: No two free frames together
+- **WHEN** every other free frame is taken and the kernel allocates 1 MiB
+- **THEN** the allocation succeeds, holds what is written, and its frames come back when it is freed

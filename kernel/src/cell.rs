@@ -189,6 +189,7 @@ static MAX_TAG: AtomicU16 = AtomicU16::new(0);
 /// the other CPUs, at most `smp` in all (spec `multi-core`); returns how
 /// many are online. Call once, before any [`Host`].
 pub fn init(smp: Option<u16>) -> usize {
+    crate::heap::window::init();
     irq::init(SLICE_NS);
     MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
     crate::smp::start(smp)
