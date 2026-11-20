@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/rhizo-logo-dark.svg">
+    <img src="docs/logo/rhizo-logo.svg" alt="Rhizo" height="96">
+  </picture>
+</p>
+
 # Rhizo
 
 **An operating system kernel built for AI agents.**
