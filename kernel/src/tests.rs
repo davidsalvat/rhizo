@@ -2078,10 +2078,12 @@ fn threads_of_a_cell_run_on_several_cpus_at_once() {
 /// the unmap has returned, the reader's next read faults; it never reads
 /// the page after it saw the flag raised after the unmap (spec
 /// `multi-core`, TLB coherence; on x86_64 a shootdown). Several rounds, the
-/// race being the point; every frame comes back.
+/// race being the point; after the first (which caches the executable),
+/// every frame comes back.
 fn unmapped_page_is_gone_on_every_cpu() {
+    run_expected("shootdown");
     let before = memory::free_bytes();
-    for _ in 0..5 {
+    for _ in 0..4 {
         run_expected("shootdown");
     }
     assert_eq!(memory::free_bytes(), before, "every frame returned");
