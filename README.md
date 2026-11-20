@@ -280,6 +280,8 @@ twice, and every spec is tested on both
 
 - [`openspec/specs/`](openspec/specs/): how the system behaves today, one spec
   per capability.
+- [`docs/vision.md`](docs/vision.md): where Rhizo goes after the proof of
+  concept (servers and local AI, one engine) and what the kernel needs for it.
 - [`bench/README.md`](bench/README.md): every metric, environment and baseline.
 - [`AGENTS.md`](AGENTS.md): code map, rules and the feedback loop (for people
   and AI coding agents alike).
