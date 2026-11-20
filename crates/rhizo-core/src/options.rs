@@ -10,6 +10,8 @@
 //!   `exit=semihosting` (AArch64 under QEMU emulation)
 //! - `ip=dhcp` or `ip=ADDR/PREFIX[,GATEWAY]`: the network card's address
 //! - `echo=ADDR:PORT`: a TCP echo server the in-kernel tests may reach
+//! - `llm=ADDR:PORT`: the host's fake model server (an HTTP chat API) the
+//!   agent workload talks to
 //! - `virtio_mmio.device=SIZE@BASE:IRQ` (added by QEMU `microvm` and
 //!   Firecracker on x86_64): read by [`virtio_mmio_devices`]
 //! - `smp=N`: use at most `N` CPUs (`N` from 1 to 65535; default: every CPU
@@ -64,6 +66,8 @@ pub struct BootOptions {
     pub ip: Option<IpOption>,
     /// A TCP echo server for the in-kernel tests.
     pub echo: Option<([u8; 4], u16)>,
+    /// The host's fake model server (`llm=ADDR:PORT`).
+    pub llm: Option<([u8; 4], u16)>,
     /// Most CPUs to use (`smp=N`); `None`: all the firmware describes.
     pub smp: Option<u16>,
 }
@@ -75,6 +79,7 @@ impl Default for BootOptions {
             exit: ExitKind::DebugExit,
             ip: None,
             echo: None,
+            llm: None,
             smp: None,
         }
     }
@@ -171,6 +176,8 @@ impl BootOptions {
                         options.ip = ip_option(v).or(options.ip);
                     } else if let Some(v) = word.strip_prefix(b"echo=") {
                         options.echo = endpoint(v).or(options.echo);
+                    } else if let Some(v) = word.strip_prefix(b"llm=") {
+                        options.llm = endpoint(v).or(options.llm);
                     } else if let Some(n) = word.strip_prefix(b"smp=").and_then(parse_count) {
                         options.smp = Some(n);
                     }
@@ -298,6 +305,10 @@ mod tests {
             Some(([10, 0, 2, 2], 7777))
         );
         assert_eq!(BootOptions::parse(b"echo=10.0.2.2:70000").echo, None);
+        let both = BootOptions::parse(b"echo=10.0.2.2:7 llm=172.16.0.1:8080");
+        assert_eq!(both.echo, Some(([10, 0, 2, 2], 7)));
+        assert_eq!(both.llm, Some(([172, 16, 0, 1], 8080)));
+        assert_eq!(BootOptions::parse(b"llm=172.16.0.1").llm, None);
     }
 
     #[test]

@@ -1,24 +1,27 @@
 # The standard library a CPython cell needs, as a tree of compiled modules
-# (design D2 of `add-cpython`). Run by the CPython that will run the script:
+# (design D2 of `add-cpython`). Run by the CPython that will run the scripts:
 #
-#     python pack_stdlib.py <script> <out-dir>
+#     python pack_stdlib.py <out-dir> <script>...
 #
-# The script runs once with its output discarded; each standard-library
-# module that it and the interpreter's start-up imported is compiled to a
-# sourceless `.pyc` (never checked against a source) at its relative path
-# under <out-dir>, the directory that becomes `lib/python3.X`.
+# Each script runs once, without arguments, with its output discarded; each
+# standard-library module that the scripts and the interpreter's start-up
+# imported is compiled to a sourceless `.pyc` (never checked against a
+# source) at its relative path under <out-dir>, the directory that becomes
+# `lib/python3.X`.
 import io
 import sys
 
-script, out = sys.argv[1], sys.argv[2]
-with open(script) as f:
-    code = compile(f.read(), script, "exec")
+out, scripts = sys.argv[1], sys.argv[2:]
 shown, sys.stdout = sys.stdout, io.StringIO()
-exec(code, {"__name__": "__main__", "__file__": script})
+for script in scripts:
+    with open(script) as f:
+        code = compile(f.read(), script, "exec")
+    sys.argv = [script]
+    exec(code, {"__name__": "__main__", "__file__": script})
 sys.stdout = shown
 modules = dict(sys.modules)
 
-import os  # noqa: E402 (after the snapshot of what the script imported)
+import os  # noqa: E402 (after the snapshot of what the scripts imported)
 import py_compile  # noqa: E402
 
 lib = os.path.dirname(os.__file__)

@@ -181,3 +181,29 @@ pub const CPYTHON_STDOUT: &str = "warm\n\
      \"gap_spread\": 7.62, \"last_date\": \"22 Dec 2026\", \"mean_gap_days\": 8.6087, \
      \"tool\": \"summarize\", \"top_words\": [\"KERNEL\", \"FORK\", \"PAGE\"]}\n\
      cpython ok\n";
+
+/// The CPython agent (`cells/python/agent_loop.py`, change
+/// `add-agent-workload`) after [`AGENT_TURNS`] turns with the host's fake
+/// model: its transcript, the same as a Linux process (`linux` mode) and as
+/// a cell suspended after every turn and forked at its decision point
+/// (`cell` mode). `conn_requests` counts the requests on the agent's
+/// connection: it keeps counting across suspends, and each branch has a
+/// connection of its own.
+#[allow(dead_code)]
+pub const AGENT_TURNS: usize = 3;
+#[allow(dead_code)]
+pub const AGENT_TRANSCRIPT: &str = "\
+turn 1 call_1c7990ea n=930 seed=783 value=350705 notes=1 crc=08f15329 conn_requests=1
+turn 2 call_c4ff4ba0 n=824 seed=999 value=402872 notes=2 crc=5b8d69ac conn_requests=2
+turn 3 call_ab9ee1a0 n=820 seed=481 value=184870 notes=3 crc=2a65944d conn_requests=3
+fork
+branch 0
+branch 0 value=184870
+branch 0 turn call_bfe901d6 n=642 seed=998 value=312881 notes=5 crc=adcea7c2 conn_requests=1
+branch 1
+branch 1 value=200031
+branch 1 turn call_d67ece69 n=833 seed=263 value=102750 notes=5 crc=fa1ef667 conn_requests=1
+branch 2
+branch 2 value=196700
+branch 2 turn call_78d9a019 n=949 seed=765 value=360186 notes=5 crc=780d122b conn_requests=1
+";

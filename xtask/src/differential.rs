@@ -11,7 +11,10 @@ use std::process::Command;
 mod expected {
     include!("../../cells/expected.rs");
 }
-use expected::{CPYTHON_ARGV, CPYTHON_STDOUT, Ending, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT};
+use expected::{
+    AGENT_TRANSCRIPT, AGENT_TURNS, CPYTHON_ARGV, CPYTHON_STDOUT, Ending, PROGRAMS, PYTHON_COMMAND,
+    PYTHON_STDOUT,
+};
 
 /// Why the check cannot run on this host, if it cannot.
 pub fn unavailable_reason() -> Option<String> {
@@ -109,6 +112,51 @@ fn check_cpython(scratch: &Path) -> Result {
                 .reproduce(format!("env -i {} {}", python.display(), script.display()))
                 .into_error(),
         );
+    }
+    check_agent(&python, &root, scratch)
+}
+
+/// The CPython agent as a Linux process (`linux` mode, its branches made
+/// with `fork`) against the host's fake model prints [`AGENT_TRANSCRIPT`],
+/// the transcript the cell must print (change `add-agent-workload`).
+fn check_agent(python: &Path, root: &Path, scratch: &Path) -> Result {
+    let port = crate::hostnet::llm_server("127.0.0.1")?.to_string();
+    let _ = std::fs::remove_dir_all(scratch);
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let script = root.join("app/agent_loop.py");
+    let turns = AGENT_TURNS.to_string();
+    let args = [
+        script.display().to_string(),
+        "127.0.0.1".into(),
+        port,
+        "linux".into(),
+        turns,
+    ];
+    let out = Command::new(python)
+        .args(&args)
+        .env_clear()
+        .current_dir(scratch)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", python.display()))?;
+    let _ = std::fs::remove_dir_all(scratch);
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || text != AGENT_TRANSCRIPT || !out.stderr.is_empty() {
+        return Err(Failure::new(
+            "differential",
+            "the CPython agent behaves differently on Linux",
+        )
+        .location("cells/python/agent_loop.py")
+        .expected(format!(
+            "exit 0, stdout {AGENT_TRANSCRIPT:?} (cells/expected.rs), no stderr"
+        ))
+        .actual(format!(
+            "{:?}, stdout {text:?}, stderr {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ))
+        .hint("Linux is the reference: fix the agent, the fake model or the expectation")
+        .reproduce("cargo xtask check (the model server runs inside xtask)")
+        .into_error());
     }
     Ok(())
 }

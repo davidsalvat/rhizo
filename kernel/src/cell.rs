@@ -2122,6 +2122,37 @@ impl Host {
         Some(child_id)
     }
 
+    /// Whether live cell `id` sleeps: none of its threads can run, and one
+    /// waits for a deadline, not for a descriptor (a host's safe point to
+    /// suspend or freeze it, design D3 of `add-agent-workload`).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn asleep(&mut self, id: u32) -> bool {
+        self.state()
+            .sched
+            .find(|l| l.cell.id == id)
+            .is_some_and(|l| {
+                let threads = &l.cell.threads;
+                !threads.is_runnable() && !threads.waits_on_io() && threads.wake_at().is_some()
+            })
+    }
+
+    /// Creates or replaces file `path` with `data` in live cell `id`'s
+    /// files; returns whether it could (how a host hands a forked cell its
+    /// part, design D3 of `add-agent-workload`).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn write_file(&mut self, id: u32, path: &[u8], data: &[u8]) -> bool {
+        self.state()
+            .sched
+            .find_mut(|l| l.cell.id == id)
+            .is_some_and(|l| l.fs.put_file(path, data).is_ok())
+    }
+
     /// Ends live cell `id` if it exists; returns whether it did.
     #[cfg_attr(
         not(feature = "ktest"),
@@ -2295,6 +2326,20 @@ pub fn bench(console: &mut impl Console) {
             rhizo_hal::ConsoleWriter(console),
             "rhizo-cpython cold_ns={cold} warm_ns={warm}"
         );
+    }
+    match agent_figures() {
+        Ok([turn, suspend_resume, fork]) => {
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-agent turn_ns={turn} suspend_resume_ns={suspend_resume} fork_ns={fork}"
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-agent skipped: {why}"
+            );
+        }
     }
     let (idle, suspended) = density();
     let _ = writeln!(
@@ -2569,6 +2614,181 @@ fn cpython() -> Option<(u64, u64)> {
     cold.sort_unstable();
     warm.sort_unstable();
     Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
+}
+
+/// One run of the CPython agent (`cells/python/agent_loop.py`, change
+/// `add-agent-workload`).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[derive(Debug)]
+pub struct AgentRun {
+    /// Everything the agent printed: its turns, then each branch in order.
+    pub transcript: Vec<u8>,
+    /// Each suspend plus resume between turns.
+    pub suspend_resume_ns: Vec<u64>,
+    /// From freezing the agent at its decision point until every branch
+    /// forked from it runs (has printed its first line).
+    pub fork_ns: u64,
+}
+
+/// Branches the agent forks into at its decision point.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+const AGENT_BRANCHES: u8 = 3;
+
+/// Runs the CPython agent for `turns` turns against the host's model
+/// server (`llm=` on the command line), suspending and resuming it (`mode`)
+/// in its pause after every turn; then, where it prints `fork` and sleeps,
+/// freezes it as a template and starts one cell per branch from it, each
+/// told its branch in `/branch` (design D3 of `add-agent-workload`), and
+/// runs them to their end. `timed`: the agent also prints its turn times.
+/// An error says why the agent could not run or finish.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn agent(
+    host: &mut Host,
+    turns: usize,
+    mode: Resume,
+    timed: bool,
+) -> Result<AgentRun, alloc::string::String> {
+    use alloc::format;
+    let files = cpython_files().ok_or("CPython not built")?;
+    let (ip, port) = crate::wire::options()
+        .llm
+        .ok_or("no network card and model server on this VMM")?;
+    host.wire_address(10_000_000_000)
+        .ok_or("the network card got no address")?;
+    let ip = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let (port, turns_arg) = (format!("{port}"), format!("{turns}"));
+    let mut argv: Vec<&[u8]> = alloc::vec![
+        b"/usr/bin/python3",
+        b"/app/agent_loop.py",
+        ip.as_bytes(),
+        port.as_bytes(),
+        b"cell",
+        turns_arg.as_bytes(),
+    ];
+    if timed {
+        argv.push(b"timed");
+    }
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    // Under emulation CPython is slow; a model that never answers must
+    // still end the run.
+    let end = now_ns().saturating_add(600_000_000_000);
+    let said = |host: &Host, id: u32| match host.finished(id) {
+        Some(f) => format!(
+            "it ended ({:?}) after: {}",
+            f.ending,
+            alloc::string::String::from_utf8_lossy(&f.output)
+                .trim()
+                .replace('\n', " | ")
+        ),
+        None => "no progress in 600 s".into(),
+    };
+    let mut id = host
+        .spawn_with_files(test_image("cpython"), &argv, files, true, false)
+        .map_err(|e| format!("cannot spawn CPython: {e:?}"))?;
+    let mut run = AgentRun {
+        transcript: Vec::new(),
+        suspend_resume_ns: Vec::new(),
+        fork_ns: 0,
+    };
+    // Its turns: after each, it pauses in a sleep, where the host suspends
+    // and resumes it; the last pause before the fork is its long sleep.
+    loop {
+        while !(host.asleep(id) && host.output(id).is_some_and(|o| o.ends_with(b"\n"))) {
+            if host.finished(id).is_some() || now_ns() > end {
+                return Err(said(host, id));
+            }
+            host.step();
+        }
+        if host.output(id).is_some_and(|o| o.ends_with(b"fork\n")) {
+            break;
+        }
+        let t0 = Counter.cycles();
+        let snapshot = host.suspend(id).ok_or("cannot suspend the agent")?;
+        let resumed = host.resume(snapshot, mode, true, false);
+        run.suspend_resume_ns.push(ns(t0, Counter.cycles()));
+        let resumed = resumed.map_err(|_| "cannot resume the agent")?;
+        run.transcript
+            .extend_from_slice(&host.finished(id).expect("suspended").output);
+        id = resumed;
+    }
+    run.transcript
+        .extend_from_slice(host.output(id).unwrap_or_default());
+    // The decision point: one cell per branch, from the frozen agent.
+    let t0 = Counter.cycles();
+    if !host.freeze(id) {
+        return Err("cannot freeze the agent".into());
+    }
+    let mut branches = Vec::new();
+    for b in 0..AGENT_BRANCHES {
+        let child = host
+            .spawn_from_template(id, true, false)
+            .ok_or("cannot fork the agent")?;
+        if !host.write_file(child, b"/branch", &[b'0' + b]) {
+            return Err("cannot give a branch its number".into());
+        }
+        branches.push(child);
+    }
+    let running = |host: &mut Host, child: u32| {
+        let out = match host.finished(child) {
+            Some(f) => Some(f.output.as_slice()),
+            None => host.output(child),
+        };
+        out.is_some_and(|o| o.contains(&b'\n'))
+    };
+    while !branches.iter().all(|&c| running(host, c)) {
+        if now_ns() > end {
+            return Err("the branches do not run".into());
+        }
+        host.step();
+    }
+    run.fork_ns = ns(t0, Counter.cycles());
+    host.run(|h| branches.iter().all(|&c| h.finished(c).is_some()) || now_ns() > end);
+    for &child in &branches {
+        match host.finished(child) {
+            Some(f) if f.ending == Ending::Exit(0) => run.transcript.extend_from_slice(&f.output),
+            _ => {
+                let why = said(host, child);
+                host.kill(child);
+                return Err(format!("branch {child}: {why}"));
+            }
+        }
+    }
+    Ok(run)
+}
+
+/// The CPython agent's figures (design D4 of `add-agent-workload`), over 3
+/// runs of 8 turns, each suspended and eagerly resumed after every turn:
+/// medians of a turn as the agent times it (the first, which connects and
+/// runs cold, left out), of a suspend plus resume, and of a fork into the
+/// branches until they run.
+#[cfg(feature = "bench-cell")]
+fn agent_figures() -> Result<[u64; 3], alloc::string::String> {
+    const ROUNDS: usize = 3;
+    const TURNS: usize = 8;
+    let mut samples: [Vec<u64>; 3] = Default::default();
+    for _ in 0..ROUNDS {
+        let mut host = Host::new();
+        let run = agent(&mut host, TURNS, Resume::Eager, true)?;
+        let text = alloc::string::String::from_utf8_lossy(&run.transcript);
+        let turns = text
+            .lines()
+            .find_map(|l| l.strip_prefix("agent turn_ns="))
+            .ok_or("the agent printed no turn times")?;
+        samples[0].extend(
+            turns
+                .split(',')
+                .skip(1)
+                .filter_map(|t| t.parse::<u64>().ok()),
+        );
+        samples[1].extend(run.suspend_resume_ns);
+        samples[2].push(run.fork_ns);
+    }
+    let mut out = [0; 3];
+    for (o, s) in out.iter_mut().zip(&mut samples) {
+        s.sort_unstable();
+        *o = s.get(s.len() / 2).copied().unwrap_or(0);
+    }
+    Ok(out)
 }
 
 /// Memory per idle cell, from 1000 forks of a template of `idle` each run

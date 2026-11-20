@@ -22,8 +22,10 @@ pub const STDLIB: &str = "usr/lib/python3.13";
 
 /// C extension modules built into the executable. The standard library's
 /// other C modules are not built at all (`make python` builds no shared
-/// module): what is left out needs what cells do not have (sockets,
-/// processes, `dlopen`) or is not used by the workload.
+/// module): what is left out needs what cells do not have (processes,
+/// `dlopen`) or is not used by the workloads. Sockets, `select` and `array`
+/// (imported by `socket`) serve the agent's connection to its model
+/// (design D2 of `add-agent-workload`).
 const SETUP_LOCAL: &str = "\
 *static*
 _bisect _bisectmodule.c
@@ -31,11 +33,16 @@ _datetime _datetimemodule.c
 _heapq _heapqmodule.c
 _json _json.c
 _random _randommodule.c
+_socket socketmodule.c
 _struct _struct.c
+array arraymodule.c
 binascii binascii.c
 math mathmodule.c
+select selectmodule.c
 zlib zlibmodule.c
 ";
+/// The scripts a CPython cell runs, from `cells/python` to `/app`.
+pub const SCRIPTS: [&str; 2] = ["agent_demo.py", "agent_loop.py"];
 const CONFIGURE: [&str; 3] = [
     "--disable-shared",
     "--without-ensurepip",
@@ -50,7 +57,7 @@ fn dir() -> PathBuf {
 }
 
 /// The tree a CPython cell sees (`usr/bin/python3`, the standard library under
-/// [`STDLIB`], `app/agent_demo.py`), as a directory on the host; present
+/// [`STDLIB`], the [`SCRIPTS`] in `app`), as a directory on the host; present
 /// once [`build`] has built CPython.
 pub fn root() -> PathBuf {
     dir().join("root")
@@ -88,11 +95,19 @@ pub fn build(out: &Path) -> Result {
     ] {
         std::fs::create_dir_all(&d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
     }
-    let script = crate::workspace_root().join("cells/python/agent_demo.py");
-    std::fs::copy(&script, root.join("app/agent_demo.py")).map_err(|e| e.to_string())?;
-    let pack = crate::workspace_root().join("cells/python/pack_stdlib.py");
+    let scripts = crate::workspace_root().join("cells/python");
+    for script in SCRIPTS {
+        std::fs::copy(scripts.join(script), root.join("app").join(script))
+            .map_err(|e| e.to_string())?;
+    }
+    let pack = scripts.join("pack_stdlib.py");
     let mut cmd = Command::new(&python);
-    cmd.env_clear().arg(&pack).arg(&script).arg(&stdlib);
+    // From the build directory: a script may write files where it runs.
+    cmd.env_clear()
+        .current_dir(dir())
+        .arg(&pack)
+        .arg(&stdlib)
+        .args(SCRIPTS.map(|s| scripts.join(s)));
     run(
         &mut cmd,
         "pack the standard library",
