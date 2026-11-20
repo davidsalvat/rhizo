@@ -26,7 +26,7 @@ const KERNEL_PACKAGE: &str = "rhizo-kernel";
 const CELLS_PACKAGE: &str = "rhizo-cells";
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
 /// Virtual CPUs of the `ktest-smp` step (spec `multi-core`).
-const SMP_CPUS: u32 = 4;
+pub(crate) const SMP_CPUS: u32 = 4;
 /// Timeout for the self-check that expects a hanging kernel.
 const HANG_CHECK_TIMEOUT_SECS: u64 = 5;
 

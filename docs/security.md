@@ -84,6 +84,14 @@ What makes the boundary hold:
   EL0), and on x86_64 the kernel GS base, which is swapped out with
   `SWAPGS` before every return to a cell and back in at every entry, so a
   cell loading GS or changing its own GS base only changes its copy.
+- **TLB coherence across CPUs** (`add-smp-scheduling`). A cell runs on one
+  CPU at a time. AArch64 invalidations of cell translations are broadcast.
+  On x86_64 each cell records the CPUs whose TLB holds nothing stale for
+  it; any other CPU drops the cell's PCID before it next runs the cell, so
+  a translation removed by `munmap`, `mprotect`, copy-on-write or a fork,
+  or left by a previous holder of the tag, is never used. A CPU lets go of
+  a cell's tables when it gives the cell back, so tables are never freed
+  while a CPU still has them loaded.
 - **Zeroed memory.** Every frame a cell is given is zeroed or fully
   written first: anonymous mappings and the heap (`map_anonymous`), ELF
   pages and the stack (`zero_frame` before copying), page tables, private

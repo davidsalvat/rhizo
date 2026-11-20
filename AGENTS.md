@@ -128,7 +128,7 @@ The feedback loop, fastest first:
 | `crates/rhizo-fs` | A cell's in-memory file system: tree, file blocks shared copy-on-write between forks, descriptors, encoding for snapshots | — |
 | `crates/rhizo-abi` | Linux system calls of cells (both conventions), files through the cell's `rhizo-fs`, threads (`clone`, `clone3`, futexes), `EFAULT`/`ENOSYS`, scheduling outcomes (yield, block, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs` |
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian, threads and files sections), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs` |
-| `crates/rhizo-sched` | Run queue, sleep list and time slice (time passed in, never read); address-space tag pool | — |
+| `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list and time slice (time and CPU passed in, never read); address-space tag pool | — |
 | `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice (`src/cell.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs` |
 | `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
 | `xtask` | Developer tooling (host only) | — |

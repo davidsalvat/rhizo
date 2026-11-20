@@ -442,9 +442,9 @@ mod tests {
                 for e in running.iter().flatten() {
                     seen[*e] += 1;
                 }
-                for e in 0..entries {
+                for (e, n) in seen.iter_mut().enumerate() {
                     if s.find(|&x| x == e).is_some() {
-                        seen[e] += 1;
+                        *n += 1;
                     }
                 }
                 prop_assert!(seen.iter().all(|&n| n == 1), "{:?}", seen);
@@ -479,9 +479,9 @@ mod tests {
                 for (c, e) in taken {
                     s.requeue(c, e);
                 }
-                for e in 0..entries {
-                    prop_assert!(round - last_run[e] < entries.max(1),
-                        "entry {} waited since round {}", e, last_run[e]);
+                for (e, &last) in last_run.iter().enumerate() {
+                    prop_assert!(round - last < entries.max(1),
+                        "entry {} waited since round {}", e, last);
                 }
                 let lens: Vec<usize> = (0..cpus).map(|c| s.queues[c].len()).collect();
                 let (min, max) = (lens.iter().min().unwrap(), lens.iter().max().unwrap());

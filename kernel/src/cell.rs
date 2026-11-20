@@ -381,6 +381,7 @@ pub struct Finished {
     pub ending: Ending,
     pub output: Vec<u8>,
     /// The CPUs it ran on (bit `n` for CPU `n`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "in-kernel tests"))]
     pub cpus: u32,
 }
 
@@ -1239,6 +1240,15 @@ pub fn run(image: &[u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), ElfError> 
 pub fn bench(console: &mut impl Console) {
     use core::fmt::Write;
     const RUNS: usize = 101;
+    if crate::smp::count() > 1 {
+        let (serial, parallel, wake) = multi_core();
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-smp cpus={} serial_ns={serial} parallel_ns={parallel} ipi_wake_ns={wake}",
+            crate::smp::count()
+        );
+        return; // the other metrics are measured with one CPU
+    }
     let image = test_image("hello");
     let mut spawn_ns = Vec::with_capacity(RUNS);
     let mut run_ns = Vec::with_capacity(RUNS);
@@ -1549,6 +1559,54 @@ fn threads() -> (u64, u64) {
             .unwrap_or(0)
     };
     (field("create_ns"), field("futex_wake_ns"))
+}
+
+/// With several CPUs (design D8 of `add-smp-scheduling`): the time for
+/// four CPU-bound cells per CPU (`spin 5`) to run to their end on this CPU
+/// alone (steps) and on every CPU (a run), medians over 3 rounds; and the
+/// round trip to an idle CPU (wake it, run nothing, see it done), robust
+/// figure over 105.
+#[cfg(feature = "bench-cell")]
+fn multi_core() -> (u64, u64, u64) {
+    const ROUNDS: usize = 3;
+    let image = test_image("spin");
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let batch = |parallel: bool| {
+        let mut host = Host::new();
+        let ids: Vec<u32> = (0..4 * crate::smp::count())
+            .map(|_| {
+                host.spawn(image, &[b"spin", b"5"], false, false)
+                    .expect("spawn")
+            })
+            .collect();
+        let t0 = Counter.cycles();
+        if parallel {
+            host.run(|_| false);
+        } else {
+            while host.step() {}
+        }
+        let t1 = Counter.cycles();
+        for id in ids {
+            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        }
+        ns(t0, t1)
+    };
+    let mut serial: Vec<u64> = (0..ROUNDS).map(|_| batch(false)).collect();
+    let mut parallel: Vec<u64> = (0..ROUNDS).map(|_| batch(true)).collect();
+    serial.sort_unstable();
+    parallel.sort_unstable();
+    fn nothing(x: u64) -> u64 {
+        x
+    }
+    let mut wake: Vec<u64> = (0..105)
+        .map(|_| {
+            let t0 = Counter.cycles();
+            crate::smp::post(1, nothing, 0);
+            crate::smp::join(1);
+            ns(t0, Counter.cycles())
+        })
+        .collect();
+    (serial[ROUNDS / 2], parallel[ROUNDS / 2], robust(&mut wake))
 }
 
 /// Rounds of a repeated measure (design D4 of `add-cell-files`).
