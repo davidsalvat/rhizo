@@ -290,8 +290,8 @@ fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
         c
     };
     cmd.args(["--kill-after=5", "60"]).arg(runsc);
-    // gVisor's KVM platform, as Rhizo uses KVM (its default, systrap, hangs on
-    // GitHub's runners); cgroups are left alone (CI runners differ); every
+    // gVisor's default platform (systrap) unless `RHIZO_GVISOR_PLATFORM` says
+    // otherwise (`kvm`); cgroups are left alone (CI runners differ); every
     // command logs to `<root>/../logs/`, quoted when a command fails.
     let mut logs = root
         .parent()
@@ -302,12 +302,11 @@ fn runsc_cmd(runsc: &Path, root: &Path) -> Command {
     logs.push('/');
     cmd.arg("--root")
         .arg(root)
-        .args([
-            "--platform=kvm",
-            "--network=none",
-            "--ignore-cgroups",
-            "--debug",
-        ])
+        .arg(format!(
+            "--platform={}",
+            std::env::var("RHIZO_GVISOR_PLATFORM").unwrap_or_else(|_| "systrap".into())
+        ))
+        .args(["--network=none", "--ignore-cgroups", "--debug"])
         .arg(format!("--debug-log={logs}"));
     cmd.stdin(Stdio::null());
     cmd
@@ -329,14 +328,31 @@ fn checked(cmd: &mut Command, what: &str, logs: &Path) -> Result<String> {
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     files.sort();
+    // The lines that say why, from the failed command's newest logs.
     let mut tail = String::new();
-    for (_, path) in files.iter().rev().take(2) {
+    for (_, path) in files.iter().rev().take(4) {
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        let start = text.len().saturating_sub(1200);
-        let start = (start..text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(0);
-        tail += &format!("\n--- {}:\n{}", path.display(), &text[start..]);
+        let why: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                [
+                    "panic",
+                    "fatal",
+                    "FATAL",
+                    "error",
+                    "Error",
+                    "denied",
+                    "unsupported",
+                ]
+                .iter()
+                .any(|k| l.contains(k))
+            })
+            .take(12)
+            .collect();
+        if !why.is_empty() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            tail += &format!("\n--- {}:\n{}", name.unwrap_or_default(), why.join("\n"));
+        }
     }
     let how = if matches!(out.status.code(), Some(124 | 137)) || out.status.code().is_none() {
         "did not finish within 60 s".to_string()
