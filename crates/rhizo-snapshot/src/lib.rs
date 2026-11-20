@@ -21,7 +21,8 @@
 //!          it (tree, open descriptions and descriptors, pipes, event
 //!          counters, `epoll` instances, working directory)
 //! sockets  length u64, then one record per socket as `rhizo_net` encodes
-//!          them; a socket descriptor's index is its record's
+//!          them (version 6: a connection may be parked in the kernel);
+//!          a socket descriptor's index is its record's
 //! ```
 //!
 //! Every value is little endian; records are sorted by address.
@@ -42,7 +43,7 @@ use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 const HEADER: usize = 24;
 const STATE: usize = 4 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.
