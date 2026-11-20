@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
 use rhizo_cell::elf::{ElfError, Image};
+use rhizo_cell::images::{self, Images};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
@@ -98,6 +99,20 @@ pub fn open_sockets() -> usize {
     NET.with(|net| net.open())
 }
 
+/// Closes the connections parked for `snapshot`, which the host drops
+/// without resuming it (spec `networking`, design D3 of
+/// `keep-tcp-across-suspend`); resumed later, it finds them reset.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn close_parked(snapshot: &Snapshot) {
+    let records = snapshot.sockets();
+    if !records.is_empty() {
+        NET.with(|net| records.iter().for_each(|r| net.unpark(r)));
+    }
+}
+
 /// Releases the sockets `fs` holds (its cell ended or was suspended).
 fn release_sockets(fs: &Fs) {
     if fs.sockets().next().is_some() {
@@ -106,7 +121,8 @@ fn release_sockets(fs: &Fs) {
 }
 
 /// `fs` with its sockets replaced by indices into the records returned, for
-/// a snapshot.
+/// a snapshot; its connections are parked in the kernel (design D1 of
+/// `keep-tcp-across-suspend`).
 fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     let mut records = Vec::new();
     if fs.sockets().next().is_none() {
@@ -121,6 +137,7 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
                 state: rhizo_net::Saved::Reset,
                 local: None,
                 opts: rhizo_net::Options::default(),
+                parked: None,
             });
             records.push(record);
             (records.len() - 1) as u32
@@ -129,8 +146,9 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     (out, records)
 }
 
-/// Makes the sockets of a resumed cell from its snapshot's records, and
-/// points its descriptors and Unix socket names at them. A socket that
+/// Makes the sockets of a resumed cell from its snapshot's records (its
+/// parked connections come back), and points its descriptors and Unix
+/// socket names at them. A socket that
 /// cannot be made at all is left out: its descriptor reads as reset.
 fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
     if records.is_empty() {
@@ -143,6 +161,7 @@ fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
             let reset = rhizo_net::Record {
                 state: rhizo_net::Saved::Reset,
                 local: None,
+                parked: None,
                 ..r.clone()
             };
             let made = net.import(r).or_else(|_| net.import(&reset));
@@ -158,13 +177,135 @@ fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
     }
 }
 
-impl Frames for KernelFrames {
+/// Executables kept loaded (design D3 of `add-image-cache`).
+const KEPT_IMAGES: usize = 4;
+
+/// Executables loaded once and copied by every later spawn of them (spec
+/// `cells`, design D1 of `add-image-cache`): each a hierarchy holding only
+/// its segments, never run, whose tables and pages are only read once it is
+/// here. Its frames are the kernel's, taken like a cell's (never from the
+/// reserve) and given back before any cell is refused memory (D4).
+static IMAGES: Global<Images<KEPT_IMAGES>> = Global::new(Images::new());
+
+/// Drops every image kept loaded; returns whether there was one. Pages that
+/// cells still share stay theirs.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "also used by in-kernel tests")
+)]
+pub fn drop_images() -> bool {
+    IMAGES.with(|images| {
+        let mut any = false;
+        while let Some(root) = images.pop() {
+            space::destroy(
+                PageTable::<Format>::from_root(root),
+                &mut DirectMap,
+                &mut ImageFrames,
+            );
+            any = true;
+        }
+        any
+    })
+}
+
+/// Whether cells may take `bytes` more, dropping the images kept loaded if
+/// that is what it takes (design D4 of `add-image-cache`).
+fn cells_may_take(bytes: u64) -> bool {
+    memory::cells_may_take(bytes) || (drop_images() && memory::cells_may_take(bytes))
+}
+
+/// A space of its own holding the segments of the executable `data`, parsed
+/// as `image` (design D2 of `add-image-cache`): a copy of the space kept
+/// for it, loaded first if it is not kept yet.
+fn image_space(data: &'static [u8], image: &Image) -> Result<PageTable<Format>, ElfError> {
+    let key = (data.as_ptr() as u64, data.len() as u64);
+    if let Some(pt) = IMAGES.with(|images| copy_image(images, key, image)) {
+        return Ok(pt);
+    }
+    // Loaded outside the lock: loading may drop the images kept.
+    let loaded = rhizo_cell::load::<Format>(image, &mut DirectMap, &mut KernelFrames)?;
+    sync_code(&loaded, image);
+    IMAGES
+        .with(|images| {
+            if images.get(key).is_some() {
+                // Another CPU loaded it meanwhile.
+                space::destroy(loaded, &mut DirectMap, &mut ImageFrames);
+            } else if let Some(old) = images.insert(key, loaded.root()) {
+                space::destroy(
+                    PageTable::<Format>::from_root(old),
+                    &mut DirectMap,
+                    &mut ImageFrames,
+                );
+            }
+            copy_image(images, key, image)
+        })
+        .ok_or(ElfError::OutOfMemory)
+}
+
+/// A copy of the space kept for `key`: its read-only pages shared, its
+/// tables and writable pages the copy's own. Short of frames for that, the
+/// kept space itself, taken out, with every other image dropped: a spawn
+/// never needs more memory than a load. `None` if `key` is not kept.
+fn copy_image(
+    images: &mut Images<KEPT_IMAGES>,
+    key: images::Key,
+    image: &Image,
+) -> Option<PageTable<Format>> {
+    let kept = PageTable::<Format>::from_root(images.get(key)?);
+    if let Ok(copy) = kept.clone_lower_half(&mut DirectMap, &mut ImageFrames, image.span()) {
+        return Some(copy);
+    }
+    images.remove(key);
+    while let Some(root) = images.pop() {
+        space::destroy(
+            PageTable::<Format>::from_root(root),
+            &mut DirectMap,
+            &mut ImageFrames,
+        );
+    }
+    Some(kept)
+}
+
+/// The frames of [`KernelFrames`] for work under the [`IMAGES`] lock: an
+/// allocation that fails does not try to drop images.
+#[derive(Debug)]
+struct ImageFrames;
+
+impl Frames for ImageFrames {
     fn alloc(&mut self) -> Option<u64> {
         memory::alloc_for_cell(1)
     }
 
     fn alloc_large(&mut self) -> Option<u64> {
         memory::alloc_for_cell((LARGE_PAGE_SIZE / FRAME_SIZE) as usize)
+    }
+
+    fn free(&mut self, phys: u64, size: PageSize) {
+        KernelFrames.free(phys, size);
+    }
+
+    fn share(&mut self, phys: u64) {
+        KernelFrames.share(phys);
+    }
+
+    fn is_shared(&self, phys: u64) -> bool {
+        KernelFrames.is_shared(phys)
+    }
+}
+
+impl Frames for KernelFrames {
+    /// Short of frames, the images kept loaded go first (design D4 of
+    /// `add-image-cache`).
+    fn alloc(&mut self) -> Option<u64> {
+        ImageFrames
+            .alloc()
+            .or_else(|| drop_images().then(|| ImageFrames.alloc()).flatten())
+    }
+
+    /// Without dropping images: whoever asks for 2 MiB falls back to
+    /// 4 KiB pages, which may.
+    fn alloc_large(&mut self) -> Option<u64> {
+        ImageFrames.alloc_large()
     }
 
     fn free(&mut self, phys: u64, size: PageSize) {
@@ -246,7 +387,7 @@ impl Services for KernelServices<'_> {
     }
 
     fn can_store(&mut self, bytes: u64) -> bool {
-        memory::cells_may_take(bytes)
+        cells_may_take(bytes)
     }
 
     fn save_fp(&mut self, fp: &mut FpState) {
@@ -477,7 +618,7 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
 /// Grows the stack of the cell with tables `pt` to cover `addr` (design D5
 /// of `add-cpython`), if memory allows.
 fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
-    memory::cells_may_take(FRAME_SIZE)
+    cells_may_take(FRAME_SIZE)
         && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, &mut KernelFrames, addr)
 }
 
@@ -956,7 +1097,12 @@ impl Host {
         if !WIRE_READY.swap(true, Ordering::Relaxed) {
             let mut seed = [0; 8];
             RANDOM.with(|g| g.fill(&mut seed));
-            NET.with(|net| crate::wire::init(net, now_ns(), u64::from_le_bytes(seed)));
+            NET.with(|net| {
+                // Parked connections re-attach only in this boot (design D2
+                // of `keep-tcp-across-suspend`).
+                net.set_boot(Counter.cycles());
+                crate::wire::init(net, now_ns(), u64::from_le_bytes(seed));
+            });
         }
         Self {
             shared: Global::new(Shared {
@@ -1018,10 +1164,12 @@ impl Host {
 
     /// Creates a cell from the static executable `image` with `argv` and
     /// makes it runnable. Its output goes to the console when `echo` is set
-    /// and is kept in [`Finished::output`] when `capture` is set.
+    /// and is kept in [`Finished::output`] when `capture` is set. The image
+    /// is loaded once and kept: later spawns of it copy that space (design
+    /// D1 of `add-image-cache`).
     pub fn spawn(
         &mut self,
-        image: &[u8],
+        image: &'static [u8],
         argv: &[&[u8]],
         capture: bool,
         echo: bool,
@@ -1034,7 +1182,7 @@ impl Host {
     /// `files`, initial files).
     pub fn spawn_with_files(
         &mut self,
-        image: &[u8],
+        image: &'static [u8],
         argv: &[&[u8]],
         files: Fs,
         capture: bool,
@@ -1045,10 +1193,12 @@ impl Host {
         RANDOM.with(|g| g.fill(&mut random));
         let kernel = memory::kernel_tables();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
-        let cell = rhizo_cell::spawn::<Format>(
+        let parsed = Image::parse(image, user::MACHINE)?;
+        let cell = rhizo_cell::start::<Format>(
             id,
-            image,
+            &parsed,
             user::MACHINE,
+            image_space(image, &parsed)?,
             kernel_half,
             &mut DirectMap,
             &mut KernelFrames,
@@ -1056,7 +1206,6 @@ impl Host {
             &[],
             random,
         )?;
-        sync_code(&PageTable::<Format>::from_root(cell.root), image);
         let live = self.new_live(cell, capture, echo, files);
         self.state().sched.place(live);
         Ok(id)
@@ -1075,7 +1224,7 @@ impl Host {
         if let Some(lazy) = &live.lazy {
             bytes += 2 * lazy.pending_bytes();
         }
-        if !memory::cells_may_take(bytes) {
+        if !cells_may_take(bytes) {
             return None;
         }
         let mut live = self.state().sched.remove(|l| l.cell.id == id)?;
@@ -1111,7 +1260,7 @@ impl Host {
             let bytes = (0..snapshot.pages())
                 .map(|i| snapshot.page(i).size.bytes())
                 .sum();
-            if !memory::cells_may_take(bytes) {
+            if !cells_may_take(bytes) {
                 return Err(snapshot);
             }
         }
@@ -1531,7 +1680,7 @@ fn idle_until(wake: u64) {
     not(feature = "ktest"),
     allow(dead_code, reason = "used by in-kernel tests")
 )]
-pub fn run(image: &[u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), ElfError> {
+pub fn run(image: &'static [u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), ElfError> {
     let mut host = Host::new();
     let id = host.spawn(image, argv, true, true)?;
     host.run(|_| false);
@@ -1633,10 +1782,10 @@ pub fn bench(console: &mut impl Console) {
         rhizo_hal::ConsoleWriter(console),
         "rhizo-files write_read_ns={write_read} fork_ns={fork_files}"
     );
-    let (pipe, loopback) = net();
+    let (pipe, loopback, tcp_resume) = net();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
-        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback}"
+        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback} tcp_resume_ns={tcp_resume}"
     );
     match wire_rtt() {
         Ok(rtt) => {
@@ -2069,9 +2218,11 @@ fn files() -> (u64, u64) {
 /// Robust figures (see [`robust`]) of the time per round trip: `piper`
 /// writing one byte into a pipe and reading it back, and two `loopback`
 /// cells exchanging a 64-byte message over TCP on 127.0.0.1 (design D7 of
-/// `add-sockets-and-poll`).
+/// `add-sockets-and-poll`); and of the time to resume a `loopback twice`
+/// client suspended with its connection established until it has made one
+/// more round trip and exited (design D5 of `keep-tcp-across-suspend`).
 #[cfg(feature = "bench-cell")]
-fn net() -> (u64, u64) {
+fn net() -> (u64, u64, u64) {
     const RUNS: usize = 3 * ROUNDS;
     const PIPE_TRIPS: u64 = 2000;
     const NET_TRIPS: u64 = 200;
@@ -2111,7 +2262,36 @@ fn net() -> (u64, u64) {
             assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
         }
     }
-    (robust(&mut pipe), robust(&mut loopback))
+    let mut resume = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let server = host
+            .spawn(image, &[b"loopback", b"serve", b"7401", b"2"], true, false)
+            .expect("spawn server");
+        host.step(); // listening, waiting in `accept`
+        let client = host
+            .spawn(image, &[b"loopback", b"twice", b"7401"], true, false)
+            .expect("spawn client");
+        while host.output(client) != Some(b"once\n") {
+            host.step();
+        }
+        let snapshot = host.suspend(client).expect("live");
+        let t0 = Counter.cycles();
+        let client = host
+            .resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume");
+        host.run(|h| h.finished(client).is_some());
+        resume.push(ns(t0, Counter.cycles()));
+        host.run(|h| h.finished(server).is_some());
+        for id in [server, client] {
+            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        }
+    }
+    (
+        robust(&mut pipe),
+        robust(&mut loopback),
+        robust(&mut resume),
+    )
 }
 
 /// A robust figure (see [`robust`]) of the round trip of a 64-byte message
@@ -2235,11 +2415,10 @@ fn switch_ns(mut host: Host) -> u64 {
 }
 
 /// Makes the executable pages just written through the direct map visible to
-/// instruction fetch (needed on AArch64; nothing to do on x86_64).
-fn sync_code(pt: &PageTable<Format>, image: &[u8]) {
-    let Ok(image) = Image::parse(image, user::MACHINE) else {
-        return;
-    };
+/// instruction fetch (needed on AArch64; nothing to do on x86_64). Once per
+/// loaded image: its copies share these pages, never written again (design
+/// D5 of `add-image-cache`).
+fn sync_code(pt: &PageTable<Format>, image: &Image) {
     for s in image.segments().filter(|s| s.flags.is_executable()) {
         let first = s.vaddr & !(FRAME_SIZE - 1);
         for page in (first..s.vaddr + s.mem_size).step_by(FRAME_SIZE as usize) {

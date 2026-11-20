@@ -114,9 +114,10 @@ The feedback loop, fastest first:
   kernel's architecture). The kernel reads `console=` and `exit=` from its
   command line (PVH on x86_64, `/chosen/bootargs` on AArch64); `xtask` passes
   the right values. In-kernel tests and cell benchmarks also get a virtio-net
-  card (QEMU user network, `ip=dhcp`; Firecracker on a tap device when
-  `sudo -n` works) and a host TCP echo server (`echo=`); Cloud Hypervisor and
-  `q35` have no card (virtio-pci is not implemented).
+  card (QEMU user network, `ip=dhcp`; Firecracker and Cloud Hypervisor each
+  on a tap device when `sudo -n` works) and a host TCP echo server
+  (`echo=`). The card is virtio-mmio on `microvm`, Firecracker and `virt`
+  (1 CPU), virtio-pci on `q35`, Cloud Hypervisor and `virt` (`ktest-smp`).
 - Project skills (open Agent Skills format) live in `.agents/skills/`:
   `openspec-change`, `kernel-test`, `benchmarks`, `boot-debugging`.
 
@@ -125,12 +126,12 @@ The feedback loop, fastest first:
 | Crate | Owns | May depend on (workspace) |
 |---|---|---|
 | `crates/rhizo-hal` | Hardware interfaces (traits: console, memory, TLB, device registers, network link, entropy) and host test doubles | — |
-| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), ChaCha20 random generator, in-kernel test runner | `rhizo-hal` |
-| `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, write resolution), kernel heap | `rhizo-hal` |
-| `crates/rhizo-cell` | Cells as plain data (their threads: registers, identifiers, futex, sleep and descriptor waits), static ELF loader and initial stack, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
+| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT and MCFG reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), ChaCha20 random generator, in-kernel test runner | `rhizo-hal` |
+| `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, copies with own tables, write resolution), kernel heap | `rhizo-hal` |
+| `crates/rhizo-cell` | Cells as plain data (their threads: registers, identifiers, futex, sleep and descriptor waits), static ELF loader and initial stack (load once, start many), which executables stay loaded, user-memory access, cell address spaces (anonymous mappings, teardown) | `rhizo-hal`, `rhizo-mm` |
 | `crates/rhizo-fs` | A cell's in-memory file system: tree, file blocks shared copy-on-write between forks, descriptors, pipes, event counters, `epoll` instances, socket descriptors and Unix socket names, encoding for snapshots | — |
 | `crates/rhizo-net` | The kernel's sockets, shared by all cells: loopback TCP and UDP, Unix stream sockets, `smoltcp` (0BSD) on the network card for other addresses, readiness, options, change counter for waiting cells, fork and snapshot records | `rhizo-hal` |
-| `crates/rhizo-virtio` | virtio-mmio (version 2) transport, split virtqueues and the network device, through `rhizo-hal` registers and memory | `rhizo-hal` |
+| `crates/rhizo-virtio` | virtio-mmio (version 2) and modern virtio-pci transports (PCI functions, BARs, capabilities), split virtqueues and the network device, through `rhizo-hal` registers and memory | `rhizo-hal` |
 | `crates/rhizo-abi` | Linux system calls of cells (both conventions), files through the cell's `rhizo-fs`, threads (`clone`, `clone3`, futexes), pipes, `poll`/`select`/`epoll`, sockets through `rhizo-net`, `EFAULT`/`ENOSYS`, scheduling outcomes (yield, block, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs`, `rhizo-net` |
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian, threads, files and sockets sections), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs`, `rhizo-net` |
 | `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list, waiting set and time slice (time and CPU passed in, never read); address-space tag pool | — |

@@ -2,7 +2,8 @@
 //!
 //! Reads only what the kernel needs at boot: memory regions, the command line
 //! (`/chosen/bootargs`), the PSCI conduit (`/psci/method`), the CPUs
-//! (`/cpus`) and the first device with a given `compatible` string. No allocation; every query is a
+//! (`/cpus`), the first device with a given `compatible` string and the
+//! memory window of a PCI host bridge. No allocation; every query is a
 //! walk over the structure block. Format: Devicetree Specification v0.4, §5.
 
 const MAGIC: u32 = 0xd00d_feed;
@@ -354,6 +355,54 @@ impl<'a> Fdt<'a> {
         Ok(found)
     }
 
+    /// The 32-bit memory window of the first PCI host bridge whose
+    /// `compatible` list contains `compatible`: the first `ranges` entry of
+    /// space code 0b10 (32-bit memory) whose PCI and CPU addresses are the
+    /// same (IEEE 1275 PCI binding, §2.2.1.1).
+    pub fn pci_memory_window(&self, compatible: &[u8]) -> Result<Option<Region>, FdtError> {
+        let mut cells = [DEFAULT_CELLS; MAX_DEPTH + 1];
+        let mut matches = [false; MAX_DEPTH + 1];
+        let mut ranges: [Option<&'a [u8]>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
+        let mut found = None;
+        self.walk(|event| {
+            match event {
+                Event::Begin { depth, .. } => {
+                    cells[depth + 1] = DEFAULT_CELLS;
+                    matches[depth + 1] = false;
+                    ranges[depth + 1] = None;
+                }
+                Event::Prop { depth, name, value } => match name {
+                    b"#address-cells" => {
+                        cells[depth].address = read_cells(value, 1).unwrap_or(2) as u32
+                    }
+                    b"#size-cells" => cells[depth].size = read_cells(value, 1).unwrap_or(1) as u32,
+                    b"compatible" => matches[depth] = list_contains(value, compatible),
+                    b"ranges" => ranges[depth] = Some(value),
+                    _ => {}
+                },
+                Event::End { depth } => {
+                    let node = depth + 1;
+                    if let (true, Some(value), 3) =
+                        (matches[node], ranges[node], cells[node].address)
+                    {
+                        let (parent, size) = (cells[depth].address, cells[node].size);
+                        let stride = (3 + parent + size) as usize * 4;
+                        found = value.chunks_exact(stride.max(4)).find_map(|e| {
+                            let space = (read_cells(e, 1)? >> 24) & 0b11;
+                            let pci = read_cells(e.get(4..)?, 2)?;
+                            let cpu = read_cells(e.get(12..)?, parent)?;
+                            let size = read_cells(e.get(12 + parent as usize * 4..)?, size)?;
+                            (space == 0b10 && pci == cpu).then_some(Region { base: cpu, size })
+                        });
+                        return false;
+                    }
+                }
+            }
+            true
+        })?;
+        Ok(found)
+    }
+
     /// Region `index` of the `reg` of each node whose `compatible` list
     /// contains `compatible`, handed to `f` until it returns `false`.
     fn compatible_regs(
@@ -451,6 +500,28 @@ mod tests {
 
     /// `-M virt,gic-version=3 -smp 4`.
     const QEMU_VIRT_SMP4: &[u8] = include_bytes!("../fixtures/qemu-virt-smp4.dtb");
+
+    #[test]
+    fn finds_the_pci_host_bridge() {
+        let fdt = Fdt::new(QEMU_VIRT_GICV3).unwrap();
+        assert_eq!(
+            fdt.find_compatible(b"pci-host-ecam-generic").unwrap(),
+            Some(Region {
+                base: 0x40_1000_0000,
+                size: 0x1000_0000
+            }),
+            "ECAM above RAM (highmem)"
+        );
+        assert_eq!(
+            fdt.pci_memory_window(b"pci-host-ecam-generic").unwrap(),
+            Some(Region {
+                base: 0x1000_0000,
+                size: 0x2eff_0000
+            }),
+            "the 32-bit window, not I/O space nor the 64-bit window"
+        );
+        assert_eq!(fdt.pci_memory_window(b"arm,pl011").unwrap(), None);
+    }
 
     #[test]
     fn lists_the_cpus() {
