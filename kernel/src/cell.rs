@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use rhizo_abi::{Abi, Context, Outcome, Services};
 use rhizo_cell::elf::{ElfError, Image};
+use rhizo_cell::images::{self, Images};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
@@ -175,13 +176,135 @@ fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
     }
 }
 
-impl Frames for KernelFrames {
+/// Executables kept loaded (design D3 of `add-image-cache`).
+const KEPT_IMAGES: usize = 4;
+
+/// Executables loaded once and copied by every later spawn of them (spec
+/// `cells`, design D1 of `add-image-cache`): each a hierarchy holding only
+/// its segments, never run, whose tables and pages are only read once it is
+/// here. Its frames are the kernel's, taken like a cell's (never from the
+/// reserve) and given back before any cell is refused memory (D4).
+static IMAGES: Global<Images<KEPT_IMAGES>> = Global::new(Images::new());
+
+/// Drops every image kept loaded; returns whether there was one. Pages that
+/// cells still share stay theirs.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "also used by in-kernel tests")
+)]
+pub fn drop_images() -> bool {
+    IMAGES.with(|images| {
+        let mut any = false;
+        while let Some(root) = images.pop() {
+            space::destroy(
+                PageTable::<Format>::from_root(root),
+                &mut DirectMap,
+                &mut ImageFrames,
+            );
+            any = true;
+        }
+        any
+    })
+}
+
+/// Whether cells may take `bytes` more, dropping the images kept loaded if
+/// that is what it takes (design D4 of `add-image-cache`).
+fn cells_may_take(bytes: u64) -> bool {
+    memory::cells_may_take(bytes) || (drop_images() && memory::cells_may_take(bytes))
+}
+
+/// A space of its own holding the segments of the executable `data`, parsed
+/// as `image` (design D2 of `add-image-cache`): a copy of the space kept
+/// for it, loaded first if it is not kept yet.
+fn image_space(data: &'static [u8], image: &Image) -> Result<PageTable<Format>, ElfError> {
+    let key = (data.as_ptr() as u64, data.len() as u64);
+    if let Some(pt) = IMAGES.with(|images| copy_image(images, key, image)) {
+        return Ok(pt);
+    }
+    // Loaded outside the lock: loading may drop the images kept.
+    let loaded = rhizo_cell::load::<Format>(image, &mut DirectMap, &mut KernelFrames)?;
+    sync_code(&loaded, image);
+    IMAGES
+        .with(|images| {
+            if images.get(key).is_some() {
+                // Another CPU loaded it meanwhile.
+                space::destroy(loaded, &mut DirectMap, &mut ImageFrames);
+            } else if let Some(old) = images.insert(key, loaded.root()) {
+                space::destroy(
+                    PageTable::<Format>::from_root(old),
+                    &mut DirectMap,
+                    &mut ImageFrames,
+                );
+            }
+            copy_image(images, key, image)
+        })
+        .ok_or(ElfError::OutOfMemory)
+}
+
+/// A copy of the space kept for `key`: its read-only pages shared, its
+/// tables and writable pages the copy's own. Short of frames for that, the
+/// kept space itself, taken out, with every other image dropped: a spawn
+/// never needs more memory than a load. `None` if `key` is not kept.
+fn copy_image(
+    images: &mut Images<KEPT_IMAGES>,
+    key: images::Key,
+    image: &Image,
+) -> Option<PageTable<Format>> {
+    let kept = PageTable::<Format>::from_root(images.get(key)?);
+    if let Ok(copy) = kept.clone_lower_half(&mut DirectMap, &mut ImageFrames, image.span()) {
+        return Some(copy);
+    }
+    images.remove(key);
+    while let Some(root) = images.pop() {
+        space::destroy(
+            PageTable::<Format>::from_root(root),
+            &mut DirectMap,
+            &mut ImageFrames,
+        );
+    }
+    Some(kept)
+}
+
+/// The frames of [`KernelFrames`] for work under the [`IMAGES`] lock: an
+/// allocation that fails does not try to drop images.
+#[derive(Debug)]
+struct ImageFrames;
+
+impl Frames for ImageFrames {
     fn alloc(&mut self) -> Option<u64> {
         memory::alloc_for_cell(1)
     }
 
     fn alloc_large(&mut self) -> Option<u64> {
         memory::alloc_for_cell((LARGE_PAGE_SIZE / FRAME_SIZE) as usize)
+    }
+
+    fn free(&mut self, phys: u64, size: PageSize) {
+        KernelFrames.free(phys, size);
+    }
+
+    fn share(&mut self, phys: u64) {
+        KernelFrames.share(phys);
+    }
+
+    fn is_shared(&self, phys: u64) -> bool {
+        KernelFrames.is_shared(phys)
+    }
+}
+
+impl Frames for KernelFrames {
+    /// Short of frames, the images kept loaded go first (design D4 of
+    /// `add-image-cache`).
+    fn alloc(&mut self) -> Option<u64> {
+        ImageFrames
+            .alloc()
+            .or_else(|| drop_images().then(|| ImageFrames.alloc()).flatten())
+    }
+
+    /// Without dropping images: whoever asks for 2 MiB falls back to
+    /// 4 KiB pages, which may.
+    fn alloc_large(&mut self) -> Option<u64> {
+        ImageFrames.alloc_large()
     }
 
     fn free(&mut self, phys: u64, size: PageSize) {
@@ -262,7 +385,7 @@ impl Services for KernelServices<'_> {
     }
 
     fn can_store(&mut self, bytes: u64) -> bool {
-        memory::cells_may_take(bytes)
+        cells_may_take(bytes)
     }
 
     fn save_fp(&mut self, fp: &mut FpState) {
@@ -482,7 +605,7 @@ impl Pager<Format, DirectMap> for CellPager<'_> {
 /// Grows the stack of the cell with tables `pt` to cover `addr` (design D5
 /// of `add-cpython`), if memory allows.
 fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
-    memory::cells_may_take(FRAME_SIZE)
+    cells_may_take(FRAME_SIZE)
         && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, &mut KernelFrames, addr)
 }
 
@@ -1027,10 +1150,12 @@ impl Host {
 
     /// Creates a cell from the static executable `image` with `argv` and
     /// makes it runnable. Its output goes to the console when `echo` is set
-    /// and is kept in [`Finished::output`] when `capture` is set.
+    /// and is kept in [`Finished::output`] when `capture` is set. The image
+    /// is loaded once and kept: later spawns of it copy that space (design
+    /// D1 of `add-image-cache`).
     pub fn spawn(
         &mut self,
-        image: &[u8],
+        image: &'static [u8],
         argv: &[&[u8]],
         capture: bool,
         echo: bool,
@@ -1043,7 +1168,7 @@ impl Host {
     /// `files`, initial files).
     pub fn spawn_with_files(
         &mut self,
-        image: &[u8],
+        image: &'static [u8],
         argv: &[&[u8]],
         files: Fs,
         capture: bool,
@@ -1060,10 +1185,12 @@ impl Host {
         services.random(&mut random);
         let kernel = memory::kernel_tables();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
-        let cell = rhizo_cell::spawn::<Format>(
+        let parsed = Image::parse(image, user::MACHINE)?;
+        let cell = rhizo_cell::start::<Format>(
             id,
-            image,
+            &parsed,
             user::MACHINE,
+            image_space(image, &parsed)?,
             kernel_half,
             &mut DirectMap,
             &mut KernelFrames,
@@ -1071,7 +1198,6 @@ impl Host {
             &[],
             random,
         )?;
-        sync_code(&PageTable::<Format>::from_root(cell.root), image);
         let live = self.new_live(cell, capture, echo, services.random, files);
         self.state().sched.place(live);
         Ok(id)
@@ -1090,7 +1216,7 @@ impl Host {
         if let Some(lazy) = &live.lazy {
             bytes += 2 * lazy.pending_bytes();
         }
-        if !memory::cells_may_take(bytes) {
+        if !cells_may_take(bytes) {
             return None;
         }
         let mut live = self.state().sched.remove(|l| l.cell.id == id)?;
@@ -1126,7 +1252,7 @@ impl Host {
             let bytes = (0..snapshot.pages())
                 .map(|i| snapshot.page(i).size.bytes())
                 .sum();
-            if !memory::cells_may_take(bytes) {
+            if !cells_may_take(bytes) {
                 return Err(snapshot);
             }
         }
@@ -1545,7 +1671,7 @@ fn idle_until(wake: u64) {
     not(feature = "ktest"),
     allow(dead_code, reason = "used by in-kernel tests")
 )]
-pub fn run(image: &[u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), ElfError> {
+pub fn run(image: &'static [u8], argv: &[&[u8]]) -> Result<(Ending, Vec<u8>), ElfError> {
     let mut host = Host::new();
     let id = host.spawn(image, argv, true, true)?;
     host.run(|_| false);
@@ -2280,11 +2406,10 @@ fn switch_ns(mut host: Host) -> u64 {
 }
 
 /// Makes the executable pages just written through the direct map visible to
-/// instruction fetch (needed on AArch64; nothing to do on x86_64).
-fn sync_code(pt: &PageTable<Format>, image: &[u8]) {
-    let Ok(image) = Image::parse(image, user::MACHINE) else {
-        return;
-    };
+/// instruction fetch (needed on AArch64; nothing to do on x86_64). Once per
+/// loaded image: its copies share these pages, never written again (design
+/// D5 of `add-image-cache`).
+fn sync_code(pt: &PageTable<Format>, image: &Image) {
     for s in image.segments().filter(|s| s.flags.is_executable()) {
         let first = s.vaddr & !(FRAME_SIZE - 1);
         for page in (first..s.vaddr + s.mem_size).step_by(FRAME_SIZE as usize) {

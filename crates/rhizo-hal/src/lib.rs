@@ -94,13 +94,22 @@ pub trait Tlb {
     fn flush_page(&mut self, virt: u64);
 }
 
-/// The registers of a memory-mapped device: 32-bit, little endian, at byte
-/// offsets from its base.
+/// The registers of a memory-mapped device: little endian, at byte offsets
+/// from its base. Each register is accessed with its own width (virtio-pci
+/// has 8- and 16-bit registers next to 32-bit ones).
 pub trait DeviceRegisters {
-    /// Reads the register at `offset`.
+    /// Reads the 32-bit register at `offset`.
     fn read32(&mut self, offset: usize) -> u32;
-    /// Writes `value` to the register at `offset`.
+    /// Writes `value` to the 32-bit register at `offset`.
     fn write32(&mut self, offset: usize, value: u32);
+    /// Reads the 16-bit register at `offset`.
+    fn read16(&mut self, offset: usize) -> u16;
+    /// Writes `value` to the 16-bit register at `offset`.
+    fn write16(&mut self, offset: usize, value: u16);
+    /// Reads the 8-bit register at `offset`.
+    fn read8(&mut self, offset: usize) -> u8;
+    /// Writes `value` to the 8-bit register at `offset`.
+    fn write8(&mut self, offset: usize, value: u8);
     /// Orders memory accesses: what was written to memory before is seen
     /// by the device before any later register access, and what the device
     /// wrote before is seen by later reads.

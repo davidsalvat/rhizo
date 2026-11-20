@@ -64,6 +64,9 @@ macro_rules! suite {
             ktest_case!(cell_cannot_touch_another_cells_mapping),
             ktest_case!(fault_does_not_disturb_other_cells),
             ktest_case!(many_cells_in_sequence_stay_isolated),
+            ktest_case!(an_image_spawned_again_starts_fresh),
+            ktest_case!(kept_images_give_way_to_cells),
+            ktest_case!(a_cell_from_a_kept_image_suspends_resumes_and_forks),
             ktest_case!(suspend_resume_after_every_step_is_invisible_eager),
             ktest_case!(suspend_resume_after_every_step_is_invisible_lazy),
             ktest_case!(suspend_between_parallel_runs_is_invisible),
@@ -520,13 +523,15 @@ fn cell_rejects_bad_executables() {
     use rhizo_cell::elf::ElfError;
     let mut other = crate::cell::test_image("hello").to_vec();
     other[18] ^= 1; // e_machine of another architecture
+    // Spawned images are static (the kernel keeps them loaded by address).
+    let other: &'static [u8] = other.leak();
     let before = memory::free_bytes();
     assert_eq!(
         crate::cell::run(b"not an elf", &[]).map(|r| r.0),
         Err(ElfError::NotElf)
     );
     assert!(matches!(
-        crate::cell::run(&other, &[]).map(|r| r.0),
+        crate::cell::run(other, &[]).map(|r| r.0),
         Err(ElfError::WrongMachine { .. })
     ));
     assert_eq!(memory::free_bytes(), before);
@@ -650,6 +655,70 @@ fn many_cells_in_sequence_stay_isolated() {
         pair();
     }
     assert_eq!(memory::free_bytes(), before);
+}
+
+// --- Executables kept loaded (change `add-image-cache`) ---------------------
+
+/// An executable spawned again, from the space kept for it, starts with the
+/// data in the executable, not what an earlier cell of it wrote; two cells
+/// of it at once keep their writes to themselves.
+fn an_image_spawned_again_starts_fresh() {
+    let mut host = Host::new();
+    let first = spawn(&mut host, "same_addr", &[b"first"]);
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, first),
+        (Ending::Exit(0), "own value ok\n".into())
+    );
+    let ids = [b"a", b"b"].map(|tag| spawn(&mut host, "same_addr", &[tag]));
+    host.run(|_| false);
+    for id in ids {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "own value ok\n".into()));
+    }
+}
+
+/// Short of frames, the executables kept loaded are dropped before a cell
+/// is refused: with every frame cells may take taken, but for those kept,
+/// a new cell still starts and runs; nothing leaks.
+fn kept_images_give_way_to_cells() {
+    let before = memory_balance();
+    run_expected("libc_hello"); // kept loaded from now on
+    run_expected("libc_float");
+    // The frames taken are listed in themselves: the heap stays as it is.
+    let mut taken = u64::MAX;
+    while let Some(frame) = memory::alloc_for_cell(1) {
+        DirectMap.write_u64(frame, taken);
+        taken = frame;
+    }
+    let ran = crate::cell::run(crate::cell::test_image("hello"), &[b"hello"]);
+    while taken != u64::MAX {
+        let next = DirectMap.read_u64(taken);
+        memory::with_frames(|f| f.free_contiguous(taken, 1));
+        taken = next;
+    }
+    let (ending, output) = ran.expect("the cell starts");
+    assert_eq!(ending, Ending::Exit(0));
+    assert_eq!(output, b"hello from a cell\n");
+    drop(output);
+    assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// A cell started from a kept executable is a cell like any other: it is
+/// suspended, resumed and forked, and every copy runs to its end.
+fn a_cell_from_a_kept_image_suspends_resumes_and_forks() {
+    let mut host = Host::new();
+    let first = forkme_ready(&mut host);
+    assert!(host.kill(first)); // `forkme` is kept loaded from now on
+    let parent = forkme_ready(&mut host);
+    let snapshot = host.suspend(parent).expect("live");
+    let resumed = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    let children = host.fork(resumed, 2).expect("fork");
+    host.run(|_| false);
+    for id in [resumed].into_iter().chain(children) {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "own ok\n".into()));
+    }
 }
 
 use crate::cell::Resume;
@@ -1104,8 +1173,10 @@ fn file_data_takes_its_own_size() {
 
 /// Memory that is not leaked: frames free in the allocator plus frames the
 /// kernel heap holds (it keeps small-object pages for reuse, by design), and
-/// the heap's live allocations.
+/// the heap's live allocations; measured with no image kept loaded (spec
+/// `cells`, image cache: those frames are the kernel's until dropped).
 fn memory_balance() -> (u64, usize) {
+    crate::cell::drop_images();
     let heap = crate::heap::stats();
     (
         memory::free_bytes() + heap.pages as u64 * FRAME_SIZE,
@@ -2047,6 +2118,7 @@ fn busy_cpus_do_not_starve_a_cell() {
 /// all at once on every CPU: each prints exactly what it prints alone, and
 /// all memory comes back.
 fn cells_in_parallel_stay_isolated() {
+    crate::cell::drop_images(); // free memory with no image kept loaded
     let before = memory::free_bytes();
     let mut host = Host::new();
     let programs = ["counter", "filer", "libc_threads", "chatter", "threads"];
@@ -2065,6 +2137,7 @@ fn cells_in_parallel_stay_isolated() {
         );
     }
     drop(host);
+    crate::cell::drop_images();
     assert_eq!(memory::free_bytes(), before);
 }
 

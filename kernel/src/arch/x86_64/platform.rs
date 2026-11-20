@@ -85,8 +85,48 @@ pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
     rhizo_core::options::virtio_mmio_devices(cmdline(&mut buf), |base, _| f(base));
 }
 
+/// The ECAM base of PCI bus 0 from the ACPI MCFG (QEMU `q35`, Cloud
+/// Hypervisor; none on QEMU `microvm` and Firecracker).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn pci_ecam() -> Option<u64> {
+    use super::smp::Firmware;
+    let hint = rhizo_core::acpi::pvh_rsdp(&DirectMap, super::boot::boot_arg());
+    let rsdp = rhizo_core::acpi::find_rsdp(&Firmware, hint)?;
+    rhizo_core::acpi::pci_ecam(&Firmware, rsdp).ok().flatten()
+}
+
+/// Addresses for PCI memory BARs left unassigned: none, the firmware
+/// (SeaBIOS on `q35`) or the VMM (Cloud Hypervisor) assigns them all
+/// (design D3 of `add-virtio-pci`).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn pci_window() -> Option<rhizo_virtio::pci::Window> {
+    None
+}
+
+/// Maps the `len` bytes of device registers at physical `phys` uncached
+/// where [`Mmio::new`] reaches them (pages the direct map already covers
+/// are left as they are). Call before the first cell exists: cell roots
+/// copy the kernel's top-level entries.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn map_device(phys: u64, len: u64) -> Result<(), MapError> {
+    use crate::memory;
+    let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
+    let first = phys & !0xfff;
+    let window = crate::heap::window::BASE..crate::heap::window::END;
+    for page in (first..phys + len.max(1)).step_by(0x1000) {
+        let virt = DirectMap::virt(page);
+        if window.contains(&virt) {
+            return Err(MapError::AlreadyMapped(virt)); // the large heap's
+        }
+        if memory::translate(virt).is_none() {
+            memory::map_page(virt, page, flags)?;
+        }
+    }
+    Ok(())
+}
+
 /// The registers of a device at physical address `base`, mapped uncached
-/// by [`map_devices`].
+/// by [`map_devices`] or [`map_device`].
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 #[derive(Debug)]
 pub struct Mmio(u64);
@@ -101,14 +141,35 @@ impl Mmio {
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 impl rhizo_hal::DeviceRegisters for Mmio {
     fn read32(&mut self, offset: usize) -> u32 {
-        // SAFETY: `map_devices` mapped the device's registers uncached at
-        // this address; offsets stay within its region.
+        // SAFETY: `map_devices` or `map_device` mapped the device's
+        // registers uncached at this address; offsets stay within its
+        // region.
         unsafe { ((self.0 + offset as u64) as *const u32).read_volatile() }
     }
 
     fn write32(&mut self, offset: usize, value: u32) {
         // SAFETY: as in `read32`.
         unsafe { ((self.0 + offset as u64) as *mut u32).write_volatile(value) }
+    }
+
+    fn read16(&mut self, offset: usize) -> u16 {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *const u16).read_volatile() }
+    }
+
+    fn write16(&mut self, offset: usize, value: u16) {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *mut u16).write_volatile(value) }
+    }
+
+    fn read8(&mut self, offset: usize) -> u8 {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *const u8).read_volatile() }
+    }
+
+    fn write8(&mut self, offset: usize, value: u8) {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *mut u8).write_volatile(value) }
     }
 
     fn barrier(&mut self) {

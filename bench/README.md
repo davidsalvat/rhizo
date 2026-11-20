@@ -25,7 +25,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `boot.kernel_cycles/rhizo/<vmm>` | timing | TSC cycles from the first kernel instruction to ready |
 | `image.size_bytes` | deterministic | Size of the release kernel image |
 | `memory.kernel_pt_frames` | deterministic | Frames used by the kernel's page tables |
-| `cell.spawn_us/rhizo/<vmm>` | timing | Time to create the `hello` cell (tables, image, stack), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
+| `cell.spawn_us/rhizo/<vmm>` | timing | Time to create the `hello` cell (tables, image, stack; the image copied from its executable kept loaded, see below), measured inside the kernel over 101 runs per boot (`bench-cell` build) |
 | `cell.run_us/rhizo/<vmm>` | timing | Median time from spawn to the cell's exit and teardown (every frame returned) |
 | `cell.pt_frames` | deterministic | Page-table frames of the `hello` cell's own half |
 | `cell.switch_ns/rhizo/<vmm>` | timing | Time per switch between two cells yielding to each other (system call in, scheduler, system call out), with address-space tags (ASID/PCID) |
@@ -50,7 +50,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.pipe_rtt_ns/rhizo/<vmm>` | timing | The `piper` cell writing one byte into a pipe and reading it back (two system calls), per round trip over 2000 |
 | `cell.loopback_rtt_us/rhizo/<vmm>` | timing | Two `loopback` cells exchanging a 64-byte message over TCP on 127.0.0.1, per round trip over 200 (each side blocks in `read`, wakes, and the other runs) |
 | `cell.tcp_resume_us/rhizo/<vmm>` | timing | A `loopback twice` client suspended right after its first round trip with a `loopback` server, its connection parked in the kernel: lazy resume until it has made its second 64-byte round trip on the same connection and exited (against `cell.resume_us` and `cell.loopback_rtt_us`) |
-| `net.tcp_rtt_us/rhizo/<vmm>` | timing | A `loopback` cell exchanging a 64-byte message with a TCP echo server on the host through the virtio-net card (QEMU user network; Firecracker on a tap device), per round trip over 100. Skipped, with the reason, on VMMs without a card (Cloud Hypervisor, `q35`: virtio-pci only) or without password-less `sudo` for the tap |
+| `net.tcp_rtt_us/rhizo/<vmm>` | timing | A `loopback` cell exchanging a 64-byte message with a TCP echo server on the host through the virtio-net card (virtio-mmio on `microvm` and Firecracker, virtio-pci on `q35` and Cloud Hypervisor; QEMU user network, Firecracker and Cloud Hypervisor on a tap device each), per round trip over 100. Skipped, with the reason, without password-less `sudo` for a tap device |
 | `cell.idle_bytes` | deterministic | Memory each of 1000 idle cells costs (forks of a template of `idle`, each run into its sleep): what "thousands of mostly idle cells per node" costs |
 | `cell.suspended_bytes` | deterministic | Snapshot size of one idle cell |
 | `cell.thread_create_us/rhizo/<vmm>` | timing | A thread of the `threads` cell creating a thread (raw `clone`, as `pthread_create` does) that exits at once, and joining it (futex wait on its clear-tid word); measured by the cell with `clock_gettime`, robust figure over 105 runs |
@@ -58,6 +58,14 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.scaling_pct/rhizo/<vmm>` | timing | That batch's time on every CPU, times the number of CPUs, over its time stepping on one CPU, in percent: 100 is perfect scaling (lower is better) |
 | `cell.ipi_wake_us/rhizo/<vmm>` | timing | Handing work to an idle CPU: post it, wake the CPU with an inter-processor interrupt, see it done (robust figure over 105) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
+
+The kernel keeps the executables it spawned loaded (spec `cells`): from the
+second spawn of an executable on, a cell starts on a copy of its loaded
+segments (own tables and writable pages, shared read-only pages) instead of
+loading the file again. The figures started from the executable
+(`cell.spawn_us`, `cell.run_us`, the `workload.*cold_us` metrics) measure
+that, as the Linux processes they are compared with start from an
+executable in the page cache.
 
 Figures the kernel repeats a hundred times or more (`cell.spawn_us`,
 `cell.run_us`, `cell.spawn_from_template_us`, the file and network

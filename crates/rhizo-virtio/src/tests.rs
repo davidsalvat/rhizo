@@ -83,6 +83,26 @@ impl Device {
             .write_bytes(s.used + 2, &idx.wrapping_add(1).to_le_bytes());
     }
 
+    /// Queue `q` was notified: the transmit queue sends everything offered.
+    fn notify(&mut self, q: usize) {
+        self.notifies[q] += 1;
+        while q == 1
+            && let Some((id, addr, len)) = self.next_buffer(1)
+        {
+            let mut frame = vec![0u8; len as usize - HDR];
+            self.mem.read_bytes(addr + HDR as u64, &mut frame);
+            self.sent.push(frame);
+            self.give_back(1, id, 0);
+        }
+    }
+
+    /// Takes a status write: FEATURES_OK only sticks if the driver took
+    /// VERSION_1.
+    fn set_status(&mut self, value: u32) {
+        let refused = value & FEATURES_OK != 0 && self.driver[1] & F_VERSION_1 == 0;
+        self.status = if refused { value & !FEATURES_OK } else { value };
+    }
+
     /// Bytes of the receive buffers offered and not yet taken.
     fn rx_offered(&self) -> u64 {
         let s = self.queues[0];
@@ -152,11 +172,7 @@ impl DeviceRegisters for Regs {
                 let sel = d.driver_sel;
                 d.driver[sel] = value;
             }
-            reg::STATUS => {
-                // FEATURES_OK only sticks if the driver took VERSION_1.
-                let refused = value & FEATURES_OK != 0 && d.driver[1] & F_VERSION_1 == 0;
-                d.status = if refused { value & !FEATURES_OK } else { value };
-            }
+            reg::STATUS => d.set_status(value),
             reg::QUEUE_SEL => d.queue_sel = value as usize,
             reg::QUEUE_NUM => d.queues[q].num = value,
             reg::QUEUE_READY => d.queues[q].ready = value,
@@ -166,19 +182,142 @@ impl DeviceRegisters for Regs {
             reg::QUEUE_DRIVER_HIGH => set_high(&mut d.queues[q].avail, value),
             reg::QUEUE_DEVICE_LOW => set_low(&mut d.queues[q].used, value),
             reg::QUEUE_DEVICE_HIGH => set_high(&mut d.queues[q].used, value),
-            reg::QUEUE_NOTIFY => {
-                d.notifies[value as usize] += 1;
-                // The transmit queue: send everything offered.
-                while value == 1
-                    && let Some((id, addr, len)) = d.next_buffer(1)
-                {
-                    let mut frame = vec![0u8; len as usize - HDR];
-                    d.mem.read_bytes(addr + HDR as u64, &mut frame);
-                    d.sent.push(frame);
-                    d.give_back(1, id, 0);
+            reg::QUEUE_NOTIFY => d.notify(value as usize),
+            _ => {}
+        }
+    }
+
+    fn read16(&mut self, _: usize) -> u16 {
+        unreachable!("virtio-mmio registers are 32-bit")
+    }
+
+    fn write16(&mut self, _: usize, _: u16) {
+        unreachable!("virtio-mmio registers are 32-bit")
+    }
+
+    fn read8(&mut self, _: usize) -> u8 {
+        unreachable!("virtio-mmio registers are 32-bit")
+    }
+
+    fn write8(&mut self, _: usize, _: u8) {
+        unreachable!("virtio-mmio registers are 32-bit")
+    }
+
+    fn barrier(&mut self) {}
+}
+
+/// The same device behind the virtio-pci structures: common configuration,
+/// notifications (multiplier 4, queue `q` at `q * 4`) and device
+/// configuration. Every access must have its register's width.
+#[derive(Debug, Clone)]
+enum PciRegs {
+    Common(Rc<RefCell<Device>>),
+    Notify(Rc<RefCell<Device>>),
+    DeviceConfig,
+}
+
+const MAC: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+
+impl DeviceRegisters for PciRegs {
+    fn read32(&mut self, offset: usize) -> u32 {
+        let Self::Common(d) = self else {
+            panic!("32-bit read of {offset:#x} outside the common configuration");
+        };
+        let d = d.borrow();
+        match offset {
+            pci::common::DEVICE_FEATURE => d.features.get(d.features_sel).copied().unwrap_or(0),
+            o => panic!("32-bit read of common register {o:#x}"),
+        }
+    }
+
+    fn write32(&mut self, offset: usize, value: u32) {
+        let Self::Common(d) = self else {
+            panic!("32-bit write of {offset:#x} outside the common configuration");
+        };
+        let mut d = d.borrow_mut();
+        let q = d.queue_sel;
+        let set_low = |r: &mut u64, v: u32| *r = (*r & !0xffff_ffff) | u64::from(v);
+        let set_high = |r: &mut u64, v: u32| *r = (*r & 0xffff_ffff) | u64::from(v) << 32;
+        match offset {
+            pci::common::DEVICE_FEATURE_SELECT => d.features_sel = value as usize,
+            pci::common::DRIVER_FEATURE_SELECT => d.driver_sel = value as usize,
+            pci::common::DRIVER_FEATURE => {
+                let sel = d.driver_sel;
+                d.driver[sel] = value;
+            }
+            o if o == pci::common::QUEUE_DESC => set_low(&mut d.queues[q].desc, value),
+            o if o == pci::common::QUEUE_DESC + 4 => set_high(&mut d.queues[q].desc, value),
+            o if o == pci::common::QUEUE_DRIVER => set_low(&mut d.queues[q].avail, value),
+            o if o == pci::common::QUEUE_DRIVER + 4 => set_high(&mut d.queues[q].avail, value),
+            o if o == pci::common::QUEUE_DEVICE => set_low(&mut d.queues[q].used, value),
+            o if o == pci::common::QUEUE_DEVICE + 4 => set_high(&mut d.queues[q].used, value),
+            o => panic!("32-bit write of common register {o:#x}"),
+        }
+    }
+
+    fn read16(&mut self, offset: usize) -> u16 {
+        let Self::Common(d) = self else {
+            panic!("16-bit read of {offset:#x} outside the common configuration");
+        };
+        let d = d.borrow();
+        let q = d.queues[d.queue_sel];
+        match offset {
+            // Queue 0 and 1 notify at offsets 0 and 1 (times the multiplier).
+            pci::common::QUEUE_NOTIFY_OFF => d.queue_sel as u16,
+            pci::common::QUEUE_ENABLE => q.ready as u16,
+            pci::common::QUEUE_SIZE => {
+                if q.num == 0 {
+                    64
+                } else {
+                    q.num as u16
                 }
             }
-            _ => {}
+            o => panic!("16-bit read of common register {o:#x}"),
+        }
+    }
+
+    fn write16(&mut self, offset: usize, value: u16) {
+        match self {
+            Self::Common(d) => {
+                let mut d = d.borrow_mut();
+                let q = d.queue_sel;
+                match offset {
+                    pci::common::QUEUE_SELECT => d.queue_sel = value.into(),
+                    pci::common::QUEUE_SIZE => d.queues[q].num = value.into(),
+                    pci::common::QUEUE_ENABLE => d.queues[q].ready = value.into(),
+                    o => panic!("16-bit write of common register {o:#x}"),
+                }
+            }
+            Self::Notify(d) => {
+                assert_eq!(
+                    offset,
+                    value as usize * 4,
+                    "queue {value} notified at {offset}"
+                );
+                d.borrow_mut().notify(value.into());
+            }
+            Self::DeviceConfig => panic!("16-bit write of device configuration"),
+        }
+    }
+
+    fn read8(&mut self, offset: usize) -> u8 {
+        match self {
+            Self::Common(d) if offset == pci::common::DEVICE_STATUS => d.borrow().status as u8,
+            Self::DeviceConfig => MAC[offset],
+            _ => panic!("8-bit read of {offset:#x}"),
+        }
+    }
+
+    fn write8(&mut self, offset: usize, value: u8) {
+        match self {
+            Self::Common(d) if offset == pci::common::DEVICE_STATUS => {
+                let mut d = d.borrow_mut();
+                d.set_status(value.into());
+                if value == 0 {
+                    d.queues = [QueueState::default(); 2];
+                }
+            }
+            _ => panic!("8-bit write of {offset:#x}"),
         }
     }
 
@@ -206,6 +345,20 @@ fn frames() -> impl FnMut() -> Option<u64> {
 }
 
 type Probed = Result<VirtioNet<Regs, Mem>, ProbeError>;
+
+type PciProbed = Result<VirtioNet<PciRegs, Mem>, ProbeError>;
+
+fn pci_card(device: Device) -> (PciProbed, Rc<RefCell<Device>>) {
+    let shared = Rc::new(RefCell::new(device));
+    let transport = pci::Transport::new(
+        PciRegs::Common(shared.clone()),
+        PciRegs::Notify(shared.clone()),
+        4,
+        PciRegs::DeviceConfig,
+    );
+    let card = VirtioNet::probe_pci(transport, Mem(shared.clone()), &mut frames());
+    (card, shared)
+}
 
 fn card(device: Device) -> (Probed, Rc<RefCell<Device>>) {
     let shared = Rc::new(RefCell::new(device));
@@ -289,6 +442,38 @@ fn without_a_mac_feature_the_address_is_local() {
     d.features = [0, F_VERSION_1];
     let card = card(d).0.unwrap();
     assert_eq!(card.mac(), [0x02, 0, 0, 0, 0, 1]);
+}
+
+#[test]
+fn a_pci_card_negotiates_sends_and_receives() {
+    let (card, dev) = pci_card(Device::new());
+    let mut card = card.unwrap();
+    assert_eq!(card.mac(), MAC);
+    {
+        let d = dev.borrow();
+        assert_eq!(d.status, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+        assert_eq!(d.driver, [F_MAC, F_VERSION_1]);
+        for q in d.queues {
+            assert_eq!((q.num, q.ready), (u32::from(QUEUE_SIZE), 1));
+            assert_eq!((q.avail - q.desc, q.used - q.desc), (AVAIL_AT, USED_AT));
+        }
+        assert_eq!(d.notifies, [1, 0], "receive buffers offered");
+    }
+    for i in 0..40u8 {
+        assert!(card.send(&[i; 60]));
+    }
+    assert_eq!(dev.borrow().sent.len(), 40);
+    assert!(dev.borrow_mut().deliver(&[7; 64]));
+    let mut got = Vec::new();
+    assert!(card.recv(&mut |f| got.push(f.to_vec())));
+    assert_eq!(got, [vec![7; 64]]);
+}
+
+#[test]
+fn a_pci_card_is_refused_without_version_1() {
+    let mut d = Device::new();
+    d.features = [F_MAC, 0];
+    assert_eq!(pci_card(d).0.err(), Some(ProbeError::Features));
 }
 
 #[test]

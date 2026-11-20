@@ -130,8 +130,45 @@ pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
     let _ = device_tree().for_each_compatible(b"virtio,mmio", |r| f(r.base));
 }
 
+/// The ECAM base of PCI bus 0: the generic host bridge of the device tree
+/// (QEMU `virt`, Cloud Hypervisor).
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn pci_ecam() -> Option<u64> {
+    let dt = device_tree();
+    dt.find_compatible(PCI_HOST).ok().flatten().map(|r| r.base)
+}
+
+/// Addresses for PCI memory BARs left unassigned (QEMU `virt` boots the
+/// kernel without firmware): the host bridge's 32-bit memory window.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn pci_window() -> Option<rhizo_virtio::pci::Window> {
+    let r = device_tree().pci_memory_window(PCI_HOST).ok()??;
+    Some(rhizo_virtio::pci::Window {
+        next: r.base,
+        end: r.base + r.size,
+    })
+}
+
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+const PCI_HOST: &[u8] = b"pci-host-ecam-generic";
+
+/// Maps the `len` bytes of device registers at physical `phys` as device
+/// memory in the MMIO window, where [`Mmio::new`] reaches them.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn map_device(phys: u64, len: u64) -> Result<(), MapError> {
+    use crate::memory;
+    let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
+    let first = phys & !(FRAME_SIZE - 1);
+    for page in (first..phys + len.max(1)).step_by(FRAME_SIZE as usize) {
+        if memory::translate(MMIO_BASE + page).is_none() {
+            memory::map_page(MMIO_BASE + page, page, flags)?;
+        }
+    }
+    Ok(())
+}
+
 /// The registers of a device at physical address `base`, mapped as device
-/// memory in the MMIO window by [`map_devices`].
+/// memory in the MMIO window by [`map_devices`] or [`map_device`].
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 #[derive(Debug)]
 pub struct Mmio(u64);
@@ -146,14 +183,35 @@ impl Mmio {
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 impl rhizo_hal::DeviceRegisters for Mmio {
     fn read32(&mut self, offset: usize) -> u32 {
-        // SAFETY: `map_devices` mapped the device's registers as device
-        // memory at this address; offsets stay within its region.
+        // SAFETY: `map_devices` or `map_device` mapped the device's
+        // registers as device memory at this address; offsets stay within
+        // its region.
         unsafe { ((self.0 + offset as u64) as *const u32).read_volatile() }
     }
 
     fn write32(&mut self, offset: usize, value: u32) {
         // SAFETY: as in `read32`.
         unsafe { ((self.0 + offset as u64) as *mut u32).write_volatile(value) }
+    }
+
+    fn read16(&mut self, offset: usize) -> u16 {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *const u16).read_volatile() }
+    }
+
+    fn write16(&mut self, offset: usize, value: u16) {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *mut u16).write_volatile(value) }
+    }
+
+    fn read8(&mut self, offset: usize) -> u8 {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *const u8).read_volatile() }
+    }
+
+    fn write8(&mut self, offset: usize, value: u8) {
+        // SAFETY: as in `read32`.
+        unsafe { ((self.0 + offset as u64) as *mut u8).write_volatile(value) }
     }
 
     fn barrier(&mut self) {
