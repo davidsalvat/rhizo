@@ -9,7 +9,7 @@ address outside 127.0.0.0/8 SHALL go through the network card, and fail
 with `ENETUNREACH` when the kernel has no card or no address. Port 0 SHALL
 pick a free port in 32768–60999.
 
-#### Scenario: Outside address without a card
+#### Scenario: Outside address
 - **WHEN** a cell of a kernel without a network address connects to 10.0.0.1
 - **THEN** it receives `-ENETUNREACH`
 

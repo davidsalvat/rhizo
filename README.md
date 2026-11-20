@@ -65,6 +65,13 @@ again:
   instead of from the executable.
 - **Threads.** `pthread_create`, mutexes, condition variables and futexes;
   snapshots, forks and templates carry every thread.
+- **Network.** Pipes, `poll`/`select`/`epoll`, Unix and TCP/UDP sockets
+  between cells, and a virtio-net card (smoltcp) to reach the outside;
+  established connections are reset on suspend, resume and fork, as CRIU
+  does by default.
+- **CPython.** Unmodified CPython 3.13 (static) runs as a cell, its standard
+  library in the cell's own files; a template frozen after its imports
+  answers each request without starting the interpreter again.
 - **Isolation, reviewed.** An adversarial review of the cell boundary, with
   hostile cells and property tests that keep it fixed:
   [`docs/security.md`](docs/security.md) lists the threat model, the
@@ -147,10 +154,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 9.1 | 9.4 | 198.2 | 201.3 | 20 |
-| Cloud Hypervisor | 11.7 | 14.2 | 110.7 | 116.6 | 20 |
-| QEMU microvm | 44.9 | 46.1 | — | — | 20 |
-| QEMU q35 | 63.8 | 66.1 | 185.0 | 187.8 | 20 |
+| Firecracker | 8.8 | 9.5 | 196.7 | 199.7 | 20 |
+| Cloud Hypervisor | 6.6 | 14.5 | 109.6 | 116.8 | 20 |
+| QEMU microvm | 44.5 | 45.2 | — | — | 20 |
+| QEMU q35 | 63.8 | 65.5 | 186.0 | 188.1 | 20 |
 
 ### A cell against a Linux process, in the same kind of VM
 
@@ -158,10 +165,10 @@ Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux gue
 
 | Operation | Rhizo cell | Linux process, same VM | Linux process, host |
 |---|---:|---:|---:|
-| The `fork` call, holding 50 MiB written | 1.5 µs | 87.1 µs | 914.8 µs |
-| Fork, then the child writes all 50 MiB and exits | 7.45 ms | 27.28 ms | 26.40 ms |
-| Start a program and run it to its exit (`hello`) | 7.3 µs | 533.9 µs | 100.1 µs |
-| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.0 µs / 594.4 µs | — | 2.70 ms (CRIU) |
+| The `fork` call, holding 50 MiB written | 1.5 µs | 86.7 µs | 868.5 µs |
+| Fork, then the child writes all 50 MiB and exits | 7.16 ms | 27.11 ms | 26.25 ms |
+| Start a program and run it to its exit (`hello`) | 7.3 µs | 602.4 µs | 97.5 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.1 µs / 594.7 µs | — | 2.72 ms (CRIU) |
 
 ### Whole VMs and sandboxes, for scale
 
@@ -169,8 +176,8 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 7.3 µs | 198.20 ms | 70.58 ms |
-| Resume a suspended environment until it runs (eager for the cell) | 594.4 µs | 4.71 ms | 99.85 ms |
+| Start a program and run it to its exit (`hello`) | 7.3 µs | 196.66 ms | 76.01 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 594.7 µs | 3.72 ms | 102.01 ms |
 
 ### A real interpreter
 
@@ -178,15 +185,15 @@ CPython (static, 3.13.18) answering one agent tool call (`cells/python/agent_dem
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 19.93 ms | 18.60 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.67 ms (5.4× faster) | 5.55 ms |
+| Cold, from its executable (interpreter start, imports, warm-up) | 18.31 ms | 18.55 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.66 ms (5.0× faster) | 5.55 ms |
 
 MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 3.64 ms |
-| Forked from a template frozen after the warm-up | 505.9 µs (7.2× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.60 ms |
+| Forked from a template frozen after the warm-up | 496.2 µs (7.3× faster) |
 
 Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 `cargo xtask bench --readme`.
@@ -199,7 +206,7 @@ Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H14, from the boot and test harness to threads inside a cell, including the gVisor and fair comparisons and an adversarial security review. Next: sockets and network, CPython in a cell, multi-core, and a dedicated benchmark machine." width="800">
+    <img src="docs/img/roadmap.svg" alt="Roadmap. Done: H0 to H16, from the boot and test harness to CPython in a cell, including the gVisor and fair comparisons, an adversarial security review, threads, and sockets with a network card. Next: multi-core and a dedicated benchmark machine." width="800">
   </picture>
 </p>
 
