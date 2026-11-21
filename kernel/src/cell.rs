@@ -603,6 +603,22 @@ pub(crate) fn now_ns() -> u64 {
     timer::cycles_to_ns(Counter.cycles()).unwrap_or(0)
 }
 
+/// Waits about `ns` nanoseconds on this CPU's timer, as an idle CPU waits,
+/// and returns how long the wait lasted by the counter (spec `multi-core`,
+/// the same time on every CPU). A secondary CPU stops its tick again
+/// afterwards, as it idles between runs. Runs on any CPU through
+/// `smp::post`.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub fn timed_wait(ns: u64) -> u64 {
+    let t0 = Counter.cycles();
+    irq::wait_ns(ns);
+    let took = timer::cycles_to_ns(Counter.cycles() - t0).unwrap_or(0);
+    if crate::arch::cpu::index() != 0 {
+        irq::stop_tick();
+    }
+    took
+}
+
 /// Who owns the CPU's FP/SIMD registers: thread `tid` of cell `cell` (0:
 /// nobody; cell identifiers start at 1, and neither they nor thread
 /// identifiers are reused, so a key never names another thread).
@@ -2767,11 +2783,13 @@ pub fn bench(console: &mut impl Console) {
     if crate::smp::count() > 1 {
         let (serial, parallel, wake, calls_serial, calls_parallel) = multi_core();
         let (one, four, shootdown) = parallel_threads();
+        let timer_error = timer_error();
         let _ = writeln!(
             rhizo_hal::ConsoleWriter(console),
             "rhizo-smp cpus={} serial_ns={serial} parallel_ns={parallel} ipi_wake_ns={wake} \
              threads1_ns={one} threads4_ns={four} shootdown_ns={shootdown} \
-             syscalls_serial_ns={calls_serial} syscalls_parallel_ns={calls_parallel}",
+             timer_error_ns={timer_error} syscalls_serial_ns={calls_serial} \
+             syscalls_parallel_ns={calls_parallel}",
             crate::smp::count()
         );
         return; // the other metrics are measured with one CPU
@@ -3677,6 +3695,27 @@ fn threads() -> (u64, u64) {
             .unwrap_or(0)
     };
     (field("create_ns"), field("futex_wake_ns"))
+}
+
+/// How far a 10 ms wait on a secondary CPU's timer is from 10 ms by the
+/// counter (change `fix-secondary-cpu-timer`): the median of five waits on
+/// each secondary CPU, the worst CPU's distance.
+#[cfg(feature = "bench-cell")]
+fn timer_error() -> u64 {
+    const WAIT_NS: u64 = 10_000_000;
+    (1..crate::smp::count())
+        .map(|cpu| {
+            let mut took: Vec<u64> = (0..5)
+                .map(|_| {
+                    crate::smp::post(cpu, timed_wait, WAIT_NS);
+                    crate::smp::join(cpu)
+                })
+                .collect();
+            took.sort_unstable();
+            took[took.len() / 2].abs_diff(WAIT_NS)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// With several CPUs (design D8 of `add-smp-scheduling`): the time for
