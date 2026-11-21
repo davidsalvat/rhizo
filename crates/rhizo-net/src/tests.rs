@@ -761,6 +761,24 @@ proptest! {
     }
 }
 
+#[test]
+fn each_boot_starts_its_ephemeral_ports_elsewhere() {
+    let first = |boot: u64| {
+        let mut net = Net::new();
+        net.set_boot(boot);
+        let s = net.socket(Family::Inet, Type::Stream).unwrap();
+        net.listen(s, 1).unwrap(); // an ephemeral port
+        match net.local_addr(s) {
+            Ok(Some(Addr::Inet { port, .. })) => port,
+            other => panic!("{other:?}"),
+        }
+    };
+    let ports: alloc::collections::BTreeSet<u16> = (0..64).map(|i| first(1_000_000 + i)).collect();
+    assert!(ports.iter().all(|p| EPHEMERAL.contains(p)));
+    assert!(ports.len() > 60, "nearby boots start far apart: {ports:?}");
+    assert_eq!(first(42), first(42), "the boot decides");
+}
+
 /// The waiters woken since the last call.
 pub(crate) fn woken(net: &mut Net) -> Vec<u32> {
     let mut out = Vec::new();
