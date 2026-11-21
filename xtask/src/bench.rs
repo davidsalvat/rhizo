@@ -2616,6 +2616,11 @@ mod tests {
         assert!(o.soak);
         assert_eq!((o.cells, o.llm_delay_ms, o.cpus), (500, 250, 4));
         assert_eq!(Options::default().cpus, 1);
+        let control = ["--workload".to_string(), "control".to_string()];
+        assert_eq!(
+            Options::parse(&control).unwrap().workload,
+            Some(Only::Control)
+        );
         for bad in [
             &["--workload", "phone"][..],
             &["--cells", "0"],
