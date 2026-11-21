@@ -13,4 +13,4 @@
 ## 3. Gates
 
 - [x] 3.1 Verify `cargo xtask --arch x86_64 bench --icount-only --vmm qemu-microvm --no-reference --runs 1` before and after: `cell.suspend_insns` within the gate, no other metric moves
-- [ ] 3.2 Verify `cargo xtask check`, `cargo xtask --arch x86_64 test`, `cargo xtask test`, and `cargo xtask test --only ktest` ten times on each architecture
+- [x] 3.2 Verify `cargo xtask check`, `cargo xtask --arch x86_64 test`, `cargo xtask test`, and `cargo xtask test --only ktest` ten times on each architecture
