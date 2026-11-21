@@ -42,8 +42,8 @@ fn idle(host: &mut Host) -> u32 {
 /// Spec `linux-abi`, "Identifiers per domain": `getpid` and the first
 /// thread's `gettid` count from 1 in each domain, whatever other domains
 /// made and ended meanwhile (they counted every cell ever made, finding O6).
-/// A copy takes another number than its source, and a resumed cell keeps
-/// its own.
+/// A copy takes another number than its source, and so does a resumed
+/// cell (a resume is a copy, design D22), in its own domain.
 fn identifiers_are_per_domain() {
     let mut host = Host::new();
     let first = spawn(&mut host, "observer", &[b"ids"]);
@@ -77,7 +77,7 @@ fn identifiers_are_per_domain() {
         ended(&host, copy),
         (Ending::Exit(0), "pid 2 tid 1\n".into())
     );
-    let out = "pid 1 tid 1\n";
+    let out = "pid 2 tid 1\n";
     assert_eq!(ended(&host, resumed), (Ending::Exit(0), out.into()));
     assert!(host.tree().is_empty(), "every node went with its cell");
 }

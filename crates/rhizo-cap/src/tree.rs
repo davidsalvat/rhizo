@@ -753,8 +753,10 @@ impl Tree {
     }
 
     /// Gives cell `old` the identifier `new` (a resume gives the cell a new
-    /// kernel identifier); its place, domain and number stay. Returns its
-    /// node, or `None` if `old` was not in the tree or `new` was.
+    /// kernel identifier); its place and domain stay. A resume is a copy
+    /// (design D22): the cell takes a new number in its domain, never its
+    /// old one. Returns its node, or `None` if `old` was not in the tree or
+    /// `new` was.
     pub fn rekey(&mut self, old: u32, new: u32) -> Option<&Node> {
         let at = self.nodes.binary_search_by_key(&new, |n| n.id).err()?;
         if new == HOST {
@@ -790,6 +792,8 @@ impl Tree {
             n.parent = new;
             c = n.next_sibling;
         }
+        let pid = self.number(new, 0);
+        self.nodes[at].pid = pid;
         Some(&self.nodes[at])
     }
 

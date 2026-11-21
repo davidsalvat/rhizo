@@ -330,9 +330,9 @@ fn rekey_keeps_the_place() {
     assert!(t.rekey(2, 40).is_some());
     assert!(t.rekey(2, 41).is_none() && t.rekey(3, 1).is_none());
     let n = t.get(40).unwrap();
-    assert_eq!((n.parent(), n.pid(), n.domain()), (1, 2, 1));
+    assert_eq!((n.parent(), n.pid(), n.domain()), (1, 5, 1), "a new number");
     assert_eq!(t.get(4).unwrap().parent(), 40);
-    assert_eq!(t.rekey(1, 50).map(Node::pid), Some(1));
+    assert_eq!(t.rekey(1, 50).map(Node::pid), Some(6));
     assert_eq!(t.get(40).unwrap().parent(), 50);
     assert_eq!(t.domain(4), Some(1), "the domain keeps its identifier");
     t.check().unwrap();

@@ -64,6 +64,10 @@ use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
+/// The copy generation of a cell loaded from bytes, which do not hold it
+/// yet (design D22 of `add-cell-hierarchy`, until format version 11): the
+/// kernel then gives the cell a value its source cannot have seen.
+pub const UNKNOWN_GENERATION: u64 = u64::MAX;
 /// Format version written by this code.
 pub const VERSION: u32 = 10;
 const HEADER: usize = 24;
@@ -160,6 +164,15 @@ pub struct Snapshot {
     /// The identifier of the cell it was taken from in this kernel; 0 for
     /// one read from bytes, which names no cell here.
     origin: u32,
+    /// The cell's copy generation, whether it may hold a secret, and its
+    /// wipe ranges (design D22 of `add-cell-hierarchy`): kept beside the
+    /// bytes, in the kernel only, until the tree section of format version
+    /// 11 holds them (task 1.10). A snapshot made from bytes has none, and
+    /// its generation is [`UNKNOWN_GENERATION`].
+    generation: u64,
+    exposed: bool,
+    /// Only its wipe ranges: one word, as in a cell.
+    wiped: WxRanges,
 }
 
 impl PartialEq for Snapshot {
@@ -256,8 +269,9 @@ fn thread_words(t: &Thread, kept: Option<u64>, now: u64) -> impl Iterator<Item =
 }
 
 impl Snapshot {
-    /// Captures `cell` (not running), its write-or-execute ranges `wx` and
-    /// the user half of its page table; its threads' deadlines, and
+    /// Captures `cell` (not running), its write-or-execute and wipe ranges
+    /// `wx` and the user half of its page table (its wipe ranges' pages as
+    /// zeros); its threads' deadlines, and
     /// `deadlines` (thread, deadline) of the calls on descriptors they make
     /// again, are kept as time left after monotonic time `now`. `files`
     /// refers to its sockets by index in `sockets`.
@@ -285,12 +299,21 @@ impl Snapshot {
         let pt = PageTable::<F>::from_root(cell.root);
         let own = pt.unshare_tables(mem, frames).is_ok();
         let mem = &*mem;
+        // Pages of the wipe ranges are captured as zeros: whoever resumes or
+        // loads the snapshot gets a copy (design D22 of `add-cell-hierarchy`).
+        let wiped = |virt: u64, size: PageSize| {
+            let end = virt + size.bytes();
+            wx.wiped().iter().any(|&(s, e)| virt < e && s < end)
+        };
         let (mut refers, mut data_len) = (Vec::new(), 0usize);
-        pt.for_each_lower_leaf(mem, &mut |_, phys, size, flags| {
+        pt.for_each_lower_leaf(mem, &mut |virt, phys, size, flags| {
             // With every table its own and writable, a writable entry is
             // the frame's only one (copy-on-write invariant): not shared.
-            let refer =
-                own && !flags.is_writable() && frames.is_shared(phys) && frames.try_share(phys);
+            let refer = own
+                && !flags.is_writable()
+                && !wiped(virt, size)
+                && frames.is_shared(phys)
+                && frames.try_share(phys);
             if !refer {
                 data_len += size.bytes() as usize;
             }
@@ -350,7 +373,9 @@ impl Snapshot {
             } else {
                 r[8..16].copy_from_slice(&offset.to_le_bytes());
                 let (at, n) = (data_start + offset as usize, size.bytes() as usize);
-                mem.read_pages(phys, &mut b[at..at + n]);
+                if !wiped(virt, size) {
+                    mem.read_pages(phys, &mut b[at..at + n]);
+                }
                 offset += size.bytes();
             }
             b[rec + 16] = (size == PageSize::Large) as u8;
@@ -370,6 +395,11 @@ impl Snapshot {
             release,
             records: data_start - pages * RECORD,
             origin: cell.id,
+            generation: cell.generation,
+            exposed: cell.exposed,
+            wiped: WxRanges::default()
+                .with_wiped(wx.wiped().to_vec())
+                .unwrap_or_default(),
         }
     }
 
@@ -477,6 +507,9 @@ impl Snapshot {
             release: |_, _| {},
             records: 0,
             origin: 0,
+            generation: UNKNOWN_GENERATION,
+            exposed: false,
+            wiped: WxRanges::default(),
         };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
@@ -591,13 +624,20 @@ impl Snapshot {
             .collect()
     }
 
-    /// The cell's write-or-execute ranges (design D7 of `node-jit`).
+    /// The cell's write-or-execute ranges (design D7 of `node-jit`) and
+    /// wipe ranges (design D22 of `add-cell-hierarchy`).
     pub fn wx(&self) -> WxRanges {
-        if self.range_count() == 0 {
-            return WxRanges::default();
-        }
         // Validated by `from_bytes` or written by `capture`.
-        WxRanges::from_ranges(self.range_list()).unwrap_or_default()
+        let wx = if self.range_count() == 0 {
+            WxRanges::default()
+        } else {
+            WxRanges::from_ranges(self.range_list()).unwrap_or_default()
+        };
+        if self.wiped.wiped().is_empty() {
+            return wx;
+        }
+        wx.with_wiped(self.wiped.wiped().to_vec())
+            .unwrap_or_default()
     }
 
     /// Validates the threads (`from_bytes`; the size was checked).
@@ -892,7 +932,9 @@ impl Snapshot {
 
     /// A cell `id` with root `root` (an empty user half, sharing the kernel
     /// half as the architecture needs) in the snapshot's state, its threads'
-    /// deadlines counted from monotonic time `now`.
+    /// deadlines counted from monotonic time `now`. Its copy generation is
+    /// the captured cell's ([`UNKNOWN_GENERATION`] for bytes): the kernel
+    /// counts the resume as a copy.
     pub fn cell(&self, id: u32, root: u64, now: u64) -> Cell {
         let s = self.state();
         Cell {
@@ -907,6 +949,8 @@ impl Snapshot {
             exit_status: None,
             quota: s.quota,
             cpu_ns: s.cpu_ns,
+            generation: self.generation,
+            exposed: self.exposed,
         }
     }
 }

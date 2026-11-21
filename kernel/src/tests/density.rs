@@ -4,24 +4,40 @@ use super::*;
 
 /// This area's tests, in execution order.
 pub(super) const ALL: &[TestCase] = &[
-    ktest_case!(memory_pressure_fails_cells_not_the_kernel),
-    ktest_case!(a_thousand_idle_cells),
-    ktest_case!(host_operations_find_cells_among_many_sleepers),
+    ktest_case!(memory_pressure_fails_cells_not_the_kernel, 48),
+    ktest_case!(a_thousand_idle_cells, 37),
+    ktest_case!(host_operations_find_cells_among_many_sleepers, 175),
     ktest_case!(memory_full_of_cells_is_refused_cleanly),
     ktest_case!(a_woken_cell_runs_at_once),
     ktest_case!(a_wake_before_the_sleep_is_kept),
     ktest_case!(a_wait_on_descriptors_keeps_no_time),
-    ktest_case!(a_suspended_wait_on_descriptors_keeps_its_time_left),
+    ktest_case!(a_suspended_wait_on_descriptors_keeps_its_time_left, 40),
     ktest_case!(a_template_travels_as_bytes),
 ];
 
 /// Memory that is not leaked: frames free in the allocator plus frames the
 /// kernel heap holds (it keeps some small-object pages for reuse), and
 /// the heap's live allocations; measured with no image kept loaded (spec
-/// `cells`, image cache: those frames are the kernel's until dropped).
+/// `cells`, image cache: those frames are the kernel's until dropped) and
+/// no connection through the card still closing ([`settle_wire`]).
 pub(super) fn memory_balance() -> (u64, usize) {
+    settle_wire();
     crate::cell::drop_images();
     (free_or_in_heap(), crate::heap::stats().live)
+}
+
+/// Waits until every connection through the network card has finished
+/// closing (`smoltcp` keeps one until its peer acknowledges the close),
+/// polling the card for at most 10 seconds: what an earlier test left
+/// closing is not counted against a later one (change
+/// `shard-kernel-tests`), and a connection that never closes fails.
+pub(super) fn settle_wire() {
+    let mut host = Host::new();
+    let end = crate::cell::now_ns() + 10_000_000_000;
+    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
+        host.wire_address(0);
+    }
+    assert!(!crate::cell::wire_busy(), "the card's connections closed");
 }
 
 /// Frames free in the allocator plus the frames the kernel heap holds: the

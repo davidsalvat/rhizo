@@ -9,7 +9,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(fp_state_is_private_to_each_cell),
     ktest_case!(fp_state_survives_suspend_and_resume),
     ktest_case!(fp_registers_hold_nothing_of_another_cell),
-    ktest_case!(fp_state_is_private_to_every_thread_and_cell),
+    ktest_case!(fp_state_is_private_to_every_thread_and_cell, 92),
     ktest_case!(fp_state_survives_suspends_resumes_and_forks),
     ktest_case!(warm_template_of_a_real_program),
 ];

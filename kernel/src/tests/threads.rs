@@ -7,8 +7,8 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(threads_behave_as_on_linux_and_return_memory),
     ktest_case!(spinning_thread_does_not_starve_its_siblings),
     ktest_case!(thread_count_does_not_buy_cpu_time),
-    ktest_case!(cells_whose_threads_all_wait_use_no_cpu),
-    ktest_case!(threaded_cell_survives_suspend_and_resume),
+    ktest_case!(cells_whose_threads_all_wait_use_no_cpu, 293),
+    ktest_case!(threaded_cell_survives_suspend_and_resume, 95),
     ktest_case!(forks_of_a_threaded_cell_run_all_threads),
     ktest_case!(template_of_a_threaded_program),
 ];

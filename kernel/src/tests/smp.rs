@@ -12,9 +12,9 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(cells_run_on_every_cpu),
     ktest_case!(busy_cpus_do_not_starve_a_cell),
     ktest_case!(cells_in_parallel_stay_isolated),
-    ktest_case!(unmapped_page_is_gone_on_every_cpu),
-    ktest_case!(a_cell_on_several_cpus_survives_suspend_and_fork),
-    ktest_case!(host_operations_leave_other_cells_running),
+    ktest_case!(unmapped_page_is_gone_on_every_cpu, 74),
+    ktest_case!(a_cell_on_several_cpus_survives_suspend_and_fork, 95),
+    ktest_case!(host_operations_leave_other_cells_running, 143),
     ktest_case!(mixed_host_operations_during_a_run_are_invisible),
     ktest_case!(threads_of_a_cell_run_on_several_cpus_at_once),
 ];

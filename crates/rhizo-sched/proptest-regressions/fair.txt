@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 668289f0617b4dee1a33b7b0678cb368b03b209deab0b32e115a6ca7593c8609 # shrinks to weights = [66, 7893, 3278, 4109]
+cc f38ada9cfc7960ef35fe2b5f94f5b5e2fdfad88ff42e295e2ff787cbbf743b67 # shrinks to weights = [2902, 1, 6824, 513], idle = 1
+cc 87969df9c50bd62f6415a36e46e713728b69377f814c152d17c0ea1153fbbfcf # shrinks to domains_cells = [(939, 1), (579, 1), (2630, 1), (6151, 1), (660, 1)]
+cc e594009f5aabceb0f45fc8d4d0c0ce121b1e93f92c63d8cb76196d430a796f2d # shrinks to weights = [4878, 474, 7180]
+cc 01f2ada3ec9322e9f47bcc8cf02190399c97dccc381fbbbbf1e7460374f4b116 # shrinks to weights = [1133, 7166, 7140, 7543], idle = 2

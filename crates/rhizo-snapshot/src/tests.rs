@@ -1126,3 +1126,54 @@ fn quotas_from_outside_are_capped() {
     assert_eq!((q.memory, q.cpu_ns, q.files, q.sockets), (1 << 20, 5, 8, 2));
     assert_eq!(snap.state().cpu_ns, 1234, "the time used stays");
 }
+
+/// A snapshot in the kernel keeps the cell's copy generation, whether it
+/// may hold a secret, and its wipe ranges (design D22 of
+/// `add-cell-hierarchy`); its exported bytes do not hold them yet (format
+/// version 11 will), so one made from bytes has none and an unknown
+/// generation.
+#[test]
+fn copy_state_kept_in_the_kernel() {
+    let mut mem = FakePhysicalMemory::new();
+    let mut frames = CountingFrames::new(4096);
+    let mut c = cell::<Aarch64>(&mut mem, &mut frames);
+    c.generation = 4;
+    c.exposed = true;
+    let mut wx = WxRanges::default();
+    wx.add(0x90_0000, 0x90_2000).unwrap();
+    wx.wipe(0x60_0000, 0x60_1000).unwrap();
+    let snap = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &[],
+        &wx,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
+    assert_eq!(snap.wx(), wx);
+    let restored = snap.cell(9, 0, 0);
+    assert_eq!((restored.generation, restored.exposed), (4, true));
+    // Its wiped page is held as zeros, the rest as they were.
+    let pt = PageTable::<Aarch64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+    for i in 0..snap.pages() {
+        snap.restore_page(i, &pt, &mut mem, &mut frames).unwrap();
+    }
+    let mut buf = [0xffu8; 4];
+    rhizo_cell::memory::copy_from(&pt, &mem, 0x60_0ffc, &mut buf).unwrap();
+    assert_eq!(buf, [0; 4], "wiped");
+    rhizo_cell::memory::copy_from(&pt, &mem, 0x4000_001f_fff8, &mut buf).unwrap();
+    assert_eq!(&buf, b"big ");
+    let loaded = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
+    assert_eq!(loaded, snap, "the same bytes");
+    assert_eq!(loaded.wx().ranges(), wx.ranges());
+    assert!(loaded.wx().wiped().is_empty());
+    let restored = loaded.cell(9, 0, 0);
+    assert_eq!(
+        (restored.generation, restored.exposed),
+        (UNKNOWN_GENERATION, false)
+    );
+}

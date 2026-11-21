@@ -8,6 +8,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(console_output_works),
     ktest_case!(node_answers_as_on_linux),
     ktest_case!(a_node_cell_suspends_resumes_and_forks),
+    ktest_case!(copies_draw_different_random),
 ];
 
 /// Spawns Node.js on `/app/demo.js` (`expected::NODE_ARGV`) with the
@@ -112,5 +113,55 @@ fn a_node_cell_suspends_resumes_and_forks() {
     host.run(|h| all.iter().all(|&id| h.finished(id).is_some()));
     for id in all {
         assert_eq!(ended(&host, id), (Ending::Exit(0), rest.into()));
+    }
+}
+
+/// Two copies of a Node.js template frozen after its warm-up each print a
+/// `Math.random()` and a `crypto.randomUUID()` of their own: the script
+/// replaces `Math.random` once it sees its copy generation changed, and
+/// OpenSSL reseeds as `getpid` changed (spec `cell-hierarchy`, design D22
+/// of `add-cell-hierarchy`).
+fn copies_draw_different_random() {
+    let Some(files) = crate::cell::node_files() else {
+        arch::console::BootConsole.write_bytes(b"(Node.js not packed: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    let template = spawn_node(&mut host, &files, &["wait", "random"]);
+    while host.output(template) != Some(b"warm\n") {
+        assert!(
+            host.finished(template).is_none(),
+            "{:?}",
+            ended(&host, template)
+        );
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let ids: Vec<u32> = (0..2)
+        .map(|_| {
+            host.spawn_from_template(template, true, false)
+                .expect("copy")
+        })
+        .collect();
+    host.run(|h| ids.iter().all(|&id| h.finished(id).is_some()));
+    let answer = expected::NODE_STDOUT
+        .strip_prefix("warm\n")
+        .expect("warm first");
+    let draws: Vec<alloc::string::String> = ids
+        .iter()
+        .map(|&id| {
+            let (ending, out) = ended(&host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            let draw = out.strip_prefix(answer).expect("the answer first");
+            assert_eq!(draw.split(' ').count(), 2, "{draw}");
+            draw.into()
+        })
+        .collect();
+    for (i, a) in draws.iter().enumerate() {
+        for b in &draws[i + 1..] {
+            for (x, y) in a.split(' ').zip(b.split(' ')) {
+                assert_ne!(x, y, "two copies drew the same");
+            }
+        }
     }
 }
