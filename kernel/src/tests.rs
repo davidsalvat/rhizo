@@ -110,6 +110,7 @@ macro_rules! suite {
             ktest_case!(a_discarded_snapshot_closes_its_connections),
             ktest_case!(loopback_connection_across_suspend_of_one_end),
             ktest_case!(a_connection_to_the_host_survives_suspend),
+            ktest_case!(the_cards_interrupt_wakes_the_idle_cpu),
             ktest_case!(connections_of_a_template_reset_in_its_cells),
             ktest_case!(a_blocked_cell_survives_suspend),
             ktest_case!(forked_servers_share_their_listener),
@@ -2007,6 +2008,49 @@ fn a_connection_to_the_host_survives_suspend() {
     );
     assert!(resumes >= 10, "suspended {resumes} times");
     assert_eq!(alloc::string::String::from_utf8_lossy(&output), "pinged\n");
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// A virtio-mmio card interrupts the boot CPU when a frame arrives: a cell
+/// exchanging bytes with the host's echo server is answered while the CPU
+/// sleeps, woken a few times per round trip, not polling the card (design
+/// D4 of `add-virtio-interrupts`); not run without a card and echo server.
+fn the_cards_interrupt_wakes_the_idle_cpu() {
+    let Some((ip, port)) = crate::wire::options().echo else {
+        arch::console::BootConsole.write_bytes(b"(no network card and echo server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(host.wire_address(10_000_000_000).is_some());
+    assert_eq!(
+        crate::wire::interrupts(),
+        crate::wire::on_mmio(),
+        "a virtio-mmio card interrupts"
+    );
+    if !crate::wire::interrupts() {
+        arch::console::BootConsole.write_bytes(b"(virtio-pci card, polled: not run) ");
+        return;
+    }
+    const ROUNDS: u64 = 20;
+    let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let port = alloc::format!("{port}");
+    let rounds = alloc::format!("{ROUNDS}");
+    let w0 = crate::prof::get(crate::prof::Count::IdleWakeups);
+    let id = spawn(
+        &mut host,
+        "loopback",
+        &[b"ping", port.as_bytes(), rounds.as_bytes(), ip.as_bytes()],
+    );
+    host.run(|_| false);
+    let wakeups = crate::prof::get(crate::prof::Count::IdleWakeups) - w0;
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
+    // Polling wakes the CPU every 20 us while a connection waits: dozens of
+    // times per round trip.
+    assert!(
+        wakeups <= 4 * ROUNDS,
+        "{wakeups} wake-ups for {ROUNDS} round trips"
+    );
     drop(host);
     assert_eq!(crate::cell::open_sockets(), 0);
 }

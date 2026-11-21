@@ -108,6 +108,7 @@ the VMM has no network card.
 | `laptop.resume_turn_us/rhizo/<vmm>` | timing | The same turn right after a lazy resume (its pages come back as it touches them) |
 | `laptop.memory_bytes/rhizo/<vmm>` | size | Memory the template and the 50 agents take (45 snapshots in the kernel heap included) |
 | `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second |
+| `laptop.turn_wakeups/rhizo/<vmm>` | count | During the agent turns: returns of the guest's CPUs from waiting for an interrupt, per turn. About 1 when the card interrupts (virtio-mmio: QEMU `microvm` and `virt`, Firecracker); more where it is polled (virtio-pci, change `add-virtio-interrupts`) |
 | `laptop.idle_host_cpu_pct/rhizo/<vmm>` | rate | Over the same window, read on the host: the VMM process's CPU time (all threads, `/proc/PID/task/*/schedstat`) over wall time, in percent of one CPU |
 
 **Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from four

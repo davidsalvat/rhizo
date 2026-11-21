@@ -25,6 +25,9 @@ static LINK: Global<Option<Card>> = Global::new(None);
 /// The card interrupts the boot CPU when a frame arrives.
 static INTERRUPTS: AtomicBool = AtomicBool::new(false);
 
+/// The card is on a virtio-mmio transport.
+static MMIO: AtomicBool = AtomicBool::new(false);
+
 /// The command line's boot options.
 pub fn options() -> BootOptions {
     let mut buf = [0u8; 1024];
@@ -59,6 +62,7 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
             Ok(c) => {
                 card = Some((format!("virtio-mmio {base:#x}"), c));
                 line = irq;
+                MMIO.store(true, Ordering::Relaxed);
             }
             Err(ProbeError::NotNet(_)) => {}
             Err(e) => {
@@ -164,6 +168,12 @@ const BUSY_NS: u64 = 20_000;
 /// Whether the card interrupts the boot CPU when a frame arrives.
 pub fn interrupts() -> bool {
     INTERRUPTS.load(Ordering::Relaxed)
+}
+
+/// Whether the card is on a virtio-mmio transport.
+#[cfg(feature = "ktest")]
+pub fn on_mmio() -> bool {
+    MMIO.load(Ordering::Relaxed)
 }
 
 /// Whether the card holds received frames not taken yet (memory only).
