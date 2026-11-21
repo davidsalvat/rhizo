@@ -343,10 +343,6 @@ impl Frames for ImageFrames {
     fn is_shared(&self, phys: u64) -> bool {
         KernelFrames.is_shared(phys)
     }
-
-    fn try_share(&mut self, phys: u64) -> bool {
-        KernelFrames.try_share(phys)
-    }
 }
 
 impl Frames for KernelFrames {
@@ -396,17 +392,6 @@ impl Frames for KernelFrames {
     fn is_shared(&self, phys: u64) -> bool {
         let _p = cost::scope(Part::Frames);
         SHARED.with(|s| s.get((phys / FRAME_SIZE) as usize).is_some_and(|&e| e > 0))
-    }
-
-    fn try_share(&mut self, phys: u64) -> bool {
-        let _p = cost::scope(Part::Frames);
-        let index = (phys / FRAME_SIZE) as usize;
-        SHARED.with(|s| {
-            if s.len() <= index {
-                s.resize(index + 1, 0);
-            }
-            s[index].checked_add(1).map(|n| s[index] = n).is_some()
-        })
     }
 }
 
@@ -527,10 +512,6 @@ pub fn init(smp: Option<u16>) -> usize {
         // Parked connections re-attach only in this boot (design D2 of
         // `keep-tcp-across-suspend`).
         net.set_boot(Counter.cycles());
-        // Parked records' keys cannot be guessed without it (finding S15).
-        let (random, _) = start_random();
-        let word = |i: usize| u64::from_le_bytes(random[i..i + 8].try_into().unwrap_or_default());
-        net.set_secret([word(0), word(8)]);
         crate::wire::init(net, now_ns(), Counter.cycles());
     });
     crate::smp::start(smp)
