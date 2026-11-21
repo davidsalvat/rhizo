@@ -754,11 +754,11 @@ fn many_cells_in_sequence_stay_isolated() {
         }
     }
     pair();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     for _ in 0..150 {
         pair();
     }
-    assert_eq!(memory::free_bytes(), before);
+    assert_eq!(free_or_in_heap(), before);
 }
 
 // --- Executables kept loaded (change `add-image-cache`) ---------------------
@@ -882,7 +882,7 @@ fn suspend_returns_all_memory() {
         snapshot
     }
     drop(cycle()); // warm the heap up for the host's small allocations
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     let snapshot = cycle();
     assert!(
         snapshot.as_bytes().len() > 8 << 20,
@@ -890,7 +890,7 @@ fn suspend_returns_all_memory() {
     );
     drop(snapshot);
     assert_eq!(
-        memory::free_bytes(),
+        free_or_in_heap(),
         before,
         "the suspended cell held nothing but its snapshot"
     );
@@ -999,10 +999,10 @@ fn children_outlive_their_parent_and_frames_return() {
         }
     }
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
     assert_eq!(
-        memory::free_bytes(),
+        free_or_in_heap(),
         before,
         "every shared frame and table returned"
     );
@@ -1281,11 +1281,14 @@ fn file_data_takes_its_own_size() {
 /// `cells`, image cache: those frames are the kernel's until dropped).
 fn memory_balance() -> (u64, usize) {
     crate::cell::drop_images();
-    let heap = crate::heap::stats();
-    (
-        memory::free_bytes() + heap.pages as u64 * FRAME_SIZE,
-        heap.live,
-    )
+    (free_or_in_heap(), crate::heap::stats().live)
+}
+
+/// Frames free in the allocator plus the frames the kernel heap holds: the
+/// same whenever the heap gives its free pages back (change
+/// `add-heap-trim`), which depends on what ran before.
+fn free_or_in_heap() -> u64 {
+    memory::free_bytes() + crate::heap::stats().pages as u64 * FRAME_SIZE
 }
 
 /// Twenty cells each wanting 8 MiB of memory, or 16 MiB of files, at once:
@@ -2146,9 +2149,9 @@ fn spinning_thread_does_not_starve_its_siblings() {
         assert_eq!(host.live(), 0);
     }
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
-    assert_eq!(memory::free_bytes(), before, "every frame returned");
+    assert_eq!(free_or_in_heap(), before, "every frame returned");
 }
 
 /// Scheduling steps until a `chatter` cell ends next to a cell of `n`
@@ -2748,9 +2751,9 @@ fn cells_in_parallel_stay_isolated() {
     // into (as `assert_no_leak` does), so the check does not depend on which
     // tests ran before this one.
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
-    assert_eq!(memory::free_bytes(), before);
+    assert_eq!(free_or_in_heap(), before);
 }
 
 /// `counter` next to spinning cells, run on every CPU twenty slices (of
@@ -2832,11 +2835,11 @@ fn threads_of_a_cell_run_on_several_cpus_at_once() {
 /// every frame comes back.
 fn unmapped_page_is_gone_on_every_cpu() {
     run_expected("shootdown");
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     for _ in 0..4 {
         run_expected("shootdown");
     }
-    assert_eq!(memory::free_bytes(), before, "every frame returned");
+    assert_eq!(free_or_in_heap(), before, "every frame returned");
 }
 
 /// `parsum` computing with 4 threads on every CPU, stopped after each slice

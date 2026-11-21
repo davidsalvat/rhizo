@@ -63,6 +63,23 @@ it. Other x86_64 CPUs are not shot down. As for the pages themselves,
 nothing ever translates those addresses again, so a cached entry
 pointing at a freed table is never used.
 
+## D4. Tests that count frames
+
+Several in-kernel tests ran a round to warm the heap, then checked that
+`memory::free_bytes()` came back to the same value after a second round:
+they relied on the heap keeping every page it grew into. Now a cell's end
+may trim the heap. Whether it does depends on what ran before, and with
+several CPUs on the order in which cells end, so one of these tests
+failed on 4 CPUs in CI. Those tests now compare the free frames plus the
+frames the heap holds (`free_or_in_heap`). A trim does not change that
+sum, and a leak still does. The check stays an exact equality.
+
+For the same reason, `cell.idle_bytes` (a thousand idle forks, measured
+in a second round after a first that warmed the heap) now includes each
+cell's kernel record: the first round's cells end, the heap gives their
+pages back, and the second round grows into new ones. That cost was real
+before as well, but the warm-up hid it.
+
 ## Measurements
 
 QEMU TCG, `cargo xtask bench --workload server --runs 1` (base: `main`
@@ -73,3 +90,6 @@ at `c479b0d`):
 | `heap_kept_bytes` after the out-of-memory push | 75,018,240 | 0 | 75,018,240 | 0 |
 | `heap_peak_bytes` (heap growth while memory was full) | – | 93,855,744 | – | 93,622,272 |
 | `density.oom_cells` | 46,760 | 46,878 | 46,648 | 46,923 |
+
+x86_64 cell figures (`--no-reference`, one run): `cell.idle_bytes`
+20,516 to 21,573 (D4); every other size and frame count unchanged.

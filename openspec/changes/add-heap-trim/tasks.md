@@ -8,7 +8,8 @@
 ## 2. Kernel
 
 - [x] 2.1 `cell::end` calls `heap::trim_if_due` once the cell is dropped; the out-of-memory push reports `heap_peak_bytes`, and `memory_full_of_cells_is_refused_cleanly` checks the heap gave the spike back; verify `cargo xtask test` and `cargo xtask --arch x86_64 test`
-- [x] 2.2 `PageTable::free_empty_tables`, called by the window when it unmaps (D3); host test `empty_tables_are_freed_below_the_upper_levels`; `large_heap_allocations_survive_fragmentation` now expects every frame back; verify `cargo xtask test --only ktest` on both architectures
+- [x] 2.2 The frame-return tests compare free frames plus the heap's (`free_or_in_heap`, D4); verify `cargo xtask test --only ktest-smp` on both architectures, twice on AArch64
+- [x] 2.3 `PageTable::free_empty_tables`, called by the window when it unmaps (D3); host test `empty_tables_are_freed_below_the_upper_levels`; `large_heap_allocations_survive_fragmentation` now expects every frame back; verify `cargo xtask test --only ktest` on both architectures
 
 ## 3. Measure
 
