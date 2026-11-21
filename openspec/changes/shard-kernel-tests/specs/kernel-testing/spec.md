@@ -1,5 +1,22 @@
 ## MODIFIED Requirements
 
+### Requirement: A share of the in-kernel tests
+An in-kernel test build booted with `shard=I/N` (`0 <= I < N`) SHALL run
+only the tests dealt to share `I`, reporting how many it runs, and SHALL
+ignore a malformed value. The tests SHALL be ranked by their estimated
+cost, most expensive first (1 unless given, ties by position across all
+test suites), and dealt by rank to shares `0` to `N-1`, then `N-1` to
+`0`, and again; each share SHALL run its tests in suite order. The deal
+SHALL depend only on the suites and `N`.
+
+#### Scenario: Shares cover every test once
+- **WHEN** the test build boots `N` times with `shard=0/N` to `shard=N-1/N`
+- **THEN** every test runs in exactly one of the boots
+
+#### Scenario: Expensive tests apart
+- **WHEN** the two most expensive tests sit at positions of the same parity and the build boots with `shard=0/2` and `shard=1/2`
+- **THEN** they run in different boots, each boot in suite order
+
 ### Requirement: Tests do not depend on their order
 An in-kernel test SHALL pass whether or not the tests before it ran: work
 done once per boot (such as bringing up the network card) SHALL happen at

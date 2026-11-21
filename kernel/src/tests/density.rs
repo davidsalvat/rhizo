@@ -4,14 +4,14 @@ use super::*;
 
 /// This area's tests, in execution order.
 pub(super) const ALL: &[TestCase] = &[
-    ktest_case!(memory_pressure_fails_cells_not_the_kernel),
-    ktest_case!(a_thousand_idle_cells),
-    ktest_case!(host_operations_find_cells_among_many_sleepers),
+    ktest_case!(memory_pressure_fails_cells_not_the_kernel, 48),
+    ktest_case!(a_thousand_idle_cells, 37),
+    ktest_case!(host_operations_find_cells_among_many_sleepers, 175),
     ktest_case!(memory_full_of_cells_is_refused_cleanly),
     ktest_case!(a_woken_cell_runs_at_once),
     ktest_case!(a_wake_before_the_sleep_is_kept),
     ktest_case!(a_wait_on_descriptors_keeps_no_time),
-    ktest_case!(a_suspended_wait_on_descriptors_keeps_its_time_left),
+    ktest_case!(a_suspended_wait_on_descriptors_keeps_its_time_left, 40),
     ktest_case!(a_template_travels_as_bytes),
 ];
 
