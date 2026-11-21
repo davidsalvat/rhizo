@@ -50,7 +50,7 @@ unicodedata unicodedata.c
 zlib zlibmodule.c
 ";
 /// The scripts a CPython cell runs, from `cells/python` to `/app`.
-pub const SCRIPTS: [&str; 2] = ["agent_demo.py", "agent_loop.py"];
+pub const SCRIPTS: [&str; 3] = ["agent_demo.py", "agent_loop.py", "agent_chat.py"];
 /// Linked statically, with its segments on 2 MiB boundaries so the kernel
 /// maps whole 2 MiB pieces of them with 2 MiB pages (design D2 of
 /// `add-large-image-pages`).
@@ -229,7 +229,8 @@ pub(crate) fn write_if_changed(path: &Path, data: &[u8]) -> Result {
 }
 
 /// The cell's files: `root` without `usr/bin` (the executable is the
-/// image the cell is spawned from), encoded as a cell file system (D2).
+/// image the cell is spawned from), and an empty `/tmp` for programs that
+/// write scratch files there, encoded as a cell file system (D2).
 fn encode(root: &Path) -> Result<Vec<u8>> {
     let mut fs = rhizo_fs::Fs::new();
     fs.mkdir(None, b"/usr")
@@ -237,6 +238,8 @@ fn encode(root: &Path) -> Result<Vec<u8>> {
     for top in ["usr/lib", "app"] {
         add_tree(&mut fs, &root.join(top), &format!("/{top}"))?;
     }
+    fs.mkdir(None, b"/tmp")
+        .map_err(|e| format!("cannot make /tmp: {e:?}"))?;
     let mut out = Vec::new();
     fs.encode(&mut out);
     Ok(out)
@@ -322,5 +325,6 @@ mod tests {
             fs.stat(None, b"/usr/bin").is_err(),
             "the executable is not a file"
         );
+        assert!(fs.stat(None, b"/tmp").is_ok(), "a /tmp for scratch files");
     }
 }

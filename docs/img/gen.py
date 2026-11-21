@@ -2,12 +2,16 @@
 """Generate the README graphics (light and dark SVGs) in docs/img/ from one
 benchmark run, so the charts agree with the README's generated tables:
 
-    python3 docs/img/gen.py bench-results.json
+    python3 docs/img/gen.py bench-results.json [bench-results-aarch64.json]
 
 `bench-results.json` is what `cargo xtask bench --output` writes (CI
 publishes it as the `bench-results-N` annotations); regenerate the tables
 from the same file with `cargo xtask bench --from bench-results.json
 --readme`. Figures use the Firecracker column; ranges span every VMM.
+
+The optional second file is the AArch64 job's instruction counts (the
+`bench-aarch64-results-N` annotations): with it, `arches.svg` shows them
+next to x86_64's (pass it to `--readme` too, as a second `--from`).
 """
 import json
 import math
@@ -16,6 +20,8 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parent
 RESULTS = json.load(open(sys.argv[1]))
+for extra in sys.argv[2:]:
+    RESULTS["metrics"] += json.load(open(extra))["metrics"]
 
 
 def median(name, guest="rhizo", vmm="firecracker", required=True):
@@ -408,6 +414,58 @@ def scorecard(t):
     return s
 
 
+# ---------------------------------------------------------------- arches
+ARCH_OPS = [
+    ("cell.syscall_insns", "System call round trip"),
+    ("cell.switch_insns", "Switch between two cells"),
+    ("cell.run_insns", "Run hello, start to exit"),
+    ("cell.fork_insns", "Fork a 50 MiB cell"),
+    ("cell.resume_insns", "Resume 8 MiB, lazy"),
+    ("cell.resume_eager_insns", "Resume 8 MiB, eager"),
+    ("cell.pipe_rtt_insns", "Pipe round trip"),
+    ("workload.warm_insns", "glibc program, warm"),
+]
+
+
+def arches(t):
+    """Instructions per operation under QEMU -icount on both architectures,
+    or None without AArch64 figures."""
+    rows = [(label, median(name, vmm="qemu-microvm-icount", required=False),
+             median(name, vmm="qemu-virt-icount", required=False))
+            for name, label in ARCH_OPS]
+    rows = [r for r in rows if r[1] and r[2]]
+    if not rows:
+        return None
+    x0, x1, gh = 230, 650, 64
+    top = 104
+    h = top + gh * len(rows) + 52
+    s = Svg(t, h, "Both architectures, in instructions",
+            "Bar chart of retired instructions per operation under QEMU -icount, lower is "
+            "better, bars to scale within each operation. "
+            + " ".join(f"{label}: x86_64 {x:,.0f}, AArch64 {a:,.0f}." for label, x, a in rows))
+    s.text(24, 40, "Both architectures, in instructions", 20, weight=700)
+    s.text(24, 64, "Retired instructions per operation under QEMU -icount; bars to scale "
+           "within each operation", 14, fill=t["muted"])
+    s.rect(24, 78, 14, 14, t["bar"], t["bar"], rx=3, sw=0)
+    s.text(44, 90, "AArch64 (virt)", 14)
+    s.rect(160, 78, 14, 14, t["other"], t["other"], rx=3, sw=0)
+    s.text(180, 90, "x86_64 (microvm)", 14)
+    y = top
+    for label, x86, arm in rows:
+        s.text(x0 - 12, y + 30, label, 15, weight=700, anchor="end")
+        longest = max(x86, arm)
+        for k, (v, c) in enumerate([(arm, t["bar"]), (x86, t["other"])]):
+            by = y + 8 + k * 24
+            w = max(3.0, v / longest * (x1 - x0))
+            s.rect(x0, by, round(w, 1), 18, c, c, rx=3, sw=0)
+            s.text(round(x0 + w + 8, 1), by + 14, f"{v:,.0f}", 14,
+                   weight=700 if k == 0 else 400)
+        y += gh
+    s.text(24, h - 22, "Exact counts: the same on every run and host. GitHub's ARM64 runners "
+           "have no KVM, so no AArch64 timings.", 13, fill=t["muted"])
+    return s
+
+
 # ---------------------------------------------------------------- roadmap
 BOOT_MS = median("boot.time_to_ready_ms")
 
@@ -668,7 +726,10 @@ def dot(s, t, x, y, kind):
 
 for name, fn in [("stack", stack), ("lifecycle", lifecycle), ("measured", chart),
                  ("scorecard", scorecard), ("roadmap", roadmap), ("layers", layers),
-                 ("clicks", clicks), ("model", model), ("markets", markets)]:
+                 ("clicks", clicks), ("model", model), ("markets", markets),
+                 ("arches", arches)]:
     for theme, t in THEMES.items():
-        fn(t).save(f"{name}{'-dark' if theme == 'dark' else ''}.svg")
+        svg = fn(t)
+        if svg:
+            svg.save(f"{name}{'-dark' if theme == 'dark' else ''}.svg")
 print("ok")

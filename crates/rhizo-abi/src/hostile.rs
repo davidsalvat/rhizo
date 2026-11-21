@@ -308,7 +308,11 @@ fn calls() -> impl Strategy<Value = Vec<(u64, [u64; 6])>> {
 /// stay, so it is compared once at the end), the kernel's messages are
 /// bounded, and every frame comes back.
 fn survive<F: EntryFormat>(arch: Arch, shared: bool, calls: &[(u64, [u64; 6])]) {
-    let mut m = Machine::<F>::new(arch, shared);
+    survive_in(Machine::<F>::new(arch, shared), calls);
+}
+
+/// [`survive`] in machine `m`.
+fn survive_in<F: EntryFormat>(mut m: Machine<F>, calls: &[(u64, [u64; 6])]) {
     let kernel = m.kernel_memory();
     let mut numbers = Vec::new();
     for &(nr, args) in calls {
@@ -500,5 +504,150 @@ fn unknown_calls_are_reported_once_whatever_their_number() {
         assert_eq!(m.call(nr, [0; 6]).1, -ENOSYS);
     }
     assert!(m.services.logged <= 4, "{} messages", m.services.logged);
+    m.end();
+}
+
+/// A file system holding something of every kind the encoding knows:
+/// directories, a file with a hole and a partial last block, a second name
+/// for it, a pipe holding bytes, an event counter, an `epoll` instance
+/// watching them, a Unix socket name, and a working directory below the
+/// root.
+fn rich_fs() -> rhizo_fs::Fs {
+    use rhizo_fs::{EpollOp, OpenFlags};
+    let mut fs = rhizo_fs::Fs::new();
+    fs.mkdir(None, b"/d").unwrap();
+    fs.mkdir(None, b"/d/e").unwrap();
+    fs.put_file(b"/d/f", &[7; 5000]).unwrap();
+    let rw = OpenFlags {
+        read: true,
+        write: true,
+        ..OpenFlags::default()
+    };
+    let f = fs.open(None, b"/d/f", rw, 2).unwrap();
+    fs.write(f, b"far", Some(5 * 4096)).unwrap();
+    let (r, w) = fs.pipe(false, false).unwrap();
+    fs.write_pipe(w, b"queued").unwrap();
+    let ev = fs.eventfd(3, false, true, false).unwrap();
+    let ep = fs.epoll_create(false).unwrap();
+    fs.epoll_ctl(ep, EpollOp::Add, r, 1, 9).unwrap();
+    fs.epoll_ctl(ep, EpollOp::Add, ev, 1, 10).unwrap();
+    fs.bind_name(None, b"/d/sock", 77).unwrap();
+    fs.dup(f, 20, true, true).unwrap();
+    fs.chdir(b"/d/e").unwrap();
+    fs
+}
+
+/// Calls on descriptors and paths: any of them, with descriptors and
+/// small values most of the time.
+fn file_calls() -> impl Strategy<Value = Vec<(u64, [u64; 6])>> {
+    // x86_64: read, write, close, fstat, poll, lseek, mmap, pread64,
+    // pwrite64, readv, writev, pipe, dup, dup2, fcntl, ftruncate,
+    // getdents64, getcwd, chdir, epoll_wait, epoll_ctl, openat, mkdirat,
+    // unlinkat, renameat, eventfd2, newfstatat, ioctl, connect, bind.
+    let nr = prop::sample::select(vec![
+        0u64, 1, 3, 5, 7, 8, 9, 17, 18, 19, 20, 22, 32, 33, 72, 77, 217, 79, 80, 232, 233, 257,
+        258, 263, 264, 290, 262, 16, 42, 49,
+    ]);
+    let small = || prop_oneof![4 => (0u64..24).boxed(), 1 => arg().boxed()].boxed();
+    prop::collection::vec(
+        (
+            nr,
+            [
+                small(),
+                arg().boxed(),
+                small(),
+                small(),
+                small(),
+                arg().boxed(),
+            ],
+        ),
+        1..30,
+    )
+}
+
+/// `bytes` with `edits` (position modulo the length, new byte) made and
+/// cut to `keep` bytes when given.
+fn mutated(mut bytes: Vec<u8>, edits: &[(usize, u8)], keep: Option<usize>) -> Vec<u8> {
+    for &(at, b) in edits {
+        let n = bytes.len();
+        bytes[at % n] = b;
+    }
+    if let Some(k) = keep {
+        bytes.truncate(k % (bytes.len() + 1));
+    }
+    bytes
+}
+
+proptest! {
+    /// A file system decoded from tampered bytes (as a snapshot from
+    /// outside holds them) is refused or works: no call on it panics, and
+    /// the kernel survives as with any cell.
+    #[test]
+    fn decoded_files_cannot_hurt_the_kernel(
+        edits in prop::collection::vec((any::<usize>(), any::<u8>()), 0..4),
+        keep in prop::option::weighted(0.1, any::<usize>()),
+        calls in file_calls(),
+    ) {
+        let mut bytes = Vec::new();
+        rich_fs().encode(&mut bytes);
+        let bytes = mutated(bytes, &edits, keep);
+        if let Ok(fs) = rhizo_fs::Fs::decode(&bytes) {
+            let mut m = Machine::<X86_64>::new(Arch::X86_64, true);
+            m.fs = fs;
+            survive_in(m, &calls);
+        }
+    }
+
+    /// Random bytes never decode into a file system that breaks.
+    #[test]
+    fn random_bytes_are_refused_or_work(
+        bytes in prop::collection::vec(any::<u8>(), 0..256),
+        calls in file_calls(),
+    ) {
+        if let Ok(fs) = rhizo_fs::Fs::decode(&bytes) {
+            let mut m = Machine::<Aarch64>::new(Arch::Aarch64, false);
+            m.fs = fs;
+            survive_in(m, &calls);
+        }
+    }
+}
+
+/// Finding S16: buffers whose lengths add up past 2^64 (each one at most
+/// `SSIZE_MAX`, as Linux allows) made `sendmsg` and `recvmsg` overflow,
+/// which panics a kernel built with overflow checks.
+#[test]
+fn buffer_lengths_that_overflow_their_sum_are_harmless() {
+    const X_SENDMSG: u64 = 46;
+    const X_RECVMSG: u64 = 47;
+    const X_SOCKETPAIR: u64 = 53;
+    let mut m = Machine::<X86_64>::new(Arch::X86_64, true);
+    assert_eq!(m.call(X_SOCKETPAIR, [1, 1, 0, DATA, 0, 0]).1, 0);
+    let mut fds = [0u8; 8];
+    let pt = PageTable::<X86_64>::from_root(m.cell.root);
+    memory::copy_from(&pt, &m.mem, DATA, &mut fds).unwrap();
+    let (a, b) = (
+        u64::from(u32::from_le_bytes(fds[..4].try_into().unwrap())),
+        u64::from(u32::from_le_bytes(fds[4..].try_into().unwrap())),
+    );
+    // Three buffers of SSIZE_MAX bytes each, all at the cell's page, and a
+    // `msghdr` pointing at them.
+    let (iov, msg) = (DATA + 64, DATA + 256);
+    let mut list = Vec::new();
+    for _ in 0..3 {
+        list.extend_from_slice(&(DATA + 1024).to_le_bytes());
+        list.extend_from_slice(&(i64::MAX as u64).to_le_bytes());
+    }
+    let mut hdr = [0u8; 56];
+    hdr[16..24].copy_from_slice(&iov.to_le_bytes());
+    hdr[24..32].copy_from_slice(&3u64.to_le_bytes());
+    memory::copy_to(&pt, &mut m.mem, iov, &list).unwrap();
+    memory::copy_to(&pt, &mut m.mem, msg, &hdr).unwrap();
+    let (_, sent) = m.call(X_SENDMSG, [a, msg, 0, 0, 0, 0]);
+    assert!(sent == -EFAULT || sent > 0, "sendmsg: {sent}");
+    let (_, got) = m.call(X_RECVMSG, [b, msg, 0x40, 0, 0, 0]);
+    assert!(
+        got == -EAGAIN || got == -EFAULT || got >= 0,
+        "recvmsg: {got}"
+    );
     m.end();
 }

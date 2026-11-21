@@ -65,12 +65,16 @@ impl Tables {
         }
     }
 
+    // Inlined into the pipe calls whatever else uses them: one pipe round
+    // trip costs 12 instructions more otherwise (`cell.pipe_rtt_insns`).
+    #[inline(always)]
     fn object(&self, i: u32) -> &Object {
         self.objects[i as usize]
             .as_deref()
             .expect("objects in use are valid")
     }
 
+    #[inline(always)]
     fn object_mut(&mut self, i: u32) -> &mut Object {
         Arc::make_mut(
             self.objects[i as usize]
@@ -117,6 +121,66 @@ impl Tables {
         let write =
             self.open_target(Target::Pipe(pipe, true), Self::status(nonblock, 1), cloexec)?;
         Ok((read, write))
+    }
+
+    /// Gives the cell standard input from the host (design D1 of
+    /// `add-interactive-chat`): descriptor 0 becomes the read end of a new
+    /// pipe whose one write end the host holds, outside the descriptors
+    /// ([`push_input`](Self::push_input), [`close_input`](Self::close_input)).
+    /// What descriptor 0 was is closed. `Exists` if the host has one already.
+    pub fn host_input(&mut self) -> Result<()> {
+        if self.input.is_some() {
+            return Err(Error::Exists);
+        }
+        if self.fds.first().copied().flatten().is_some() {
+            self.close(0)?;
+        }
+        let pipe = self.alloc_object(Object::Pipe {
+            data: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        });
+        let desc = self.new_desc(Target::Pipe(pipe, false), Self::status(false, 0));
+        self.fds.resize(self.fds.len().max(1), None);
+        self.fds[0] = Some((desc, false));
+        self.input = Some(pipe);
+        Ok(())
+    }
+
+    /// Whether the host holds the write end of the cell's standard input.
+    pub fn has_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Writes `bytes` from the host into the cell's standard input, whole
+    /// or not at all: `BadFd` without host input (or once the host closed
+    /// it), `Pipe` once the cell closed every read end, `Again` when the
+    /// unread bytes leave less room than `bytes` ([`PIPE_CAP`] in all).
+    pub fn push_input(&mut self, bytes: &[u8]) -> Result<()> {
+        let i = self.input.ok_or(Error::BadFd)?;
+        let Object::Pipe { data, readers, .. } = self.object(i) else {
+            unreachable!("the host's input is a pipe")
+        };
+        if *readers == 0 {
+            return Err(Error::Pipe);
+        }
+        if PIPE_CAP - data.len() < bytes.len() {
+            return Err(Error::Again);
+        }
+        if let Object::Pipe { data, .. } = self.object_mut(i) {
+            data.extend(bytes);
+        }
+        self.changes += 1;
+        Ok(())
+    }
+
+    /// Closes the host's end of the cell's standard input: once the unread
+    /// bytes are read, reads return 0 (end of file). `BadFd` without host
+    /// input.
+    pub fn close_input(&mut self) -> Result<()> {
+        let i = self.input.take().ok_or(Error::BadFd)?;
+        self.drop_end(Target::Pipe(i, true));
+        Ok(())
     }
 
     /// `eventfd2`.
@@ -174,6 +238,14 @@ impl Tables {
         }
     }
 
+    /// Counts changes to pipes, event counters and `epoll` instances: data
+    /// in or out, an end closed, an interest changed. Only the cell's own
+    /// threads make them, so a thread waiting on one of these waits for
+    /// another thread of its cell (design D3 of `add-socket-wait-queues`).
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
     /// Whether socket handles wait to be released.
     pub fn has_released(&self) -> bool {
         !self.released.is_empty()
@@ -187,6 +259,7 @@ impl Tables {
 
     /// One description of `target` (not a file or socket) is gone.
     pub(crate) fn drop_end(&mut self, target: Target) {
+        self.changes += 1;
         let i = match target {
             Target::Pipe(i, write) => {
                 let Object::Pipe {
@@ -255,6 +328,7 @@ impl Tables {
             && let Object::Pipe { data, .. } = self.object_mut(i)
         {
             data.drain(..done);
+            self.changes += 1;
         }
         Ok(done)
     }
@@ -281,6 +355,7 @@ impl Tables {
         if let Object::Pipe { data, .. } = self.object_mut(i) {
             data.extend(&bytes[..n]);
         }
+        self.changes += 1;
         Ok(n)
     }
 
@@ -305,6 +380,7 @@ impl Tables {
         if let Object::Event { count, .. } = self.object_mut(i) {
             *count -= take;
         }
+        self.changes += 1;
         Ok(take)
     }
 
@@ -324,6 +400,7 @@ impl Tables {
         if let Object::Event { count, .. } = self.object_mut(i) {
             *count += value;
         }
+        self.changes += 1;
         Ok(())
     }
 
@@ -410,6 +487,7 @@ impl Tables {
         if let Target::Inode(_) = target {
             return Err(Error::Perm); // regular files and directories
         }
+        self.changes += 1;
         let Object::Epoll(list) = self.object_mut(i) else {
             unreachable!("epoll descriptions refer to epoll instances")
         };

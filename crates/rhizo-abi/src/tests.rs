@@ -70,6 +70,18 @@ pub(crate) struct World {
     pub(crate) deadline: Option<u64>,
     /// The last call waits on descriptors: with this deadline.
     pub(crate) io: Option<Option<u64>>,
+    /// Whether a call reached the sockets.
+    pub(crate) used_net: bool,
+}
+
+/// The sockets, noting whether a call reached them.
+struct Noting<'a>(&'a mut rhizo_net::Net, &'a mut bool);
+
+impl Sockets for Noting<'_> {
+    fn net(&mut self) -> &mut rhizo_net::Net {
+        *self.1 = true;
+        self.0
+    }
 }
 
 pub(crate) const DATA: u64 = 0x10_0000;
@@ -98,6 +110,7 @@ impl World {
             pages: PageCache::new(64),
             deadline: None,
             io: None,
+            used_net: false,
         }
     }
 
@@ -127,7 +140,7 @@ impl World {
             frames: &mut self.frames,
             services: &mut self.services,
             fs: &mut self.fs,
-            net: &mut self.net,
+            net: &mut Noting(&mut self.net, &mut self.used_net),
             deadline: self.deadline.take(),
             pager: &mut NoPager,
             pages: &mut self.pages,
@@ -1114,6 +1127,29 @@ fn thread_exit_clears_its_tid_and_wakes_the_joiner() {
     let mut w = World::new(Arch::Aarch64);
     w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]);
     assert_eq!(w.call(EXIT_GROUP, &[2]).1, Outcome::Exit(2), "every thread");
+}
+
+#[test]
+fn a_pipe_write_wakes_the_threads_of_the_cell_waiting_on_descriptors() {
+    const PIPE2: u64 = 59;
+    const READ: u64 = 63;
+    let mut w = World::new(Arch::Aarch64);
+    let fds = DATA + 0x200;
+    assert_eq!(w.call(PIPE2, &[fds, 0]).0, 0);
+    let fd = |at: u64| u64::from(u32::from_le_bytes(w.peek(at, 4).try_into().unwrap()));
+    let (r, wr) = (fd(fds), fd(fds + 4));
+    let main = w.cell.threads.current().tid;
+    assert_eq!(w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]).0, 6);
+    w.switch_to(6);
+    assert_eq!(w.call(READ, &[r, DATA, 1]).1, Outcome::Block);
+    // The world made it runnable again: it waits, as the kernel keeps it.
+    w.cell.threads.current_mut().wait = Wait::Io { until: None };
+    w.switch_to(main);
+    w.poke(DATA + 0x300, b"x");
+    assert_eq!(w.call(WRITE, &[1, DATA + 0x300, 1]).0, 1);
+    assert_ne!(w.thread(6).wait, Wait::Ready, "the console is no pipe");
+    assert_eq!(w.call(WRITE, &[wr, DATA + 0x300, 1]).0, 1);
+    assert_eq!(w.thread(6).wait, Wait::Ready, "it reads again");
 }
 
 #[test]

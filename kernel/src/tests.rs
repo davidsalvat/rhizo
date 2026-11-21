@@ -96,6 +96,7 @@ macro_rules! suite {
             ktest_case!(a_thousand_idle_cells),
             ktest_case!(memory_full_of_cells_is_refused_cleanly),
             ktest_case!(a_woken_cell_runs_at_once),
+            ktest_case!(a_wake_before_the_sleep_is_kept),
             ktest_case!(hostile_pointers_get_efault),
             ktest_case!(cell_cannot_write_kernel_memory),
             ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
@@ -104,6 +105,7 @@ macro_rules! suite {
             ktest_case!(fresh_memory_never_holds_another_cells_data),
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
+            ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
             ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
             ktest_case!(hardware_entropy_works_where_present),
@@ -112,6 +114,7 @@ macro_rules! suite {
             ktest_case!(sockets_and_pipes_behave_as_on_linux),
             ktest_case!(cells_talk_over_loopback),
             ktest_case!(a_waiting_cell_uses_no_cpu),
+            ktest_case!(only_the_cells_waiting_on_a_socket_wake),
             ktest_case!(sockets_across_suspend_and_resume),
             ktest_case!(a_discarded_snapshot_closes_its_connections),
             ktest_case!(loopback_connection_across_suspend_of_one_end),
@@ -1375,6 +1378,28 @@ fn a_woken_cell_runs_at_once() {
     assert!(output.starts_with("ready\nops="), "{output}");
 }
 
+/// A wake from the host that comes while the cell is still on its way to
+/// its sleep is kept for that sleep (design D5 of `add-socket-wait-queues`):
+/// `a_woken_cell_runs_at_once` hung when a tick preempted the cell between
+/// printing `ready` and sleeping, and the wake found nothing to end. Here
+/// the cell yields between the two, so the wake always comes first.
+fn a_wake_before_the_sleep_is_kept() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "sleeper", &[b"3600000", b"yield"]);
+    while host.output(id) != Some(b"ready\n") {
+        host.step();
+    }
+    // Before or at its yield: runnable, not asleep.
+    assert!(host.wake(id));
+    // At most its yield, then its sleep of an hour, which ends at once.
+    for _ in 0..2 {
+        if host.finished(id).is_none() {
+            host.step();
+        }
+    }
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "ready\nwoken\n".into()));
+}
+
 // --- H13: isolation under attack (spec `isolation`) -------------------------
 
 fn hostile_pointers_get_efault() {
@@ -1508,6 +1533,39 @@ fn shared_read_only_pages_stay_shared_after_mprotect() {
         assert_eq!(ending, Ending::Exit(0), "{out}");
         assert!(out.ends_with("own ok\n"), "{out}");
     }
+}
+
+/// Hostile threads on several CPUs (spec `isolation`, `multi-core`):
+/// `racer` cells unmap memory other threads are copying through the
+/// kernel, unmap a word a thread waits on, end while their threads are in
+/// system calls, and flip a page read-only under a writer. Each ends as its
+/// race allows, a cell next to them finishes, the kernel keeps running and
+/// every frame comes back.
+fn threads_racing_on_several_cpus_cannot_hurt_the_kernel() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let races = ["io", "futex", "exit", "protect"].map(|race| {
+        let id = spawn(&mut host, "racer", &[race.as_bytes()]);
+        (race, id)
+    });
+    let other = spawn(&mut host, "hello", &[]);
+    host.run(|_| false);
+    for (race, id) in races {
+        let (ending, out) = ended(&host, id);
+        match race {
+            "exit" => assert_eq!(ending, Ending::Exit(3), "{race}: {out}"),
+            // The writer may hit the page while it is read-only.
+            "protect" if ending == Ending::Fault => {}
+            _ => assert_eq!(
+                (ending, out.as_str()),
+                (Ending::Exit(0), alloc::format!("{race} ok\n").as_str()),
+                "{race}"
+            ),
+        }
+    }
+    assert_eq!(ended(&host, other).0, Ending::Exit(0));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
 }
 
 /// A cell that spins with the direction and alignment-check flags set
@@ -1733,6 +1791,29 @@ fn a_waiting_cell_uses_no_cpu() {
     host.run(|_| false);
     assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
     assert_eq!(ended(&host, client).0, Ending::Exit(0));
+}
+
+/// A socket change wakes only the cells waiting on that socket (design D1
+/// of `add-socket-wait-queues`): a server waiting for a client that never
+/// comes stays asleep while two other cells talk, and no wake-up finds
+/// nothing to do.
+fn only_the_cells_waiting_on_a_socket_wake() {
+    use crate::prof::{self, Count};
+    let mut host = Host::new();
+    let idle = spawn(&mut host, "loopback", &[b"serve", b"7310", b"1"]);
+    step_until_waiting(&mut host); // it reaches `accept` and waits
+    prof::start();
+    let server = spawn(&mut host, "loopback", &[b"serve", b"7311", b"50"]);
+    let client = spawn(&mut host, "loopback", &[b"ping", b"7311", b"50"]);
+    host.run(|h| h.finished(server).is_some() && h.finished(client).is_some());
+    let report = prof::stop();
+    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
+    assert_eq!(ended(&host, client), (Ending::Exit(0), "pinged\n".into()));
+    assert_eq!(report.count(Count::IoWasted), 0, "no wake-up found nothing");
+    assert!(host.finished(idle).is_none());
+    assert_eq!(host.waiting(), 1, "the idle server was never woken");
+    assert!(host.kill(idle));
+    assert_eq!(crate::cell::open_sockets(), 0);
 }
 
 /// Runs `netstate` to its `ready` line.

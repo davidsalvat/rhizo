@@ -118,8 +118,8 @@ class Model:
         data, self.buf = self.buf[:n], self.buf[n:]
         return data
 
-    def chat(self, messages):
-        body = json.dumps({"model": self.name, "messages": messages, "tools": TOOLS}).encode()
+    def chat(self, messages, tools=None):
+        body = json.dumps({"model": self.name, "messages": messages, "tools": tools or TOOLS}).encode()
         head = (
             "POST %s HTTP/1.1\r\nHost: %s:%d\r\n"
             "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n"
