@@ -265,6 +265,7 @@ rhizo_isr_\n:
     RHIZO_ISR_NOERR 32
     RHIZO_ISR_NOERR 33
     RHIZO_ISR_NOERR 34
+    RHIZO_ISR_NOERR 35
     RHIZO_ISR_NOERR 255
 
 rhizo_isr_common:
@@ -291,6 +292,7 @@ rhizo_isr_device:
     .quad rhizo_isr_32
     .quad rhizo_isr_33
     .quad rhizo_isr_34
+    .quad rhizo_isr_35
     .quad rhizo_isr_255
 
     .text
@@ -300,7 +302,7 @@ rhizo_isr_device:
 
 unsafe extern "C" {
     static rhizo_isr_table: [u64; 32];
-    static rhizo_isr_device: [u64; 4];
+    static rhizo_isr_device: [u64; 5];
 }
 
 /// Stack layout built by the stubs and the CPU.
@@ -341,12 +343,14 @@ fn load_idt() {
             };
             idt[vector] = IdtEntry::interrupt_gate(stub, ist);
         }
-        // SAFETY: as above, four more stubs (timer, wake-up, sampling and spurious
-        // vectors).
-        let [timer, wake, sample, spurious] = unsafe { *core::ptr::addr_of!(rhizo_isr_device) };
+        // SAFETY: as above, five more stubs (timer, wake-up, sampling,
+        // device and spurious vectors).
+        let [timer, wake, sample, device, spurious] =
+            unsafe { *core::ptr::addr_of!(rhizo_isr_device) };
         idt[32] = IdtEntry::interrupt_gate(timer, 0);
         idt[33] = IdtEntry::interrupt_gate(wake, 0);
         idt[34] = IdtEntry::interrupt_gate(sample, 0);
+        idt[35] = IdtEntry::interrupt_gate(device, 0);
         idt[255] = IdtEntry::interrupt_gate(spurious, 0);
         DescriptorPointer {
             limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,

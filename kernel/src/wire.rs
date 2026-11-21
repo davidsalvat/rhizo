@@ -1,7 +1,9 @@
 //! The network card (spec `networking`, design D1, D4 and D5 of
 //! `add-virtio-net`, D3 of `add-virtio-pci`): found among the virtio-mmio
 //! transports the platform lists, else on PCI bus 0, given the address the
-//! command line asks for, and polled by the cell host.
+//! command line asks for, and polled by the cell host. A virtio-mmio card
+//! whose interrupt the platform can route also interrupts the boot CPU when
+//! a frame arrives (design D1 and D2 of `add-virtio-interrupts`).
 
 use crate::arch::console::BootConsole;
 use crate::arch::platform::{self, Mmio};
@@ -10,6 +12,7 @@ use crate::sync::Global;
 use alloc::format;
 use alloc::string::String;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 use rhizo_core::options::{BootOptions, IpOption};
 use rhizo_hal::{ConsoleWriter, NetLink};
 use rhizo_net::{Net, WireConfig};
@@ -18,6 +21,9 @@ use rhizo_virtio::{ProbeError, VirtioNet, pci};
 type Card = VirtioNet<Mmio, DirectMap>;
 
 static LINK: Global<Option<Card>> = Global::new(None);
+
+/// The card interrupts the boot CPU when a frame arrives.
+static INTERRUPTS: AtomicBool = AtomicBool::new(false);
 
 /// The command line's boot options.
 pub fn options() -> BootOptions {
@@ -44,12 +50,16 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
         *used += 1;
         Some(*start + (*used as u64 - 1) * rhizo_mm::FRAME_SIZE)
     };
-    platform::for_each_virtio_mmio(|base| {
+    let mut line = None;
+    platform::for_each_virtio_mmio(|base, irq| {
         if card.is_some() {
             return;
         }
         match VirtioNet::probe(Mmio::new(base), DirectMap, alloc) {
-            Ok(c) => card = Some((format!("virtio-mmio {base:#x}"), c)),
+            Ok(c) => {
+                card = Some((format!("virtio-mmio {base:#x}"), c));
+                line = irq;
+            }
             Err(ProbeError::NotNet(_)) => {}
             Err(e) => {
                 let _ = writeln!(
@@ -65,16 +75,23 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
     let Some((at, mut card)) = card else {
         return;
     };
+    if let Some(irq) = line
+        && crate::arch::irq::route_device(irq)
+    {
+        card.enable_interrupts();
+        INTERRUPTS.store(true, Ordering::Relaxed);
+    }
     let m = card.mac();
     let _ = writeln!(
         ConsoleWriter(&mut BootConsole),
-        "net: card {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} at {at}",
+        "net: card {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} at {at}{}",
         m[0],
         m[1],
         m[2],
         m[3],
         m[4],
-        m[5]
+        m[5],
+        if interrupts() { ", interrupts" } else { "" }
     );
     let config = match options().ip {
         Some(IpOption::Dhcp) => Some(WireConfig::Dhcp),
@@ -140,17 +157,33 @@ fn pci_card(alloc: &mut dyn FnMut() -> Option<u64>) -> Option<(String, Card)> {
     None
 }
 
-/// Longest time the card goes unpolled while cells use it and nothing else
-/// runs (design D4).
+/// Longest time a card without interrupts goes unpolled while cells use
+/// it and nothing else runs (design D4).
 const BUSY_NS: u64 = 20_000;
 
+/// Whether the card interrupts the boot CPU when a frame arrives.
+pub fn interrupts() -> bool {
+    INTERRUPTS.load(Ordering::Relaxed)
+}
+
+/// Whether the card holds received frames not taken yet (memory only).
+pub fn pending() -> bool {
+    LINK.with(|l| l.as_ref().is_some_and(Card::pending))
+}
+
 /// Polls the card and `smoltcp`; returns in how many nanoseconds they want
-/// to be polled again, if there is a card.
+/// to be polled again, if there is a card. A card that interrupts has its
+/// interrupt acknowledged first, so a frame arriving later raises it again,
+/// and is not polled for frames meanwhile.
 pub fn poll(net: &mut Net, now_ns: u64) -> Option<u64> {
     LINK.with(|l| {
         let link = l.as_mut()?;
+        let interrupts = interrupts();
+        if interrupts {
+            link.acknowledge();
+        }
         let delay = net.poll_wire(link, now_ns).unwrap_or(u64::MAX);
-        Some(if net.wire_busy() {
+        Some(if net.wire_busy() && !interrupts {
             delay.min(BUSY_NS)
         } else {
             delay

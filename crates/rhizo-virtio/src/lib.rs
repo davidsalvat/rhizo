@@ -451,6 +451,12 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
         self.regs.barrier();
     }
 
+    /// Whether the device handed over received frames the driver has not
+    /// taken yet (a read of memory, no register).
+    pub fn pending(&self) -> bool {
+        Queue::read16(&self.mem, self.rx.frame + USED_AT + 2) != self.rx.used
+    }
+
     /// Acknowledges the device's interrupt, before the driver looks at the
     /// rings: a frame that arrives later raises it again. A virtio-mmio
     /// device holds its line until its status is acknowledged; an MSI-X

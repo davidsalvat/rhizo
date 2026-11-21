@@ -170,6 +170,37 @@ fn ns_to_ticks(ns: u64) -> u64 {
     (ticks as u64).clamp(1, u32::MAX as u64)
 }
 
+/// Routes device interrupt `intid` (an SPI, from the device tree) to the
+/// boot CPU, edge-triggered, group 1, middle priority, enabled (design D2
+/// of `add-virtio-interrupts`): it wakes the boot CPU from `wfi`, or
+/// interrupts the cell code it runs. Returns whether it could.
+pub fn route_device(intid: u32) -> bool {
+    let Some([(d, _), _]) = gic_regions() else {
+        return false;
+    };
+    if !(32..1020).contains(&intid) || !available() {
+        return false;
+    }
+    let gicd = MMIO_BASE + d;
+    let (word, bit) = (intid as u64 / 32 * 4, 1u32 << (intid % 32));
+    // Group 1.
+    write32(gicd + 0x80 + word, read32(gicd + 0x80 + word) | bit);
+    // SAFETY: byte access to the priority register of the interrupt.
+    unsafe { ((gicd + 0x400 + intid as u64) as *mut u8).write_volatile(0x80) };
+    // Edge-triggered (bit 1 of its two configuration bits).
+    let cfg = gicd + 0xc00 + intid as u64 / 16 * 4;
+    write32(cfg, read32(cfg) | 2 << (2 * (intid % 16)));
+    // To the boot CPU (affinity routing: Aff3 in bits 39:32).
+    let aff = mpidr();
+    let route = ((aff >> 32) << 32) | (aff & 0xff_ffff);
+    // SAFETY: 64-bit access to the GICD_IROUTER of the interrupt, in the
+    // distributor mapped as device memory.
+    unsafe { ((gicd + 0x6000 + intid as u64 * 8) as *mut u64).write_volatile(route) };
+    // Enabled.
+    write32(gicd + 0x100 + word, bit);
+    true
+}
+
 /// Whether preemption is available (a GICv3 was found).
 pub fn available() -> bool {
     GICR[0].load(Ordering::Relaxed) != 0

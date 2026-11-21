@@ -112,7 +112,7 @@ pub fn map_devices(
     {
         // Transports share pages: map each page once.
         let (mut result, mut last) = (Ok(()), u64::MAX);
-        for_each_virtio_mmio(|base| {
+        for_each_virtio_mmio(|base, _| {
             if result.is_ok() && base & !(FRAME_SIZE - 1) != last {
                 last = base & !(FRAME_SIZE - 1);
                 result = map(base, rhizo_virtio::REGION);
@@ -123,11 +123,12 @@ pub fn map_devices(
     Ok(())
 }
 
-/// Calls `f` with the physical base of every virtio-mmio transport the
-/// device tree lists (QEMU `virt`, Firecracker).
+/// Calls `f` with the physical base and the interrupt (a GIC interrupt
+/// identifier) of every virtio-mmio transport the device tree lists (QEMU
+/// `virt`, Firecracker).
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
-pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
-    let _ = device_tree().for_each_compatible(b"virtio,mmio", |r| f(r.base));
+pub fn for_each_virtio_mmio(mut f: impl FnMut(u64, Option<u32>)) {
+    let _ = device_tree().for_each_compatible_irq(b"virtio,mmio", |r, irq| f(r.base, irq));
 }
 
 /// The performance monitors' overflow interrupt (INTID) from the device

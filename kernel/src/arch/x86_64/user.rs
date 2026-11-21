@@ -228,7 +228,10 @@ pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Tra
     if vector == 7 {
         return Trap::FpUnavailable;
     }
-    if vector == super::irq::TIMER_VECTOR || vector == super::irq::WAKE_VECTOR {
+    if vector == super::irq::TIMER_VECTOR
+        || vector == super::irq::WAKE_VECTOR
+        || vector == super::irq::DEVICE_VECTOR
+    {
         super::irq::acknowledge();
         return Trap::Interrupt;
     }

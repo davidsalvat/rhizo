@@ -907,6 +907,18 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
     })
 }
 
+/// A system call gave `smoltcp` something to send: the boot CPU, which
+/// polls the card, polls it at its next step, woken for it if it waits
+/// (design D3 of `add-virtio-interrupts`).
+static WIRE_WORK: AtomicBool = AtomicBool::new(false);
+
+fn wire_work() {
+    WIRE_WORK.store(true, Ordering::Release);
+    if crate::arch::cpu::index() != 0 {
+        crate::smp::wake(0);
+    }
+}
+
 /// Waits for work: until `wake`, or a wake-up interrupt.
 fn wait(wake: Option<u64>) {
     let _p = cost::scope(Part::Idle);
@@ -1119,6 +1131,9 @@ fn syscall(
             live.io_seen = cx.net.changes();
             if live.io_seen != changes && prof::on() {
                 prof::net_changed(now_ns());
+            }
+            if cx.net.take_wire_work() {
+                wire_work();
             }
             (outcome, deadline)
         })
@@ -2153,14 +2168,21 @@ impl Host {
     /// Polls the network card when it is due (every scheduling step at most
     /// once per [`WIRE_PERIOD_NS`]), and reports a new address.
     fn poll_wire(&mut self, now: u64) {
-        if now < self.wire_due {
+        let work = WIRE_WORK.swap(false, Ordering::Acquire);
+        if now < self.wire_due && !work && !(crate::wire::interrupts() && crate::wire::pending()) {
             return;
         }
         let _p = cost::scope(Part::Net);
         let (delay, addr) = NET.with(|net| (crate::wire::poll(net, now), net.wire_addr()));
         // As often as the wire needs, but not more than once per period,
-        // and at least every millisecond for frames nobody waits for yet.
-        self.wire_due = now + delay.unwrap_or(u64::MAX).clamp(WIRE_PERIOD_NS, 1_000_000);
+        // and, without interrupts, at least every millisecond for frames
+        // nobody waits for yet.
+        let most = if crate::wire::interrupts() {
+            u64::MAX
+        } else {
+            1_000_000
+        };
+        self.wire_due = now.saturating_add(delay.unwrap_or(u64::MAX).clamp(WIRE_PERIOD_NS, most));
         self.wire_delay = delay;
         self.wire_addr = addr;
         let packed = addr.map_or(0, u32::from_be_bytes);

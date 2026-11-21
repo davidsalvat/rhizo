@@ -57,7 +57,7 @@ pub fn map_devices(
         let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
         // Transports share pages: map each page once.
         let (mut result, mut last) = (Ok(()), u64::MAX);
-        for_each_virtio_mmio(|base| {
+        for_each_virtio_mmio(|base, _| {
             let page = base & !0xfff;
             if result.is_ok() && page != last {
                 last = page;
@@ -76,13 +76,13 @@ pub fn map_devices(
     Ok(())
 }
 
-/// Calls `f` with the physical base of every virtio-mmio transport the
-/// command line lists (`virtio_mmio.device=`, from QEMU `microvm` and
-/// Firecracker).
+/// Calls `f` with the physical base and the interrupt line (an I/O APIC
+/// input) of every virtio-mmio transport the command line lists
+/// (`virtio_mmio.device=`, from QEMU `microvm` and Firecracker).
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
-pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
+pub fn for_each_virtio_mmio(mut f: impl FnMut(u64, Option<u32>)) {
     let mut buf = [0u8; 1024];
-    rhizo_core::options::virtio_mmio_devices(cmdline(&mut buf), |base, _, _| f(base));
+    rhizo_core::options::virtio_mmio_devices(cmdline(&mut buf), |base, _, irq| f(base, irq));
 }
 
 /// The ECAM base of PCI bus 0 from the ACPI MCFG (QEMU `q35`, Cloud

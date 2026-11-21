@@ -288,6 +288,8 @@ pub struct Net {
     /// Listeners and connections of suspended cells, by key, each holding
     /// one reference.
     parked: Vec<(u64, Handle)>,
+    /// A call gave `smoltcp` something to send ([`Net::take_wire_work`]).
+    wire_work: bool,
 }
 
 impl Default for Net {
@@ -322,6 +324,7 @@ impl Net {
             boot: 0,
             next_key: 1,
             parked: Vec::new(),
+            wire_work: false,
         }
     }
 

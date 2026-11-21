@@ -361,3 +361,27 @@ fn a_reset_from_outside_is_reported_once() {
     assert_eq!(drain(&mut w.net, s), Err(Error::ConnReset));
     assert_eq!(drain(&mut w.net, s).unwrap(), b"");
 }
+
+#[test]
+fn calls_that_give_smoltcp_work_say_so() {
+    let mut w = World::new();
+    let s = w.net.socket(Family::Inet, Type::Stream).unwrap();
+    assert!(!w.net.take_wire_work());
+    let to = Addr::Inet { ip: PEER, port: 80 };
+    assert_eq!(w.net.connect(s, &to), Err(Error::InProgress));
+    assert!(w.net.take_wire_work(), "a SYN to send");
+    assert!(!w.net.take_wire_work(), "asked once");
+    w.run(20);
+    w.net.take_wire_work();
+    assert_eq!(w.net.send(s, b"x", None), Ok(1));
+    assert!(w.net.take_wire_work(), "bytes to send");
+    w.run(20);
+    w.net.take_wire_work();
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"x");
+    assert!(w.net.take_wire_work(), "room in the window");
+    w.net.release(s);
+    assert!(w.net.take_wire_work(), "a FIN to send");
+    let loopback = w.net.socket(Family::Inet, Type::Stream).unwrap();
+    w.net.poll(loopback);
+    assert!(!w.net.take_wire_work(), "nothing for the wire");
+}

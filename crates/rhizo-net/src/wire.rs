@@ -201,6 +201,14 @@ impl Net {
         self.wire.as_ref().and_then(|w| w.addr)
     }
 
+    /// Whether a call gave `smoltcp` something to send (bytes, a SYN, a
+    /// FIN, room in a receive window) since the last time this was asked:
+    /// the card should be polled now, not at `smoltcp`'s next timer (design
+    /// D3 of `add-virtio-interrupts`).
+    pub fn take_wire_work(&mut self) -> bool {
+        core::mem::take(&mut self.wire_work)
+    }
+
     /// Whether cells have sockets on the wire (the card should then be
     /// polled often, design D4).
     pub fn wire_busy(&self) -> bool {
@@ -326,6 +334,7 @@ impl Net {
         };
         s.refused = false;
         self.changes += 1;
+        self.wire_work = true;
         Err(Error::InProgress)
     }
 
@@ -351,6 +360,7 @@ impl Net {
         if !s.can_send() {
             return Err(Error::Again);
         }
+        self.wire_work = true;
         s.send_slice(data).map_err(|_| Error::Pipe)
     }
 
@@ -363,6 +373,7 @@ impl Net {
         take: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<usize> {
         let wire = self.wire.as_mut().ok_or(Error::NotConn)?;
+        self.wire_work = true; // room in its window
         let s = wire.tcp(handle);
         if !s.can_recv() {
             return if s.may_recv() {
@@ -423,6 +434,7 @@ impl Net {
         if let Some(wire) = self.wire.as_mut() {
             wire.tcp(handle).close();
             self.changes += 1;
+            self.wire_work = true;
         }
     }
 
@@ -432,6 +444,7 @@ impl Net {
         if let Some(wire) = self.wire.as_mut() {
             wire.tcp(handle).close();
             wire.closing.push((handle, None));
+            self.wire_work = true;
         }
     }
 
@@ -451,6 +464,7 @@ impl Net {
             .sockets
             .get_mut::<udp::Socket>(handle)
             .send_slice(data, (v4(ip), dport));
+        self.wire_work = true;
         Ok(())
     }
 

@@ -446,7 +446,9 @@ fn received_frames_interrupt_once_asked_and_until_acknowledged() {
     assert_eq!(dev.borrow().interrupts, 1, "the line stays up");
     card.acknowledge();
     assert_eq!(dev.borrow().isr, 0);
+    assert!(card.pending());
     while card.recv(&mut |_| got += 1) {}
+    assert!(!card.pending());
     assert_eq!(got, 3);
     assert!(dev.borrow_mut().deliver(&[4; 60]));
     assert_eq!(

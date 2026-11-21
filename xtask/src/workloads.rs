@@ -137,6 +137,11 @@ fn parse_laptop(out: &VmRun) -> std::result::Result<Laptop, String> {
             "/s",
             get("idle_wakeups")? as f64 / idle_s,
         ),
+        (
+            "laptop.turn_wakeups",
+            "wakeups",
+            get("turn_wakeups")? as f64,
+        ),
     ];
     if let Some(pct) = host_cpu_pct(&out.marks, "idle-start", "idle-end") {
         values.push(("laptop.idle_host_cpu_pct", "%", pct));
@@ -342,7 +347,7 @@ mod tests {
              rhizo-laptop agents=50 suspended=45 open_ns=30000 suspend_ns=900000 \
              resume_ns=2000 turn_ns=150000 resume_turn_ns=400000 memory_bytes=60000000 \
              template_bytes=1200000 live_bytes=40000 snapshot_bytes=1100000 \
-             idle_ns=2000000000 idle_wakeups=4\n",
+             idle_ns=2000000000 idle_wakeups=4 turn_wakeups=3\n",
             vec![mark("idle-start", 1000, 50), mark("idle-end", 3000, 60)],
         );
         let l = parse_laptop(&out).unwrap();
@@ -352,6 +357,7 @@ mod tests {
         assert_eq!(get("laptop.resume_us"), Some(2.0));
         assert_eq!(get("laptop.memory_bytes"), Some(60_000_000.0));
         assert_eq!(get("laptop.idle_wakeups_per_s"), Some(2.0));
+        assert_eq!(get("laptop.turn_wakeups"), Some(3.0));
         assert_eq!(get("laptop.idle_host_cpu_pct"), Some(0.5));
     }
 

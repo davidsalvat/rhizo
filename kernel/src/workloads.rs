@@ -227,6 +227,10 @@ fn laptop(console: &mut impl Console) {
     let _ = writeln!(out, "rhizo-mark idle-end");
 
     let mut turn = Vec::new();
+    // How often the CPU waits for an interrupt while agents answer: a card
+    // that interrupts lets it sleep until the answer (design D4 of
+    // `add-virtio-interrupts`).
+    let turn_w0 = prof::get(Count::IdleWakeups);
     for round in 1..=TURNS {
         for &id in &agents {
             let t0 = Counter.cycles();
@@ -235,6 +239,7 @@ fn laptop(console: &mut impl Console) {
             turn.push(ns(t0));
         }
     }
+    let turn_wakeups = (prof::get(Count::IdleWakeups) - turn_w0) / turn.len() as u64;
     let (mut resume, mut resume_turn) = (Vec::new(), Vec::new());
     for snapshot in snapshots {
         let t0 = Counter.cycles();
@@ -255,7 +260,8 @@ fn laptop(console: &mut impl Console) {
         out,
         "rhizo-laptop agents={AGENTS} suspended={} open_ns={} suspend_ns={} resume_ns={} \
          turn_ns={} resume_turn_ns={} memory_bytes={} template_bytes={} live_bytes={} \
-         snapshot_bytes={snapshot_bytes} idle_ns={idle_ns} idle_wakeups={wakeups}",
+         snapshot_bytes={snapshot_bytes} idle_ns={idle_ns} idle_wakeups={wakeups} \
+         turn_wakeups={turn_wakeups}",
         AGENTS - LIVE,
         median(&mut open),
         median(&mut suspend),

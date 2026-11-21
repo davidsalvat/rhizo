@@ -20,6 +20,11 @@ pub const WAKE_VECTOR: u8 = 33;
 /// Vector of the performance counters' sampling interrupt (spec
 /// `profiling`).
 pub const SAMPLE_VECTOR: u8 = 34;
+/// Vector of device interrupts: the network card's (design D2 of
+/// `add-virtio-interrupts`).
+pub const DEVICE_VECTOR: u8 = 35;
+/// Physical address of the I/O APIC (QEMU `microvm`, Firecracker).
+const IOAPIC: u64 = 0xfec0_0000;
 /// Vector of spurious APIC interrupts (no EOI).
 pub const SPURIOUS_VECTOR: u8 = 255;
 
@@ -205,6 +210,50 @@ pub fn wait() {
     // SAFETY: as in `wait_ns`.
     unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
     acknowledge();
+}
+
+/// Register `index` of the I/O APIC mapped at `base`.
+fn ioapic_read(base: u64, index: u32) -> u32 {
+    // SAFETY: the I/O APIC page is mapped as device memory by
+    // `route_device`; IOREGSEL at 0 selects the register IOWIN at 0x10 reads.
+    unsafe {
+        (base as *mut u32).write_volatile(index);
+        ((base + 0x10) as *const u32).read_volatile()
+    }
+}
+
+fn ioapic_write(base: u64, index: u32, value: u32) {
+    // SAFETY: as in `ioapic_read`.
+    unsafe {
+        (base as *mut u32).write_volatile(index);
+        ((base + 0x10) as *mut u32).write_volatile(value);
+    }
+}
+
+/// Routes I/O APIC input `pin` (a device's interrupt line) to the boot CPU
+/// on [`DEVICE_VECTOR`], edge-triggered, active high (design D2 of
+/// `add-virtio-interrupts`): it wakes the boot CPU from `hlt`, or
+/// interrupts the cell code it runs. Returns whether it could (no I/O APIC,
+/// or no such input: no).
+pub fn route_device(pin: u32) -> bool {
+    if !available() {
+        return false;
+    }
+    let base = DirectMap::virt(IOAPIC);
+    if memory::translate(base).is_none() {
+        let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
+        if memory::map_page(base, IOAPIC, flags).is_err() {
+            return false;
+        }
+    }
+    let version = ioapic_read(base, 1);
+    if version == u32::MAX || pin > (version >> 16) & 0xff {
+        return false;
+    }
+    ioapic_write(base, 0x10 + 2 * pin + 1, apic_id() << 24);
+    // Fixed delivery, physical destination, active high, edge, unmasked.
+    ioapic_write(base, 0x10 + 2 * pin, DEVICE_VECTOR as u32);
+    true
 }
 
 /// Whether preemption is available (always, once `init` ran).
