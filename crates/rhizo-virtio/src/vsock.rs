@@ -136,6 +136,8 @@ pub struct Stream {
     /// A credit request went out since the peer last gave credit.
     asked: bool,
     control: VecDeque<Header>,
+    /// Connections made, ever (wrapping): the current one's number.
+    made: u32,
 }
 
 impl Stream {
@@ -152,12 +154,21 @@ impl Stream {
             told: 0,
             asked: false,
             control: VecDeque::new(),
+            made: 0,
         }
     }
 
     /// Whether a peer is connected.
     pub fn connected(&self) -> bool {
         self.peer.is_some()
+    }
+
+    /// The number of the connection a peer holds, if any: every connection
+    /// gets a new one, so an owner that compares numbers sees a new
+    /// connection even when the old one ended and the new one began between
+    /// two of its looks.
+    pub fn connection(&self) -> Option<u32> {
+        self.peer.map(|_| self.made)
     }
 
     /// Takes a packet the device received, with the payload bytes it holds.
@@ -177,6 +188,7 @@ impl Stream {
                     fwd_cnt: h.fwd_cnt,
                 });
                 (self.tx_cnt, self.fwd_cnt, self.told, self.asked) = (0, 0, 0, false);
+                self.made = self.made.wrapping_add(1);
                 self.reply(h, op::RESPONSE);
                 return Some(Change::Connected);
             }
@@ -226,8 +238,14 @@ impl Stream {
         !self.rx.is_empty()
     }
 
-    /// The next byte received, if any.
-    pub fn read(&mut self) -> Option<u8> {
+    /// The next byte received on connection `connection` (its
+    /// [`number`](Self::connection)), if any: none once another connection
+    /// took its place, so no byte of a new connection is read as the old
+    /// one's.
+    pub fn read(&mut self, connection: u32) -> Option<u8> {
+        if self.connection() != Some(connection) {
+            return None;
+        }
         let byte = self.rx.pop_front()?;
         self.fwd_cnt = self.fwd_cnt.wrapping_add(1);
         Some(byte)

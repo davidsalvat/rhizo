@@ -131,28 +131,27 @@ fn pump(c: &mut Channel) {
     }
 }
 
-/// Polls the device when nothing received is left to read; whether the
-/// host is connected.
-pub fn poll() -> bool {
+/// Polls the device when nothing received is left to read; the number of
+/// the host's connection, if it is connected (`Stream::connection`).
+pub fn poll() -> Option<u32> {
     CHANNEL.with(|c| {
-        let Some(c) = c.as_mut() else {
-            return false;
-        };
+        let c = c.as_mut()?;
         if !c.stream.has_input() {
             pump(c);
         }
-        c.stream.connected()
+        c.stream.connection()
     })
 }
 
-/// Whether the host is connected, as last polled.
-pub fn connected() -> bool {
-    CHANNEL.with(|c| c.as_ref().is_some_and(|c| c.stream.connected()))
+/// The number of the host's connection, as last polled.
+pub fn connection() -> Option<u32> {
+    CHANNEL.with(|c| c.as_ref()?.stream.connection())
 }
 
-/// The next byte the host sent, if one was received.
-pub fn read_byte() -> Option<u8> {
-    CHANNEL.with(|c| c.as_mut()?.stream.read())
+/// The next byte the host sent on connection `connection`, if one was
+/// received and that connection is still the host's.
+pub fn read_byte(connection: u32) -> Option<u8> {
+    CHANNEL.with(|c| c.as_mut()?.stream.read(connection))
 }
 
 /// Sends what is still queued for the host, polling the device, until the
