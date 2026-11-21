@@ -52,8 +52,10 @@ pub struct Scheduler<T> {
     /// Arrival number of the next entry made runnable.
     arrivals: u64,
     /// Sorted by wake time, with their key; equal times keep the order they
-    /// were added in.
-    sleeping: Vec<(u64, u32, T)>,
+    /// were added in. A deque: the due ones leave from the front and a new
+    /// deadline, most often the latest, joins at the back, neither moving
+    /// the others (change `host-ops-per-cell`).
+    sleeping: VecDeque<(u64, u32, T)>,
     /// By key (design D2 of `add-socket-wait-queues`), with their deadline
     /// if any.
     waiting: BTreeMap<u32, (Option<u64>, T)>,
@@ -67,7 +69,7 @@ impl<T: Keyed> Scheduler<T> {
         Self {
             queues: (0..cpus.max(1)).map(|_| VecDeque::new()).collect(),
             arrivals: 0,
-            sleeping: Vec::new(),
+            sleeping: VecDeque::new(),
             waiting: BTreeMap::new(),
             deadlines: BTreeSet::new(),
         }
@@ -158,19 +160,11 @@ impl<T: Keyed> Scheduler<T> {
     /// [`next`](Self::next) does first, for a caller that wants to know
     /// when an entry became runnable.
     pub fn wake_due(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
-        let due = self.sleeping.partition_point(|&(t, _, _)| t <= now);
-        if due > 0 {
-            let Self {
-                queues,
-                arrivals,
-                sleeping,
-                ..
-            } = self;
-            for (_, key, mut entry) in sleeping.drain(..due) {
-                f(&mut entry);
-                queues[cpu].push_back((*arrivals, key, entry));
-                *arrivals += 1;
-            }
+        // The due ones are at the front: no search, nothing else moves.
+        while let Some((_, key, mut entry)) = self.sleeping.pop_front_if(|e| e.0 <= now) {
+            f(&mut entry);
+            self.queues[cpu].push_back((self.arrivals, key, entry));
+            self.arrivals += 1;
         }
         while let Some(&(d, key)) = self.deadlines.first()
             && d <= now
@@ -216,7 +210,7 @@ impl<T: Keyed> Scheduler<T> {
     /// Earliest wake-up time among sleepers and waiters with a deadline.
     pub fn next_wake(&self) -> Option<u64> {
         let waiter = self.deadlines.first().map(|&(d, _)| d);
-        match (self.sleeping.first().map(|&(t, _, _)| t), waiter) {
+        match (self.sleeping.front().map(|&(t, _, _)| t), waiter) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -240,7 +234,7 @@ impl<T: Keyed> Scheduler<T> {
             return Some((entry, None));
         }
         let i = self.sleeping.iter().position(|e| e.1 == key)?;
-        let (wake, _, entry) = self.sleeping.remove(i);
+        let (wake, _, entry) = self.sleeping.remove(i)?;
         Some((entry, Some(wake)))
     }
 
@@ -250,7 +244,9 @@ impl<T: Keyed> Scheduler<T> {
             return self.take_waiting(key);
         }
         let queued = self.queues.iter_mut().find_map(VecDeque::pop_front);
-        queued.or_else(|| self.sleeping.pop()).map(|(_, _, e)| e)
+        queued
+            .or_else(|| self.sleeping.pop_back())
+            .map(|(_, _, e)| e)
     }
 
     /// The entry known by `key` (runnable, waiting or sleeping).

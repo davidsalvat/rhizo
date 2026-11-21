@@ -100,6 +100,16 @@ the sleep list without touching any cell.
 | A map from key to place (queue and arrival number) | O(log n) | a map update on every take and give-back: the switch is 880 instructions (`cell.switch_insns`), gated at +2 % |
 | A per-cell slot table | O(1) | a slot allocator and a store per move; more code than the lookups need |
 
+The sleep list becomes a deque. As a sorted vector it lost its due entries
+from the front, so every wake-up moved all the other sleepers: 96 KB with
+the server workload's 6,000 sleeping workers, and 144 KB once the keys made
+each entry 24 bytes instead of 16. That doubled the workload's p99 sched
+and wake latencies on one CPU (in CI: 3.5 ms against 1.5 ms). As a deque,
+the due entries leave from the front and a new deadline, most often the
+latest, joins at the back, and nothing else moves. A take with 6,000
+sleepers went from 1.4 µs (main) and 1.9 µs (keys) to 0.05 µs, measured
+on the host.
+
 ## D5. Bounded cost
 
 The host's lock is held for a key lookup and a constant amount of work per
