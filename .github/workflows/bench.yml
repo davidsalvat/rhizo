@@ -74,6 +74,7 @@ jobs:
           echo "metrics=${metrics:-the job failed before the gate (see the run)}" >> "$GITHUB_OUTPUT"
           # The runner class (change `bench-runner-class`): what the gate
           # compared the timings with, and the machine's identity.
+          # shellcheck disable=SC2016 # backticks in the pattern are literal
           compared=$(grep -m1 -oE '(unknown runner class: .*|runner class `[^`]*`: .*)' bench.log 2>/dev/null || true)
           machine=$(jq -r '.runner // empty | "class `\(.class)` (\(.model_name); family \(.cpu_family) model \(.model) stepping \(.stepping) microcode \(.microcode); \(.cores) CPUs; KVM: \(.kvm); guest PMU: \(if .guest_pmu == null then "unknown" else .guest_pmu end); TSC: \(if .tsc_mhz then "\(.tsc_mhz) MHz" else "unknown" end))"' bench-results.json 2>/dev/null || true)
           echo "runner=${machine:-not recorded}${compared:+; $compared}" >> "$GITHUB_OUTPUT"
