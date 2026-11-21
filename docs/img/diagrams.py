@@ -765,7 +765,7 @@ MODULES = [
     ("file", "Documents", ["“Read these", "invoices”"],
      ["PDF reader,", "OCR"], "egress: none", "none", "Python + OCR"),
     ("plug", "Your own tools", ["“Update the", "customer record”"],
-     ["your MCP servers:", "CRM, database"], "egress: you choose", "some", "your image"),
+     ["your MCP servers:", "CRM, database"], ["egress: you set it,", "within the agent's"], "some", "your image"),
 ]
 
 
@@ -774,7 +774,8 @@ def modules(t):
             "Designed, not built yet. A small static chat agent starts with egress to its "
             "model only. Each task that needs an ability adds a child cell, forked from a "
             "signed, warm template and reached only over a channel: " + "; ".join(
-                f"{' '.join(task)} adds {name.lower()} ({' '.join(c)}), {eg}"
+                f"{' '.join(task)} adds {name.lower()} ({' '.join(c)}), "
+                f"{eg if isinstance(eg, str) else ' '.join(eg)}"
                 for _, name, task, c, eg, _, _ in MODULES) + ". The web browser is the "
             "sensitive one: the parent or the operator approves it first, and it may reach "
             "only allowed sites. Children fork in milliseconds from templates that share "
@@ -823,8 +824,10 @@ def modules(t):
                    weight=700)
             s.text(cx, top + 163, "parent or operator", 12, fill=t["warn"], anchor="middle",
                    weight=700)
-        s.text(cx, top + 182, egress, 12, weight=700, anchor="middle",
-               fill={"none": t["muted"], "some": t["blue"], "approve": t["warn"]}[kind])
+        lines = [egress] if isinstance(egress, str) else egress
+        for j, ln in enumerate(reversed(lines)):
+            s.text(cx, top + 182 - j * 17, ln, 12, weight=700, anchor="middle",
+                   fill={"none": t["muted"], "some": t["blue"], "approve": t["warn"]}[kind])
         # Forked from its warm template, below.
         s.line(cx, 440, cx, top + 200, sw=2)
         s.text(cx + 14, 431, "fork", 12, fill=t["muted"])
