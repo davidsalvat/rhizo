@@ -15,6 +15,6 @@
 ## 3. Tests, metric, docs
 
 - [x] 3.1 The conversation in the `control` step, `CHAT_MESSAGES` and `CHAT_TRANSCRIPT` in `cells/expected.rs`; verify `cargo xtask --arch x86_64 test --only control` with CPython built
-- [ ] 3.2 The same on AArch64; verify CI's AArch64 job
+- [x] 3.2 The same on AArch64; verify CI's AArch64 job
 - [x] 3.3 `chat.turn_us` in `cargo xtask bench`, documented in `bench/README.md`; verify `cargo xtask --arch x86_64 bench --vmm qemu-microvm --runs 1 --no-reference` lists it
 - [x] 3.4 "Talk to an agent" in `docs/demo.md`; verify `openspec validate add-interactive-chat --strict`
