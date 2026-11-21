@@ -959,13 +959,28 @@ fn wait(wake: Option<u64>) {
     match wake {
         Some(at) => idle_until(at),
         None => {
-            irq::stop_tick();
-            prof::idle(crate::smp::idle);
-            irq::start_tick();
+            let t0 = now_ns();
+            prof::idle(|| irq::wait_ns(1_000_000_000));
+            if now_ns() - t0 > 990_000_000 {
+                let p = DBG_SHARED.load(Ordering::Relaxed);
+                if p != 0 {
+                    // SAFETY: debug only.
+                    let shared = unsafe { &*(p as *const Global<Shared>) };
+                    let line = shared.with(|s| alloc::format!(
+                        "DBG stuck cpu={} runnable={} waiting={} running={} idle={:#x} net={} seen={} timer={:?} next={:?} ended={} stopping={} gangs={}\n",
+                        crate::arch::cpu::index(), s.sched.runnable(), s.sched.waiting(), s.running, s.idle,
+                        NET.with(|n| n.changes()), s.net_seen, s.timer.armed(), next_wake(s), s.ended.len(), s.stopping, s.gangs.len()));
+                    let _ = core::fmt::Write::write_str(
+                        &mut rhizo_hal::ConsoleWriter(&mut BootConsole),
+                        &line,
+                    );
+                }
+            }
         }
     }
     cost::after_idle();
 }
+static DBG_SHARED: AtomicU64 = AtomicU64::new(0);
 
 /// Puts `live`, back from a slice on `cpu`, where `how` says, and wakes an
 /// idle CPU that has something to do because of it: another runnable cell
@@ -2121,6 +2136,10 @@ impl Host {
             return;
         }
         let cpus = crate::smp::count();
+        DBG_SHARED.store(
+            &self.shared as *const Global<Shared> as u64,
+            Ordering::Relaxed,
+        );
         if cpus > 1 {
             let shared = &self.shared as *const Global<Shared> as u64;
             for cpu in 1..cpus {
@@ -2190,6 +2209,16 @@ impl Host {
         }
         match wake {
             Some(at) => {
+                if at > now + 1_000_000_000 {
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut rhizo_hal::ConsoleWriter(&mut BootConsole),
+                        format_args!(
+                            "DBG cpu0 long wait {} wire={:?}\n",
+                            at - now,
+                            self.wire_delay
+                        ),
+                    );
+                }
                 wait(Some(at));
                 true
             }
