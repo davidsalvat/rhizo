@@ -181,11 +181,13 @@ pub static ALL: &[TestCase] = &[
 
 /// The package tests (change `add-pip-packages`), alone in the kernel
 /// built with the packages embedded, whose VM has the memory they need.
+/// requests first: the network card gets its address there, which takes
+/// memory for good, before numpy's test checks that none is left behind.
 #[cfg(feature = "packages")]
 pub static ALL: &[TestCase] = &[
     ktest_case!(console_output_works),
-    ktest_case!(numpy_from_a_wheel_computes_as_on_linux),
     ktest_case!(requests_gets_from_the_host_as_on_linux),
+    ktest_case!(numpy_from_a_wheel_computes_as_on_linux),
     ktest_case!(a_cell_that_imported_numpy_suspends_resumes_and_forks),
 ];
 
