@@ -91,7 +91,7 @@ is the only such Arm core).
 ## D5. Cost, measured in every run
 
 The `bench-cell` kernel measures, in its default mode, `cell.syscall_ns`
-(a cell times 20000 `getpid` calls with `clock_gettime`), and then with
-KPTI forced on `cell.syscall_kpti_ns`, `cell.switch_kpti_ns` and
+(`yielder getpid 20000` run to its exit minus `yielder getpid 0`, per
+call), and then with KPTI forced on `cell.syscall_kpti_ns`, `cell.switch_kpti_ns` and
 `cell.run_kpti_us` (the `cell.switch_ns` and `cell.run_us` workloads). So
 the cost is visible even on CI runners whose CPUs do not need KPTI.

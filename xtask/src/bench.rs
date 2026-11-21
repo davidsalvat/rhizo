@@ -46,6 +46,8 @@ pub struct Options {
     pub update_baseline: bool,
     pub readme: bool,
     pub reference: bool,
+    /// Also count instructions under QEMU with `-icount` (spec `profiling`).
+    pub icount: bool,
     /// Measure only this reference workload.
     pub workload: Option<Only>,
     /// The long versions of the workloads (the weekly soak).
@@ -69,6 +71,7 @@ impl Default for Options {
             update_baseline: false,
             readme: false,
             reference: true,
+            icount: true,
             workload: None,
             soak: false,
             llm_delay_ms: 0,
@@ -111,6 +114,7 @@ impl Options {
                 "--update-baseline" => o.update_baseline = true,
                 "--readme" => o.readme = true,
                 "--no-reference" => o.reference = false,
+                "--no-icount" => o.icount = false,
                 "--workload" => {
                     o.workload = Some(match value("--workload")?.as_str() {
                         "laptop" => Only::Laptop,
@@ -371,6 +375,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
     measure_comparisons(opts, &mut metrics, &mut skipped)?;
     Ok(Results {
@@ -401,7 +406,7 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("linux-process/firecracker".into(), e)),
         }
-        match crate::compare::cpython_in_vm(opts.accel, &scratch) {
+        match crate::compare::cpython_in_vm(opts.accel, &scratch, skipped) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
         }
@@ -423,6 +428,10 @@ fn measure_comparisons(
 
 /// Cell metrics: a `bench-cell` kernel spawns and runs the hello cell many
 /// times per boot and prints medians; each VMM boots it a few times.
+///
+/// The VM gets [`CELL_BENCH_MEMORY_MIB`]: forking a 50 MiB cell whose child
+/// writes every page needs 100 MiB for cells alone, more than the default
+/// 128 MiB VM leaves once the kernel image holds every benchmark program.
 fn measure_cells(
     opts: &Options,
     metrics: &mut Vec<Metric>,
@@ -439,8 +448,9 @@ fn measure_cells(
         network: true,
         pci_card: false,
         cpus: 1,
-        memory_mib: vmm::DEFAULT_MEMORY_MIB,
+        memory_mib: CELL_BENCH_MEMORY_MIB,
         bench: None,
+        shard: None,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -462,10 +472,17 @@ fn measure_cells(
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
+        let (mut agent_turn, mut agent_model) = (Vec::new(), Vec::new());
+        let (mut agent_suspend_resume, mut agent_fork) = (Vec::new(), Vec::new());
+        let mut agent_skipped = None;
         let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
-        let (mut syscall, mut syscall_kpti) = (Vec::new(), Vec::new());
-        let (mut switch_kpti, mut run_kpti) = (Vec::new(), Vec::new());
+        let mut syscall = Vec::new();
+        let (mut syscall_kpti, mut switch_kpti, mut run_kpti) =
+            (Vec::new(), Vec::new(), Vec::new());
+        // The PMU's passes, where the guest has one (spec `profiling`).
+        let mut counted = crate::profile::Samples::default();
+        let mut pmu = None;
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -501,6 +518,16 @@ fn measure_cells(
                         cpy_cold.push(c as f64 / 1000.0);
                         cpy_warm.push(w as f64 / 1000.0);
                     }
+                    match parse_agent_line(&out.output) {
+                        Some(Ok([turn, model, suspend_resume, fork])) => {
+                            agent_turn.push(turn as f64 / 1000.0);
+                            agent_model.push(model as f64 / 1000.0);
+                            agent_suspend_resume.push(suspend_resume as f64 / 1000.0);
+                            agent_fork.push(fork as f64 / 1000.0);
+                        }
+                        Some(Err(why)) => agent_skipped = Some(why),
+                        None => {}
+                    }
                     if let Some((r, t)) = parse_dynamic_line(&out.output) {
                         dyn_run.push(r as f64 / 1000.0);
                         dyn_template.push(t as f64 / 1000.0);
@@ -527,11 +554,23 @@ fn measure_cells(
                         futex_wake.push(w as f64);
                     }
                     if let Some(k) = parse_kpti_line(&out.output) {
-                        syscall.push(k[0] as f64);
-                        syscall_kpti.push(k[1] as f64);
-                        switch_kpti.push(k[2] as f64);
-                        run_kpti.push(k[3] as f64 / 1000.0);
+                        syscall_kpti.push(k[0] as f64);
+                        switch_kpti.push(k[1] as f64);
+                        run_kpti.push(k[2] as f64 / 1000.0);
                     }
+                    if let Some(ns) = crate::profile::field(&out.output, "rhizo-ops", "syscall_ns")
+                    {
+                        syscall.push(ns as f64);
+                    }
+                    for (name, value) in crate::profile::pmu_passes(&out.output) {
+                        let unit = if name.ends_with("_insns") {
+                            "insns"
+                        } else {
+                            "cycles"
+                        };
+                        counted.add(name, unit, value);
+                    }
+                    pmu = crate::profile::pmu_line(&out.output).map(str::to_string);
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
                         resume.push(snap.resume_ns as f64 / 1000.0);
@@ -609,19 +648,27 @@ fn measure_cells(
             ("workload.python_warm_us", "us", &mut py_warm),
             ("workload.cpython_cold_us", "us", &mut cpy_cold),
             ("workload.cpython_warm_us", "us", &mut cpy_warm),
+            ("workload.agent_cpython_turn_us", "us", &mut agent_turn),
+            ("workload.agent_cpython_model_us", "us", &mut agent_model),
+            (
+                "workload.agent_suspend_resume_us",
+                "us",
+                &mut agent_suspend_resume,
+            ),
+            ("workload.agent_fork_us", "us", &mut agent_fork),
             ("workload.dynamic_run_us", "us", &mut dyn_run),
             ("workload.dynamic_template_us", "us", &mut dyn_template),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
-            ("cell.syscall_ns", "ns", &mut syscall),
-            ("cell.syscall_kpti_ns", "ns", &mut syscall_kpti),
-            ("cell.switch_kpti_ns", "ns", &mut switch_kpti),
-            ("cell.run_kpti_us", "us", &mut run_kpti),
             ("cell.parallel_us", "us", &mut parallel),
             ("cell.scaling_pct", "%", &mut scaling),
             ("cell.ipi_wake_us", "us", &mut ipi_wake),
             ("cell.thread_scaling_pct", "%", &mut thread_scaling),
             ("cell.shootdown_us", "us", &mut shootdown),
+            ("cell.syscall_ns", "ns", &mut syscall),
+            ("cell.syscall_kpti_ns", "ns", &mut syscall_kpti),
+            ("cell.switch_kpti_ns", "ns", &mut switch_kpti),
+            ("cell.run_kpti_us", "us", &mut run_kpti),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
                 let why = match crate::hostnet::for_vmm(vmm) {
@@ -631,6 +678,12 @@ fn measure_cells(
                         .unwrap_or_else(|| "not measured".into()),
                 };
                 skipped.push((format!("{name}/{}", vmm.id()), why));
+            }
+            if values.is_empty()
+                && name == "workload.agent_cpython_turn_us"
+                && let Some(why) = &agent_skipped
+            {
+                skipped.push((format!("workload.agent_*/{}", vmm.id()), why.clone()));
             }
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -643,6 +696,16 @@ fn measure_cells(
                     p90,
                     runs: values.len(),
                 });
+            }
+        }
+        metrics.extend(counted.metrics(vmm.id()));
+        if let Some(pmu) = pmu {
+            report::text(&format!("performance counters on {}: {pmu}", vmm.id()));
+            if pmu == "none" {
+                skipped.push((
+                    format!("pmu/{}", vmm.id()),
+                    "the guest has no performance counters: no instruction or cycle counts".into(),
+                ));
             }
         }
     }
@@ -694,6 +757,30 @@ fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("cold_ns")?, field("warm_ns")?))
+}
+
+/// `[turn_ns, model_ns, suspend_resume_ns, fork_ns]` of the CPython agent's line of
+/// a `bench-cell` kernel, or why the kernel skipped it.
+fn parse_agent_line(output: &str) -> Option<Result<[u64; 4]>> {
+    let line = output
+        .lines()
+        .find_map(|l| l.strip_prefix("rhizo-agent "))?;
+    if let Some(why) = line.strip_prefix("skipped: ") {
+        return Some(Err(why.to_string()));
+    }
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    let figures = [
+        field("turn_ns")?,
+        field("model_ns")?,
+        field("suspend_resume_ns")?,
+        field("fork_ns")?,
+    ];
+    Some(Ok(figures))
 }
 
 /// `(run_ns, template_ns)` of the dynamic linking line of a `bench-cell`
@@ -783,9 +870,9 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
     })
 }
 
-/// `[syscall_ns, syscall_kpti_ns, switch_kpti_ns, run_kpti_ns]` of the KPTI
+/// `[syscall_kpti_ns, switch_kpti_ns, run_kpti_ns]` of the KPTI
 /// line of a `bench-cell` kernel (design D5 of `add-kpti`).
-fn parse_kpti_line(output: &str) -> Option<[u64; 4]> {
+fn parse_kpti_line(output: &str) -> Option<[u64; 3]> {
     let line = output.lines().find(|l| l.starts_with("rhizo-kpti "))?;
     let field = |key: &str| -> Option<u64> {
         line.split_whitespace()
@@ -794,7 +881,6 @@ fn parse_kpti_line(output: &str) -> Option<[u64; 4]> {
             .ok()
     };
     Some([
-        field("syscall_ns")?,
         field("syscall_kpti_ns")?,
         field("switch_kpti_ns")?,
         field("run_kpti_ns")?,
@@ -976,6 +1062,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         cpus: 1,
         memory_mib: vmm::DEFAULT_MEMORY_MIB,
         bench: None,
+        shard: None,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),
@@ -1065,18 +1152,29 @@ fn load_baseline() -> Result<Value> {
 
 /// Whether `metric` is gated in `env`. Metrics listed under `ungated.<env>`
 /// are recorded but never fail the gate (for example, TSC cycles on shared CI
-/// runners, whose hosts run at different TSC frequencies).
+/// runners, whose hosts run at different TSC frequencies); an entry ending
+/// in `.` covers every metric it starts (`breakdown.`).
 fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
-    !baseline["ungated"][env]
-        .as_array()
-        .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(metric)))
+    !baseline["ungated"][env].as_array().is_some_and(|names| {
+        names
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|n| n == metric || (n.ends_with('.') && metric.starts_with(n)))
+    })
 }
 
-/// Allowed regression, in percent, for `metric` in `env`.
-fn threshold_pct(baseline: &Value, env: &str, metric: &str) -> f64 {
+/// Memory of the cell benchmark VM, in MiB.
+pub(crate) const CELL_BENCH_MEMORY_MIB: u32 = 256;
+
+/// Allowed regression, in percent, for `m` in `env`: instructions counted
+/// under QEMU's `-icount` are exact, so their threshold is narrow (spec
+/// `profiling`).
+fn threshold_pct(baseline: &Value, env: &str, m: &Metric) -> f64 {
     let t = &baseline["thresholds_pct"];
-    if DETERMINISTIC.contains(&metric) {
+    if DETERMINISTIC.contains(&m.name.as_str()) {
         t["deterministic"].as_f64().unwrap_or(1.0)
+    } else if m.vmm.as_deref().is_some_and(|v| v.ends_with("-icount")) {
+        t["instructions"].as_f64().unwrap_or(2.0)
     } else {
         t["timing"][env].as_f64().unwrap_or(50.0)
     }
@@ -1130,7 +1228,7 @@ pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regres
             key: m.key(),
             baseline: base,
             current: m.median,
-            allowed_pct: threshold_pct(baseline, env, &m.name),
+            allowed_pct: threshold_pct(baseline, env, m),
             higher_is_better: HIGHER_IS_BETTER.contains(&m.name.as_str()),
         };
         let worse = if r.higher_is_better {
@@ -1145,6 +1243,35 @@ pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regres
     out
 }
 
+/// Gated `rhizo` metrics stored for `env` that this run did not measure
+/// although it measured something on their VMM: a figure lost to a crash
+/// or a skipped step must fail the gate, not pass it (spec `benchmarks`).
+pub fn missing(baseline: &Value, env: &str, results: &Results) -> Vec<String> {
+    let measured: std::collections::BTreeSet<String> =
+        results.metrics.iter().map(Metric::key).collect();
+    let vmms: std::collections::BTreeSet<&str> = results
+        .metrics
+        .iter()
+        .filter(|m| m.guest == "rhizo")
+        .filter_map(|m| m.vmm.as_deref())
+        .collect();
+    let Some(stored) = baseline["environments"][env].as_object() else {
+        return Vec::new();
+    };
+    stored
+        .keys()
+        .filter(|key| {
+            let mut parts = key.split('/');
+            let (name, guest, vmm) = (parts.next(), parts.next(), parts.next());
+            guest == Some("rhizo")
+                && vmm.is_some_and(|v| vmms.contains(v))
+                && name.is_some_and(|n| is_gated(baseline, env, n))
+                && !measured.contains(key.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 fn check_baseline(env: &str, results: &Results) -> Result {
     let baseline = load_baseline()?;
     if baseline["environments"][env]
@@ -1157,7 +1284,8 @@ fn check_baseline(env: &str, results: &Results) -> Result {
         return Ok(());
     }
     let found = regressions(&baseline, env, results);
-    if found.is_empty() {
+    let lost = missing(&baseline, env, results);
+    if found.is_empty() && lost.is_empty() {
         report::text(&format!(
             "benchmark gate: every metric is within its threshold for `{env}`"
         ));
@@ -1187,6 +1315,33 @@ fn check_baseline(env: &str, results: &Results) -> Result {
                 .reproduce(format!("cargo xtask bench --env {env} --check"))
                 .into_error()
         })
+        .chain(lost.iter().map(|key| {
+            let why: Vec<String> = results
+                .skipped
+                .iter()
+                .map(|(what, reason)| {
+                    format!(
+                        "{what}: {}",
+                        reason.lines().take(12).collect::<Vec<_>>().join(" | ")
+                    )
+                })
+                .collect();
+            Failure::new("bench", format!("benchmark not measured: {key}"))
+                .location(format!("{BASELINE} (environment `{env}`)"))
+                .expected("a value, as the baseline has one")
+                .actual(if why.is_empty() {
+                    "missing from the results".to_string()
+                } else {
+                    format!("missing; skipped steps: {}", why.join("; "))
+                })
+                .hint(
+                    "a benchmark that crashed or was skipped is a failure: fix it; if the \
+                     metric was removed on purpose, remove it from the baseline in the same \
+                     pull request",
+                )
+                .reproduce(format!("cargo xtask bench --env {env} --check"))
+                .into_error()
+        }))
         .collect();
     Err(errors.join("\n"))
 }
@@ -1669,6 +1824,41 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_figure_fails_the_gate() {
+        let baseline = json!({
+            "environments": {"ci": {
+                "cell.run_us/rhizo/qemu-microvm": 7.0,
+                "cell.fork_us/rhizo/qemu-microvm": 1.4,
+                "cell.fork_us/rhizo/firecracker": 1.4,
+                "boot.time_to_ready_ms/rhizo/qemu-microvm": 40.0
+            }},
+            "ungated": {"ci": ["boot.time_to_ready_ms"]}
+        });
+        let metric = |name: &str, vmm: &str| Metric {
+            name: name.into(),
+            guest: "rhizo".into(),
+            vmm: Some(vmm.into()),
+            unit: "us".into(),
+            median: 1.0,
+            p90: 1.0,
+            runs: 1,
+        };
+        let results = Results {
+            environment: "ci".into(),
+            date: String::new(),
+            kvm: true,
+            metrics: vec![metric("cell.run_us", "qemu-microvm")],
+            skipped: vec![("cells/qemu-microvm".into(), "PANIC".into())],
+        };
+        // Lost on a VMM that ran; not on one this run did not measure, and
+        // not for an ungated metric.
+        assert_eq!(
+            missing(&baseline, "ci", &results),
+            ["cell.fork_us/rhizo/qemu-microvm"]
+        );
+    }
+
+    #[test]
     fn regression_gate_uses_thresholds_per_kind() {
         let baseline = json!({
             "thresholds_pct": {"deterministic": 1, "timing": {"ci": 50, "dedicated": 5}},
@@ -1702,6 +1892,62 @@ mod tests {
                 "image.size_bytes"
             ]
         );
+    }
+
+    #[test]
+    fn instruction_counts_have_their_own_threshold() {
+        let baseline = json!({
+            "thresholds_pct": {"deterministic": 1, "instructions": 2, "timing": {"ci": 100}},
+            "environments": {"ci": {
+                "cell.switch_insns/rhizo/qemu-microvm-icount": 1000.0,
+                "cell.switch_ns/rhizo/qemu-microvm": 100.0
+            }}
+        });
+        let within = results(vec![
+            metric(
+                "cell.switch_insns",
+                "rhizo",
+                Some("qemu-microvm-icount"),
+                1019.0,
+            ),
+            metric("cell.switch_ns", "rhizo", Some("qemu-microvm"), 150.0),
+        ]);
+        assert!(regressions(&baseline, "ci", &within).is_empty());
+        let worse = results(vec![metric(
+            "cell.switch_insns",
+            "rhizo",
+            Some("qemu-microvm-icount"),
+            1021.0,
+        )]);
+        let found = regressions(&baseline, "ci", &worse);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].allowed_pct, 2.0);
+    }
+
+    #[test]
+    fn an_ungated_prefix_covers_its_metrics() {
+        let baseline = json!({
+            "thresholds_pct": {"timing": {"ci": 10}},
+            "ungated": {"ci": ["breakdown."]},
+            "environments": {"ci": {
+                "breakdown.fork_touch.cow_us/rhizo/qemu-q35": 1.0,
+                "breakdowns_us/rhizo/qemu-q35": 1.0
+            }}
+        });
+        let r = results(vec![
+            metric(
+                "breakdown.fork_touch.cow_us",
+                "rhizo",
+                Some("qemu-q35"),
+                9.0,
+            ),
+            metric("breakdowns_us", "rhizo", Some("qemu-q35"), 9.0),
+        ]);
+        let keys: Vec<_> = regressions(&baseline, "ci", &r)
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["breakdowns_us/rhizo/qemu-q35"]);
     }
 
     #[test]
@@ -1936,6 +2182,21 @@ mod tests {
     }
 
     #[test]
+    fn agent_line_is_parsed() {
+        let out = "rhizo-cpython cold_ns=1 warm_ns=2\n\
+                   rhizo-agent turn_ns=900000 model_ns=300000 suspend_resume_ns=400000 fork_ns=700000\n";
+        assert_eq!(
+            parse_agent_line(out),
+            Some(Ok([900_000, 300_000, 400_000, 700_000]))
+        );
+        assert_eq!(
+            parse_agent_line("rhizo-agent skipped: CPython not built\n"),
+            Some(Err("CPython not built".into()))
+        );
+        assert_eq!(parse_agent_line("rhizo-cpython cold_ns=1 warm_ns=2"), None);
+    }
+
+    #[test]
     fn cpython_line_is_parsed() {
         let out =
             "rhizo-python cold_ns=1 warm_ns=2\nrhizo-cpython cold_ns=30000000 warm_ns=900000\n";
@@ -2001,10 +2262,10 @@ mod tests {
     fn kpti_line_is_parsed() {
         assert_eq!(
             parse_kpti_line(
-                "x\nrhizo-kpti default=0 syscall_ns=90 syscall_kpti_ns=300 \
-                 switch_kpti_ns=700 run_kpti_ns=9000\n"
+                "x\nrhizo-kpti default=0 syscall_kpti_ns=300 switch_kpti_ns=700 \
+                 run_kpti_ns=9000\n"
             ),
-            Some([90, 300, 700, 9000])
+            Some([300, 700, 9000])
         );
         assert_eq!(parse_kpti_line("rhizo-kpti syscall_ns=1\n"), None);
     }

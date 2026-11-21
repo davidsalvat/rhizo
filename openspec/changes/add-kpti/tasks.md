@@ -12,7 +12,7 @@
 
 ## 3. Cost
 
-- [x] 3.1 `syscalls` cell, `rhizo-kpti` line and the four metrics (D5); verify `cargo test -p xtask kpti` and a local `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference`
+- [x] 3.1 `rhizo-kpti` line and the four metrics (D5); verify `cargo test -p xtask kpti` and a local `cargo xtask --arch x86_64 bench --runs 1 --vmm qemu-microvm --no-reference`
 - [x] 3.2 CI numbers before and after in the pull request, `bench/README.md` and `docs/security.md` (O3) updated; verify by reading
 
 ## 4. CI

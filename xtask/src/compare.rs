@@ -153,7 +153,13 @@ pub fn linux_process_in_vm(cells: &Path, accel: Accel, scratch: &Path) -> Result
     }
     let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (n.as_str(), &d[..])).collect();
     let initramfs = refguest::initramfs_with(&read(&program)?, &files);
-    let samples = boot_guest(&initramfs, scratch, "linux-process", parse_process_sample)?;
+    let samples = boot_guest(
+        &initramfs,
+        scratch,
+        "linux-process",
+        None,
+        parse_process_sample,
+    )?;
     report::text(&format!(
         "linux processes inside firecracker on {}: {} boots",
         arch::current().id(),
@@ -168,11 +174,13 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 
 /// Boots a Linux guest in Firecracker with `initramfs` three times and
 /// returns what `parse` finds in the first console line it accepts, per
-/// boot (`what` names the line in errors).
+/// boot (`what` names the line in errors). `network`: a tap device for a
+/// network card, and words added to the guest's command line.
 fn boot_guest<T: Send + 'static>(
     initramfs: &[u8],
     scratch: &Path,
     what: &str,
+    network: Option<(&str, &str)>,
     parse: fn(&str) -> Option<T>,
 ) -> Result<Vec<T>> {
     let binary = tools::firecracker()?;
@@ -180,14 +188,24 @@ fn boot_guest<T: Send + 'static>(
     let image = scratch.join(format!("{what}-{}.cpio", std::process::id()));
     std::fs::write(&image, initramfs).map_err(|e| e.to_string())?;
     let config = scratch.join(format!("{what}-{}.json", std::process::id()));
+    let (interfaces, extra) = match network {
+        Some((tap, words)) => (
+            format!(
+                "{{\"iface_id\": \"net0\", \"host_dev_name\": {tap:?}, \
+                 \"guest_mac\": \"06:00:ac:10:00:02\"}}"
+            ),
+            words,
+        ),
+        None => (String::new(), ""),
+    };
     std::fs::write(
         &config,
         format!(
             "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}, \
-             \"initrd_path\": {:?}}}, \"drives\": [], \
+             \"initrd_path\": {:?}}}, \"drives\": [], \"network-interfaces\": [{interfaces}], \
              \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": 256}}}}",
             kernel.display().to_string(),
-            crate::vmm::linux_cmdline(Vmm::Firecracker),
+            format!("{}{extra}", crate::vmm::linux_cmdline(Vmm::Firecracker)),
             image.display().to_string()
         ),
     )
@@ -234,24 +252,52 @@ fn boot_guest<T: Send + 'static>(
     Ok(samples)
 }
 
-/// Parses a `linux-cpython cold_us=<x> warm_us=<y>` line.
-pub fn parse_cpython_line(text: &str) -> Option<[f64; 2]> {
+/// What `bench/host/linux_cpython.c` prints: cold and warm CPython, and
+/// the agent's turn, its model part and its fork when it ran (else why
+/// not).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CpythonLine {
+    pub cold_us: f64,
+    pub warm_us: f64,
+    pub agent: std::result::Result<[f64; 3], String>,
+}
+
+/// Parses a `linux-cpython cold_us=<x> warm_us=<y> agent...` line.
+pub fn parse_cpython_line(text: &str) -> Option<CpythonLine> {
     let line = &text[text.find("linux-cpython ")?..];
-    let field = |key: &str| -> Option<f64> {
+    let value = |key: &str| {
         line.split_whitespace()
-            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
-            .parse()
-            .ok()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
     };
-    Some([field("cold_us")?, field("warm_us")?])
+    let field = |key: &str| -> Option<f64> { value(key)?.parse().ok() };
+    let agent = match (
+        field("agent_turn_us"),
+        field("agent_model_us"),
+        field("agent_fork_us"),
+    ) {
+        (Some(turn), Some(model), Some(fork)) => Ok([turn, model, fork]),
+        _ => Err(value("agent").unwrap_or("no agent figures").to_string()),
+    };
+    Some(CpythonLine {
+        cold_us: field("cold_us")?,
+        warm_us: field("warm_us")?,
+        agent,
+    })
 }
 
 /// CPython on Linux in the same Firecracker VM as the cells (design D4 of
-/// `add-cpython`): the static CPython, its standard library and the script
+/// `add-cpython`): the static CPython, its standard library and the scripts
 /// of the CPython cell in the guest's initramfs, `bench/host/linux_cpython.c`
 /// as `/init`. Cold: fork and exec of the script; warm: a fork of a CPython
-/// process that imported and warmed it up (`cpython_forkserver.py`).
-pub fn cpython_in_vm(accel: Accel, scratch: &Path) -> Result<Vec<Metric>> {
+/// process that imported and warmed it up (`cpython_forkserver.py`). With
+/// a tap device, the agent as a Linux process talks to the host's model
+/// through the VM's card (design D5 of `add-agent-workload`); without one,
+/// or when it fails, the reason is in `skipped`.
+pub fn cpython_in_vm(
+    accel: Accel,
+    scratch: &Path,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<Vec<Metric>> {
     let root = crate::cpython::root();
     if !root.join("usr/bin/python3").exists() {
         return Err("CPython not built (RHIZO_CPYTHON_SRC unset)".into());
@@ -279,27 +325,61 @@ pub fn cpython_in_vm(accel: Accel, scratch: &Path) -> Result<Vec<Metric>> {
         .map(|(n, d)| (n.as_str(), d.as_slice()))
         .collect();
     let initramfs = refguest::initramfs_with(&read(&program)?, &entries);
-    let samples = boot_guest(&initramfs, scratch, "linux-cpython", parse_cpython_line)?;
+    let network = crate::hostnet::linux_guest_network();
+    let samples = boot_guest(
+        &initramfs,
+        scratch,
+        "linux-cpython",
+        network
+            .as_ref()
+            .ok()
+            .map(|(tap, words)| (*tap, words.as_str())),
+        parse_cpython_line,
+    )?;
     report::text(&format!(
         "cpython inside firecracker on {}: {} boots",
         arch::current().id(),
         samples.len()
     ));
-    let mut out = Vec::new();
-    for (i, name) in ["workload.cpython_cold_us", "workload.cpython_warm_us"]
-        .into_iter()
-        .enumerate()
-    {
-        let mut values: Vec<f64> = samples.iter().map(|s| s[i]).collect();
-        out.push(metric(
-            name,
-            "linux-process",
-            "firecracker",
-            "us",
-            &mut values,
+    let agent: Vec<[f64; 3]> = samples
+        .iter()
+        .filter_map(|s| s.agent.clone().ok())
+        .collect();
+    let mut columns: Vec<(&str, Vec<f64>)> = vec![
+        (
+            "workload.cpython_cold_us",
+            samples.iter().map(|s| s.cold_us).collect(),
+        ),
+        (
+            "workload.cpython_warm_us",
+            samples.iter().map(|s| s.warm_us).collect(),
+        ),
+    ];
+    if agent.len() == samples.len() {
+        columns.push((
+            "workload.agent_cpython_turn_us",
+            agent.iter().map(|a| a[0]).collect(),
         ));
+        columns.push((
+            "workload.agent_cpython_model_us",
+            agent.iter().map(|a| a[1]).collect(),
+        ));
+        columns.push((
+            "workload.agent_fork_us",
+            agent.iter().map(|a| a[2]).collect(),
+        ));
+    } else {
+        let why = match (&network, samples.iter().find_map(|s| s.agent.clone().err())) {
+            (Err(e), _) => e.clone(),
+            (_, Some(why)) => format!("the agent did not run in the guest: {why}"),
+            _ => "the agent did not run in the guest".into(),
+        };
+        skipped.push(("workload.agent_*/linux-process/firecracker".into(), why));
     }
-    Ok(out)
+    Ok(columns
+        .into_iter()
+        .map(|(name, mut values)| metric(name, "linux-process", "firecracker", "us", &mut values))
+        .collect())
 }
 
 /// Every file and directory under `dir` as initramfs entries named from
@@ -971,8 +1051,21 @@ mod tests {
 
     #[test]
     fn cpython_line_is_found_among_console_noise() {
-        let line = "[  1.2] junk linux-cpython cold_us=31000.5 warm_us=2100.25\r\n";
-        assert_eq!(parse_cpython_line(line), Some([31000.5, 2100.25]));
+        let line = "[  1.2] junk linux-cpython cold_us=31000.5 warm_us=2100.25 \
+                    agent_turn_us=900.5 agent_model_us=300 agent_fork_us=4000\r\n";
+        assert_eq!(
+            parse_cpython_line(line),
+            Some(CpythonLine {
+                cold_us: 31000.5,
+                warm_us: 2100.25,
+                agent: Ok([900.5, 300.0, 4000.0]),
+            })
+        );
+        let line = "linux-cpython cold_us=1 warm_us=2 agent=failed:no-network";
+        assert_eq!(
+            parse_cpython_line(line).map(|l| l.agent),
+            Some(Err("failed:no-network".into()))
+        );
         assert_eq!(
             parse_cpython_line("linux-cpython cold_us=1 warm_us=failed"),
             None

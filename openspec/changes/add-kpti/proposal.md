@@ -53,7 +53,7 @@ hold no secret: the kernel's layout is public, there is no KASLR).
 `kernel/src/arch/x86_64/{cpu,user,tests}.rs` (entry code, per-CPU data,
 entry tables), `kernel/src/arch/aarch64/user.rs` (E0PD),
 `kernel/src/cell.rs` (stale-everywhere flushes, KPTI benchmarks),
-`kernel/src/tests.rs`, `cells/src/bin/syscalls.rs`, `xtask/src/bench.rs`,
+`kernel/src/tests.rs`, `xtask/src/bench.rs`,
 `bench/README.md`, `docs/security.md`. The boot image is unchanged in
 size beyond a few instructions (page alignment only in builds that run
 cells). With KPTI off, the entry paths gain two tests of a zero CR3.
