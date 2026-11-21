@@ -10,7 +10,7 @@ questions (proposal, "Decisions taken by the user").
 - [x] 0.2 The user's decisions recorded (operator approval for roots, Rhizo's own package proxy, static chat as default) with key management (D2, D4a, D5a, D6); verify with `openspec validate add-cell-modules --strict`
 
 - [x] 0.3 The default for module children (empty policy, no `spawn`, ask the agent) and opt-in delegation recorded (D3a); verify with `openspec validate add-cell-modules --strict`
-- [x] 0.4 The state-of-the-art review applied to modules: module templates as public objects, module children reseeding, the build token dead before the freeze, devices only by derivation (D1, D5, D5a, D7; H-D21, H-D22, H-D24); verify with `openspec validate add-cell-modules --strict`
+- [x] 0.4 The state-of-the-art review applied to modules: module templates as public objects, module children reseeding, the build token dead before the freeze, accelerator handles only by derivation (D1, D5, D5a, D7; H-D21, H-D22, H-D24); verify with `openspec validate add-cell-modules --strict`
 
 ## 1. Modules and requests
 

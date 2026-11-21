@@ -177,23 +177,23 @@ agent unless its parent deliberately raises its ceiling. This is the
 "talk to each other to reach the internet" case, closed by the kernel
 rather than by advice.
 
-## Devices and accelerators
+## Accelerators
 
-Rhizo is not CPU-only. A GPU, an NPU or another device, or a partition of
-one, is a handle like any other:
+Rhizo is not CPU-only. Following `add-accelerators`, a broker on the host
+owns every GPU, NPU and hardware partition, and binds each to one domain
+at a time. Cells never touch a device; they hold an accelerator handle:
 
-- rights `use`, `derive` (split off a smaller partition) and `observe`;
+- rights `infer` (model sessions on the models it lists), `compute`
+  (compute sessions) and `stats` (its subtree's use);
+- narrowed by derivation only: fewer rights, fewer models, a smaller
+  budget;
 - no cell holds one unless it was granted;
-- device memory, device time and queues are budgets carved from the
-  parent, like memory;
-- the exposure check applies: a partition the hardware does not isolate
-  stays in one domain, and a device that reaches a network by itself
-  counts as egress;
-- copies do not inherit device handles.
-
-Only this capability model is part of the hierarchy. Drivers, DMA
-isolation and device state in snapshots are designed in the separate
-change `add-accelerators`.
+- device memory, KV bytes, device time and sessions are budgets carved
+  from the parent, like memory;
+- a device the hardware cannot partition stays in one domain, which the
+  broker enforces;
+- copies do not inherit the handle (their open sessions are forked by the
+  broker).
 
 ## Shared files
 
@@ -255,7 +255,7 @@ is done about it. In short:
 
 | Closed (no longer shared, or partitioned) | Accepted and measured (timing) |
 |---|---|
-| Loopback network and ports, card ports, socket pool, free memory (`sysinfo`), kernel heap and file data, page cache (partitioned per domain, public objects always resident), template frames (only published templates, held while shared), cell identifiers, the cell table, error codes, device partitions | CPU contention and scheduling (with weights and caps), hardware caches and TLB, 2 MiB block availability, the card's queues and neighbour cache, kernel locks |
+| Loopback network and ports, card ports, socket pool, free memory (`sysinfo`), kernel heap and file data, page cache (partitioned per domain, public objects always resident), template frames (only published templates, held while shared), cell identifiers, the cell table, error codes, accelerators (one domain per device or partition) | CPU contention and scheduling (with weights and caps), hardware caches and TLB, 2 MiB block availability, the card's queues and neighbour cache, kernel locks |
 
 The phase 1 benchmarks measure a CPU-contention channel between two
 domains (`covert.cpu_bps`), and `docs/security.md` will publish the
@@ -437,7 +437,7 @@ agent ◄── /run/rhizo/chan/np ── child cell (copy of python+numpy templ
 | Phase | What | Key tests | Key benchmarks |
 |---|---|---|---|
 | 1 | Tree, reserved budgets, CPU weights and caps, private loopback, address translation on the card, egress with the floor, storage channels closed, sharing bounded by the domain, copies told to reseed, scoped host access, CPU sets, audit log, limits, upgrades | Differential colluders in two domains, egress per level, fork bomb, forged snapshot authority, copies draw different random numbers, domains share by weight | No regression on system calls, switches, forks, loopback, network; `net.egress_check_insns`, `covert.cpu_bps`, `sched.domain_share_pct` |
-| 2 | Handles (devices among them), channels, exposure ceilings, subtree snapshots | Forged handle numbers, rights cannot grow, sockets cannot be passed, proxy past the ceiling, revocation everywhere | `cell.channel_rtt_us` (not above loopback), `cell.handle_pass_us`, `cell.revoke_us`, `cell.grant_us` |
+| 2 | Handles (accelerators among them), channels, exposure ceilings, subtree snapshots | Forged handle numbers, rights cannot grow, sockets cannot be passed, proxy past the ceiling, revocation everywhere | `cell.channel_rtt_us` (not above loopback), `cell.handle_pass_us`, `cell.revoke_us`, `cell.grant_us` |
 | 3 | Snapshot and live views | Renames do not signal, climbing out of a view, writing through read-only | `cell.view_grant_us`, `cell.view_read_us` |
 | 4 | Cells creating cells | Fork bomb from inside, a child cannot escape | `cell.child_spawn_us` |
 | Modules | Module policy, approvals, signed catalogue with key management, package proxy, builder, static chat | `requests` grants no internet, signatures, confined builder, private pip | `module.add_us`, `module.extra_bytes`, `chat.static_bytes` |
@@ -476,9 +476,9 @@ From a later review of the state of the art:
     secrets.
 12. **CPU and memory quotas per tree:** charged to the using cell only;
     CPU weights between domains and caps per subtree.
-13. **Accelerators:** devices and their partitions are capabilities with
-    budgets and exposure checks; their architecture is
-    `add-accelerators`.
+13. **Accelerators:** a handle with `infer`, `compute` and `stats`,
+    narrowed by derivation, with carved budgets and exposure checks;
+    devices and partitions stay with the broker of `add-accelerators`.
 
 The production requirements that came with these decisions are:
 

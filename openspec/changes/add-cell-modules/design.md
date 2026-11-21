@@ -672,12 +672,13 @@ the same way already.
   and budget are the agent's.
 - A pending approval is not snapshotted. A suspended agent's pending
   request is refused, and the agent asks again after its resume.
-- **Devices.** A module that needs an accelerator names a device class
-  and its limits in its manifest. Its child gets a device handle only by
-  derivation from one the agent holds, within the agent's device budget
-  and its exposure ceiling (H-D24); an agent without one gets the module
-  without the device, or a refusal if the manifest requires it. The
-  device itself is `add-accelerators`' design.
+- **Accelerators.** A module that needs an accelerator names the rights
+  (`infer`, `compute`) and the accelerator budgets it needs in its
+  manifest. Its child gets an accelerator handle only by derivation from
+  one the agent holds, within the agent's budgets and its exposure
+  ceiling (H-D24); an agent without one gets the module without it, or a
+  refusal if the manifest requires it. The broker behind it is
+  `add-accelerators`' design.
 
 ## D8. Tests and benchmarks
 

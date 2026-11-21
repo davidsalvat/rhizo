@@ -124,8 +124,8 @@ cell handle, no view, no kernel endpoint and, by default, egress `none`.
 ### Requirement: Handles and rights
 A handle SHALL name one kernel object with rights: on a cell observe,
 input, message and control; on a channel endpoint send, receive and
-carry; on a view read and write; on a device or partition use, derive
-and observe; on the kernel endpoint spawn, channel, derive, revoke and
+carry; on a view read and write; on an accelerator infer, compute and
+stats; on the kernel endpoint spawn, channel, derive, revoke and
 narrow. A cell SHALL use handles only through
 descriptors and entries of `/run/rhizo`; a handle's number, sent as
 bytes, SHALL confer nothing.
@@ -363,14 +363,18 @@ not run until the next period.
 - **WHEN** a subtree capped at 0.25 CPU spins next to an idle CPU
 - **THEN** it gets at most 25 % of the CPU plus one time slice per period
 
-### Requirement: Devices are capabilities
-A device or a partition of one (an accelerator such as a GPU or an NPU)
-SHALL be reached only through a handle, derived only to a smaller
-partition or fewer rights, with device memory, time and queues as limits
-carved from the parent's. A grant SHALL pass the exposure check, a
-partition the hardware does not isolate SHALL stay in one domain, and a
-copy SHALL not inherit device handles.
+### Requirement: Accelerators are capabilities
+A cell SHALL reach an accelerator only through a handle with the rights
+`infer`, `compute` or `stats`, narrowed only by derivation to fewer
+rights, fewer models or a smaller budget, with device memory, KV bytes,
+device time and sessions as budgets carved from the parent's. No handle
+SHALL name a device or partition, a non-isolated device SHALL serve one
+domain at a time, and a copy SHALL not inherit the handle.
 
-#### Scenario: Partition across domains
-- **WHEN** the host grants one partition that the hardware does not isolate to cells of two domains
-- **THEN** the second grant is refused with `EACCES`, and a cell with no grant sees no device
+#### Scenario: Asking for more
+- **WHEN** a cell holding an accelerator handle with `infer` on one model derives one with `compute`, and one listing another model
+- **THEN** both derivations fail with `EACCES`, and a cell with no grant finds no accelerator under `/run/rhizo`
+
+#### Scenario: Copy of a cell with a handle
+- **WHEN** a cell holding an accelerator handle is forked by its parent
+- **THEN** the copy holds no accelerator handle, and opening a new session in it fails

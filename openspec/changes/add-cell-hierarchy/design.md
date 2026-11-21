@@ -50,7 +50,7 @@ the art:
 | S1 | Content sharing only inside a domain, with the domain in every content key; across domains only public objects, shared when loaded, never by scanning memory | D21 |
 | S2 | A copy generation per cell (`/run/rhizo/generation`), `MADV_WIPEONFORK` across every copy, a copy's `getpid` unlike its source's; shipped templates reseed; templates hold no secrets | D22 |
 | C2 | Accounting charged to the using cell only; CPU weights (exact between domains) and CPU caps per subtree | D23 |
-| A | Devices and their partitions are handles with budgets and exposure checks; their architecture is `add-accelerators` | D24 |
+| A | Accelerators are handles (`infer`, `compute`, `stats`, narrowed by derivation) with carved budgets and exposure checks; devices and partitions stay with the host's broker (`add-accelerators`) | D24 |
 
 Module signing keys are in `add-cell-modules`.
 
@@ -275,7 +275,7 @@ without reservations (cgroup v2's model). Rejected: one sibling's use then
 decides another's failures, which is a storage channel.
 
 What accounting costs, and how CPUs are shared between subtrees while
-they run (weights and caps), are in D23. Device budgets are in D24.
+they run (weights and caps), are in D23. Accelerator budgets are in D24.
 
 ## D5. Loopback networks
 
@@ -529,7 +529,7 @@ Kernel objects and their rights:
 | View (phase 3) | read, write |
 | Kernel endpoint (phase 4, D10) | spawn, channel, derive, revoke, narrow |
 | Template (as a cell handle) | control (make copies of it), observe |
-| Device or partition (D24) | use, derive, observe |
+| Accelerator (D24) | infer, compute, stats |
 
 **The grant table.** Every handle is a grant entry in `rhizo-cap`:
 `{object, rights, holder, grantor, parent grant}`. The entries form a
@@ -770,7 +770,7 @@ not collude belong in two domains.
 | 38 | **File names** | `rhizo-fs` keeps one tree per cell: names, inode numbers, directories, sizes and times are per cell, and blocks are shared only immutably | None: `rename` changes only the caller's own tree, and no other cell can list it | — | **Confirmed: there is no shared namespace through which renaming files could signal.** Live views (D11) share a namespace on purpose, and only by grant inside the ceilings |
 | 39 | `/run/rhizo/` | Per cell, read-only, built by the kernel | — | — | No channel (D9) |
 | 40 | Snapshots on disk (save/load) | The host chooses what to load | Host mediated | — | Loaded snapshots carry no authority (D13) |
-| 41 | Devices and accelerators (`add-accelerators`) | None yet | Device memory and queues | Device caches and contention | Handles with budgets (D24): a partition the hardware does not isolate is never shared across domains, and device caches keyed by content carry the domain (D21) |
+| 41 | Accelerators (`add-accelerators`) | None yet | Device memory and sessions | Engine batching, device caches and contention | Handles with carved budgets (D24); the broker binds each device or hardware partition to one domain at a time, so a device it cannot partition stays in one domain; KV caches keyed by content carry the domain (D21). The audited override is listed as a channel |
 | 42 | CPU weights and caps (D23) | Round robin per cell | — | A domain's share depends on others' load | Same as 15: **accept**; caps bound how much a domain can take |
 
 **What remains is timing.** Items 14 to 17, 25 and 28 cannot be closed on
@@ -792,7 +792,8 @@ handles or quota by it.
   copies, unless the source is a published template (D21).
 - Every copy gets a new copy generation, its `MADV_WIPEONFORK` ranges
   read as zero, and its `getpid` differs from the source's (D22).
-- Device handles are not inherited (D24).
+- Accelerator handles are not inherited; open sessions are forked by the
+  broker (D24).
 - Budget: the source's limits are carved again for each copy from that
   parent's budget.
 - Copied unchanged: egress policy, ceiling and `on_parent_end`.
@@ -1555,58 +1556,64 @@ Alternatives:
   Rejected: its cost on every switch grows with the depth.
 - Fairness per cell, as today. Rejected: cells would buy CPU.
 
-## D24. Devices and accelerators as capabilities
+## D24. Accelerators as capabilities
 
-Rhizo must not be CPU-only. The architecture of accelerators (drivers,
-DMA isolation, device memory, scheduling of their work, their state in
-snapshots) is designed in a separate change, `add-accelerators`. This
-design only makes room for them in the capability model, so that a GPU,
-an NPU or another device is held like any other resource.
+Rhizo must not be CPU-only. The accelerator architecture is the change
+`add-accelerators`: a broker on the host owns every device and every
+hardware partition, binds each to one domain at a time, and runs the
+engines; cells never touch a device or map its buffers, and reach it
+only through sessions the kernel relays (D1, D3 to D5 there). This
+design only places that handle in the capability model, so that an
+accelerator is held like any other resource.
 
-**A device is a handle.** A device, or a partition of one (a slice the
-hardware isolates, a virtual function, a group of cores, a share of its
-time), is a kernel object that a cell reaches only through a handle:
+**An accelerator handle.** It names an accelerator the host registered
+with the broker, and carries the rights of `add-accelerators` D5:
 
 | Object | Rights |
 |---|---|
-| Device or partition | use (submit work, map its buffers), derive (split off a smaller partition), observe (its counters) |
+| Accelerator | infer (model sessions on the models the handle lists), compute (compute sessions, phase E there), stats (its subtree's use) |
 
-- The host registers devices and their partitions. `add-accelerators`
-  says which partitions the hardware isolates.
-- No cell holds a device by default (no ambient authority).
-- A device handle is derived into a smaller partition or fewer rights,
-  never more; it moves only over channels with the carry right; its
-  grantor can revoke it. A revoked handle refuses new work, and work in
-  flight ends as `add-accelerators` specifies.
-- A child gets a device handle only by derivation from its creator's
-  own, through a grant or a `spawn` request.
+- No cell holds one by default (no ambient authority). The host grants a
+  root one (`rhizo run --accel gpu0:infer`).
+- **Narrowing** is the hierarchy's generic derivation (D9): a derived
+  handle has fewer rights, fewer models or a smaller budget, never more.
+  It moves only over channels with the carry right, and its grantor can
+  revoke it; a revoked handle opens no session, and open sessions end as
+  `add-accelerators` specifies.
+- **Partitions are not cell objects.** Devices and their hardware
+  partitions (MIG instances, compute and memory partitions, virtual
+  functions) are registered by the host and bound to a domain by the
+  broker. No handle names one, and no right splits one.
+- A child gets an accelerator handle only by derivation from its
+  creator's own, through a grant or a `spawn` request; a module child
+  only from its agent's (`add-cell-modules`).
 
-**Budgets.** Device resources are limits, like memory and CPU time (D4):
-device memory in bytes, device time, and contexts or queues. A child's
-are carved from its parent's and come back when it ends, and a root's
-are admitted against what the device has. They are charged to the cell
-that asks, where `add-accelerators` allocates them.
+**Budgets.** The accelerator budgets of `add-accelerators` D5 are limits
+like memory and CPU time (D4), reserved only: device memory
+(`accel.mem`), KV bytes in host memory (`accel.kv_host`, ordinary frames
+charged to the cell's memory), device time (`accel.time`) and open
+sessions (`accel.sessions`). A child's are carved from its parent's and
+come back when it ends; a root's are admitted against what the broker
+bound to its domain.
 
-**Exposure ceilings.** A device is a path for information:
+**Exposure ceilings.**
 
-- A partition used by several cells is a flow edge between them, both
-  ways (D8). A partition the hardware does not isolate is never shared
-  across domains: its memory, caches and timing would be a channel.
-- A device that reaches a network by itself (RDMA, a smart NIC) counts
-  as egress: the grant is refused unless that reach is within the
-  holder's ceiling.
-- A device must reach only its holder's memory (DMA behind an IOMMU, in
-  `add-accelerators`). The kernel refuses to grant one that cannot.
-- A device's caches keyed by content (a KV cache) follow D21: the domain
-  identifier is in the key.
+- An accelerator shared by cells of a domain is a flow edge between them
+  (D8): an engine that batches their sessions is one path.
+- A device or partition serves at most one domain at a time; a device
+  the hardware does not partition stays in one domain. The broker
+  enforces it (`EBUSY`); the operator's override is audited and listed
+  as a covert channel, like a missing CPU set (D17).
+- KV and prompt caches carry the domain in their key (D21).
 
-**Fork and snapshots.** A copy does not inherit device handles: its
-device state would need a copy the device may not support. A snapshot
-records a device handle by label, as D13 records other handles, and the
-host binds it again at load. Capturing and restoring device state is
-`add-accelerators`' part, under rule 6.
+**Fork and snapshots.** A copy does not inherit the accelerator handle:
+it opens no new session unless one is granted to it. The sessions the
+source holds are channel endpoints, which the broker forks as
+`add-accelerators` D6 specifies, charged to the copy's carved budgets. A
+snapshot records the handle by label, as D13 records other handles, and
+the host binds it again at load.
 
-**Phase.** The handle kind, its rights, its budgets and the exposure
-check come with phase 2 (handles), as plain data in `rhizo-cap`, tested
-on the host with a fake device. Real devices come with
-`add-accelerators`.
+**Phase.** The handle kind, its rights, its narrowing, its budgets and
+the exposure check come with phase 2 (handles), as plain data in
+`rhizo-cap`, tested on the host. Sessions and the broker come with
+`add-accelerators`, starting with its fake accelerator.

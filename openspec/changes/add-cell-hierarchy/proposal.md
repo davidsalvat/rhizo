@@ -115,11 +115,11 @@ containment, implemented in four phases (design D16). It holds no code.
   cell's information could reach egress beyond its ceiling, so no
   proxying past a policy.
 - Snapshot format version 12 (handles) and subtree snapshots.
-- **Devices as handles** (D24): a device or a partition of it (GPU, NPU,
-  other accelerators) is a handle with rights (use, derive, observe),
-  budgets carved like memory, and the exposure check. Only the
-  capability model is here; the accelerator architecture is the separate
-  change `add-accelerators`.
+- **Accelerators as handles** (D24): rights `infer`, `compute` and
+  `stats` from `add-accelerators`, narrowed by derivation (fewer rights,
+  models or budget), with budgets carved like memory and the exposure
+  check. Devices and partitions stay with the host's broker, bound to one
+  domain at a time; no cell holds one.
 
 **Phase 3: shared file views.** Snapshot views (copy-on-write, read-only)
 and live views (volumes, read-only or read-write), granted by handle,
@@ -181,15 +181,16 @@ art (design D21 to D24):
   copies; the shipped templates reseed; templates hold no secrets.
 - **C2. Hierarchical CPU and memory quotas.** Charged to the using cell
   only; CPU weights between domains and caps per subtree.
-- **Accelerators.** Devices and their partitions are capabilities with
-  budgets and exposure checks; their architecture is `add-accelerators`.
+- **Accelerators.** An accelerator handle (`infer`, `compute`, `stats`)
+  is a capability with carved budgets and exposure checks; devices and
+  partitions stay with the broker of `add-accelerators`.
 
 ## Capabilities
 
 ### New Capabilities
 
 - `cell-hierarchy`: the ownership tree, authority, budgets, CPU weights
-  and caps, handles (devices among them), channels, exposure ceilings,
+  and caps, handles (accelerators among them), channels, exposure ceilings,
   public objects, copy generations and cells creating cells.
 
 ### Modified Capabilities

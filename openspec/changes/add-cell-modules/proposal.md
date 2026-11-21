@@ -31,7 +31,7 @@ there. This change adds the module-specific parts:
   shared across domains, holding no secret (the build token dies before
   the freeze, and signing attests it). **Module children reseed** their
   interpreters' generators after the copy (D22 there). A module that
-  needs an accelerator gets a device handle only by derivation from the
+  needs an accelerator gets an accelerator handle only by derivation from the
   agent's (D24 there).
 - **Request flow.** An `add` request goes to the agent's own kernel
   endpoint (the new `modules` right). The kernel checks the whitelist, the
