@@ -46,8 +46,9 @@ pub enum Count {
     /// Cells made with no address-space tag left: every switch to them
     /// flushes the TLB.
     Untagged,
-    /// Write-or-execute pages changed between writing and running by a
-    /// fault (change `node-jit`).
+    /// Write-or-execute pages made running by an instruction fetch (change
+    /// `node-jit`); each was made writing by a write before, so the changes
+    /// both ways are about twice as many.
     WxFlips,
 }
 

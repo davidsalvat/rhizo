@@ -142,7 +142,7 @@ macro_rules! suite {
             ktest_case!(template_of_a_threaded_program),
             ktest_case!(code_written_at_run_time_runs_as_on_linux),
             ktest_case!(code_written_at_run_time_survives_fork_suspend_and_templates),
-            ktest_case!(code_written_at_run_time_survives_suspend_after_every_step),
+            ktest_case!(code_written_at_run_time_survives_repeated_suspends),
             ktest_case!(code_memory_misused_is_a_fault),
             ktest_case!(every_cpu_has_its_number_and_own_stack),
             ktest_case!(kernel_globals_are_safe_across_cpus),
@@ -2799,8 +2799,8 @@ fn code_written_at_run_time_runs_as_on_linux() {
     crate::prof::start();
     assert_no_leak("libc_jit");
     let flips = crate::prof::stop().count(crate::prof::Count::WxFlips);
-    // Two runs, each with two changes per turn of its threads at least.
-    assert!(flips >= 2 * 2 * 200, "{flips} changes");
+    // Two runs, each making the page running once per turn of its threads.
+    assert!(flips >= 2 * 200, "{flips} changes");
     let said = alloc::format!("({flips} flips) ");
     arch::console::BootConsole.write_bytes(said.as_bytes());
 }
@@ -2859,20 +2859,26 @@ fn code_written_at_run_time_survives_fork_suspend_and_templates() {
     }
 }
 
-/// `libc_jit` suspended after every scheduling step and resumed lazily from
-/// the snapshot's bytes, its code pages writing or running at each stop:
-/// its output is the uninterrupted one (spec `snapshots`).
-fn code_written_at_run_time_survives_suspend_after_every_step() {
+/// `libc_jit` suspended after every few scheduling steps (every one would
+/// take minutes: its threads take hundreds of turns) and resumed lazily
+/// from the snapshot's bytes, its code pages writing or running at each
+/// stop: its output is the uninterrupted one (spec `snapshots`).
+fn code_written_at_run_time_survives_repeated_suspends() {
+    const EVERY: u32 = 8;
     let mut host = Host::new();
     let mut id = spawn(&mut host, "libc_jit", &[]);
     let mut output = Vec::new();
-    let mut resumes = 0;
+    let (mut resumes, mut steps) = (0, 0u32);
     loop {
         host.step();
         if let Some(done) = host.finished(id) {
             assert_eq!(done.ending, Ending::Exit(0));
             output.extend_from_slice(&done.output);
             break;
+        }
+        steps += 1;
+        if !steps.is_multiple_of(EVERY) {
+            continue;
         }
         let snapshot = host.suspend(id).expect("live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);

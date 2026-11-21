@@ -137,6 +137,9 @@ pub struct Snapshot {
     /// Records that refer to a frame.
     frames: usize,
     release: Release,
+    /// Where the page records start (after the threads and ranges), read
+    /// once: every page lookup needs it.
+    records: usize,
 }
 
 impl PartialEq for Snapshot {
@@ -325,6 +328,7 @@ impl Snapshot {
             bytes: b,
             frames: refers.iter().filter(|&&r| r).count(),
             release,
+            records: data_start - pages * RECORD,
         }
     }
 
@@ -396,14 +400,16 @@ impl Snapshot {
                 found,
             });
         }
-        let snapshot = Self {
+        let mut snapshot = Self {
             bytes,
             frames: 0,
             release: |_, _| {},
+            records: 0,
         };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
-        let records = snapshot.records();
+        let records = snapshot.ranges_at() + snapshot.range_count() * RANGE;
+        snapshot.records = records;
         let data_start = records + pages * RECORD;
         if snapshot.bytes.len() < data_start {
             return Err(FormatError::Truncated);
@@ -497,7 +503,7 @@ impl Snapshot {
 
     /// Where the page records start.
     fn records(&self) -> usize {
-        self.ranges_at() + self.range_count() * RANGE
+        self.records
     }
 
     /// The write-or-execute ranges as stored (the size was checked).
@@ -515,6 +521,9 @@ impl Snapshot {
 
     /// The cell's write-or-execute ranges (design D7 of `node-jit`).
     pub fn wx(&self) -> WxRanges {
+        if self.range_count() == 0 {
+            return WxRanges::default();
+        }
         // Validated by `from_bytes` or written by `capture`.
         WxRanges::from_ranges(self.range_list()).unwrap_or_default()
     }

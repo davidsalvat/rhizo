@@ -933,23 +933,18 @@ fn resolve_exec(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> boo
 /// Whether a write fault at `addr` from the instruction at `pc` writes the
 /// running write-or-execute page it runs from: no change of state lets it
 /// complete, so it is a fault (spec `linux-abi`, design D3 of `node-jit`).
+/// Off the copy-on-write path but for one comparison: the page is looked
+/// at only when the fault is in the page of the instruction.
+#[inline(always)]
 fn writes_own_code(pt: &PageTable<Format>, pc: u64, addr: u64) -> bool {
-    pc >> 12 == addr >> 12
-        && pt
-            .translate(&DirectMap, addr)
-            .is_some_and(|t| t.flags.contains(PageFlags::WRITE_OR_EXEC) && t.flags.is_executable())
+    pc >> 12 == addr >> 12 && writes_running_page(pt, addr)
 }
 
-/// Counts a write that made a write-or-execute page writing, while counting
-/// is on.
-fn count_wx_write(pt: &PageTable<Format>, addr: u64) {
-    if prof::on()
-        && pt
-            .translate(&DirectMap, addr)
-            .is_some_and(|t| t.flags.contains(PageFlags::WRITE_OR_EXEC))
-    {
-        prof::add(Count::WxFlips, 1);
-    }
+#[cold]
+#[inline(never)]
+fn writes_running_page(pt: &PageTable<Format>, addr: u64) -> bool {
+    pt.translate(&DirectMap, addr)
+        .is_some_and(|t| t.flags.contains(PageFlags::WRITE_OR_EXEC) && t.flags.is_executable())
 }
 
 /// How [`Host::resume`] restores memory.
@@ -1571,9 +1566,6 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     }) =>
                 {
                     prof::add(Count::CowFaults, 1);
-                    if let Some(addr) = fault.write_denied() {
-                        count_wx_write(&pt, addr);
-                    }
                     live.clean = flushed_by_kernel_on(cpu);
                     continue;
                 }
@@ -1893,7 +1885,6 @@ impl GangCell {
                 resolve_write(&pt, &mut CellTlb::new(Some((gang, cpu))), addr)
             })
         {
-            count_wx_write(&pt, addr);
             return true;
         }
         if let Some(addr) = fault.exec_denied()
