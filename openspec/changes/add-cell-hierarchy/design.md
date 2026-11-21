@@ -1362,6 +1362,53 @@ Alternatives:
 - No sharing across domains at all. Rejected: every domain would hold its
   own CPython and libc, and density is the project's point.
 
+**As built in phase 1 (tasks 1.8 and 1.8a).**
+
+- **Forks of roots.** Every copy of a root is the root of a new domain
+  (D13), so `Host::fork` of a root and a copy of an unpublished template
+  are full copies: `rhizo-mm`'s `copy_lower_half` copies every page into
+  tables of the copy's own, sharing only read-only pages of public objects
+  (published file pages and the read-only pages of the executables the
+  kernel keeps loaded). A fork of a cell under a parent, and a copy of a
+  published template, still share copy-on-write and allocate only a root.
+  The common paths stay fast because what the host ships is published:
+  the host's file sets when the kernel decodes them, and the templates the
+  benchmarks, the reference workloads and the agent workload make
+  (`Host::publish` after `freeze`). The agent workload's template talked to
+  the fake model through the card, so its host attests. A live root forked
+  by the host pays the copy, proportional to its private memory; the
+  `fork` spec's "Fork cost independent of memory size" says so.
+- **The control kernel** has no `publish` request until protocol version 4
+  (task 1.11): templates it freezes or loads stay unpublished, and their
+  copies are full copies. `rhizo up` publishes its templates once the
+  request exists.
+- **The page cache** keeps public pages apart from domains' pages, so a
+  domain's pages, once dropped, leave no record behind. Each domain keeps
+  at most 65,536 pages; one past its limit is the cell's own copy. Charging
+  a domain's pages to its root (D4) comes with the metering of task 1.3.
+  A public page that was not published (a written template file, a page
+  outside an executable's loadable segments) is kept for each domain like
+  a private one: nothing is filled for every domain on demand.
+- **Published sets** fill a frame for every page of the loadable segments
+  of their executables and libraries, not of their other files.
+- **A dropped template that was published** keeps its tables while any
+  table or page of them is shared with another cell, except pages a cache
+  of the kernel holds (whose counts never fall to one); it goes when the
+  last cell sharing it ends. A template never published goes at once.
+- **Leaving a domain.** `Host::reparent` across domains first gives every
+  live cell and template of the moved subtree private copies of what it
+  shares, and is refused with `NoMemory` (`ENOMEM`) if the cell's memory
+  quota or the machine cannot hold them; a cell promoted when its parent
+  ends does the same, or ends. A suspended cell's snapshot is moved when it
+  is resumed: the kernel keeps the domain a snapshot was taken in beside
+  its bytes, and a resume into another domain first turns its references
+  to frames other than public ones into data (`Snapshot::move_to`), as
+  `export` does. No format change: a snapshot from bytes refers to no
+  frame, so format version 11 needs no field for this.
+- Frames of a published template count as private when a cell that
+  shares them leaves its domain or is copied into another: they are
+  copied, which costs memory, never isolation.
+
 ## D22. Randomness after fork, resume and template spawn
 
 The kernel already gives each cell its own generator, split off the

@@ -187,12 +187,18 @@ impl Host {
             for &root in &ended.promoted {
                 for cell in self.tree.subtree(root).unwrap_or_default() {
                     self.sync(cell);
+                    // It left its domain (design D21): a cell that cannot
+                    // take private copies of what it shared there ends.
+                    if !self.unshare(cell) && !self.kill(cell) {
+                        self.drop_template(cell);
+                    }
                 }
             }
             // Its parent got its reservation back, less promoted ones.
             self.sync_up(parent);
         }
         self.settling = false;
+        self.release_held();
     }
 
     /// Gives cell `id` (live or a template) what its node says: its number,
@@ -324,6 +330,19 @@ impl Host {
     )]
     pub fn reparent(&mut self, id: u32, to: u32, by: Actor) -> Result<(), TreeError> {
         let old = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
+        // Leaving its domain, its subtree first takes private copies of
+        // what it shares there, or the move is refused (design D21).
+        let leaves = match to {
+            HOST => self.tree.get(id).is_some_and(|n| !n.is_root()),
+            _ => self.tree.domain(to) != self.tree.domain(id),
+        };
+        if leaves && self.tree.controls(by, id) {
+            for cell in self.tree.subtree(id)? {
+                if !self.unshare(cell) {
+                    return Err(TreeError::NoMemory);
+                }
+            }
+        }
         let used = self.usage(to);
         self.tree
             .reparent(id, to, by, &|_| used, &mut fresh_domain)?;

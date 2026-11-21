@@ -139,6 +139,12 @@ pub fn agent(
     if !host.freeze(id) {
         return Err("cannot freeze the agent".into());
     }
+    // Its branches, each a root, share its memory (design D21 of
+    // `add-cell-hierarchy`). It talked to the model through the network
+    // card, so the host attests: the fake model gives it no secret.
+    if host.publish(id, true).is_err() {
+        return Err("cannot publish the agent".into());
+    }
     let mut branches = Vec::new();
     for b in 0..AGENT_BRANCHES {
         let child = host

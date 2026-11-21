@@ -33,6 +33,9 @@ fn ballast_template(host: &mut Host, mib: &[u8]) -> u32 {
         host.step();
     }
     assert!(host.freeze(big));
+    // Shipped by the host: its copies, each a root, share it (design D21
+    // of `add-cell-hierarchy`).
+    assert_eq!(host.publish(big, false), Ok(()));
     big
 }
 

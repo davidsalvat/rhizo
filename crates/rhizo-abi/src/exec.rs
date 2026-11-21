@@ -108,7 +108,7 @@ mod tests {
                 &mut self.mem,
                 &mut RecordingTlb::default(),
                 &mut self.frames,
-                &mut self.cache,
+                &mut crate::Scoped(&mut self.cache, 1),
                 &[path],
                 &[b"LD_LIBRARY_PATH=/opt"],
                 [1; 16],

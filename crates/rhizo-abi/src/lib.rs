@@ -17,7 +17,7 @@ mod sockets;
 mod threads;
 
 pub use exec::{ExecError, exec};
-pub use pages::{FilePages, PageCache, Share, own_copy};
+pub use pages::{FilePages, PUBLIC, PageCache, Scoped, Share, own_copy};
 
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};

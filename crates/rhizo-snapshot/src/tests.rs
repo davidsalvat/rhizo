@@ -1010,6 +1010,99 @@ fn shared_pages_are_referred_to_x86_64() {
     shared::<X86_64>();
 }
 
+/// Design D21 of `add-cell-hierarchy`: a snapshot remembers its cell's
+/// domain, and moved to another domain it keeps referring only to the
+/// frames it is told to (public ones): the others' contents are copied
+/// into it, their references given back, and it restores and exports the
+/// same bytes as before, sharing no frame but the kept one.
+fn frames_stay_in_the_domain<F: EntryFormat>() {
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let template = cell::<F>(&mut mem, &mut frames);
+    let tpt = PageTable::<F>::from_root(template.root);
+    let code = tpt.translate(&mem, 0x40_0000).unwrap().phys;
+    let fork = tpt.fork_lower_half(&mut mem, &mut frames).unwrap();
+    let child = Cell {
+        root: fork.root(),
+        domain: 5,
+        ..template
+    };
+    let mut snap = Snapshot::capture::<F>(
+        Machine::Aarch64,
+        &child,
+        &[],
+        &WxRanges::default(),
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        release,
+    );
+    space::destroy(fork, &mut mem, &mut frames);
+    assert_eq!(snap.domain(), 5);
+    assert_eq!(snap.shared_bytes(), 2 * 0x1000 + (2 << 20), "all shared");
+    let exported = snap.export(&mem, crc32c);
+    snap.move_to(9, &mem, &mut |phys| phys == code);
+    assert_eq!(snap.domain(), 9);
+    assert_eq!(snap.shared_bytes(), 0x1000, "only the kept frame");
+    assert_eq!(snap.page(0).data, Data::Frame(code));
+    let released = RELEASED.with(|r| r.take());
+    assert_eq!(released.len(), 2, "the data and 2 MiB pages given back");
+    assert!(released.iter().all(|&(phys, _)| phys != code));
+    for (phys, size) in released {
+        frames.free(phys, size);
+    }
+    assert_eq!(snap.export(&mem, crc32c), exported, "the same bytes");
+    // The template writes every page: the snapshot's are its own now.
+    for at in [0x60_0ffc, 0x4000_001f_fff8] {
+        let resolved = tpt.resolve_write(&mut mem, &mut frames, &mut RecordingTlb::default(), at);
+        assert_eq!(resolved, Ok(true), "the template's pages are its own");
+        rhizo_cell::memory::copy_to(&tpt, &mut mem, at, b"tmpl").unwrap();
+    }
+    let pt = PageTable::<F>::new(&mut mem, &mut || frames.alloc()).unwrap();
+    for i in 0..snap.pages() {
+        snap.restore_page(i, &pt, &mut mem, &mut frames).unwrap();
+    }
+    let mut buf = [0u8; 8];
+    rhizo_cell::memory::copy_from(&pt, &mem, 0x4000_001f_fff8, &mut buf).unwrap();
+    assert_eq!(&buf, b"big page");
+    rhizo_cell::memory::copy_from(&pt, &mem, 0x60_0ffc, &mut buf[..4]).unwrap();
+    assert_eq!(&buf[..4], b"data");
+    let restored = pt.translate(&mem, 0x40_0000).unwrap().phys;
+    assert_eq!(restored, code, "the kept frame is shared");
+    for at in [0x60_0000, 0x4000_0000_0000] {
+        let phys = pt.translate(&mem, at).unwrap().phys;
+        assert_ne!(phys, tpt.translate(&mem, at).unwrap().phys, "{at:#x}");
+    }
+    drop(snap);
+    let released = RELEASED.with(|r| r.take());
+    assert_eq!(
+        released,
+        [(code, PageSize::Small)],
+        "the one reference left"
+    );
+    frames.free(code, PageSize::Small);
+    // From bytes: no domain and no frame, and nothing to move.
+    let mut loaded = Snapshot::from_bytes(exported, Machine::Aarch64, crc32c).unwrap();
+    assert_eq!(loaded.domain(), 0);
+    loaded.move_to(3, &mem, &mut |_| unreachable!("no frame"));
+    assert_eq!((loaded.domain(), loaded.shared_bytes()), (3, 0));
+    for pt in [pt, tpt] {
+        space::destroy(pt, &mut mem, &mut frames);
+    }
+    assert_eq!(frames.outstanding(), 0, "every frame back");
+}
+
+#[test]
+fn frames_stay_in_the_domain_aarch64() {
+    frames_stay_in_the_domain::<Aarch64>();
+}
+
+#[test]
+fn frames_stay_in_the_domain_x86_64() {
+    frames_stay_in_the_domain::<X86_64>();
+}
+
 #[test]
 fn records_that_refer_to_frames_are_refused() {
     // A file whose record claims a physical address (`REFERS`, change

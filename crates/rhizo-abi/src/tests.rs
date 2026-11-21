@@ -152,7 +152,7 @@ impl World {
             net: &mut Noting(&mut self.net, &mut self.used_net),
             deadline: self.deadline.take(),
             pager: &mut self.pager,
-            pages: &mut self.pages,
+            pages: &mut crate::Scoped(&mut self.pages, 1), // one domain
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
         // A thread waiting on descriptors keeps its deadline and makes its

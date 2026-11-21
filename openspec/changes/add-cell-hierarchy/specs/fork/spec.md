@@ -1,5 +1,23 @@
 # Spec Delta
 
+## MODIFIED Requirements
+
+### Requirement: Fork cost independent of memory size
+A copy that stays in its source's domain (a fork of a cell under a
+parent, or a copy of a template the host published) SHALL NOT copy pages
+or leaf page tables; it SHALL allocate only the copy's root table. A copy
+that is the root of a new domain (a fork of a root, or a copy of an
+unpublished template as a root) SHALL be a full copy that shares only
+public objects with its source (design D21 of `add-cell-hierarchy`).
+
+#### Scenario: Large cell
+- **WHEN** a cell with 50 MiB of memory under a parent is forked, or a copy of a published template holding 50 MiB is made
+- **THEN** exactly one page-table frame is allocated
+
+#### Scenario: Fork of a root
+- **WHEN** a root with 50 MiB of memory is forked
+- **THEN** the copy shares no page with it but those of public objects, and the source's later writes copy nothing
+
 ## ADDED Requirements
 
 ### Requirement: Where copies go

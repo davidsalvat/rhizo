@@ -25,7 +25,9 @@ pub(super) fn spawn_dynamic(
 /// dynamically linked executables): each, started from the cell's files by
 /// its interpreter, prints what it prints on Linux (`cells/expected.rs`, by
 /// the differential check) and exits with 0. Their file pages are kept for
-/// later cells, and once dropped every frame and heap allocation is back.
+/// later cells (public: loaded when their file set was published, design
+/// D21 of `add-cell-hierarchy`), and once the cells end every frame and
+/// heap allocation is back.
 fn dynamically_linked_programs_behave_as_on_linux() {
     let packed = [crate::cell::dynamic_files(), crate::cell::distro_files()];
     assert!(packed[0].is_some(), "xtask packs the dynamic hello");
@@ -42,7 +44,7 @@ fn dynamically_linked_programs_behave_as_on_linux() {
         host.run(|_| false);
         assert_eq!(ended(&host, id), (Ending::Exit(0), stdout.into()), "{path}");
     }
-    assert!(crate::cell::drop_images(), "file pages were kept");
+    assert!(crate::cell::kept_pages() > 0, "file pages were kept");
     assert_eq!(memory_balance(), before, "nothing leaked");
 }
 

@@ -518,6 +518,100 @@ fn clone_shares_read_only_pages_and_copies_the_rest<F: EntryFormat>() {
     assert_eq!(w.frames.live(), 0);
 }
 
+/// A full copy (design D21 of `add-cell-hierarchy`) shares only the
+/// read-only pages it is told to, whatever the source shares with others:
+/// every other page is a private copy with the same bytes and permissions,
+/// and its writes take no frame. `shares` sees what another hierarchy can
+/// still reach.
+fn full_copy_shares_only_kept_pages<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let parent = w.table();
+    w.map(&parent, 0x40_0000, PageSize::Small, RO);
+    w.map(&parent, 0x41_0000, PageSize::Small, RO);
+    w.map(&parent, 0x60_0000, PageSize::Small, WX);
+    w.map(&parent, 0x4000_0000_0000, PageSize::Large, RW);
+    for (at, value) in [(0x40_0000, 1), (0x41_0000, 2)] {
+        let page = w.page(&parent, at);
+        w.mem.write_u64(page, value);
+    }
+    w.write(&parent, 0x60_0000, 3);
+    w.write(&parent, 0x4000_0000_0008, 4);
+    let public = w.page(&parent, 0x40_0000);
+    let mut skip = |p| p == public;
+    assert!(!parent.shares(&w.mem, &w.frames, &mut skip), "alone");
+    // The source shares its tables and pages with a fork.
+    let source = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    assert!(source.shares(&w.mem, &w.frames, &mut skip), "with the fork");
+    let source_leaves = w.leaves(&source);
+    let live = w.frames.live();
+
+    let copy = source
+        .copy_lower_half(&mut w.mem, &mut w.frames, &mut |p| p == public)
+        .unwrap();
+    assert_eq!(w.leaves(&source), source_leaves, "the source is only read");
+    let pages = w.leaves(&copy);
+    assert_eq!(
+        w.frames.live(),
+        live + copy.lower_half_tables(&w.mem) + 3,
+        "own tables and every page but the public one"
+    );
+    for ((virt, phys, size, flags), source) in pages.iter().zip(&source_leaves) {
+        assert_eq!(
+            (*virt, *size, *flags),
+            (source.0, source.2, source.3),
+            "{virt:#x}"
+        );
+        assert_eq!(*phys == source.1, *virt == 0x40_0000, "{virt:#x}");
+    }
+    for (at, value) in [
+        (0x40_0000, 1),
+        (0x41_0000, 2),
+        (0x60_0000, 3),
+        (0x4000_0000_0008, 4),
+    ] {
+        assert_eq!(w.read(&copy, at), value, "{at:#x}");
+    }
+    assert!(
+        !copy.shares(&w.mem, &w.frames, &mut skip),
+        "only the public page"
+    );
+    let live = w.frames.live();
+    assert!(w.write(&copy, 0x60_0000, 5) && w.write(&copy, 0x4000_0000_0008, 6));
+    assert_eq!(w.frames.live(), live, "its pages are its own: no copy");
+    assert_eq!(w.read(&source, 0x60_0000), 3, "the source keeps its bytes");
+    assert!(!w.write(&copy, 0x41_0000, 7), "read-only stays read-only");
+
+    parent.destroy_lower_half(&mut w.mem, &mut w.frames);
+    assert!(
+        !source.shares(&w.mem, &w.frames, &mut skip),
+        "the fork ended"
+    );
+    assert!(
+        source.shares(&w.mem, &w.frames, &mut |_| false),
+        "the public page"
+    );
+    for pt in [source, copy] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0, "every frame returned once");
+
+    // No 2 MiB block: the large page comes as 4 KiB pages.
+    let source = w.table();
+    w.map(&source, 0x4000_0000_0000, PageSize::Large, RW);
+    w.write(&source, 0x4000_0000_1008, 8);
+    w.frames.no_large = true;
+    let copy = source
+        .copy_lower_half(&mut w.mem, &mut w.frames, &mut |_| true)
+        .unwrap();
+    w.frames.no_large = false;
+    assert_eq!(w.read(&copy, 0x4000_0000_1008), 8);
+    assert_eq!(w.leaves(&copy).len(), 512);
+    for pt in [source, copy] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0);
+}
+
 /// After `unshare_tables`, a child forked from a parent has tables of its
 /// own, every page it shares counts its reference and is write-protected in
 /// both, and nothing was copied but tables.
@@ -560,6 +654,7 @@ fn fork_aarch64() {
     large_page_copied_as_small_pages::<Aarch64>();
     copies_are_break_before_make::<Aarch64>();
     unshare_tables_leaves_pages_shared::<Aarch64>();
+    full_copy_shares_only_kept_pages::<Aarch64>();
 }
 
 #[test]
@@ -570,6 +665,7 @@ fn fork_x86_64() {
     large_page_copied_as_small_pages::<X86_64>();
     copies_are_break_before_make::<X86_64>();
     unshare_tables_leaves_pages_shared::<X86_64>();
+    full_copy_shares_only_kept_pages::<X86_64>();
 }
 
 /// Addresses spread over different tables at every level.
@@ -593,6 +689,9 @@ enum Op {
     Unmap(usize, usize),
     Fork(usize),
     Clone(usize),
+    /// A full copy that shares no page (design D21 of
+    /// `add-cell-hierarchy`).
+    Copy(usize),
     Destroy(usize),
     /// Holds a reference to every page of a cell another one can reach,
     /// after `unshare_tables`, as a snapshot does.
@@ -610,6 +709,7 @@ fn op() -> impl Strategy<Value = Op> {
         (0..4usize).prop_map(Op::Clone),
         (0..4usize).prop_map(Op::Destroy),
         (0..4usize).prop_map(Op::Hold),
+        (0..4usize).prop_map(Op::Copy),
     ]
 }
 
@@ -667,6 +767,15 @@ fn model_check<F: EntryFormat>(ops: &[Op]) {
                     .0
                     .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
                     .unwrap();
+                let model = cells[c].1.clone();
+                cells.push((copy, model));
+            }
+            Op::Copy(c) if c < n && n < 4 => {
+                let copy = cells[c]
+                    .0
+                    .copy_lower_half(&mut w.mem, &mut w.frames, &mut |_| false)
+                    .unwrap();
+                assert!(!copy.shares(&w.mem, &w.frames, &mut |_| false), "{op:?}");
                 let model = cells[c].1.clone();
                 cells.push((copy, model));
             }

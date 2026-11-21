@@ -103,11 +103,27 @@ impl Host {
     /// The live cell `snapshot` holds, not yet scheduled.
     fn restore(
         &mut self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         mode: Resume,
         capture: bool,
         echo: bool,
     ) -> Result<Box<Live>, Snapshot> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        // Resumed into another domain than it was taken in (a load, a copy
+        // of a template's snapshot, a suspended cell moved meanwhile), it
+        // first stops referring to its old domain's frames (design D21 of
+        // `add-cell-hierarchy`).
+        let origin = snapshot.origin();
+        let to = match self.suspended.contains(&origin) {
+            true => self.tree.domain(origin).unwrap_or(id),
+            false => id, // a new root
+        };
+        if to != snapshot.domain() {
+            if !cells_may_take(snapshot.shared_bytes()) {
+                return Err(snapshot);
+            }
+            snapshot.move_to(to, &DirectMap, &mut public_frames());
+        }
         if mode == Resume::Eager {
             let bytes = (0..snapshot.pages())
                 .map(|i| snapshot.page(i))
@@ -121,7 +137,6 @@ impl Host {
         let Ok(pt) = PageTable::<Format>::new(&mut DirectMap, &mut || KernelFrames.alloc()) else {
             return Err(snapshot);
         };
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         if user::CELL_ROOT_HAS_KERNEL_HALF {
             pt.share_upper_half(&mut DirectMap, &user::cell_kernel_half());
         }
@@ -171,24 +186,31 @@ impl Host {
         }
         parent.demand.lazy = None;
         sync_fp(&mut parent, false);
+        // Copies of a root are roots of new domains: full copies, sharing
+        // only public objects with it (design D21 of `add-cell-hierarchy`).
+        let full = self.copies_leave_domain(id).then_some(parent.shares);
+        let fits = full.is_none() || cells_may_take(n as u64 * mapped_bytes(&pt));
         let mut children = Vec::with_capacity(n);
-        for _ in 0..n {
+        for _ in 0..if fits { n } else { 0 } {
             let Some(child) = self.child_of(
                 &parent.cell,
                 &parent.fs,
                 &parent.demand.wx,
                 parent.output.is_some(),
                 parent.echo,
+                full,
             ) else {
                 break;
             };
             children.push(child);
         }
-        // The parent lost write access to everything it shares: drop what its
-        // TLB still caches (on other CPUs, when it next runs there).
-        user::flush_user(parent.cell.root, parent.tag);
-        parent.clean = flushed_by_kernel_on(crate::arch::cpu::index());
-        parent.shares = true;
+        if full.is_none() {
+            // The parent lost write access to everything it shares: drop what
+            // its TLB still caches (on other CPUs, when it next runs there).
+            user::flush_user(parent.cell.root, parent.tag);
+            parent.clean = flushed_by_kernel_on(crate::arch::cpu::index());
+            parent.shares = true;
+        }
         self.requeue(parent, wake);
         if children.len() < n || !self.enter_copies(id, &mut children) {
             // All or nothing: the children made so far never ran.
@@ -224,7 +246,10 @@ impl Host {
     /// files `fs` and its write-or-execute ranges `wx`. Only counts go up,
     /// on tables `cell` holds, and only `cell`'s root changes: no
     /// [`SHARING`], even while cells sharing those tables run (design D3 of
-    /// `host-ops-per-cell`). It is a copy (design D22 of
+    /// `host-ops-per-cell`). With `full`, it is instead a full copy that
+    /// shares only public objects with `cell` (a copy into another domain,
+    /// design D21 of `add-cell-hierarchy`), made under [`SHARING`] if
+    /// `full` says `cell` shares its memory. It is a copy (design D22 of
     /// `add-cell-hierarchy`): its generation is one more, and its wipe
     /// ranges read as zero, the only work done for cells that have some.
     fn child_of(
@@ -234,9 +259,14 @@ impl Host {
         wx: &WxRanges,
         capture: bool,
         echo: bool,
+        full: Option<bool>,
     ) -> Option<Box<Live>> {
         let pt = PageTable::<Format>::from_root(cell.root);
-        let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
+        let used = Meter::new(0, u64::MAX);
+        let child = match full {
+            None => pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?,
+            Some(shares) => sharing(shares, || full_copy(&pt, &used))?,
+        };
         // The child has the cell's quotas and none of its usage (design D3
         // of `add-cell-quotas`): what it shares stays counted to the cell.
         let cell = Cell {
@@ -247,8 +277,11 @@ impl Host {
             ..cell.clone()
         };
         let mut live = self.new_live(cell, capture, echo, fork_files(fs));
-        live.frames.set_used(1); // its root
-        live.shares = true;
+        live.frames.set_used(match full {
+            None => 1, // its root
+            Some(_) => used.used(),
+        });
+        live.shares = full.is_none();
         live.demand.wx = wx.clone();
         if !wx.wiped().is_empty() && !wipe_copy(&live) {
             self.discard(&live);
@@ -338,12 +371,8 @@ impl Host {
     /// other domains (design D22 of `add-cell-hierarchy`): not if the cell
     /// it was made of reached the network card, unless the host attests
     /// (`attested`) that it holds no secret. `None` if there is no such
-    /// template. Publishing itself and the audit record of an attestation
-    /// come with tasks 1.8a and 1.9b.
-    #[cfg_attr(
-        not(feature = "ktest"),
-        allow(dead_code, reason = "publishing comes with task 1.8a")
-    )]
+    /// template ([`publish`](Self::publish) asks it). The audit record of
+    /// an attestation comes with task 1.9b.
     pub fn may_publish(&self, id: u32, attested: bool) -> Option<bool> {
         let (cell, ..) = self.templates.iter().find(|(c, ..)| c.id == id)?;
         Some(attested || !cell.exposed)
@@ -367,11 +396,7 @@ impl Host {
             return false;
         };
         let (template, fs, _) = self.templates.swap_remove(index);
-        space::destroy(
-            PageTable::<Format>::from_root(template.root),
-            &mut DirectMap,
-            &mut KernelFrames,
-        );
+        self.end_template_memory(template.id, template.root);
         release_sockets(&fs, template.id);
         true
     }
@@ -391,7 +416,14 @@ impl Host {
         let index = self.templates.iter().position(|(c, ..)| c.id == id)?;
         let (cell, fs, wx) = &self.templates[index];
         let (cell, fs, wx) = (cell.clone(), fs.clone(), wx.clone());
-        let mut child = self.child_of(&cell, &fs, &wx, capture, echo)?;
+        // Only a published template shares its frames with copies in other
+        // domains (design D21 of `add-cell-hierarchy`).
+        let full = (self.copies_leave_domain(id) && !self.is_published(id)).then_some(true);
+        let pt = PageTable::<Format>::from_root(cell.root);
+        if full.is_some() && !cells_may_take(mapped_bytes(&pt)) {
+            return None;
+        }
+        let mut child = self.child_of(&cell, &fs, &wx, capture, echo, full)?;
         child.expire_timers();
         let mut copies = [child];
         if !self.enter_copies(id, &mut copies) {

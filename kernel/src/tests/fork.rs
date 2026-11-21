@@ -72,18 +72,51 @@ fn forks_of_forks() {
     }
 }
 
+/// Spec `fork`, "Large cell" and "Fork of a root": a fork of a cell under
+/// a parent, whose copies stay in its domain, allocates only a root table;
+/// a fork of a root, whose copy is the root of a new domain, shares none
+/// of its pages (design D21 of `add-cell-hierarchy`).
 fn fork_allocates_only_a_root() {
     let mut host = Host::new();
-    let parent = spawn(&mut host, "ballast", &[b"all", b"8"]);
-    while host.output(parent) != Some(b"filled\n") {
-        host.step();
-    }
+    let ballast = |host: &mut Host| {
+        let id = spawn(host, "ballast", &[b"all", b"8"]);
+        while host.output(id) != Some(b"filled\n") {
+            host.step();
+        }
+        id
+    };
+    let root = ballast(&mut host);
+    let copy = host.fork(root, 1).expect("fork")[0];
+    let at = rhizo_cell::MMAP_BASE;
+    assert_ne!(
+        host.frame_of(copy, at),
+        host.frame_of(root, at),
+        "a full copy"
+    );
+    let parent = spawn(&mut host, "idle", &[]);
+    let quota = rhizo_cell::quota::Quota {
+        memory: 64 << 20,
+        ..rhizo_cell::quota::Quota::DEFAULT
+    };
+    assert!(host.set_limits(parent, quota, 8));
+    let source = ballast(&mut host);
+    let spec = rhizo_cap::Spec {
+        limits: rhizo_cap::Limits {
+            memory: 16 << 20,
+            cpu_ns: u64::MAX,
+            sockets: 16,
+            cells: 0,
+        },
+        ..rhizo_cap::Spec::default()
+    };
+    host.adopt(source, parent, spec, rhizo_cap::Actor::Host)
+        .expect("placed");
     // Warm up: the same fork once, ended again, so the host's queues already
     // have room for the child and the heap does not grow during the measure.
-    let warm = host.fork(parent, 1).expect("fork")[0];
+    let warm = host.fork(source, 1).expect("fork")[0];
     assert!(host.kill(warm));
     let before = memory::free_bytes();
-    host.fork(parent, 1).expect("fork");
+    host.fork(source, 1).expect("fork");
     assert_eq!(
         before - memory::free_bytes(),
         4096,

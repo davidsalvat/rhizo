@@ -35,8 +35,8 @@ pub(super) fn files_of(snapshot: &Snapshot) -> Fs {
 
 /// The files a CPython cell starts with (`cpython-files`, packed by `xtask`:
 /// the standard library under `/usr/lib/python3.13` and `/app/agent_demo.py`;
-/// design D2 of `add-cpython`), decoded once and then shared copy-on-write
-/// by every CPython cell; `None` when CPython was not built.
+/// design D2 of `add-cpython`), decoded once and published, then shared
+/// copy-on-write by every CPython cell; `None` when CPython was not built.
 #[cfg_attr(
     not(any(feature = "ktest", feature = "bench-cell")),
     allow(dead_code, reason = "used by in-kernel tests and benchmarks")
@@ -47,17 +47,28 @@ pub fn cpython_files() -> Option<Fs> {
     if bytes.is_empty() {
         return None;
     }
-    Some(FILES.with(|files| {
-        files
-            .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
-            .clone()
-    }))
+    Some(FILES.with(|files| files.get_or_insert_with(|| published(bytes)).clone()))
+}
+
+/// The host's file set `bytes`, decoded and published (design D21 of
+/// `add-cell-hierarchy`): public, the pages of its executables and
+/// libraries loaded now and kept as long as the kernel runs, shared by
+/// every domain.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+fn published(bytes: &[u8]) -> Fs {
+    let mut fs = Fs::decode(bytes).expect("xtask packs a valid file system");
+    publish_files(&mut fs);
+    fs
 }
 
 /// The files of the dynamically linked `hello` (`dynamic-files`, packed by
 /// `xtask` with its interpreter and libraries; change
-/// `add-dynamic-linking`), decoded once and then shared copy-on-write by
-/// every cell given them; `None` when they were not packed.
+/// `add-dynamic-linking`), decoded once and published, then shared
+/// copy-on-write by every cell given them; `None` when they were not
+/// packed.
 #[cfg_attr(
     not(any(feature = "ktest", feature = "bench-cell")),
     allow(dead_code, reason = "used by in-kernel tests and benchmarks")
@@ -116,9 +127,5 @@ fn decoded(slot: &Global<Option<Fs>>, name: &str) -> Option<Fs> {
     if bytes.is_empty() {
         return None;
     }
-    Some(slot.with(|files| {
-        files
-            .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
-            .clone()
-    }))
+    Some(slot.with(|files| files.get_or_insert_with(|| published(bytes)).clone()))
 }

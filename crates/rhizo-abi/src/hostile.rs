@@ -233,7 +233,7 @@ impl<F: EntryFormat> Machine<F> {
             net: &mut self.net,
             deadline: None,
             pager: &mut self.pager,
-            pages: &mut self.pages,
+            pages: &mut crate::Scoped(&mut self.pages, 1), // one domain
         };
         let outcome = self.abi.handle(&mut self.cell, &mut cx);
         // A call waiting on descriptors runs again as the next one.

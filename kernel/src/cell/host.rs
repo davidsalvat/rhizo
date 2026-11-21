@@ -61,6 +61,9 @@ pub struct Host {
     pub(super) ends: Vec<u32>,
     /// Ends are being applied (not again from inside).
     pub(super) settling: bool,
+    /// Templates published, and dropped ones still shared (design D21 of
+    /// `add-cell-hierarchy`).
+    pub(super) published: Published,
 }
 
 /// Words of a running cell's memory ([`Host::watch`]), read through the
@@ -116,6 +119,7 @@ impl Host {
             suspended: Vec::new(),
             ends: Vec::new(),
             settling: false,
+            published: Published::default(),
         }
     }
 
@@ -397,7 +401,7 @@ impl Host {
             &mut DirectMap,
             &mut NewSpace,
             &mut KernelFrames,
-            &mut KernelPages,
+            &mut KernelPages(id), // its domain until it is placed
             argv,
             envp,
             random,
@@ -614,5 +618,6 @@ impl Drop for Host {
             let id = template.id;
             self.drop_template(id);
         }
+        self.drop_held();
     }
 }

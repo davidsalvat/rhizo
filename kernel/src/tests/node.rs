@@ -45,7 +45,7 @@ fn node_answers_as_on_linux() {
         (Ending::Exit(0), expected::NODE_STDOUT.into())
     );
     drop(host);
-    assert!(crate::cell::drop_images(), "file pages were kept");
+    assert!(crate::cell::kept_pages() > 0, "file pages were kept");
     // Every frame is back; heap allocations too, but for the few the card's
     // own traffic (DHCP, ARP) holds at any moment.
     let after = memory_balance();

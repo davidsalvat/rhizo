@@ -160,6 +160,131 @@ impl<F: EntryFormat> PageTable<F> {
         Ok(copy)
     }
 
+    /// Copies the user half into a new hierarchy that shares nothing with
+    /// this one but the read-only pages `keep` names (design D21 of
+    /// `add-cell-hierarchy`: a copy into another domain shares only public
+    /// objects). Every other page, copy-on-write, writable or read-only, is
+    /// copied into a frame of its own whose entry keeps every permission
+    /// and mark (a copy-on-write mark left on it is resolved by the next
+    /// write without a copy); a 2 MiB page with no 2 MiB block free is
+    /// copied as 4 KiB pages. The tables are the copy's own, and the upper
+    /// half's entries are copied as [`fork_lower_half`] copies them. This
+    /// hierarchy is only read. On failure every frame taken is returned.
+    ///
+    /// [`fork_lower_half`]: Self::fork_lower_half
+    pub fn copy_lower_half(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        frames: &mut impl Frames,
+        keep: &mut impl FnMut(u64) -> bool,
+    ) -> Result<Self, MapError> {
+        fn walk<F: EntryFormat>(
+            mem: &mut impl PhysicalMemory,
+            frames: &mut impl Frames,
+            keep: &mut impl FnMut(u64) -> bool,
+            from: u64,
+            to: u64,
+            level: u32,
+            entries: u64,
+        ) -> Result<(), MapError> {
+            for i in 0..entries {
+                let entry = mem.read_u64(from + i * 8);
+                if !F::is_valid(entry) {
+                    continue;
+                }
+                if !F::is_leaf(entry, level) {
+                    let table = frames.alloc().ok_or(MapError::OutOfFrames)?;
+                    mem.zero_frame(table);
+                    // Linked before it is filled, so a failure below frees it.
+                    mem.write_u64(
+                        to + i * 8,
+                        F::with_table_writable(F::with_address(entry, table), true),
+                    );
+                    walk::<F>(
+                        mem,
+                        frames,
+                        keep,
+                        F::address(entry),
+                        table,
+                        level - 1,
+                        ENTRIES,
+                    )?;
+                    continue;
+                }
+                let bytes = leaf_bytes::<F>(entry, level);
+                let page = F::address(entry) & !(bytes - 1);
+                let flags = F::flags(entry);
+                let shareable = !flags.is_writable() && !flags.contains(PageFlags::COPY_ON_WRITE);
+                if shareable && keep(page) {
+                    frames.share(page);
+                    mem.write_u64(to + i * 8, entry);
+                    continue;
+                }
+                let copy = match bytes {
+                    FRAME_SIZE => frames.alloc(),
+                    crate::LARGE_PAGE_SIZE => frames.alloc_large(),
+                    _ => return Err(MapError::OutOfFrames), // cells map no 1 GiB page
+                };
+                let new = match copy {
+                    Some(copy) => {
+                        mem.copy(page, copy, bytes);
+                        F::with_address(entry, copy)
+                    }
+                    None if bytes == crate::LARGE_PAGE_SIZE => {
+                        F::table(copy_as_small_pages::<F>(mem, frames, page, entry)?)
+                    }
+                    None => return Err(MapError::OutOfFrames),
+                };
+                mem.write_u64(to + i * 8, new);
+            }
+            Ok(())
+        }
+        let root = frames.alloc().ok_or(MapError::OutOfFrames)?;
+        mem.zero_frame(root);
+        for i in ENTRIES / 2..ENTRIES {
+            mem.write_u64(root + i * 8, mem.read_u64(self.root() + i * 8));
+        }
+        let copy = Self::from_root(root);
+        if let Err(e) = walk::<F>(mem, frames, keep, self.root(), root, 3, ENTRIES / 2) {
+            copy.destroy_lower_half(mem, frames);
+            return Err(e);
+        }
+        Ok(copy)
+    }
+
+    /// Whether another hierarchy may still reach a page of this one's user
+    /// half: a table below the root, or a page `skip` does not name, with
+    /// more than one reference (copy-on-write invariant: what an entry
+    /// shares is shared everywhere below it). Only read.
+    pub fn shares(
+        &self,
+        mem: &impl PhysicalMemory,
+        frames: &impl Frames,
+        skip: &mut impl FnMut(u64) -> bool,
+    ) -> bool {
+        fn walk<F: EntryFormat>(
+            mem: &impl PhysicalMemory,
+            frames: &impl Frames,
+            skip: &mut impl FnMut(u64) -> bool,
+            table: u64,
+            level: u32,
+            entries: u64,
+        ) -> bool {
+            (0..entries).any(|i| {
+                let entry = mem.read_u64(table + i * 8);
+                if !F::is_valid(entry) {
+                    return false;
+                }
+                let next = F::address(entry) & !(leaf_bytes::<F>(entry, level) - 1);
+                if F::is_leaf(entry, level) {
+                    return frames.is_shared(next) && !skip(next);
+                }
+                frames.is_shared(next) || walk::<F>(mem, frames, skip, next, level - 1, ENTRIES)
+            })
+        }
+        walk::<F>(mem, frames, skip, self.root(), 3, ENTRIES / 2)
+    }
+
     /// Makes the tables on the way to `virt` private to this hierarchy and
     /// writable, down to the level above the leaf (or above the first empty
     /// entry). Called before changing a mapping, so the change is not seen
