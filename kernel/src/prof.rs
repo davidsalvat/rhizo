@@ -56,6 +56,11 @@ static NET_CHANGED_AT: AtomicU64 = AtomicU64::new(0);
 /// before then is not a latency of the window counted (cells made before a
 /// workload's load starts all run at its start).
 static STARTED_AT: AtomicU64 = AtomicU64::new(0);
+/// Latencies restart the next time no cell runs or waits for a CPU
+/// ([`settle`]).
+static SETTLING: AtomicBool = AtomicBool::new(false);
+/// When they restarted, since counting started (nanoseconds; 0: never).
+static SETTLED_AFTER: AtomicU64 = AtomicU64::new(0);
 
 /// Whether counting is on.
 #[inline]
@@ -81,9 +86,39 @@ pub fn start() {
     }
     COUNTERS.iter().for_each(|c| c.store(0, Ordering::Relaxed));
     NET_CHANGED_AT.store(0, Ordering::Relaxed);
+    SETTLING.store(false, Ordering::Relaxed);
+    SETTLED_AFTER.store(0, Ordering::Relaxed);
     let now = crate::arch::timer::cycles_to_ns(Counter.cycles()).unwrap_or(0);
     STARTED_AT.store(now, Ordering::Relaxed);
     ON.store(true, Ordering::Release);
+}
+
+/// Starts the latencies again the next time no cell runs or waits for a
+/// CPU (design D6 of `add-socket-wait-queues`): the cells runnable at the
+/// start of a load have all run once by then, and what was queued behind
+/// them is not a latency of the load. A load that never gets there keeps
+/// every latency since [`start`].
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+pub fn settle() {
+    SETTLING.store(true, Ordering::Relaxed);
+}
+
+/// No cell runs or waits for a CPU at `now` (nanoseconds since boot): after
+/// [`settle`], the latencies start again from here.
+#[cold]
+pub fn nothing_runs(now: u64) {
+    if SETTLING.swap(false, Ordering::Relaxed) {
+        LATENCY.with(|l| {
+            if let Some(h) = l.as_deref_mut() {
+                h.iter_mut().for_each(Histogram::clear);
+            }
+        });
+        let started = STARTED_AT.swap(now, Ordering::Relaxed);
+        SETTLED_AFTER.store(now.saturating_sub(started).max(1), Ordering::Relaxed);
+    }
 }
 
 /// Stops counting; returns what was counted since [`start`].
@@ -93,6 +128,7 @@ pub fn start() {
 )]
 pub fn stop() -> Report {
     ON.store(false, Ordering::Release);
+    SETTLING.store(false, Ordering::Relaxed);
     let (sched, wake) = LATENCY.with(|l| {
         l.as_deref()
             .map_or_else(Default::default, |[s, w]| (s.clone(), w.clone()))
@@ -110,6 +146,7 @@ pub fn stop() -> Report {
         wake,
         syscall_cycles: syscalls,
         counts: core::array::from_fn(|i| COUNTERS[i].load(Ordering::Relaxed)),
+        settled_ns: SETTLED_AFTER.load(Ordering::Relaxed),
     }
 }
 
@@ -245,6 +282,9 @@ pub struct Report {
     pub syscall_cycles: Histogram,
     /// Every [`Count`], by its number.
     pub counts: [u64; COUNTS],
+    /// After [`settle`]: how long after [`start`] the latencies started
+    /// again, in nanoseconds (0: never, they count from the start).
+    pub settled_ns: u64,
 }
 
 #[cfg_attr(

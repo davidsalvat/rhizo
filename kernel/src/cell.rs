@@ -1058,6 +1058,9 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
         s.idle |= 1 << cpu;
         // A timer it held covers nothing any more: it looks again.
         s.timer.leave(cpu);
+        if s.running == 0 && prof::on() {
+            prof::nothing_runs(now);
+        }
         if s.running == 0 && wake.is_none() {
             // Only parked cells are left: nothing will wake them (but the
             // network card, or the end of the run).

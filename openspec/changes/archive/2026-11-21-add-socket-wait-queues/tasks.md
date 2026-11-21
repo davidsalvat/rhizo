@@ -14,9 +14,10 @@
 
 - [x] 2.1 `IoWoken` and `IoWasted` counts, `density.wasted_wakeups_pct` (D4); verify `cargo test -p xtask workloads` and `cargo xtask bench --workload server --cells 1000 --vmm qemu-microvm --runs 1` locally
 - [x] 2.4 Latencies counted only for cells queued or woken after counting started (D4); verify `cargo xtask check`
-- [ ] 2.2 Before and after figures of the server workload from CI in the pull request; verify the CI benchmark job
-- [ ] 2.3 Gate `density.sched_p99_us` and `density.wake_p99_us` from two CI runs that agree, `density.wasted_wakeups_pct` ungated with its reason (D4); verify `cargo xtask bench --from <run> --env ci --check` on both runs
+- [x] 2.5 Latencies counted from the first moment no cell runs after the load starts (`prof::settle`, D6); verify `cargo xtask test --only ktest` and `--only ktest-smp` on both architectures (`latencies_count_from_the_first_idle_moment`) and `cargo xtask bench --workload server --cells 1000 --vmm qemu-microvm --accel icount --runs 3` before and after
+- [x] 2.2 Before and after figures of the server workload from CI in the pull request; verify the CI benchmark job
+- [x] 2.3 Gate `density.sched_p99_us` and `density.wake_p99_us` from CI runs that agree (three per VMM in this change's benchmark job, within 19 %), `density.wasted_wakeups_pct` ungated with its reason (D4, D6); verify `cargo xtask bench --from <run> --env ci --check` passes on this change's run and fails on the p99s of a run of `main` before D6
 
 ## 3. Documentation
 
-- [ ] 3.1 `bench/README.md`: the new metric, the p99 latencies gated, the breakdown line; verify by reading it next to a CI run's output
+- [x] 3.1 `bench/README.md`: the new metric, the p99 latencies gated, the breakdown line; verify by reading it next to a CI run's output

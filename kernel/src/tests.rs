@@ -121,6 +121,7 @@ macro_rules! suite {
             ktest_case!(cells_talk_over_loopback),
             ktest_case!(a_waiting_cell_uses_no_cpu),
             ktest_case!(only_the_cells_waiting_on_a_socket_wake),
+            ktest_case!(latencies_count_from_the_first_idle_moment),
             ktest_case!(sockets_across_suspend_and_resume),
             ktest_case!(a_discarded_snapshot_closes_its_connections),
             ktest_case!(loopback_connection_across_suspend_of_one_end),
@@ -1975,6 +1976,41 @@ fn only_the_cells_waiting_on_a_socket_wake() {
     assert_eq!(host.waiting(), 1, "the idle server was never woken");
     assert!(host.kill(idle));
     assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// After `prof::settle`, latencies count from the first moment no cell runs
+/// or waits for a CPU (design D6 of `add-socket-wait-queues`): a cell that
+/// yields 2,000 times once counting starts is not counted, the deadlines of
+/// cells started after it, which pass once they all sleep, are. Without
+/// it, every latency counts.
+fn latencies_count_from_the_first_idle_moment() {
+    use crate::prof;
+    const SLEEPERS: u64 = 4;
+    for settle in [false, true] {
+        let mut host = Host::new();
+        prof::start();
+        if settle {
+            prof::settle();
+        }
+        let yielder = spawn(&mut host, "yielder", &[]);
+        host.run(|h| h.finished(yielder).is_some());
+        let sleepers: Vec<u32> = (0..SLEEPERS)
+            .map(|_| spawn(&mut host, "sleeper", &[b"250"]))
+            .collect();
+        host.run(|h| sleepers.iter().all(|&id| h.finished(id).is_some()));
+        let report = prof::stop();
+        for &id in sleepers.iter().chain([&yielder]) {
+            assert_eq!(ended(&host, id).0, Ending::Exit(0));
+        }
+        assert_eq!(report.wake.count(), SLEEPERS, "each deadline counts");
+        if settle {
+            assert!(report.settled_ns > 0, "a moment came when no cell ran");
+            assert_eq!(report.sched.count(), SLEEPERS, "only the woken cells");
+        } else {
+            assert_eq!(report.settled_ns, 0);
+            assert!(report.sched.count() > SLEEPERS + 1000, "the yields count");
+        }
+    }
 }
 
 /// Runs `netstate` to its `ready` line.
