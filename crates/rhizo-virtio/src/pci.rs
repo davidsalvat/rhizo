@@ -179,12 +179,16 @@ pub fn memory_bars(cfg: &mut impl DeviceRegisters) -> [Option<Bar>; 6] {
             (0, !0)
         };
         let mask = (u64::from(high_mask) << 32) | u64::from(low_mask);
-        if low_mask != 0 || (wide && high_mask != 0) {
-            bars[slot] = Some(Bar {
-                addr: (u64::from(high) << 32) | u64::from(low & !0xf),
-                size: (!mask).wrapping_add(1),
-                wide,
-            });
+        let addr = (u64::from(high) << 32) | u64::from(low & !0xf);
+        let size = (!mask).wrapping_add(1);
+        // A BAR decodes a naturally aligned power of two below the top of
+        // the address space; a mask that says otherwise is a broken device
+        // (finding S17 of `docs/security.md`), and its BAR is left out.
+        if (low_mask != 0 || (wide && high_mask != 0))
+            && size.is_power_of_two()
+            && addr.checked_add(size).is_some()
+        {
+            bars[slot] = Some(Bar { addr, size, wide });
         }
         slot += if wide { 2 } else { 1 };
     }
@@ -312,7 +316,7 @@ mod tests {
     /// A function's configuration space: plain bytes, except BARs, which
     /// read back their size mask after all ones are written.
     struct Config {
-        bytes: [u8; 256],
+        bytes: [u8; FUNCTION_BYTES as usize],
         /// Size of the BAR in each slot (0: none; a 64-bit BAR's size is
         /// in its first slot).
         sizes: [u64; 6],
@@ -323,7 +327,7 @@ mod tests {
     impl Config {
         fn new(vendor: u16, device: u16) -> Self {
             let mut c = Self {
-                bytes: [0; 256],
+                bytes: [0; FUNCTION_BYTES as usize],
                 sizes: [0; 6],
                 probing: [false; 6],
             };
@@ -384,7 +388,7 @@ mod tests {
                 }
                 _ => return Some(0),
             };
-            let mask = !(size - 1);
+            let mask = !(size.max(1) - 1);
             Some(if high_half {
                 (mask >> 32) as u32
             } else {
@@ -599,5 +603,48 @@ mod tests {
             net_regions(&mut c, None),
             Err(PciError::Capability(NOTIFY_CFG))
         );
+    }
+
+    /// Configuration space from a broken device (spec `networking`,
+    /// virtio-pci): a QEMU network function with any dwords changed and any
+    /// BAR sizes. Setting it up never panics, and what it finds lies inside
+    /// one of its BARs, without wrapping around.
+    mod hostile {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn any_configuration_space_is_set_up_or_refused(
+                edits in prop::collection::vec((0usize..64, any::<u32>()), 0..6),
+                sizes in [0u32..64, 0u32..64, 0u32..64, 0u32..64, 0u32..64, 0u32..64],
+                window in prop_oneof![
+                    Just(None),
+                    Just(Some((0x1000_0000, 0x2000_0000))),
+                    prop::option::of((any::<u64>(), any::<u64>())),
+                ],
+            ) {
+                let mut c = qemu_net();
+                for (dword, value) in edits {
+                    c.put32(dword * 4, value);
+                }
+                for (slot, &bits) in sizes.iter().enumerate() {
+                    if bits < 40 {
+                        c.sizes[slot] = if bits < 4 { 0 } else { 1u64 << bits };
+                    }
+                }
+                let mut w = window.map(|(next, end)| Window { next, end });
+                if let Ok(Some(r)) = net_regions(&mut c, w.as_mut()) {
+                    let bars = memory_bars(&mut c);
+                    for (addr, len) in [r.common, r.notify, r.device] {
+                        let inside = bars.iter().flatten().any(|b| {
+                            addr >= b.addr
+                                && addr.checked_add(len).is_some_and(|e| Some(e) <= b.addr.checked_add(b.size))
+                        });
+                        prop_assert!(inside, "{addr:#x} + {len:#x} in {bars:x?}");
+                    }
+                }
+            }
+        }
     }
 }

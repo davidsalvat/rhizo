@@ -310,6 +310,9 @@ pub struct Tables {
     /// Socket handles whose last description closed, for the kernel to
     /// release ([`Tables::take_released`]); empty between system calls.
     released: Vec<u32>,
+    /// Counts changes to pipes, event counters and `epoll` instances
+    /// ([`Tables::changes`]).
+    changes: u64,
 }
 
 impl Tables {
@@ -336,6 +339,7 @@ impl Tables {
             used: 0,
             objects: Vec::new(),
             released: Vec::new(),
+            changes: 0,
         }
     }
 
