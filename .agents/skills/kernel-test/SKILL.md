@@ -14,8 +14,9 @@ Pick the cheapest level that can observe the behavior:
    the seed is fixed by `.cargo/config.toml`, so failures reproduce.
    Run: `cargo test -p <crate> <name>`.
 2. **In-kernel test** (seconds): needs real page tables, CPU state or
-   devices. Add a `fn` to `kernel/src/tests.rs` and list it in the `suite!`
-   macro. Run: `cargo xtask test --only ktest`.
+   devices. Add a `fn` to its area's file in `kernel/src/tests/` and list
+   it in that file's `ALL`; a new area is a new file, listed in `AREAS` in
+   `kernel/src/tests.rs`. Run: `cargo xtask test --only ktest`.
 3. **Self-check** (a run that must fail in a precise way): the test kernel
    runs one when booted with `selfcheck=<name>`, so it needs no build of its
    own. Add a `("<name>", self_check!(<case>))` row to `SELF_CHECKS` in
