@@ -34,6 +34,8 @@ struct Device {
     /// Interrupt status (bit 0: a used buffer), and interrupts raised.
     isr: u32,
     interrupts: usize,
+    /// Reads of the interrupt status (each a VM exit on real hardware).
+    isr_reads: core::cell::Cell<usize>,
 }
 
 impl Device {
@@ -53,6 +55,7 @@ impl Device {
             notifies: [0; 2],
             isr: 0,
             interrupts: 0,
+            isr_reads: core::cell::Cell::new(0),
         }
     }
 
@@ -166,7 +169,10 @@ impl DeviceRegisters for Regs {
             reg::QUEUE_NUM_MAX => 64,
             reg::QUEUE_READY => d.queues[d.queue_sel].ready,
             reg::STATUS => d.status,
-            reg::INTERRUPT_STATUS => d.isr,
+            reg::INTERRUPT_STATUS => {
+                d.isr_reads.set(d.isr_reads.get() + 1);
+                d.isr
+            }
             reg::CONFIG => {
                 u32::from_le_bytes([0x52, 0x54, 0, 0x12, 0x34, 0x56][..4].try_into().unwrap())
             }
@@ -457,8 +463,15 @@ fn received_frames_interrupt_once_asked_and_until_acknowledged() {
         "a frame after the acknowledgment"
     );
     card.acknowledge();
+    assert_eq!(dev.borrow().isr, 0);
+    let reads = dev.borrow().isr_reads.get();
     card.acknowledge();
     assert_eq!(dev.borrow().isr, 0, "acknowledging nothing changes nothing");
+    assert_eq!(
+        dev.borrow().isr_reads.get(),
+        reads,
+        "no frame since the last acknowledgment: no register read"
+    );
 }
 
 #[test]

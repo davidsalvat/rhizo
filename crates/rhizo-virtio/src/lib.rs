@@ -316,6 +316,8 @@ pub struct VirtioNet<R, M> {
     /// Transmit descriptors the device gave back.
     tx_free: Vec<u16>,
     frame: Vec<u8>,
+    /// The receive queue's used index at the last acknowledgment.
+    acked: u16,
 }
 
 impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
@@ -391,6 +393,7 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
             rx,
             tx,
             tx_free: (0..QUEUE_SIZE).rev().collect(),
+            acked: 0,
             frame: vec![0; FRAME_MAX],
         };
         for id in 0..QUEUE_SIZE {
@@ -460,8 +463,19 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
     /// Acknowledges the device's interrupt, before the driver looks at the
     /// rings: a frame that arrives later raises it again. A virtio-mmio
     /// device holds its line until its status is acknowledged; an MSI-X
-    /// message needs nothing.
+    /// message needs nothing. Only the receive queue interrupts, and only
+    /// when it hands over a frame, so with no frame since the last
+    /// acknowledgment there is nothing to acknowledge and no register is
+    /// touched (each access is a VM exit).
     pub fn acknowledge(&mut self) {
+        let used = Queue::read16(&self.mem, self.rx.frame + USED_AT + 2);
+        if used == self.acked {
+            return;
+        }
+        // A frame handed over after this read raises the status again
+        // (acknowledged at the next call), or comes before the
+        // acknowledgment and is taken by the receive that follows.
+        self.acked = used;
         if let Transport::Mmio(r) = &mut self.regs {
             let status = r.read32(reg::INTERRUPT_STATUS);
             if status != 0 {
