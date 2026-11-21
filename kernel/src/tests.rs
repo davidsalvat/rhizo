@@ -100,6 +100,7 @@ macro_rules! suite {
             ktest_case!(file_data_takes_its_own_size),
             ktest_case!(memory_pressure_fails_cells_not_the_kernel),
             ktest_case!(a_thousand_idle_cells),
+            ktest_case!(host_operations_find_cells_among_many_sleepers),
             ktest_case!(memory_full_of_cells_is_refused_cleanly),
             ktest_case!(a_woken_cell_runs_at_once),
             ktest_case!(a_wake_before_the_sleep_is_kept),
@@ -1548,6 +1549,60 @@ fn a_thousand_idle_cells() {
     let per_cell = round();
     assert!(per_cell < 64 << 10, "{per_cell} bytes per idle cell");
     assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// Host operations find a cell among hundreds of sleepers by its
+/// identifier (design D2 of `heap-caches-cell-index`), between runs and
+/// from a run's stop condition while the other CPUs run.
+fn host_operations_find_cells_among_many_sleepers() {
+    const N: usize = 300;
+    let mut host = Host::new();
+    let template = spawn(&mut host, "idle", &[]);
+    while host.output(template) != Some(b"idle\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let mut ids: Vec<u32> = (0..N)
+        .map(|_| {
+            host.spawn_from_template(template, false, false)
+                .expect("fork")
+        })
+        .collect();
+    // Each runs into its sleep (once all sleep, a step would wait an hour).
+    for &id in &ids {
+        while !host.asleep(id) {
+            host.step();
+        }
+    }
+    // Between runs: suspended, resumed and killed, every seventh from the
+    // last.
+    for i in (0..N).rev().step_by(7) {
+        let id = ids.swap_remove(i);
+        let snapshot = host.suspend(id).expect("suspend a sleeper");
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Suspended));
+        assert!(!host.asleep(id) && !host.kill(id), "{id} is gone");
+        let back = host
+            .resume(snapshot, Resume::Lazy, false, false)
+            .expect("resume");
+        assert!(host.kill(back));
+    }
+    assert_eq!(host.live(), ids.len());
+    // From the stop condition: each forked, its child and itself killed.
+    host.look_every(Some(1_000_000));
+    let mut left = ids.clone();
+    host.run(|h| {
+        let Some(id) = left.pop() else {
+            return true;
+        };
+        let child = h.fork(id, 1).expect("fork a sleeper")[0];
+        assert!(h.kill(child) && h.kill(id));
+        assert!(!h.kill(id), "{id} is gone");
+        false
+    });
+    assert_eq!(host.live(), 0);
+    for id in ids {
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Killed));
+    }
 }
 
 /// Idle cells forked until memory runs out (spec `benchmarks`, server

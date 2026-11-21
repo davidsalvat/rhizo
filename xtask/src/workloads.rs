@@ -234,7 +234,16 @@ fn parse_server(
     let elapsed_s = get("elapsed_ns")? as f64 / 1e9;
     let woken = get("io_woken")?;
     let wasted = 100.0 * get("io_wasted")? as f64 / woken.max(1) as f64;
-    Ok(vec![
+    // Host operations at the target count, where the breakdown has them.
+    let breakdown = fields(&out.output, "rhizo-server-breakdown ").unwrap_or_default();
+    let host_ops = [
+        ("density.suspend_us", "suspend_ns"),
+        ("density.fork_us", "fork_ns"),
+        ("density.kill_us", "kill_ns"),
+    ]
+    .into_iter()
+    .filter_map(|(name, k)| Some((name, "us", *breakdown.get(k)? as f64 / 1000.0)));
+    let mut values = vec![
         ("density.cells", "cells", get("cells")? as f64),
         ("density.cell_bytes", "bytes", get("per_cell_bytes")? as f64),
         ("density.ops_per_s", "ops/s", get("ops")? as f64 / elapsed_s),
@@ -267,7 +276,9 @@ fn parse_server(
             *oom.get("heap_kept_bytes")
                 .ok_or("no `heap_kept_bytes` in the out-of-memory line")? as f64,
         ),
-    ])
+    ];
+    values.extend(host_ops);
+    Ok(values)
 }
 
 fn server(opts: &Options, vmm: Vmm, guest: &Guest, metrics: &mut Vec<Metric>) -> Result {
@@ -414,6 +425,24 @@ mod tests {
         assert_eq!(get("density.oom_cells"), Some(25000.0));
         assert_eq!(get("density.oom_heap_kept_bytes"), Some(8192.0));
         assert_eq!(get("density.wasted_wakeups_pct"), Some(25.0));
+    }
+
+    #[test]
+    fn server_breakdown_gives_the_host_operations() {
+        let out = run(
+            &format!(
+                "{SERVER}rhizo-server-breakdown elapsed_ns=1 host_ops=900 suspend_ns=130000 \
+                 resume_ns=8000 fork_ns=30000 kill_ns=25000 sched_max_ns=1\n\
+                 rhizo-oom cells=25000 spawn_refused=1 fork_refused=1 resume_refused=1 \
+                 hog_enomem=1 leaked_bytes=0 heap_kept_bytes=0\n"
+            ),
+            vec![],
+        );
+        let values = parse_server(&out).unwrap();
+        let get = |name: &str| values.iter().find(|v| v.0 == name).map(|v| v.2);
+        assert_eq!(get("density.suspend_us"), Some(130.0));
+        assert_eq!(get("density.fork_us"), Some(30.0));
+        assert_eq!(get("density.kill_us"), Some(25.0));
     }
 
     #[test]
