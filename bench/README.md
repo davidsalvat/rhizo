@@ -163,6 +163,9 @@ own load on a shared runner), the p99.9 latencies (`*_p999_*`: a
 handful of samples per run) and `density.wasted_wakeups_pct` (near 0,
 where a relative threshold means nothing; the in-kernel test
 `only_the_cells_waiting_on_a_socket_wake` requires none).
+`density.oom_heap_kept_bytes` has no baseline for the same reason (0 on
+every VMM, where the spec allows up to 2 MiB; the in-kernel test
+`memory_full_of_cells_is_refused_cleanly` checks that bound).
 `density.sched_p99_us` and `density.wake_p99_us` are gated since
 `add-socket-wait-queues` (design D6). Before it they read the start of
 the load, not its wake-ups: the 10,000 workers, forked beforehand, all run

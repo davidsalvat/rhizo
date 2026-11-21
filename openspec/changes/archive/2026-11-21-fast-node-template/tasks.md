@@ -14,4 +14,4 @@
 
 - [x] 3.1 Verify `openspec validate fast-node-template --strict` and `cargo xtask check`
 - [x] 3.2 Verify `RHIZO_NODE=1 cargo xtask --arch x86_64 test` and `cargo xtask test`
-- [ ] 3.3 CI with KVM: `workload.node_warm_us` below `workload.node_cold_us` on every VMM, no other metric worse
+- [x] 3.3 CI with KVM: `workload.node_warm_us` below `workload.node_cold_us` on every VMM, no other metric worse
