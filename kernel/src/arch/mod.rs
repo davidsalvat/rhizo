@@ -9,7 +9,7 @@
 //!   and `Mmio` (a device's registers)
 //! - `console`: `init`, `BootConsole`; in control builds, `control::{read_byte,
 //!   write}` (the UART both ways); `power`: `init`, `Machine`
-//! - `cpu`: `init`, `supports_1gib_pages`, `activate`, `CpuTlb`
+//! - `cpu`: `init`, `supports_1gib_pages`, `activate`, `CpuTlb`, `flush_all`
 //! - `timer`: `Counter`, `cycles_to_ns`
 //! - `user` (cell builds only): `enter_user`, `Trap`, `release_user`,
 //!   `sync_code`; `platform::{MACHINE, ABI, CELL_ROOT_HAS_KERNEL_HALF}`

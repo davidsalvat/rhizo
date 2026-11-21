@@ -262,6 +262,23 @@ impl Tlb for CpuTlb {
     }
 }
 
+/// Drops every EL1 translation and walk-cache entry on every core (inner
+/// shareable).
+#[cfg(feature = "cells")]
+pub fn flush_all() {
+    // SAFETY: invalidating translations only drops cached entries; the
+    // barriers order it with the preceding table writes.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
+}
+
 /// Executes an undefined instruction (self-check `ktest-invalid-opcode`).
 #[cfg(feature = "ktest-invalid-opcode")]
 pub fn execute_invalid_instruction() {
