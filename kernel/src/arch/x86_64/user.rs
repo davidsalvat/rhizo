@@ -130,6 +130,12 @@ pub fn fp_trap(enable: bool) {
     }
 }
 
+/// Whether FP/SIMD use traps on this CPU now ([`fp_trap`]).
+#[cfg(feature = "ktest")]
+pub fn fp_trapping() -> bool {
+    FP_TRAPS[index()].load(Ordering::Relaxed)
+}
+
 /// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
 /// state of the cell that last ran), leaving FP/SIMD trapping as it was:
 /// the kernel ties it to who owns the registers (design D1 of
@@ -147,13 +153,71 @@ pub fn fp_save(state: &mut FpState) {
     }
 }
 
+/// Whether `FXRSTOR` keeps the x87 `FOP`, `FIP` and `FDP` of whatever ran
+/// before ([`fxsave_leaks`]), set once by [`init_tags`].
+static FXSAVE_LEAK: AtomicBool = AtomicBool::new(false);
+/// What the x87 load before `FXRSTOR` reads where it leaks: its address,
+/// and that instruction's, are all a cell can find of the kernel there.
+static FP_SCRUB: u32 = 0;
+
+/// Whether this CPU's `FXRSTOR` leaves the x87 last-instruction opcode,
+/// instruction pointer and data pointer as they were: AMD and Hygon CPUs
+/// that do not report `XSAVEERPTR` (`CPUID.8000_0008:EBX[2]`), unless the
+/// image has an exception pending, as Linux decides; and QEMU's emulation
+/// (TCG), which reports `XSAVEERPTR` yet never loads them (design D1 of
+/// `scrub-x87-pointers`).
+fn fxsave_leaks() -> bool {
+    use core::arch::x86_64::__cpuid;
+    let errptr =
+        __cpuid(0x8000_0000).eax >= 0x8000_0008 && __cpuid(0x8000_0008).ebx & (1 << 2) != 0;
+    (amd_like() && !errptr) || tcg()
+}
+
+/// Whether the CPU is QEMU's emulation: the hypervisor bit
+/// (`CPUID.1:ECX[31]`) and the signature `TCGTCGTCGTCG` at `0x4000_0000`.
+fn tcg() -> bool {
+    use core::arch::x86_64::__cpuid;
+    if __cpuid(1).ecx & (1 << 31) == 0 {
+        return false;
+    }
+    let sig = __cpuid(0x4000_0000);
+    // "TCGT", "CGTC", "GTCG"
+    [sig.ebx, sig.ecx, sig.edx] == [0x5447_4354, 0x4354_4743, 0x4743_5447]
+}
+
+/// Whether the x87 pointers are scrubbed before each load ([`fxsave_leaks`]
+/// on the boot CPU).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "read by the tests"))]
+pub fn fp_scrubs() -> bool {
+    FXSAVE_LEAK.load(Ordering::Relaxed)
+}
+
 /// Loads the FP/SIMD registers for the cell about to run, leaving FP/SIMD
 /// trapping as it was, like [`fp_save`] (enable it first to load for a
-/// thread that runs with FP/SIMD: no `CR0` write is then undone).
+/// thread that runs with FP/SIMD: no `CR0` write is then undone; design D1
+/// of `lazy-fp-switch`). Where `FXRSTOR` would keep the previous owner's
+/// x87 pointers, an x87 load of a kernel value first replaces them (design
+/// D2 of `scrub-x87-pointers`).
 pub fn fp_load(state: &FpState) {
     let trapping = FP_TRAPS[index()].load(Ordering::Relaxed);
     if trapping {
         fp_trap(false);
+    }
+    if FXSAVE_LEAK.load(Ordering::Relaxed) {
+        // SAFETY: CR0.TS is clear and x87 enabled; `fnclex` drops pending
+        // exceptions so `fild` cannot raise one, `emms` empties the x87
+        // stack so its push cannot overflow, and `FP_SCRUB` is a kernel
+        // static, always mapped. Only x87 state changes, and `FXRSTOR`
+        // below replaces all of it but the pointers.
+        unsafe {
+            asm!(
+                "fnclex",
+                "emms",
+                "fild dword ptr [{}]",
+                in(reg) &FP_SCRUB,
+                options(nostack, readonly, preserves_flags)
+            )
+        };
     }
     // SAFETY: as for `fp_save`; `FXRSTOR` only loads valid images (reserved
     // MXCSR bits are cleared by the kernel's initial image and cannot be set
@@ -171,6 +235,7 @@ pub fn fp_load(state: &FpState) {
 pub fn init_tags() -> u16 {
     enable_sse();
     enable_user_guards();
+    FXSAVE_LEAK.store(fxsave_leaks(), Ordering::Relaxed);
     if core::arch::x86_64::__cpuid(1).ecx & (1 << 17) == 0 {
         return 0;
     }
@@ -456,20 +521,24 @@ const IA32_ARCH_CAPABILITIES: u32 = 0x10a;
 /// decides.
 pub fn kpti_needed() -> bool {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
-    let vendor = __cpuid(0);
-    let name = [vendor.ebx, vendor.edx, vendor.ecx];
-    // "AuthenticAMD", "HygonGenuine"
-    if name == [0x6874_7541, 0x6974_6e65, 0x444d_4163]
-        || name == [0x6f67_7948, 0x6e65_476e, 0x656e_6975]
-    {
+    if amd_like() {
         return false;
     }
-    if vendor.eax >= 7 && __cpuid_count(7, 0).edx & (1 << 29) != 0 {
+    if __cpuid(0).eax >= 7 && __cpuid_count(7, 0).edx & (1 << 29) != 0 {
         // SAFETY: CPUID.7.0:EDX[29] says the MSR exists.
         let caps = unsafe { super::cpu::rdmsr(IA32_ARCH_CAPABILITIES) };
         return caps & 1 == 0;
     }
     true
+}
+
+/// Whether the CPU's vendor is AMD or Hygon.
+fn amd_like() -> bool {
+    let vendor = core::arch::x86_64::__cpuid(0);
+    let name = [vendor.ebx, vendor.edx, vendor.ecx];
+    // "AuthenticAMD", "HygonGenuine"
+    name == [0x6874_7541, 0x6974_6e65, 0x444d_4163]
+        || name == [0x6f67_7948, 0x6e65_476e, 0x656e_6975]
 }
 
 /// Whether KPTI is on.

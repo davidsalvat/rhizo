@@ -127,7 +127,11 @@ What makes the boundary hold:
   uses it is switched in, trapped on first use otherwise, never left in
   the registers for another thread: see *Speculation*), files and
   descriptors (`rhizo_fs::Fs`, private copy-on-write) and the system-call
-  handler (`Abi`) belong to one cell.
+  handler (`Abi`) belong to one cell. On x86_64 CPUs whose `FXRSTOR`
+  keeps the previous x87 instruction and data pointers (AMD and Hygon
+  without `XSAVEERPTR`, and QEMU's emulation), an x87 load of a kernel
+  variable overwrites them before each FP/SIMD load
+  (`scrub-x87-pointers`).
 - **Per-CPU kernel data** (`add-smp-boot`). The entry code finds the
   kernel stack and the running cell's registers through per-CPU data that
   cell code cannot redirect: `TPIDR_EL1` on AArch64 (not accessible at
@@ -226,10 +230,7 @@ and at most 256 sockets (S21).
   a cell that never used FP/SIMD ran right after one that filled them.
 - **Left open.** Spectre v1/v2, L1TF, MDS and their mitigations; the entry
   pages themselves are readable by speculation (they hold per-CPU stack
-  pointers and the cell's own saved RDI, no other cell's data). On AMD
-  CPUs without `XSAVEERPTR`, `FXRSTOR` keeps the x87 last instruction and
-  data pointers of the thread that ran before (Linux's
-  `X86_BUG_FXSAVE_LEAK`).
+  pointers and the cell's own saved RDI, no other cell's data).
 
 ## Randomness
 
