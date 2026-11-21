@@ -176,7 +176,7 @@ Inside a chat:
 | `/suspend` | Suspends the current branch and leaves; `rhizo chat N` resumes it later, history and files included |
 | `/exit` | Ends the current branch and leaves (other branches keep running: `rhizo ps`, `rhizo kill N`) |
 | `/help` | The commands |
-| Ctrl-D | Closes the agent's input: it ends, and the chat with it |
+| Ctrl-D | Closes the agent's input: the branch ends for good (use `/suspend` to leave it for later), and the chat with it |
 
 `model` is the time the agent waited for the model's answers (requests
 sent until answers read); `rhizo` is everything else from Enter to the
@@ -196,6 +196,14 @@ Limits: one conversation on screen; answers appear whole, not token by
 token; a turn cannot be interrupted (a snippet stops by itself after 10 s,
 but a single long call into C runs to its end); a new `rhizo chat N` knows
 only cell `N` until you fork or switch.
+
+The agent's cell has `/app` (the agent), `/usr/lib/python3.13` (the
+standard library) and an empty `/tmp` for scratch files; files a tool
+writes stay in the cell, and travel with it through `/fork` and
+`/suspend`. Small models (1.5B) often answer without calling a tool,
+sometimes with an invented result or an empty answer (shown as
+`(no answer)`): that is the model, not the cell. Asking explicitly ("use
+`run_python` to…") or a larger model (Qwen2.5 7B, Llama 3.1 8B) helps.
 
 ## Driving cells by hand
 

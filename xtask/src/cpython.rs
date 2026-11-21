@@ -229,7 +229,8 @@ pub(crate) fn write_if_changed(path: &Path, data: &[u8]) -> Result {
 }
 
 /// The cell's files: `root` without `usr/bin` (the executable is the
-/// image the cell is spawned from), encoded as a cell file system (D2).
+/// image the cell is spawned from), and an empty `/tmp` for programs that
+/// write scratch files there, encoded as a cell file system (D2).
 fn encode(root: &Path) -> Result<Vec<u8>> {
     let mut fs = rhizo_fs::Fs::new();
     fs.mkdir(None, b"/usr")
@@ -237,6 +238,8 @@ fn encode(root: &Path) -> Result<Vec<u8>> {
     for top in ["usr/lib", "app"] {
         add_tree(&mut fs, &root.join(top), &format!("/{top}"))?;
     }
+    fs.mkdir(None, b"/tmp")
+        .map_err(|e| format!("cannot make /tmp: {e:?}"))?;
     let mut out = Vec::new();
     fs.encode(&mut out);
     Ok(out)
@@ -322,5 +325,6 @@ mod tests {
             fs.stat(None, b"/usr/bin").is_err(),
             "the executable is not a file"
         );
+        assert!(fs.stat(None, b"/tmp").is_ok(), "a /tmp for scratch files");
     }
 }

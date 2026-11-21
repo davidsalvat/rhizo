@@ -33,11 +33,11 @@ fn net_err(e: NetError) -> i64 {
 
 /// The socket handle of `fd` and its family and type.
 fn socket_of<F, M, T, A, S>(
-    cx: &Context<'_, F, M, T, A, S>,
+    cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
 ) -> Result<(Handle, Family, Type), i64> {
     let h = cx.fs.socket(fd as u32).map_err(err)?;
-    let (family, ty) = cx.net.kind(h).map_err(net_err)?;
+    let (family, ty) = cx.net.net().kind(h).map_err(net_err)?;
     Ok((h, family, ty))
 }
 
@@ -163,7 +163,7 @@ pub(crate) fn socket<F, M, T, A, S>(
     if !protocol_ok {
         return -EPROTONOSUPPORT;
     }
-    let h = match cx.net.socket(family, kind) {
+    let h = match cx.net.net().socket(family, kind) {
         Ok(h) => h,
         Err(e) => return net_err(e),
     };
@@ -178,7 +178,7 @@ fn open_fd<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, h: Handle, flags:
     {
         Ok(fd) => fd as i64,
         Err(e) => {
-            cx.net.release(h);
+            cx.net.net().release(h);
             err(e)
         }
     }
@@ -195,13 +195,13 @@ pub(crate) fn socketpair<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         (2, _, _) => return -EOPNOTSUPP,
         _ => return -EAFNOSUPPORT,
     }
-    let (x, y) = match cx.net.pair() {
+    let (x, y) = match cx.net.net().pair() {
         Ok(pair) => pair,
         Err(e) => return net_err(e),
     };
     let fx = open_fd(cx, x, flags);
     if fx < 0 {
-        cx.net.release(y);
+        cx.net.net().release(y);
         return fx;
     }
     let fy = open_fd(cx, y, flags);
@@ -229,17 +229,21 @@ pub(crate) fn bind<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     let run = |cx: &mut Context<'_, F, M, T, A, S>| -> Result<i64, i64> {
         let (h, family, _) = socket_of(cx, fd)?;
         match read_addr(cx, family, addr, len)? {
-            Given::Inet(ip, port) => cx.net.bind(h, &Addr::Inet { ip, port }).map_err(net_err)?,
+            Given::Inet(ip, port) => cx
+                .net
+                .net()
+                .bind(h, &Addr::Inet { ip, port })
+                .map_err(net_err)?,
             Given::UnixPath(path) => {
-                if cx.net.local_addr(h).map_err(net_err)?.is_some() {
+                if cx.net.net().local_addr(h).map_err(net_err)?.is_some() {
                     return Err(-EINVAL);
                 }
-                let name = cx.net.new_name();
+                let name = cx.net.net().new_name();
                 cx.fs.bind_name(None, &path, name).map_err(|e| match e {
                     rhizo_fs::Error::Exists => -EADDRINUSE,
                     e => err(e),
                 })?;
-                if let Err(e) = cx.net.bind(
+                if let Err(e) = cx.net.net().bind(
                     h,
                     &Addr::Unix {
                         name,
@@ -269,7 +273,7 @@ pub(crate) fn listen<F, M, T, A, S>(
         b if b < 0 => rhizo_net::BACKLOG_MAX,
         b => b as usize,
     };
-    match cx.net.listen(h, backlog) {
+    match cx.net.net().listen(h, backlog) {
         Ok(()) => 0,
         Err(e) => net_err(e),
     }
@@ -292,11 +296,11 @@ pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     if ty == Type::Dgram {
         return -EOPNOTSUPP;
     }
-    let conn = match cx.net.accept(h) {
+    let conn = match cx.net.net().accept(h) {
         Ok(conn) => conn,
         Err(NetError::Again) => {
             let nonblocking = cx.fs.nonblocking(fd as u32).unwrap_or(true);
-            let timeout = cx.net.options(h).map_or(0, |o| o.rcv_timeout_ns);
+            let timeout = cx.net.net().options(h).map_or(0, |o| o.rcv_timeout_ns);
             return would_wait(cx, nonblocking, (timeout != 0).then_some(timeout));
         }
         Err(e) => return net_err(e),
@@ -305,7 +309,7 @@ pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     if new < 0 || addr == 0 {
         return new;
     }
-    let peer = cx.net.peer_addr(conn).unwrap_or(Addr::UnixUnnamed);
+    let peer = cx.net.net().peer_addr(conn).unwrap_or(Addr::UnixUnnamed);
     match write_addr(cx, &peer, addr, lenp) {
         0 => new,
         e => {
@@ -331,7 +335,7 @@ pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
             }
         };
         let nonblocking = cx.fs.nonblocking(fd as u32).unwrap_or(false);
-        match cx.net.connect(h, &to) {
+        match cx.net.net().connect(h, &to) {
             Ok(()) => {}
             // Through the network card the handshake takes time: a blocking
             // call waits and is made again until it reports the connection
@@ -413,12 +417,12 @@ fn send_bytes<F, M, T, A, S: Services>(
     if !cx.services.can_store(bytes.len() as u64) {
         return -ENOBUFS;
     }
-    match cx.net.send(h, bytes, dest) {
+    match cx.net.net().send(h, bytes, dest) {
         Ok(n) => n as i64,
         Err(NetError::Again) => {
             let nonblocking =
                 flags & MSG_DONTWAIT != 0 || cx.fs.nonblocking(fd as u32).unwrap_or(true);
-            let timeout = cx.net.options(h).map_or(0, |o| o.snd_timeout_ns);
+            let timeout = cx.net.net().options(h).map_or(0, |o| o.snd_timeout_ns);
             would_wait(cx, nonblocking, (timeout != 0).then_some(timeout))
         }
         Err(e) => net_err(e),
@@ -490,6 +494,7 @@ fn recv_into<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     let (pt, mem, pager) = (&cx.pt, &mut *cx.mem, &mut *cx.pager);
     let got = cx
         .net
+        .net()
         .recv(h, len as usize, flags & MSG_PEEK != 0, &mut |piece| {
             into.put(pt, mem, pager, piece)
         });
@@ -507,7 +512,7 @@ fn recv_into<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         Err(NetError::Again) => {
             let nonblocking =
                 flags & MSG_DONTWAIT != 0 || cx.fs.nonblocking(fd as u32).unwrap_or(true);
-            let timeout = cx.net.options(h).map_or(0, |o| o.rcv_timeout_ns);
+            let timeout = cx.net.net().options(h).map_or(0, |o| o.rcv_timeout_ns);
             (
                 would_wait(cx, nonblocking, (timeout != 0).then_some(timeout)),
                 None,
@@ -673,7 +678,7 @@ pub(crate) fn shutdown<F, M, T, A, S>(
         Ok(s) => s,
         Err(e) => return e,
     };
-    match cx.net.shutdown(h, how) {
+    match cx.net.net().shutdown(h, how) {
         Ok(()) => 0,
         Err(e) => net_err(e),
     }
@@ -692,12 +697,12 @@ pub(crate) fn name<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         Err(e) => return e,
     };
     let a = if peer {
-        match cx.net.peer_addr(h) {
+        match cx.net.net().peer_addr(h) {
             Ok(a) => a,
             Err(e) => return net_err(e),
         }
     } else {
-        match (cx.net.local_addr(h), family) {
+        match (cx.net.net().local_addr(h), family) {
             (Ok(Some(a)), _) => a,
             (Ok(None), Family::Inet) => Addr::Inet {
                 ip: rhizo_net::ANY,
@@ -764,7 +769,7 @@ pub(crate) fn setsockopt<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         }
         cx.read(val, &mut raw[..want]).map_err(|_| -EFAULT)?;
         let int = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        let mut o = cx.net.options(h).map_err(net_err)?;
+        let mut o = cx.net.net().options(h).map_err(net_err)?;
         let buf = |v: i32, min: u32| (v.max(0) as u32).min(BUF_MAX).saturating_mul(2).max(min);
         let tcp = family == Family::Inet && ty == Type::Stream;
         match (level, name) {
@@ -807,7 +812,7 @@ pub(crate) fn setsockopt<F: EntryFormat, M: PhysicalMemory, T, A, S>(
             (IPPROTO_TCP, TCP_KEEPCNT) => o.keep_cnt = int as u32,
             _ => return Err(-ENOPROTOOPT),
         }
-        cx.net.set_options(h, o).map_err(net_err)?;
+        cx.net.net().set_options(h, o).map_err(net_err)?;
         Ok(0)
     };
     run(cx).unwrap_or_else(|e| e)
@@ -821,7 +826,7 @@ pub(crate) fn getsockopt<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         Ok(s) => s,
         Err(e) => return e,
     };
-    let Ok(o) = cx.net.options(h) else {
+    let Ok(o) = cx.net.net().options(h) else {
         return -EBADF;
     };
     let (level, name) = (a[1], a[2]);
@@ -854,9 +859,9 @@ pub(crate) fn getsockopt<F: EntryFormat, M: PhysicalMemory, T, A, S>(
             (Family::Inet, Type::Dgram) => IPPROTO_UDP as u32,
             _ => 0,
         }),
-        (SOL_SOCKET, SO_ACCEPTCONN) => flag(cx.net.is_listening(h)),
+        (SOL_SOCKET, SO_ACCEPTCONN) => flag(cx.net.net().is_listening(h)),
         (SOL_SOCKET, SO_ERROR) => {
-            let e = cx.net.take_error(h).ok().flatten();
+            let e = cx.net.net().take_error(h).ok().flatten();
             int(e.map_or(0, |e| e.errno() as u32))
         }
         (IPPROTO_TCP, _) if !tcp => return -EOPNOTSUPP,
