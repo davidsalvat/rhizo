@@ -33,6 +33,8 @@ pub enum Only {
     Server,
     /// The Node.js workload (change `add-node-workload`).
     Node,
+    /// The control plane's figures (change `measure-control-path`).
+    Control,
 }
 
 /// Options for `cargo xtask bench`.
@@ -131,9 +133,11 @@ impl Options {
                         "laptop" => Only::Laptop,
                         "server" => Only::Server,
                         "node" => Only::Node,
+                        "control" => Only::Control,
                         other => {
                             return Err(format!(
-                                "unknown workload `{other}` (expected laptop, server or node)"
+                                "unknown workload `{other}` (expected laptop, server, node or \
+                                 control)"
                             ));
                         }
                     });
@@ -345,6 +349,8 @@ fn measure(opts: &Options) -> Result<Results> {
             crate::profile::measure_icount(&mut metrics, &mut skipped)?;
         } else if opts.workload == Some(Only::Node) {
             measure_runtime(opts, &mut metrics, &mut skipped, &NODE)?;
+        } else if opts.workload == Some(Only::Control) {
+            crate::control::measure(&opts.vmms, opts.accel, &mut metrics, &mut skipped)?;
         } else {
             crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
         }

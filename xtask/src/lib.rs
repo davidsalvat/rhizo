@@ -80,9 +80,10 @@ Commands:
       --no-icount            Skip the instruction counts under QEMU -icount
       --icount-only          Only those instruction counts (hosts without
                              KVM, such as GitHub's ARM64 runners)
-      --workload <laptop|server|node>
+      --workload <laptop|server|node|control>
                              Only this workload (all run by default, after
-                             the cell figures; Node.js with RHIZO_NODE)
+                             the cell figures; Node.js with RHIZO_NODE;
+                             control: the control plane's figures)
       --soak                 The long versions of the workloads (weekly)
       --cells <n>            Cells of the server workload (default 10000)
       --cpus <n>             Virtual CPUs of the server VM (default 1;
