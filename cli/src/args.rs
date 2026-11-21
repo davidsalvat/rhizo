@@ -49,6 +49,9 @@ Commands:
   attach <id>                Show a cell's output until it ends
   kill <id>                  End a cell, or forget one that ended
   down                       Power the VM off
+  snapshot upgrade <in> <out>
+                             Convert a file saved by an older kernel (one
+                             format version before) to the current version
 
 Every command prints the time the kernel took and the round trip from the
 host. The state (VM, control socket, console log) lives in --state, or
@@ -124,6 +127,12 @@ pub enum Command {
     Attach(u32),
     Kill(u32),
     Down,
+    /// `snapshot upgrade IN OUT`: converts a saved file to the current
+    /// format version (no VM needed).
+    SnapshotUpgrade {
+        input: PathBuf,
+        output: PathBuf,
+    },
     Help,
 }
 
@@ -216,6 +225,13 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         "attach" => Command::Attach(id(args, "attach")?),
         "kill" => Command::Kill(id(args, "kill")?),
         "down" => Command::Down,
+        "snapshot" => match args {
+            [sub, input, output] if sub == "upgrade" => Command::SnapshotUpgrade {
+                input: PathBuf::from(input),
+                output: PathBuf::from(output),
+            },
+            _ => return Err("usage: rhizo snapshot upgrade <in> <out>".into()),
+        },
         "help" | "--help" | "-h" => Command::Help,
         other => return Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
@@ -427,6 +443,15 @@ mod tests {
         assert!(parse_words("load a b").is_err());
         assert_eq!(command("kill 7"), Command::Kill(7));
         assert_eq!(command("down"), Command::Down);
+        assert_eq!(
+            command("snapshot upgrade old.rhz new.rhz"),
+            Command::SnapshotUpgrade {
+                input: "old.rhz".into(),
+                output: "new.rhz".into()
+            }
+        );
+        assert!(parse_words("snapshot upgrade old.rhz").is_err());
+        assert!(parse_words("snapshot downgrade a b").is_err());
         assert_eq!(command("list"), Command::Ps);
         assert!(parse_words("kill").is_err());
         assert!(parse_words("kill x").is_err());

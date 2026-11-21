@@ -15,6 +15,7 @@ rhizo-mm = { path = "../rhizo-mm" }
 rhizo-cell = { path = "../rhizo-cell" }
 rhizo-fs = { path = "../rhizo-fs" }
 rhizo-net = { path = "../rhizo-net" }
+rhizo-cap = { path = "../rhizo-cap" }
 
 [dev-dependencies]
 rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }

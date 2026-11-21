@@ -3,7 +3,7 @@
 //! its domain and its number there, and what its end does to its subtree.
 
 use super::*;
-use rhizo_cap::{Limits, Spec, Tree};
+use rhizo_cap::{Egress, Limits, Spec, Tree};
 
 /// A fresh domain identifier: from the cells' own counter, so never 0 and
 /// never one another domain had in this boot.
@@ -85,15 +85,36 @@ impl Host {
             .is_ok()
     }
 
-    /// Places a cell restored from `snapshot`'s state, not yet run: under
-    /// the parent it had, in its domain, if it was suspended from this
-    /// host; otherwise as the root of a new domain (spec `snapshots`, loaded
-    /// snapshots hold no authority). Either way it is a copy and takes a new
-    /// number (design D22): a loaded one never 1, the number of the roots
-    /// most snapshots come from, until the snapshot holds its own number
-    /// (format version 11). Its threads keep their identifiers. `false` if
-    /// the tree has no room.
-    pub(super) fn enter_restored(&mut self, cell: &mut Cell, origin: u32) -> bool {
+    /// Records in `snapshot`, taken of cell `id`, its node's limits and
+    /// policies (format version 11, spec `snapshots`, tree state).
+    pub(super) fn record_tree(&self, snapshot: &mut Snapshot, id: u32) {
+        let Some(n) = self.tree.get(id) else {
+            return;
+        };
+        let p = n.policy();
+        snapshot.set_tree(&Spec {
+            limits: n.limits(),
+            on_parent_end: n.on_parent_end(),
+            egress: p.egress.clone(),
+            ceiling: Some(p.ceiling.clone()),
+            label: p.label.clone(),
+            weight: p.weight,
+            cpu_max: p.cpu_max,
+            cpus: p.cpus,
+        });
+    }
+
+    /// Places a cell restored from `snapshot`, not yet run: under the
+    /// parent it had, in its domain, if it was suspended from this host;
+    /// otherwise as the root of a new domain, with no authority from the
+    /// bytes (spec `snapshots`, loaded snapshots hold no authority): egress
+    /// and ceiling `none`, limits within the quotas the host left it, no
+    /// CPU set. Either way it is a copy and takes a new number (design
+    /// D22), never the one the snapshot holds (1, its likeliest, when a
+    /// version-10 file holds none). Its threads keep their identifiers.
+    /// `false` if the tree has no room.
+    pub(super) fn enter_restored(&mut self, cell: &mut Cell, snapshot: &Snapshot) -> bool {
+        let origin = snapshot.origin();
         if let Some(at) = self.suspended.iter().position(|&s| s == origin)
             && let Some(n) = self.tree.rekey(origin, cell.id)
         {
@@ -101,11 +122,15 @@ impl Host {
             self.suspended.swap_remove(at);
             return true;
         }
-        let spec = Spec {
-            limits: root_limits(&cell.quota),
-            ..Spec::default()
+        let Ok(spec) = snapshot.placed(&Egress::None, &Egress::None, root_limits(&cell.quota))
+        else {
+            return false;
         };
-        let Ok(pid) = self.tree.add_root(cell.id, spec, 1) else {
+        let source = match snapshot.tree().pid {
+            0 => 1,
+            pid => pid,
+        };
+        let Ok(pid) = self.tree.add_root(cell.id, spec, source) else {
             return false;
         };
         (cell.pid, cell.domain) = (pid, cell.id);

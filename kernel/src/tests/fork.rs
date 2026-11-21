@@ -249,8 +249,8 @@ fn tainted_template_not_published() {
 /// Two loads of the bytes of a template that was itself a copy (it read
 /// generation 1 before it was frozen) each read a generation that is not
 /// 1 and not the other's, so each reseeds and draws its own numbers
-/// (design D22 of `add-cell-hierarchy`: the bytes do not hold the
-/// generation until format version 11).
+/// (design D22 of `add-cell-hierarchy`: the bytes hold the template's
+/// generation, and each load draws its own).
 fn loads_of_a_copied_template_see_new_generations() {
     let mut host = Host::new();
     let first = spawn(&mut host, "copies", &[b"wait"]);

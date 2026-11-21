@@ -683,8 +683,14 @@ fn describe(e: FormatError) -> String {
         FormatError::Truncated => String::from("truncated"),
         FormatError::BadMagic => String::from("not a Rhizo snapshot"),
         FormatError::Version(v) => format!(
-            "snapshot format version {v}; this kernel reads version {}",
-            rhizo_snapshot::VERSION
+            "snapshot format version {v}; this kernel reads versions {} and {}{}",
+            rhizo_snapshot::PREVIOUS,
+            rhizo_snapshot::VERSION,
+            if v < rhizo_snapshot::PREVIOUS {
+                " (convert it with `rhizo snapshot upgrade`)"
+            } else {
+                ""
+            }
         ),
         FormatError::Machine { expected, found } => format!(
             "taken on {}; this kernel runs on {}",
