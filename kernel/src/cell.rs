@@ -867,10 +867,9 @@ pub struct Host {
     /// Frozen cells and their files: never run, only forked (spec `fork`,
     /// templates).
     templates: Vec<(Cell, Fs)>,
-    /// When the network card is to be polled next, and what its last poll
-    /// said: nanoseconds until it wants polling (design D4 of
-    /// `add-virtio-net`; `None`: no card). The boot CPU polls it.
-    wire_due: u64,
+    /// What the network card's last poll said: nanoseconds until it wants
+    /// polling (design D4 of `add-virtio-net`; `None`: no card). The boot
+    /// CPU polls it, when [`WIRE_DUE`] says.
     wire_delay: Option<u64>,
     /// The card's address after its last poll.
     wire_addr: Option<[u8; 4]>,
@@ -966,15 +965,25 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
     })
 }
 
-/// A system call gave `smoltcp` something to send: the boot CPU, which
-/// polls the card, polls it at its next step, woken for it if it waits
-/// (design D3 of `add-virtio-interrupts`).
-static WIRE_WORK: AtomicBool = AtomicBool::new(false);
+/// When the boot CPU polls the network card next (nanoseconds since boot).
+/// A system call that gave `smoltcp` something to send, or an interrupt
+/// while frames wait in the card's ring, sets it to 0: the card is polled at
+/// the boot CPU's next step (design D3 of `add-virtio-interrupts`).
+static WIRE_DUE: AtomicU64 = AtomicU64::new(0);
 
-fn wire_work() {
-    WIRE_WORK.store(true, Ordering::Release);
-    if crate::arch::cpu::index() != 0 {
-        crate::smp::wake(0);
+/// What a system call left for the kernel under the sockets' lock: woken
+/// waiters to drain, or work for the wire.
+#[cold]
+#[inline(never)]
+fn after_call(net: &mut Net) {
+    if net.has_woken() {
+        WOKEN.store(true, Ordering::Release);
+    }
+    if net.take_wire_work() {
+        WIRE_DUE.store(0, Ordering::Release);
+        if crate::arch::cpu::index() != 0 {
+            crate::smp::wake(0);
+        }
     }
 }
 
@@ -1024,6 +1033,18 @@ fn wait(wake: Option<u64>) {
         None => prof::idle(crate::smp::idle),
     }
     cost::after_idle();
+    card_interrupt();
+}
+
+/// After an interrupt: if it may have been the card's (frames wait in its
+/// ring), the boot CPU polls the card at its next step (design D3 of
+/// `add-virtio-interrupts`).
+#[cold]
+#[inline(never)]
+fn card_interrupt() {
+    if crate::wire::interrupts() && crate::wire::pending() {
+        WIRE_DUE.store(0, Ordering::Release);
+    }
 }
 
 /// Puts `live`, back from a slice on `cpu`, where `how` says, and wakes an
@@ -1232,7 +1253,7 @@ fn syscall(
             // sockets it looked at (design D1 of `add-socket-wait-queues`).
             let waits = || matches!(live.cell.threads.current().wait, Wait::Io { .. });
             if net.end_call(|| waits().then_some(live.cell.id)) {
-                WOKEN.store(true, Ordering::Release);
+                after_call(net);
             }
             if prof::on() {
                 if net.changes() != changes {
@@ -1241,9 +1262,6 @@ fn syscall(
                 if core::mem::take(&mut live.io_woken) && waits() {
                     prof::add(Count::IoWasted, 1);
                 }
-            }
-            if net.take_wire_work() {
-                wire_work();
             }
             (outcome, deadline)
         })
@@ -1339,6 +1357,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     continue;
                 }
                 Trap::Interrupt => {
+                    card_interrupt();
                     if cost::timer_sampling() {
                         cost::sample(live.cell.id, live.cell.regs().pc);
                     }
@@ -1828,6 +1847,7 @@ fn run_gang(
                 }
                 Trap::Sample => cost::sample(gang.id, regs.pc),
                 Trap::Interrupt => {
+                    card_interrupt();
                     if cost::timer_sampling() {
                         cost::sample(gang.id, regs.pc);
                     }
@@ -1915,6 +1935,8 @@ fn sync_fp(live: &mut Live, leaving: bool) {
 impl Host {
     /// An empty host for every CPU online.
     pub fn new() -> Self {
+        // A new host polls the card at its first step.
+        WIRE_DUE.store(0, Ordering::Relaxed);
         Self {
             shared: Global::new(Shared {
                 sched: Scheduler::new(crate::smp::count()),
@@ -1928,7 +1950,6 @@ impl Host {
             }),
             finished: Vec::new(),
             templates: Vec::new(),
-            wire_due: 0,
             wire_delay: None,
             wire_addr: None,
             look_every: None,
@@ -2319,7 +2340,7 @@ impl Host {
             (w, every) => w.or(every.map(|e| now.saturating_add(e))),
         };
         if waiting && self.wire_delay.is_some() {
-            self.wire_due = 0;
+            WIRE_DUE.store(0, Ordering::Relaxed);
             self.poll_wire(now);
             if WOKEN.load(Ordering::Acquire) {
                 return true; // the next take wakes them
@@ -2344,15 +2365,17 @@ impl Host {
 
     /// Polls the network card when it is due (every scheduling step at most
     /// once per [`WIRE_PERIOD_NS`]), and reports a new address.
+    #[inline(always)]
     fn poll_wire(&mut self, now: u64) {
-        // A plain load first: the common step has nothing to do here.
-        if now < self.wire_due
-            && !WIRE_WORK.load(Ordering::Relaxed)
-            && !(crate::wire::interrupts() && crate::wire::pending())
-        {
-            return;
+        // The check inline, at every step; the poll out of line.
+        let due = WIRE_DUE.load(Ordering::Acquire);
+        if now >= due {
+            self.poll_wire_now(now, due);
         }
-        WIRE_WORK.store(false, Ordering::Relaxed);
+    }
+
+    #[inline(never)]
+    fn poll_wire_now(&mut self, now: u64, due: u64) {
         let _p = cost::scope(Part::Net);
         let (delay, addr) = with_net(|net| (crate::wire::poll(net, now), net.wire_addr()));
         // As often as the wire needs, but not more than once per period,
@@ -2363,7 +2386,10 @@ impl Host {
         } else {
             1_000_000
         };
-        self.wire_due = now.saturating_add(delay.unwrap_or(u64::MAX).clamp(WIRE_PERIOD_NS, most));
+        let next = now.saturating_add(delay.unwrap_or(u64::MAX).clamp(WIRE_PERIOD_NS, most));
+        // Unless work came for the wire meanwhile (it set 0: polled again at
+        // the next step).
+        let _ = WIRE_DUE.compare_exchange(due, next, Ordering::AcqRel, Ordering::Relaxed);
         self.wire_delay = delay;
         self.wire_addr = addr;
         let packed = addr.map_or(0, u32::from_be_bytes);
@@ -2392,7 +2418,7 @@ impl Host {
         let end = now_ns().saturating_add(timeout_ns);
         loop {
             let now = now_ns();
-            self.wire_due = 0;
+            WIRE_DUE.store(0, Ordering::Relaxed);
             self.poll_wire(now);
             if self.wire_addr.is_some() || self.wire_delay.is_none() || now >= end {
                 return self.wire_addr;

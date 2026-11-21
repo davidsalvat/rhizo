@@ -43,6 +43,13 @@ With an interrupting card, the scheduler's poll (`poll_wire`) runs when:
   a `connect`, `send` or `sendto` on the card, a read that opened room in
   a receive window, a close. A call on another CPU wakes the boot CPU for it.
 
+The last two set `WIRE_DUE`, the time of the next poll, to 0: a system
+call as it ends (under the sockets' lock, when `Net::end_call` reports work
+for the wire), and any CPU after an interrupt or a wait for one, when
+frames wait in the card's ring. The scheduler's check at every step stays a
+single load and comparison, inlined; the poll is out of line, and a poll
+that started before a 0 was stored does not overwrite it.
+
 The 20 us poll while connections wait (`BUSY_NS`) and the 1 ms poll for frames
 nobody waits for apply only to cards without interrupts.
 

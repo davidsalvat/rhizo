@@ -383,9 +383,10 @@ impl Net {
     /// The end of a call: if it blocks (`waiter` says who waits, asked only
     /// when the call looked at sockets), the waiter joins the wait queue of
     /// each socket the call looked at (once), and is woken by the next
-    /// change to one of them. Returns whether waiters were woken since the
-    /// last [`drain_woken`](Self::drain_woken), as
-    /// [`has_woken`](Self::has_woken) does.
+    /// change to one of them. Returns whether the caller has something to
+    /// do: waiters woken since the last [`drain_woken`](Self::drain_woken)
+    /// ([`has_woken`](Self::has_woken)), or work for the wire
+    /// ([`take_wire_work`](Self::take_wire_work)).
     pub fn end_call(&mut self, waiter: impl FnOnce() -> Option<u32>) -> bool {
         let looked = self.looked.get_mut();
         if !looked.is_empty() {
@@ -400,7 +401,7 @@ impl Net {
             }
             looked.clear();
         }
-        !self.woken.is_empty()
+        !self.woken.is_empty() || self.wire_work
     }
 
     /// Takes `waiter` off the wait queue of `h` (it is gone).
