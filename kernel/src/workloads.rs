@@ -177,9 +177,6 @@ fn laptop(console: &mut impl Console) {
     let wakeups = prof::get(Count::IdleWakeups) - w0;
     let _ = writeln!(out, "rhizo-mark idle-end");
 
-    for d in &crate::wire::DIAG {
-        d.store(0, core::sync::atomic::Ordering::Relaxed);
-    }
     let mut turn = Vec::new();
     for round in 1..=TURNS {
         for &id in &agents {
@@ -189,28 +186,6 @@ fn laptop(console: &mut impl Console) {
             turn.push(ns(t0));
         }
     }
-    // Diagnostic: the phases of the slowest turn (connect, sent, first
-    // bytes, end), and the card's polls and frames during the turns.
-    let mut slow = [0u64; 4];
-    for &id in &agents {
-        let text = String::from_utf8_lossy(host.output(id).unwrap_or_default()).into_owned();
-        for l in text.lines().filter(|l| l.starts_with("ph ")) {
-            let v: Vec<u64> = l[3..].split(' ').filter_map(|x| x.parse().ok()).collect();
-            if v.len() == 4 && v[3] > slow[3] {
-                slow.copy_from_slice(&v);
-            }
-        }
-    }
-    let diag = alloc::format!(
-        "diag_connect_us={} diag_sent_us={} diag_first_us={} diag_end_us={} diag_polls={} diag_rx={} diag_tx={}",
-        slow[0],
-        slow[1],
-        slow[2],
-        slow[3],
-        crate::wire::DIAG[0].load(core::sync::atomic::Ordering::Relaxed),
-        crate::wire::DIAG[1].load(core::sync::atomic::Ordering::Relaxed),
-        crate::wire::DIAG[2].load(core::sync::atomic::Ordering::Relaxed),
-    );
     let (mut resume, mut resume_turn) = (Vec::new(), Vec::new());
     for snapshot in snapshots {
         let t0 = Counter.cycles();
@@ -231,7 +206,7 @@ fn laptop(console: &mut impl Console) {
         out,
         "rhizo-laptop agents={AGENTS} suspended={} open_ns={} suspend_ns={} resume_ns={} \
          turn_ns={} resume_turn_ns={} memory_bytes={} template_bytes={} live_bytes={} \
-         snapshot_bytes={snapshot_bytes} idle_ns={idle_ns} idle_wakeups={wakeups} {diag}",
+         snapshot_bytes={snapshot_bytes} idle_ns={idle_ns} idle_wakeups={wakeups}",
         AGENTS - LIVE,
         median(&mut open),
         median(&mut suspend),

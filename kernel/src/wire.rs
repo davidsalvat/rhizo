@@ -144,38 +144,12 @@ fn pci_card(alloc: &mut dyn FnMut() -> Option<u64>) -> Option<(String, Card)> {
 /// runs (design D4).
 const BUSY_NS: u64 = 20_000;
 
-/// Diagnostic counts: polls, frames received, frames sent.
-pub static DIAG: [core::sync::atomic::AtomicU64; 3] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
-
-struct Counting<'a>(&'a mut Card);
-
-impl NetLink for Counting<'_> {
-    fn mac(&self) -> [u8; 6] {
-        self.0.mac()
-    }
-    fn send(&mut self, frame: &[u8]) -> bool {
-        DIAG[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        self.0.send(frame)
-    }
-    fn recv(&mut self, take: &mut dyn FnMut(&[u8])) -> bool {
-        let got = self.0.recv(take);
-        if got {
-            DIAG[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-        got
-    }
-}
-
 /// Polls the card and `smoltcp`; returns in how many nanoseconds they want
 /// to be polled again, if there is a card.
 pub fn poll(net: &mut Net, now_ns: u64) -> Option<u64> {
     LINK.with(|l| {
         let link = l.as_mut()?;
-        DIAG[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let delay = net
-            .poll_wire(&mut Counting(link), now_ns)
-            .unwrap_or(u64::MAX);
+        let delay = net.poll_wire(link, now_ns).unwrap_or(u64::MAX);
         Some(if net.wire_busy() {
             delay.min(BUSY_NS)
         } else {

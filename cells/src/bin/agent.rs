@@ -14,43 +14,8 @@
 #![no_main]
 
 use rhizo_cells::{
-    arg, check, loopback, now_ns, nr, number, print, sleep_ns, syscall, tcp_socket, write_all,
+    arg, check, loopback, nr, number, print, sleep_ns, syscall, tcp_socket, write_all,
 };
-
-static mut PH: [u64; 5] = [0; 5];
-
-fn mark(i: usize) {
-    // SAFETY: single-threaded program.
-    unsafe { (*core::ptr::addr_of_mut!(PH))[i] = now_ns() };
-}
-
-fn print_phases() {
-    // SAFETY: single-threaded program.
-    let ph = unsafe { *core::ptr::addr_of!(PH) };
-    let mut line = [b' '; 128];
-    line[..2].copy_from_slice(b"ph");
-    let mut at = 2;
-    for i in 1..5 {
-        let mut n = (ph[i] - ph[0]) / 1000;
-        let mut digits = [0u8; 20];
-        let mut k = 0;
-        loop {
-            digits[k] = b'0' + (n % 10) as u8;
-            k += 1;
-            n /= 10;
-            if n == 0 {
-                break;
-            }
-        }
-        at += 1;
-        for d in digits[..k].iter().rev() {
-            line[at] = *d;
-            at += 1;
-        }
-    }
-    line[at] = b'\n';
-    print(&line[..at + 1]);
-}
 
 const AT_FDCWD: usize = -100isize as usize;
 const HISTORY: usize = 1 << 20;
@@ -96,7 +61,6 @@ fn ipv4(text: &[u8]) -> [u8; 4] {
 /// One request to the model; returns the length of the answer's body,
 /// which is left in `answer`.
 fn ask(ip: [u8; 4], port: u16, answer: &mut [u8]) -> usize {
-    mark(0);
     let c = tcp_socket(0);
     check(c >= 0, "socket");
     let c = c as usize;
@@ -106,7 +70,6 @@ fn ask(ip: [u8; 4], port: u16, answer: &mut [u8]) -> usize {
         syscall(nr::CONNECT, [c, addr.as_ptr() as usize, 16, 0, 0, 0]) == 0,
         "connect to the model",
     );
-    mark(1);
     let body = b"{\"messages\":[{\"role\":\"user\",\"content\":\"next step\"}]}";
     let head = b"POST /v1/chat/completions HTTP/1.1\r\nHost: model\r\n\
                  Content-Type: application/json\r\nConnection: close\r\nContent-Length: ";
@@ -117,7 +80,6 @@ fn ask(ip: [u8; 4], port: u16, answer: &mut [u8]) -> usize {
     for part in [&head[..], &len, b"\r\n\r\n", body] {
         check(write_all(c, part) == part.len() as isize, "send");
     }
-    mark(2);
     // The answer, until the model closes the connection.
     let mut got = 0;
     loop {
@@ -133,16 +95,12 @@ fn ask(ip: [u8; 4], port: u16, answer: &mut [u8]) -> usize {
             ],
         );
         check(n >= 0, "receive");
-        if got == 0 {
-            mark(3);
-        }
         if n == 0 {
             break;
         }
         got += n as usize;
         check(got < answer.len(), "answer too long");
     }
-    mark(4);
     syscall(nr::CLOSE, [c, 0, 0, 0, 0, 0]);
     check(answer.starts_with(b"HTTP/1.1 200"), "status");
     let start = answer[..got]
@@ -183,7 +141,6 @@ fn main() -> i32 {
         memory[turn % HISTORY] = answer[0];
         check(notes_digest() == digest, "shared notes unchanged");
         turn += 1;
-        print_phases();
         print(b"turn\n");
     }
 }
