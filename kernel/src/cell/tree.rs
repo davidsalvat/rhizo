@@ -50,10 +50,10 @@ impl Host {
             limits: root_limits(&cell.quota),
             ..Spec::default()
         };
-        if self.tree.add_root(cell.id, domain, spec, 0).is_err() {
+        let Ok(pid) = self.tree.add_root(cell.id, domain, spec, 0) else {
             return false;
-        }
-        cell.renumber(self.tree.get(cell.id).map_or(cell.id, |n| n.pid()));
+        };
+        cell.renumber(pid);
         cell.domain = domain;
         true
     }
@@ -63,20 +63,27 @@ impl Host {
     /// threads' identifiers and take new numbers in their domain, never the
     /// source's (design D22).
     pub(super) fn enter_copies(&mut self, source: u32, copies: &mut [Box<Live>]) -> bool {
-        let ids: Vec<u32> = copies.iter().map(|c| c.cell.id).collect();
+        // One copy, as most often, needs no list.
+        let one = [copies.first().map_or(0, |c| c.cell.id)];
+        let many: Vec<u32> = match copies.len() {
+            1 => Vec::new(),
+            _ => copies.iter().map(|c| c.cell.id).collect(),
+        };
+        let ids = if copies.len() == 1 {
+            &one[..]
+        } else {
+            &many[..]
+        };
         let parent = self.tree.get(source).map_or(0, |n| n.parent());
         let used = self.usage(parent);
-        if self
-            .tree
-            .add_copies(source, &ids, &|_| used, &mut fresh_domain)
-            .is_err()
-        {
-            return false;
-        }
-        for copy in copies {
-            self.place(&mut copy.cell);
-        }
-        true
+        let mut placed = |k: usize, pid, domain| {
+            if let Some(copy) = copies.get_mut(k) {
+                (copy.cell.pid, copy.cell.domain) = (pid, domain);
+            }
+        };
+        self.tree
+            .add_copies(source, ids, &|_| used, &mut fresh_domain, &mut placed)
+            .is_ok()
     }
 
     /// Places a cell restored from `snapshot`'s state, not yet run: under
@@ -159,7 +166,7 @@ impl Host {
     /// ones reported killed in [`finished`](Self::finished)), and those
     /// promoted take their new domain and numbers.
     pub(super) fn settle(&mut self) {
-        if self.settling {
+        if self.settling || self.ends.is_empty() {
             return;
         }
         self.settling = true;
@@ -167,7 +174,7 @@ impl Host {
             let Ok(ended) = self.tree.end(id, &mut fresh_domain) else {
                 continue;
             };
-            for &gone in ended.gone.iter().filter(|&&g| g != id) {
+            for &gone in &ended.gone {
                 if let Some(at) = self.suspended.iter().position(|&s| s == gone) {
                     self.suspended.swap_remove(at);
                     self.finished.push(Finished {

@@ -248,9 +248,10 @@ impl Host {
     /// CPUs may be adding to them).
     fn collect(&mut self) {
         let ended = self.shared.with(|s| core::mem::take(&mut s.ended));
-        for f in &ended {
-            self.ends.push(f.id);
+        if ended.is_empty() {
+            return;
         }
+        self.ends.extend(ended.iter().map(|f| f.id));
         self.finished.extend(ended);
         self.settle();
     }

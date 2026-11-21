@@ -1,12 +1,17 @@
 //! The ownership tree (design D1 to D4 of `add-cell-hierarchy`).
 
 use crate::limits::{CHILDREN_MAX, DEPTH_MAX, LABEL_MAX, WEIGHT_DEFAULT, WEIGHT_MAX, WEIGHT_MIN};
-use crate::{Egress, Error, reserve};
-use alloc::boxed::Box;
+use crate::{Egress, Error, alloc_point, reserve};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// The parent of a root: the host, which is not a cell.
 pub const HOST: u32 = 0;
+
+/// The number of a new domain's root and the next one, never `skip`.
+fn first_numbers(skip: u32) -> (u32, u32) {
+    if skip == 1 { (2, 3) } else { (1, 2) }
+}
 
 /// Who asks for a tree operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,9 +124,10 @@ pub enum OnParentEnd {
     Promote,
 }
 
-/// A cell's label: at most [`LABEL_MAX`] bytes of `[A-Za-z0-9._-]`.
+/// A cell's label: at most [`LABEL_MAX`] bytes of `[A-Za-z0-9._-]`,
+/// shared by the copies of a cell (no allocation to copy one).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Label(Box<[u8]>);
+pub struct Label(Option<Arc<[u8]>>);
 
 impl Label {
     /// The label `bytes`, or [`Error::Invalid`].
@@ -130,14 +136,15 @@ impl Label {
         if bytes.len() > LABEL_MAX || !bytes.iter().all(ok) {
             return Err(Error::Invalid);
         }
-        let mut v = Vec::new();
-        reserve(&mut v, bytes.len())?;
-        v.extend_from_slice(bytes);
-        Ok(Self(v.into_boxed_slice()))
+        if bytes.is_empty() {
+            return Ok(Self(None));
+        }
+        alloc_point()?;
+        Ok(Self(Some(Arc::from(bytes))))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.0.as_deref().unwrap_or_default()
     }
 }
 
@@ -175,30 +182,56 @@ impl Default for Spec {
     }
 }
 
-/// One cell in the tree: a running or suspended cell, or a template.
+/// A cell's policies: egress (design D7), exposure ceiling (D8), label,
+/// CPU weight and cap (D23) and exclusive CPU set (D17). Shared by the
+/// cells that have the same ones (a cell's copies, every cell with the
+/// defaults) and replaced, never changed, so a socket can keep the policy
+/// it was made under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    pub egress: Egress,
+    pub ceiling: Egress,
+    pub label: Label,
+    pub weight: u16,
+    pub cpu_max: u32,
+    pub cpus: u64,
+}
+
+impl Policy {
+    /// What a cell gets when its creator decides nothing.
+    const DEFAULT: Self = Self {
+        egress: Egress::None,
+        ceiling: Egress::None,
+        label: Label(None),
+        weight: WEIGHT_DEFAULT,
+        cpu_max: u32::MAX,
+        cpus: 0,
+    };
+}
+
+/// One cell in the tree: a running or suspended cell, or a template. Small,
+/// since the kernel keeps one per cell: its policies are shared, and what
+/// its children reserved is summed from them when asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     id: u32,
     parent: u32,
     first_child: u32,
     next_sibling: u32,
-    children: u16,
-    depth: u8,
-    on_parent_end: OnParentEnd,
     domain: u32,
     pid: u32,
     /// For a root: the number the next cell made in its domain gets.
     next_pid: u32,
+    children: u16,
+    depth: u8,
+    on_parent_end: OnParentEnd,
     limits: Limits,
-    /// What its children took: the sum of their charges.
-    reserved: Limits,
-    weight: u16,
-    cpu_max: u32,
-    cpus: u64,
-    egress: Egress,
-    ceiling: Egress,
-    label: Label,
+    policy: Arc<Policy>,
 }
+
+// The kernel keeps one node per cell (`cell.idle_bytes`), and copies one
+// at each fork: it stays within a cache line.
+const _: () = assert!(core::mem::size_of::<Node>() <= 64);
 
 impl Node {
     /// The cell's identifier in the kernel.
@@ -230,43 +263,33 @@ impl Node {
     pub fn limits(&self) -> Limits {
         self.limits
     }
-    /// What its children reserved.
-    pub fn reserved(&self) -> Limits {
-        self.reserved
-    }
-    /// What the cell itself may use: its limits less its children's
-    /// reservations.
-    pub fn own(&self) -> Limits {
-        self.limits.left(self.reserved)
-    }
-    /// Its free budget while it uses `used` itself (design D4): its limits
-    /// less what it uses and what its children reserved.
-    pub fn free(&self, used: Limits) -> Limits {
-        self.own().left(used)
-    }
     pub fn mode(&self) -> Mode {
         Mode::Reserved
     }
     pub fn on_parent_end(&self) -> OnParentEnd {
         self.on_parent_end
     }
+    /// Its policies, shared and immutable.
+    pub fn policy(&self) -> &Arc<Policy> {
+        &self.policy
+    }
     pub fn egress(&self) -> &Egress {
-        &self.egress
+        &self.policy.egress
     }
     pub fn ceiling(&self) -> &Egress {
-        &self.ceiling
+        &self.policy.ceiling
     }
     pub fn label(&self) -> &Label {
-        &self.label
+        &self.policy.label
     }
     pub fn weight(&self) -> u16 {
-        self.weight
+        self.policy.weight
     }
     pub fn cpu_max(&self) -> u32 {
-        self.cpu_max
+        self.policy.cpu_max
     }
     pub fn cpus(&self) -> u64 {
-        self.cpus
+        self.policy.cpus
     }
     /// How many children it has.
     pub fn children(&self) -> u16 {
@@ -277,8 +300,8 @@ impl Node {
 /// What [`Tree::end`] did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Ended {
-    /// The cells that ended: the one asked for, and every descendant whose
-    /// policy was to cascade, depth first (children before parents).
+    /// The descendants that ended with the cell (those whose policy was
+    /// to cascade, below cells that ended), newest first.
     pub gone: Vec<u32>,
     /// The cells that became roots, with their subtrees (each in a new
     /// domain, numbered again).
@@ -287,9 +310,17 @@ pub struct Ended {
 
 /// The ownership tree of a kernel's cells (design D1), ordered by
 /// identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree {
     nodes: Vec<Node>,
+    /// The default policies, shared by every cell that has them.
+    default: Arc<Policy>,
+}
+
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Fresh domain identifiers: never 0, never one a live domain has.
@@ -299,7 +330,10 @@ pub type Usage<'a> = &'a dyn Fn(u32) -> Limits;
 
 impl Tree {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            nodes: Vec::new(),
+            default: Arc::new(Policy::DEFAULT),
+        }
     }
 
     /// Number of cells in the tree.
@@ -422,24 +456,46 @@ impl Tree {
             .unwrap_or(0)
     }
 
-    /// The free budget of cell `id`, which uses `used` itself.
+    /// What the children of cell `id` reserved: the sum of their charges.
+    fn reserved_by(&self, id: u32) -> Limits {
+        self.children(id)
+            .fold(Limits::ZERO, |sum, c| sum.add(self.node(c).limits.charge()))
+    }
+
+    /// What cell `id`'s children reserved from its limits.
+    pub fn reserved(&self, id: u32) -> Option<Limits> {
+        self.get(id).map(|_| self.reserved_by(id))
+    }
+
+    /// What cell `id` itself may use: its limits less its children's
+    /// reservations.
+    pub fn own(&self, id: u32) -> Option<Limits> {
+        self.get(id).map(|n| n.limits.left(self.reserved_by(id)))
+    }
+
+    /// The free budget of cell `id`, which uses `used` itself (design D4):
+    /// its limits less what it uses and what its children reserved.
+    pub fn free_budget(&self, id: u32, used: Limits) -> Option<Limits> {
+        self.get(id).map(|_| self.free(id, used))
+    }
+
     fn free(&self, id: u32, used: Limits) -> Limits {
-        self.node(id).free(used)
+        self.node(id).limits.left(self.reserved_by(id)).left(used)
     }
 
     /// Adds root `id` of a new domain `domain` (a fresh identifier, never
-    /// 0). Its numbering starts at 1, skipping `skip` (the source's number
-    /// for a copy, so a copy's `getpid` differs, design D22; 0 for none).
-    pub fn add_root(&mut self, id: u32, domain: u32, spec: Spec, skip: u32) -> Result<(), Error> {
+    /// 0) and returns its number: 1, or 2 when `skip` is 1 (`skip` is the
+    /// source's number for a copy, so a copy's `getpid` differs, design
+    /// D22; 0 for none).
+    pub fn add_root(&mut self, id: u32, domain: u32, spec: Spec, skip: u32) -> Result<u32, Error> {
         if id == HOST || domain == 0 {
             return Err(Error::Invalid);
         }
-        let node = self.made(id, HOST, domain, spec)?;
+        let mut node = self.made(id, HOST, domain, spec)?;
         let i = self.insert_at(id)?;
+        (node.pid, node.next_pid) = first_numbers(skip);
         self.nodes.insert(i, node);
-        let pid = self.number(id, skip);
-        self.node_mut(id).pid = pid;
-        Ok(())
+        Ok(self.nodes[i].pid)
     }
 
     /// Adds cell `id` as a child of `parent`, at `by`'s request: its limits
@@ -462,7 +518,9 @@ impl Tree {
             return Err(Error::Invalid); // exclusive sets go to roots
         }
         let ceiling = spec.ceiling.as_ref().unwrap_or(&spec.egress);
-        if !spec.egress.within(&p.egress) || !ceiling.within(&p.ceiling) || spec.cpu_max > p.cpu_max
+        if !spec.egress.within(p.egress())
+            || !ceiling.within(p.ceiling())
+            || spec.cpu_max > p.cpu_max()
         {
             return Err(Error::Denied);
         }
@@ -508,6 +566,14 @@ impl Tree {
             return Err(Error::Invalid);
         }
         let ceiling = spec.ceiling.unwrap_or_else(|| spec.egress.clone());
+        let policy = Policy {
+            egress: spec.egress,
+            ceiling,
+            label: spec.label,
+            weight: spec.weight,
+            cpu_max: spec.cpu_max,
+            cpus: spec.cpus,
+        };
         let depth = if parent == HOST {
             1
         } else {
@@ -518,20 +584,44 @@ impl Tree {
             parent,
             first_child: HOST,
             next_sibling: HOST,
-            children: 0,
-            depth,
-            on_parent_end: spec.on_parent_end,
             domain,
             pid: 0,
             next_pid: 1,
+            children: 0,
+            depth,
+            on_parent_end: spec.on_parent_end,
             limits: spec.limits,
-            reserved: Limits::ZERO,
-            weight: spec.weight,
-            cpu_max: spec.cpu_max,
-            cpus: spec.cpus,
-            egress: spec.egress,
+            policy: self.shared(policy)?,
+        })
+    }
+
+    /// `policy`, shared with the default when it is the default.
+    fn shared(&self, policy: Policy) -> Result<Arc<Policy>, Error> {
+        if policy == *self.default {
+            return Ok(self.default.clone());
+        }
+        alloc_point()?;
+        Ok(Arc::new(policy))
+    }
+
+    /// `node`'s policies with egress `egress` and ceiling `ceiling`: the
+    /// same record when they do not change.
+    fn narrowed(
+        &self,
+        node: &Node,
+        egress: Egress,
+        ceiling: Egress,
+        cap: u32,
+    ) -> Result<Arc<Policy>, Error> {
+        let p = &node.policy;
+        if p.egress == egress && p.ceiling == ceiling && p.cpu_max == cap {
+            return Ok(p.clone());
+        }
+        self.shared(Policy {
+            egress,
             ceiling,
-            label: spec.label,
+            cpu_max: cap,
+            ..Policy::clone(p)
         })
     }
 
@@ -554,7 +644,6 @@ impl Tree {
         let n = self.node_mut(id);
         n.parent = parent;
         n.next_sibling = first;
-        self.recount(parent);
     }
 
     /// Unlinks node `id` from its parent's children (a root: nothing).
@@ -579,15 +668,6 @@ impl Tree {
         let n = self.node_mut(id);
         n.parent = HOST;
         n.next_sibling = HOST;
-        self.recount(parent);
-    }
-
-    /// Sets cell `id`'s reservation to the sum of its children's charges.
-    fn recount(&mut self, id: u32) {
-        let reserved = self
-            .children(id)
-            .fold(Limits::ZERO, |sum, c| sum.add(self.node(c).limits.charge()));
-        self.node_mut(id).reserved = reserved;
     }
 
     /// The next number in cell `id`'s domain, never `skip`.
@@ -607,59 +687,62 @@ impl Tree {
     /// from `fresh`, numbered from 1 but never with the source's number;
     /// copies of any other cell are carved from its parent's budget again.
     /// A copy has the source's limits and policies, and no children.
+    /// `placed(k, pid, domain)` learns the number and domain of copy `k`.
     pub fn add_copies(
         &mut self,
         source: u32,
         ids: &[u32],
         usage: Usage,
         fresh: Fresh,
+        placed: &mut dyn FnMut(usize, u32, u32),
     ) -> Result<(), Error> {
         let s = self.get(source).ok_or(Error::NotFound)?;
-        let spec = Spec {
-            limits: s.limits,
-            on_parent_end: s.on_parent_end,
-            egress: s.egress.clone(),
-            ceiling: Some(s.ceiling.clone()),
-            label: s.label.clone(),
-            weight: s.weight,
-            cpu_max: s.cpu_max,
-            cpus: 0, // an exclusive set stays with one domain
-        };
-        let (parent, domain, pid) = (s.parent, s.domain, s.pid);
+        let (parent, pid) = (s.parent, s.pid);
         let count = u32::try_from(ids.len()).map_err(|_| Error::Invalid)?;
         if parent != HOST {
-            self.room_for(parent, spec.limits.charge(), count, usage)?;
+            self.room_for(parent, s.limits.charge(), count, usage)?;
         }
-        // Every check and allocation first: then nothing fails.
-        let mut nodes = Vec::new();
-        reserve(&mut nodes, ids.len())?;
         for (k, &id) in ids.iter().enumerate() {
-            if ids[..k].contains(&id) {
+            if id == HOST || ids[..k].contains(&id) || self.get(id).is_some() {
                 return Err(Error::Exists);
             }
-            nodes.push(self.made(id, parent, domain, spec.clone())?);
         }
         reserve(&mut self.nodes, ids.len())?;
-        let domains: Vec<u32> = if parent == HOST {
-            let mut d = Vec::new();
-            reserve(&mut d, ids.len())?;
-            d.extend(ids.iter().map(|_| fresh()));
-            d
-        } else {
-            Vec::new()
-        };
-        for (k, mut node) in nodes.into_iter().enumerate() {
-            let id = node.id;
-            if parent == HOST {
-                node.domain = domains[k];
+        // Nothing fails from here. An exclusive CPU set stays with one
+        // domain.
+        let mut copy = Some(self.node(source).clone());
+        if let Some(c) = copy.as_mut() {
+            (c.first_child, c.next_sibling, c.children, c.next_pid) = (HOST, HOST, 0, 1);
+            if c.policy.cpus != 0 {
+                c.policy = self.shared(Policy {
+                    cpus: 0,
+                    ..Policy::clone(&c.policy)
+                })?;
             }
+        }
+        for (k, &id) in ids.iter().enumerate() {
+            // The last copy takes the record itself.
+            let mut node = if k + 1 == ids.len() {
+                copy.take()
+            } else {
+                copy.clone()
+            }
+            .expect("a record for each copy");
+            node.id = id;
             let i = self.nodes.binary_search_by_key(&id, |n| n.id).unwrap_err();
-            self.nodes.insert(i, node);
-            if parent != HOST {
+            if parent == HOST {
+                node.domain = fresh();
+                (node.pid, node.next_pid) = first_numbers(pid);
+                placed(k, node.pid, node.domain);
+                self.nodes.insert(i, node);
+            } else {
+                let domain = node.domain;
+                self.nodes.insert(i, node);
                 self.link(id, parent);
+                let p = self.number(id, 0);
+                self.node_mut(id).pid = p;
+                placed(k, p, domain);
             }
-            let p = self.number(id, if parent == HOST { pid } else { 0 });
-            self.node_mut(id).pid = p;
         }
         Ok(())
     }
@@ -674,11 +757,18 @@ impl Tree {
         let Some(i) = self.index(old) else {
             return false;
         };
-        let mut node = self.nodes.remove(i);
+        // Moves the node to its new place in one rotation.
+        let at = self.nodes.binary_search_by_key(&new, |n| n.id).unwrap_err();
+        let at = if at > i {
+            self.nodes[i..at].rotate_left(1);
+            at - 1
+        } else {
+            self.nodes[at..=i].rotate_right(1);
+            at
+        };
+        let node = &mut self.nodes[at];
         node.id = new;
         let (parent, first) = (node.parent, node.first_child);
-        let at = self.nodes.binary_search_by_key(&new, |n| n.id).unwrap_err();
-        self.nodes.insert(at, node); // the room `old` left
         if parent != HOST {
             let p = self.node_mut(parent);
             if p.first_child == old {
@@ -765,15 +855,13 @@ impl Tree {
             if !charge.fits(room) {
                 return Err(Error::Budget);
             }
-            let (egress, ceiling, cap) = (p.egress.clone(), p.ceiling.clone(), p.cpu_max);
+            let top = p.policy.clone();
             reserve(&mut narrowed, sub.len())?;
             for &c in &sub {
                 let c = self.node(c);
-                narrowed.push((
-                    c.egress.intersect(&egress)?,
-                    c.ceiling.intersect(&ceiling)?,
-                    c.cpu_max.min(cap),
-                ));
+                let egress = c.egress().intersect(&top.egress)?;
+                let ceiling = c.ceiling().intersect(&top.ceiling)?;
+                narrowed.push(self.narrowed(c, egress, ceiling, c.cpu_max().min(top.cpu_max))?);
             }
         }
         let new_domain = if to == HOST {
@@ -793,8 +881,8 @@ impl Tree {
         for (k, &c) in sub.iter().enumerate() {
             let c = self.node_mut(c);
             c.depth = (i16::from(c.depth) + shift) as u8;
-            if let Some((egress, ceiling, cap)) = narrowed.get(k) {
-                (c.egress, c.ceiling, c.cpu_max) = (egress.clone(), ceiling.clone(), *cap);
+            if let Some(policy) = narrowed.get(k) {
+                c.policy = policy.clone();
             }
         }
         if to != HOST {
@@ -815,14 +903,6 @@ impl Tree {
             let n = self.node_mut(at);
             n.limits = n.limits.left(charge);
             at = n.parent;
-        }
-        let mut at = from;
-        while at != HOST {
-            let parent = self.node(at).parent;
-            if parent != HOST {
-                self.recount(parent);
-            }
-            at = parent;
         }
     }
 
@@ -849,8 +929,12 @@ impl Tree {
     /// cells used is spent for the whole subtree: the kernel counts it as
     /// the parent's own use ([`Ended::gone`] names whose).
     pub fn end(&mut self, id: u32, fresh: Fresh) -> Result<Ended, Error> {
-        if self.get(id).is_none() {
-            return Err(Error::NotFound);
+        let n = self.get(id).ok_or(Error::NotFound)?;
+        if n.children == 0 {
+            self.unlink(id);
+            let i = self.index(id).expect("a cell of the tree");
+            self.nodes.remove(i);
+            return Ok(Ended::default());
         }
         // Who ends and who is promoted, before anything changes.
         let mut ended = Ended::default();
@@ -896,7 +980,8 @@ impl Tree {
         }
         self.unlink(id);
         self.nodes.retain(|n| !ended.gone.contains(&n.id));
-        ended.gone.reverse(); // children before parents
+        ended.gone.swap_remove(0); // the cell itself
+        ended.gone.sort_unstable_by(|a, b| b.cmp(a));
         Ok(ended)
     }
 
@@ -918,7 +1003,7 @@ impl Tree {
         if n.children > 0 && !limits.bounded() {
             return Err(Error::Unlimited);
         }
-        if !n.reserved.add(usage(id)).fits(limits) {
+        if !self.reserved_by(id).add(usage(id)).fits(limits) {
             return Err(Error::Budget);
         }
         let parent = n.parent;
@@ -929,9 +1014,6 @@ impl Tree {
             }
         }
         self.node_mut(id).limits = limits;
-        if parent != HOST {
-            self.recount(parent);
-        }
         Ok(())
     }
 
@@ -954,9 +1036,9 @@ impl Tree {
             (Actor::Host, HOST) => true,
             (Actor::Host, p) => {
                 let p = self.node(p);
-                egress.within(&p.egress) && ceiling.within(&p.ceiling)
+                egress.within(p.egress()) && ceiling.within(p.ceiling())
             }
-            (Actor::Cell(_), _) => egress.within(&n.egress) && ceiling.within(&n.ceiling),
+            (Actor::Cell(_), _) => egress.within(n.egress()) && ceiling.within(n.ceiling()),
         };
         if !allowed {
             return Err(Error::Denied);
@@ -966,14 +1048,18 @@ impl Tree {
         reserve(&mut narrowed, sub.len())?;
         for &c in &sub[1..] {
             let c = self.node(c);
-            narrowed.push((c.egress.intersect(&egress)?, c.ceiling.intersect(&ceiling)?));
+            let (e, ce) = (
+                c.egress().intersect(&egress)?,
+                c.ceiling().intersect(&ceiling)?,
+            );
+            narrowed.push(self.narrowed(c, e, ce, c.cpu_max())?);
         }
-        for (&c, (e, ce)) in sub[1..].iter().zip(narrowed) {
-            let c = self.node_mut(c);
-            (c.egress, c.ceiling) = (e, ce);
+        let top = self.node(id);
+        let policy = self.narrowed(top, egress, ceiling, top.cpu_max())?;
+        for (&c, policy) in sub[1..].iter().zip(narrowed) {
+            self.node_mut(c).policy = policy;
         }
-        let n = self.node_mut(id);
-        (n.egress, n.ceiling) = (egress, ceiling);
+        self.node_mut(id).policy = policy;
         Ok(())
     }
 
@@ -1033,18 +1119,15 @@ impl Tree {
                 if c.parent != n.id || c.depth != n.depth + 1 {
                     return Err("a child's parent or depth is wrong");
                 }
-                if !c.egress.within(&n.egress)
-                    || !c.ceiling.within(&n.ceiling)
-                    || c.cpu_max > n.cpu_max
+                if !c.egress().within(n.egress())
+                    || !c.ceiling().within(n.ceiling())
+                    || c.cpu_max() > n.cpu_max()
                 {
                     return Err("a child's policy is wider than its parent's");
                 }
                 sum = sum.add(c.limits.charge());
             }
-            if sum != n.reserved {
-                return Err("a reservation unlike its children's charges");
-            }
-            if !n.reserved.fits(n.limits) {
+            if !sum.fits(n.limits) {
                 return Err("reserved more than the limits");
             }
             if count > 0 && !n.limits.bounded() {

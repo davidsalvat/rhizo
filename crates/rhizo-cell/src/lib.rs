@@ -153,9 +153,7 @@ impl Cell {
     /// cell's. A cell that ran keeps its threads' identifiers, which its
     /// program may have kept: set [`pid`](Self::pid) alone.
     pub fn renumber(&mut self, pid: u32) {
-        let mut first = self.threads.current().clone();
-        first.tid = pid;
-        self.threads = Threads::new(first);
+        self.threads.renumber(pid);
         self.pid = pid;
     }
 

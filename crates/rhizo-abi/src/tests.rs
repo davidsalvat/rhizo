@@ -523,7 +523,11 @@ fn sysinfo_per_cell() {
     };
     assert_eq!(read(&mut w), (64 << 20, 54 << 20));
     let taken: Vec<u64> = (0..4096).map(|_| w.frames.alloc().unwrap()).collect();
-    assert_eq!(read(&mut w), (64 << 20, 54 << 20), "while another domain holds 16 MiB");
+    assert_eq!(
+        read(&mut w),
+        (64 << 20, 54 << 20),
+        "while another domain holds 16 MiB"
+    );
     for phys in taken {
         w.frames.free(phys, rhizo_mm::paging::PageSize::Small);
     }
@@ -540,7 +544,11 @@ fn identifiers_come_from_the_domain() {
     w.cell.pid = 3;
     assert_eq!(w.call(172, &[]).0, 3, "getpid");
     assert_eq!(w.call(121, &[3, DATA]).0, 0, "sched_getparam of itself");
-    assert_eq!(w.call(121, &[4711, DATA]).0, -ESRCH, "the kernel's identifier names nothing");
+    assert_eq!(
+        w.call(121, &[4711, DATA]).0,
+        -ESRCH,
+        "the kernel's identifier names nothing"
+    );
 }
 
 /// The calls Node.js makes at start-up and under load (spec `linux-abi`,

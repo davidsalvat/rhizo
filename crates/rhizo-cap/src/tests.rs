@@ -60,8 +60,8 @@ fn roots_start_domains_numbered_from_one() {
     );
     assert_eq!((n(12).domain(), n(9).domain()), (5, 9));
     assert_eq!(t.root_of(13), Some(5));
-    assert_eq!(n(5).own().memory, 32 * MIB);
-    assert_eq!(n(5).own().cells, 6);
+    assert_eq!(t.own(5).unwrap().memory, 32 * MIB);
+    assert_eq!(t.own(5).unwrap().cells, 6);
     assert_eq!(t.children(5).collect::<Vec<_>>(), [13, 12]);
     assert_eq!(t.children(HOST).collect::<Vec<_>>(), [5, 9]);
     assert_eq!(n(12).egress(), &Egress::None, "egress none by default");
@@ -112,7 +112,7 @@ fn fork_bomb_stops_at_the_descendant_limit() {
     for _ in 0..100 {
         let parents: Vec<u32> = t.iter().map(|n| n.id()).collect();
         for p in parents {
-            let own = t.get(p).unwrap().own();
+            let own = t.own(p).unwrap();
             let want = Limits {
                 cells: own.cells.saturating_sub(1),
                 memory: own.memory / 2,
@@ -137,7 +137,7 @@ fn depth_is_bounded() {
     t.add_root(1, 1, spec(limits(64 * MIB, 100)), 0).unwrap();
     let mut parent = 1;
     for id in 2..=u32::from(DEPTH_MAX) {
-        let own = t.get(parent).unwrap().own();
+        let own = t.own(parent).unwrap();
         let l = limits(own.memory, own.cells - 1);
         t.add_child(id, parent, spec(l), Actor::Cell(parent), &none)
             .unwrap();
@@ -208,7 +208,7 @@ fn authority_flows_down() {
         .unwrap();
     r(&mut t, 4, 3, Actor::Cell(1), &mut f).unwrap();
     assert_eq!(t.get(4).unwrap().parent(), 3);
-    assert_eq!(t.get(2).unwrap().reserved(), Limits::ZERO);
+    assert_eq!(t.reserved(2), Some(Limits::ZERO));
     t.check().unwrap();
 }
 
@@ -226,7 +226,7 @@ fn promotion_moves_the_reservation() {
     let (p, c) = (t.get(1).unwrap(), t.get(2).unwrap());
     assert_eq!(p.limits().memory, 48 * MIB);
     assert_eq!(p.limits().cells, 2);
-    assert_eq!(p.reserved(), Limits::ZERO);
+    assert_eq!(t.reserved(1), Some(Limits::ZERO));
     assert!(c.is_root());
     assert_eq!(
         (c.limits().memory, c.domain(), c.pid()),
@@ -246,7 +246,7 @@ fn the_host_promotes_without_shrinking() {
     t.reparent(2, HOST, Actor::Host, &none, &mut fresh())
         .unwrap();
     assert_eq!(t.get(1).unwrap().limits().memory, 64 * MIB);
-    assert_eq!(t.get(1).unwrap().own().memory, 64 * MIB);
+    assert_eq!(t.own(1).unwrap().memory, 64 * MIB);
     t.check().unwrap();
 }
 
@@ -267,7 +267,7 @@ fn ending_cascades_or_promotes() {
     t.add_child(5, 2, keep, Actor::Host, &none).unwrap();
     child(&mut t, 6, 5, timed(MIB, 1000, 0)).unwrap();
     let ended = t.end(2, &mut fresh()).unwrap();
-    assert_eq!(ended.gone, [4, 3, 2]);
+    assert_eq!(ended.gone, [4, 3]);
     assert_eq!(ended.promoted, [5]);
     let root = t.get(1).unwrap();
     assert_eq!(
@@ -277,7 +277,7 @@ fn ending_cascades_or_promotes() {
     );
     assert_eq!(root.limits().cells, 6);
     assert_eq!(root.limits().cpu_ns, 1_000_000 - 10_000);
-    assert_eq!(root.reserved(), Limits::ZERO);
+    assert_eq!(t.reserved(1), Some(Limits::ZERO));
     let p = t.get(5).unwrap();
     assert!(p.is_root() && p.pid() == 1 && t.get(6).unwrap().pid() == 2);
     assert_eq!(t.len(), 3);
@@ -293,19 +293,28 @@ fn copies_are_siblings_with_new_numbers() {
     t.add_child(2, 1, spec(limits(16 * MIB, 0)), Actor::Host, &none)
         .unwrap();
     assert_eq!(
-        t.add_copies(2, &[3, 4, 5, 6], &none, &mut f),
+        t.add_copies(2, &[3, 4, 5, 6], &none, &mut f, &mut |_, _, _| {}),
         Err(Error::Budget)
     );
-    t.add_copies(2, &[3, 4, 5], &none, &mut f).unwrap();
+    t.add_copies(2, &[3, 4, 5], &none, &mut f, &mut |_, _, _| {})
+        .unwrap();
     assert!((3..=5).all(|c| t.get(c).unwrap().parent() == 1));
     assert_eq!(t.get(5).unwrap().pid(), 5);
-    assert_eq!(t.get(1).unwrap().own().memory, 0);
+    assert_eq!(t.own(1).unwrap().memory, 0);
     // Copies of a root are roots of new domains; none takes its number.
-    t.add_copies(1, &[7, 8], &none, &mut f).unwrap();
+    let mut seen = Vec::new();
+    t.add_copies(1, &[7, 8], &none, &mut f, &mut |k, pid, domain| {
+        seen.push((k, pid, domain))
+    })
+    .unwrap();
     let (a, b) = (t.get(7).unwrap(), t.get(8).unwrap());
     assert!(a.is_root() && a.domain() != b.domain() && a.domain() != 1);
     assert_eq!((a.pid(), b.pid(), a.children()), (2, 2, 0));
-    assert_eq!(t.add_copies(1, &[9, 9], &none, &mut f), Err(Error::Exists));
+    assert_eq!(seen, [(0, 2, a.domain()), (1, 2, b.domain())]);
+    assert_eq!(
+        t.add_copies(1, &[9, 9], &none, &mut f, &mut |_, _, _| {}),
+        Err(Error::Exists)
+    );
     t.check().unwrap();
 }
 
@@ -353,7 +362,7 @@ fn moves_across_domains_are_the_hosts() {
     t.reparent(3, 1, Actor::Host, &none, &mut fresh()).unwrap();
     let n = t.get(3).unwrap();
     assert_eq!((n.domain(), n.pid(), n.egress()), (1, 2, &Egress::None));
-    assert_eq!(t.get(2).unwrap().reserved(), Limits::ZERO);
+    assert_eq!(t.reserved(2), Some(Limits::ZERO));
     t.check().unwrap();
 }
 
@@ -523,13 +532,13 @@ fn apply(t: &mut Tree, op: &Op, next: &mut u32, domains: &mut u32) -> Result<(),
     *next += 4;
     let id = *next;
     match op {
-        Op::Root(l) => t.add_root(id, fresh(), spec(*l), 0),
+        Op::Root(l) => t.add_root(id, fresh(), spec(*l), 0).map(|_| ()),
         Op::Child(p, by, f, promote, e, within) => {
             let parent = pick(*p);
             let Some(n) = t.get(parent) else {
                 return Err(Error::NotFound);
             };
-            let free = n.free(usage(parent));
+            let free = t.free_budget(parent, usage(parent)).unwrap();
             let part = |x: u64| {
                 if x == u64::MAX {
                     x
@@ -561,7 +570,7 @@ fn apply(t: &mut Tree, op: &Op, next: &mut u32, domains: &mut u32) -> Result<(),
         }
         Op::Copies(s, n) => {
             let ids: Vec<u32> = (0..u32::from(*n)).map(|k| id + k).collect();
-            t.add_copies(pick(*s), &ids, &usage, &mut fresh)
+            t.add_copies(pick(*s), &ids, &usage, &mut fresh, &mut |_, _, _| {})
         }
         Op::Reparent(c, to, by) => {
             let to = to.map_or(HOST, pick);
@@ -584,7 +593,7 @@ fn budgets_hold(t: &Tree) {
         let sub = t.subtree(root.id()).unwrap();
         let held = sub
             .iter()
-            .map(|&c| t.get(c).unwrap().own().memory)
+            .map(|&c| t.own(c).unwrap().memory)
             .fold(0u64, u64::saturating_add);
         if root.limits().memory != u64::MAX {
             assert!(
@@ -593,9 +602,8 @@ fn budgets_hold(t: &Tree) {
             );
         }
         for &c in &sub {
-            let n = t.get(c).unwrap();
-            assert!(n.reserved().memory <= n.limits().memory);
-            assert!(n.reserved().cells <= n.limits().cells);
+            let (n, r) = (t.get(c).unwrap(), t.reserved(c).unwrap());
+            assert!(r.memory <= n.limits().memory && r.cells <= n.limits().cells);
         }
     }
 }
