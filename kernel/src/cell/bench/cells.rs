@@ -387,6 +387,30 @@ pub(super) fn switch_ns(mut host: Host) -> u64 {
     rounds[2]
 }
 
+/// Limits that let cell `id` hold `cells` descendants, with CPU time
+/// counted (a quota never reached).
+fn bounded(host: &mut Host, id: u32, cells: u32) {
+    let quota = Quota {
+        memory: 1 << 30,
+        cpu_ns: u64::MAX - 1,
+        ..Quota::DEFAULT
+    };
+    assert!(host.set_limits(id, quota, cells));
+}
+
+/// A child's spec: 64 MiB, one socket, CPU time counted.
+fn child_spec() -> rhizo_cap::Spec {
+    rhizo_cap::Spec {
+        limits: rhizo_cap::Limits {
+            memory: 64 << 20,
+            cpu_ns: 1 << 56,
+            sockets: 1,
+            cells: 0,
+        },
+        ..rhizo_cap::Spec::default()
+    }
+}
+
 /// [`switch_ns`] with the two cells in two domains while cells share the
 /// CPUs by weight (design D23 of `add-cell-hierarchy`): an `idle` cell
 /// placed under the first one makes the host pick a domain, then a cell of
@@ -401,7 +425,9 @@ pub(super) fn switch_domains_ns() -> u64 {
                 .expect("spawn")
         };
         let (a, b, idle) = (spawn("yielder"), spawn("yielder"), spawn("idle"));
-        assert!(host.set_cpu_share(idle, Some(a), 100, u32::MAX));
+        bounded(&mut host, a, 1);
+        host.adopt(idle, a, child_spec(), rhizo_cap::Actor::Host)
+            .expect("placed");
         let t0 = bench_clock();
         host.run(|h| h.finished(a).is_some() && h.finished(b).is_some());
         let t1 = bench_clock();
@@ -417,31 +443,28 @@ pub(super) fn switch_domains_ns() -> u64 {
 /// robin per cell.
 pub(super) fn domain_share_pct() -> u64 {
     let mut host = Host::new();
-    let spinner = |host: &mut Host, parent| {
-        let id = host
-            .spawn(test_image("spin"), &[b"spin"], false, false)
-            .expect("spawn spin");
-        let quota = Quota {
-            cpu_ns: u64::MAX - 1, // counted, never reached
-            ..Quota::NONE
-        };
-        assert!(host.set_quota(id, quota));
-        assert!(host.set_cpu_share(id, parent, 100, u32::MAX));
-        id
+    let spin = |host: &mut Host| {
+        host.spawn(test_image("spin"), &[b"spin"], false, false)
+            .expect("spawn spin")
     };
-    let root = spinner(&mut host, None);
+    let root = spin(&mut host);
+    bounded(&mut host, root, 15);
     let mut cells = alloc::vec![root];
     for _ in 0..15 {
-        cells.push(spinner(&mut host, Some(root)));
+        let id = spin(&mut host);
+        host.adopt(id, root, child_spec(), rhizo_cap::Actor::Host)
+            .expect("placed");
+        cells.push(id);
     }
-    let one = spinner(&mut host, None);
+    let one = spin(&mut host);
+    bounded(&mut host, one, 0);
     cells.push(one);
     let t0 = now_ns();
     while now_ns() - t0 < 1_000_000_000 {
         host.step();
     }
     let used: Vec<u64> = cells.iter().map(|&c| host.cpu_ns(c).unwrap_or(0)).collect();
-    for c in cells {
+    for &c in cells.iter().rev() {
         host.kill(c);
     }
     let all: u64 = used.iter().sum();

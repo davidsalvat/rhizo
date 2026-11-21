@@ -1599,17 +1599,60 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   requeueing in one call, `requeue_charged`; a filed cell is charged
   apart). A copy of a plain cell, a root of default weight and a resumed
   cell keep the host round robin, so spawn, fork and resume test the policy
-  without computing anything. Measured with `--icount-only` against the
-  commit this branched from: `cell.switch_insns` 876 to 875 (x86_64) and
-  817 to 820 (AArch64, +0.37 %); every other figure within +0.5 %.
-- **Cost of the domain pick.** `cell.switch_domains_ns` (reported) is the
-  switch with two domains while the host shares by weight: 2,137
-  instructions on x86_64 and 1,899 on AArch64, against 875 and 820, so
-  about 1,100 to 1,300 instructions per switch: the pick builds the list
-  of domains with work and looks each key up in ordered maps, and the end
-  of the slice reads the clock and charges the cell, its domain and its
-  capped nodes. Accepted for now: only trees that use weights or caps pay
-  it, and it is a cost per switch, not per system call.
+  without computing anything. Measured with `--icount-only` against
+  `main` (d211ad7): `cell.switch_insns` 875, unchanged (x86_64), and 817
+  to 819 (AArch64, +0.24 %); every other figure within +0.53 % (forks
+  and spawns: the tests of the policy and the tree).
+- **No search, no allocation per switch.** While the host shares by
+  weight, the scheduler tells `Fair` each entry it queues and each it
+  takes out other than by a pick, so a pick never reads the queue:
+  - each CPU keeps the list of domains with work in its queue, and each
+    domain one binary heap of its queued cells per CPU, least finishing
+    virtual time first; a pick scans the CPU's domains (WF2Q+, linear in
+    the domains with work there, which a CPU's queue rarely holds many
+    of), pops the chosen domain's heap (O(log k) in its cells there), and
+    finds the entry in the queue by its arrival number (the first, or a
+    binary search: a queue is in arrival order);
+  - cells, domains and caps are vectors sorted by identifier (binary
+    search on a tree change or a lookup by key); the cell just picked is
+    remembered, so its charge and requeue look nothing up;
+  - a charge multiplies by each weight's reciprocal, computed when the
+    weight is set (the CPU's weight sum: when it changes), never divides;
+  - a domain's virtual time is 64 bits (2^-16 ns per unit of weight,
+    compared by wrapping difference: unambiguous while the compared times
+    are within 2^63 units, 39 hours of one CPU's time at weight 1); a
+    cell's stays 128 bits, in the heaps only;
+  - a domain leaves a CPU's list when a pick finds its heap there empty,
+    not when its last cell is taken: a domain whose cell runs and comes
+    back neither leaves nor joins;
+  - every change of the tables marks them dirty, and the next locked
+    section learns the queues again (O(entries), on tree changes only).
+- **Cost of sharing by weight.** `cell.switch_domains_insns` (gated with
+  `-icount`, ±2 %) is the switch with the two cells in two domains and a
+  third, waiting cell placed under the first: 1,373 instructions on
+  x86_64 and 1,286 on AArch64. The same three cells in round robin take
+  887 and 829, so sharing by weight costs 486 and 457 instructions per
+  switch (it was 1,250 and 1,070 with ordered maps, a list built at each
+  pick and 64-bit divisions). Of those, measured with callgrind on the
+  library alone (x86_64, `lto = "fat"` as the kernel builds, 105
+  instructions per switch in round robin, 415 by weight):
+  - taking a cell, about 150: the pick scans the two domains with work
+    (about 24 each, with bounds checks), pops a heap, and the queue is
+    searched by arrival;
+  - putting it back, about 160: three charges (the cell's, its domain's
+    and the CPU's virtual time: a 64-by-64 multiplication each), the cap
+    check, the heap push and the list check, and the tests of the dirty
+    mark and of a cap holding the cell.
+  The kernel adds about 150: the clock read that measures the slice
+  (`now_ns`, a 128-bit scaling of the cycle counter) and its own code
+  generation of the same path. That is over the 200 instructions aimed
+  at. The floor of this design is the work above: a domain choice, a
+  heap per domain and three charges per switch, kept in step with a
+  queue the round robin path also uses. Going lower would store the
+  entries in the heaps themselves while sharing by weight (no parallel
+  queue to search) and keep a heap of one cell inline; both change every
+  operation of the scheduler, not only the pick, and are left as the
+  next step if the figure matters more than the change's size.
 - **Shares are computed when the tree changes.** The host recomputes every
   cell's domain, flattened share and capped nodes (`fair::flatten`) after
   a spawn, a copy, a resume, a placement and each settled end, only while
@@ -1621,11 +1664,12 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   slice, and a slice lasts up to two timer ticks (a cell is preempted at
   its second): a capped subtree overshoots by up to one such slice per
   period for each CPU running it.
-- **Placement and weights from tests.** Until the tree operations of task
-  1.9 and protocol version 4 (task 1.11) reach the kernel, in-kernel tests
-  and benchmarks place cells and set weights and caps with
-  `Host::set_cpu_share`; those operations call `reshare` once they change
-  the tree, and `--cpu-weight` and `--cpu-max` come with version 4.
+- **Tree operations.** `adopt` and `reparent` share the CPUs again
+  (`reshare`) once they changed the tree, and `set_limits_from` when cells
+  share by weight. In-kernel tests and benchmarks place cells with
+  `set_limits` and `adopt`, a cap or a weight going in the child's `Spec`.
+  A root's weight and cap, and `--cpu-weight` and `--cpu-max`, come with
+  protocol version 4 (task 1.11).
 - `sched.domain_share_pct`: 49 under `-icount` on AArch64.
 
 Alternatives:

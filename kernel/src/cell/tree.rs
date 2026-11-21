@@ -268,6 +268,7 @@ impl Host {
             return false;
         }
         self.sync(id);
+        self.reshare_if_by_weight();
         true
     }
 
@@ -312,6 +313,7 @@ impl Host {
         }
         self.sync(id);
         self.sync_up(parent);
+        self.reshare(); // a child: cells share by weight
         // A cell placed before it ran: its thread takes its new number.
         let pid = self.tree.get(id).map_or(0, |n| n.pid());
         self.with_live(id, |live| {
@@ -339,6 +341,7 @@ impl Host {
         self.sync_down(id);
         self.sync_up(old);
         self.sync_up(to);
+        self.reshare();
         Ok(())
     }
 

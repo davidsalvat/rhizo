@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::cell::now_ns;
+use rhizo_cap::{Actor, Limits, Spec};
 use rhizo_cell::quota::Quota;
 use rhizo_sched::SLICE_NS;
 
@@ -12,17 +13,39 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(cpu_cap_holds, 25),
 ];
 
-/// A spinning cell whose CPU time is counted (a CPU time quota it never
-/// reaches), placed under `parent` with the default CPU weight and cap
-/// `cpu_max`.
-fn spinner(host: &mut Host, parent: Option<u32>, cpu_max: u32) -> u32 {
-    let id = spawn(host, "spin", &[]);
+const MIB: u64 = 1 << 20;
+
+/// A root's limits: 1 GiB, CPU time counted (a quota no test reaches),
+/// and room for `cells` descendants.
+fn parent(host: &mut Host, id: u32, cells: u32) {
     let quota = Quota {
+        memory: 1 << 30,
         cpu_ns: u64::MAX - 1,
-        ..Quota::NONE
+        ..Quota::DEFAULT
     };
-    assert!(host.set_quota(id, quota));
-    assert!(host.set_cpu_share(id, parent, 100, cpu_max), "placed");
+    assert!(host.set_limits(id, quota, cells), "limits of {id}");
+}
+
+/// A child's spec: `mib` MiB, `cpu_ns` of CPU time (finite: counted), one
+/// socket per cell, `cells` descendants, and CPU cap `cpu_max`
+/// (thousandths of a CPU, `u32::MAX`: none).
+fn child(mib: u64, cpu_ns: u64, cells: u32, cpu_max: u32) -> Spec {
+    Spec {
+        limits: Limits {
+            memory: mib * MIB,
+            cpu_ns,
+            sockets: cells + 1,
+            cells,
+        },
+        cpu_max,
+        ..Spec::default()
+    }
+}
+
+/// A spinning cell placed by the host under `under` with `spec`.
+fn spinner_under(host: &mut Host, under: u32, spec: Spec) -> u32 {
+    let id = spawn(host, "spin", &[]);
+    host.adopt(id, under, spec, Actor::Host).expect("placed");
     id
 }
 
@@ -39,17 +62,24 @@ fn step_for(host: &mut Host, ns: u64) {
     }
 }
 
-/// Design D23: on one CPU, a domain of 16 spinning cells and a domain of
+/// Spec `cell-hierarchy`, "Many cells do not buy CPU": on one CPU, a
+/// domain of 16 spinning cells (a root and 15 children) and a domain of
 /// one, with equal weights, each get half the CPU within 5 % over 2 s
 /// (round robin per cell would give the one cell a seventeenth).
 fn domains_share_by_weight() {
     let mut host = Host::new();
-    let root = spinner(&mut host, None, u32::MAX);
+    let root = spawn(&mut host, "spin", &[]);
+    parent(&mut host, root, 15);
     let mut many = alloc::vec![root];
     for _ in 0..15 {
-        many.push(spinner(&mut host, Some(root), u32::MAX));
+        many.push(spinner_under(
+            &mut host,
+            root,
+            child(32, 1 << 56, 0, u32::MAX),
+        ));
     }
-    let one = spinner(&mut host, None, u32::MAX);
+    let one = spawn(&mut host, "spin", &[]);
+    parent(&mut host, one, 0);
     assert_eq!(host.domain(many[15]), host.domain(root), "one domain");
     step_for(&mut host, 2_000_000_000);
     let (a, b) = (cpu_of(&mut host, &many), cpu_of(&mut host, &[one]));
@@ -66,16 +96,21 @@ fn domains_share_by_weight() {
 }
 
 /// Spec `cell-hierarchy`, "Capped subtree": a subtree of two spinning
-/// cells capped at 0.25 CPU, alone on idle CPUs, gets at most 25 % of a
-/// CPU plus one slice per period for each CPU running it (one with
-/// `ktest`, two with `ktest-smp`), on every CPU at once. The cap is
-/// charged at the end of a slice, which lasts up to two timer ticks of
+/// cells capped at 0.25 CPU (under an idle root), alone on idle CPUs, gets
+/// at most 25 % of a CPU plus one slice per period for each CPU running it
+/// (one with `ktest`, two with `ktest-smp`), on every CPU at once. The cap
+/// is charged at the end of a slice, which lasts up to two timer ticks of
 /// [`SLICE_NS`] (a cell is preempted at its second).
 fn cpu_cap_holds() {
     const PERIOD: u64 = rhizo_sched::fair::PERIOD_NS;
     let mut host = Host::new();
-    let root = spinner(&mut host, None, 250);
-    let capped = [root, spinner(&mut host, Some(root), 250)];
+    let root = spawn(&mut host, "idle", &[]);
+    parent(&mut host, root, 2);
+    let top = spinner_under(&mut host, root, child(256, 1 << 60, 1, 250));
+    let capped = [
+        top,
+        spinner_under(&mut host, top, child(64, 1 << 58, 0, 250)),
+    ];
     let t0 = now_ns();
     host.run_until(t0 + 1_000_000_000, |_| false);
     let elapsed = now_ns() - t0;
@@ -91,7 +126,7 @@ fn cpu_cap_holds() {
         used >= elapsed / 5,
         "it still ran: {used} ns in {elapsed} ns"
     );
-    for id in capped.into_iter().rev() {
+    for id in [capped[1], capped[0], root] {
         assert!(host.kill(id));
     }
     assert!(host.tree().is_empty());

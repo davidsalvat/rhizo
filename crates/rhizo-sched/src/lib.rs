@@ -118,8 +118,11 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// period ends, the ones in queues at once and this one when it is put
     /// back.
     pub fn charge(&mut self, cpu: usize, key: u32, ns: u64, now: u64) {
-        for node in self.share.charge(cpu, key, ns, now) {
-            self.hold(node);
+        self.refresh();
+        if self.share.charge(cpu, key, ns, now) {
+            for node in self.share.spent() {
+                self.hold(node);
+            }
         }
     }
 
@@ -127,13 +130,14 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     #[cold]
     fn hold(&mut self, node: u32) {
         let mut held = Vec::new();
-        for queue in &mut self.queues {
+        for cpu in 0..self.queues.len() {
             let mut i = 0;
-            while i < queue.len() {
-                let key = queue[i].1;
+            while i < self.queues[cpu].len() {
+                let key = self.queues[cpu][i].1;
                 if self.share.under(key, node) {
                     let until = self.share.held(key).unwrap_or(0);
-                    held.extend(queue.remove(i).map(|(_, _, e)| (e, until)));
+                    held.extend(self.queues[cpu].remove(i).map(|(_, _, e)| (e, until)));
+                    self.share.dequeued(cpu, key);
                 } else {
                     i += 1;
                 }
@@ -142,6 +146,21 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         for (entry, until) in held {
             self.sleep(entry, until);
         }
+    }
+
+    /// Tells the share the queues again if its weights changed.
+    #[inline]
+    fn refresh(&mut self) {
+        if self.share.dirty() {
+            self.relearn();
+        }
+    }
+
+    #[cold]
+    fn relearn(&mut self) {
+        let queued = self.queues.iter().enumerate();
+        let entries = queued.flat_map(|(c, q)| q.iter().map(move |e| (c, e.0, e.1)));
+        self.share.rebuild(entries);
     }
 }
 
@@ -173,20 +192,23 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// [`push`](Self::push) while entries share by weight.
     #[inline(never)]
     fn push_by_weight(&mut self, cpu: usize, key: u32, entry: T, arrives: bool) {
+        self.refresh();
         if arrives {
-            let peers = self.queues[cpu].iter().map(|e| e.1);
-            self.share.arrive(cpu, key, peers);
+            self.share.arrive(cpu, key);
         }
         self.enqueue(cpu, key, entry);
     }
 
     /// Puts `entry` at the end of `cpu`'s queue, or to sleep until its cap's
-    /// period ends.
+    /// period ends (only while entries share by weight: the share learns
+    /// what is queued).
     fn enqueue(&mut self, cpu: usize, key: u32, entry: T) {
         if let Some(until) = self.share.held(key) {
             return self.sleep(entry, until);
         }
+        let arrival = self.arrivals;
         self.queue(cpu, key, entry);
+        self.share.queued(cpu, key, arrival);
     }
 
     /// Puts `entry` at the end of `cpu`'s queue.
@@ -198,16 +220,16 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// Takes, of the entries in the queues of CPUs `queues`, the one owed
     /// the most CPU time by weight, for `cpu` to run.
     fn take_by_weight(&mut self, cpu: usize, queues: core::ops::Range<usize>) -> Option<T> {
-        let mut from = queues.start;
-        let keys = self.queues[queues]
-            .iter()
-            .flat_map(|q| q.iter().map(|e| e.1));
-        let mut at = self.share.pick(cpu, keys);
-        while at >= self.queues[from].len() {
-            at -= self.queues[from].len();
-            from += 1;
+        self.refresh();
+        let (from, arrival) = self.share.pick(cpu, queues)?;
+        // A queue is in arrival order: entries join only at its end.
+        // Most often the first: equal shares take turns.
+        let queue = &mut self.queues[from];
+        if queue.front().is_some_and(|e| e.0 == arrival) {
+            return queue.pop_front().map(|(_, _, e)| e);
         }
-        self.queues[from].remove(at).map(|(_, _, e)| e)
+        let at = queue.binary_search_by_key(&arrival, |e| e.0).ok()?;
+        queue.remove(at).map(|(_, _, e)| e)
     }
 
     /// The CPU with the shortest queue (the lowest number on ties).
@@ -445,9 +467,10 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
             let (wake, _, entry) = self.sleeping.remove(i)?;
             return Some((entry, Some(wake)));
         }
-        for queue in &mut self.queues {
-            if let Some(i) = queue.iter().position(|e| e.1 == key) {
-                return queue.remove(i).map(|(_, _, e)| (e, None));
+        for cpu in 0..self.queues.len() {
+            if let Some(i) = self.queues[cpu].iter().position(|e| e.1 == key) {
+                self.share.dequeued(cpu, key);
+                return self.queues[cpu].remove(i).map(|(_, _, e)| (e, None));
             }
         }
         if let Some(entry) = self.take_waiting(key) {
@@ -463,7 +486,12 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         if let Some(&key) = self.waiting.keys().next() {
             return self.take_waiting(key);
         }
-        let queued = self.queues.iter_mut().find_map(VecDeque::pop_front);
+        let cpu = self.queues.iter().position(|q| !q.is_empty());
+        let queued = cpu.and_then(|c| {
+            let e = self.queues[c].pop_front()?;
+            self.share.dequeued(c, e.1);
+            Some(e)
+        });
         queued
             .or_else(|| self.sleeping.pop_back())
             .map(|(_, _, e)| e)
