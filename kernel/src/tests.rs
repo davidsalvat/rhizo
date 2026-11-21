@@ -11,6 +11,7 @@ use rhizo_core::ktest_case;
 use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
 
 use rhizo_mm::FRAME_SIZE;
+use rhizo_mm::heap::TRIM_AT;
 use rhizo_mm::paging::PageFlags;
 
 /// Builds a harness self-check: one passing case, then the case the harness
@@ -1262,7 +1263,7 @@ fn file_data_takes_its_own_size() {
 // --- H9: memory accounting and density -------------------------------------
 
 /// Memory that is not leaked: frames free in the allocator plus frames the
-/// kernel heap holds (it keeps small-object pages for reuse, by design), and
+/// kernel heap holds (it keeps some small-object pages for reuse), and
 /// the heap's live allocations; measured with no image kept loaded (spec
 /// `cells`, image cache: those frames are the kernel's until dropped).
 fn memory_balance() -> (u64, usize) {
@@ -1359,6 +1360,14 @@ fn memory_full_of_cells_is_refused_cleanly() {
         "{o:?}"
     );
     assert_eq!(o.leaked_bytes, 0, "{o:?}");
+    // The heap gave back the pages of the cells' kernel records (change
+    // `add-heap-trim`): it keeps at most what its next trim waits for.
+    let spike = o.heap_peak_bytes;
+    assert!(
+        spike > 2 * TRIM_AT as u64,
+        "a spike of {spike} bytes: {o:?}"
+    );
+    assert!(o.heap_kept_bytes <= 2 * TRIM_AT as u64, "{o:?}");
 }
 
 /// A sleeping cell woken by the host (the stand-in for a user's message)

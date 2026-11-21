@@ -71,13 +71,14 @@ pub fn run(console: &mut impl Console, workload: Workload) {
             let _ = writeln!(
                 ConsoleWriter(console),
                 "rhizo-oom cells={} spawn_refused={} fork_refused={} resume_refused={} \
-                 hog_enomem={} leaked_bytes={} heap_kept_bytes={}",
+                 hog_enomem={} leaked_bytes={} heap_peak_bytes={} heap_kept_bytes={}",
                 o.cells,
                 o.spawn_refused as u8,
                 o.fork_refused as u8,
                 o.resume_refused as u8,
                 o.hog_enomem as u8,
                 o.leaked_bytes,
+                o.heap_peak_bytes,
                 o.heap_kept_bytes
             );
         }
@@ -443,8 +444,10 @@ pub struct Oom {
     pub hog_enomem: bool,
     /// Memory not back once every cell ended (0: none).
     pub leaked_bytes: u64,
-    /// Of what came back, what the kernel heap kept for itself (its free
-    /// blocks are never returned to the frame allocator).
+    /// What the kernel heap grew by while memory was full.
+    pub heap_peak_bytes: u64,
+    /// Of what came back, what the kernel heap kept for itself: free blocks
+    /// in pages it has not given back (change `add-heap-trim`).
     pub heap_kept_bytes: u64,
 }
 
@@ -480,6 +483,7 @@ pub fn fill_memory() -> Oom {
     let spawn_refused = host.spawn(idle, &[b"idle"], false, false) == Err(ElfError::OutOfMemory);
     let fork_refused = host.fork(cells[0], 1).is_none();
     let resume_refused = host.resume(snapshot, Resume::Eager, false, false).is_err();
+    let heap_peak = crate::heap::stats().pages as u64 * FRAME_SIZE;
     let count = cells.len();
     for id in cells.drain(..count / 4) {
         host.kill(id);
@@ -505,6 +509,7 @@ pub fn fill_memory() -> Oom {
         resume_refused,
         hog_enomem,
         leaked_bytes: before.saturating_sub(after),
+        heap_peak_bytes: heap_peak.saturating_sub(heap_before),
         heap_kept_bytes: (crate::heap::stats().pages as u64 * FRAME_SIZE)
             .saturating_sub(heap_before),
     }
