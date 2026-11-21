@@ -68,6 +68,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.shootdown_us/rhizo/<vmm>` | timing | With 4 vCPUs: one `munmap` of a written page by a thread of the `shootdown` cell while its three other threads run on the other CPUs, median of 200 (x86_64: interrupts the other CPUs and waits until they left the cell's code; AArch64: broadcast invalidation, no interrupt) |
 | `cell.syscall_scaling_pct/rhizo/<vmm>` | rate | With 4 vCPUs: four `piper` cells per CPU (each writes and reads a byte through its pipe 20,000 times) run on every CPU, times the number of CPUs, over their time on one CPU after the other, in percent: 100 is perfect scaling, 400 means the calls took turns. Calls that use no socket take no global lock (change `split-sockets-lock`) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
+| `cell.timer_error_us/rhizo/<vmm>` | timing | With 4 vCPUs: a 10 ms wait on a secondary CPU's own timer (as an idle CPU waits), the median of five per CPU, its distance from 10 ms by the counter, the worst CPU's (change `fix-secondary-cpu-timer`: x86_64 secondary CPUs once woke after about 1.3 ms) |
 | `cell.syscall_ns/rhizo/<vmm>` | timing | One system call round trip: `yielder getpid 20000` run to its exit minus `yielder getpid 0`, per call (robust figure) |
 | `cell.cow_fault_ns/rhizo/<vmm>` | timing | The kernel's side of one copy-on-write fault of a 4 KiB page (frame, copy, entry, TLB flush; the trap itself is about `cell.syscall_ns`), accounted alone (`profile` build) while a fork of a cell holding 1 MiB writes every page |
 | `<metric>_insns/rhizo/<vmm>-icount` | instructions | Every timed figure above, and every breakdown, counted in retired instructions under QEMU with `-icount` (see below) |
@@ -116,7 +117,7 @@ the VMM has no network card.
 | `workload.agent_turn_us/rhizo/<vmm>` | timing | One turn of a live agent: woken by its user, HTTP request to the model, answer, tool action (history appended, shared notes read and checked) |
 | `laptop.resume_turn_us/rhizo/<vmm>` | timing | The same turn right after a lazy resume (its pages come back as it touches them) |
 | `laptop.memory_bytes/rhizo/<vmm>` | size | Memory the template and the 50 agents take (45 snapshots in the kernel heap included) |
-| `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second |
+| `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second. Idle CPUs have no tick, and only one of them programs its timer, for the earliest deadline (change `add-tickless-idle`); what still wakes them is that deadline, work handed over by another CPU, and the boot CPU polling the network card while a cell waits on a descriptor |
 | `laptop.idle_host_cpu_pct/rhizo/<vmm>` | rate | Over the same window, read on the host: the VMM process's CPU time (all threads, `/proc/PID/task/*/schedstat`) over wall time, in percent of one CPU |
 
 **Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from four
