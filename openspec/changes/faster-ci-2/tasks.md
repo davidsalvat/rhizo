@@ -18,5 +18,5 @@
 
 ## 4. Measure the result
 
-- [ ] 4.1 Per-job times and wall clock of this pull request's runs against the baseline (design *Result*); verify from `gh api .../runs/<id>/jobs`
+- [x] 4.1 Per-job times and wall clock of this pull request's runs against the baseline (design *Result*); verify from `gh api .../runs/<id>/jobs`
 - [x] 4.2 A failing quick check cancels the other jobs and fails `ci-ok`; verify on a run of this pull request with a deliberate format error, then reverted
