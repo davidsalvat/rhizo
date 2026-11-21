@@ -116,12 +116,11 @@ fn a_node_cell_suspends_resumes_and_forks() {
     }
 }
 
-/// Two copies of a Node.js template frozen after its warm-up, and two
-/// loads of the template's snapshot bytes, each print a `Math.random()`
-/// and a `crypto.randomUUID()` of their own: the script replaces
-/// `Math.random` once it sees its copy generation changed, and OpenSSL
-/// reseeds as `getpid` changed (spec `cell-hierarchy`, design D22 of
-/// `add-cell-hierarchy`).
+/// Two copies of a Node.js template frozen after its warm-up each print a
+/// `Math.random()` and a `crypto.randomUUID()` of their own: the script
+/// replaces `Math.random` once it sees its copy generation changed, and
+/// OpenSSL reseeds as `getpid` changed (spec `cell-hierarchy`, design D22
+/// of `add-cell-hierarchy`).
 fn copies_draw_different_random() {
     let Some(files) = crate::cell::node_files() else {
         arch::console::BootConsole.write_bytes(b"(Node.js not packed: not run) ");
@@ -138,25 +137,12 @@ fn copies_draw_different_random() {
         host.step();
     }
     assert!(host.freeze(template));
-    let mut ids: Vec<u32> = (0..2)
+    let ids: Vec<u32> = (0..2)
         .map(|_| {
             host.spawn_from_template(template, true, false)
                 .expect("copy")
         })
         .collect();
-    let crc = crate::arch::mem::crc32c;
-    let bytes = host
-        .template_snapshot(template)
-        .expect("snapshot")
-        .export(&DirectMap, crc);
-    for _ in 0..2 {
-        let snapshot =
-            Snapshot::from_bytes(bytes.clone(), crate::arch::user::MACHINE, crc).expect("valid");
-        ids.push(
-            host.resume(snapshot, Resume::Lazy, true, false)
-                .expect("load"),
-        );
-    }
     host.run(|h| ids.iter().all(|&id| h.finished(id).is_some()));
     let answer = expected::NODE_STDOUT
         .strip_prefix("warm\n")

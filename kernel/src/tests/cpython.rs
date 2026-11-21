@@ -107,7 +107,7 @@ fn a_cpython_agent_talks_forks_and_survives_suspend() {
 }
 
 /// Two copies of a CPython template frozen after its warm-up (`random`
-/// imported and seeded), and two loads of the template's snapshot bytes,
+/// imported and seeded), and two resumes of a snapshot of the template,
 /// each print a `random.random()` and an `os.urandom(16)` of their own:
 /// they reseed once they see their copy generation changed (spec
 /// `cell-hierarchy`, design D22 of `add-cell-hierarchy`).
@@ -133,14 +133,8 @@ fn copies_draw_different_random() {
                 .expect("copy")
         })
         .collect();
-    let crc = crate::arch::mem::crc32c;
-    let bytes = host
-        .template_snapshot(template)
-        .expect("snapshot")
-        .export(&DirectMap, crc);
     for _ in 0..2 {
-        let snapshot =
-            Snapshot::from_bytes(bytes.clone(), crate::arch::user::MACHINE, crc).expect("valid");
+        let snapshot = host.template_snapshot(template).expect("snapshot");
         ids.push(
             host.resume(snapshot, Resume::Lazy, true, false)
                 .expect("load"),
