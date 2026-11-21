@@ -1,5 +1,7 @@
 //! The small local state that lets later commands find the VM `rhizo up`
 //! started: a directory with the state file, the control socket and logs.
+//! Once the VM is down only the console log stays, the last VM's, until the
+//! next `rhizo up` replaces it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +47,21 @@ impl Dir {
     /// original).
     pub fn kernel(&self) -> PathBuf {
         self.0.join("kernel")
+    }
+
+    /// Removes what a VM leaves here but the console log, the state file
+    /// last (`rhizo down` waits for it to go). Files that are not there
+    /// are fine.
+    pub fn clean(&self) {
+        for file in [
+            self.0.join("state.new"),
+            self.socket(),
+            self.kernel(),
+            self.log(),
+            self.state(),
+        ] {
+            let _ = fs::remove_file(file);
+        }
     }
 }
 
@@ -125,6 +142,32 @@ mod tests {
         assert_eq!(Info::decode(&info.encode()), Some(info));
         assert_eq!(Info::decode("pid=1\n"), None);
         assert_eq!(Info::decode("garbage"), None);
+    }
+
+    #[test]
+    fn cleaning_leaves_only_the_console_log() {
+        let dir = Dir(std::env::temp_dir().join(format!("rhizo-clean-{}", std::process::id())));
+        let _ = fs::remove_dir_all(&dir.0);
+        fs::create_dir_all(&dir.0).unwrap();
+        for file in [
+            dir.state(),
+            dir.0.join("state.new"),
+            dir.socket(),
+            dir.console(),
+            dir.log(),
+            dir.kernel(),
+        ] {
+            fs::write(file, b"x").unwrap();
+        }
+        dir.clean();
+        let left: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["console.log"]);
+        dir.clean();
+        assert!(dir.console().exists());
+        fs::remove_dir_all(&dir.0).unwrap();
     }
 
     #[test]

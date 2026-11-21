@@ -4,8 +4,10 @@
 //! it is asked: which programs, with which files and when to suspend, fork
 //! or kill them is the host's business (`rhizo`, design D1).
 //!
-//! A cell keeps its identifier for its whole life here: the kernel gives a
-//! resumed snapshot a new one, which this table hides.
+//! A cell keeps its identifier for its whole life here, and identifiers
+//! count up by one for each cell the host starts or forks: the kernel's own
+//! cell identifiers, which a resume also takes, stay behind this table
+//! (change `fix-cli-nits`).
 
 use crate::arch::console::control as link;
 use crate::arch::timer::{self, Counter};
@@ -60,6 +62,8 @@ struct Entry {
 struct Server {
     host: Host,
     cells: Vec<Entry>,
+    /// The identifier of the next cell the host starts or forks.
+    next: u32,
     decoder: Decoder,
     /// Frames and refusals read, not yet handled.
     items: Vec<Item>,
@@ -81,6 +85,7 @@ pub fn serve() {
     let mut server = Server {
         host: Host::new(),
         cells: Vec::new(),
+        next: 1,
         decoder: Decoder::new(),
         items: Vec::new(),
     };
@@ -257,17 +262,11 @@ impl Server {
                     .fork(cell, n as usize)
                     .ok_or((Error::NoMemory, String::from("the children do not fit")))?;
                 let image = self.entry(target)?.image.clone();
-                for &child in &children {
-                    self.cells.push(Entry {
-                        id: child,
-                        image: image.clone(),
-                        place: Place::Live(child),
-                        cell: child,
-                        out: Vec::new(),
-                        watchers: Vec::new(),
-                    });
-                }
-                Ok(Body::Cells(children))
+                let ids = children
+                    .into_iter()
+                    .map(|child| self.add(image.clone(), child))
+                    .collect();
+                Ok(Body::Cells(ids))
             }
             Request::Kill(target) => {
                 let entry = self.entry(target)?;
@@ -358,19 +357,27 @@ impl Server {
         }
         let argv: Vec<&[u8]> = run.argv.iter().map(Vec::as_slice).collect();
         let envp: Vec<&[u8]> = run.envp.iter().map(Vec::as_slice).collect();
-        let id = self
+        let cell = self
             .host
             .spawn_with_env(image, &argv, &envp, files, true, false)
             .map_err(|e| (Error::Failed, format!("{e:?}")))?;
+        Ok(Body::Cell(self.add(run.image, cell)))
+    }
+
+    /// Enters kernel cell `cell`, running `image`, in the table under the
+    /// next identifier, and returns it.
+    fn add(&mut self, image: Vec<u8>, cell: u32) -> u32 {
+        let id = self.next;
+        self.next += 1;
         self.cells.push(Entry {
             id,
-            image: run.image,
-            place: Place::Live(id),
-            cell: id,
+            image,
+            place: Place::Live(cell),
+            cell,
             out: Vec::new(),
             watchers: Vec::new(),
         });
-        Ok(Body::Cell(id))
+        id
     }
 
     fn stats(&self) -> Stats {

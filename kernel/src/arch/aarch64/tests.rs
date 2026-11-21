@@ -8,6 +8,7 @@ pub static ALL: &[TestCase] = &[
     ktest_case!(device_tree_is_valid),
     ktest_case!(counter_frequency_is_known),
     ktest_case!(pan_is_on),
+    ktest_case!(a_cell_reads_the_counter),
 ];
 
 /// PAN is on wherever the CPU has it (QEMU's `max` CPU does), also after
@@ -36,4 +37,11 @@ fn device_tree_is_valid() {
 
 fn counter_frequency_is_known() {
     assert!(super::timer::frequency() > 0, "CNTFRQ_EL0 is zero");
+}
+
+/// A cell reads the CPU's counter directly (`ticks`: `CNTVCT_EL0` and
+/// `CNTFRQ_EL0` on AArch64, `rdtsc` on x86_64), without a trap killing it,
+/// on whichever CPU it runs (change `add-node-workload`).
+fn a_cell_reads_the_counter() {
+    crate::tests::run_expected("ticks");
 }

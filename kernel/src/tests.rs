@@ -139,6 +139,8 @@ macro_rules! suite {
             ktest_case!(template_of_a_threaded_program),
             ktest_case!(every_cpu_has_its_number_and_own_stack),
             ktest_case!(kernel_globals_are_safe_across_cpus),
+            ktest_case!(timed_waits_last_as_long_on_every_cpu),
+            ktest_case!(idle_cpus_wake_only_for_deadlines),
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
@@ -162,9 +164,19 @@ macro_rules! suite {
     feature = "ktest-oom",
     feature = "ktest-user-read",
     feature = "ktest-user-exec",
+    feature = "node",
 )))]
 /// Every in-kernel test case, in execution order.
 pub static ALL: &[TestCase] = suite!();
+
+/// The Node.js tests (change `add-node-workload`), alone in the kernel
+/// built with Node.js embedded, whose VM has the memory it needs.
+#[cfg(feature = "node")]
+pub static ALL: &[TestCase] = &[
+    ktest_case!(console_output_works),
+    ktest_case!(node_answers_as_on_linux),
+    ktest_case!(a_node_cell_suspends_resumes_and_forks),
+];
 
 /// In self-check builds the regular suite is compiled but not run (it runs
 /// in the `ktest` build): referenced here so it keeps compiling everywhere.
@@ -177,6 +189,7 @@ pub static ALL: &[TestCase] = suite!();
     feature = "ktest-oom",
     feature = "ktest-user-read",
     feature = "ktest-user-exec",
+    feature = "node",
 ))]
 #[allow(dead_code, reason = "the suite runs in the regular `ktest` build")]
 static SUITE: &[TestCase] = suite!();
@@ -531,7 +544,7 @@ mod expected {
 
 /// Runs test cell `name` and checks its output and ending against
 /// `cells/expected.rs`; returns everything it printed.
-fn run_expected(name: &str) -> alloc::string::String {
+pub(crate) fn run_expected(name: &str) -> alloc::string::String {
     let &(_, stdout, ending) = expected::PROGRAMS
         .iter()
         .chain(expected::KERNEL_ONLY)
@@ -2027,6 +2040,111 @@ fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
     }
 }
 
+// --- C.3: Node.js ------------------------------------------------------------
+
+/// Spawns Node.js on `/app/demo.js` (`expected::NODE_ARGV`) with the
+/// script's arguments `args`.
+#[cfg(feature = "node")]
+fn spawn_node(host: &mut Host, files: &rhizo_fs::Fs, args: &[&str]) -> u32 {
+    let mut argv: Vec<&[u8]> = expected::NODE_ARGV.iter().map(|a| a.as_bytes()).collect();
+    argv.extend(args.iter().map(|a| a.as_bytes()));
+    host.spawn_file(files.clone(), argv[0], &argv, &[], true, true)
+        .unwrap_or_else(|e| panic!("cannot spawn Node.js: {e:?}"))
+}
+
+/// Node.js, the official build run unmodified with `--jitless` (spec
+/// `workloads`), answers its tool call as on Linux (`cells/expected.rs`,
+/// by the differential check), asks the host's fake model over HTTP with
+/// `node:http` when the VM has a network card, and gives back every frame
+/// and heap allocation once its file pages are dropped.
+#[cfg(feature = "node")]
+fn node_answers_as_on_linux() {
+    let Some(files) = crate::cell::node_files() else {
+        arch::console::BootConsole.write_bytes(b"(Node.js not packed: not run) ");
+        return;
+    };
+    // The card's address first: its lease is kept.
+    let mut host = Host::new();
+    let model = crate::wire::options().llm;
+    if model.is_some() {
+        host.wire_address(10_000_000_000)
+            .expect("the network card got an address");
+    }
+    let before = memory_balance();
+    let id = spawn_node(&mut host, &files, &[]);
+    host.run(|h| h.finished(id).is_some());
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::NODE_STDOUT.into())
+    );
+    drop(host);
+    assert!(crate::cell::drop_images(), "file pages were kept");
+    // Every frame is back; heap allocations too, but for the few the card's
+    // own traffic (DHCP, ARP) holds at any moment.
+    let after = memory_balance();
+    assert_eq!(after.0, before.0, "every frame returned");
+    assert!(after.1.abs_diff(before.1) <= 4, "{after:?} {before:?}");
+    let Some((ip, port)) = model else {
+        arch::console::BootConsole.write_bytes(b"(no model server: HTTP not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    let url = alloc::format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+    let id = spawn_node(&mut host, &files, &[&url]);
+    host.run(|h| h.finished(id).is_some());
+    let want = alloc::format!("{}{}", expected::NODE_STDOUT, expected::NODE_MODEL_LINE);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), want));
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0, "its connection is closed");
+}
+
+/// A Node.js cell is plain data like any other (spec `cells`): suspended
+/// after its warm-up, resumed from the snapshot's bytes, forked, and frozen
+/// as a template, every copy finishes the answer.
+#[cfg(feature = "node")]
+fn a_node_cell_suspends_resumes_and_forks() {
+    let Some(files) = crate::cell::node_files() else {
+        arch::console::BootConsole.write_bytes(b"(Node.js not packed: not run) ");
+        return;
+    };
+    let rest = expected::NODE_STDOUT
+        .strip_prefix("warm\n")
+        .expect("warm first");
+    let mut host = Host::new();
+    let warm = |host: &mut Host| {
+        let id = spawn_node(host, &files, &["wait"]);
+        while host.output(id) != Some(b"warm\n") {
+            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
+            host.step();
+        }
+        id
+    };
+    let id = warm(&mut host);
+    let bytes = host.suspend(id).expect("live").export(&DirectMap);
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let resumed = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    let children = host.fork(resumed, 2).expect("fork");
+    let template = warm(&mut host);
+    assert!(host.freeze(template));
+    let from_template: Vec<u32> = (0..2)
+        .map(|_| {
+            host.spawn_from_template(template, true, true)
+                .expect("fork")
+        })
+        .collect();
+    let all: Vec<u32> = [resumed]
+        .into_iter()
+        .chain(children)
+        .chain(from_template)
+        .collect();
+    host.run(|h| all.iter().all(|&id| h.finished(id).is_some()));
+    for id in all {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), rest.into()));
+    }
+}
+
 // --- H14: threads ------------------------------------------------------------
 
 /// Raw `clone` and futexes (`threads`) and glibc's pthreads, mutexes and
@@ -2532,6 +2650,53 @@ fn kernel_globals_are_safe_across_cpus() {
         heap_before.live,
         "every allocation freed"
     );
+}
+
+/// A 20 ms wait on each CPU's own timer lasts 20 ms by the counter, on
+/// the secondary CPUs as on the boot CPU (spec `multi-core`: x86_64
+/// secondary CPUs once kept the local APIC timer's reset divider, and
+/// such a wait ended after 1.3 ms on QEMU). The longest of three tries, as
+/// another interrupt may end a wait early.
+fn timed_waits_last_as_long_on_every_cpu() {
+    const WAIT_NS: u64 = 20_000_000;
+    for cpu in 0..crate::smp::count() {
+        let took = (0..3)
+            .map(|_| {
+                if cpu == 0 {
+                    crate::cell::timed_wait(WAIT_NS)
+                } else {
+                    crate::smp::post(cpu, crate::cell::timed_wait, WAIT_NS);
+                    crate::smp::join(cpu)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (WAIT_NS * 9 / 10..WAIT_NS * 10).contains(&took),
+            "CPU {cpu}: a {WAIT_NS} ns wait took {took} ns"
+        );
+    }
+}
+
+/// Every CPU idles while one cell sleeps 300 ms: the CPUs leave their
+/// waits a handful of times in all, not at every slice (spec `multi-core`,
+/// idle CPUs use no time: each idle CPU once looked again every 10 ms while
+/// a cell slept), and the sleeper still ends on time.
+fn idle_cpus_wake_only_for_deadlines() {
+    use crate::prof::{self, Count};
+    let now = || arch::timer::cycles_to_ns(arch::timer::Counter.cycles()).unwrap_or(0);
+    let mut host = Host::new();
+    let id = spawn(&mut host, "sleeper", &[b"300"]);
+    let (w0, t0) = (prof::get(Count::IdleWakeups), now());
+    host.run(|h| h.finished(id).is_some());
+    let (wakeups, took) = (prof::get(Count::IdleWakeups) - w0, now() - t0);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "slept ok\n".into()));
+    let cpus = crate::smp::count() as u64;
+    assert!(
+        wakeups <= 4 * cpus,
+        "{cpus} CPUs left their waits {wakeups} times in 300 ms"
+    );
+    assert!(took < 400_000_000, "the 300 ms sleeper took {took} ns");
 }
 
 /// Every CPU online, as a mask.

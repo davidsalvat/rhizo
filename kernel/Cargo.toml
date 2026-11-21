@@ -33,6 +33,10 @@ ktest-oom = ["ktest"]
 # reading, then executing, a user page must fault.
 ktest-user-read = ["ktest"]
 ktest-user-exec = ["ktest"]
+# Node.js builds (change `add-node-workload`): embed `node-files` (over
+# 100 MiB, so only here); with `ktest`, run the Node.js tests only, with
+# `bench-cell`, measure the Node.js workload only. Their VMs get more memory.
+node = []
 # Benchmark build: spawn and run the hello cell repeatedly and print
 # `rhizo-cell spawn_ns=<median>` (`cargo xtask bench`).
 bench-cell = ["cells"]

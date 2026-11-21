@@ -93,6 +93,8 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
             dir.0.display()
         ));
     }
+    // What a server that did not end cleanly left.
+    dir.clean();
     std::fs::create_dir_all(&dir.0)
         .map_err(|e| format!("cannot create {}: {e}", dir.0.display()))?;
     xtask::arch::select(up.arch);
@@ -157,12 +159,13 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
     Ok(())
 }
 
-/// `rhizo down`: asks the kernel to power off and waits for the server.
+/// `rhizo down`: asks the kernel to power off and waits for the server,
+/// which leaves only the console log in the state directory.
 fn cmd_down(dir: &Dir) -> Result<(), String> {
     let mut client = Client::connect(dir)?;
     let t0 = Instant::now();
     let reply = client.call(&Request::Shutdown)?;
-    // The server removes the state once the VMM has ended.
+    // The server removes the state, last, once the VMM has ended.
     let gone = |within: Duration| {
         let deadline = Instant::now() + within;
         while dir.state().exists() {
