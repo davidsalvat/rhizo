@@ -2686,6 +2686,10 @@ impl Host {
     /// CPU's waits end by then, whatever the cells wait for and whichever
     /// CPU's timer holds their deadlines (design D1 of
     /// `fix-lost-wakeup-smp`).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
     pub fn run_until(&mut self, at: u64, mut stop: impl FnMut(&Self) -> bool) {
         self.until = Some(at);
         self.run(|h| now_ns() >= at || stop(h));
