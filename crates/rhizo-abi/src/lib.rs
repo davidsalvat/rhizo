@@ -406,6 +406,21 @@ fn wake_on_fs_change(cell: &mut Cell, changed: bool) {
     }
 }
 
+/// The kernel's sockets as a system call reaches them: the kernel locks
+/// them the first time a call uses them, so calls that use no socket never
+/// wait for the calls of other cells that do (design D1 of
+/// `split-sockets-lock`).
+pub trait Sockets {
+    /// The sockets, locked until the end of the call.
+    fn net(&mut self) -> &mut rhizo_net::Net;
+}
+
+impl Sockets for rhizo_net::Net {
+    fn net(&mut self) -> &mut rhizo_net::Net {
+        self
+    }
+}
+
 /// Everything a call needs to reach the cell's memory and the kernel.
 pub struct Context<'a, F, M, T, A, S> {
     pub pt: PageTable<F>,
@@ -415,8 +430,9 @@ pub struct Context<'a, F, M, T, A, S> {
     pub services: &'a mut S,
     /// The cell's files and descriptors.
     pub fs: &'a mut rhizo_fs::Fs,
-    /// The sockets of every cell (spec `networking`).
-    pub net: &'a mut rhizo_net::Net,
+    /// The sockets of every cell (spec `networking`), reached only by the
+    /// calls that use them.
+    pub net: &'a mut dyn Sockets,
     /// On entry, the deadline of the blocked call the thread makes again,
     /// if any (it keeps its timeout); a call that blocks on descriptors sets
     /// the deadline it waits for ([`Wait::Io`]).
@@ -688,7 +704,7 @@ impl Abi {
         // Sockets whose last descriptor the call closed.
         if cx.fs.has_released() {
             for h in cx.fs.take_released() {
-                cx.net.release(h);
+                cx.net.net().release(h);
             }
         }
         // Another thread of the cell may wait for what changed in its pipes,

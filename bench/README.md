@@ -66,6 +66,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.ipi_wake_us/rhizo/<vmm>` | timing | Handing work to an idle CPU: post it, wake the CPU with an inter-processor interrupt, see it done (robust figure over 105) |
 | `cell.thread_scaling_pct/rhizo/<vmm>` | timing | With 4 vCPUs: `parsum` summing 24 million rounds with 4 threads of one cell, times 4, over the same sum with 1 thread, in percent (each the time the cell reports, median of 3): 100 is perfect scaling (lower is better) |
 | `cell.shootdown_us/rhizo/<vmm>` | timing | With 4 vCPUs: one `munmap` of a written page by a thread of the `shootdown` cell while its three other threads run on the other CPUs, median of 200 (x86_64: interrupts the other CPUs and waits until they left the cell's code; AArch64: broadcast invalidation, no interrupt) |
+| `cell.syscall_scaling_pct/rhizo/<vmm>` | rate | With 4 vCPUs: four `piper` cells per CPU (each writes and reads a byte through its pipe 20,000 times) run on every CPU, times the number of CPUs, over their time on one CPU after the other, in percent: 100 is perfect scaling, 400 means the calls took turns. Calls that use no socket take no global lock (change `split-sockets-lock`) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
 | `cell.syscall_ns/rhizo/<vmm>` | timing | One system call round trip: `yielder getpid 20000` run to its exit minus `yielder getpid 0`, per call (robust figure) |
 | `cell.cow_fault_ns/rhizo/<vmm>` | timing | The kernel's side of one copy-on-write fault of a 4 KiB page (frame, copy, entry, TLB flush; the trap itself is about `cell.syscall_ns`), accounted alone (`profile` build) while a fork of a cell holding 1 MiB writes every page |
@@ -79,6 +80,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `control.resume_us/rhizo/<vmm>` | timing | `resume` of it (lazy: pages come back on first touch) |
 | `control.fork_us/rhizo/<vmm>` | timing | `fork` of it into one cell |
 | `control.kill_us/rhizo/<vmm>` | timing | `kill` of it. Each of these five over 20 rounds; each reply also carries the kernel's own time for the operation, which `rhizo` prints next to the round trip |
+| `chat.turn_us/rhizo/<vmm>` | timing | The Rhizo side of one interactive turn (change `add-interactive-chat`): on the same boot, when CPython is built, the chat agent (`cells/python/agent_chat.py`) against the host's fake model with no delay; each turn timed by the host from writing the `input` request (one line) to the VMM's standard input until it reads the agent's end-of-turn line back, less the time the agent waited for the model (its requests sent until their answers were read). What is left: the request on the serial line, waking the agent's read, CPython's work (JSON, one `run_python` snippet, printing), the answer's output and the serial line back. Median of 20 turns; `rhizo chat` prints the same split after every turn |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded

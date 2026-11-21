@@ -28,7 +28,7 @@ host has no way to say how much one cell may use.
 - Sockets: past the quota, socket creation answers `ENFILE`.
 - `getrlimit`/`prlimit64` report the quotas (`RLIMIT_CPU`, `RLIMIT_AS`,
   `RLIMIT_NOFILE`).
-- Snapshot format version 7: the state section holds the quotas and the
+- Snapshot format version 8: the state section holds the quotas and the
   CPU time used. A resumed cell keeps both; a fork or template copy keeps
   the quotas and starts with no usage.
 
@@ -50,7 +50,7 @@ hierarchies of quotas shared by several cells.
 
 `crates/rhizo-cell` (`quota`, `Cell`), `crates/rhizo-fs` (limits on
 descriptors and sockets), `crates/rhizo-abi` (`getrlimit`),
-`crates/rhizo-snapshot` (version 7), `kernel/src/cell.rs`,
+`crates/rhizo-snapshot` (version 8), `kernel/src/cell.rs`,
 `kernel/src/tests.rs`, `cells/src/bin/limits.rs`, `docs/security.md`.
 The cost on benchmarked paths is a compare per frame taken and one clock
 read per slice.

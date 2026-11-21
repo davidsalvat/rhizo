@@ -320,6 +320,10 @@ pub struct Tables {
     fd_limit: usize,
     /// Sockets (open socket descriptions) the cell may hold.
     socket_limit: usize,
+    /// The pipe whose write end the host holds, outside the descriptors:
+    /// standard input from the host ([`Tables::host_input`]).
+    input: Option<u32>,
+
     /// Counts changes to pipes, event counters and `epoll` instances
     /// ([`Tables::changes`]).
     changes: u64,
@@ -351,6 +355,8 @@ impl Tables {
             released: Vec::new(),
             fd_limit: FD_MAX,
             socket_limit: SOCKETS_DEFAULT,
+            input: None,
+
             changes: 0,
         }
     }

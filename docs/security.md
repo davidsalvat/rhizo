@@ -156,7 +156,7 @@ and at most 256 sockets (S21).
 - **Descriptors** (at most 1024): `EMFILE` past the quota. **Sockets**:
   `ENFILE` past the quota, 256 by default (S21).
 - **Cell state.** Quotas live in the `Cell`: forks and template copies keep
-  them (with no usage), snapshots (format version 7) keep them and the CPU
+  them (with no usage), snapshots (format version 8) keep them and the CPU
   time used, so a suspend and resume buys no time. `getrlimit` reports
   them; nothing in a cell can raise them.
 

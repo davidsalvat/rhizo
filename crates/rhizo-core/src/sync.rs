@@ -57,6 +57,24 @@ impl<T> SpinLock<T> {
     /// # Panics
     /// If `cpu` already holds it (reentrance).
     pub fn with<R>(&self, cpu: usize, f: impl FnOnce(&mut T) -> R) -> R {
+        self.acquire(cpu);
+        self.run(f)
+    }
+
+    /// Exclusive access to the value, on behalf of CPU `cpu`, until the
+    /// guard is dropped: for a holder that takes the lock only once it
+    /// turns out to need it, then keeps it.
+    ///
+    /// # Panics
+    /// If `cpu` already holds it (reentrance).
+    pub fn lock(&self, cpu: usize) -> Guard<'_, T> {
+        self.acquire(cpu);
+        Guard(self)
+    }
+
+    /// Takes the lock for CPU `cpu`, waiting while another CPU holds it.
+    #[inline(always)]
+    fn acquire(&self, cpu: usize) {
         let me = cpu as u32 + 1;
         while let Err(held) =
             self.holder
@@ -64,7 +82,6 @@ impl<T> SpinLock<T> {
         {
             self.wait_while_held(held, me);
         }
-        self.run(f)
     }
 
     /// [`with`](Self::with), calling `wait` when the lock is found held by
@@ -81,6 +98,29 @@ impl<T> SpinLock<T> {
         done: impl FnOnce(W),
         f: impl FnOnce(&mut T) -> R,
     ) -> R {
+        self.acquire_waiting(cpu, wait, done);
+        self.run(f)
+    }
+
+    /// [`lock`](Self::lock), with the hooks of
+    /// [`with_waiting`](Self::with_waiting).
+    ///
+    /// # Panics
+    /// If `cpu` already holds it (reentrance).
+    pub fn lock_waiting<W>(
+        &self,
+        cpu: usize,
+        wait: impl FnOnce() -> W,
+        done: impl FnOnce(W),
+    ) -> Guard<'_, T> {
+        self.acquire_waiting(cpu, wait, done);
+        Guard(self)
+    }
+
+    /// [`acquire`](Self::acquire), with the hooks of
+    /// [`with_waiting`](Self::with_waiting).
+    #[inline(always)]
+    fn acquire_waiting<W>(&self, cpu: usize, wait: impl FnOnce() -> W, done: impl FnOnce(W)) {
         let me = cpu as u32 + 1;
         if self
             .holder
@@ -96,7 +136,6 @@ impl<T> SpinLock<T> {
             }
             done(waiting);
         }
-        self.run(f)
     }
 
     /// The lock was found held by `held` (a CPU number plus one, 0 for a
@@ -144,6 +183,34 @@ impl<T> SpinLock<T> {
     /// The value, the lock gone: owning it proves nobody else has it.
     pub fn into_inner(self) -> T {
         self.value.into_inner()
+    }
+}
+
+/// Exclusive access to a [`SpinLock`]'s value; dropping it releases the
+/// lock.
+#[derive(Debug)]
+pub struct Guard<'a, T>(&'a SpinLock<T>);
+
+impl<T> core::ops::Deref for Guard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists only while `holder` is ours, so no other
+        // reference to the value exists.
+        unsafe { &*self.0.value.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for Guard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, and `&mut self` makes this the only
+        // reference through the guard.
+        unsafe { &mut *self.0.value.get() }
+    }
+}
+
+impl<T> Drop for Guard<'_, T> {
+    fn drop(&mut self) {
+        self.0.holder.store(0, Ordering::Release);
     }
 }
 
@@ -236,5 +303,23 @@ mod tests {
         let lock = SpinLock::new(1);
         assert_eq!(lock.with(0, |v| *v + 1), 2);
         assert_eq!(lock.with(1, |v| *v), 1, "another CPU gets it");
+    }
+
+    #[test]
+    fn a_guard_holds_the_lock_until_dropped() {
+        let lock = SpinLock::new(1);
+        let mut guard = lock.lock(0);
+        *guard += 1;
+        assert_eq!(lock.holder.load(Ordering::Relaxed), 1, "held by CPU 0");
+        drop(guard);
+        assert_eq!(lock.with(1, |v| *v), 2, "released, with the change");
+    }
+
+    #[test]
+    #[should_panic(expected = "reentrant access")]
+    fn a_guard_is_reentrance_too() {
+        let lock = SpinLock::new(0);
+        let _held = lock.lock(1);
+        lock.with(1, |_| ());
     }
 }

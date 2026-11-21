@@ -5,7 +5,7 @@
 - [x] 1.1 `Quota`, `Metered` and `Cell::charge_cpu` in `rhizo_cell::quota` (D1, D2); verify `cargo test -p rhizo-cell quota`
 - [x] 1.2 Descriptor and socket limits in `rhizo-fs` (D4); verify `cargo test -p rhizo-fs quotas`
 - [x] 1.3 `getrlimit`/`prlimit64` report the quotas (D3); verify `cargo test -p rhizo-abi rlimits`
-- [x] 1.4 Snapshot format version 7 with quotas and CPU time used (D3); verify `cargo test -p rhizo-snapshot`
+- [x] 1.4 Snapshot format version 8 with quotas and CPU time used (D3); verify `cargo test -p rhizo-snapshot`
 
 ## 2. Kernel
 

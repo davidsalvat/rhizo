@@ -36,6 +36,24 @@ impl<T> Global<T> {
         self.0.with(crate::arch::cpu::index(), f)
     }
 
+    /// Exclusive access to the value until the guard is dropped (taken by
+    /// a holder only once it turns out to need it), accounted as
+    /// [`with`](Self::with) is.
+    ///
+    /// # Panics
+    /// If this CPU holds it already.
+    #[cfg(feature = "cells")]
+    pub fn lock(&self) -> rhizo_core::sync::Guard<'_, T> {
+        #[cfg(feature = "profile")]
+        return self.0.lock_waiting(
+            crate::arch::cpu::index(),
+            || crate::cost::scope(rhizo_prof::Part::Lock),
+            drop,
+        );
+        #[cfg(not(feature = "profile"))]
+        self.0.lock(crate::arch::cpu::index())
+    }
+
     /// How often CPUs waited for it.
     #[cfg_attr(
         not(feature = "bench-cell"),

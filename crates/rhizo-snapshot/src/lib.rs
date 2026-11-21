@@ -8,9 +8,9 @@
 //! ```text
 //! header   "RHZSNAP1", version u32, machine u16, reserved u16, pages u32,
 //!          threads u32                                       (24 bytes)
-//! state    brk_start, brk, mmap_next, next thread identifier, then the
-//!          quotas: memory bytes, CPU ns, CPU ns used, files (low 32
-//!          bits) and sockets (high 32 bits)              (8 x u64)
+//! state    brk_start, brk, mmap_next, next thread identifier, then
+//!          (version 8) the quotas: memory bytes, CPU ns, CPU ns used,
+//!          files (low 32 bits) and sockets (high 32 bits)  (8 x u64)
 //! threads  per thread, the current one first: tid, clear_tid, wait kind
 //!          (0 runnable, 1 sleep, 2 futex), futex address, futex bitset,
 //!          time left in ns (u64::MAX: no deadline), pc, sp, gpr[31], tls,
@@ -21,7 +21,8 @@
 //! data     page contents, in record order
 //! files    length u64, then the cell's file system as `rhizo_fs` encodes
 //!          it (tree, open descriptions and descriptors, pipes, event
-//!          counters, `epoll` instances, working directory)
+//!          counters, `epoll` instances, working directory; version 7:
+//!          the pipe of the host's standard input)
 //! sockets  length u64, then one record per socket as `rhizo_net` encodes
 //!          them (version 6: a connection may be parked in the kernel);
 //!          a socket descriptor's index is its record's
@@ -46,7 +47,7 @@ use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 const HEADER: usize = 24;
 const STATE: usize = 8 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.

@@ -107,10 +107,18 @@ pub fn serve() {
         } else {
             LOOK_SLOW_NS
         };
-        let watched = server
+        // Watched cells' output goes out as soon as they wait for something
+        // (an agent's reply, then its read of the next line), else every
+        // `OUTPUT_EVERY_NS` (design D3 of `add-interactive-chat`).
+        let watched: Vec<u32> = server
             .cells
             .iter()
-            .any(|e| !e.watchers.is_empty() && matches!(e.place, Place::Live(_)));
+            .filter(|e| !e.watchers.is_empty())
+            .filter_map(|e| match e.place {
+                Place::Live(cell) => Some(cell),
+                _ => None,
+            })
+            .collect();
         let flush_at = now + OUTPUT_EVERY_NS;
         let Server {
             host,
@@ -128,7 +136,8 @@ pub fn serve() {
             !items.is_empty()
                 || decoder.in_frame()
                 || h.has_finished()
-                || (watched && now_ns() >= flush_at)
+                || (!watched.is_empty() && now_ns() >= flush_at)
+                || watched.iter().any(|&cell| h.has_output(cell))
         });
     }
 }
@@ -287,6 +296,36 @@ impl Server {
             }
             Request::Stats => Ok(Body::Stats(self.stats())),
             Request::Shutdown => Ok(Body::None),
+            Request::Input { cell, data } => self.input(cell, Some(&data)),
+            Request::CloseInput(cell) => self.input(cell, None),
+        }
+    }
+
+    /// Writes into a cell's standard input, or closes it (design D1 of
+    /// `add-interactive-chat`).
+    fn input(&mut self, target: u32, data: Option<&[u8]>) -> Outcome {
+        let cell = self.live(target)?;
+        match self.host.input(cell, data) {
+            Some(Ok(())) => Ok(Body::None),
+            Some(Err(e)) => Err(match e {
+                rhizo_fs::Error::BadFd => (
+                    Error::Failed,
+                    String::from("the cell has no input from the host, or it was closed"),
+                ),
+                rhizo_fs::Error::Pipe => (
+                    Error::Failed,
+                    String::from("the cell closed its standard input"),
+                ),
+                rhizo_fs::Error::Again => (
+                    Error::Failed,
+                    format!(
+                        "the cell's input is full ({} KiB unread)",
+                        rhizo_fs::PIPE_CAP >> 10
+                    ),
+                ),
+                _ => (Error::NoMemory, String::new()),
+            }),
+            None => refuse(Error::NotRunning),
         }
     }
 
@@ -304,6 +343,11 @@ impl Server {
             Error::NoImage,
             String::from_utf8_lossy(&run.files_from).into(),
         ))?;
+        if run.input {
+            files
+                .host_input()
+                .map_err(|e| (Error::Failed, format!("standard input: {e:?}")))?;
+        }
         for (path, data) in &run.files {
             files.put_file(path, data).map_err(|e| {
                 (
