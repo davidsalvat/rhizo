@@ -17,6 +17,11 @@ fn plain(n: &Node) -> bool {
     n.is_root() && n.weight() == WEIGHT_DEFAULT && n.cpu_max() == u32::MAX
 }
 
+/// Whether a root placed with `spec` is plain (see [`plain`]).
+pub(super) fn plain_root(spec: &rhizo_cap::Spec) -> bool {
+    spec.weight == WEIGHT_DEFAULT && spec.cpu_max == u32::MAX
+}
+
 /// A CPU cap in thousandths of a CPU, in nanoseconds of CPU time per
 /// period (`u32::MAX`: none).
 fn cap_ns(cpu_max: u32) -> Option<u64> {
@@ -32,6 +37,16 @@ impl Host {
     /// shares again. Round robin needs none, and keeps holding: a root of
     /// the default weight, a copy of a plain cell and a cell resumed where
     /// it was are plain again.
+    /// A cell was placed, `plain` if as a root with [`plain_root`]'s spec:
+    /// the shares again if cells share by weight or it is not plain (on
+    /// round robin, a plain root tests two values it already holds).
+    #[inline(always)]
+    pub(super) fn reshare_after(&mut self, plain: bool) {
+        if self.by_weight || !plain {
+            self.reshare();
+        }
+    }
+
     #[inline(always)]
     pub(super) fn reshare_if_by_weight(&mut self) {
         if self.by_weight {

@@ -16,6 +16,11 @@
 //! host over TCP through the network card, and a load fetches one the same
 //! way, then validates it as the untrusted input it is
 //! (`Snapshot::from_bytes`).
+//!
+//! Protocol version 4 places the cells the host makes in the cell tree and
+//! operates on it (`tree`, design D14 of `add-cell-hierarchy`).
+
+mod tree;
 
 use crate::arch::timer::{self, Counter};
 use crate::cell::{self, Ending, Host, Resume, now_ns};
@@ -25,7 +30,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rhizo_cell::quota::Quota;
 use rhizo_control::{
-    Body, CellInfo, Decoder, Error, Item, Message, Request, Run, State, Stats, VERSION,
+    Body, Decoder, Error, Item, Message, Placement, Request, Run, State, Stats, VERSION,
 };
 use rhizo_hal::CycleCounter;
 use rhizo_mm::FRAME_SIZE;
@@ -70,6 +75,9 @@ struct Entry {
     out: Vec<u8>,
     /// Requests streaming its output.
     watchers: Vec<u32>,
+    /// A loaded cell's placement, applied when it is resumed, and the
+    /// number its snapshot held (which it never takes again).
+    pending: Option<(Placement, u32)>,
 }
 
 struct Server {
@@ -80,8 +88,9 @@ struct Server {
     decoder: Decoder,
     /// Frames and refusals read, not yet handled.
     items: Vec<Item>,
-    /// Whether frames go over the vsock stream (else the serial line).
-    on_vsock: bool,
+    /// The vsock connection frames go over, by its number (else the
+    /// serial line).
+    vsock: Option<u32>,
 }
 
 /// The control channel: the vsock stream while the host is connected to
@@ -90,17 +99,21 @@ mod link {
     use crate::arch::console::control as serial;
     use crate::vsock;
 
-    /// Whether the host is connected over vsock (the device is polled).
-    pub fn on_vsock() -> bool {
+    /// The host's vsock connection, if it is connected (the device is
+    /// polled).
+    pub fn connection() -> Option<u32> {
         vsock::poll()
     }
 
-    /// The next byte the host sent, if one is waiting.
-    pub fn read_byte() -> Option<u8> {
-        if vsock::poll() {
-            vsock::read_byte()
-        } else {
-            serial::read_byte()
+    /// The next byte the host sent on the channel `on` (a vsock
+    /// connection, else the serial line), if one is waiting; none once the
+    /// channel changed, so a new connection's bytes wait for its greeting
+    /// and a fresh decoder (`Server::read`).
+    pub fn read_byte(on: Option<u32>) -> Option<u8> {
+        match (vsock::poll(), on) {
+            (Some(_), Some(on)) => vsock::read_byte(on),
+            (None, None) => serial::read_byte(),
+            _ => None,
         }
     }
 
@@ -138,7 +151,7 @@ pub fn serve() {
         next: 1,
         decoder: Decoder::new(),
         items: Vec::new(),
-        on_vsock: false,
+        vsock: None,
     };
     // Cells may talk to the host's network as soon as they start.
     server.host.wire_address(10_000_000_000);
@@ -183,19 +196,20 @@ pub fn serve() {
             host,
             decoder,
             items,
-            on_vsock,
+            vsock,
             ..
         } = &mut server;
+        let on = *vsock;
         host.look_every(Some(every));
         host.run(|h| {
-            while let Some(byte) = link::read_byte() {
+            while let Some(byte) = link::read_byte(on) {
                 if let Some(item) = decoder.push(byte) {
                     items.push(item);
                 }
             }
             !items.is_empty()
                 || decoder.in_frame()
-                || crate::vsock::connected() != *on_vsock
+                || crate::vsock::connection() != on
                 || h.has_finished()
                 || (!watched.is_empty() && now_ns() >= flush_at)
                 || watched.iter().any(|&cell| h.has_output(cell))
@@ -205,19 +219,20 @@ pub fn serve() {
 
 impl Server {
     /// Reads what the host sent; a frame begun is read to its end. A new
-    /// vsock connection is greeted, and frames go there from then on.
+    /// vsock connection, even one that replaced another between two looks,
+    /// is greeted, and frames go there from then on.
     fn read(&mut self) {
-        let on_vsock = link::on_vsock();
-        if on_vsock != self.on_vsock {
-            self.on_vsock = on_vsock;
+        let vsock = link::connection();
+        if vsock != self.vsock {
+            self.vsock = vsock;
             self.decoder = Decoder::new();
-            if on_vsock {
+            if vsock.is_some() {
                 send(0, &Message::Hello { version: VERSION });
             }
         }
         let mut last = now_ns();
         loop {
-            match link::read_byte() {
+            match link::read_byte(self.vsock) {
                 Some(byte) => {
                     last = now_ns();
                     if let Some(item) = self.decoder.push(byte) {
@@ -273,17 +288,8 @@ impl Server {
 
     fn execute(&mut self, id: u32, request: Request) -> Outcome {
         match request {
-            Request::Run(run) => self.run(run),
-            Request::List => Ok(Body::List(
-                self.cells
-                    .iter()
-                    .map(|e| CellInfo {
-                        id: e.id,
-                        image: e.image.clone(),
-                        state: state_of(&e.place),
-                    })
-                    .collect(),
-            )),
+            Request::Run(run) => self.run(id, run),
+            Request::List => Ok(Body::List(self.cells.iter().map(|e| self.row(e)).collect())),
             Request::Suspend(target) => {
                 let cell = self.live(target)?;
                 let snapshot = self
@@ -295,47 +301,77 @@ impl Server {
                 self.entry(target)?.place = Place::Suspended(snapshot);
                 Ok(Body::Bytes(bytes))
             }
-            Request::Resume(target) => {
-                let entry = self.entry(target)?;
-                let snapshot =
-                    match core::mem::replace(&mut entry.place, Place::Ended(State::Killed)) {
-                        Place::Suspended(snapshot) => snapshot,
-                        other => {
-                            entry.place = other;
-                            return refuse(Error::NotSuspended);
-                        }
-                    };
-                match self.host.resume(snapshot, Resume::Lazy, true, false) {
-                    Ok(cell) => {
-                        let entry = self.entry(target)?;
-                        (entry.place, entry.cell) = (Place::Live(cell), cell);
-                        Ok(Body::None)
-                    }
-                    Err(snapshot) => {
-                        self.entry(target)?.place = Place::Suspended(snapshot);
-                        Err((Error::NoMemory, String::from("the cell does not fit")))
-                    }
-                }
-            }
-            Request::Fork { cell: target, n } => {
+            Request::Resume(target) => self.resume(target),
+            Request::Fork {
+                cell: target,
+                n,
+                placement,
+                watch,
+            } => {
                 if n == 0 || n > MAX_FORK {
                     return Err((Error::Failed, format!("from 1 to {MAX_FORK} children")));
                 }
-                let children = match self.entry(target)?.place {
-                    Place::Template(template) => self.copies_of(template, n),
-                    _ => {
+                let template = match self.entry(target)?.place {
+                    Place::Template(template) => Some(template),
+                    _ => None,
+                };
+                let to = match (template, placement.is_root()) {
+                    (_, true) => None,
+                    (Some(_), false) => Some(self.target(&placement)?),
+                    (None, false) => {
+                        return Err((
+                            Error::Invalid,
+                            String::from(
+                                "a running cell's copies are its siblings: only a template's \
+                                 are placed",
+                            ),
+                        ));
+                    }
+                };
+                let children = match template {
+                    Some(template) => self.copies_of(template, n),
+                    None => {
                         let cell = self.live(target)?;
                         self.host.fork(cell, n as usize)
                     }
                 }
                 .ok_or((Error::NoMemory, String::from("the children do not fit")))?;
+                if let (Some((parent, spec)), Some(template)) = (to, template) {
+                    // Each copy keeps a number unlike its template's.
+                    let skip = self.host.tree().get(template).map_or(0, |n| n.pid());
+                    for &child in &children {
+                        if let Err(e) = self.host.place(child, parent, spec.clone(), skip) {
+                            for &child in &children {
+                                self.host.kill(child);
+                            }
+                            self.reap();
+                            return Err(tree::tree_error(e));
+                        }
+                    }
+                }
                 let image = self.entry(target)?.image.clone();
-                let ids = children
+                let ids: Vec<u32> = children
                     .into_iter()
                     .map(|child| self.add(image.clone(), child))
                     .collect();
+                if watch {
+                    for &child in &ids {
+                        self.entry(child)?.watchers.push(id);
+                    }
+                }
                 Ok(Body::Cells(ids))
             }
+            Request::KillTree(target) => self.kill_tree(target),
+            Request::SuspendTree(target) => self.suspend_tree(target),
+            Request::ResumeTree(target) => self.resume_tree(target),
+            Request::Reparent { cell, to } => self.reparent(cell, to),
+            Request::Policy {
+                cell,
+                egress,
+                ceiling,
+            } => self.policy(cell, &egress, ceiling.as_ref()),
+            Request::Limits { cell, limits } => self.limits(cell, &limits),
+            Request::Scoped { root, request } => self.scoped(id, root, *request),
             Request::Kill(target) => {
                 let entry = self.entry(target)?;
                 match core::mem::replace(&mut entry.place, Place::Ended(State::Killed)) {
@@ -387,8 +423,52 @@ impl Server {
                 size,
                 template,
                 host,
-            } => self.load(size, template, host),
+                placement,
+            } => self.load(size, template, host, placement),
         }
+    }
+
+    /// Resumes suspended cell `target` under its identifier; a loaded one
+    /// then takes the placement it was loaded with, or, if the tree
+    /// refuses it, is suspended again (a root) and the reply says why.
+    fn resume(&mut self, target: u32) -> Outcome {
+        let entry = self.entry(target)?;
+        let snapshot = match core::mem::replace(&mut entry.place, Place::Ended(State::Killed)) {
+            Place::Suspended(snapshot) => snapshot,
+            other => {
+                entry.place = other;
+                return refuse(Error::NotSuspended);
+            }
+        };
+        let cell = match self.host.resume(snapshot, Resume::Lazy, true, false) {
+            Ok(cell) => cell,
+            Err(snapshot) => {
+                self.entry(target)?.place = Place::Suspended(snapshot);
+                return Err((Error::NoMemory, String::from("the cell does not fit")));
+            }
+        };
+        let entry = self.entry(target)?;
+        (entry.place, entry.cell) = (Place::Live(cell), cell);
+        let Some((placement, skip)) = entry.pending.take() else {
+            return Ok(Body::None);
+        };
+        let placed = self.target(&placement).and_then(|(parent, spec)| {
+            self.host
+                .place(cell, parent, spec, skip)
+                .map_err(tree::tree_error)
+        });
+        let Err((error, why)) = placed else {
+            return Ok(Body::None);
+        };
+        let left = match self.host.suspend(cell) {
+            Some(snapshot) => {
+                self.reap();
+                self.entry(target)?.place = Place::Suspended(snapshot);
+                "suspended again"
+            }
+            None => "running",
+        };
+        Err((error, format!("{why}; the cell is {left}, a root")))
     }
 
     /// Cells made from template `template`, all or none.
@@ -441,7 +521,18 @@ impl Server {
     /// Fetches a snapshot of `size` bytes from the host, validates it and
     /// makes it a suspended cell or a template under the next identifier
     /// (design D2 to D4 of `snapshots-on-disk`).
-    fn load(&mut self, size: u64, template: bool, from: rhizo_control::Host) -> Outcome {
+    fn load(
+        &mut self,
+        size: u64,
+        template: bool,
+        from: rhizo_control::Host,
+        placement: Placement,
+    ) -> Outcome {
+        // A placement is checked before any byte moves; its parent again
+        // when it applies.
+        if !placement.is_root() {
+            self.target(&placement)?;
+        }
         let size = usize::try_from(size).unwrap_or(usize::MAX);
         let mut bytes = Vec::new();
         if !cell::cells_may_take(size as u64) || bytes.try_reserve_exact(size).is_err() {
@@ -455,14 +546,28 @@ impl Server {
                 .map_err(|e| (Error::BadSnapshot, describe(e)))?;
         // It gets no more than a cell the host starts (design D4).
         snapshot.cap_quota(Quota::DEFAULT);
-        let place = if template {
+        let source = snapshot.tree().pid;
+        let (place, cell, pending) = if template {
             let t = self
                 .host
                 .load_template(snapshot)
                 .map_err(|_| (Error::NoMemory, String::from("the template does not fit")))?;
-            Place::Template(t)
+            if !placement.is_root() {
+                let skip = self.host.tree().get(t).map_or(0, |n| n.pid());
+                let placed = self.target(&placement).and_then(|(parent, spec)| {
+                    self.host
+                        .place(t, parent, spec, skip)
+                        .map_err(tree::tree_error)
+                });
+                if let Err(e) = placed {
+                    self.host.drop_template(t);
+                    return Err(e);
+                }
+            }
+            (Place::Template(t), t, None)
         } else {
-            Place::Suspended(snapshot)
+            let pending = (!placement.is_root()).then_some((placement, source));
+            (Place::Suspended(snapshot), 0, pending)
         };
         let id = self.next;
         self.next += 1;
@@ -470,9 +575,10 @@ impl Server {
             id,
             image: b"loaded".to_vec(),
             place,
-            cell: 0,
+            cell,
             out: Vec::new(),
             watchers: Vec::new(),
+            pending,
         });
         Ok(Body::Cell(id))
     }
@@ -505,7 +611,14 @@ impl Server {
         }
     }
 
-    fn run(&mut self, run: Run) -> Outcome {
+    fn run(&mut self, id: u32, run: Run) -> Outcome {
+        // Checked before the cell is made; nothing to do for a root with
+        // the defaults, as every cell before version 4.
+        let to = if run.placement.is_root() {
+            None
+        } else {
+            Some(self.target(&run.placement)?)
+        };
         let image = cell::find_image(&run.image)
             .filter(|i| !i.is_empty())
             .ok_or((Error::NoImage, String::from_utf8_lossy(&run.image).into()))?;
@@ -538,7 +651,18 @@ impl Server {
             .host
             .spawn_with_env(image, &argv, &envp, files, true, false)
             .map_err(|e| (Error::Failed, format!("{e:?}")))?;
-        Ok(Body::Cell(self.add(run.image, cell)))
+        if let Some((parent, spec)) = to
+            && let Err(e) = self.host.place(cell, parent, spec, 0)
+        {
+            self.host.kill(cell);
+            self.reap();
+            return Err(tree::tree_error(e));
+        }
+        let host_id = self.add(run.image, cell);
+        if run.watch {
+            self.entry(host_id)?.watchers.push(id);
+        }
+        Ok(Body::Cell(host_id))
     }
 
     /// Enters kernel cell `cell`, running `image`, in the table under the
@@ -553,6 +677,7 @@ impl Server {
             cell,
             out: Vec::new(),
             watchers: Vec::new(),
+            pending: None,
         });
         id
     }

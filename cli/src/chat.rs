@@ -190,10 +190,9 @@ pub fn run(client: &mut Client, chat: &args::Chat) -> Result<(), String> {
 
 fn start<'a>(client: &'a mut Client, llm: &str, model: &str) -> Result<Session<'a>, String> {
     let t0 = Instant::now();
-    let url = format!(
-        "http://{}",
-        agent::guest_endpoint(llm, Vmm::parse(&client.info.vmm)?)?
-    );
+    let endpoint = agent::guest_endpoint(llm, Vmm::parse(&client.info.vmm)?)?;
+    let url = format!("http://{endpoint}");
+    let placement = agent::agent_placement(client, &endpoint)?;
     let reply = client.call(&Request::Run(Run {
         image: b"cpython".to_vec(),
         files_from: b"cpython-files".to_vec(),
@@ -202,6 +201,7 @@ fn start<'a>(client: &'a mut Client, llm: &str, model: &str) -> Result<Session<'
             .map(|a| a.as_bytes().to_vec())
             .collect(),
         input: true,
+        placement,
         ..Run::default()
     }))?;
     let &Body::Cell(id) = &reply.body else {
@@ -417,10 +417,7 @@ impl<'a> Session<'a> {
     }
 
     fn fork(&mut self, k: u32) -> Result<bool, String> {
-        let reply = self.client.call(&Request::Fork {
-            cell: self.current,
-            n: k,
-        })?;
+        let reply = self.client.call(&Request::fork(self.current, k))?;
         let Body::Cells(children) = &reply.body else {
             return Err(format!("unexpected reply {:?}", reply.body));
         };

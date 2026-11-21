@@ -3,13 +3,14 @@
 
 use super::*;
 use crate::cell::now_ns;
-use rhizo_cap::{Actor, Limits, Spec};
+use rhizo_cap::{Actor, HOST, Limits, Spec};
 use rhizo_cell::quota::Quota;
 use rhizo_sched::SLICE_NS;
 
 /// This area's tests, in execution order.
 pub(super) const ALL: &[TestCase] = &[
     ktest_case!(domains_share_by_weight, 45),
+    ktest_case!(root_weights_share_a_cpu, 25),
     ktest_case!(cpu_cap_holds, 25),
 ];
 
@@ -90,6 +91,37 @@ fn domains_share_by_weight() {
         a + b
     );
     for id in many.into_iter().rev().chain([one]) {
+        assert!(host.kill(id));
+    }
+    assert!(host.tree().is_empty());
+}
+
+/// Spec `cell-hierarchy`, "CPU weights between domains": on one CPU, two
+/// spinning roots placed with weights 300 and 100 (protocol version 4,
+/// `run --cpu-weight`) get three quarters and one quarter of it, within
+/// 5 %, over 1 s.
+fn root_weights_share_a_cpu() {
+    let mut host = Host::new();
+    let mut root = |weight| {
+        let id = spawn(&mut host, "spin", &[]);
+        parent(&mut host, id, 0);
+        let spec = Spec {
+            weight,
+            ..Spec::default()
+        };
+        host.place(id, HOST, spec, 0).expect("placed");
+        id
+    };
+    let (heavy, light) = (root(300), root(100));
+    step_for(&mut host, 1_000_000_000);
+    let (a, b) = (cpu_of(&mut host, &[heavy]), cpu_of(&mut host, &[light]));
+    let pct = 100 * a / (a + b);
+    assert!(
+        (70..=80).contains(&pct),
+        "weight 300 got {pct} % ({a} ns of {})",
+        a + b
+    );
+    for id in [heavy, light] {
         assert!(host.kill(id));
     }
     assert!(host.tree().is_empty());

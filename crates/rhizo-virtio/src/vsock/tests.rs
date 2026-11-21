@@ -39,8 +39,12 @@ fn drain(s: &mut Stream, max: usize) -> Vec<(Header, Vec<u8>)> {
     out
 }
 
+/// What the current connection received, if one is held.
 fn read_all(s: &mut Stream) -> Vec<u8> {
-    core::iter::from_fn(|| s.read()).collect()
+    let Some(c) = s.connection() else {
+        return Vec::new();
+    };
+    core::iter::from_fn(|| s.read(c)).collect()
 }
 
 fn connected() -> Stream {
@@ -722,6 +726,53 @@ fn a_connection_carries_bytes_through_the_device() {
     assert_eq!(d.sent[1].0.dst_port, HOST_PORT);
     assert_eq!(d.sent[2].0.fwd_cnt, 4);
     assert_eq!(d.notifies[1], 3, "one notification per packet sent");
+}
+
+/// The host resets its connection and connects again (a restarted
+/// server), all before the kernel next polls: the stream never looks
+/// disconnected, yet the new connection has a new number, and its bytes
+/// are never read as the old connection's (the control kernel greets each
+/// connection and starts its frames afresh, design D2 of
+/// `fix-vsock-reconnect`).
+#[test]
+fn a_reconnect_between_two_polls_is_a_new_connection() {
+    let (mut dev, d) = device();
+    let mut s = Stream::new(dev.cid(), PORT);
+    assert!(d.borrow_mut().deliver(&from_host(op::REQUEST, 0), &[]));
+    assert_eq!(pump(&mut dev, &mut s), [Change::Connected]);
+    let old = s.connection().expect("connected");
+    // Half a frame, not read yet when the connection goes.
+    assert!(
+        d.borrow_mut()
+            .deliver(&from_host(op::RW, 4), b"\x01Z\x01\x02")
+    );
+    pump(&mut dev, &mut s);
+    let again = Header {
+        src_port: HOST_PORT + 1,
+        ..from_host(op::REQUEST, 0)
+    };
+    for (h, data) in [
+        (from_host(op::RST, 0), &b""[..]),
+        (again, &b""[..]),
+        (
+            Header {
+                src_port: HOST_PORT + 1,
+                ..from_host(op::RW, 3)
+            },
+            &b"new"[..],
+        ),
+    ] {
+        assert!(d.borrow_mut().deliver(&h, data));
+    }
+    assert_eq!(pump(&mut dev, &mut s), [Change::Closed, Change::Connected]);
+    assert!(s.connected(), "connected before and after");
+    let new = s.connection().expect("connected");
+    assert_ne!(new, old, "a new connection, a new number");
+    assert_eq!(s.read(old), None, "nothing is read as the old connection's");
+    assert_eq!(read_all(&mut s), b"new", "and the old one's bytes are gone");
+    let sent = &d.borrow().sent;
+    let last = sent.last().expect("answered").0;
+    assert_eq!((last.op, last.dst_port), (op::RESPONSE, HOST_PORT + 1));
 }
 
 #[test]

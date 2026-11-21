@@ -27,6 +27,13 @@ fn text(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+fn run_request() -> Run {
+    match run() {
+        Request::Run(r) => r,
+        _ => unreachable!(),
+    }
+}
+
 fn run() -> Request {
     Request::Run(Run {
         image: b"cpython".to_vec(),
@@ -39,7 +46,55 @@ fn run() -> Request {
         envp: vec![b"HOME=/".to_vec()],
         files: vec![(b"/branch".to_vec(), b"1".to_vec())],
         input: true,
+        ..Run::default()
     })
+}
+
+/// A placement with every field away from its default.
+fn placed() -> Placement {
+    Placement {
+        parent: 3,
+        label: b"tools".to_vec(),
+        limits: Limits {
+            memory: 256 << 20,
+            cpu_ns: 10_000_000_000,
+            sockets: 16,
+            cells: 4,
+        },
+        egress: Egress::Rules(vec![
+            Rule {
+                proto: Proto::Tcp,
+                addr: [140, 82, 112, 0],
+                prefix: 20,
+                lo: 443,
+                hi: 443,
+            },
+            Rule {
+                proto: Proto::Any,
+                addr: [10, 0, 2, 2],
+                prefix: 32,
+                lo: 1,
+                hi: u16::MAX,
+            },
+        ]),
+        ceiling: Some(Egress::Full),
+        on_parent_end: OnParentEnd::Promote,
+        cpus: 0b1100,
+        cpu_weight: 250,
+        cpu_max: 1500,
+    }
+}
+
+/// Everything the host's decoder finds in `bytes`.
+fn host_frames(bytes: &[u8]) -> Vec<Frame> {
+    let mut d = Decoder::any_version();
+    bytes
+        .iter()
+        .filter_map(|&b| match d.push(b) {
+            Some(Item::Frame(f)) => Some(f),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -48,7 +103,8 @@ fn a_frame_has_its_header_then_its_payload() {
     assert_eq!(
         bytes,
         [
-            0x01, b'Z', VERSION, 0x03, 0x04, 0x03, 0x02, 0x01, 4, 0, 0, 0, 7, 0, 0, 0
+            // The cell, then its `tree` flag (version 4).
+            0x01, b'Z', VERSION, 0x03, 0x04, 0x03, 0x02, 0x01, 5, 0, 0, 0, 7, 0, 0, 0, 0
         ]
     );
 }
@@ -81,8 +137,49 @@ fn every_request_round_trips() {
         Request::List,
         Request::Suspend(1),
         Request::Resume(2),
-        Request::Fork { cell: 3, n: 4 },
+        Request::fork(3, 4),
+        Request::Fork {
+            cell: 3,
+            n: 2,
+            placement: placed(),
+            watch: true,
+        },
+        Request::Run(Run {
+            placement: placed(),
+            watch: true,
+            ..Run::default()
+        }),
         Request::Kill(5),
+        Request::KillTree(5),
+        Request::SuspendTree(1),
+        Request::ResumeTree(2),
+        Request::Reparent { cell: 7, to: 3 },
+        Request::Reparent { cell: 7, to: 0 },
+        Request::Policy {
+            cell: 7,
+            egress: Egress::Full,
+            ceiling: None,
+        },
+        Request::Policy {
+            cell: 7,
+            egress: placed().egress,
+            ceiling: Some(Egress::None),
+        },
+        Request::Limits {
+            cell: 7,
+            limits: placed().limits,
+        },
+        Request::Scoped {
+            root: 3,
+            request: Box::new(Request::KillTree(9)),
+        },
+        Request::Scoped {
+            root: 3,
+            request: Box::new(Request::Run(Run {
+                placement: placed(),
+                ..run_request()
+            })),
+        },
         Request::Output(6),
         Request::WriteFile {
             cell: 7,
@@ -117,6 +214,7 @@ fn every_request_round_trips() {
                 port: 1,
                 token: u64::MAX,
             },
+            placement: placed(),
         },
     ];
     for (id, request) in requests.iter().enumerate() {
@@ -154,31 +252,49 @@ fn every_message_round_trips() {
                     id: 1,
                     image: b"cpython".to_vec(),
                     state: State::Running,
+                    tree: None,
                 },
                 CellInfo {
                     id: 2,
                     image: b"idle".to_vec(),
                     state: State::Suspended { bytes: 4096 },
+                    tree: None,
                 },
                 CellInfo {
                     id: 3,
                     image: b"exit3".to_vec(),
                     state: State::Exited(-3),
+                    tree: None,
                 },
                 CellInfo {
                     id: 4,
                     image: Vec::new(),
                     state: State::Fault,
+                    tree: None,
                 },
                 CellInfo {
                     id: 5,
                     image: b"hog".to_vec(),
                     state: State::Killed,
+                    tree: None,
                 },
                 CellInfo {
                     id: 6,
                     image: b"cpython".to_vec(),
                     state: State::Template,
+                    tree: None,
+                },
+                CellInfo {
+                    id: 7,
+                    image: b"python".to_vec(),
+                    state: State::Running,
+                    tree: Some(TreeInfo {
+                        parent: 6,
+                        root: 1,
+                        label: b"tools".to_vec(),
+                        limits: placed().limits,
+                        egress: placed().egress,
+                    }),
                 },
             ]),
         },
@@ -236,6 +352,7 @@ fn another_version_is_refused_and_skipped() {
     assert_eq!(
         found[1..],
         [Item::Frame(Frame {
+            version: VERSION,
             kind: 0x02,
             id: 6,
             payload: Vec::new()
@@ -272,6 +389,7 @@ fn a_stray_start_byte_is_dropped() {
 #[test]
 fn malformed_payloads_are_refused() {
     let frame = |kind, payload: &[u8]| Frame {
+        version: VERSION,
         kind,
         id: 1,
         payload: payload.to_vec(),
@@ -302,6 +420,7 @@ fn malformed_payloads_are_refused() {
 #[test]
 fn input_is_bounded_and_its_flag_checked() {
     let frame = |kind, payload: Vec<u8>| Frame {
+        version: VERSION,
         kind,
         id: 1,
         payload,
@@ -325,22 +444,283 @@ fn input_is_bounded_and_its_flag_checked() {
         Request::decode(&frame(0x0c, vec![1, 0, 0])),
         Err(Error::Malformed)
     );
-    // `run`'s input flag is 0 or 1.
-    let mut run = Request::Run(Run::default()).encode(1);
-    let last = run.len() - 1;
-    run[last] = 2;
-    assert_eq!(Request::decode(&frames(&run)[0]), Err(Error::Malformed));
+    // `run`'s input and watch flags are 0 or 1 (the input flag comes
+    // before the placement, one byte by default).
+    let run = Request::Run(Run::default()).encode(1);
+    for back in [1, 1 + PLACEMENT_BYTES + 1] {
+        let mut bad = run.clone();
+        let at = bad.len() - back;
+        bad[at] = 2;
+        assert_eq!(Request::decode(&frames(&bad)[0]), Err(Error::Malformed));
+    }
     // `load`'s template flag is 0 or 1.
     let mut load = Request::Load {
         size: 1,
         template: false,
         host: Host::default(),
+        placement: Placement::root(),
     }
     .encode(5);
-    let flag = load.len() - 15;
+    let flag = load.len() - 15 - PLACEMENT_BYTES;
     load[flag] = 2;
     assert_eq!(Request::decode(&frames(&load)[0]), Err(Error::Malformed));
 }
+
+/// Bytes from hexadecimal.
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Frames the version-3 code (`2ee4667`) wrote: a `run`, a `fork`, a
+/// `kill`, a `load` and a `list` reply.
+const V3_RUN: &str = "015a030107000000350000000500000068656c6c6f00000000010000000500000068656c6c6f0100000003000000413d3101000000020000002f66010000007801";
+const V3_FORK: &str = "015a030508000000080000000300000002000000";
+const V3_KILL: &str = "015a0306090000000400000004000000";
+const V3_LOAD: &str = "015a030f0a000000170000000010000000000000010202000a88138877665544332211";
+const V3_LIST: &str = "015a03810b00000030000000dc050000000000000402000000010000000500000068656c6c6f00020000000400000069646c65010020000000000000";
+
+/// The host speaks version 3 as the version-3 code did (design D20 of
+/// `add-cell-hierarchy`): its requests are the same bytes, and it reads
+/// that code's frames, list rows without a place in the tree.
+#[test]
+fn the_host_speaks_version_3() {
+    let load = Request::Load {
+        size: 4096,
+        template: true,
+        host: Host {
+            ip: [10, 0, 2, 2],
+            port: 5000,
+            token: 0x1122_3344_5566_7788,
+        },
+        placement: Placement::root(),
+    };
+    let requests = [
+        (
+            V3_RUN,
+            7,
+            Request::Run(Run {
+                image: b"hello".to_vec(),
+                argv: vec![b"hello".to_vec()],
+                envp: vec![b"A=1".to_vec()],
+                files: vec![(b"/f".to_vec(), b"x".to_vec())],
+                input: true,
+                ..Run::default()
+            }),
+        ),
+        (V3_FORK, 8, Request::fork(3, 2)),
+        (V3_KILL, 9, Request::Kill(4)),
+        (V3_LOAD, 10, load),
+    ];
+    for (hex, id, request) in &requests {
+        assert_eq!(
+            request.encode_as(PREVIOUS, *id),
+            Ok(unhex(hex)),
+            "{request:?}"
+        );
+        // Version 4 says a default placement in one byte, and a `run` or a
+        // `fork` adds its watch flag.
+        let more = match request {
+            Request::Run(_) | Request::Fork { .. } => 2,
+            _ => 1, // `load`'s placement, `kill`'s `tree` flag
+        };
+        assert_eq!(
+            request.encode(*id).len(),
+            unhex(hex).len() + more,
+            "{request:?}"
+        );
+        let found = host_frames(&unhex(hex));
+        assert_eq!(found[0].version, PREVIOUS);
+        assert_eq!(Request::decode(&found[0]).as_ref(), Ok(request));
+        // The kernel takes only its own version.
+        assert_eq!(
+            items(&unhex(hex))[0],
+            Item::Bad {
+                id: *id,
+                error: Error::Version
+            }
+        );
+    }
+    let list = Message::Done {
+        ns: 1500,
+        body: Body::List(vec![
+            CellInfo {
+                id: 1,
+                image: b"hello".to_vec(),
+                state: State::Running,
+                tree: None,
+            },
+            CellInfo {
+                id: 2,
+                image: b"idle".to_vec(),
+                state: State::Suspended { bytes: 8192 },
+                tree: None,
+            },
+        ]),
+    };
+    let found = host_frames(&unhex(V3_LIST));
+    assert_eq!(Message::decode(&found[0]), Ok(list.clone()));
+    assert_eq!(list.encode_as(PREVIOUS, 11), unhex(V3_LIST));
+}
+
+/// What version 3 cannot say is not written in it, and frames of other
+/// versions are read only as far as naming the kernel goes.
+#[test]
+fn version_4_requests_stay_in_version_4() {
+    let placed_run = Request::Run(Run {
+        placement: placed(),
+        ..Run::default()
+    });
+    let watched = Request::Fork {
+        cell: 1,
+        n: 1,
+        placement: Placement::root(),
+        watch: true,
+    };
+    for request in [
+        placed_run,
+        watched,
+        Request::KillTree(1),
+        Request::SuspendTree(1),
+        Request::ResumeTree(1),
+        Request::Reparent { cell: 1, to: 0 },
+        Request::Limits {
+            cell: 1,
+            limits: Limits::NONE,
+        },
+        Request::Scoped {
+            root: 1,
+            request: Box::new(Request::List),
+        },
+    ] {
+        assert_eq!(
+            request.encode_as(PREVIOUS, 1),
+            Err(Error::Version),
+            "{request:?}"
+        );
+        assert!(request.encode_as(VERSION, 1).is_ok());
+    }
+    assert_eq!(Request::List.encode_as(2, 1), Err(Error::Version));
+    // A version-2 kernel's hello and refusals name it; nothing else of it
+    // is read.
+    let mut hello = Message::Hello { version: 2 }.encode(0);
+    hello[2] = 2;
+    let mut failed = Message::Failed {
+        ns: 0,
+        error: Error::Version,
+        message: Vec::new(),
+    }
+    .encode(4);
+    failed[2] = 2;
+    let mut done = Message::Done {
+        ns: 0,
+        body: Body::None,
+    }
+    .encode(5);
+    done[2] = 2;
+    let mut stream = hello;
+    stream.extend(failed);
+    stream.extend(done);
+    let found = host_frames(&stream);
+    assert_eq!(found.len(), 3);
+    assert_eq!(
+        Message::decode(&found[0]),
+        Ok(Message::Hello { version: 2 })
+    );
+    assert!(matches!(
+        Message::decode(&found[1]),
+        Ok(Message::Failed {
+            error: Error::Version,
+            ..
+        })
+    ));
+    assert_eq!(Message::decode(&found[2]), Err(Error::Version));
+    assert_eq!(Request::decode(&found[2]), Err(Error::Version));
+}
+
+/// Malformed tree requests are refused when read (spec `control-plane`,
+/// malformed tree request): an unknown reservation mode, protocol, egress
+/// or parent policy, a nested scoped request, and a scoped one wrapping
+/// what is not a request.
+#[test]
+fn malformed_tree_requests_are_refused() {
+    let frame = |bytes: Vec<u8>| frames(&bytes).remove(0);
+    let run = Request::Run(Run {
+        placement: placed(),
+        ..Run::default()
+    })
+    .encode(1);
+    // Offsets from the payload's start of the placement's fields: a
+    // default `Run` takes 4 + 4 + 4 + 4 + 4 + 1 bytes before it, and the
+    // placement starts with its flag.
+    let at = HEADER_LEN + 21 + 1;
+    let label = 4 + 5; // `tools`
+    let mode = at + 4 + label;
+    let egress = mode + 1 + 24;
+    let proto = egress + 1 + 4;
+    let mut bad = run.clone();
+    bad[at - 1] = 2;
+    assert_eq!(
+        Request::decode(&frame(bad)),
+        Err(Error::Malformed),
+        "placement flag"
+    );
+    let mut bad = run.clone();
+    bad[mode] = 1;
+    assert_eq!(Request::decode(&frame(bad)), Err(Error::Malformed), "mode");
+    let mut bad = run.clone();
+    bad[egress] = 3;
+    assert_eq!(
+        Request::decode(&frame(bad)),
+        Err(Error::Malformed),
+        "egress"
+    );
+    let mut bad = run.clone();
+    bad[proto] = 3;
+    assert_eq!(
+        Request::decode(&frame(bad)),
+        Err(Error::Malformed),
+        "protocol"
+    );
+    // The parent policy, after the two rules and the ceiling.
+    let ope = proto + 2 * 10 + 2;
+    let mut bad = run;
+    assert_eq!(bad[ope], 1, "on_parent_end is `promote`");
+    bad[ope] = 2;
+    assert_eq!(
+        Request::decode(&frame(bad)),
+        Err(Error::Malformed),
+        "parent end"
+    );
+    let nested = Request::Scoped {
+        root: 1,
+        request: Box::new(Request::Scoped {
+            root: 2,
+            request: Box::new(Request::List),
+        }),
+    }
+    .encode(1);
+    assert_eq!(Request::decode(&frame(nested)), Err(Error::Malformed));
+    let mut unknown = Request::Scoped {
+        root: 1,
+        request: Box::new(Request::List),
+    }
+    .encode(1);
+    unknown[HEADER_LEN + 4] = 0x7f;
+    assert_eq!(Request::decode(&frame(unknown)), Err(Error::UnknownKind));
+    let mut reply = Request::Scoped {
+        root: 1,
+        request: Box::new(Request::List),
+    }
+    .encode(1);
+    reply[HEADER_LEN + 4] = 0x81; // a message kind
+    assert_eq!(Request::decode(&frame(reply)), Err(Error::UnknownKind));
+}
+
+/// Bytes of a default placement.
+const PLACEMENT_BYTES: usize = 1;
 
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..24)
@@ -354,7 +734,72 @@ fn host() -> impl Strategy<Value = Host> {
     })
 }
 
-fn request() -> impl Strategy<Value = Request> {
+fn limits() -> impl Strategy<Value = Limits> {
+    (any::<u64>(), any::<u64>(), any::<u32>(), any::<u32>()).prop_map(
+        |(memory, cpu_ns, sockets, cells)| Limits {
+            memory,
+            cpu_ns,
+            sockets,
+            cells,
+        },
+    )
+}
+
+fn egress() -> impl Strategy<Value = Egress> {
+    let rule = (
+        0u8..3,
+        any::<[u8; 4]>(),
+        any::<u8>(),
+        any::<u16>(),
+        any::<u16>(),
+    )
+        .prop_map(|(p, addr, prefix, lo, hi)| Rule {
+            proto: [Proto::Tcp, Proto::Udp, Proto::Any][p as usize],
+            addr,
+            prefix,
+            lo,
+            hi,
+        });
+    prop_oneof![
+        Just(Egress::None),
+        Just(Egress::Full),
+        proptest::collection::vec(rule, 0..4).prop_map(Egress::Rules),
+    ]
+}
+
+fn placement() -> impl Strategy<Value = Placement> {
+    (
+        any::<u32>(),
+        bytes(),
+        limits(),
+        egress(),
+        proptest::option::of(egress()),
+        any::<bool>(),
+        (any::<u64>(), any::<u16>(), any::<u32>()),
+    )
+        .prop_map(
+            |(parent, label, limits, egress, ceiling, promote, (cpus, cpu_weight, cpu_max))| {
+                Placement {
+                    parent,
+                    label,
+                    limits,
+                    egress,
+                    ceiling,
+                    on_parent_end: if promote {
+                        OnParentEnd::Promote
+                    } else {
+                        OnParentEnd::Cascade
+                    },
+                    cpus,
+                    cpu_weight,
+                    cpu_max,
+                }
+            },
+        )
+}
+
+/// Requests of version 3 too.
+fn request_v3() -> impl Strategy<Value = Request> {
     let list = || proptest::collection::vec(bytes(), 0..4);
     prop_oneof![
         (
@@ -372,13 +817,14 @@ fn request() -> impl Strategy<Value = Request> {
                     argv,
                     envp,
                     files,
-                    input
+                    input,
+                    ..Run::default()
                 })
             ),
         Just(Request::List),
         any::<u32>().prop_map(Request::Suspend),
         any::<u32>().prop_map(Request::Resume),
-        (any::<u32>(), any::<u32>()).prop_map(|(cell, n)| Request::Fork { cell, n }),
+        (any::<u32>(), any::<u32>()).prop_map(|(cell, n)| Request::fork(cell, n)),
         any::<u32>().prop_map(Request::Kill),
         any::<u32>().prop_map(Request::Output),
         (any::<u32>(), bytes(), bytes()).prop_map(|(cell, path, data)| Request::WriteFile {
@@ -395,7 +841,59 @@ fn request() -> impl Strategy<Value = Request> {
         (any::<u64>(), any::<bool>(), host()).prop_map(|(size, template, host)| Request::Load {
             size,
             template,
-            host
+            host,
+            placement: Placement::root(),
+        }),
+    ]
+}
+
+/// Requests of version 4: those of version 3, placed, and the tree's.
+fn request() -> impl Strategy<Value = Request> {
+    let leaf = prop_oneof![
+        request_v3(),
+        (request_v3(), placement(), any::<bool>()).prop_map(|(r, p, watch)| match r {
+            Request::Run(run) => Request::Run(Run {
+                placement: p,
+                watch,
+                ..run
+            }),
+            Request::Fork { cell, n, .. } => Request::Fork {
+                cell,
+                n,
+                placement: p,
+                watch,
+            },
+            Request::Load {
+                size,
+                template,
+                host,
+                ..
+            } => Request::Load {
+                size,
+                template,
+                host,
+                placement: p,
+            },
+            other => other,
+        }),
+        any::<u32>().prop_map(Request::KillTree),
+        any::<u32>().prop_map(Request::SuspendTree),
+        any::<u32>().prop_map(Request::ResumeTree),
+        (any::<u32>(), any::<u32>()).prop_map(|(cell, to)| Request::Reparent { cell, to }),
+        (any::<u32>(), egress(), proptest::option::of(egress())).prop_map(
+            |(cell, egress, ceiling)| Request::Policy {
+                cell,
+                egress,
+                ceiling
+            }
+        ),
+        (any::<u32>(), limits()).prop_map(|(cell, limits)| Request::Limits { cell, limits }),
+    ];
+    prop_oneof![
+        3 => leaf.clone(),
+        1 => (any::<u32>(), leaf).prop_map(|(root, r)| Request::Scoped {
+            root,
+            request: Box::new(r)
         }),
     ]
 }
@@ -418,11 +916,24 @@ fn message() -> impl Strategy<Value = Message> {
         proptest::collection::vec(any::<u32>(), 0..5).prop_map(Body::Cells),
         any::<u64>().prop_map(Body::Bytes),
         proptest::collection::vec(
-            (any::<u32>(), bytes(), state()).prop_map(|(id, image, state)| CellInfo {
-                id,
-                image,
-                state
-            }),
+            (
+                any::<u32>(),
+                bytes(),
+                state(),
+                proptest::option::of((any::<[u32; 2]>(), bytes(), limits(), egress()))
+            )
+                .prop_map(|(id, image, state, tree)| CellInfo {
+                    id,
+                    image,
+                    state,
+                    tree: tree.map(|([parent, root], label, limits, egress)| TreeInfo {
+                        parent,
+                        root,
+                        label,
+                        limits,
+                        egress,
+                    }),
+                }),
             0..4
         )
         .prop_map(Body::List),
@@ -439,7 +950,7 @@ fn message() -> impl Strategy<Value = Message> {
     prop_oneof![
         any::<u8>().prop_map(|version| Message::Hello { version }),
         (any::<u64>(), body).prop_map(|(ns, body)| Message::Done { ns, body }),
-        (any::<u64>(), 1u8..=11, bytes()).prop_map(|(ns, code, message)| Message::Failed {
+        (any::<u64>(), 1u8..=13, bytes()).prop_map(|(ns, code, message)| Message::Failed {
             ns,
             error: Error::from_code(code).expect("a code"),
             message
@@ -479,6 +990,30 @@ proptest! {
     }
 
     #[test]
+    fn version_3_requests_round_trip(request in request_v3(), id in any::<u32>()) {
+        let bytes = request.encode_as(PREVIOUS, id).unwrap();
+        let found = host_frames(&bytes);
+        prop_assert_eq!(found.len(), 1);
+        prop_assert_eq!(Request::decode(&found[0]).unwrap(), request);
+    }
+
+    #[test]
+    fn version_3_messages_round_trip(message in message(), id in any::<u32>()) {
+        // Version 3 has no place in the tree: rows come back without one.
+        let found = host_frames(&message.encode_as(PREVIOUS, id));
+        let expected = match message {
+            Message::Done { ns, body: Body::List(cells) } => Message::Done {
+                ns,
+                body: Body::List(
+                    cells.into_iter().map(|c| CellInfo { tree: None, ..c }).collect(),
+                ),
+            },
+            other => other,
+        };
+        prop_assert_eq!(Message::decode(&found[0]).unwrap(), expected);
+    }
+
+    #[test]
     fn messages_round_trip(message in message(), id in any::<u32>()) {
         let found = frames(&message.encode(id));
         prop_assert_eq!(found.len(), 1);
@@ -496,6 +1031,12 @@ proptest! {
                 let _ = Request::decode(&frame);
                 let _ = Message::decode(&frame);
             }
+        }
+        // The host's decoder reads frames of every version.
+        for frame in host_frames(&input) {
+            prop_assert!(frame.payload.len() <= input.len());
+            let _ = Request::decode(&frame);
+            let _ = Message::decode(&frame);
         }
     }
 
@@ -529,7 +1070,7 @@ proptest! {
         let mut payload = cell.to_le_bytes().to_vec();
         payload.extend(len.to_le_bytes());
         payload.extend(&tail);
-        match Request::decode(&Frame { kind: 0x0b, id: 1, payload }) {
+        match Request::decode(&Frame { version: VERSION, kind: 0x0b, id: 1, payload }) {
             Ok(Request::Input { data, .. }) => {
                 prop_assert!(data.len() <= MAX_INPUT && data.len() == len as usize);
             }
@@ -541,7 +1082,7 @@ proptest! {
     /// Any payload under any request or message kind decodes or is refused.
     #[test]
     fn any_payload_never_panics(kind in any::<u8>(), payload in proptest::collection::vec(any::<u8>(), 0..256)) {
-        let frame = Frame { kind, id: 1, payload };
+        let frame = Frame { version: VERSION, kind, id: 1, payload };
         let _ = Request::decode(&frame);
         let _ = Message::decode(&frame);
     }
