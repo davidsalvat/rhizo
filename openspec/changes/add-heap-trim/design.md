@@ -55,13 +55,50 @@ stale translation on any CPU can never reach memory freed there. Its
 page tables were never freed: each 2 MiB of addresses used kept a 4 KiB
 table for good. `PageTable::free_empty_tables` frees the last-level
 tables (2 MiB) and the level above (1 GiB) that a freed range leaves
-empty, clearing their entries and invalidating them (`tlbi vaae1is` on
-AArch64 drops every level for the address; `invlpg` on x86_64 drops the
-paging-structure caches for it). The table below the root stays: on
-x86_64, cell roots copy the kernel's top-level entries, which point at
-it. Other x86_64 CPUs are not shot down. As for the pages themselves,
-nothing ever translates those addresses again, so a cached entry
-pointing at a freed table is never used.
+empty, clearing their entries and invalidating them on this CPU
+(`tlbi vaae1is` on AArch64, `invlpg` on x86_64). The table below the
+root stays: on x86_64, cell roots copy the kernel's top-level entries,
+which point at it.
+
+## D5. Free a table only after every CPU flushed
+
+Addresses that are never reused make stale *translations* harmless, but
+not a freed *table frame*. Once the frame is reused as data, a CPU that
+still caches an upper entry pointing at it may walk through it
+speculatively or by prefetch, reading garbage as entries. On x86_64,
+`invlpg` only reaches this CPU and the current PCID, and kernel-half
+walks happen under every cell's PCID. So an emptied table is retired, not
+freed:
+
+- **Retired list.** The tables go on a list linked through their first
+  entry. A frame address is 4 KiB-aligned, so it is never a valid entry,
+  and a walk through a retired table finds nothing. The list changes only
+  under the heap's lock.
+- **Full flush per CPU.** `cpu::flush_all` drops every translation and
+  paging-structure cache entry of the CPU, for every PCID, global ones
+  included: on x86_64 a write to CR4 that toggles PGE (set back at once);
+  on AArch64 `TLBI VMALLE1IS` between `DSB` barriers, broadcast to every
+  core.
+- **Every CPU.** `smp::flush_everywhere` runs it on every CPU and frees
+  nothing itself. On x86_64 with several CPUs, the boot CPU posts it to
+  each secondary through the mailbox and waits for all of them. It does
+  this only when every secondary is idle; otherwise, or when it runs on
+  a secondary, it returns `false` and does nothing. On AArch64 this CPU's
+  broadcast flush is enough.
+- **When reclaim happens.** Right after the window unmaps an allocation
+  (frees happen under the heap's lock), and at the end of `Host::run`,
+  once the other CPUs are back. Tables retired during a run, when the
+  other CPUs are busy, wait for its end. This is rare: only a free that
+  empties a table, through a window used only when no contiguous run of
+  frames is free.
+
+There is **no IPI shootdown**. The caller holds the heap's lock, and the
+kernel runs with interrupts masked: interrupts arrive only while cell
+code runs or a CPU idles. Another CPU may be spinning on that very lock
+in kernel code, and would never take an interrupt, so the caller would
+wait forever. Deferring the free to a moment when every CPU can be
+reached is what an OS does with page tables anyway: free them after the
+flush, not before.
 
 ## D4. Tests that count frames
 

@@ -28,7 +28,9 @@ for the rest of the kernel's life.
   freeing are unchanged: no counter, no check on the hot path.
 - `PageTable::free_empty_tables`: frees the tables of the last two
   levels that a range leaves empty. The window calls it after unmapping
-  a large allocation, so its tables come back with its frames.
+  a large allocation, so its tables come back with its frames: freed
+  once every CPU has flushed its paging-structure caches, after the
+  unmap or at the end of a host run (design D5).
 - The server workload reports `heap_peak_bytes` and a new metric,
   `density.oom_heap_kept_bytes`.
 
@@ -41,7 +43,8 @@ for the rest of the kernel's life.
 ## Impact
 
 - `crates/rhizo-mm` (`heap`: trim, sort; `paging`: `free_empty_tables`),
-  `kernel/src/heap.rs`, `kernel/src/cell.rs` (`end`),
+  `kernel/src/heap.rs`, `kernel/src/cell.rs` (`end`, `Host::run`),
+  `kernel/src/smp.rs`, `kernel/src/arch/*/cpu.rs` (`flush_all`),
   `kernel/src/workloads.rs`, `kernel/src/tests.rs`, `xtask/src/workloads.rs`,
   `bench/README.md`.
 - Server: `heap_kept_bytes` 75 MB to 0 on both architectures.
