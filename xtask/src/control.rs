@@ -1181,10 +1181,17 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         let console = std::fs::read_to_string(state.join("console.log")).unwrap_or_default();
         Failure::new("control", what)
             .expected(expected)
-            .actual(format!(
-                "rhizo said:\n{}\nconsole:\n{console}",
-                log.borrow()
-            ))
+            .actual({
+                // What rhizo said last first: a summary of the failure shows
+                // only its first line.
+                let log = log.borrow();
+                let last = log
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                format!("{last}\nrhizo said:\n{log}\nconsole:\n{console}")
+            })
             .hint("the commands and their output are above, then the kernel's console")
             .reproduce(reproduce)
             .into_error()

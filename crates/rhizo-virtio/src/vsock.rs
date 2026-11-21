@@ -215,6 +215,12 @@ impl Stream {
         None
     }
 
+    /// Whether bytes written or control packets still wait to go out to a
+    /// connected peer (then the kernel must not power off yet).
+    pub fn sending(&self) -> bool {
+        !self.control.is_empty() || (self.peer.is_some() && !self.tx.is_empty())
+    }
+
     /// Whether bytes received wait to be read.
     pub fn has_input(&self) -> bool {
         !self.rx.is_empty()
@@ -448,6 +454,13 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioVsock<R, M> {
     pub fn can_send(&mut self) -> bool {
         self.reclaim();
         !self.tx_free.is_empty()
+    }
+
+    /// Whether the device is done with every packet sent: none is still in
+    /// a transmit slot.
+    pub fn sent_all(&mut self) -> bool {
+        self.reclaim();
+        self.tx_free.len() == usize::from(SLOTS)
     }
 
     /// Takes back the transmit slots the device is done with.
