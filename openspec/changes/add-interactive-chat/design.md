@@ -73,7 +73,9 @@ ends with the agent printing its answer and blocking on its next read: the
 kernel now also stops its run loop when a watched cell has output waiting
 and none of its threads can run (`Host::has_output`), so the answer goes
 out at once instead of up to 10 ms later. A cell that prints while it
-computes is still flushed every 10 ms.
+computes is still flushed every 10 ms. Measured with `chat.turn_us` on
+QEMU `microvm` under TCG (one run of 20 turns each): 15.6 ms median with
+the check, 23.8 ms without it.
 
 ## D4. The chat agent
 
