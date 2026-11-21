@@ -102,6 +102,8 @@ macro_rules! suite {
             ktest_case!(fresh_memory_never_holds_another_cells_data),
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
+            ktest_case!(hardware_entropy_works_where_present),
+            ktest_case!(no_two_cells_draw_the_same_random_bytes),
             ktest_case!(micropython_in_a_cell),
             ktest_case!(sockets_and_pipes_behave_as_on_linux),
             ktest_case!(cells_talk_over_loopback),
@@ -1437,6 +1439,66 @@ fn shared_read_only_pages_stay_shared_after_mprotect() {
         assert_eq!(ending, Ending::Exit(0), "{out}");
         assert!(out.ends_with("own ok\n"), "{out}");
     }
+}
+
+/// The CPU's random-number instruction, where it has one, gives bytes that
+/// differ from one read to the next (QEMU's `max` CPU has it on both
+/// architectures; without it the boot says `getrandom` is predictable).
+fn hardware_entropy_works_where_present() {
+    use rhizo_hal::Entropy;
+    let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+    if !arch::random::HardwareEntropy.fill(&mut a) {
+        arch::console::BootConsole.write_bytes(b"(no hardware random source on this CPU) ");
+        return;
+    }
+    assert!(arch::random::HardwareEntropy.fill(&mut b));
+    assert_ne!(a, b, "two reads gave the same bytes");
+    assert_ne!(a, [0; 32]);
+}
+
+/// `getrandom` is a private stream per cell (spec `isolation`): independent
+/// cells, forks, copies of a template and two resumes of one snapshot all
+/// draw different bytes after the point they share.
+fn no_two_cells_draw_the_same_random_bytes() {
+    fn ready(host: &mut Host) -> u32 {
+        let id = spawn(host, "dice", &[]);
+        while host.output(id) != Some(b"ready\n") {
+            host.step();
+        }
+        id
+    }
+    let mut host = Host::new();
+    // Each is used as soon as it is ready (stepping may end the others).
+    let mut ids = alloc::vec![ready(&mut host)];
+    ids.extend(host.fork(ids[0], 2).expect("fork"));
+    ids.push(ready(&mut host));
+    let template = ready(&mut host);
+    assert!(host.freeze(template));
+    for _ in 0..2 {
+        ids.push(
+            host.spawn_from_template(template, true, false)
+                .expect("copy"),
+        );
+    }
+    let suspended = ready(&mut host);
+    let bytes = host.suspend(suspended).expect("suspend").into_bytes();
+    for mode in [Resume::Eager, Resume::Lazy] {
+        let snapshot = Snapshot::from_bytes(bytes.clone(), arch::user::MACHINE).expect("valid");
+        ids.push(host.resume(snapshot, mode, true, false).expect("resume"));
+    }
+    host.run(|_| false);
+    let mut draws: Vec<alloc::string::String> = ids
+        .iter()
+        .map(|&id| {
+            let (ending, out) = ended(&host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            out.trim_start_matches("ready\n").trim_end().into()
+        })
+        .collect();
+    assert!(draws.iter().all(|d| d.len() == 32), "{draws:?}");
+    draws.sort();
+    draws.dedup();
+    assert_eq!(draws.len(), ids.len(), "two cells drew the same bytes");
 }
 
 /// Cells make directories until refused. Next to a cell that takes all the
