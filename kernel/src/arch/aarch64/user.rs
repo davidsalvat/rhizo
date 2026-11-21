@@ -264,6 +264,86 @@ pub fn init_cpu() {
     // `add-node-workload`). EL1's own use of the timer is unaffected.
     unsafe { asm!("msr cntkctl_el1, {}", "isb", in(reg) 1u64 << 1, options(nostack)) };
     USER_ROOT[index()].store(EMPTY_ROOT.load(Ordering::Relaxed), Ordering::Relaxed);
+    if has_e0pd() {
+        // SAFETY: TCR_EL1.E0PD1 only makes EL0 accesses to the kernel half
+        // (TTBR1) fault, in constant time; the kernel never runs at EL0.
+        unsafe {
+            asm!(
+                "mrs {t}, tcr_el1",
+                "orr {t}, {t}, #(1 << 56)",
+                "msr tcr_el1, {t}",
+                "isb",
+                t = out(reg) _,
+                options(nostack)
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Meltdown (design D4 of `add-kpti`)
+// ---------------------------------------------------------------------------
+
+fn id_field(reg: u64, shift: u32) -> u64 {
+    (reg >> shift) & 0xf
+}
+
+/// Whether the CPU has FEAT_E0PD (`ID_AA64MMFR2_EL1.E0PD`): EL0 accesses
+/// to the kernel half fault in constant time, whatever the TLB holds, which
+/// is what KPTI buys elsewhere.
+pub fn has_e0pd() -> bool {
+    let mmfr2: u64;
+    // SAFETY: reading an ID register has no side effects.
+    unsafe { asm!("mrs {}, id_aa64mmfr2_el1", out(reg) mmfr2, options(nomem, nostack)) };
+    id_field(mmfr2, 60) != 0
+}
+
+/// Whether this CPU would need a KPTI trampoline: neither FEAT_E0PD nor
+/// `ID_AA64PFR0_EL1.CSV3` (not affected by Meltdown, as every Arm core but
+/// Cortex-A75). Rhizo has no trampoline: such a CPU is reported, not
+/// protected (`docs/security.md`).
+pub fn kpti_needed() -> bool {
+    let pfr0: u64;
+    // SAFETY: reading an ID register has no side effects.
+    unsafe { asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack)) };
+    id_field(pfr0, 60) == 0 && !has_e0pd()
+}
+
+/// Whether the kernel half is out of reach of cell code: E0PD is on.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "read by the tests and the benchmarks")
+)]
+pub fn kpti() -> bool {
+    has_e0pd()
+}
+
+/// Nothing to build: cells' tables never hold the kernel half (it lives in
+/// `TTBR1_EL1`), and E0PD is set on every CPU by [`init_cpu`].
+pub fn init_kpti(_cpus: usize) {}
+
+/// E0PD costs nothing and stays on: nothing to switch. Without it and
+/// CSV3, the kernel says that it is not protected.
+pub fn set_kpti(on: bool) {
+    if on && kpti_needed() {
+        use core::fmt::Write;
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(&mut super::console::BootConsole),
+            "rhizo: this CPU may be open to Meltdown and has no E0PD: no KPTI"
+        );
+    }
+}
+
+/// Whether a kernel TLB flush leaves stale translations on every CPU: no,
+/// AArch64 flushes are broadcast and reach the cell's ASID.
+pub fn stale_everywhere() -> bool {
+    false
+}
+
+/// The kernel half of a cell's root: never used on AArch64
+/// ([`CELL_ROOT_HAS_KERNEL_HALF`] is false).
+pub fn cell_kernel_half() -> rhizo_mm::paging::PageTable<super::platform::Format> {
+    crate::memory::kernel_tables()
 }
 
 /// Enables FP/SIMD for cells (and for the save and load above), and 16-bit

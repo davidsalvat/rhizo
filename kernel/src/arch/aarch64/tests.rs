@@ -7,9 +7,25 @@ use rhizo_core::ktest_case;
 pub static ALL: &[TestCase] = &[
     ktest_case!(device_tree_is_valid),
     ktest_case!(counter_frequency_is_known),
+    ktest_case!(e0pd_is_on_where_present),
     ktest_case!(pan_is_on),
     ktest_case!(a_cell_reads_the_counter),
 ];
+
+/// Where the CPU has FEAT_E0PD, `TCR_EL1.E0PD1` is set: cell accesses to
+/// the kernel half fault in constant time (QEMU's `max` CPU has it).
+fn e0pd_is_on_where_present() {
+    let tcr: u64;
+    // SAFETY: reading TCR_EL1 has no side effects.
+    unsafe { core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack)) };
+    assert_eq!(super::user::kpti(), super::user::has_e0pd());
+    if super::user::kpti() {
+        assert_ne!(tcr & (1 << 56), 0, "TCR_EL1.E0PD1 is clear");
+    } else {
+        use rhizo_hal::Console;
+        super::console::BootConsole.write_bytes(b"(no E0PD on this CPU) ");
+    }
+}
 
 /// PAN is on wherever the CPU has it (QEMU's `max` CPU does), also after
 /// cells ran (every exception from EL0 sets it again); the self-check
