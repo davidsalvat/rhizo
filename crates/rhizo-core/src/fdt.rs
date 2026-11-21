@@ -355,6 +355,43 @@ impl<'a> Fdt<'a> {
         Ok(found)
     }
 
+    /// The interrupt identifier (GIC INTID) of the performance monitors'
+    /// overflow interrupt: the first `interrupts` entry of the
+    /// `arm,armv8-pmuv3` node (a PPI, `<1 n flags>`, is INTID 16 + n; an
+    /// SPI, `<0 n flags>`, 32 + n).
+    pub fn pmu_interrupt(&self) -> Result<Option<u32>, FdtError> {
+        let mut matches = [false; MAX_DEPTH + 1];
+        let mut interrupts: [Option<&'a [u8]>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
+        let mut found = None;
+        self.walk(|event| {
+            match event {
+                Event::Begin { depth, .. } => {
+                    matches[depth + 1] = false;
+                    interrupts[depth + 1] = None;
+                }
+                Event::Prop { depth, name, value } => match name {
+                    b"compatible" => matches[depth] = list_contains(value, b"arm,armv8-pmuv3"),
+                    b"interrupts" => interrupts[depth] = Some(value),
+                    _ => {}
+                },
+                Event::End { depth } => {
+                    if let (true, Some(value)) = (matches[depth + 1], interrupts[depth + 1]) {
+                        let kind = read_cells(value, 1);
+                        let number = value.get(4..).and_then(|v| read_cells(v, 1));
+                        found = match (kind, number) {
+                            (Some(1), Some(n)) => Some(16 + n as u32),
+                            (Some(0), Some(n)) => Some(32 + n as u32),
+                            _ => None,
+                        };
+                        return false;
+                    }
+                }
+            }
+            true
+        })?;
+        Ok(found)
+    }
+
     /// The 32-bit memory window of the first PCI host bridge whose
     /// `compatible` list contains `compatible`: the first `ranges` entry of
     /// space code 0b10 (32-bit memory) whose PCI and CPU addresses are the
@@ -475,6 +512,12 @@ mod tests {
             base: 0x0a00_0000,
             size: 0x200
         }));
+    }
+
+    #[test]
+    fn finds_the_pmu_interrupt() {
+        let fdt = Fdt::new(QEMU_VIRT_GICV3).unwrap();
+        assert_eq!(fdt.pmu_interrupt().unwrap(), Some(23), "PPI 7");
     }
 
     #[test]

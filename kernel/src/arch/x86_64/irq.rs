@@ -17,6 +17,9 @@ use rhizo_mm::paging::PageFlags;
 pub const TIMER_VECTOR: u8 = 32;
 /// Vector of the wake-up between CPUs (spec `multi-core`).
 pub const WAKE_VECTOR: u8 = 33;
+/// Vector of the performance counters' sampling interrupt (spec
+/// `profiling`).
+pub const SAMPLE_VECTOR: u8 = 34;
 /// Vector of spurious APIC interrupts (no EOI).
 pub const SPURIOUS_VECTOR: u8 = 255;
 
@@ -31,6 +34,7 @@ const INIT: u32 = 0b101 << 8;
 const STARTUP: u32 = 0b110 << 8;
 const EOI: u32 = 0xb0;
 const LVT_TIMER: u32 = 0x320;
+const LVT_PERF: u32 = 0x340;
 const INITIAL_COUNT: u32 = 0x380;
 const CURRENT_COUNT: u32 = 0x390;
 const DIVIDE: u32 = 0x3e0;
@@ -206,6 +210,24 @@ pub fn wait() {
 /// Whether preemption is available (always, once `init` ran).
 pub fn available() -> bool {
     APIC.load(Ordering::Relaxed) != 0
+}
+
+/// Makes the periodic tick fire every `ns` from now on (spec `profiling`:
+/// sampling by the timer where there is no PMU).
+#[cfg(feature = "sampling")]
+pub fn set_tick_ns(ns: u64) {
+    TICK.store(
+        (ns / NS_PER_COUNT).clamp(1, u32::MAX as u64),
+        Ordering::Relaxed,
+    );
+    tick();
+}
+
+/// Delivers the performance counters' overflow on [`SAMPLE_VECTOR`]
+/// (`on`), or masks it.
+pub(super) fn sample_interrupt(on: bool) {
+    let mask = if on { 0 } else { 1 << 16 };
+    write(LVT_PERF, mask | SAMPLE_VECTOR as u32);
 }
 
 /// Starts this CPU's periodic tick (a secondary CPU running cells).

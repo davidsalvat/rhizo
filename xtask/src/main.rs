@@ -76,6 +76,14 @@ Commands:
       --soak                 The long versions of the workloads (weekly)
       --cells <n>            Cells of the server workload (default 10000)
       --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
+  profile [options]          Run the workloads (cell loop, fork_touch, CPython
+                             cold) sampled and accounted; write folded stacks
+                             per workload (cells' functions, kernel parts) and
+                             per system call
+      --vmm <name>           VMM (default: QEMU's default machine)
+      --accel <a>            QEMU acceleration
+      --out <dir>            Where to write them (default target/profile)
+      --per-cell             One frame per cell under the image
   ci                         Everything CI runs: fmt, clippy, test
   demo agent --llm <url> --model <name> [--vmm <name>] [--accel <a>]
                              The CPython agent in a cell against a real
@@ -125,6 +133,7 @@ fn main() -> ExitCode {
         Some("run") => RunArgs::parse(rest).and_then(|a| cmd_run(&a)),
         Some("test") => RunArgs::parse(rest).and_then(|a| cmd_test(&a)),
         Some("bench") => bench::Options::parse(rest).and_then(|o| bench::cmd(&o)),
+        Some("profile") => profile::ProfileArgs::parse(rest).and_then(|a| profile::cmd(&a)),
         Some("ci") => cmd_ci(),
         Some("demo") => demo::cmd(rest),
         Some("mutants") => cmd_mutants(),
