@@ -146,8 +146,8 @@ come back, or the benchmark fails.
 | `density.cells/rhizo/<vmm>` | deterministic, higher is better | Workers made: the target, or fewer when memory keeps less than 32 MiB of headroom (`limit=` in the `rhizo-server` line says which) |
 | `density.ops_per_s/rhizo/<vmm>` | rate, higher is better | Operations of the workers that exited with 0, over the load's wall time |
 | `density.cell_bytes/rhizo/<vmm>` | size | Most memory in use during the load, per cell (pages, tables, files, sockets, kernel record) |
-| `density.sched_p50_us`, `_p99_us`, `_p999_us` | timing | Scheduling latency: a cell joined a run queue (preempted, yielded, new, or its deadline passed) until it runs |
-| `density.wake_p50_us`, `density.wake_p99_us`, `_p999_us` | timing | Wake-up latency: its event (deadline, or a socket change by another cell's system call) until it runs |
+| `density.sched_p50_us`, `_p99_us`, `_p999_us` | timing | Scheduling latency: a cell joined a run queue (preempted, yielded, new, or its deadline passed) until it runs; counted from the first moment of the load at which no cell runs (below) |
+| `density.wake_p50_us`, `density.wake_p99_us`, `_p999_us` | timing | Wake-up latency: its event (deadline, or a socket change by another cell's system call) until it runs; counted from the same moment |
 | `density.syscall_p50_ns`, `_p99_ns`, `_p999_ns` | timing | Time in the system-call handler, locks included |
 | `density.wasted_wakeups_pct/rhizo/<vmm>` | rate | Of the cells a socket change woke from waiting on descriptors, the share whose next system call waited again: a wake-up that found nothing (each socket wakes only the cells waiting on it, change `add-socket-wait-queues`) |
 | `density.oom_cells/rhizo/<vmm>` | count, higher is better | Idle cells memory held before the kernel refused one |
@@ -156,11 +156,23 @@ In the `ci` environment (from two CI runs that agreed within the
 threshold) every workload metric is gated except these, recorded but
 listed under `ungated.ci`: `laptop.idle_host_cpu_pct` (the host's
 own load on a shared runner), the p99.9 latencies (`*_p999_*`: a
-handful of samples per run), and `density.sched_p99_us` and
-`density.wake_p99_us`: the server load runs close to saturation (every
-socket change wakes every cell waiting on a socket), so its tails moved
-up to 5x between runners of the same code. They are gated once that is
-fixed. The agent turns are gated since `fix-ephemeral-ports`: they took
+handful of samples per run) and `density.wasted_wakeups_pct` (near 0,
+where a relative threshold means nothing; the in-kernel test
+`only_the_cells_waiting_on_a_socket_wake` requires none).
+`density.sched_p99_us` and `density.wake_p99_us` are gated since
+`add-socket-wait-queues` (design D6). Before it they read the start of
+the load, not its wake-ups: the 10,000 workers, forked beforehand, all run
+for the first time when it starts (85 ms on QEMU, 560 ms on Firecracker,
+which faults in guest memory on first touch), and the deadlines that pass
+meanwhile, more than 1 % of the samples, waited behind them. The p99 moved
+with how fast each runner faults in memory (13 to 28 ms on QEMU, 400 ms on
+Firecracker) while the guest idled 70 % of the load. The latencies now
+count from the first moment after the load starts at which no cell runs
+or waits for a CPU (`settle_ns` in the breakdown line; a load that never
+gets there counts from its start). In CI the p99 went from 13 to 23 ms to
+about 3 ms on QEMU and Cloud Hypervisor, and from 400 ms to 7 ms on
+Firecracker, within 19 % between runs.
+The agent turns are gated since `fix-ephemeral-ports`: they took
 1 s in most runs on Firecracker and Cloud Hypervisor, because each boot
 started its ephemeral ports at 32768, so its first connections reused
 4-tuples the host still kept in `TIME_WAIT` from the previous run, and
@@ -168,7 +180,9 @@ smoltcp retried the refused SYN after 1 s.
 
 The `rhizo-server-breakdown` line printed with the results says where the
 load's time went (idle, system calls, scheduling decisions, host
-operations; runs, socket wake-ups, faults): simple counters in
+operations; runs, socket wake-ups, faults), the longest latencies
+(`sched_max_ns`, `wake_max_ns`) and how long the start of the load took
+before latencies counted (`settle_ns`): simple counters in
 `kernel/src/prof.rs`, until the permanent per-workload breakdown replaces
 them.
 

@@ -220,9 +220,29 @@ start took (`settle_ns`).
 Under `-icount` with 1,000 cells (three runs each, before and after):
 `density.wake_p99_us` 205 to 221 µs before, 197 to 205 after;
 `density.wake_p999_us` 7.6 to 12.6 ms before, 229 µs after in all three;
-the longest wake-up 236 to 241 µs. With 10,000 cells the start is ten
-times as long and holds more than 1 % of the samples, so the p99 itself
-was the start; the CI figures of this change are in its pull request.
+the longest wake-up 236 to 241 µs. With 10,000 cells the start holds more
+than 1 % of the samples, so the p99 itself was the start. In CI (10,000
+cells, three runs per VMM, the same base as `main` at bd51b7e):
+
+| VMM | `wake_p99_us` before | after | `wake_p999_us` before | after | start (`settle_ns`) |
+|---|---|---|---|---|---|
+| QEMU `microvm` | 18.9 to 21.0 ms | 3.3 to 3.4 ms | 71 to 75 ms | 4.1 to 4.5 ms | 122 to 124 ms |
+| QEMU `q35` | 16.8 to 18.9 ms | 2.9 to 3.3 ms | 71 ms | 4.2 to 4.4 ms | 118 to 121 ms |
+| Firecracker | 352 to 369 ms | 7.1 to 8.4 ms | 470 ms | 7.6 to 11.2 ms | 746 to 755 ms |
+| Cloud Hypervisor | 17.8 to 23.1 ms | 3.1 to 3.3 ms | 75 to 80 ms | 4.0 to 4.5 ms | 121 to 124 ms |
+
+The medians (37 to 43 µs; 53 to 70 µs in that run of `main`, on a slower
+runner) and the throughput are not what changed: only where the counting
+starts. What is left
+of the tail with 10,000 cells, about 3 ms (7 ms on Firecracker), is more
+than the host's operations; the likely cause, not measured further, is the
+same start: the workers whose first sleep ended during it ran back to back
+at its end, and since each sleeps a fixed period after it runs, they come
+back bunched in the next periods, with their partners on loopback queued
+behind them. It is stable between runs (within 19 %), so the p99s are
+gated at the `ci` timing threshold (+100 %) with this run's values: the
+runs of `main` before this change fail that gate, as would the wake-all of
+before the wait queues (p50 2.8 ms).
 
 Lost: making the start itself shorter, for example preferring woken cells
 to new ones in the run queues. It would hide the same start behind a
