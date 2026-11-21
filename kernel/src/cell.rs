@@ -2412,9 +2412,15 @@ impl Host {
 
     /// Runs `f` on the shared state to put cells in it, then wakes an idle
     /// CPU to take the runnable ones (during a run; none idles between
-    /// runs).
+    /// runs). Out of line: inlined into the spawn paths, it made an
+    /// AArch64 spawn about 530 instructions slower (`cell.spawn_insns`)
+    /// through the code generated around it, not its own.
+    #[inline(never)]
     fn admit<R>(&mut self, f: impl FnOnce(&mut Shared) -> R) -> R {
-        let (r, wake) = self.locked(|s| (f(s), idle_for_runnable(s)));
+        if !self.others {
+            return f(self.shared.get_mut());
+        }
+        let (r, wake) = self.shared.with(|s| (f(s), idle_for_runnable(s)));
         wake_cpus(wake);
         r
     }
