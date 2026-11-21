@@ -334,9 +334,9 @@ impl Stream {
 const SLOTS: u16 = QUEUE_SIZE / 2;
 /// Most payload bytes in one packet.
 pub const PAYLOAD_MAX: usize = crate::BUF as usize;
-/// Frames [`VirtioVsock::probe`] takes: the receive and transmit queues'
-/// rings and buffers, and the event queue's ring.
-pub const FRAMES: usize = crate::FRAMES + 1;
+/// Frames [`VirtioVsock::probe`] takes: each of its three queues' ring and
+/// buffers.
+pub const FRAMES: usize = crate::FRAMES / 2 * 3;
 
 /// A virtio socket device.
 #[derive(Debug)]
@@ -380,11 +380,11 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioVsock<R, M> {
     ) -> Result<Self, ProbeError> {
         negotiate(&mut regs, F_STREAM)?;
         let cid = u64::from(regs.config32(0)) | (u64::from(regs.config32(4)) << 32);
-        let rx = queue(&mut regs, &mut mem, alloc, 0, QUEUE_SIZE)?;
-        let tx = queue(&mut regs, &mut mem, alloc, 1, QUEUE_SIZE)?;
+        let rx = queue(&mut regs, &mut mem, alloc, 0)?;
+        let tx = queue(&mut regs, &mut mem, alloc, 1)?;
         // Events (a transport reset after the VM was restored) are not
-        // taken: the queue gets no buffers.
-        queue(&mut regs, &mut mem, alloc, 2, 0)?;
+        // taken: no buffer is offered on that queue.
+        queue(&mut regs, &mut mem, alloc, 2)?;
         let mut dev = Self {
             regs,
             mem,

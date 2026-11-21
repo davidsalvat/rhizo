@@ -376,8 +376,8 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
         } else {
             [0x02, 0, 0, 0, 0, 1] // locally administered
         };
-        let rx = queue(&mut regs, &mut mem, alloc, 0, QUEUE_SIZE)?;
-        let tx = queue(&mut regs, &mut mem, alloc, 1, QUEUE_SIZE)?;
+        let rx = queue(&mut regs, &mut mem, alloc, 0)?;
+        let tx = queue(&mut regs, &mut mem, alloc, 1)?;
         let mut card = Self {
             regs,
             mem,
@@ -438,14 +438,12 @@ fn negotiate<R: DeviceRegisters>(regs: &mut Transport<R>, wanted: u32) -> Result
     Ok(low)
 }
 
-/// Sets up queue `index` in a new frame, with `buffers` buffers of [`BUF`]
-/// bytes in more frames.
+/// Sets up queue `index` in a new frame, with buffers in more frames.
 fn queue<R: DeviceRegisters, M: PhysicalMemory>(
     regs: &mut Transport<R>,
     mem: &mut M,
     alloc: &mut dyn FnMut() -> Option<u64>,
     index: u16,
-    buffers: u16,
 ) -> Result<Queue, ProbeError> {
     if regs
         .queue_max(index)
@@ -459,8 +457,8 @@ fn queue<R: DeviceRegisters, M: PhysicalMemory>(
         Ok::<u64, ProbeError>(f)
     };
     let ring = frame()?;
-    let mut bufs = Vec::with_capacity(buffers as usize);
-    while bufs.len() < buffers as usize {
+    let mut bufs = Vec::with_capacity(QUEUE_SIZE as usize);
+    while bufs.len() < QUEUE_SIZE as usize {
         let f = frame()?;
         bufs.extend((0..FRAME / BUF).map(|i| f + i * BUF));
     }

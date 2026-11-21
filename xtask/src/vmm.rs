@@ -392,7 +392,8 @@ impl Vsock {
 
 /// Whether `/dev/vhost-vsock` opens for reading and writing, after a
 /// `sudo -n chmod 0666` if it exists and does not (CI runners leave it to
-/// `root:kvm`).
+/// `root:kvm`). The module is loaded first: loading it on the first open
+/// has udev set the old mode back.
 fn vhost_vsock_usable() -> bool {
     const DEVICE: &str = "/dev/vhost-vsock";
     let opens = || {
@@ -402,14 +403,20 @@ fn vhost_vsock_usable() -> bool {
             .open(DEVICE)
             .is_ok()
     };
+    let sudo = |args: &[&str]| {
+        Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
     opens()
         || (Path::new(DEVICE).exists()
-            && Command::new("sudo")
-                .args(["-n", "chmod", "0666", DEVICE])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
+            && sudo(&["modprobe", "vhost_vsock"])
+            && sudo(&["udevadm", "settle"])
+            && sudo(&["chmod", "0666", DEVICE])
             && opens())
 }
 
