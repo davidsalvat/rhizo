@@ -359,13 +359,13 @@ impl Server {
                 if !cell::cells_may_take(size) {
                     return Err((Error::NoMemory, String::from("the file does not fit")));
                 }
-                snapshot.export(&crate::memory::DirectMap)
+                snapshot.export(&crate::memory::DirectMap, crate::arch::mem::crc32c)
             }
             &Place::Template(template) => self
                 .host
                 .template_snapshot(template)
                 .ok_or((Error::NoMemory, String::from("the file does not fit")))?
-                .export(&crate::memory::DirectMap),
+                .export(&crate::memory::DirectMap, crate::arch::mem::crc32c),
             _ => {
                 return Err((
                     Error::NotSuspended,
@@ -391,8 +391,9 @@ impl Server {
         self.host
             .fetch_bytes(from.ip, from.port, from.token, size, &mut bytes)
             .map_err(transfer)?;
-        let mut snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE)
-            .map_err(|e| (Error::BadSnapshot, describe(e)))?;
+        let mut snapshot =
+            Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+                .map_err(|e| (Error::BadSnapshot, describe(e)))?;
         // It gets no more than a cell the host starts (design D4).
         snapshot.cap_quota(Quota::DEFAULT);
         let place = if template {

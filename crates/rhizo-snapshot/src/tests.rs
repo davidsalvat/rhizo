@@ -100,7 +100,7 @@ fn round_trip<F: EntryFormat>() {
         ),
         "deterministic"
     );
-    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
     assert_eq!(snap.pages(), 3);
     assert_eq!(snap.page(2).size, PageSize::Large);
     assert_eq!(snap.find(0x60_0fff), Some(1));
@@ -203,7 +203,7 @@ fn wx_pages_and_ranges_travel<F: EntryFormat>() {
         &mut frames,
         unshared,
     );
-    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
     assert_eq!(snap.wx(), wx);
     let pt = PageTable::<F>::new(&mut mem, &mut || frames.alloc()).unwrap();
     for i in 0..snap.pages() {
@@ -234,7 +234,7 @@ fn rejects_bad_wx_records_and_ranges() {
     let good = sample();
     let check = |bytes: Vec<u8>, err| {
         assert_eq!(
-            Snapshot::from_bytes(sealed(bytes), Machine::Aarch64),
+            Snapshot::from_bytes(sealed(bytes), Machine::Aarch64, crc32c),
             Err(err)
         )
     };
@@ -249,7 +249,7 @@ fn rejects_bad_wx_records_and_ranges() {
         b[rec0 + 17] = flags; // the code page
         match ok {
             true => assert!(
-                Snapshot::from_bytes(sealed(b), Machine::Aarch64).is_ok(),
+                Snapshot::from_bytes(sealed(b), Machine::Aarch64, crc32c).is_ok(),
                 "{flags:#b}"
             ),
             false => check(b, FormatError::BadPage { index: 0 }),
@@ -266,7 +266,7 @@ fn rejects_bad_wx_records_and_ranges() {
         b.extend_from_slice(&good[rec0..]);
         sealed(b)
     };
-    let snap = Snapshot::from_bytes(with(&[(0x1000, 0x3000)]), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(with(&[(0x1000, 0x3000)]), Machine::Aarch64, crc32c).unwrap();
     assert_eq!(snap.wx().ranges(), &[(0x1000, 0x3000)]);
     assert_eq!(snap.find(0x60_0000), Some(1), "records after the ranges");
     for bad in [
@@ -284,7 +284,7 @@ fn rejects_bad_wx_records_and_ranges() {
     check(with(&many), FormatError::BadRanges);
     let mut cut = with(&[(0x1000, 0x3000)]);
     cut[14] = 200; // the records read as ranges
-    assert!(Snapshot::from_bytes(sealed(cut), Machine::Aarch64).is_err());
+    assert!(Snapshot::from_bytes(sealed(cut), Machine::Aarch64, crc32c).is_err());
 }
 
 #[test]
@@ -311,18 +311,18 @@ fn files_travel_with_the_snapshot() {
         &mut frames,
         unshared,
     );
-    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
     let back = snap.files();
     assert_eq!(back.getcwd(), b"/in");
     assert_eq!(back.stat(None, b"data.txt").unwrap().size, 5);
     // A files section that does not decode is refused (its last byte is
     // just before the sockets section: a length and an empty list, then
     // the checksum).
-    let mut bytes = snap.export(&mem);
+    let mut bytes = snap.export(&mem, crc32c);
     let last = bytes.len() - 13 - CHECKSUM;
     bytes[last] ^= 0xff;
     assert_eq!(
-        Snapshot::from_bytes(sealed(bytes), Machine::Aarch64),
+        Snapshot::from_bytes(sealed(bytes), Machine::Aarch64, crc32c),
         Err(FormatError::BadFiles)
     );
 }
@@ -357,7 +357,7 @@ fn socket_records_travel_one_per_descriptor() {
         &mut frames,
         unshared,
     );
-    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
     assert_eq!(snap.sockets(), std::slice::from_ref(&listener));
     assert_eq!(snap.files().socket(fd), Ok(0));
     let mut refused = |fs: &Fs, records: &[Record]| {
@@ -373,7 +373,7 @@ fn socket_records_travel_one_per_descriptor() {
             &mut frames,
             unshared,
         );
-        Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64)
+        Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c)
     };
     assert_eq!(
         refused(&fs, &[]),
@@ -427,13 +427,13 @@ fn parked_connections_travel_as_their_key() {
         &mut frames,
         unshared,
     );
-    let mut bytes = snap.export(&mem);
-    let back = Snapshot::from_bytes(bytes.clone(), Machine::Aarch64).unwrap();
+    let mut bytes = snap.export(&mem, crc32c);
+    let back = Snapshot::from_bytes(bytes.clone(), Machine::Aarch64, crc32c).unwrap();
     assert_eq!(back.sockets(), std::slice::from_ref(&parked));
     assert_eq!(back.files().socket(fd), Ok(0));
     // The last byte of the section belongs to the record: cut, it is refused.
     bytes.remove(bytes.len() - CHECKSUM - 1);
-    assert!(Snapshot::from_bytes(sealed(bytes), Machine::Aarch64).is_err());
+    assert!(Snapshot::from_bytes(sealed(bytes), Machine::Aarch64, crc32c).is_err());
 }
 
 /// `bytes` (an exported snapshot, edited) with its checksum made right
@@ -461,13 +461,14 @@ fn sample() -> Vec<u8> {
         &mut frames,
         unshared,
     )
-    .export(&mem)
+    .export(&mem, crc32c)
 }
 
 #[test]
 fn rejects_what_it_cannot_resume() {
     let good = sample();
-    let refused = |bytes: Vec<u8>| Snapshot::from_bytes(bytes, Machine::Aarch64).unwrap_err();
+    let refused =
+        |bytes: Vec<u8>| Snapshot::from_bytes(bytes, Machine::Aarch64, crc32c).unwrap_err();
     let check = |bytes: Vec<u8>, err| assert_eq!(refused(sealed(bytes)), err);
     check(good[..30].to_vec(), FormatError::Truncated);
     // Cut or damaged after the header, a file fails its checksum.
@@ -486,7 +487,7 @@ fn rejects_what_it_cannot_resume() {
     b[8] = (VERSION + 1) as u8; // a later format
     check(b, FormatError::Version(VERSION + 1));
     assert_eq!(
-        Snapshot::from_bytes(good.clone(), Machine::X86_64),
+        Snapshot::from_bytes(good.clone(), Machine::X86_64, crc32c),
         Err(FormatError::Machine {
             expected: 62,
             found: 183
@@ -535,8 +536,8 @@ fn x86_64_state_that_would_fault_in_the_kernel_is_refused() {
         &mut frames,
         unshared,
     )
-    .export(&mem);
-    assert!(Snapshot::from_bytes(good.clone(), Machine::X86_64).is_ok());
+    .export(&mem, crc32c);
+    assert!(Snapshot::from_bytes(good.clone(), Machine::X86_64, crc32c).is_ok());
     // The first thread's words: tls is word 39, the FP image from word 41.
     let tls = HEADER + STATE + 39 * 8;
     let mxcsr = HEADER + STATE + (41 + 3) * 8;
@@ -548,14 +549,14 @@ fn x86_64_state_that_would_fault_in_the_kernel_is_refused() {
         let mut b = good.clone();
         b[at..at + 8].copy_from_slice(&value.to_le_bytes());
         assert_eq!(
-            Snapshot::from_bytes(sealed(b), Machine::X86_64),
+            Snapshot::from_bytes(sealed(b), Machine::X86_64, crc32c),
             Err(FormatError::BadState)
         );
     }
     // MXCSR_MASK (bytes 28-31), as a real FXSAVE writes it, is accepted.
     let mut b = good;
     b[mxcsr..mxcsr + 8].copy_from_slice(&(0xffbf_u64 << 32 | 0x1f80).to_le_bytes());
-    assert!(Snapshot::from_bytes(sealed(b), Machine::X86_64).is_ok());
+    assert!(Snapshot::from_bytes(sealed(b), Machine::X86_64, crc32c).is_ok());
 }
 
 /// Frames without any 2 MiB run free.
@@ -611,7 +612,7 @@ fn a_large_page_comes_back_in_small_pages_without_a_large_frame() {
 
 #[test]
 fn restore_failure_returns_the_frame() {
-    let snap = Snapshot::from_bytes(sample(), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(sample(), Machine::Aarch64, crc32c).unwrap();
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let pt = PageTable::<Aarch64>::new(&mut mem, &mut || frames.alloc()).unwrap();
     snap.restore_page(0, &pt, &mut mem, &mut frames).unwrap();
@@ -639,13 +640,13 @@ fn rejects_malformed_threads() {
         &mut frames,
         unshared,
     )
-    .export(&mem);
-    assert!(Snapshot::from_bytes(good.clone(), Machine::Aarch64).is_ok());
+    .export(&mem, crc32c);
+    assert!(Snapshot::from_bytes(good.clone(), Machine::Aarch64, crc32c).is_ok());
     let word = |index: usize, i: usize| HEADER + STATE + index * THREAD + i * 8;
     let with = |at: usize, v: u64| {
         let mut b = good.clone();
         b[at..at + 8].copy_from_slice(&v.to_le_bytes());
-        Snapshot::from_bytes(sealed(b), Machine::Aarch64)
+        Snapshot::from_bytes(sealed(b), Machine::Aarch64, crc32c)
     };
     let bad = |index| Err(FormatError::BadThread { index });
     assert_eq!(with(word(1, 0), 11), bad(1), "repeated identifier");
@@ -672,14 +673,14 @@ fn rejects_malformed_threads() {
     let mut none = good.clone();
     none[20..24].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(
-        Snapshot::from_bytes(sealed(none), Machine::Aarch64),
+        Snapshot::from_bytes(sealed(none), Machine::Aarch64, crc32c),
         bad(0),
         "no thread"
     );
     let mut many = good;
     many[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(
-        Snapshot::from_bytes(sealed(many), Machine::Aarch64),
+        Snapshot::from_bytes(sealed(many), Machine::Aarch64, crc32c),
         Err(FormatError::Truncated)
     );
 }
@@ -767,7 +768,7 @@ mod hostile {
             &mut frames,
             unshared,
         )
-        .export(&mem)
+        .export(&mem, crc32c)
     }
 
     /// Restores everything `snap` holds as the kernel does on resume, then
@@ -870,7 +871,7 @@ mod hostile {
     proptest! {
         #[test]
         fn tampered_snapshots_are_refused_or_contained(bytes in tampered()) {
-            if let Ok(snap) = Snapshot::from_bytes(bytes, Machine::X86_64) {
+            if let Ok(snap) = Snapshot::from_bytes(bytes, Machine::X86_64, crc32c) {
                 restore_safely(&snap);
             }
         }
@@ -889,7 +890,7 @@ mod hostile {
                 bytes[16..20].copy_from_slice(&pages.to_le_bytes());
                 bytes[20..24].copy_from_slice(&threads.to_le_bytes());
             }
-            if let Ok(snap) = Snapshot::from_bytes(sealed(bytes), Machine::X86_64) {
+            if let Ok(snap) = Snapshot::from_bytes(sealed(bytes), Machine::X86_64, crc32c) {
                 restore_safely(&snap);
             }
         }
@@ -980,7 +981,7 @@ fn shared<F: EntryFormat>() {
         0x4000_0000_0000,
         b"resumed!",
     );
-    let back = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
+    let back = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
     assert_eq!(back.shared_bytes(), 0, "an export stands alone");
     assert!(
         RELEASED.with(|r| r.borrow().is_empty()),
@@ -1016,7 +1017,7 @@ fn records_that_refer_to_frames_are_refused() {
     let mut b = sample();
     b[HEADER + STATE + THREAD + REFERS] = 1;
     assert_eq!(
-        Snapshot::from_bytes(sealed(b), Machine::Aarch64),
+        Snapshot::from_bytes(sealed(b), Machine::Aarch64, crc32c),
         Err(FormatError::BadPage { index: 0 })
     );
 }
@@ -1048,7 +1049,7 @@ fn waits_on_descriptors_keep_their_time_left() {
         &mut frames,
         unshared,
     );
-    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::X86_64).unwrap();
+    let snap = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::X86_64, crc32c).unwrap();
     let threads = snap.threads(5000);
     let wait = |tid| threads.get(tid).unwrap().wait;
     assert_eq!(wait(first), Wait::Io { until: Some(5500) });
@@ -1072,11 +1073,47 @@ fn the_checksum_is_crc32c() {
     assert_eq!(crc32c(&up), 0x46dd_794e);
 }
 
+/// CRC-32C one bit at a time, straight from its definition.
+fn crc32c_bitwise(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0u32, |c, &b| {
+        (0..8).fold(c ^ u32::from(b), |c, _| {
+            (c >> 1) ^ (0x82f6_3b78 & (c & 1).wrapping_neg())
+        })
+    })
+}
+
+proptest::proptest! {
+    /// The table form equals the definition for any contents, length and
+    /// alignment: the reference the kernel's CRC instructions are tested
+    /// against (change `fast-mem-primitives`).
+    #[test]
+    fn the_table_checksum_equals_the_definition(
+        bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..600),
+        skip in 0usize..8,
+    ) {
+        let bytes = &bytes[skip.min(bytes.len())..];
+        proptest::prop_assert_eq!(crc32c(bytes), crc32c_bitwise(bytes));
+    }
+}
+
+#[test]
+fn the_checksum_function_passed_in_is_the_one_used() {
+    let sealed_by_other: Crc32c = |b| !crc32c(b);
+    let bytes = Snapshot::from_bytes(sample(), Machine::Aarch64, crc32c)
+        .unwrap()
+        .export(&FakePhysicalMemory::new(), sealed_by_other);
+    assert!(Snapshot::from_bytes(bytes.clone(), Machine::Aarch64, sealed_by_other).is_ok());
+    assert_eq!(
+        Snapshot::from_bytes(bytes, Machine::Aarch64, crc32c).err(),
+        Some(FormatError::Checksum)
+    );
+}
+
 #[test]
 fn quotas_from_outside_are_capped() {
     use rhizo_cell::quota::Quota;
     // `sample` has 32 MiB, 7 ms of CPU, 64 descriptors and 3 sockets.
-    let mut snap = Snapshot::from_bytes(sample(), Machine::Aarch64).unwrap();
+    let mut snap = Snapshot::from_bytes(sample(), Machine::Aarch64, crc32c).unwrap();
     snap.cap_quota(Quota::DEFAULT);
     assert_eq!(snap.state().quota.sockets, 3, "lower ones stay");
     snap.cap_quota(Quota {

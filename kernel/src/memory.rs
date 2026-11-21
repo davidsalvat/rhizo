@@ -2,6 +2,7 @@
 
 use crate::arch::boot::layout;
 use crate::arch::cpu::{self, CpuTlb};
+use crate::arch::mem;
 use crate::arch::platform::{self, Format};
 use crate::sync::Global;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,31 +39,39 @@ impl PhysicalMemory for DirectMap {
 
     fn zero_frame(&mut self, frame: u64) {
         let _copy = copying();
-        // SAFETY: the frame is RAM, mapped through the direct map, and owned
-        // by the caller.
-        unsafe { core::ptr::write_bytes(Self::virt(frame) as *mut u8, 0, FRAME_SIZE as usize) }
+        // SAFETY: the frame is 4 KiB-aligned RAM (normal memory), mapped
+        // through the direct map, and owned by the caller.
+        unsafe { mem::zero_page(Self::virt(frame) as *mut u8) }
     }
 
     fn read_bytes(&self, phys: u64, out: &mut [u8]) {
         let _copy = copying();
+        let src = Self::virt(phys) as *const u8;
         // SAFETY: as for `read_u64`; the range is RAM owned by the caller and
         // does not overlap `out` (kernel heap or stack).
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                Self::virt(phys) as *const u8,
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        }
+        unsafe { core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out.len()) }
     }
 
     fn write_bytes(&mut self, phys: u64, data: &[u8]) {
         let _copy = copying();
+        let dst = Self::virt(phys) as *mut u8;
         // SAFETY: as for `write_u64`; the range is RAM owned by the caller and
         // does not overlap `data`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), Self::virt(phys) as *mut u8, data.len())
-        }
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) }
+    }
+
+    fn read_pages(&self, phys: u64, out: &mut [u8]) {
+        let _copy = copying();
+        let src = Self::virt(phys) as *const u8;
+        // SAFETY: as for `read_bytes`.
+        unsafe { copy(out.as_mut_ptr(), src, out.len()) }
+    }
+
+    fn write_pages(&mut self, phys: u64, data: &[u8]) {
+        let _copy = copying();
+        let dst = Self::virt(phys) as *mut u8;
+        // SAFETY: as for `write_bytes`.
+        unsafe { copy(dst, data.as_ptr(), data.len()) }
     }
 
     fn copy(&mut self, from: u64, to: u64, len: u64) {
@@ -70,14 +79,34 @@ impl PhysicalMemory for DirectMap {
         // SAFETY: both ranges are RAM mapped through the direct map, owned by
         // the caller, and do not overlap.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                Self::virt(from) as *const u8,
+            copy(
                 Self::virt(to) as *mut u8,
+                Self::virt(from) as *const u8,
                 len as usize,
             )
         }
     }
 }
+
+/// Copies `len` bytes from `src` to `dst`: whole pages with the
+/// architecture's page copy, anything else with `memcpy` (change
+/// `fast-mem-primitives`).
+///
+/// # Safety
+/// As for `core::ptr::copy_nonoverlapping`, on normal memory.
+#[inline]
+unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) {
+    // Callers pass whole pages; anything else is copied all the same.
+    if len < PAGE || !len.is_multiple_of(PAGE) {
+        // SAFETY: guaranteed by the caller.
+        return unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
+    }
+    // SAFETY: guaranteed by the caller; the page copy takes any alignment.
+    unsafe { mem::copy_pages(dst, src, len / PAGE) }
+}
+
+/// The unit of the architecture's zero and copy primitives.
+const PAGE: usize = FRAME_SIZE as usize;
 
 /// Accounts the time of a copy as such (spec `profiling`) in profile
 /// builds, until the returned value is dropped.

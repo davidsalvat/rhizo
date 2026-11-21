@@ -11,6 +11,9 @@
 //!   write}` (the UART both ways); `power`: `init`, `Machine`
 //! - `cpu`: `init`, `supports_1gib_pages`, `activate`, `CpuTlb`, `flush_all`
 //! - `timer`: `Counter`, `cycles_to_ns`
+//! - `mem`: `zero_page`, `copy_pages` (4 KiB, behind `memory::DirectMap`);
+//!   in cell builds, `crc32c` (snapshot files' checksum, the CPU's
+//!   instructions where it has them) and `has_crc32`
 //! - `user` (cell builds only): `enter_user`, `Trap`, `release_user`,
 //!   `sync_code`; `platform::{MACHINE, ABI, CELL_ROOT_HAS_KERNEL_HALF}`
 //! - `random` (cell builds only): `HardwareEntropy` (`rhizo_hal::Entropy`)
