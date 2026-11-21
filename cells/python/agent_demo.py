@@ -3,14 +3,19 @@
 # host may freeze the cell there as a template), then answer one tool call:
 # parse its JSON, run regular expressions and string operations over its
 # text, compute, and reply in JSON. Deterministic: the same output on Linux
-# and in a cell.
+# and in a cell. A copy of the frozen cell reseeds `random` first (design
+# D22 of `add-cell-hierarchy`); with the argument `random`, it then prints
+# `random.random()` and 16 bytes of `os.urandom`, which every copy draws
+# anew.
 import binascii
 import datetime
 import json
 import math
+import os
 import random
 import re
 import struct
+import sys
 import time
 
 WORDS = re.compile(r"[a-z]+")
@@ -75,12 +80,27 @@ def answer(request, quiet=False):
         print(json.dumps(reply, sort_keys=True))
 
 
+def generation():
+    """The cell's copy generation, which changes in every copy of it (a
+    fork, a cell from a template, a resume); None outside Rhizo."""
+    try:
+        with open("/run/rhizo/generation", "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def main():
     request = warm()
+    seen = generation()
     print("warm", flush=True)
     time.sleep(0.001)
+    if generation() != seen:
+        random.seed()  # a copy: from its own `getrandom`
     answer(request)
     print("cpython ok")
+    if "random" in sys.argv[1:]:
+        print(random.random(), os.urandom(16).hex())
 
 
 if __name__ == "__main__":

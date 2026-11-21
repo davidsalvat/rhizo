@@ -35,7 +35,7 @@ import traceback
 # Modules a snippet may import (packed because this script imports them).
 import collections  # noqa: F401
 import datetime  # noqa: F401
-import random  # noqa: F401
+import random
 import re  # noqa: F401
 import textwrap  # noqa: F401
 
@@ -267,11 +267,27 @@ def answer(model, messages):
     print("[agent] stopped after %d model requests" % STEPS)
 
 
+def generation():
+    """The cell's copy generation, which changes in every copy of it (a
+    fork, a cell from a template, a resume); None outside Rhizo."""
+    try:
+        with open("/run/rhizo/generation", "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def chat(model):
     messages = [{"role": "system", "content": SYSTEM}]
+    seen = generation()
     print("\x1eready")
     while line := sys.stdin.buffer.readline():
         t0 = time.perf_counter_ns()
+        # A copy of a template draws its own random numbers (design D22 of
+        # `add-cell-hierarchy`): one read per message.
+        if (now := generation()) != seen:
+            random.seed()
+            seen = now
         waited = len(model.waited)
         text = line.decode("utf-8", errors="replace").strip()
         if text:

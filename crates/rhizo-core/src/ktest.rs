@@ -15,23 +15,41 @@ pub struct TestCase {
     pub name: &'static str,
     /// The test body. It fails by panicking.
     pub run: fn(),
+    /// Its estimated duration, in tenths of a second, by which shares are
+    /// dealt ([`run`]); 1 unless measured.
+    pub cost: u32,
 }
 
-/// Builds a [`TestCase`] from a function, using the function's name.
+/// Builds a [`TestCase`] from a function, using the function's name, with
+/// its estimated cost when given (`ktest_case!(f, 120)`).
 #[macro_export]
 macro_rules! ktest_case {
     ($f:path) => {
+        $crate::ktest_case!($f, 1)
+    };
+    ($f:path, $cost:expr) => {
         $crate::ktest::TestCase {
             name: stringify!($f),
             run: $f,
+            cost: $cost,
         }
     };
 }
 
+/// The share (0 to `n - 1`) that runs the case of rank `rank`, counting
+/// from the most expensive: ranks go out 0, 1, .., n - 1, then back
+/// n - 1, .., 0, and again, so every share gets cases of every cost.
+fn share_of_rank(rank: usize, n: usize) -> usize {
+    let (round, at) = (rank / n, rank % n);
+    if round % 2 == 0 { at } else { n - 1 - at }
+}
+
 /// Runs every test case of every suite, in order, and returns the status to
-/// exit the VM with. With `shard = Some((i, n))` only the cases whose
-/// position (counting across the suites) is `i` modulo `n` run, so `n` VMs
-/// together run each case once.
+/// exit the VM with. With `shard = Some((i, n))` only the cases dealt to
+/// share `i` run, so `n` VMs together run each case once: the cases are
+/// ranked by cost, most expensive first (ties by position across the
+/// suites), and dealt to the shares by rank, back and forth, so the shares
+/// take about the same time. The deal depends only on the suites and `n`.
 ///
 /// Output format, one line per test:
 ///
@@ -47,11 +65,16 @@ pub fn run(
     shard: Option<(u16, u16)>,
 ) -> ExitStatus {
     let (i, n) = shard.map_or((0, 1), |(i, n)| (usize::from(i), usize::from(n)));
-    let mine = |k: &usize| k % n == i;
     let all = || suites.iter().flat_map(|s| s.iter()).enumerate();
-    let total = all().filter(|(k, _)| mine(k)).count();
+    let rank = |k: usize, cost: u32| {
+        all()
+            .filter(|&(j, c)| c.cost > cost || (c.cost == cost && j < k))
+            .count()
+    };
+    let mine = |&(k, c): &(usize, &TestCase)| share_of_rank(rank(k, c.cost), n) == i;
+    let total = all().filter(mine).count();
     let _ = writeln!(ConsoleWriter(console), "running {total} tests");
-    for (_, case) in all().filter(|(k, _)| mine(k)) {
+    for (_, case) in all().filter(mine) {
         let _ = write!(ConsoleWriter(console), "test {} ... ", case.name);
         (case.run)();
         let _ = writeln!(ConsoleWriter(console), "ok");
@@ -127,6 +150,41 @@ mod tests {
         }
         names.sort();
         assert_eq!(names, ["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn shares_split_the_cost_and_keep_the_order() {
+        fn a() {}
+        fn b() {}
+        fn c() {}
+        fn d() {}
+        fn e() {}
+        fn f() {}
+        // Positions 0 and 2 would share a VM if dealt by position.
+        let cases = [
+            ktest_case!(a, 90),
+            ktest_case!(b),
+            ktest_case!(c, 80),
+            ktest_case!(d),
+            ktest_case!(e, 10),
+            ktest_case!(f, 10),
+        ];
+        let cost = |name: &str| cases.iter().find(|k| k.name == name).unwrap().cost;
+        let mut loads = Vec::new();
+        for i in 0..2 {
+            let mut console = RecordingConsole::new();
+            run(&mut console, &[&cases], Some((i, 2)));
+            let text = console.text();
+            let ran: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... ok"))
+                .collect();
+            let mut sorted = ran.clone();
+            sorted.sort();
+            assert_eq!(ran, sorted, "a share runs its cases in their order");
+            loads.push(ran.iter().map(|n| cost(n)).sum::<u32>());
+        }
+        assert_eq!(loads, [101, 91]);
     }
 
     #[test]

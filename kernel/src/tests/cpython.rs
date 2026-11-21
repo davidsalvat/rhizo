@@ -7,6 +7,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(stack_grows_on_touch_and_returns_its_frames),
     ktest_case!(cpython_in_a_cell),
     ktest_case!(a_cpython_agent_talks_forks_and_survives_suspend),
+    ktest_case!(copies_draw_different_random),
 ];
 
 /// A program using 4 MiB of stack, and a system call writing into stack it
@@ -97,10 +98,62 @@ fn a_cpython_agent_talks_forks_and_survives_suspend() {
     assert_eq!(crate::cell::open_sockets(), 0);
     // The card's connections finish closing with the model server: the
     // kernel goes back to holding nothing for the agent.
+    settle_wire();
+}
+
+/// Two copies of a CPython template frozen after its warm-up (`random`
+/// imported and seeded), and two resumes of a snapshot of the template,
+/// each print a `random.random()` and an `os.urandom(16)` of their own:
+/// they reseed once they see their copy generation changed (spec
+/// `cell-hierarchy`, design D22 of `add-cell-hierarchy`).
+fn copies_draw_different_random() {
+    let image = crate::cell::test_image("cpython");
+    let Some(files) = crate::cell::cpython_files() else {
+        arch::console::BootConsole.write_bytes(b"(CPython not built: not run) ");
+        return;
+    };
+    let mut argv: Vec<&[u8]> = expected::CPYTHON_ARGV.map(str::as_bytes).to_vec();
+    argv.push(b"random");
     let mut host = Host::new();
-    let end = crate::cell::now_ns() + 10_000_000_000;
-    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
-        host.wire_address(0);
+    let template = host
+        .spawn_with_files(image, &argv, files, true, false)
+        .expect("spawn");
+    while host.output(template) != Some(b"warm\n") {
+        host.step();
     }
-    assert!(!crate::cell::wire_busy(), "the card's connections closed");
+    assert!(host.freeze(template));
+    let mut ids: Vec<u32> = (0..2)
+        .map(|_| {
+            host.spawn_from_template(template, true, false)
+                .expect("copy")
+        })
+        .collect();
+    for _ in 0..2 {
+        let snapshot = host.template_snapshot(template).expect("snapshot");
+        ids.push(
+            host.resume(snapshot, Resume::Lazy, true, false)
+                .expect("load"),
+        );
+    }
+    host.run(|_| false);
+    let answer = expected::CPYTHON_STDOUT
+        .strip_prefix("warm\n")
+        .expect("warm first");
+    let draws: Vec<alloc::string::String> = ids
+        .into_iter()
+        .map(|id| {
+            let (ending, out) = ended(&host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            let draw = out.strip_prefix(answer).expect("the answer first");
+            assert_eq!(draw.split(' ').count(), 2, "{draw}");
+            draw.into()
+        })
+        .collect();
+    for (i, a) in draws.iter().enumerate() {
+        for b in &draws[i + 1..] {
+            for (x, y) in a.split(' ').zip(b.split(' ')) {
+                assert_ne!(x, y, "two copies drew the same");
+            }
+        }
+    }
 }

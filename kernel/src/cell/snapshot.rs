@@ -2,6 +2,7 @@
 //! `snapshots` and `fork`).
 
 use super::*;
+use rhizo_snapshot::UNKNOWN_GENERATION;
 
 /// How [`Host::resume`] restores memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +127,13 @@ impl Host {
         }
         let now = now_ns();
         let mut cell = snapshot.cell(id, pt.root(), now);
+        // A resume or a load is a copy (design D22 of `add-cell-hierarchy`);
+        // the snapshot holds its wipe ranges as zeros.
+        cell.generation = if cell.generation == UNKNOWN_GENERATION {
+            loaded_generation()
+        } else {
+            cell.generation + 1
+        };
         if !self.enter_restored(&mut cell, snapshot.origin()) {
             space::destroy(pt, &mut DirectMap, &mut KernelFrames);
             return Err(snapshot);
@@ -216,7 +224,9 @@ impl Host {
     /// files `fs` and its write-or-execute ranges `wx`. Only counts go up,
     /// on tables `cell` holds, and only `cell`'s root changes: no
     /// [`SHARING`], even while cells sharing those tables run (design D3 of
-    /// `host-ops-per-cell`).
+    /// `host-ops-per-cell`). It is a copy (design D22 of
+    /// `add-cell-hierarchy`): its generation is one more, and its wipe
+    /// ranges read as zero, the only work done for cells that have some.
     fn child_of(
         &mut self,
         cell: &Cell,
@@ -233,12 +243,17 @@ impl Host {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             root: child.root(),
             cpu_ns: 0,
+            generation: cell.generation + 1,
             ..cell.clone()
         };
         let mut live = self.new_live(cell, capture, echo, fork_files(fs));
         live.frames.set_used(1); // its root
         live.shares = true;
         live.demand.wx = wx.clone();
+        if !wx.wiped().is_empty() && !wipe_copy(&live) {
+            self.discard(&live);
+            return None;
+        }
         Some(live)
     }
 
@@ -319,6 +334,21 @@ impl Host {
         Some(snapshot)
     }
 
+    /// Whether template `id` may be published, its copies then going into
+    /// other domains (design D22 of `add-cell-hierarchy`): not if the cell
+    /// it was made of reached the network card, unless the host attests
+    /// (`attested`) that it holds no secret. `None` if there is no such
+    /// template. Publishing itself and the audit record of an attestation
+    /// come with tasks 1.8a and 1.9b.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "publishing comes with task 1.8a")
+    )]
+    pub fn may_publish(&self, id: u32, attested: bool) -> Option<bool> {
+        let (cell, ..) = self.templates.iter().find(|(c, ..)| c.id == id)?;
+        Some(attested || !cell.exposed)
+    }
+
     /// Drops template `id`: its memory and sockets go back once no copy
     /// shares them. Returns whether it existed.
     pub fn drop_template(&mut self, id: u32) -> bool {
@@ -373,4 +403,30 @@ impl Host {
         self.admit(|s| file(s, None, child));
         Some(child_id)
     }
+}
+
+/// Makes the wipe ranges of `live`, a copy that never ran, read as zero
+/// (design D22 of `add-cell-hierarchy`); returns whether it could. Kept
+/// out of line: copies of cells without wipe ranges never come here.
+#[cold]
+#[inline(never)]
+fn wipe_copy(live: &Live) -> bool {
+    let pt = PageTable::<Format>::from_root(live.cell.root);
+    let mut frames = cell_frames(&live.frames);
+    let ranges = live.demand.wx.wiped();
+    sharing(true, || {
+        space::wipe(&pt, &mut DirectMap, &mut NewSpace, &mut frames, ranges)
+    })
+    .is_ok()
+}
+
+/// The copy generation of a cell loaded from bytes that do not hold its
+/// own (until format version 11, task 1.10): drawn from the kernel's
+/// generator, so it equals no value the cell saw before it was saved but
+/// with chance 2^-62. Never 0, and below 2^62, so later copies counting up
+/// from it stay far from [`UNKNOWN_GENERATION`].
+fn loaded_generation() -> u64 {
+    let mut word = [0u8; 8];
+    RANDOM.with(|g| g.fill(&mut word));
+    (u64::from_le_bytes(word) >> 2) | 1
 }

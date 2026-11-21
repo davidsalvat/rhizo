@@ -854,7 +854,7 @@ review:
   and `holes_end_where_their_empty_entry_ends` (`rhizo-mm`),
   `files_and_directories_are_limited_per_cell` (`rhizo-fs`), the snapshot
   register tests.
-- In the kernel, both architectures (`kernel/src/tests.rs`, H13 section),
+- In the kernel, both architectures (`kernel/src/tests/isolation.rs`),
   with hostile cells in `cells/src/bin`:
   - `syscall_fuzzer_cannot_hurt_the_kernel`: `fuzz`, 20000 calls from a
     fixed seed next to a well-behaved cell; nothing leaks.

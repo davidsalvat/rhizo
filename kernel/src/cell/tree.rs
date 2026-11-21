@@ -86,10 +86,13 @@ impl Host {
     }
 
     /// Places a cell restored from `snapshot`'s state, not yet run: under
-    /// the parent it had, with its domain and number, if it was suspended
-    /// from this host; otherwise as the root of a new domain (spec
-    /// `snapshots`, loaded snapshots hold no authority). Its threads keep
-    /// their identifiers. `false` if the tree has no room.
+    /// the parent it had, in its domain, if it was suspended from this
+    /// host; otherwise as the root of a new domain (spec `snapshots`, loaded
+    /// snapshots hold no authority). Either way it is a copy and takes a new
+    /// number (design D22): a loaded one never 1, the number of the roots
+    /// most snapshots come from, until the snapshot holds its own number
+    /// (format version 11). Its threads keep their identifiers. `false` if
+    /// the tree has no room.
     pub(super) fn enter_restored(&mut self, cell: &mut Cell, origin: u32) -> bool {
         if let Some(at) = self.suspended.iter().position(|&s| s == origin)
             && let Some(n) = self.tree.rekey(origin, cell.id)
@@ -102,7 +105,7 @@ impl Host {
             limits: root_limits(&cell.quota),
             ..Spec::default()
         };
-        let Ok(pid) = self.tree.add_root(cell.id, spec, 0) else {
+        let Ok(pid) = self.tree.add_root(cell.id, spec, 1) else {
             return false;
         };
         (cell.pid, cell.domain) = (pid, cell.id);

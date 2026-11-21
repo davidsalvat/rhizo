@@ -6,7 +6,7 @@ use super::*;
 pub(super) const ALL: &[TestCase] = &[
     ktest_case!(an_image_spawned_again_starts_fresh),
     ktest_case!(kept_images_give_way_to_cells),
-    ktest_case!(a_cell_from_a_kept_image_suspends_resumes_and_forks),
+    ktest_case!(a_cell_from_a_kept_image_suspends_resumes_and_forks, 167),
 ];
 
 /// An executable spawned again, from the space kept for it, starts with the

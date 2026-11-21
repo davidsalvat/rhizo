@@ -256,6 +256,26 @@ fn open_flags_follow_linux() {
     assert_eq!(read_all(&mut fs, b"/x").unwrap(), b"");
 }
 
+/// A file of data no name refers to (design D22 of `add-cell-hierarchy`):
+/// read only, its bytes read back, nothing listed, and its block gone once
+/// it is closed.
+#[test]
+fn unnamed_data_reads_back_and_goes_on_close() {
+    let mut fs = Fs::new();
+    let fd = fs.open_data(&7u64.to_le_bytes()).unwrap();
+    assert_eq!(fs.data_bytes(), BLOCK as u64);
+    let st = fs.fstat(fd).unwrap().unwrap();
+    assert_eq!((st.kind, st.links, st.size), (Kind::File, 0, 8));
+    let mut buf = [0u8; 16];
+    assert_eq!(fs.read(fd, &mut buf, None), Ok(8));
+    assert_eq!(buf[..8], 7u64.to_le_bytes());
+    assert_eq!(fs.read(fd, &mut buf, None), Ok(0));
+    assert_eq!(fs.write(fd, b"x", Some(0)), Err(Error::BadFd));
+    assert_eq!(names(&mut fs, b"/"), [b".".to_vec(), b"..".to_vec()]);
+    fs.close(fd).unwrap();
+    assert_eq!(fs.data_bytes(), 0);
+}
+
 #[test]
 fn directories_paths_and_cwd() {
     let mut fs = Fs::new();

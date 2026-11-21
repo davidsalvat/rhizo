@@ -321,6 +321,42 @@ fn udp_to_a_host_outside() {
     assert_eq!(w.net.recv(u, 100, false, &mut |_| true), Err(Error::Again));
 }
 
+/// A call that reaches the card, a TCP connection or a datagram out, says
+/// so in the caller's ports; loopback calls, and calls without a card, do
+/// not (design D22 of `add-cell-hierarchy`).
+#[test]
+fn calls_that_reach_the_card_mark_the_caller() {
+    let mut w = World::new();
+    let call = |net: &mut Net, f: &mut dyn FnMut(&mut Net)| {
+        net.enter(Ports::new(3));
+        f(net);
+        net.leave().unwrap().out
+    };
+    let local = Addr::Inet {
+        ip: LOOPBACK,
+        port: 9,
+    };
+    let s = w.net.socket(Family::Inet, Type::Stream).unwrap();
+    let u = w.net.socket(Family::Inet, Type::Dgram).unwrap();
+    assert!(!call(&mut w.net, &mut |n| {
+        let _ = n.connect(s, &local);
+        let _ = n.send(u, b"here", Some(&local));
+    }));
+    let tcp = Addr::Inet { ip: PEER, port: 80 };
+    assert!(call(&mut w.net, &mut |n| {
+        let _ = n.connect(s, &tcp);
+    }));
+    let dns = Addr::Inet { ip: PEER, port: 53 };
+    assert!(call(&mut w.net, &mut |n| {
+        let _ = n.send(u, b"query", Some(&dns));
+    }));
+    let mut cardless = Net::new();
+    let s = cardless.socket(Family::Inet, Type::Stream).unwrap();
+    assert!(!call(&mut cardless, &mut |n| {
+        let _ = n.connect(s, &tcp);
+    }));
+}
+
 #[test]
 fn binding_takes_the_card_s_address_only() {
     let mut w = World::new();

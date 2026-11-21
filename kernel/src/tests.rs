@@ -3,7 +3,10 @@
 //!
 //! Each area of the kernel has its file here, which lists its tests in its
 //! own `ALL`, in execution order: a new test touches its area's file only.
-//! The suite runs the areas in the order of [`AREAS`].
+//! The suite runs the areas in the order of [`AREAS`]. A test that takes 3
+//! seconds or more on AArch64 (on 1 CPU plus on 4) has its cost there, in
+//! tenths of a second (`ktest_case!(name, 120)`), so `RHIZO_SHARDS` splits
+//! the suite evenly (change `shard-kernel-tests`).
 
 use crate::arch;
 use crate::cell::{Ending, Host, Resume};

@@ -17,7 +17,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(a_blocked_cell_survives_suspend),
     ktest_case!(forked_servers_share_their_listener),
     ktest_case!(pipes_and_sockets_of_a_fork),
-    ktest_case!(a_cell_reaches_the_host),
+    ktest_case!(a_cell_reaches_the_host, 31),
     ktest_case!(a_silent_connection_outlasts_the_timeout_and_reconnects_at_once),
 ];
 
