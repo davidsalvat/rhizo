@@ -1,6 +1,8 @@
 //! Minimal 16550 UART driver (polling; receiving in control builds only).
 
 use super::port::{inb, outb};
+#[cfg(feature = "control")]
+use core::sync::atomic::{AtomicBool, Ordering};
 use rhizo_hal::Console;
 
 /// I/O base of the first serial port.
@@ -11,6 +13,16 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 /// Line status register bit: a received byte is waiting.
 #[cfg(feature = "control")]
 const LSR_DATA_READY: u8 = 1 << 0;
+/// Bytes the transmit FIFO takes once the line status says it is empty.
+#[cfg(feature = "control")]
+const TX_FIFO: usize = 16;
+
+/// Whether [`Serial::init`] turned the FIFOs on. Each register access traps
+/// to the VMM, so control frames fill the transmit FIFO after one look at
+/// the line status instead of looking before every byte (change
+/// `measure-control-path`).
+#[cfg(feature = "control")]
+static FIFOS_ON: AtomicBool = AtomicBool::new(false);
 
 /// A 16550-compatible serial port.
 #[derive(Debug)]
@@ -38,6 +50,8 @@ impl Serial {
             outb(b + 2, 0xC7); // enable and clear FIFOs, 14-byte threshold
             outb(b + 4, 0x03); // DTR | RTS
         }
+        #[cfg(feature = "control")]
+        FIFOS_ON.store(true, Ordering::Relaxed);
     }
 
     /// The next received byte, if one is waiting.
@@ -51,8 +65,22 @@ impl Serial {
     /// Sends `bytes` as they are (no `\r` before `\n`).
     #[cfg(feature = "control")]
     pub fn write_raw(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_byte(byte);
+        if !FIFOS_ON.load(Ordering::Relaxed) {
+            bytes.iter().for_each(|&byte| self.write_byte(byte));
+            return;
+        }
+        for burst in bytes.chunks(TX_FIFO) {
+            // SAFETY: reading the line status register and writing the
+            // transmit register of COM1 have no side effects beyond sending
+            // the bytes; once the transmit FIFO is empty it takes `TX_FIFO`.
+            unsafe {
+                while inb(self.base + 5) & LSR_THR_EMPTY == 0 {
+                    core::hint::spin_loop();
+                }
+                for &byte in burst {
+                    outb(self.base, byte);
+                }
+            }
         }
     }
 
