@@ -30,8 +30,9 @@ upgrade (save the cells, `rhizo down`, `rhizo up` with the new kernel,
 
 ### Requirement: Tree under control
 `run`, `load` and the fork of a template SHALL take a parent, a label,
-limits, an egress policy and ceiling (egress `none` when not given), a
-policy for when the parent ends and a CPU set; `list` SHALL give each
+limits (CPU weight and cap among them), an egress policy and ceiling
+(egress `none` when not given), a policy for when the parent ends and a
+CPU set; `list` SHALL give each
 cell's parent, domain root and label, and `rhizo ps --tree` SHALL show
 the tree. `rhizo chat` and agent templates SHALL pass `--egress model`.
 
@@ -48,6 +49,18 @@ grant, list and revoke handles (`rhizo reparent`, `policy`, `grant`,
 #### Scenario: Grant and revoke from the host
 - **WHEN** the host grants a channel between two cells, they exchange a message, and the host revokes it
 - **THEN** the message arrives, and after the revocation both ends read end of file
+
+### Requirement: Publishing templates
+`rhizo publish T [--attest-no-secrets]` SHALL make template `T` a public
+object whose copies in any domain share its frames, and `rhizo withdraw
+T` SHALL end that: later copies outside its domain are full copies, and
+its frames stay until its last copy ends. The host's own
+file sets and the templates `rhizo up` makes from them SHALL be
+published at start.
+
+#### Scenario: Publish and copy
+- **WHEN** the host publishes a template and runs a copy of it in each of two new roots
+- **THEN** both copies share the template's frames, and after `withdraw` a third copy as a new root shares none while the two run on
 
 ### Requirement: Scoped host access
 `rhizo scope N --socket PATH` SHALL serve on PATH requests limited to

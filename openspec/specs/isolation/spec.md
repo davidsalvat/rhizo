@@ -153,12 +153,13 @@ SHALL be the cell's again when it resumes.
 Snapshot bytes SHALL be treated as written by anyone: any bytes SHALL be
 refused with a format error, or resume into a cell that changes no kernel
 memory or kernel page-table entry, maps only user pages below `USER_END`
-and never writable and executable at once, starts every thread below
+and never writable and executable at once, keeps only write-or-execute
+ranges below `USER_END` and at most 64 of them, starts every thread below
 `USER_END`, has files whose every operation answers instead of panicking,
 and gives every frame back when it ends.
 
 #### Scenario: Tampered or random snapshot
-- **WHEN** a valid snapshot with bytes changed or cut, or random bytes behind a valid header, are read and resumed
+- **WHEN** a valid snapshot with bytes changed or cut, or random bytes behind a valid header, are read and resumed, with their checksum made right again or not
 - **THEN** they are refused, or the resumed cell holds the properties above
 
 ### Requirement: A broken device cannot widen what the kernel maps
@@ -258,13 +259,33 @@ have the cell's quotas and the CPU time it had used.
 - **THEN** every copy stops at the same quotas as the cell
 
 ### Requirement: FP/SIMD registers hold nothing of another thread
-The FP/SIMD state a cell thread finds when it runs SHALL be its own or
-kernel values, never another thread's or another cell's. On x86_64 this
-covers the x87 last-instruction opcode, instruction pointer and data
-pointer, including on CPUs whose `FXRSTOR` does not load them: AMD and
-Hygon CPUs without `XSAVEERPTR`, and QEMU's emulation. The kernel SHALL
-decide at start whether the CPU needs this, and SHALL add no work to a
-thread's FP/SIMD load on a CPU that does not.
+While cell code runs, the CPU's FP/SIMD registers SHALL hold only the
+running thread's own state or the state a program starts with, never
+another thread's or cell's, even before the thread's first FP/SIMD
+instruction, so that code run speculatively before an FP/SIMD trap cannot
+read them (LazyFP, CVE-2018-3665). This SHALL hold on both
+architectures and every CPU, including threads of one cell on several
+CPUs.
+
+#### Scenario: Registers after another cell
+- **WHEN** a cell fills every FP/SIMD register with its own values and yields, and a cell that never uses FP/SIMD runs next on that CPU
+- **THEN** the CPU's FP/SIMD registers, read by the kernel after that cell's turn, hold the initial state
+
+#### Scenario: A hostile reader
+- **WHEN** a cell that only reads its FP/SIMD registers (its first FP/SIMD instruction a read) runs many times next to cells and threads holding distinct values in theirs, on 1 and on 4 CPUs
+- **THEN** it only ever finds the initial state, and every other cell and thread finds its own values
+
+#### Scenario: Suspends, resumes and forks
+- **WHEN** a cell whose threads hold values in their FP/SIMD registers is suspended and resumed (eagerly and lazily, sometimes twice before it runs again) and forked while it runs
+- **THEN** it and its forks find their own values, and so does every other cell
+
+### Requirement: x87 pointers hold nothing of another thread
+On x86_64, the x87 last-instruction opcode, instruction pointer and data
+pointer a cell thread finds SHALL be its own or kernel values, never
+another thread's or another cell's, including on CPUs whose `FXRSTOR` does
+not load them: AMD and Hygon CPUs without `XSAVEERPTR`, and QEMU's
+emulation. The kernel SHALL decide at start whether the CPU needs this,
+and SHALL add no work to a thread's FP/SIMD load on a CPU that does not.
 
 #### Scenario: x87 pointers after a switch
 - **WHEN** an x87 load runs on a CPU and another thread's FP/SIMD state is then loaded there, and that thread reads its x87 environment
@@ -273,3 +294,56 @@ thread's FP/SIMD load on a CPU that does not.
 #### Scenario: Only where needed
 - **WHEN** the kernel starts on an x86_64 CPU
 - **THEN** it scrubs the x87 pointers before each FP/SIMD load exactly when the CPU is AMD or Hygon without `XSAVEERPTR`, or QEMU's emulation
+
+### Requirement: Write-or-execute pages stay the cell's
+Changing a write-or-execute page between writing and running SHALL change
+only the cell's own entry: a page whose tables or frame another cell
+shares SHALL be changed in tables of the cell's own, and written only in
+a frame of its own.
+
+#### Scenario: Code pages after a fork
+- **WHEN** copies of a forked cell each rewrite and run the code in a write-or-execute page they share
+- **THEN** each runs its own code, and the others' pages are unchanged
+
+### Requirement: Cache maintenance a cell may do
+On AArch64 a cell SHALL be able to read `CTR_EL0` and clean and invalidate
+caches by address (`DC CVAU`, `IC IVAU`) on its own memory without a
+system call, as on Linux, on every CPU it runs on.
+
+#### Scenario: Code made visible by the cell
+- **WHEN** a cell writes code and calls GCC's `__clear_cache` on it before running it
+- **THEN** the cell keeps running and the code runs
+
+### Requirement: Loaded snapshots claim nothing more
+Bytes the host loads SHALL go through that validation, checksum included.
+No page of them SHALL refer to a physical frame, and the cell they make
+SHALL have no higher quotas than a cell the host starts.
+
+#### Scenario: A page that claims a frame
+- **WHEN** an exported snapshot's page record is marked as referring to a frame, its checksum made right
+- **THEN** decoding refuses it
+
+#### Scenario: Quotas from a file
+- **WHEN** a decoded snapshot's quotas are capped by those of a new cell, or by lower ones
+- **THEN** each quota is the lower of the two, and the CPU time used is kept
+
+### Requirement: No cell reads another through shared counters
+What the kernel tells a cell about memory (`sysinfo`) and the ephemeral
+ports it gives a cell SHALL NOT depend on what other cells allocate or
+bind, and no cell SHALL make the kernel drop the kept file pages another
+cell maps (findings S24 to S26 in `docs/security.md`). Ports other cells
+hold, pages other cells keep in the cache, cell identifiers and errors
+from pools all cells share are outside this requirement (change
+`add-cell-hierarchy`).
+
+#### Scenario: Free memory
+- **WHEN** a cell with a 64 MiB memory quota reads `sysinfo`, then again while another cell holds 32 MiB
+- **THEN** it reads 64 MiB of total memory both times and the same free memory
+
+#### Scenario: Ports
+- **WHEN** another cell binds 100 sockets to ephemeral ports and closes them between two binds of a cell to port 0
+- **THEN** the cell's two ports are one apart
+
+#### Scenario: Page cache
+- **WHEN** a cell takes memory until refused while another cell maps a page of its own file
+- **THEN** that page stays kept

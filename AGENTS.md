@@ -33,7 +33,8 @@ This repository uses spec-driven development with
   so its deltas are folded into `openspec/specs/`.
 - The archive pull request of a change that completes a milestone or adds a
   headline metric also brings the README up to date: take one benchmark run
-  (`bench-results.json`, from CI's `bench-results-N` annotations), run
+  (`bench-results.json`, from the `bench-results-N` annotations of a `bench`
+  workflow run on main), run
   `python3 docs/img/gen.py <it>` for the graphics and
   `cargo xtask bench --from <it> --readme` for the tables, and check every
   changed image in light and dark themes (no clipped or overlapping text).
@@ -105,7 +106,7 @@ The feedback loop, fastest first:
 | `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, `ktest-smp` (4 vCPUs), `ktest-node` (Node.js, with `RHIZO_NODE`), `ktest-packages` (numpy and requests, with `RHIZO_CPYTHON_SRC`), or a self-check such as `ktest-page-fault` |
 | `cargo xtask test` | ~1 min | Host tests, boot check, in-kernel tests, all self-checks |
 | `cargo xtask ci` | minutes | Everything CI runs. **Run before pushing.** |
-| `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates) |
+| `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates; `--icount-only` for the instruction counts alone, as pull requests run) |
 | `cargo xtask mutants` | long | Mutation testing (weekly in CI) |
 
 - `cargo xtask test` builds every kernel first, then runs its steps at once
@@ -131,8 +132,39 @@ The feedback loop, fastest first:
   on a tap device when `sudo -n` works) and a host TCP echo server
   (`echo=`). The card is virtio-mmio on `microvm`, Firecracker and `virt`
   (1 CPU), virtio-pci on `q35`, Cloud Hypervisor and `virt` (`ktest-smp`).
+- CI (`.github/workflows/ci.yml`) runs by what a pull request touches:
+  docs only (`docs/`, `openspec/`, `.agents/`, `*.md`, images) runs the
+  `docs` job (specs, changed changes, Markdown links, images when they
+  change); `cli/` alone adds the quick checks and the control plane;
+  anything else runs everything, after a quick job (`cargo xtask check`)
+  that the heavy jobs wait for. Pull requests are gated on instruction
+  counts (`-icount`) only; timing benchmarks run on main and nightly
+  (`bench.yml`) and open an issue when their gate fails. `ci-ok` is the
+  check that sums up a run. A job that fails and then passes on a re-run
+  of the same commit gets a `flaky:` issue (`flaky.yml`); fix the cause,
+  never retry or skip it in the workflow (rule 9).
 - Project skills (open Agent Skills format) live in `.agents/skills/`:
   `openspec-change`, `kernel-test`, `benchmarks`, `boot-debugging`.
+
+## Working with many PRs
+
+Several agents work at once; these rules keep merges cheap.
+
+- **One open pull request at a time per hotspot.** The hotspots: the core
+  of `kernel/src/cell.rs`, `kernel/src/tests.rs`, the snapshot format
+  version, the control protocol version, `bench/baseline.json` and
+  `docs/security.md`. Check open pull requests before starting on one.
+- **Small stacked pull requests**, each a reviewable step, rather than one
+  large one.
+- **Merge main only when GitHub reports a conflict**, not to keep a branch
+  fresh: every merge restarts CI.
+- **The coordinator merges in order** and re-runs CI only for pull requests
+  that touch the same area as one just merged.
+- **Version numbers are reserved before work starts:** the coordinator
+  hands out snapshot-format and control-protocol versions, so two pull
+  requests never take the same one.
+- **Semantic conflicts after a merge** (both sides green, main broken) are
+  fixed with a small follow-up patch, not by re-waking every agent.
 
 ## Code map
 

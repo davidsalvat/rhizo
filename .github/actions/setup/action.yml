@@ -1,0 +1,83 @@
+name: Set up a Rhizo build
+description: >
+  The pinned toolchain and its caches, and, for jobs that boot kernels, QEMU,
+  KVM and the pinned MicroPython and CPython sources (change `faster-ci`).
+inputs:
+  qemu:
+    description: "QEMU package to install (qemu-system-x86, qemu-system-arm), or empty for none"
+    default: ""
+  sources:
+    description: "Fetch MicroPython and CPython and restore the CPython build"
+    default: "false"
+outputs:
+  cpython-hit:
+    description: "Whether the CPython build came from the cache"
+    value: ${{ steps.cpython-cache.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - name: Fetch MicroPython (pinned commit, MIT)
+      # Built by xtask into a cell (cells/python); see xtask/src/main.rs.
+      if: inputs.sources == 'true'
+      shell: bash
+      run: |
+        dir="$RUNNER_TEMP/micropython"
+        git init --quiet "$dir"
+        git -C "$dir" fetch --quiet --depth 1 https://github.com/micropython/micropython.git ecfdd5d6f9be971852003c2049600dc7b3e2a838
+        git -C "$dir" checkout --quiet FETCH_HEAD
+        echo "RHIZO_MICROPYTHON_SRC=$dir" >> "$GITHUB_ENV"
+
+    - name: Install QEMU
+      if: inputs.qemu != ''
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ${{ inputs.qemu }}
+
+    - name: Fetch CPython (pinned release, PSF license)
+      # Built by xtask into a cell, which checks the tarball's SHA-256 and
+      # builds zlib into it (xtask/src/cpython.rs).
+      if: inputs.sources == 'true'
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends zlib1g-dev
+        tarball="$RUNNER_TEMP/Python-3.13.18.tar.xz"
+        curl --fail --silent --show-error --location -o "$tarball" https://www.python.org/ftp/python/3.13.18/Python-3.13.18.tar.xz
+        echo "RHIZO_CPYTHON_SRC=$tarball" >> "$GITHUB_ENV"
+
+    - name: Enable KVM when the runner offers it
+      if: inputs.qemu != ''
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm || true
+
+    - name: Install the pinned Rust toolchain
+      # Reads rust-toolchain.toml (channel, components, targets).
+      shell: bash
+      run: rustup toolchain install
+
+    # Dependencies only (workspace crates are rebuilt), keyed on the job
+    # (one feature set per job), the compiler and every Cargo.lock; saved
+    # by main only, so pull requests cannot fill the cache and evict it.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Restore the CPython build
+      # Keyed on its recipe; the build checks the tarball's SHA-256.
+      id: cpython-cache
+      if: inputs.sources == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: target/cpython
+        key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
+
+    - name: Cache the downloaded tools (Node.js, VMMs, reference guest)
+      if: inputs.qemu != ''
+      uses: actions/cache@v4
+      with:
+        path: target/tools
+        key: tools-${{ runner.arch }}-${{ hashFiles('xtask/src/tools.rs') }}

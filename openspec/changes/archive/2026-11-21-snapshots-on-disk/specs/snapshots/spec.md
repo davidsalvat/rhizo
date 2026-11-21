@@ -6,7 +6,9 @@
 A snapshot SHALL encode to a versioned byte sequence (format version 10)
 tagged with its architecture, independent of in-memory layouts, and decoding SHALL reject a
 sequence that is truncated, corrupted, of another version or of another
-architecture with an error naming the reason.
+architecture with an error naming the reason. It SHALL record, for each
+page, whether it is a write-or-execute page, and the cell's
+write-or-execute ranges.
 
 #### Scenario: Wrong architecture
 - **WHEN** a snapshot taken on one architecture is decoded on the other
@@ -15,6 +17,14 @@ architecture with an error naming the reason.
 #### Scenario: Deterministic encoding
 - **WHEN** the same cell state is encoded twice
 - **THEN** both byte sequences are identical
+
+#### Scenario: Write-or-execute page writable and executable
+- **WHEN** a page record marked write-or-execute is both writable and executable, or neither
+- **THEN** decoding fails with a page error
+
+#### Scenario: Bad ranges
+- **WHEN** a snapshot's write-or-execute ranges are unaligned, empty, out of order, touching, past `USER_END` or more than 64
+- **THEN** decoding fails with a ranges error
 
 ## ADDED Requirements
 

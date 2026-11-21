@@ -49,10 +49,12 @@ call on its behalf touches it.
 - **THEN** only those pages were restored, and its output is the same as with an eager resume
 
 ### Requirement: Snapshot format
-A snapshot SHALL encode to a versioned byte sequence (format version 8)
+A snapshot SHALL encode to a versioned byte sequence (format version 10)
 tagged with its architecture, independent of in-memory layouts, and decoding SHALL reject a
 sequence that is truncated, corrupted, of another version or of another
-architecture with an error naming the reason.
+architecture with an error naming the reason. It SHALL record, for each
+page, whether it is a write-or-execute page, and the cell's
+write-or-execute ranges.
 
 #### Scenario: Wrong architecture
 - **WHEN** a snapshot taken on one architecture is decoded on the other
@@ -61,6 +63,14 @@ architecture with an error naming the reason.
 #### Scenario: Deterministic encoding
 - **WHEN** the same cell state is encoded twice
 - **THEN** both byte sequences are identical
+
+#### Scenario: Write-or-execute page writable and executable
+- **WHEN** a page record marked write-or-execute is both writable and executable, or neither
+- **THEN** decoding fails with a page error
+
+#### Scenario: Bad ranges
+- **WHEN** a snapshot's write-or-execute ranges are unaligned, empty, out of order, touching, past `USER_END` or more than 64
+- **THEN** decoding fails with a ranges error
 
 ### Requirement: Files in snapshots
 A snapshot SHALL contain the cell's file system, open descriptors and
@@ -136,3 +146,70 @@ and decoding SHALL reject bytes that refer to a frame.
 #### Scenario: Reference from outside
 - **WHEN** bytes whose page record is marked as referring to a frame are decoded
 - **THEN** decoding fails with a page error
+
+### Requirement: Write-or-execute memory across snapshots
+A resumed cell SHALL find its write-or-execute pages in the state they were
+in, with their contents, and its write-or-execute ranges, whose untouched
+pages SHALL still come zeroed on first touch, eagerly or lazily resumed.
+
+#### Scenario: Code across a suspend
+- **WHEN** a cell that wrote and ran code in write-or-execute memory is suspended, resumed, rewrites the code and runs it, and touches a new page of its range
+- **THEN** the old code runs before the rewrite and the new one after, and the new page reads as zero
+
+### Requirement: Waits on descriptors across suspend
+A snapshot SHALL record a thread waiting on descriptors (`poll`, `select`,
+`epoll_wait`) as waiting, with the time its call had left, and a runnable
+thread about to make such a call again with that call's time left. A
+resumed cell's threads SHALL make their calls again with the time they had
+left, not with their whole timeout.
+
+#### Scenario: Time left across suspend
+- **WHEN** a cell 1.5 s into a 2 s wait in `epoll_pwait` is suspended, its snapshot exported and decoded, and the cell resumed
+- **THEN** the snapshot holds at most 0.5 s left for that call, and the resumed cell's call times out less than 1.5 s after the resume
+
+#### Scenario: Waits decoded
+- **WHEN** a snapshot holds a thread waiting on descriptors with a deadline, one waiting without, and a runnable one with a call's deadline kept, and it is decoded at a later time
+- **THEN** the first two wait on descriptors again (the first with its time left from then), and the deadlines of the calls to make again are the first's and the third's, moved by the same time
+
+### Requirement: Snapshot files
+The exported form of a snapshot (the bytes that leave the kernel, as a
+file) SHALL stand alone and end with the CRC-32C of everything before it.
+Decoding SHALL check, in this order, its header (magic, version,
+architecture), its checksum and then everything it holds, and SHALL refuse
+a damaged or cut file with a checksum error. Page sizes are recorded per
+page (4 KiB or 2 MiB, the same on both architectures); a kernel with
+another format version SHALL refuse the file by its version.
+
+#### Scenario: Damaged or cut file
+- **WHEN** one byte after the header of an exported snapshot is changed, or its last byte is cut
+- **THEN** decoding fails with a checksum error
+
+#### Scenario: Errors in order
+- **WHEN** an exported snapshot of another version, or of another architecture, is decoded
+- **THEN** decoding fails with the version or architecture error, not a checksum error
+
+### Requirement: Templates as files
+The snapshot of a template SHALL hold its threads, memory, files and
+sockets (none parked), and loaded as a template SHALL give a template:
+never run, its copies starting where it was frozen, with no time kept, as
+for any template.
+
+#### Scenario: A template through bytes
+- **WHEN** a cell waiting an hour in `epoll_pwait` is frozen into a template, its snapshot exported, decoded and loaded as a template, the first template dropped and two cells made from the loaded one
+- **THEN** both cells time out at once and exit with 0, and every frame comes back once the loaded template is dropped
+
+### Requirement: Snapshot checksum computed by the CPU
+The kernel SHALL compute the CRC-32C of exported snapshots, and check it
+when decoding, with the CPU's CRC instructions where the CPU has them
+(AArch64 `CRC32C*` when `ID_AA64ISAR0_EL1` lists CRC32, x86_64 SSE4.2
+`crc32` when `CPUID` lists SSE4.2), and with the portable table of
+`rhizo-snapshot` otherwise. Both SHALL give the same checksum for any
+bytes, so a file saved by one kernel loads in the other.
+
+#### Scenario: Same checksum for any bytes
+- **WHEN** the kernel's checksum and the portable table are computed over random bytes of every length from 0 to 63 and of about one and two pages, at every offset modulo 8
+- **THEN** they are equal, and equal to the CRC-32C check value for `123456789`
+
+#### Scenario: The function passed in is the one used
+- **WHEN** a snapshot is exported with one checksum function and decoded with another that gives other values
+- **THEN** decoding fails with a checksum error, and decoding with the first succeeds

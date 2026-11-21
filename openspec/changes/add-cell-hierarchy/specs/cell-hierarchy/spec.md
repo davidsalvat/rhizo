@@ -119,13 +119,14 @@ cell handle, no view, no kernel endpoint and, by default, egress `none`.
 
 #### Scenario: A new cell looks around
 - **WHEN** a cell created with no grants lists `/run/rhizo`, connects to every loopback port and opens every descriptor number up to 1023
-- **THEN** it finds only an empty `inbox`, every connection is refused, and only its own descriptors open
+- **THEN** it finds only an empty `inbox` and `generation`, every connection is refused, and only its own descriptors open
 
 ### Requirement: Handles and rights
 A handle SHALL name one kernel object with rights: on a cell observe,
 input, message and control; on a channel endpoint send, receive and
-carry; on a view read and write; on the kernel endpoint spawn, channel,
-derive, revoke and narrow. A cell SHALL use handles only through
+carry; on a view read and write; on an accelerator infer, compute and
+stats; on the kernel endpoint spawn, channel, derive, revoke and
+narrow. A cell SHALL use handles only through
 descriptors and entries of `/run/rhizo`; a handle's number, sent as
 bytes, SHALL confer nothing.
 
@@ -261,3 +262,119 @@ bound and the rest counted as dropped.
 #### Scenario: Fork that cannot finish
 - **WHEN** a fork into four copies runs out of memory after making two
 - **THEN** the two are undone, the parent's free budget is what it was, and the request reports the memory error
+
+### Requirement: Content sharing stays in its domain
+The kernel SHALL share a frame by content (page cache, file pages,
+frames a snapshot refers to, and any later cache keyed by content) only
+between cells of one domain, with the domain's identifier in the key.
+It SHALL never merge frames by scanning memory. A cell that leaves its
+domain SHALL first take private copies of the pages it shares with it,
+public objects' pages excepted, or the move SHALL fail with `ENOMEM`.
+
+#### Scenario: Same file in two domains
+- **WHEN** cells of two domains map the same page of a private file copied into both, and a cell of the first domain maps it again
+- **THEN** each domain holds its own frame for it, and the first domain's second map shares its first frame
+
+#### Scenario: Promoted cell
+- **WHEN** a cell forked inside a domain is promoted to root and its former sibling writes every page they shared
+- **THEN** the promoted cell already held private copies, and its writes to those pages copy nothing
+
+### Requirement: Public objects
+Across domains the kernel SHALL share only public objects: executables
+and libraries of the host's file sets, read-only template and index
+files, and templates the host published. They SHALL be immutable, and
+the pages of their mapped files SHALL be loaded when published and kept
+until withdrawn and unmapped, so a cell's map of one never depends on
+another domain. A write SHALL make the writer's file private.
+
+#### Scenario: Library in two domains
+- **WHEN** cells of two domains map the same published library, and one of them maps it again after the other ended
+- **THEN** both map one frame per page, and every map is a hit
+
+### Requirement: Copy generation
+Each cell SHALL have a 64-bit copy generation, readable in
+`/run/rhizo/generation` (8 bytes, little endian), that changes in every
+copy of a fork or a template, every load of a snapshot file and every
+resume, and that nothing else changes; the source of a fork SHALL keep
+its value.
+
+#### Scenario: Fork
+- **WHEN** a cell reads its generation, is forked into two copies, and each reads it
+- **THEN** the source reads the same value as before, and each copy reads a value unlike the source's
+
+### Requirement: Copies draw different random numbers
+The CPython and Node.js templates the project ships SHALL reseed their
+user-space generators when their copy generation changed since warm-up,
+from the copy's own `getrandom`, so that no two copies of one template,
+and no two loads of one snapshot file, draw the same sequence.
+
+#### Scenario: Two children of one template
+- **WHEN** two cells are copied from a CPython template frozen after `import random`, and each prints `random.random()` and `os.urandom(16)`
+- **THEN** the two copies print different values for both
+
+#### Scenario: Node.js template
+- **WHEN** two cells are copied from a Node.js template frozen after its warm-up, and each prints `Math.random()` and `crypto.randomUUID()`
+- **THEN** the two copies print different values for both
+
+### Requirement: Published templates hold no secrets
+The host SHALL be able to publish a template so that copies of it go
+into other domains, and only a published template SHALL have copies in
+more than one domain. The kernel SHALL refuse to publish a template of a
+cell that connected through the network card or received a message, a
+handle or a view, unless the host attests it holds no secret; the
+attestation SHALL be audited.
+
+#### Scenario: Tainted template
+- **WHEN** the host publishes a template of a cell that connected to the host's echo server, then the same with an attestation
+- **THEN** the first is refused and the second is accepted with an audit record naming the attestation
+
+#### Scenario: Unpublished template in another domain
+- **WHEN** the host asks for a copy of an unpublished template as a root
+- **THEN** the copy is a full copy that shares no frame with the template
+
+### Requirement: Accounting charges the using cell
+Memory, file data, kernel records and CPU time SHALL be charged only to
+the cell that takes them, never to each ancestor: a subtree SHALL be
+bounded by the limits reserved from its parent, and socket buffers SHALL
+be charged at their full size when the socket is made.
+
+#### Scenario: Deep tree
+- **WHEN** a cell at depth 15 and a root each take memory page by page until refused
+- **THEN** each is refused at its own limit, and the deep cell's ancestors' free budgets are unchanged
+
+### Requirement: CPU weights between domains
+Each cell SHALL have a CPU weight from 1 to 10,000 (default 100). Busy
+domains SHALL share each CPU in proportion to their roots' weights
+whatever their numbers of cells, and cells of a domain by their weights
+flattened along the tree; an idle part's share SHALL go to the busy
+ones.
+
+#### Scenario: Many cells do not buy CPU
+- **WHEN** on one CPU a domain of 16 spinning cells and a domain of one spinning cell, with equal weights, run for 2 s
+- **THEN** each domain gets half the CPU within 5 %
+
+### Requirement: CPU caps per subtree
+A cell MAY have a CPU cap, a rate (such as 1.5 CPUs) bounding its whole
+subtree over each period of 100 ms. A child's cap SHALL be at most its
+parent's, caps SHALL only narrow, and a subtree that used its cap SHALL
+not run until the next period.
+
+#### Scenario: Capped subtree
+- **WHEN** a subtree capped at 0.25 CPU spins next to an idle CPU
+- **THEN** it gets at most 25 % of the CPU plus one time slice per period
+
+### Requirement: Accelerators are capabilities
+A cell SHALL reach an accelerator only through a handle with the rights
+`infer`, `compute` or `stats`, narrowed only by derivation to fewer
+rights, fewer models or a smaller budget, with device memory, KV bytes,
+device time and sessions as budgets carved from the parent's. No handle
+SHALL name a device or partition, a non-isolated device SHALL serve one
+domain at a time, and a copy SHALL not inherit the handle.
+
+#### Scenario: Asking for more
+- **WHEN** a cell holding an accelerator handle with `infer` on one model derives one with `compute`, and one listing another model
+- **THEN** both derivations fail with `EACCES`, and a cell with no grant finds no accelerator under `/run/rhizo`
+
+#### Scenario: Copy of a cell with a handle
+- **WHEN** a cell holding an accelerator handle is forked by its parent
+- **THEN** the copy holds no accelerator handle, and opening a new session in it fails

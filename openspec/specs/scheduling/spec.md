@@ -94,6 +94,8 @@ A host run SHALL run its cells on every CPU online, a cell's threads on
 one or more CPUs at a time, each CPU for a slice. Each CPU SHALL be
 preempted by its own timer. A run SHALL end only after every CPU has given
 back every cell, so that between runs no thread of any cell runs anywhere.
+Cells that a host operation made runnable during a run SHALL be taken by
+an idle CPU, if one is idle, without waiting for the boot CPU.
 
 #### Scenario: CPU-bound cells
 - **WHEN** two CPU-bound cells per CPU run on 4 vCPUs
@@ -184,3 +186,33 @@ at once.
 #### Scenario: Woken on the way to its sleep
 - **WHEN** the host wakes a cell that printed `ready` and yielded, and that will then sleep for an hour
 - **THEN** its sleep ends at once and it exits within two scheduling steps
+
+### Requirement: A run with a time limit ends on time
+A host run given a time limit SHALL end by that limit, within a slice, on
+any number of CPUs, whatever its cells wait for and whichever CPU's timer
+holds their deadlines.
+
+#### Scenario: Cells sleeping an hour
+- **WHEN** one cell per CPU sleeps an hour on 1 or 4 vCPUs, and the host runs them 20 times with a limit of 50 ms each
+- **THEN** each run ends within 500 ms (its limit and a slice, with room for an emulated machine), and the cells still sleep
+
+### Requirement: Cells found by identifier
+The scheduler SHALL find, take out and change a cell by its identifier,
+wherever it is (a run queue, the sleepers, the waiting set), without
+reading the other cells it holds.
+
+#### Scenario: Any place
+- **WHEN** entries are runnable, sleeping and waiting on several CPUs' queues, and one is changed, found again and taken out by its key
+- **THEN** the right entry comes out, with its wake time if it slept, and a key no entry has finds nothing
+
+### Requirement: Sleepers found without a search
+The scheduler SHALL find, take out and change a sleeping entry by its key
+in time logarithmic in the number of sleepers whenever no other sleeper
+put to sleep since has a key with the same low bits, without any work
+when entries are taken to run or given back. Wherever its hint fails, it
+SHALL find the entry by searching, so a lookup by key always gives what a
+search of every place gives.
+
+#### Scenario: Stale and shared hints
+- **WHEN** entries sleep with keys sharing their low bits, some wake and are requeued, others sleep again at the same time as another
+- **THEN** finding, changing and removing each by its key gives the same entry, and wake time, as a search of every queue, the waiting set and the sleepers
