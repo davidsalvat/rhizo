@@ -269,7 +269,9 @@ jobs:
 
   ci-arm64:
     # Two runners share the steps of `xtask ci` (`--part`: every step runs
-    # in exactly one part; part 1 also lints).
+    # in exactly one part; part 1 also lints). Each runs its in-kernel
+    # tests in two VMs that together run every test once (change
+    # `shard-kernel-tests`).
     name: AArch64 tests, part ${{ matrix.part }} of 2 (host and QEMU virt)
     needs: changes
     if: needs.changes.outputs.class == 'code'
@@ -281,6 +283,7 @@ jobs:
         part: [1, 2]
     env:
       RHIZO_NODE: "1"
+      RHIZO_SHARDS: "2"
     steps:
       - uses: actions/checkout@v4
       - id: setup

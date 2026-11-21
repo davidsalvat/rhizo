@@ -97,10 +97,5 @@ fn a_cpython_agent_talks_forks_and_survives_suspend() {
     assert_eq!(crate::cell::open_sockets(), 0);
     // The card's connections finish closing with the model server: the
     // kernel goes back to holding nothing for the agent.
-    let mut host = Host::new();
-    let end = crate::cell::now_ns() + 10_000_000_000;
-    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
-        host.wire_address(0);
-    }
-    assert!(!crate::cell::wire_busy(), "the card's connections closed");
+    settle_wire();
 }

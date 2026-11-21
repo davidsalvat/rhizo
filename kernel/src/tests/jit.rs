@@ -5,8 +5,11 @@ use super::*;
 /// This area's tests, in execution order.
 pub(super) const ALL: &[TestCase] = &[
     ktest_case!(code_written_at_run_time_runs_as_on_linux),
-    ktest_case!(code_written_at_run_time_survives_fork_suspend_and_templates),
-    ktest_case!(code_written_at_run_time_survives_repeated_suspends),
+    ktest_case!(
+        code_written_at_run_time_survives_fork_suspend_and_templates,
+        41
+    ),
+    ktest_case!(code_written_at_run_time_survives_repeated_suspends, 71),
     ktest_case!(code_memory_misused_is_a_fault),
 ];
 

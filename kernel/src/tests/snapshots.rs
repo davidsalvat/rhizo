@@ -4,7 +4,7 @@ use super::*;
 
 /// This area's tests, in execution order.
 pub(super) const ALL: &[TestCase] = &[
-    ktest_case!(suspend_resume_after_every_step_is_invisible_eager),
+    ktest_case!(suspend_resume_after_every_step_is_invisible_eager, 174),
     ktest_case!(suspend_resume_after_every_step_is_invisible_lazy),
     ktest_case!(suspend_between_parallel_runs_is_invisible),
     ktest_case!(suspend_returns_all_memory),

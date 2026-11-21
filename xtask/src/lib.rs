@@ -500,7 +500,7 @@ fn cmd_test(args: &RunArgs) -> Result {
                     ..opts
                 },
                 Check::Ktest { cpus: 1 },
-                args.reproduce("ktest"),
+                shard_reproduce(args.reproduce("ktest"), shards),
             ));
         }
     }
@@ -521,7 +521,7 @@ fn cmd_test(args: &RunArgs) -> Result {
                     ..opts
                 },
                 Check::Ktest { cpus: SMP_CPUS },
-                args.reproduce("ktest-smp"),
+                shard_reproduce(args.reproduce("ktest-smp"), shards),
             ));
         }
     }
@@ -639,10 +639,9 @@ const MAX_SHARDS: usize = 4;
 
 /// How many VMs share the in-kernel tests of one step: `RHIZO_SHARDS`
 /// (at most [`MAX_SHARDS`] and `parallel`), 1 by default. Splitting runs
-/// tests without the ones before them, which still exposes tests that
-/// depend on their order (change `speed-up-feedback-loop`, archived in
-/// `openspec/changes/archive/2026-11-21-speed-up-feedback-loop`), so it
-/// is opt-in until they are fixed.
+/// tests without the ones before them; they pass in any split (spec
+/// `kernel-testing`), and CI splits the AArch64 ones (change
+/// `shard-kernel-tests`).
 fn shards(parallel: usize) -> usize {
     env::var("RHIZO_SHARDS")
         .ok()
@@ -667,6 +666,16 @@ fn parallelism(args: &RunArgs) -> usize {
 
 fn shard(i: usize, n: usize) -> Option<(u16, u16)> {
     (n > 1).then_some((i as u16, n as u16))
+}
+
+/// The command that reruns a step split into `n` VMs: with the same
+/// split, since a test may fail only after the ones its VM ran first.
+fn shard_reproduce(cmd: String, n: usize) -> String {
+    if n > 1 {
+        format!("RHIZO_SHARDS={n} {cmd}")
+    } else {
+        cmd
+    }
 }
 
 fn shard_name(name: &str, i: usize, n: usize) -> String {
@@ -1702,6 +1711,16 @@ fn check_vm(ok: bool, check: VmCheck, run: &VmRun) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_split_step_is_reproduced_with_the_same_split() {
+        let cmd = || "cargo xtask --arch aarch64 test --only ktest".to_string();
+        assert_eq!(shard_reproduce(cmd(), 1), cmd());
+        assert_eq!(
+            shard_reproduce(cmd(), 2),
+            "RHIZO_SHARDS=2 cargo xtask --arch aarch64 test --only ktest"
+        );
+    }
 
     #[test]
     fn the_kernel_s_freshness_is_read_from_cargo_messages() {

@@ -115,8 +115,8 @@ The feedback loop, fastest first:
   shows its console output. `RHIZO_JOBS=N` sets the CPUs it uses
   (`RHIZO_JOBS=1`: one step at a time, output live). Firecracker, Cloud
   Hypervisor and `--gdb` run one step at a time. `RHIZO_SHARDS=N` splits
-  the in-kernel tests over `N` VMs (opt-in: see
-  `openspec/changes/archive/2026-11-21-speed-up-feedback-loop/design.md`).
+  the in-kernel tests over `N` VMs (CI uses 2 on AArch64; a failing VM's
+  `reproduce` keeps the split).
 - Add `--json` to `check`, `test`, `ci` or `bench` for one JSON object per
   line on stdout (`step`, `failure`, `data`, `summary`).
 - Every failure prints `FAILED <kind>` with `where`, `expected`, `actual`,
