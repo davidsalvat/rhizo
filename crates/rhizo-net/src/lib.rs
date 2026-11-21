@@ -10,7 +10,10 @@
 //! through the network card, with `smoltcp` (module `wire`). Nothing here
 //! reads a clock or touches hardware: time is passed in, the card is a
 //! [`rhizo_hal::NetLink`], and blocking is the caller's business
-//! ([`Error::Again`] and [`Net::changes`]).
+//! ([`Error::Again`]): each socket keeps a wait queue of the waiters that
+//! looked at it before they blocked, and a change to a socket hands its
+//! waiters to the caller ([`Net::end_call`], [`Net::drain_woken`]; design D1
+//! of `add-socket-wait-queues`).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -21,6 +24,7 @@ mod wire;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 pub use record::{DecodeError, Park, Record, Saved, decode_records, encode_records};
 use smoltcp::iface::SocketHandle;
@@ -240,6 +244,9 @@ struct Socket {
     udp: Option<SocketHandle>,
     /// A reset connection was refused (it never opened).
     refused: bool,
+    /// Its wait queue: the waiters that looked at it before they blocked,
+    /// woken by its next change.
+    waiters: Vec<u32>,
 }
 
 impl Socket {
@@ -260,6 +267,7 @@ impl Socket {
             dgram_bytes: 0,
             udp: None,
             refused: false,
+            waiters: Vec::new(),
         }
     }
 
@@ -292,6 +300,12 @@ pub struct Net {
     /// Listeners and connections of suspended cells, by key, each holding
     /// one reference.
     parked: Vec<(u64, Handle)>,
+    /// Waiters taken off the wait queues of sockets that changed, for the
+    /// caller to wake ([`drain_woken`](Self::drain_woken)).
+    woken: Vec<u32>,
+    /// The sockets the current call looked at: its waiter joins their wait
+    /// queues if it blocks ([`end_call`](Self::end_call)).
+    looked: RefCell<Vec<Handle>>,
 }
 
 impl Default for Net {
@@ -335,6 +349,8 @@ impl Net {
             next_key: 1,
             secret: [0; 2],
             parked: Vec::new(),
+            woken: Vec::new(),
+            looked: RefCell::new(Vec::new()),
         }
     }
 
@@ -357,10 +373,66 @@ impl Net {
         self.secret = secret;
     }
 
-    /// Counts every change a waiting cell may wait for (data, connections,
-    /// closes): when it moves, waiting cells try again (design D3).
+    /// Counts every change a waiter may wait for (data, connections,
+    /// closes), for statistics.
     pub fn changes(&self) -> u64 {
         self.changes
+    }
+
+    /// A change a waiter of `h` may wait for: its wait queue is woken.
+    fn touch(&mut self, h: Handle) {
+        self.changes += 1;
+        if let Some(Some(s)) = self.sockets.get_mut(h as usize) {
+            self.woken.append(&mut s.waiters);
+        }
+    }
+
+    /// The current call looked at `h`: it may wait for it.
+    fn look(&self, h: Handle) {
+        self.looked.borrow_mut().push(h);
+    }
+
+    /// The end of a call: if it blocks (`waiter` says who waits, asked only
+    /// when the call looked at sockets), the waiter joins the wait queue of
+    /// each socket the call looked at (once), and is woken by the next
+    /// change to one of them. Returns whether waiters were woken since the
+    /// last [`drain_woken`](Self::drain_woken), as
+    /// [`has_woken`](Self::has_woken) does.
+    pub fn end_call(&mut self, waiter: impl FnOnce() -> Option<u32>) -> bool {
+        let looked = self.looked.get_mut();
+        if !looked.is_empty() {
+            if let Some(key) = waiter() {
+                for &h in looked.iter() {
+                    if let Some(Some(s)) = self.sockets.get_mut(h as usize)
+                        && !s.waiters.contains(&key)
+                    {
+                        s.waiters.push(key);
+                    }
+                }
+            }
+            looked.clear();
+        }
+        !self.woken.is_empty()
+    }
+
+    /// Takes `waiter` off the wait queue of `h` (it is gone).
+    pub fn forget(&mut self, h: Handle, waiter: u32) {
+        if let Ok(s) = self.get_mut(h) {
+            s.waiters.retain(|&k| k != waiter);
+        }
+    }
+
+    /// Whether waiters were woken since the last
+    /// [`drain_woken`](Self::drain_woken).
+    pub fn has_woken(&self) -> bool {
+        !self.woken.is_empty()
+    }
+
+    /// Hands `f` the waiters woken by changes since the last call, in the
+    /// order they were woken (a waiter may come more than once); the list
+    /// keeps its room, so a change allocates nothing.
+    pub fn drain_woken(&mut self, f: impl FnMut(u32)) {
+        self.woken.drain(..).for_each(f);
     }
 
     /// Sockets open.
@@ -446,11 +518,12 @@ impl Net {
     /// reset if bytes were left unread), connections never accepted are
     /// reset.
     fn close(&mut self, h: Handle) {
-        let Some(s) = self.sockets.get_mut(h as usize).and_then(Option::take) else {
+        let Some(mut s) = self.sockets.get_mut(h as usize).and_then(Option::take) else {
             return;
         };
         self.open -= 1;
         self.changes += 1;
+        self.woken.append(&mut s.waiters);
         if let Some(udp) = s.udp {
             self.wire_drop(udp);
         }
@@ -473,6 +546,7 @@ impl Net {
                 } else if let Ok(peer) = self.get_mut(p) {
                     peer.eof = true;
                     peer.state = State::Connected { peer: None };
+                    self.touch(p);
                 }
             }
             _ => {}
@@ -485,7 +559,7 @@ impl Net {
             s.state = State::Reset { pending: true };
             s.rx.clear();
             s.eof = true;
-            self.changes += 1;
+            self.touch(h);
         }
     }
 
@@ -615,6 +689,7 @@ impl Net {
     /// `accept`: the oldest connection waiting on listener `h`, with one
     /// reference.
     pub fn accept(&mut self, h: Handle) -> Result<Handle> {
+        self.look(h);
         let s = self.get_mut(h)?;
         let State::Listening { queue, .. } = &mut s.state else {
             return Err(Error::Invalid);
@@ -645,6 +720,7 @@ impl Net {
     /// `connect`. A stream connection is established at once (queued on the
     /// listener); a datagram socket only records its default destination.
     pub fn connect(&mut self, h: Handle, addr: &Addr) -> Result<()> {
+        self.look(h);
         let s = self.get(h)?;
         let (family, ty) = (s.family, s.ty);
         let addr = match (family, addr) {
@@ -717,7 +793,7 @@ impl Net {
         if let State::Listening { queue, .. } = &mut self.get_mut(listener)?.state {
             queue.push_back(server);
         }
-        self.changes += 1;
+        self.touch(listener);
         Ok(())
     }
 
@@ -790,7 +866,7 @@ impl Net {
                     s.refused = !ever_open;
                     s.eof = true;
                 }
-                self.changes += 1;
+                self.touch(h);
             }
         }
     }
@@ -808,6 +884,7 @@ impl Net {
     /// default destination (dropped if nobody is bound there or its queue is
     /// full, as UDP does).
     pub fn send(&mut self, h: Handle, data: &[u8], to: Option<&Addr>) -> Result<usize> {
+        self.look(h);
         let s = self.get_mut(h)?;
         if s.ty == Type::Dgram {
             return self.send_datagram(h, data, to);
@@ -842,7 +919,7 @@ impl Net {
         }
         let n = room.min(data.len());
         p.rx.extend(&data[..n]);
-        self.changes += 1;
+        self.touch(peer);
         Ok(n)
     }
 
@@ -875,19 +952,21 @@ impl Net {
             },
             _ => return Err(Error::Invalid),
         };
-        let receiver = self.sockets.iter_mut().flatten().find(|r| {
-            r.ty == Type::Dgram
+        let receiver = self.sockets.iter_mut().enumerate().find_map(|(i, r)| {
+            let r = r.as_mut()?;
+            let bound = r.ty == Type::Dgram
                 && r.port()
                     .is_some_and(|(rip, rport)| rport == port && (rip == ANY || rip == ip))
-                && r.remote.as_ref().is_none_or(|only| *only == from)
+                && r.remote.as_ref().is_none_or(|only| *only == from);
+            bound.then_some((i as Handle, r))
         });
-        if let Some(r) = receiver
+        if let Some((i, r)) = receiver
             && r.dgram_bytes + data.len() <= DGRAM_BUF
             && !r.shut_rd
         {
             r.dgram_bytes += data.len();
             r.dgrams.push_back((from, data.to_vec()));
-            self.changes += 1;
+            self.touch(i);
         }
         Ok(data.len())
     }
@@ -903,6 +982,7 @@ impl Net {
         peek: bool,
         take: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<Received> {
+        self.look(h);
         self.settle(h);
         let s = self.get_mut(h)?;
         if s.ty == Type::Dgram && s.dgrams.is_empty() && !s.shut_rd {
@@ -998,8 +1078,12 @@ impl Net {
             done += n;
         }
         if !peek && done > 0 {
+            // A writer waits only on a full queue.
+            let full = s.rx.len() == STREAM_BUF;
             s.rx.drain(..done);
-            self.changes += 1; // room for a writer
+            if let (true, &State::Connected { peer: Some(p) }) = (full, &s.state) {
+                self.touch(p);
+            }
         }
         Ok(Received {
             len: done,
@@ -1024,7 +1108,7 @@ impl Net {
                 if how != Shutdown::Write {
                     s.shut_rd = true;
                 }
-                self.changes += 1;
+                self.touch(h);
                 return Ok(());
             }
             _ => return Err(Error::NotConn),
@@ -1035,17 +1119,19 @@ impl Net {
         if how != Shutdown::Read {
             s.shut_wr = true;
             if let Some(p) = peer
-                && let Ok(p) = self.get_mut(p)
+                && let Ok(ps) = self.get_mut(p)
             {
-                p.eof = true;
+                ps.eof = true;
+                self.touch(p);
             }
         }
-        self.changes += 1;
+        self.touch(h);
         Ok(())
     }
 
     /// The `poll` events of `h` (`events::*`).
     pub fn poll(&self, h: Handle) -> u32 {
+        self.look(h);
         let Ok(s) = self.get(h) else {
             return ERR | HUP;
         };

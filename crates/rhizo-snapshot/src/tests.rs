@@ -425,3 +425,185 @@ fn rejects_malformed_threads() {
         Err(FormatError::Truncated)
     );
 }
+
+/// Hostile snapshots (spec `isolation`, snapshots from outside): bytes
+/// that `from_bytes` accepts, however they were made, restore into a cell
+/// that reaches nothing beyond its own memory, with files and sockets whose
+/// operations work.
+mod hostile {
+    use super::*;
+    use proptest::prelude::*;
+    use rhizo_net::{Addr, Family, Options, Record, Saved, Type};
+
+    /// Kernel data, mapped in the kernel half every x86_64 cell shares.
+    const KERNEL_DATA: u64 = 0xffff_8000_0000_0000;
+    const SECRET: u64 = 0x5ec2_e75e_c2e7_5ec2;
+
+    /// A snapshot holding something of every kind but 2 MiB pages (which
+    /// make each case slow): two threads, code and data pages, files with a
+    /// pipe, and two sockets.
+    fn rich() -> Vec<u8> {
+        let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+        let mut tlb = RecordingTlb::default();
+        let pt = PageTable::<X86_64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+        for (at, flags) in [(0x40_0000, RX), (0x60_0000, RW), (0x60_1000, RW)] {
+            space::map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, at, 0x1000, flags).unwrap();
+        }
+        rhizo_cell::memory::copy_to(&pt, &mut mem, 0x60_0ffc, b"data").unwrap();
+        let mut c = Cell::new(9, pt.root(), 0x40_0123, 0x7fff_0000, 0x61_0000);
+        let regs = *c.regs();
+        assert_eq!(c.threads.spawn(regs, 0x60_0ff4), Some(10));
+        c.threads.block(Wait::Futex {
+            addr: 0x60_0ff8,
+            bitset: u32::MAX,
+            until: Some(2000),
+        });
+        let mut fs = Fs::new();
+        fs.put_file(b"/d/f", &[7; 5000]).unwrap();
+        let (_, w) = fs.pipe(false, false).unwrap();
+        fs.write_pipe(w, b"queued").unwrap();
+        fs.socket_fd(0, false, false).unwrap();
+        fs.socket_fd(1, true, false).unwrap();
+        let records = [
+            Record {
+                family: Family::Inet,
+                ty: Type::Stream,
+                state: Saved::Listening(4),
+                local: Some(Addr::Inet {
+                    ip: [127, 0, 0, 1],
+                    port: 80,
+                }),
+                opts: Options::default(),
+                parked: None,
+            },
+            Record {
+                family: Family::Unix,
+                ty: Type::Stream,
+                state: Saved::Open,
+                local: Some(Addr::Unix {
+                    name: 3,
+                    path: b"/s".to_vec(),
+                }),
+                opts: Options::default(),
+                parked: None,
+            },
+        ];
+        Snapshot::capture::<X86_64>(Machine::X86_64, &c, &fs, &records, 0, &mem).into_bytes()
+    }
+
+    /// Restores everything `snap` holds as the kernel does on resume, then
+    /// checks that kernel memory and the kernel half are unchanged, that
+    /// every mapping and register stays in the cell's half, that its files
+    /// answer, and that every frame comes back when the cell is gone.
+    fn restore_safely(snap: &Snapshot) {
+        let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1 << 16));
+        let mut next = 0x1000_0000_0000u64;
+        let mut ktake = || {
+            next += 0x1000;
+            Some(next)
+        };
+        let kernel = PageTable::<X86_64>::new(&mut mem, &mut ktake).unwrap();
+        let data = ktake().unwrap();
+        mem.write_u64(data, SECRET);
+        kernel
+            .map(&mut mem, &mut ktake, KERNEL_DATA, data, PageSize::Small, RW)
+            .unwrap();
+        let pt = PageTable::<X86_64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+        pt.share_upper_half(&mut mem, &kernel);
+        for i in 0..snap.pages() {
+            if snap.restore_page(i, &pt, &mut mem, &mut frames).is_err() {
+                break;
+            }
+        }
+        let cell = snap.cell(5, pt.root(), 1_000);
+        for t in cell.threads.iter() {
+            assert!(t.regs.pc < USER_END && t.regs.tls < USER_END, "{t:?}");
+        }
+        pt.for_each_lower_leaf(&mem, &mut |virt, _, size, flags| {
+            assert!(virt + size.bytes() <= USER_END, "{virt:#x}");
+            assert!(flags.contains(PageFlags::USER), "{virt:#x}");
+            assert!(!(flags.is_writable() && flags.is_executable()), "W^X");
+        });
+        for addr in [0, 0x40_0000, 0x60_0fff, USER_END - 1, u64::MAX] {
+            if let Some(i) = snap.find(addr) {
+                let p = snap.page(i);
+                assert!(p.virt <= addr && addr < p.virt + p.size.bytes());
+            }
+        }
+        let mut files = snap.files();
+        let sockets = snap.sockets();
+        for h in files.sockets().collect::<Vec<_>>() {
+            assert!((h as usize) < sockets.len(), "socket {h}");
+        }
+        let mut net = rhizo_net::Net::new();
+        for r in &sockets {
+            let _ = net.import(r);
+        }
+        // Every descriptor answers (no operation panics).
+        let mut buf = [0u8; 64];
+        for fd in 0..32 {
+            let _ = files.read(fd, &mut buf, None);
+            let _ = files.write(fd, b"x", None);
+            let _ = files.read_pipe(fd, 64, &mut |_| true);
+            let _ = files.fstat(fd);
+            let _ = files.read_dir(fd, |_| true);
+            let _ = files.poll(fd, &|_| 0);
+            let _ = files.close(fd);
+        }
+        let _ = files.getcwd();
+        assert_eq!(mem.read_u64(data), SECRET, "kernel data unchanged");
+        assert_eq!(pt.translate(&mem, KERNEL_DATA).unwrap().phys, data);
+        space::destroy(pt, &mut mem, &mut frames);
+        assert_eq!(frames.outstanding(), 0, "every frame back");
+    }
+
+    /// Up to three edits, most in the header, state, threads and page
+    /// records (where a byte changes the most), and sometimes a cut.
+    fn tampered() -> impl Strategy<Value = Vec<u8>> {
+        let good = rich();
+        let head = HEADER + STATE + 2 * THREAD + 3 * RECORD;
+        let at = prop_oneof![3 => 0..head, 1 => 0..good.len()];
+        (
+            prop::collection::vec((at, any::<u8>()), 1..4),
+            prop::option::weighted(0.1, any::<usize>()),
+        )
+            .prop_map(move |(edits, keep)| {
+                let mut bytes = good.clone();
+                for (at, b) in edits {
+                    bytes[at] = b;
+                }
+                if let Some(k) = keep {
+                    bytes.truncate(k % (bytes.len() + 1));
+                }
+                bytes
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn tampered_snapshots_are_refused_or_contained(bytes in tampered()) {
+            if let Ok(snap) = Snapshot::from_bytes(bytes, Machine::X86_64) {
+                restore_safely(&snap);
+            }
+        }
+
+        #[test]
+        fn random_bytes_are_refused_or_contained(
+            mut bytes in prop::collection::vec(any::<u8>(), 0..2048),
+            pages in 0u32..4,
+            threads in 1u32..3,
+        ) {
+            // A valid header, so the rest is what gets tested.
+            if bytes.len() >= HEADER {
+                bytes[..8].copy_from_slice(MAGIC);
+                bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+                bytes[12..14].copy_from_slice(&(Machine::X86_64 as u16).to_le_bytes());
+                bytes[16..20].copy_from_slice(&pages.to_le_bytes());
+                bytes[20..24].copy_from_slice(&threads.to_le_bytes());
+            }
+            if let Ok(snap) = Snapshot::from_bytes(bytes, Machine::X86_64) {
+                restore_safely(&snap);
+            }
+        }
+    }
+}

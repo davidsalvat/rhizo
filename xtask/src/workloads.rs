@@ -232,6 +232,8 @@ fn parse_server(
     }
     let us = |k: &str| get(k).map(|v| v as f64 / 1000.0);
     let elapsed_s = get("elapsed_ns")? as f64 / 1e9;
+    let woken = get("io_woken")?;
+    let wasted = 100.0 * get("io_wasted")? as f64 / woken.max(1) as f64;
     Ok(vec![
         ("density.cells", "cells", get("cells")? as f64),
         ("density.cell_bytes", "bytes", get("per_cell_bytes")? as f64),
@@ -257,6 +259,7 @@ fn parse_server(
             "ns",
             get("syscall_p999_ns")? as f64,
         ),
+        ("density.wasted_wakeups_pct", "%", wasted),
         ("density.oom_cells", "cells", oom["cells"] as f64),
     ])
 }
@@ -383,7 +386,7 @@ mod tests {
         per_cell_bytes=40000 fill_ns=1 ops=150000 elapsed_ns=3000000000 unfinished=0 \
         sched_p50_ns=2000 sched_p99_ns=90000 sched_p999_ns=400000 wake_p50_ns=3000 \
         wake_p99_ns=120000 wake_p999_ns=900000 syscall_p50_ns=300 syscall_p99_ns=5000 \
-        syscall_p999_ns=20000\n";
+        syscall_p999_ns=20000 io_woken=4000 io_wasted=1000\n";
 
     #[test]
     fn server_line_gives_the_density_metrics() {
@@ -402,6 +405,7 @@ mod tests {
         assert_eq!(get("density.sched_p999_us"), Some(400.0));
         assert_eq!(get("density.syscall_p99_ns"), Some(5000.0));
         assert_eq!(get("density.oom_cells"), Some(25000.0));
+        assert_eq!(get("density.wasted_wakeups_pct"), Some(25.0));
     }
 
     #[test]
