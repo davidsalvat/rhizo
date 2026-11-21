@@ -220,7 +220,7 @@ impl Server {
                     .host
                     .suspend(cell)
                     .ok_or((Error::NoMemory, String::from("the snapshot does not fit")))?;
-                let bytes = snapshot.as_bytes().len() as u64;
+                let bytes = snapshot.heap_bytes() as u64;
                 self.reap();
                 self.entry(target)?.place = Place::Suspended(snapshot);
                 Ok(Body::Bytes(bytes))
@@ -380,7 +380,7 @@ impl Server {
                 Place::Live(_) => stats.running += 1,
                 Place::Suspended(s) => {
                     stats.suspended += 1;
-                    stats.snapshot_bytes += s.as_bytes().len() as u64;
+                    stats.snapshot_bytes += s.heap_bytes() as u64;
                 }
                 Place::Ended(_) => stats.ended += 1,
             }
@@ -462,7 +462,7 @@ fn state_of(place: &Place) -> State {
     match place {
         Place::Live(_) => State::Running,
         Place::Suspended(s) => State::Suspended {
-            bytes: s.as_bytes().len() as u64,
+            bytes: s.heap_bytes() as u64,
         },
         Place::Ended(state) => *state,
     }

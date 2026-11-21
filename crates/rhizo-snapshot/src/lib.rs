@@ -27,6 +27,15 @@
 //! ```
 //!
 //! Every value is little endian; records are sorted by address.
+//!
+//! In the kernel, a snapshot refers to the pages its cell shared with
+//! another (a template, a fork, a loaded image) instead of copying them
+//! (design D1-D3 of `add-shared-snapshots`): such a record has 1 in its
+//! first reserved byte and the page's physical address as its offset, and
+//! no data. The snapshot holds a reference to each of those frames until it
+//! is dropped. Those records never leave the kernel: [`Snapshot::export`]
+//! writes the pages' contents in their place, and [`Snapshot::from_bytes`]
+//! refuses them.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -39,6 +48,7 @@ use rhizo_cell::threads::{Thread, Threads, Wait};
 use rhizo_cell::{Cell, Registers, USER_END};
 use rhizo_fs::Fs;
 use rhizo_hal::PhysicalMemory;
+use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_net::Record;
 
@@ -51,6 +61,8 @@ const STATE: usize = 4 * 8;
 const THREAD_WORDS: usize = 6 + 35 + 66;
 const THREAD: usize = THREAD_WORDS * 8;
 const RECORD: usize = 24;
+/// The first reserved byte of a record, 1 if it refers to a frame.
+const REFERS: usize = 18;
 /// "No deadline" in a thread's time left.
 const NO_DEADLINE: u64 = u64::MAX;
 
@@ -96,13 +108,51 @@ pub struct Page<'a> {
     pub virt: u64,
     pub size: PageSize,
     pub flags: PageFlags,
-    pub data: &'a [u8],
+    pub data: Data<'a>,
 }
 
+/// Where the contents of a page of a snapshot are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Data<'a> {
+    /// In the snapshot.
+    Bytes(&'a [u8]),
+    /// In the frame at this physical address, shared with other cells: the
+    /// snapshot holds a reference to it.
+    Frame(u64),
+}
+
+/// Drops one reference to a frame a snapshot refers to.
+pub type Release = fn(u64, PageSize);
+
 /// A validated snapshot, in its encoded form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Snapshot {
     bytes: Vec<u8>,
+    /// Records that refer to a frame.
+    frames: usize,
+    release: Release,
+}
+
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Snapshot {}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if self.frames == 0 {
+            return;
+        }
+        for i in 0..self.page_count() {
+            let page = self.page(i);
+            if let Data::Frame(phys) = page.data {
+                (self.release)(phys, page.size);
+            }
+        }
+    }
 }
 
 fn u64_at(b: &[u8], at: usize) -> u64 {
@@ -167,26 +217,40 @@ fn thread_words(t: &Thread, now: u64) -> impl Iterator<Item = u64> + '_ {
 }
 
 impl Snapshot {
-    /// Captures `cell` (not running) and the user half of its page table,
-    /// copying every page; its threads' deadlines are kept as time left
-    /// after monotonic time `now`. The cell's memory is left as it was; the
-    /// caller frees it. `files` refers to its sockets by index in
-    /// `sockets`.
+    /// Captures `cell` (not running) and the user half of its page table;
+    /// its threads' deadlines are kept as time left after monotonic time
+    /// `now`. `files` refers to its sockets by index in `sockets`.
+    ///
+    /// Every table of the cell is made its own first, without copying a
+    /// page ([`PageTable::unshare_tables`]); then a page other cells share
+    /// is referred to, with one more reference from `frames`, and every
+    /// other page is copied. The snapshot gives each reference back through
+    /// `release` when dropped. Short of frames for the tables, or with a
+    /// frame's count full, it copies instead. The cell's memory is left
+    /// mapped; the caller frees it.
+    #[allow(clippy::too_many_arguments)]
     pub fn capture<F: EntryFormat>(
         machine: Machine,
         cell: &Cell,
         files: &Fs,
         sockets: &[Record],
         now: u64,
-        mem: &impl PhysicalMemory,
+        mem: &mut impl PhysicalMemory,
+        frames: &mut impl Frames,
+        release: Release,
     ) -> Self {
         let pt = PageTable::<F>::from_root(cell.root);
-        let (mut pages, mut data_len) = (0usize, 0usize);
-        pt.for_each_lower_leaf(mem, &mut |_, _, size, _| {
-            pages += 1;
-            data_len += size.bytes() as usize;
+        let own = pt.unshare_tables(mem, frames).is_ok();
+        let mem = &*mem;
+        let (mut refers, mut data_len) = (Vec::new(), 0usize);
+        pt.for_each_lower_leaf(mem, &mut |_, phys, size, _| {
+            let refer = own && frames.is_shared(phys) && frames.try_share(phys);
+            if !refer {
+                data_len += size.bytes() as usize;
+            }
+            refers.push(refer);
         });
-        let threads = cell.threads.len();
+        let (pages, threads) = (refers.len(), cell.threads.len());
         let data_start = HEADER + STATE + threads * THREAD + pages * RECORD;
         let mut encoded = Vec::new();
         files.encode(&mut encoded);
@@ -210,27 +274,89 @@ impl Snapshot {
         for v in state.into_iter().chain(words) {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        let mut offset = 0u64;
-        pt.for_each_lower_leaf(mem, &mut |virt, _, size, flags| {
+        let (mut offset, mut i) = (0u64, 0);
+        pt.for_each_lower_leaf(mem, &mut |virt, phys, size, flags| {
             b.extend_from_slice(&virt.to_le_bytes());
-            b.extend_from_slice(&offset.to_le_bytes());
+            if refers[i] {
+                b.extend_from_slice(&phys.to_le_bytes());
+            } else {
+                b.extend_from_slice(&offset.to_le_bytes());
+                offset += size.bytes();
+            }
             b.push((size == PageSize::Large) as u8);
             b.push(encode_flags(flags));
-            b.extend_from_slice(&[0; 6]);
-            offset += size.bytes();
+            b.push(refers[i] as u8);
+            b.extend_from_slice(&[0; 5]);
+            i += 1;
         });
         b.resize(data_start + data_len, 0);
-        let mut at = data_start;
+        let (mut at, mut i) = (data_start, 0);
         pt.for_each_lower_leaf(mem, &mut |_, phys, size, _| {
-            let n = size.bytes() as usize;
-            mem.read_bytes(phys, &mut b[at..at + n]);
-            at += n;
+            if !refers[i] {
+                let n = size.bytes() as usize;
+                mem.read_bytes(phys, &mut b[at..at + n]);
+                at += n;
+            }
+            i += 1;
         });
         b.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
         b.extend_from_slice(&encoded);
         b.extend_from_slice(&(records.len() as u64).to_le_bytes());
         b.extend_from_slice(&records);
-        Self { bytes: b }
+        Self {
+            bytes: b,
+            frames: refers.iter().filter(|&&r| r).count(),
+            release,
+        }
+    }
+
+    /// The snapshot as bytes that stand alone, to leave the kernel: the
+    /// contents of the frames it refers to are written in their place
+    /// (design D2 of `add-shared-snapshots`), and its references dropped.
+    pub fn export(mut self, mem: &impl PhysicalMemory) -> Vec<u8> {
+        if self.frames == 0 {
+            return core::mem::take(&mut self.bytes);
+        }
+        let (records, pages) = (self.records(), self.page_count());
+        let data_len: u64 = (0..pages).map(|i| self.page(i).size.bytes()).sum();
+        let tail = &self.bytes[self.files_at()..];
+        let mut b = Vec::with_capacity(records + pages * RECORD + data_len as usize + tail.len());
+        b.extend_from_slice(&self.bytes[..records]);
+        let mut offset = 0u64;
+        for i in 0..pages {
+            let rec = &self.bytes[records + i * RECORD..][..RECORD];
+            b.extend_from_slice(&rec[..8]);
+            b.extend_from_slice(&offset.to_le_bytes());
+            b.extend_from_slice(&rec[16..REFERS]);
+            b.extend_from_slice(&[0; 6]);
+            offset += self.page(i).size.bytes();
+        }
+        for i in 0..pages {
+            match self.page(i).data {
+                Data::Bytes(data) => b.extend_from_slice(data),
+                Data::Frame(phys) => {
+                    let at = b.len();
+                    b.resize(at + self.page(i).size.bytes() as usize, 0);
+                    mem.read_bytes(phys, &mut b[at..]);
+                }
+            }
+        }
+        b.extend_from_slice(tail);
+        b
+    }
+
+    /// Bytes the snapshot takes in the kernel heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Bytes of the frames it refers to.
+    pub fn shared_bytes(&self) -> u64 {
+        (0..self.page_count())
+            .map(|i| self.page(i))
+            .filter(|p| matches!(p.data, Data::Frame(_)))
+            .map(|p| p.size.bytes())
+            .sum()
     }
 
     /// Validates `bytes` as a snapshot for `machine`.
@@ -252,7 +378,11 @@ impl Snapshot {
                 found,
             });
         }
-        let snapshot = Self { bytes };
+        let snapshot = Self {
+            bytes,
+            frames: 0,
+            release: |_, _| {},
+        };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
         let records = HEADER + STATE + snapshot.thread_count() * THREAD;
@@ -316,16 +446,6 @@ impl Snapshot {
             return Err(FormatError::BadSockets);
         }
         Ok(snapshot)
-    }
-
-    /// The encoded bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Takes the encoded bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
     }
 
     fn u32_at(&self, at: usize) -> usize {
@@ -445,12 +565,15 @@ impl Snapshot {
     fn files_at(&self) -> usize {
         let pages = self.page_count();
         let data_start = self.records() + pages * RECORD;
-        // Pages are stored in record order: the data ends after the last.
-        let data_len = pages.checked_sub(1).map_or(0, |last| {
-            let page = self.page(last);
-            u64_at(&self.bytes, self.records() + last * RECORD + 8) + page.size.bytes()
+        // Pages are stored in record order: the data ends after the last
+        // one stored.
+        let data_len = (0..pages).rev().find_map(|i| match self.page(i).data {
+            Data::Bytes(data) => {
+                Some(u64_at(&self.bytes, self.records() + i * RECORD + 8) as usize + data.len())
+            }
+            Data::Frame(_) => None,
         });
-        data_start + data_len as usize
+        data_start + data_len.unwrap_or(0)
     }
 
     /// The encoded file system (after the page data and its length).
@@ -493,12 +616,17 @@ impl Snapshot {
         } else {
             PageSize::Small
         };
-        let start = self.records() + self.page_count() * RECORD + u64_at(b, rec + 8) as usize;
+        let data = if b[rec + REFERS] == 1 {
+            Data::Frame(u64_at(b, rec + 8))
+        } else {
+            let start = self.records() + self.page_count() * RECORD + u64_at(b, rec + 8) as usize;
+            Data::Bytes(&b[start..start + size.bytes() as usize])
+        };
         Page {
             virt: u64_at(b, rec),
             size,
             flags: decode_flags(b[rec + 17]).unwrap_or(PageFlags::USER),
-            data: &b[start..start + size.bytes() as usize],
+            data,
         }
     }
 
@@ -519,9 +647,12 @@ impl Snapshot {
         None
     }
 
-    /// Maps page `index` into `pt` with a fresh frame holding its contents.
-    /// A 2 MiB page comes back as 512 pages of 4 KiB when no 2 MiB run of
-    /// frames is free (as when it was first mapped).
+    /// Maps page `index` into `pt`: a frame the snapshot refers to is
+    /// shared once more, copy-on-write if the page is writable; any other
+    /// page goes into a fresh frame holding its contents (as does a shared
+    /// one whose count is full). A 2 MiB page comes back as 512 pages of
+    /// 4 KiB when no 2 MiB run of frames is free (as when it was first
+    /// mapped).
     pub fn restore_page<F: EntryFormat>(
         &self,
         index: usize,
@@ -530,25 +661,46 @@ impl Snapshot {
         frames: &mut impl Frames,
     ) -> Result<(), MapError> {
         let page = self.page(index);
+        if let Data::Frame(phys) = page.data
+            && frames.try_share(phys)
+        {
+            let flags = match page.flags.is_writable() {
+                true => page.flags | PageFlags::COPY_ON_WRITE,
+                false => page.flags,
+            };
+            return pt
+                .map(
+                    mem,
+                    &mut || frames.alloc(),
+                    page.virt,
+                    phys,
+                    page.size,
+                    flags,
+                )
+                .inspect_err(|_| frames.free(phys, page.size));
+        }
         let large = match page.size {
             PageSize::Large => frames.alloc_large(),
             _ => None,
         };
         let pieces = match large {
-            Some(phys) => alloc::vec![(page.virt, phys, page.size, page.data)],
-            None => page
-                .data
-                .chunks(rhizo_mm::FRAME_SIZE as usize)
-                .zip((page.virt..).step_by(rhizo_mm::FRAME_SIZE as usize))
-                .map(|(data, virt)| (virt, 0, PageSize::Small, data))
+            Some(phys) => alloc::vec![(0, phys, page.size)],
+            None => (0..page.size.bytes())
+                .step_by(FRAME_SIZE as usize)
+                .map(|at| (at, 0, PageSize::Small))
                 .collect(),
         };
-        for (virt, phys, size, data) in pieces {
+        for (at, phys, size) in pieces {
             let phys = match size {
                 PageSize::Small => frames.alloc().ok_or(MapError::OutOfFrames)?,
                 _ => phys,
             };
-            mem.write_bytes(phys, data);
+            let n = size.bytes();
+            match page.data {
+                Data::Bytes(data) => mem.write_bytes(phys, &data[at as usize..(at + n) as usize]),
+                Data::Frame(from) => mem.copy(from + at, phys, n),
+            }
+            let virt = page.virt + at;
             pt.map(mem, &mut || frames.alloc(), virt, phys, size, page.flags)
                 .inspect_err(|_| frames.free(phys, size))?;
         }

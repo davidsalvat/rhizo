@@ -835,7 +835,7 @@ fn suspend_resume_after_every_step(mode: Resume) {
         }
         let snapshot = host.suspend(id).expect("the counter is live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let bytes = snapshot.into_bytes();
+        let bytes = snapshot.export(&DirectMap);
         let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
         id = host.resume(snapshot, mode, true, false).expect("resume");
         resumes += 1;
@@ -869,10 +869,7 @@ fn suspend_returns_all_memory() {
     drop(cycle()); // warm the heap up for the host's small allocations
     let before = memory::free_bytes();
     let snapshot = cycle();
-    assert!(
-        snapshot.as_bytes().len() > 8 << 20,
-        "8 MiB of pages captured"
-    );
+    assert!(snapshot.heap_bytes() > 8 << 20, "8 MiB of pages captured");
     drop(snapshot);
     assert_eq!(
         memory::free_bytes(),
@@ -935,7 +932,7 @@ fn suspended_cells_hold_no_kernel_resources() {
 fn snapshot_of_another_architecture_is_rejected() {
     let mut host = Host::new();
     let id = spawn(&mut host, "chatter", &[]);
-    let mut bytes = host.suspend(id).expect("live").into_bytes();
+    let mut bytes = host.suspend(id).expect("live").export(&DirectMap);
     let other: u16 = if crate::arch::user::MACHINE as u16 == 183 {
         62
     } else {
@@ -1191,8 +1188,9 @@ fn open_file_survives_suspend_and_resume() {
             }
             let snapshot = host.suspend(id).expect("live");
             output.extend_from_slice(&host.finished(id).expect("suspended").output);
-            let snapshot = Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE)
-                .expect("valid");
+            let snapshot =
+                Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
+                    .expect("valid");
             id = host.resume(snapshot, mode, true, false).expect("resume");
             resumes += 1;
         }
@@ -1647,7 +1645,7 @@ fn no_two_cells_draw_the_same_random_bytes() {
         );
     }
     let suspended = ready(&mut host);
-    let bytes = host.suspend(suspended).expect("suspend").into_bytes();
+    let bytes = host.suspend(suspended).expect("suspend").export(&DirectMap);
     for mode in [Resume::Eager, Resume::Lazy] {
         let snapshot = Snapshot::from_bytes(bytes.clone(), arch::user::MACHINE).expect("valid");
         ids.push(host.resume(snapshot, mode, true, false).expect("resume"));
@@ -1977,7 +1975,7 @@ fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
         id
     };
     let id = ready(&mut host);
-    let bytes = host.suspend(id).expect("live").into_bytes();
+    let bytes = host.suspend(id).expect("live").export(&DirectMap);
     let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
     let resumed = host
         .resume(snapshot, Resume::Lazy, true, true)
@@ -2097,8 +2095,9 @@ fn threaded_cell_survives_suspend_and_resume() {
             }
             let snapshot = host.suspend(id).expect("live");
             output.extend_from_slice(&host.finished(id).expect("suspended").output);
-            let snapshot = Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE)
-                .expect("valid");
+            let snapshot =
+                Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
+                    .expect("valid");
             id = host.resume(snapshot, mode, true, false).expect("resume");
             resumes += 1;
         }
@@ -2132,7 +2131,7 @@ fn sockets_across_suspend_and_resume() {
         3,
         "a suspended cell's listener and connection's two ends, parked"
     );
-    let bytes = snapshot.into_bytes();
+    let bytes = snapshot.export(&DirectMap);
     let copy = Snapshot::from_bytes(bytes.clone(), crate::arch::user::MACHINE).expect("valid");
     let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
     let id = host
@@ -2603,7 +2602,7 @@ fn suspend_between_parallel_runs_is_invisible() {
         }
         let snapshot = host.suspend(id).expect("the counter is live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let bytes = snapshot.into_bytes();
+        let bytes = snapshot.export(&DirectMap);
         let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
         id = host
             .resume(snapshot, Resume::Lazy, true, false)
@@ -2693,7 +2692,8 @@ fn a_cell_on_several_cpus_survives_suspend_and_fork() {
         let snapshot = host.suspend(id).expect("live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
         let snapshot =
-            Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE).expect("valid");
+            Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
+                .expect("valid");
         id = host
             .resume(snapshot, Resume::Lazy, true, false)
             .expect("resume");
