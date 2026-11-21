@@ -134,8 +134,8 @@ The feedback loop, fastest first:
 
 | Crate | Owns | May depend on (workspace) |
 |---|---|---|
-| `crates/rhizo-hal` | Hardware interfaces (traits: console, memory, TLB, device registers, network link) and host test doubles | — |
-| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT and MCFG reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
+| `crates/rhizo-hal` | Hardware interfaces (traits: console, memory, TLB, device registers, network link, entropy) and host test doubles | — |
+| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT and MCFG reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), ChaCha20 random generator, in-kernel test runner | `rhizo-hal` |
 | `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, copies with own tables, write resolution), kernel heap | `rhizo-hal` |
 | `crates/rhizo-cell` | Cells as plain data (their threads: registers, identifiers, futex, sleep and descriptor waits), ELF loader and initial stack (static executables loaded once, started many; executables and interpreters mapped from file pages), which executables stay loaded, user-memory access, cell address spaces (anonymous mappings, mappings of given frames, teardown) | `rhizo-hal`, `rhizo-mm` |
 | `crates/rhizo-fs` | A cell's in-memory file system: tree, file blocks shared copy-on-write between forks, descriptors, pipes, event counters, `epoll` instances, socket descriptors and Unix socket names, encoding for snapshots | — |
@@ -145,9 +145,11 @@ The feedback loop, fastest first:
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian, threads, files and sockets sections), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs`, `rhizo-net` |
 | `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list, waiting set and time slice (time and CPU passed in, never read); cells whose threads run on several CPUs (`Gangs`); address-space tag pool | — |
 | `crates/rhizo-prof` | Cost accounting: where a CPU's time goes, in exclusive parts and per system call (ticks passed in, never read), and the breakdown lines the benchmarks print | — |
-| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, threads of one cell on several CPUs (gangs, the cell lock, x86_64 TLB shootdowns), the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); cost accounting hooks (`src/cost.rs`, feature `profile`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio`, `rhizo-prof` |
+| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, threads of one cell on several CPUs (gangs, the cell lock, x86_64 TLB shootdowns), the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); cost accounting hooks (`src/cost.rs`, feature `profile`); the control kernel's table of cells and request loop (`src/control.rs`, feature `control`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio`, `rhizo-prof`, `rhizo-control` |
 | `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building), and dynamically linked (`c/dynamic`); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
-| `xtask` | Developer tooling (host only); builds the static CPython cell and encodes its files (`cpython.rs`); packs the dynamically linked programs with their interpreter and libraries (`dynamic.rs`) | `rhizo-fs` |
+| `crates/rhizo-control` | The control protocol between the host and a control kernel: frames (versioned, length-prefixed, with a request identifier) told apart from console text, requests and replies, checked decoding | — |
+| `xtask` | Developer tooling (host only), a library with a thin binary; builds the static CPython cell and encodes its files (`cpython.rs`); packs the dynamically linked programs with their interpreter and libraries (`dynamic.rs`); drives a control kernel over its serial line (`control.rs`) | `rhizo-fs`, `rhizo-control` |
+| `cli` (`rhizo-cli`) | `rhizo`, the control plane's command-line tool (host only, Linux): `up` (VM and background server relaying a Unix socket to the serial line), `run` with templates, `ps`, `fork`, `suspend`, `resume`, `attach`, `kill`, `down` | `rhizo-control`, `xtask` |
 
 Planned crates are created by the milestone that adds their code, not
 before.
@@ -164,7 +166,8 @@ shared kernel code may use: `boot`, `platform`, `console`, `power`, `cpu`,
 `timer`, `tests`, and, compiled only in builds that run cells, `user`
 (entering and leaving cell code, address-space tags), `irq` (the
 preemption timer and the wake-up between CPUs; interrupts arrive only
-while cell code runs or a CPU idles), `smp` (starting the other CPUs,
+while cell code runs or a CPU idles), `random` (the CPU's hardware
+random source, as `rhizo_hal::Entropy`), `smp` (starting the other CPUs,
 waking them, idling) and `pmu` (performance counters: retired
 instructions and core cycles, where the guest has them). `cpu::index()` is
 the running CPU's number (0 for the

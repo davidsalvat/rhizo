@@ -147,10 +147,18 @@ impl<T> Scheduler<T> {
     /// when an entry became runnable.
     pub fn wake_due(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
         let due = self.sleeping.partition_point(|&(t, _)| t <= now);
-        let woken: Vec<_> = self.sleeping.drain(..due).collect();
-        for (_, mut entry) in woken {
-            f(&mut entry);
-            self.push(cpu, entry);
+        if due > 0 {
+            let Self {
+                queues,
+                arrivals,
+                sleeping,
+                ..
+            } = self;
+            for (_, mut entry) in sleeping.drain(..due) {
+                f(&mut entry);
+                queues[cpu].push_back((*arrivals, entry));
+                *arrivals += 1;
+            }
         }
         while let Some(&(d, key)) = self.deadlines.first()
             && d <= now

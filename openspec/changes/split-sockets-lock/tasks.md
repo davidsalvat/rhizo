@@ -4,7 +4,7 @@
 
 - [x] 1.1 `SpinLock::lock` and its guard, `Global::lock`; verify `cargo test -p rhizo-core sync`
 - [x] 1.2 `Sockets` accessor in `rhizo-abi`; `poll`, `select` and `epoll_wait` lock only for sockets (D1); verify `cargo test -p rhizo-abi only_calls_on_sockets_reach_them`
-- [x] 1.3 `CallNet` and `WOKEN` in the kernel (D1, D2); verify `cargo xtask test` and `--only ktest-smp` on both architectures
+- [x] 1.3 `CallNet` in the kernel (D1); verify `cargo xtask test` and `--only ktest-smp` on both architectures
 
 ## 2. Measuring
 

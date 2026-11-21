@@ -27,14 +27,10 @@ sockets.
 
 ## D2. Waiters are drained only when a change woke some
 
-`add-socket-wait-queues` drains woken keys under the host's lock at every
-take and give-back of a cell, taking `NET` each time. Now a change that
-wakes waiters sets `WOKEN` while it holds `NET`: a system call, as it
-ends, and the kernel's own uses of the sockets (forks, snapshots, the card's
-polls) through `with_net`. The drain swaps the flag to clear and locks `NET`
-only if it was set. A change after the swap sets the flag again for the
-next drain. A change made before a cell is filed is still drained before
-the filing, since its flag was set before the change's lock was released.
+This part landed with `add-socket-wait-queues` (its D2: the `WOKEN` flag),
+which needed it to keep a switch between cells as cheap as before. A call
+that locked the sockets sets the flag, as it ends, if its changes woke
+waiters; a call that never locked them changed nothing.
 
 ## D3. Measuring it
 

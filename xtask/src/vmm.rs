@@ -165,6 +165,16 @@ impl Accel {
         }
     }
 
+    /// The name [`parse`](Self::parse) reads.
+    pub fn id(self) -> &'static str {
+        match self {
+            Accel::Auto => "auto",
+            Accel::Kvm => "kvm",
+            Accel::Tcg => "tcg",
+            Accel::Icount => "icount",
+        }
+    }
+
     fn uses_kvm(self) -> bool {
         match self {
             Accel::Auto => kvm_available(),
@@ -275,12 +285,6 @@ pub enum Bench {
     Laptop { idle_secs: u16, llm_delay_ms: u32 },
     /// `bench=server cells=N secs=S`.
     Server { cells: u16, secs: u16 },
-    /// `bench=agent-demo model=NAME llm=ADDR`: the CPython agent's live
-    /// demo against a model at `ADDR` (`IP:PORT` as the guest sees it).
-    AgentDemo {
-        llm: &'static str,
-        model: &'static str,
-    },
 }
 
 impl Bench {
@@ -297,9 +301,6 @@ impl Bench {
                 format!(" bench=laptop secs={idle_secs}{llm}")
             }
             Bench::Server { cells, secs } => format!(" bench=server cells={cells} secs={secs}"),
-            Bench::AgentDemo { llm, model } => {
-                format!(" bench=agent-demo model={model} llm={llm}")
-            }
         }
     }
 }
@@ -333,6 +334,20 @@ pub struct RunOptions {
     pub bench: Option<Bench>,
     /// The share of the in-kernel tests this VM runs (`shard=I/N`).
     pub shard: Option<(u16, u16)>,
+    /// A control kernel (spec `control-plane`): its console is the serial
+    /// line, both ways, on the VMM's standard input and output, also where
+    /// the kernel would otherwise use a debug port.
+    pub control: bool,
+}
+
+/// The console and exit options of a Rhizo kernel on `vmm`.
+fn rhizo_args(vmm: Vmm, kvm: bool, opts: &RunOptions) -> String {
+    let args = vmm.rhizo_cmdline(kvm);
+    if opts.control {
+        args.replace("console=e9", "console=serial")
+    } else {
+        args.to_string()
+    }
 }
 
 /// The `shard=I/N` option for a Rhizo command line, if any.
@@ -350,7 +365,7 @@ pub fn parse_ready_cycles(output: &str) -> Option<u64> {
 }
 
 /// Builds the command that launches `guest` on `vmm`.
-fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
+pub fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
     match vmm {
         Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
         Vmm::Firecracker => firecracker_command(guest, opts, scratch),
@@ -425,12 +440,12 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
     }
     match guest {
         Guest::Rhizo(kernel) => {
-            if vmm == Vmm::QemuVirt {
+            if vmm == Vmm::QemuVirt || opts.control {
                 cmd.args(["-serial", "stdio"]);
             } else {
                 cmd.args(["-debugcon", "stdio", "-serial", "none"]);
             }
-            let mut args = vmm.rhizo_cmdline(kvm).to_string();
+            let mut args = rhizo_args(vmm, kvm, opts);
             if opts.network
                 && let crate::hostnet::Network::Qemu { cmdline } = crate::hostnet::for_vmm(vmm)
             {
@@ -475,7 +490,7 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
         Guest::Rhizo(kernel) => (
             kernel.clone(),
             None,
-            Vmm::Firecracker.rhizo_cmdline(true).to_string(),
+            rhizo_args(Vmm::Firecracker, true, opts),
         ),
         Guest::ReferenceLinux { kernel, initramfs } => (
             kernel.clone(),
@@ -531,7 +546,7 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
         .args(["--console", "off"]);
     match guest {
         Guest::Rhizo(kernel) => {
-            let mut args = Vmm::CloudHypervisor.rhizo_cmdline(true).to_string();
+            let mut args = rhizo_args(Vmm::CloudHypervisor, true, opts);
             if opts.network
                 && let crate::hostnet::Network::Tap { tap, cmdline } =
                     crate::hostnet::for_vmm(Vmm::CloudHypervisor)
@@ -545,7 +560,7 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
             }
             args += &shard_arg(opts);
             cmd.arg("--kernel").arg(kernel).args(["--cmdline", &args]);
-            if arch::current() == Arch::X86_64 {
+            if arch::current() == Arch::X86_64 && !opts.control {
                 cmd.args(["--serial", "off", "--debug-console", "tty"]);
             } else {
                 cmd.args(["--serial", "tty"]);

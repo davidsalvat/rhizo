@@ -14,9 +14,10 @@
 # MODEL the model's name in each request. MODE says how the branches are
 # made:
 # - `cell`: Rhizo forks the cell. The agent prints a line ending in `fork`
-#   and sleeps; the host freezes it there as a template and starts one cell
-#   per branch from it (templates keep no time, so each wakes at once),
-#   giving each its branch number in the file `/branch`. Between turns the
+#   and waits for the file `/branch`, looking every few milliseconds; the
+#   host forks it there (a template it starts cells from, or a fork through
+#   the control plane) and gives each branch its number in `/branch`, in
+#   that branch's own files. Between turns the
 #   agent pauses briefly, and the host may suspend and resume it there: its
 #   connection to the model survives (the model's request count on it goes
 #   on).
@@ -196,7 +197,7 @@ def turn(model, messages, label):
         text = message.get("content") or ""
         messages.append({"role": "assistant", "content": text})
         messages.append({"role": "user", "content": "Call the compute tool with other numbers."})
-        say("[%s] model (%s): %s" % (label, ms(waited), " ".join(text.split())[:300] or "(empty)"))
+        say("[%s] model (%s): %s" % (label, ms(waited), " ".join(text.split()) or "(empty)"))
         say("[%s] no tool call: asked again (python %s)" % (label, ms(time.perf_counter_ns() - t0 - waited)))
         return "%s reply chars=%d conn_requests=%d" % (label, len(text), requests)
     call = calls[0]
@@ -300,7 +301,8 @@ def run(model, mode, turns, timed):
     if mode == "linux":
         fork_linux(model, messages, timed)
         return
-    time.sleep(3600)  # the host freezes the cell here and starts the branches
+    while not os.path.exists("/branch"):  # the host forks the cell here
+        time.sleep(0.01)
     with open("/branch", "rb") as f:
         b = int(f.read())
     print("[branch %d] running" % b if LIVE else "branch %d" % b, flush=True)

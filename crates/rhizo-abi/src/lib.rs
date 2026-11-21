@@ -395,6 +395,16 @@ pub enum Outcome {
 
 pub use rhizo_cell::memory::NoPager;
 
+/// Wakes the threads of `cell` waiting on descriptors if its pipes, event
+/// counters or `epoll` instances `changed` (kept off the common path).
+#[cold]
+#[inline(never)]
+fn wake_on_fs_change(cell: &mut Cell, changed: bool) {
+    if changed {
+        cell.threads.wake_io();
+    }
+}
+
 /// The kernel's sockets as a system call reaches them: the kernel locks
 /// them the first time a call uses them, so calls that use no socket never
 /// wait for the calls of other cells that do (design D1 of
@@ -501,7 +511,10 @@ impl Abi {
         S: Services,
     {
         let (nr, a) = self.arch.call(cell);
-        let fs_seen = cx.fs.changes();
+        // Only another thread of the cell can wait for its pipes, event
+        // counters and `epoll` instances (design D3 of
+        // `add-socket-wait-queues`).
+        let fs_seen = (cell.threads.len() > 1).then(|| cx.fs.changes());
         let result = match self.arch.decode(nr) {
             // One thread of several: only it ends.
             Some(Sys::Exit) if cell.threads.len() > 1 => {
@@ -643,7 +656,7 @@ impl Abi {
             Some(Sys::Fsync) => files::fsync(cx, a[0]),
             Some(Sys::Dup) => files::dup(cx, a[0], 0, false, false),
             Some(Sys::Dup2) => match cx.fs.kind(a[0] as u32) {
-                Ok(_) if a[0] == a[1] => a[1] as i64,
+                Ok(_) if a[0] as u32 == a[1] as u32 => (a[1] as u32).into(),
                 _ => files::dup(cx, a[0], a[1], true, false),
             },
             Some(Sys::Dup3) => files::dup3(cx, a[0], a[1], a[2]),
@@ -696,8 +709,8 @@ impl Abi {
         // Another thread of the cell may wait for what changed in its pipes,
         // event counters or `epoll` instances (design D3 of
         // `add-socket-wait-queues`).
-        if cx.fs.changes() != fs_seen {
-            cell.threads.wake_io();
+        if let Some(seen) = fs_seen {
+            wake_on_fs_change(cell, cx.fs.changes() != seen);
         }
         if result == BLOCK {
             cell.regs_mut().pc -= self.arch.syscall_len();

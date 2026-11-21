@@ -6,8 +6,8 @@ Every system call of every cell takes the kernel's sockets lock (`NET`,
 design D9 of `add-smp-scheduling`), whether or not it uses a socket. A
 `getpid`, a pipe read or a file write on one CPU therefore waits for the
 calls of the cells on the other CPUs. With several CPUs, the system calls
-of all cells take turns. The scheduler also took the same lock at every
-step to look for woken waiters (`add-socket-wait-queues`).
+of all cells take turns. (The scheduler's own use of the lock, to drain
+woken waiters, is already gated by a flag since `add-socket-wait-queues`.)
 
 ## What Changes
 
@@ -19,8 +19,6 @@ step to look for woken waiters (`add-socket-wait-queues`).
   instances without sockets, files, memory, time and threads never touch
   the lock. `poll`, `select` and `epoll_wait` lock it only when a
   descriptor they look at is a socket.
-- **The scheduler takes the lock only when there are woken waiters to
-  drain.** A flag is set under the lock by the change that woke them.
 - **`SpinLock::lock`** returns a guard, for a holder that turns out to
   need the lock in the middle of its work.
 - **Metric**: `cell.syscall_scaling_pct`. Four `piper` cells per CPU, each

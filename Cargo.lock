@@ -380,6 +380,21 @@ name = "rhizo-cells"
 version = "0.1.0"
 
 [[package]]
+name = "rhizo-cli"
+version = "0.1.0"
+dependencies = [
+ "rhizo-control",
+ "xtask",
+]
+
+[[package]]
+name = "rhizo-control"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "rhizo-core"
 version = "0.1.0"
 dependencies = [
@@ -404,6 +419,7 @@ version = "0.1.0"
 dependencies = [
  "rhizo-abi",
  "rhizo-cell",
+ "rhizo-control",
  "rhizo-core",
  "rhizo-fs",
  "rhizo-hal",
@@ -450,6 +466,7 @@ dependencies = [
 name = "rhizo-snapshot"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rhizo-cell",
  "rhizo-fs",
  "rhizo-hal",
@@ -461,6 +478,7 @@ dependencies = [
 name = "rhizo-virtio"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rhizo-hal",
 ]
 
@@ -675,6 +693,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "rhizo-control",
  "rhizo-fs",
  "serde_json",
 ]

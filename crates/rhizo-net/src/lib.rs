@@ -293,6 +293,10 @@ pub struct Net {
     /// `keep-tcp-across-suspend`).
     boot: u64,
     next_key: u64,
+    /// The secret that turns `next_key` into a parked record's key (finding
+    /// S15 of `docs/security.md`): a forged snapshot cannot name another
+    /// cell's parked connection by guessing it.
+    secret: [u64; 2],
     /// Listeners and connections of suspended cells, by key, each holding
     /// one reference.
     parked: Vec<(u64, Handle)>,
@@ -319,6 +323,14 @@ fn reset_pending(state: &mut State) -> Option<bool> {
     }
 }
 
+/// Spreads the bits of `x` over the whole word (the SplitMix64 finalizer):
+/// nearby boot identities pick far-apart ports.
+fn mix(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 fn is_loopback(ip: [u8; 4]) -> bool {
     ip[0] == 127
 }
@@ -335,6 +347,7 @@ impl Net {
             wire: None,
             boot: 0,
             next_key: 1,
+            secret: [0; 2],
             parked: Vec::new(),
             woken: Vec::new(),
             looked: RefCell::new(Vec::new()),
@@ -342,9 +355,22 @@ impl Net {
     }
 
     /// Sets the identity of this boot (the caller's randomness, never read
-    /// here): sockets parked in another boot do not re-attach.
+    /// here): sockets parked in another boot do not re-attach, and ephemeral
+    /// ports start at a place it chooses. A peer keeps the addresses and
+    /// ports of a connection it closed for a while (`TIME_WAIT`); starting
+    /// every boot at the first port would make the first connections of a
+    /// new boot look like old ones to it (RFC 6056; design D1 of
+    /// `fix-ephemeral-ports`).
     pub fn set_boot(&mut self, boot: u64) {
         self.boot = boot;
+        let span = u64::from(EPHEMERAL.end() - EPHEMERAL.start()) + 1;
+        self.next_port = EPHEMERAL.start() + (mix(boot) % span) as u16;
+    }
+
+    /// Sets the secret parked records' keys are derived from (the caller's
+    /// randomness, never read here; design D1 of `fix-parked-keys`).
+    pub fn set_secret(&mut self, secret: [u64; 2]) {
+        self.secret = secret;
     }
 
     /// Counts every change a waiter may wait for (data, connections,
@@ -366,21 +392,27 @@ impl Net {
         self.looked.borrow_mut().push(h);
     }
 
-    /// The end of a call: if it blocks, `waiter` joins the wait queue of
+    /// The end of a call: if it blocks (`waiter` says who waits, asked only
+    /// when the call looked at sockets), the waiter joins the wait queue of
     /// each socket the call looked at (once), and is woken by the next
-    /// change to one of them.
-    pub fn end_call(&mut self, waiter: Option<u32>) {
+    /// change to one of them. Returns whether waiters were woken since the
+    /// last [`drain_woken`](Self::drain_woken), as
+    /// [`has_woken`](Self::has_woken) does.
+    pub fn end_call(&mut self, waiter: impl FnOnce() -> Option<u32>) -> bool {
         let looked = self.looked.get_mut();
-        if let Some(key) = waiter {
-            for &h in looked.iter() {
-                if let Some(Some(s)) = self.sockets.get_mut(h as usize)
-                    && !s.waiters.contains(&key)
-                {
-                    s.waiters.push(key);
+        if !looked.is_empty() {
+            if let Some(key) = waiter() {
+                for &h in looked.iter() {
+                    if let Some(Some(s)) = self.sockets.get_mut(h as usize)
+                        && !s.waiters.contains(&key)
+                    {
+                        s.waiters.push(key);
+                    }
                 }
             }
+            looked.clear();
         }
-        looked.clear();
+        !self.woken.is_empty()
     }
 
     /// Takes `waiter` off the wait queue of `h` (it is gone).
@@ -1231,8 +1263,15 @@ impl Net {
             s.state,
             State::Listening { .. } | State::Connected { .. } | State::Wire { .. }
         ) {
-            let key = self.next_key;
-            self.next_key += 1;
+            // A key no other parked socket has, unpredictable without the
+            // secret.
+            let key = loop {
+                let key = siphash24(self.secret, self.next_key);
+                self.next_key += 1;
+                if self.parked.iter().all(|p| p.0 != key) {
+                    break key;
+                }
+            };
             self.parked.push((key, h));
             self.retain(h);
             record.parked = Some(Park {
@@ -1303,6 +1342,43 @@ impl Net {
             self.release(h);
         }
     }
+}
+
+/// SipHash-2-4 of one 64-bit word (little endian) under `key` (Aumasson
+/// and Bernstein, "SipHash: a fast short-input PRF", 2012): a pseudorandom
+/// function, so keys made from consecutive counters say nothing about each
+/// other or about `key`.
+fn siphash24(key: [u64; 2], m: u64) -> u64 {
+    let mut v = [
+        key[0] ^ 0x736f_6d65_7073_6575,
+        key[1] ^ 0x646f_7261_6e64_6f6d,
+        key[0] ^ 0x6c79_6765_6e65_7261,
+        key[1] ^ 0x7465_6462_7974_6573,
+    ];
+    fn round(v: &mut [u64; 4]) {
+        v[0] = v[0].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(13) ^ v[0];
+        v[0] = v[0].rotate_left(32);
+        v[2] = v[2].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(16) ^ v[2];
+        v[0] = v[0].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(21) ^ v[0];
+        v[2] = v[2].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(17) ^ v[2];
+        v[2] = v[2].rotate_left(32);
+    }
+    // One message block, then the final block: no bytes left, length 8.
+    for block in [m, 8 << 56] {
+        v[3] ^= block;
+        round(&mut v);
+        round(&mut v);
+        v[0] ^= block;
+    }
+    v[2] ^= 0xff;
+    for _ in 0..4 {
+        round(&mut v);
+    }
+    v[0] ^ v[1] ^ v[2] ^ v[3]
 }
 
 #[cfg(test)]

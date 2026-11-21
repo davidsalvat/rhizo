@@ -73,6 +73,12 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `<metric>_insns/rhizo/<vmm>`, `<metric>_cycles/rhizo/<vmm>` | counts | Every single-CPU timed figure counted by the guest's PMU in retired instructions and core cycles, where the guest has one (see below) |
 | `breakdown.<workload>.<part>_us/rhizo/<vmm>` | timing, not gated | Where a workload's time goes (see below) |
 | `lock.<name>_waits/rhizo/<vmm>` | count, not gated | During the four-CPU breakdown: acquisitions that found the lock held by another CPU, for `frames` (frame allocator), `heap`, `refs` (frame reference counts), `sharing` (memory shared by forks), `net` (sockets), `sched` (run queues) |
+| `control.roundtrip_us/rhizo/<vmm>` | timing | The control plane (spec `control-plane`): a `list` request from the host to a control kernel and its reply back, as the host times it (frame written to the VMM's standard input, the serial line both ways, the kernel's poll of its UART, the reply read from the VMM's standard output). Median of 200 in a row on one boot, 1 CPU, 128 MiB |
+| `control.run_us/rhizo/<vmm>` | timing | On the same boot, as the host times them: `run` of the `idle` cell (the reply comes once it is created) |
+| `control.suspend_us/rhizo/<vmm>` | timing | `suspend` of that cell (snapshot kept in the kernel) |
+| `control.resume_us/rhizo/<vmm>` | timing | `resume` of it (lazy: pages come back on first touch) |
+| `control.fork_us/rhizo/<vmm>` | timing | `fork` of it into one cell |
+| `control.kill_us/rhizo/<vmm>` | timing | `kill` of it. Each of these five over 20 rounds; each reply also carries the kernel's own time for the operation, which `rhizo` prints next to the round trip |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded
@@ -138,16 +144,17 @@ come back, or the benchmark fails.
 
 In the `ci` environment (from two CI runs that agreed within the
 threshold) every workload metric is gated except these, recorded but
-listed under `ungated.ci`: `workload.agent_turn_us` and
-`laptop.resume_turn_us` (bimodal: about 0.3 ms, or 1 s when the answer
-arrives after the guest stopped polling its card and only smoltcp's
-retransmission timer wakes it), `laptop.idle_host_cpu_pct` (the host's
+listed under `ungated.ci`: `laptop.idle_host_cpu_pct` (the host's
 own load on a shared runner), the p99.9 latencies (`*_p999_*`: a
 handful of samples per run), and `density.sched_p99_us` and
 `density.wake_p99_us`: the server load runs close to saturation (every
 socket change wakes every cell waiting on a socket), so its tails moved
 up to 5x between runners of the same code. They are gated once that is
-fixed.
+fixed. The agent turns are gated since `fix-ephemeral-ports`: they took
+1 s in most runs on Firecracker and Cloud Hypervisor, because each boot
+started its ephemeral ports at 32768, so its first connections reused
+4-tuples the host still kept in `TIME_WAIT` from the previous run, and
+smoltcp retried the refused SYN after 1 s.
 
 The `rhizo-server-breakdown` line printed with the results says where the
 load's time went (idle, system calls, scheduling decisions, host
@@ -204,6 +211,31 @@ The kernel also prints the scopes entered per part
 (`rhizo-breakdown-counts`) and the eight system calls that took most time
 (`rhizo-breakdown-calls`, `name=count/ns`). Without `profile` the hooks
 compile to nothing, so no other figure is measured with them.
+
+### Sampling: `cargo xtask profile`
+
+```bash
+cargo xtask --arch x86_64 profile [--vmm <name>] [--accel <a>] [--out <dir>] [--per-cell]
+```
+
+runs a kernel built with `sampling` (which includes `profile`): the same
+workloads (five rounds each, CPython where built), accounted as above and
+sampled. The PMU counts cycles of cell code only and interrupts every
+100,000 (x86_64 counter 2 on vector 34; AArch64 event counter 1 on the PMU's
+PPI); without a PMU the timer samples every 100 µs instead. Each sample is
+the cell and its program counter; kernel addresses are not sampled (the
+kernel runs with interrupts masked), its time is the accounted parts. It
+writes to `target/profile` (or `--out`):
+
+- `<workload>.folded`: `<workload>;<image>[;cell <id>];<function> <ns>`,
+  the samples sharing the workload's `user` time by count, and
+  `<workload>;kernel;<part> <ns>`;
+- `<workload>.calls.folded`: `<workload>;<system call> <ns>` (each call's
+  own time, nested parts included).
+
+Functions come from `nm` on the image (CPython: the interpreter before it
+was stripped); the Rust test cells are stripped, so their addresses fold by
+4 KiB page. Render with `flamegraph.pl`, `inferno-flamegraph` or speedscope.
 
 ### Instructions and cycles
 

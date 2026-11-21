@@ -761,6 +761,24 @@ proptest! {
     }
 }
 
+#[test]
+fn each_boot_starts_its_ephemeral_ports_elsewhere() {
+    let first = |boot: u64| {
+        let mut net = Net::new();
+        net.set_boot(boot);
+        let s = net.socket(Family::Inet, Type::Stream).unwrap();
+        net.listen(s, 1).unwrap(); // an ephemeral port
+        match net.local_addr(s) {
+            Ok(Some(Addr::Inet { port, .. })) => port,
+            other => panic!("{other:?}"),
+        }
+    };
+    let ports: alloc::collections::BTreeSet<u16> = (0..64).map(|i| first(1_000_000 + i)).collect();
+    assert!(ports.iter().all(|p| EPHEMERAL.contains(p)));
+    assert!(ports.len() > 60, "nearby boots start far apart: {ports:?}");
+    assert_eq!(first(42), first(42), "the boot decides");
+}
+
 /// The waiters woken since the last call.
 pub(crate) fn woken(net: &mut Net) -> Vec<u32> {
     let mut out = Vec::new();
@@ -770,9 +788,9 @@ pub(crate) fn woken(net: &mut Net) -> Vec<u32> {
 
 /// Waiter `key` looks at `h` and blocks, as a call that would wait does.
 fn wait_on(net: &mut Net, key: u32, h: Handle) {
-    net.end_call(None);
+    net.end_call(|| None);
     net.poll(h);
-    net.end_call(Some(key));
+    net.end_call(|| Some(key));
 }
 
 #[test]
@@ -785,10 +803,10 @@ fn a_change_wakes_only_the_waiters_of_its_socket() {
     wait_on(&mut net, 2, s2);
     assert!(!net.has_woken());
     net.send(c1, b"x", None).unwrap();
-    net.end_call(None);
+    net.end_call(|| None);
     assert_eq!(woken(&mut net), [1]);
     net.send(c1, b"y", None).unwrap();
-    net.end_call(None);
+    net.end_call(|| None);
     assert_eq!(
         woken(&mut net),
         [],
@@ -802,9 +820,9 @@ fn a_change_wakes_only_the_waiters_of_its_socket() {
 fn a_call_that_does_not_block_joins_no_queue() {
     let mut net = Net::new();
     let (c, s, _) = connection(&mut net, 22);
-    net.end_call(None);
+    net.end_call(|| None);
     assert_eq!(drain(&mut net, s), Err(Error::Again));
-    net.end_call(None);
+    net.end_call(|| None);
     net.send(c, b"x", None).unwrap();
     assert!(!net.has_woken());
 }
@@ -813,19 +831,19 @@ fn a_call_that_does_not_block_joins_no_queue() {
 fn accept_waits_for_a_connection_and_a_writer_for_room() {
     let mut net = Net::new();
     let l = listener(&mut net, 23);
-    net.end_call(None);
+    net.end_call(|| None);
     assert_eq!(net.accept(l), Err(Error::Again));
-    net.end_call(Some(5));
+    net.end_call(|| Some(5));
     let c = net.socket(Family::Inet, Type::Stream).unwrap();
     net.connect(c, &inet(LOOPBACK, 23)).unwrap();
-    net.end_call(None);
+    net.end_call(|| None);
     assert_eq!(woken(&mut net), [5], "a connection to accept");
     let s = net.accept(l).unwrap();
-    net.end_call(None);
+    net.end_call(|| None);
     let big = vec![1u8; STREAM_BUF];
     assert_eq!(net.send(c, &big, None), Ok(STREAM_BUF));
     assert_eq!(net.send(c, b"x", None), Err(Error::Again));
-    net.end_call(Some(6));
+    net.end_call(|| Some(6));
     assert_eq!(woken(&mut net), [], "the reader is not waiting");
     net.recv(s, 10, false, &mut |_| true).unwrap();
     assert_eq!(woken(&mut net), [6], "room for the writer");
@@ -844,4 +862,49 @@ fn closing_wakes_the_waiters_of_the_socket_and_its_peer() {
     let mut woken = woken(&mut net);
     woken.sort_unstable();
     assert_eq!(woken, [7, 8]);
+}
+
+/// The reference test vector of SipHash-2-4 for an 8-byte message: key
+/// bytes 00..0f, message bytes 00..07.
+#[test]
+fn park_keys_use_siphash_2_4() {
+    let key = [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908];
+    assert_eq!(
+        super::siphash24(key, 0x0706_0504_0302_0100),
+        0x93f5_f579_9a93_2462
+    );
+}
+
+/// Finding S15: a forged record that guesses a parked socket's key (the
+/// counter they used to be, or a neighbour of a key it saw) does not take
+/// the socket; only the record that parked it does.
+#[test]
+fn a_parked_socket_answers_only_its_own_key() {
+    let mut net = Net::new();
+    net.set_secret([0x1234_5678, 0x9abc_def0]);
+    let (_, s, _) = connection(&mut net, 14);
+    let (_, s2, _) = connection(&mut net, 15);
+    let (r, r2) = (net.export(s).unwrap(), net.export(s2).unwrap());
+    net.release(s);
+    net.release(s2);
+    let (park, park2) = (r.parked.unwrap(), r2.parked.unwrap());
+    let mut guesses: Vec<u64> = (0..64).collect();
+    guesses.extend([
+        park.key ^ 1,
+        park.key.wrapping_add(1),
+        park2.key.wrapping_sub(1),
+    ]);
+    guesses.retain(|&g| g != park.key && g != park2.key);
+    for key in guesses {
+        let forged = Record {
+            parked: Some(Park { key, ..park }),
+            ..r.clone()
+        };
+        let (h, _) = net.import(&forged).unwrap();
+        assert_ne!(h, s, "key {key} took the parked socket");
+        assert_ne!(h, s2, "key {key} took the parked socket");
+        net.release(h);
+    }
+    assert_eq!(net.import(&r).unwrap().0, s, "its own record");
+    assert_eq!(net.import(&r2).unwrap().0, s2);
 }
