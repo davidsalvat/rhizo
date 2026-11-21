@@ -141,4 +141,45 @@ complete.
 
 ## Result
 
-To be measured on this pull request's runs.
+This pull request's code runs (16 changed paths, class *code*), same
+method as the baseline:
+
+| Job | Baseline 44932285327 | 44934092719 | Final run |
+|---|---|---|---|
+| `changes` | 0.1 min | 0.1 min | FINAL_CHANGES |
+| `quick` | 1.5 min, then the rest | 1.5 min, beside the rest | FINAL_QUICK |
+| `policy` | 0.8 min | 1.0 min | FINAL_POLICY |
+| `ci-arm64` | 4.7 min, from 1.8 | part 1: 2.8 min, part 2: 2.8 min, from 0.2 | FINAL_ARM |
+| `icount-aarch64` | 3.3 min | 3.4 min | FINAL_ICA |
+| `ci` (x86_64 tests) | 3.3 min | 3.4 min | FINAL_X86 |
+| `vmm` | 2.4 min | 2.6 min | FINAL_VMM |
+| `icount-x86_64` | 1.7 min | 1.7 min | FINAL_ICX |
+| `miri` | 3.7 min | 2.1 min | FINAL_MIRI |
+| **Wall clock** | **6.65 min** | **3.7 min** | **FINAL_WALL** |
+
+Inside the AArch64 parts of 44934092719: part 1 lints for 13 s, runs the
+differential check, and its VM phase ends with the in-kernel tests on 4
+CPUs (79.8 s); part 2 builds the host tests and kernels in 39 s and ends
+with the in-kernel tests on one CPU (92.8 s) beside the host tests
+(67.5 s). Both restored main's `ci-arm64` dependency cache (full match).
+Miri's three processes took 91.4 s, 82.7 s and 28.8 s at once. Every
+step of the baseline ran in exactly one part.
+
+The critical path is now `changes` plus the AArch64 instruction counts
+or the x86_64 tests (3.4 minutes each), neither changed here; the
+AArch64 tests are no longer on it. Runner time per code pull request
+grows by one ARM64 runner for about 2.8 minutes and the AArch64 lints'
+setup; Miri's is 1.6 minutes shorter.
+
+Cold and warm builds. Every job restored a warm dependency cache. From an
+empty target directory on the 4-CPU development host, the host tests
+build in 20.4 s and the test kernel in 7.9 s: the most that reusing every
+build between jobs could save per job, against the 25 to 57 s of setup a
+separate build job would add before them.
+
+A failing quick check (run 44934545695, a deliberate format error, then
+reverted): `quick` failed its check step at 0.4 minutes and cancelled
+the run; the nine other jobs stopped within 40 s of their start, and
+`ci-ok` failed. GitHub shows `quick` itself as cancelled (its cancel step
+was still running), with the failed step and its `ci-log` annotation
+naming the format diff.

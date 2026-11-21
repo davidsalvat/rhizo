@@ -12,11 +12,11 @@
 
 ## 3. Workflow
 
-- [ ] 3.1 `ci.yml`: heavy jobs need only `changes`; `quick` cancels the run on failure (D1); `ci-arm64` as a two-part matrix (D2); Miri in three processes (D3); verify `actionlint` and `cargo xtask check`
-- [ ] 3.2 AGENTS.md: the feedback loop table and the CI paragraph; verify by reading
+- [x] 3.1 `ci.yml`: heavy jobs need only `changes`; `quick` cancels the run on failure (D1); `ci-arm64` as a two-part matrix (D2); Miri in three processes (D3); verify `actionlint` and `cargo xtask check`
+- [x] 3.2 AGENTS.md: the feedback loop table and the CI paragraph; verify by reading
 - [x] 3.3 `openspec validate faster-ci-2 --strict`
 
 ## 4. Measure the result
 
 - [ ] 4.1 Per-job times and wall clock of this pull request's runs against the baseline (design *Result*); verify from `gh api .../runs/<id>/jobs`
-- [ ] 4.2 A failing quick check cancels the other jobs and fails `ci-ok`; verify on a run of this pull request with a deliberate format error, then reverted
+- [x] 4.2 A failing quick check cancels the other jobs and fails `ci-ok`; verify on a run of this pull request with a deliberate format error, then reverted
