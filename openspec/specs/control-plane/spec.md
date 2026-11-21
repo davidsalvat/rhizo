@@ -13,8 +13,9 @@ interactive chat with an agent in a cell.
 ### Requirement: Control kernel
 A `control` kernel build SHALL boot, say hello on its control channel, and
 then serve the host's requests until asked to power off: run, list,
-suspend, resume, fork and kill cells, stream a cell's output, write a file
-into a running cell, report memory and cells. It SHALL decide nothing by
+suspend, resume, fork, freeze and kill cells, stream a cell's output, write
+a file into a running cell, save a suspended cell or a template as bytes
+and load bytes as one, report memory and cells. It SHALL decide nothing by
 itself, and every reply SHALL carry the time the kernel took, in
 nanoseconds.
 
@@ -76,9 +77,9 @@ any text or damage that leaves its header readable.
 architecture, memory, CPUs and acceleration), keep a state that later
 commands use to reach it, and offer `run` (templates: `python-agent`,
 `python`, any program the kernel holds), `ps`, `stats`, `fork`, `suspend`,
-`resume`, `attach`, `kill` and `down`, each printing the kernel's time and
-the round trip the host measured. Several commands SHALL be able to talk to
-the same VM at once.
+`resume`, `freeze`, `save`, `load`, `attach`, `kill` and `down`, each
+printing the kernel's time and the round trip the host measured. Several
+commands SHALL be able to talk to the same VM at once.
 
 #### Scenario: Argument errors
 - **WHEN** a command is unknown, misses its cell, or `run python-agent` misses `--llm` or `--model`
@@ -150,13 +151,17 @@ moment and written only when the host addresses that cell.
 - **THEN** it reads the unread bytes, and the host's next input reaches it
 
 ### Requirement: Bounded input requests
-The protocol's version SHALL be 2. An `input` request carrying more than
+The protocol's version SHALL be 3. An `input` request carrying more than
 64 KiB SHALL be refused as too large, and its decoding, like that of every
 request, SHALL never panic nor allocate more than the frame's bytes.
 
 #### Scenario: Oversized or malformed input
 - **WHEN** the kernel receives an `input` request of 64 KiB plus one byte, or one whose length exceeds its payload
 - **THEN** it refuses it and keeps serving
+
+#### Scenario: Malformed load
+- **WHEN** a `load` request carries a template flag other than 0 or 1
+- **THEN** decoding refuses it
 
 ### Requirement: Prompt output
 A watched cell's output SHALL reach the host as soon as the cell waits with
@@ -191,9 +196,9 @@ it), `/branches` (the session's branches with their cells and states),
 - **THEN** `rhizo` refuses it with a message, and in a chat the conversation goes on
 
 ### Requirement: Sequential cell identifiers
-The control kernel SHALL give the cells the host starts or forks
-identifiers from 1, each one more than the last given; suspending and
-resuming a cell SHALL take none.
+The control kernel SHALL give the cells the host starts, forks or loads
+identifiers from 1, each one more than the last given; suspending,
+resuming and freezing a cell SHALL take none.
 
 #### Scenario: Fork after a resume
 - **WHEN** the host suspends cell `N`, resumes it and forks it into two, with no other cell started in between
@@ -225,3 +230,45 @@ once per line, never in front of a line already typed.
 #### Scenario: Two lines typed at once
 - **WHEN** two messages are typed at once into `rhizo chat`
 - **THEN** it prints `[rhizo] queued for the next turn` once, answers the first message, then the second
+
+### Requirement: Templates under control
+`freeze` SHALL make a running cell a template: it never runs again, `list`
+shows it as a template, `fork` of it SHALL make cells from it (all or
+none, each keeping no time of the template's waits), and `kill` SHALL drop
+it; its memory goes back once no cell made from it shares it.
+
+#### Scenario: Freeze and fork
+- **WHEN** the host freezes the chat agent waiting for its input and later forks the template into two
+- **THEN** `rhizo ps` lists it as a template, and each new cell answers its own input
+
+### Requirement: Save
+`save` SHALL send the exported snapshot of a suspended cell or a template
+over TCP to the host address and port it names, through the network card,
+first sending the request's one-time token, which the host checks before
+it keeps a byte, then reply with its size, leaving the cell as it was. `rhizo save <id>
+<file>` SHALL write the file once all its bytes came, and print its size,
+the kernel's time, the round trip and the rate.
+
+#### Scenario: Only the guest's connection
+- **WHEN** another connection reaches the host's end of a save or a load first, with a wrong token
+- **THEN** it is closed without a byte sent to it or kept from it, and the transfer completes with the connection that sends the request's token
+
+#### Scenario: Save a template
+- **WHEN** the `control` test step saves a template
+- **THEN** `rhizo save` reports the file, its size and its rate, and refuses a cell that does not exist
+
+### Requirement: Load
+`load` SHALL fetch a snapshot of the size it names over TCP from the host
+address and port it names, refused when memory cannot hold it, validate it
+and make it a suspended cell or a template, or refuse it with the reason
+and keep nothing. A VM without a network card SHALL refuse both, saying
+so. `rhizo load <file> [--template]` SHALL send a file and print as
+`save`.
+
+#### Scenario: A template and a suspended cell across a reboot
+- **WHEN** the `control` test step freezes a chat agent into a template after one turn, leaves another suspended after one turn, saves both, runs `rhizo down` and `rhizo up`, loads the first as a template and forks it into two, and loads the second and talks to it
+- **THEN** each of the two copies and the resumed cell answers its next message right
+
+#### Scenario: Refused files
+- **WHEN** `rhizo load` is given a saved file with one byte changed, its first half only, or the architecture of the other in its header
+- **THEN** it fails, saying `checksum mismatch` for the first two and `taken on` the other architecture for the third

@@ -191,13 +191,13 @@ next to `/usr/lib/python3.13` and `/app`.
 
 ### Requirement: Node.js in a cell
 The official Linux build of a pinned Node.js LTS release, dynamically
-linked, SHALL run unmodified as a cell with `--jitless`, started from the
-cell's files with its interpreter and libraries, and print what the same
-files print on Linux with an empty environment, HTTP requests through the
-network card with `node:http` included.
+linked, SHALL run unmodified as a cell with its JIT (no `--jitless`),
+started from the cell's files with its interpreter and libraries, and
+print what the same files print on Linux with an empty environment, HTTP
+requests through the network card with `node:http` included.
 
 #### Scenario: Agent request
-- **WHEN** Node.js runs `/app/demo.js` with `--jitless` in a cell holding the packed files
+- **WHEN** Node.js runs `/app/demo.js` in a cell holding the packed files
 - **THEN** it prints the output recorded from Linux, nothing else, and exits with 0
 
 #### Scenario: A request to the host
@@ -265,3 +265,13 @@ text as an answer. Any other text SHALL be the answer.
 #### Scenario: Text that is not a call
 - **WHEN** a reply's text holds no JSON object, or one naming no tool of the agent, or one whose arguments are not an object
 - **THEN** the agent shows the text as the answer and runs no tool
+
+### Requirement: Code written at run time
+A statically linked C program that writes machine code into memory it maps
+writable and executable, runs it, rewrites it and runs it again, also from
+two threads at once, SHALL print in a cell what it prints on Linux, also
+when forked, suspended and resumed between its steps.
+
+#### Scenario: A small JIT
+- **WHEN** `libc_jit` runs in a cell, plain, forked at `ready`, or suspended and resumed there
+- **THEN** every copy prints its expected output and exits with 0

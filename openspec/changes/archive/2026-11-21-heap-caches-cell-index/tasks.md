@@ -21,4 +21,4 @@
 
 ## 4. CI
 
-- [ ] 4.1 Everything CI runs; verify `cargo xtask check`, `cargo xtask test` on both architectures, and CI
+- [x] 4.1 Everything CI runs; verify `cargo xtask check`, `cargo xtask test` on both architectures, and CI (pull request #108, run 44916198844, green)

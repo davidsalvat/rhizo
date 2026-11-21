@@ -19,4 +19,4 @@
 
 ## 4. Measure the result
 
-- [ ] 4.1 Per-job times of this pull request's CI run against the baseline, and the classifier's verdict on it; verify from `gh api .../runs/<id>/jobs`
+- [x] 4.1 Per-job times of this pull request's CI run against the baseline, and the classifier's verdict on it; verify from `gh api .../runs/<id>/jobs`
