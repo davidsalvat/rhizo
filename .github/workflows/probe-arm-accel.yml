@@ -34,7 +34,7 @@ jobs:
       - run: rustup toolchain install
       - name: Build the AArch64 kernel
         run: |
-          path=$(cargo xtask --arch aarch64 build --release | tail -1)
+          path=$(cargo xtask --arch aarch64 build --release | grep "^/" | tail -1)
           cp "$path" kernel.img
           ls -l kernel.img
       - uses: actions/upload-artifact@v4
