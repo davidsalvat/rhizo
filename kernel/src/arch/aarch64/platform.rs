@@ -108,7 +108,7 @@ pub fn map_devices(
         map(d, d_len)?;
         map(r, 0x2_0000)?; // the boot CPU's; the others map theirs (`irq`)
     }
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     {
         // Transports share pages: map each page once.
         let (mut result, mut last) = (Ok(()), u64::MAX);
@@ -126,7 +126,7 @@ pub fn map_devices(
 /// Calls `f` with the physical base and the interrupt (a GIC interrupt
 /// identifier) of every virtio-mmio transport the device tree lists (QEMU
 /// `virt`, Firecracker).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn for_each_virtio_mmio(mut f: impl FnMut(u64, Option<u32>)) {
     let _ = device_tree().for_each_compatible_irq(b"virtio,mmio", |r, irq| f(r.base, irq));
 }
@@ -140,7 +140,7 @@ pub fn pmu_interrupt() -> Option<u32> {
 
 /// The ECAM base of PCI bus 0: the generic host bridge of the device tree
 /// (QEMU `virt`, Cloud Hypervisor).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn pci_ecam() -> Option<u64> {
     let dt = device_tree();
     dt.find_compatible(PCI_HOST).ok().flatten().map(|r| r.base)
@@ -148,7 +148,7 @@ pub fn pci_ecam() -> Option<u64> {
 
 /// Addresses for PCI memory BARs left unassigned (QEMU `virt` boots the
 /// kernel without firmware): the host bridge's 32-bit memory window.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn pci_window() -> Option<rhizo_virtio::pci::Window> {
     let r = device_tree().pci_memory_window(PCI_HOST).ok()??;
     Some(rhizo_virtio::pci::Window {
@@ -157,12 +157,12 @@ pub fn pci_window() -> Option<rhizo_virtio::pci::Window> {
     })
 }
 
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 const PCI_HOST: &[u8] = b"pci-host-ecam-generic";
 
 /// Maps the `len` bytes of device registers at physical `phys` as device
 /// memory in the MMIO window, where [`Mmio::new`] reaches them.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub fn map_device(phys: u64, len: u64) -> Result<(), MapError> {
     use crate::memory;
     let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE | PageFlags::DEVICE;
@@ -177,18 +177,18 @@ pub fn map_device(phys: u64, len: u64) -> Result<(), MapError> {
 
 /// The registers of a device at physical address `base`, mapped as device
 /// memory in the MMIO window by [`map_devices`] or [`map_device`].
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 #[derive(Debug)]
 pub struct Mmio(u64);
 
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 impl Mmio {
     pub fn new(base: u64) -> Self {
         Self(MMIO_BASE + base)
     }
 }
 
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 impl rhizo_hal::DeviceRegisters for Mmio {
     fn read32(&mut self, offset: usize) -> u32 {
         // SAFETY: `map_devices` or `map_device` mapped the device's

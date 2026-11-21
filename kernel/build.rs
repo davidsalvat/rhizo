@@ -73,7 +73,10 @@ fn embed_cells() {
     let from = std::env::var("RHIZO_CELLS_DIR").ok();
     let mut lookup = String::from(
         "/// The test cells built by `cargo xtask` and embedded at build time.\n\
-         pub fn test_image(name: &str) -> &'static [u8] {\n    match name {\n",
+         pub fn test_image(name: &str) -> &'static [u8] {\n    \
+         find_image(name.as_bytes()).unwrap_or_else(|| panic!(\"no test cell named {name}\"))\n}\n\n\
+         /// The embedded cell named `name`, if any (empty: not built).\n\
+         pub fn find_image(name: &[u8]) -> Option<&'static [u8]> {\n    Some(match name {\n",
     );
     for name in &names {
         let ktest = std::env::var_os("CARGO_FEATURE_KTEST").is_some();
@@ -92,9 +95,9 @@ fn embed_cells() {
         };
         std::fs::write(out.join(name), data).expect("write embedded cell");
         lookup += &format!(
-            "        {name:?} => include_bytes!(concat!(env!(\"OUT_DIR\"), \"/cells/{name}\")),\n"
+            "        b{name:?} => include_bytes!(concat!(env!(\"OUT_DIR\"), \"/cells/{name}\")) as &[u8],\n"
         );
     }
-    lookup += "        _ => panic!(\"no test cell named {name}\"),\n    }\n}\n";
+    lookup += "        _ => return None,\n    })\n}\n";
     std::fs::write(Path::new(&out_dir).join("cells.rs"), lookup).expect("write cells.rs");
 }

@@ -119,7 +119,7 @@ pub fn index() -> usize {
 }
 
 /// Error code of the last exception from a cell on this CPU.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub(super) fn trap_error() -> u64 {
     PERCPU[index()]
         .trap_error
@@ -128,7 +128,7 @@ pub(super) fn trap_error() -> u64 {
 
 /// Prepares the per-CPU data of secondary CPU `cpu`; returns its address
 /// (for its GS base).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub(super) fn percpu(cpu: usize) -> u64 {
     PERCPU[cpu]
         .index
@@ -517,6 +517,10 @@ rhizo_syscall_entry:
     // RIP, CS, RFLAGS, RSP, SS (pushed by the stub and the CPU).
 rhizo_user_trap:
     swapgs
+    push 2                          // RFLAGS: only the reserved bit. The
+    popfq                           // cell's DF and AC (set by POPF in ring
+                                    // 3; an interrupt gate keeps them) must
+                                    // not reach Rust code or lift SMAP
     push rax
     mov rax, gs:[16]
     mov [rax + 24], rbx

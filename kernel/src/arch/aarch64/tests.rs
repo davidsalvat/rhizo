@@ -7,7 +7,20 @@ use rhizo_core::ktest_case;
 pub static ALL: &[TestCase] = &[
     ktest_case!(device_tree_is_valid),
     ktest_case!(counter_frequency_is_known),
+    ktest_case!(pan_is_on),
 ];
+
+/// PAN is on wherever the CPU has it (QEMU's `max` CPU does), also after
+/// cells ran (every exception from EL0 sets it again); the self-check
+/// `ktest-user-read` shows it at work.
+fn pan_is_on() {
+    if !super::user::has_pan() {
+        use rhizo_hal::Console;
+        super::console::BootConsole.write_bytes(b"(no PAN on this CPU) ");
+        return;
+    }
+    assert!(super::user::pan_on(), "PSTATE.PAN is clear");
+}
 
 fn device_tree_is_valid() {
     let dt = super::platform::device_tree();
