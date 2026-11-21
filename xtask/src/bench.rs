@@ -1893,7 +1893,28 @@ pub fn comparison_table(results: &Results) -> String {
     };
     let (cpy_cold, cpy_warm) = cpython("rhizo");
     let (linux_cold, linux_warm) = cpython("linux-process");
-    if (cold.is_some() && warm.is_some()) || (cpy_cold.is_some() && cpy_warm.is_some()) {
+    let numpy = |guest: &str| {
+        (
+            find("workload.numpy_cold_us", guest, "firecracker"),
+            find("workload.numpy_warm_us", guest, "firecracker"),
+        )
+    };
+    let (np_cold, np_warm) = numpy("rhizo");
+    let (np_linux_cold, np_linux_warm) = numpy("linux-process");
+    let (node_cold, node_warm) = (
+        find("workload.node_cold_us", "rhizo", "firecracker"),
+        find("workload.node_warm_us", "rhizo", "firecracker"),
+    );
+    let node_linux = find("workload.node_cold_us", "linux-process", "firecracker");
+    if [
+        (cold, warm),
+        (cpy_cold, cpy_warm),
+        (np_cold, np_warm),
+        (node_cold, node_warm),
+    ]
+    .iter()
+    .any(|(c, w)| c.is_some() && w.is_some())
+    {
         s += "\n### A real interpreter\n";
     }
     if let (Some(c), Some(w)) = (cpy_cold, cpy_warm) {
@@ -1923,6 +1944,38 @@ pub fn comparison_table(results: &Results) -> String {
              | Forked from a template frozen after the warm-up | {} ({:.1}× faster) |\n",
             time(cold),
             time(warm),
+            c.median / w.median
+        );
+    }
+    if let (Some(c), Some(w)) = (np_cold, np_warm) {
+        s += &format!(
+            "\nnumpy and its OpenBLAS, installed from their PyPI wheels into a dynamically \
+             linked CPython, computing on arrays (`cells/python/numpy_demo.py`: a linear \
+             solve, a ufunc, a matrix product), in a cell and as a Linux process in the same \
+             Firecracker VM:\n\n\
+             | Started | Rhizo cell | Linux process |\n|---|---:|---:|\n\
+             | Cold (interpreter start, `import numpy`, compute) | {} | {} |\n\
+             | Forked from an interpreter frozen (cell) or kept (process) after \
+             `import numpy` | {} ({:.1}× faster) | {} |\n",
+            time(np_cold),
+            time(np_linux_cold),
+            time(np_warm),
+            c.median / w.median,
+            time(np_linux_warm)
+        );
+    }
+    if let (Some(c), Some(w)) = (node_cold, node_warm) {
+        s += &format!(
+            "\nNode.js (the official build, dynamically linked, run unmodified with \
+             `--jitless`) answering one agent tool call (`cells/node/demo.js`), in a cell \
+             and as a Linux process in the same Firecracker VM (Node.js cannot fork itself, \
+             so the process has no warm row):\n\n\
+             | Started | Rhizo cell | Linux process |\n|---|---:|---:|\n\
+             | Cold, from its executable (`ld.so`, V8 start-up, warm-up) | {} | {} |\n\
+             | Forked from Node.js frozen after its warm-up | {} ({:.1}× faster) | — |\n",
+            time(node_cold),
+            time(node_linux),
+            time(node_warm),
             c.median / w.median
         );
     }
@@ -2533,6 +2586,38 @@ mod tests {
             us("workload.cpython_warm_us", "rhizo", 1500.0),
         ]));
         assert!(only_cell.contains("| 30.00 ms | — |"), "{only_cell}");
+    }
+
+    #[test]
+    fn comparison_table_shows_numpy_and_node() {
+        let us = |name: &str, guest: &str, v: f64| {
+            let mut m = metric(name, guest, Some("firecracker"), v);
+            m.unit = "us".into();
+            m
+        };
+        let run = us("cell.run_us", "rhizo", 7.2);
+        let t = comparison_table(&results(vec![
+            run.clone(),
+            us("workload.numpy_cold_us", "rhizo", 70000.0),
+            us("workload.numpy_warm_us", "rhizo", 14000.0),
+            us("workload.numpy_cold_us", "linux-process", 60000.0),
+            us("workload.numpy_warm_us", "linux-process", 16000.0),
+            us("workload.node_cold_us", "rhizo", 36000.0),
+            us("workload.node_warm_us", "rhizo", 4500.0),
+            us("workload.node_cold_us", "linux-process", 32000.0),
+        ]));
+        assert!(t.contains("### A real interpreter"), "{t}");
+        assert!(
+            t.contains("`import numpy`, compute) | 70.00 ms | 60.00 ms |"),
+            "{t}"
+        );
+        assert!(t.contains("| 14.00 ms (5.0× faster) | 16.00 ms |"), "{t}");
+        assert!(
+            t.contains("V8 start-up, warm-up) | 36.00 ms | 32.00 ms |"),
+            "{t}"
+        );
+        assert!(t.contains("| 4.50 ms (8.0× faster) | — |"), "{t}");
+        assert!(!comparison_table(&results(vec![run])).contains("numpy"));
     }
 
     #[test]

@@ -345,3 +345,47 @@ calls cells have.
 #### Scenario: libuv probes io_uring
 - **WHEN** a cell calls `io_uring_setup`
 - **THEN** it receives `-ENOSYS` and the console shows nothing
+
+### Requirement: Hardware capabilities in the auxiliary vector
+On AArch64 the auxiliary vector of every cell SHALL carry `AT_HWCAP` with
+`HWCAP_FP`, `HWCAP_ASIMD` and `HWCAP_CPUID`, and no capability a cell
+cannot use. On x86_64 it SHALL stay without `AT_HWCAP`: programs read the
+CPU with `CPUID`.
+
+#### Scenario: A program checks its capabilities
+- **WHEN** a static glibc program reads `getauxval(AT_HWCAP)` in a cell on AArch64
+- **THEN** it finds FP, Advanced SIMD and `HWCAP_CPUID`
+
+### Requirement: ID registers read at EL0
+A read of an AArch64 ID register by cell code (`MRS` with op0 3, op1 0,
+CRn 0, CRm 0 to 7) SHALL be answered by the kernel as Linux answers it:
+`MIDR_EL1` and `REVIDR_EL1` as the CPU has them, `MPIDR_EL1` with only
+bit 31 set, every other register as zero; the cell resumes after the
+instruction.
+
+#### Scenario: A program reads the ID registers
+- **WHEN** a static glibc program reads `MIDR_EL1`, `MPIDR_EL1` and `ID_AA64ISAR0_EL1` in a cell on AArch64
+- **THEN** it finds a non-zero `MIDR_EL1` and `MPIDR_EL1` equal to bit 31, prints what it prints on Linux and exits with 0
+
+#### Scenario: OpenBLAS picks its kernels
+- **WHEN** numpy loads OpenBLAS in a cell on AArch64, which reads `MIDR_EL1` when `HWCAP_CPUID` is set and otherwise opens files under `/proc` and `/sys`
+- **THEN** it reads the register and computes, and does not fault
+
+#### Scenario: Any other undefined instruction
+- **WHEN** cell code runs an undefined instruction that is not such a read, or writes an ID register
+- **THEN** the cell ends with a fault, as before
+
+### Requirement: The monotonic clock follows real time
+The clock `clock_gettime` reads SHALL advance at the rate of real time
+within 0.05% on every VMM, with or without KVM: on x86_64, the TSC
+frequency the kernel finds (from KVM's clock, CPUID, the PIT or the local
+APIC timer) SHALL agree within 0.05% with 50 ms of the local APIC timer,
+which counts at 1 GHz on KVM and QEMU.
+
+#### Scenario: Under emulation
+- **WHEN** the kernel runs on QEMU without KVM (`microvm` or `q35`) and has found the TSC frequency
+- **THEN** 50 ms of the local APIC timer converts to 50 ms of the clock within 0.05%
+
+#### Scenario: A long wait measured in a cell
+- **WHEN** a cell times, with `CLOCK_MONOTONIC`, a model that answers 65 s after its request
+- **THEN** it reads at least 65 s, not 0.3 to 1.5% less

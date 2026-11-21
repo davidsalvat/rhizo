@@ -529,3 +529,36 @@ threshold.
 #### Scenario: A longer wake-up tail
 - **WHEN** a change makes `density.wake_p99_us` slower than its `ci` baseline by more than the timing threshold
 - **THEN** `cargo xtask bench --env ci --check` fails and names the metric
+
+### Requirement: numpy metrics
+`cargo xtask bench` SHALL report, for every VMM that measures cells and
+where the packages are built, the time to start the packages' CPython from
+the cell's files, import numpy, compute and exit
+(`workload.numpy_cold_us`), and the time for the same computation in a
+cell forked from a template frozen once numpy was imported
+(`workload.numpy_warm_us`).
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench` runs with `RHIZO_CPYTHON_SRC` set, natively, on a VMM where the counter frequency is known
+- **THEN** the results contain `workload.numpy_cold_us` and `workload.numpy_warm_us` for guest `rhizo`
+
+### Requirement: KPTI metrics
+`cargo xtask bench` SHALL report `cell.syscall_ns`, the round trip of the
+cheapest system call (`getpid`) measured by a cell, in the kernel's
+default mode, and the cost of KPTI forced on: `cell.syscall_kpti_ns`,
+`cell.switch_kpti_ns` (as `cell.switch_ns`) and `cell.run_kpti_us` (as
+`cell.run_us`), for every VMM that measures cells.
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench` runs a `bench-cell` kernel where the counter frequency is known
+- **THEN** the results contain `cell.syscall_ns`, `cell.syscall_kpti_ns`, `cell.switch_kpti_ns` and `cell.run_kpti_us`
+
+### Requirement: Node.js template frozen in its pause
+The template behind `workload.node_warm_us` SHALL be frozen once all its
+threads wait in the pause after the warm-up, so that every VMM measures
+forks of the same state, and the pause SHALL be over before the first
+fork.
+
+#### Scenario: Forks do not wait for the pause
+- **WHEN** `workload.node_warm_us` is measured
+- **THEN** no fork waits for the script's 50 ms pause after `warm`, and the figure is below `workload.node_cold_us`
