@@ -88,7 +88,7 @@ fn fresh(root: &Path, sub: &str) -> Result {
 
 /// Adds the interpreter and libraries to the tree `root`, then writes it
 /// to `file` as a cell file system.
-fn pack(root: &Path, native: bool, file: &Path) -> Result {
+pub(crate) fn pack(root: &Path, native: bool, file: &Path) -> Result {
     add_libraries(root, native)?;
     let mut fs = rhizo_fs::Fs::new();
     let mut tops: Vec<_> = std::fs::read_dir(root)
@@ -190,8 +190,13 @@ fn pack_python(root: &Path) -> Result {
     )
 }
 
-/// The interpreter and `DT_NEEDED` libraries of an ELF file (`readelf`).
-fn dynamic_info(file: &Path) -> Result<(Option<String>, Vec<String>)> {
+/// What `readelf` says of an ELF file: its interpreter, its `DT_NEEDED`
+/// libraries, and the directories of its run path (`DT_RPATH` or
+/// `DT_RUNPATH`).
+type Dynamic = (Option<String>, Vec<String>, Vec<String>);
+
+/// The interpreter, libraries and run path of an ELF file (`readelf`).
+fn dynamic_info(file: &Path) -> Result<Dynamic> {
     let out = Command::new("readelf")
         .args(["-ldW"])
         .arg(file)
@@ -210,13 +215,21 @@ fn dynamic_info(file: &Path) -> Result<(Option<String>, Vec<String>)> {
         .filter(|l| l.contains("(NEEDED)"))
         .filter_map(|l| between(l, "Shared library: ["))
         .collect();
-    Ok((interp, needed))
+    let run_path = text
+        .lines()
+        .filter_map(|l| between(l, "Library rpath: [").or_else(|| between(l, "Library runpath: [")))
+        .flat_map(|p| p.split(':').map(String::from).collect::<Vec<_>>())
+        .collect();
+    Ok((interp, needed, run_path))
 }
 
 /// Adds, for every ELF file in `root`, its interpreter at the path it names
 /// and the libraries it needs (and theirs) under `lib/<triple>`, a
 /// directory the interpreter searches by default: from the host's system
-/// directories, or from the cross toolchain's when `native` is false.
+/// directories, or from the cross toolchain's when `native` is false. A
+/// library the tree already holds in a directory the file's run path names
+/// relative to the file (`$ORIGIN`: what a wheel vendors) is used from
+/// there.
 fn add_libraries(root: &Path, native: bool) -> Result {
     let triple = triple();
     let search: Vec<PathBuf> = if native {
@@ -238,9 +251,9 @@ fn add_libraries(root: &Path, native: bool) -> Result {
     // Libraries need the interpreter too, by name: it is loaded already.
     let mut seen: BTreeSet<String> = todo
         .iter()
-        .filter_map(|(_, (interp, _))| Some(interp.as_ref()?.rsplit('/').next()?.to_string()))
+        .filter_map(|(_, (interp, _, _))| Some(interp.as_ref()?.rsplit('/').next()?.to_string()))
         .collect();
-    while let Some((file, (interp, needed))) = todo.pop() {
+    while let Some((file, (interp, needed, run_path))) = todo.pop() {
         if let Some(interp) = interp {
             let name = interp.rsplit('/').next().unwrap_or_default().to_string();
             let at = root.join(interp.trim_start_matches('/'));
@@ -254,8 +267,19 @@ fn add_libraries(root: &Path, native: bool) -> Result {
                 copy(&host.ok_or(format!("no interpreter {interp}"))?, &at)?;
             }
         }
+        let origin = file.parent().unwrap_or(root);
+        let vendored = |name: &str| {
+            run_path.iter().any(|dir| {
+                dir.strip_prefix("$ORIGIN").is_some_and(|rel| {
+                    origin
+                        .join(rel.trim_start_matches('/'))
+                        .join(name)
+                        .exists()
+                })
+            })
+        };
         for name in needed {
-            if !seen.insert(name.clone()) {
+            if vendored(&name) || !seen.insert(name.clone()) {
                 continue;
             }
             let Some(host) = search.iter().map(|d| d.join(&name)).find(|p| p.exists()) else {

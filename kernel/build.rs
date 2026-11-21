@@ -1,12 +1,13 @@
 use std::path::Path;
 
 /// Cells built only when their source is given, or by `xtask` only.
-const OPTIONAL: [&str; 5] = [
+const OPTIONAL: [&str; 6] = [
     "micropython",
     "cpython",
     "cpython-files",
     "dynamic-files",
     "distro-files",
+    "packages-files",
 ];
 /// Cells embedded in test kernels only (`ktest`): elsewhere they read as
 /// not built, and take no memory from the cells a benchmark runs (its guest

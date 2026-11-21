@@ -129,6 +129,9 @@ macro_rules! suite {
             ktest_case!(a_cpython_agent_talks_forks_and_survives_suspend),
             ktest_case!(dynamically_linked_programs_behave_as_on_linux),
             ktest_case!(a_dynamically_linked_cell_suspends_resumes_and_forks),
+            ktest_case!(numpy_from_a_wheel_computes_as_on_linux),
+            ktest_case!(requests_gets_from_the_host_as_on_linux),
+            ktest_case!(a_cell_that_imported_numpy_suspends_resumes_and_forks),
             ktest_case!(threads_behave_as_on_linux_and_return_memory),
             ktest_case!(spinning_thread_does_not_starve_its_siblings),
             ktest_case!(thread_count_does_not_buy_cpu_time),
@@ -1273,11 +1276,11 @@ fn memory_balance() -> (u64, usize) {
     )
 }
 
-/// Twenty cells each wanting 8 MiB of memory, or 16 MiB of files, at once:
-/// more than memory holds. Some are refused (`FAIL` from their own checks,
-/// or a fault), the rest finish, the kernel keeps running, and nothing
-/// leaks: every frame is back in the allocator or in the heap, and every
-/// heap allocation is freed.
+/// Twenty cells each wanting an eighth of free memory, as memory or as
+/// files, at once: more than memory holds, whatever the VM's size. Some are
+/// refused (`FAIL` from their own checks, or a fault), the rest finish, the
+/// kernel keeps running, and nothing leaks: every frame is back in the
+/// allocator or in the heap, and every heap allocation is freed.
 fn memory_pressure_fails_cells_not_the_kernel() {
     fn flood(name: &str, args: &[&[u8]]) -> (usize, usize) {
         let mut host = Host::new();
@@ -1294,11 +1297,13 @@ fn memory_pressure_fails_cells_not_the_kernel() {
         }
         (done, refused)
     }
+    // 2.5 times what memory holds: more even when, on several CPUs, some
+    // cells end before others start.
+    let mib = alloc::format!("{}", (memory::free_bytes() >> 20) / 8 + 1);
+    let mib = mib.as_bytes();
     for (name, args) in [
-        // 16 MiB each: more than memory holds even when, on several
-        // CPUs, some cells end before others start.
-        ("ballast", &[&b"all"[..], b"16"][..]),
-        ("filer", &[&b"16"[..]][..]),
+        ("ballast", &[&b"all"[..], mib][..]),
+        ("filer", &[mib][..]),
     ] {
         let before = memory_balance();
         let (done, refused) = flood(name, args);
@@ -1994,6 +1999,110 @@ fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
     host.run(|_| false);
     for id in [resumed].into_iter().chain(children).chain(from_template) {
         assert_eq!(ended(&host, id), (Ending::Exit(0), rest.into()));
+    }
+}
+
+// --- C.2: packages from PyPI --------------------------------------------------
+
+/// The files of the packages' CPython, or `None` (said on the console)
+/// when they were not packed.
+fn packages() -> Option<rhizo_fs::Fs> {
+    let files = crate::cell::packages_files();
+    if files.is_none() {
+        arch::console::BootConsole.write_bytes(b"(packages not packed: not run) ");
+    }
+    files
+}
+
+/// Spawns the packages' CPython with `argv` (spec `workloads`, packages
+/// from PyPI).
+fn spawn_python(host: &mut Host, files: &rhizo_fs::Fs, argv: &[&str]) -> u32 {
+    spawn_dynamic(host, files, expected::NUMPY_ARGV[0], argv)
+}
+
+/// numpy from its manylinux wheel: CPython opens its extension modules and
+/// the OpenBLAS they need with `dlopen`, and the computation prints what it
+/// prints on Linux (`cells/expected.rs`, by the differential check). Once
+/// the kept file pages are dropped, every frame and heap allocation is
+/// back.
+fn numpy_from_a_wheel_computes_as_on_linux() {
+    let Some(files) = packages() else { return };
+    let before = memory_balance();
+    let mut host = Host::new();
+    let id = spawn_python(&mut host, &files, &expected::NUMPY_ARGV);
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::NUMPY_STDOUT.into())
+    );
+    drop(host);
+    assert!(crate::cell::drop_images(), "file pages were kept");
+    assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// requests (with urllib3, idna, charset_normalizer and certifi) makes an
+/// HTTP GET to the host's fake model through the network card and prints
+/// what a Linux process prints of the answer.
+fn requests_gets_from_the_host_as_on_linux() {
+    let Some(files) = packages() else { return };
+    let Some((ip, port)) = crate::wire::options().llm else {
+        arch::console::BootConsole.write_bytes(b"(no network card and model server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card got an address"
+    );
+    let url = alloc::format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+    let [python, flag, script] = expected::REQUESTS_ARGV;
+    let id = spawn_python(&mut host, &files, &[python, flag, script, &url]);
+    let end = crate::cell::now_ns() + 600_000_000_000;
+    while host.finished(id).is_none() && crate::cell::now_ns() < end {
+        host.step();
+    }
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::REQUESTS_STDOUT.into())
+    );
+}
+
+/// The template case: a cell that imported numpy, suspended and resumed
+/// from the snapshot's bytes, forked, and frozen as a template, every copy
+/// finishes the computation without importing numpy again.
+fn a_cell_that_imported_numpy_suspends_resumes_and_forks() {
+    let Some(files) = packages() else { return };
+    let [python, flag, script] = expected::NUMPY_ARGV;
+    let mut host = Host::new();
+    let ready = |host: &mut Host| {
+        let id = spawn_python(host, &files, &[python, flag, script, "wait"]);
+        while host.output(id) != Some(b"ready\n") {
+            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
+            host.step();
+        }
+        id
+    };
+    let id = ready(&mut host);
+    let bytes = host.suspend(id).expect("live").into_bytes();
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let resumed = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    let children = host.fork(resumed, 2).expect("fork");
+    let template = ready(&mut host);
+    assert!(host.freeze(template));
+    let from_template: Vec<u32> = (0..2)
+        .map(|_| {
+            host.spawn_from_template(template, true, true)
+                .expect("fork")
+        })
+        .collect();
+    host.run(|_| false);
+    for id in [resumed].into_iter().chain(children).chain(from_template) {
+        assert_eq!(
+            ended(&host, id),
+            (Ending::Exit(0), expected::NUMPY_STDOUT.into())
+        );
     }
 }
 

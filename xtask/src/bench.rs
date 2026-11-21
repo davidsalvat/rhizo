@@ -411,6 +411,10 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
         }
+        match crate::compare::numpy_in_vm(opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("numpy/linux-process/firecracker".into(), e)),
+        }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),
@@ -478,6 +482,7 @@ fn measure_cells(
         let (mut agent_suspend_resume, mut agent_fork) = (Vec::new(), Vec::new());
         let mut agent_skipped = None;
         let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
+        let (mut numpy_cold, mut numpy_warm) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         let mut syscall = Vec::new();
         // The PMU's passes, where the guest has one (spec `profiling`).
@@ -531,6 +536,10 @@ fn measure_cells(
                     if let Some((r, t)) = parse_dynamic_line(&out.output) {
                         dyn_run.push(r as f64 / 1000.0);
                         dyn_template.push(t as f64 / 1000.0);
+                    }
+                    if let Some((c, w)) = parse_numpy_line(&out.output) {
+                        numpy_cold.push(c as f64 / 1000.0);
+                        numpy_warm.push(w as f64 / 1000.0);
                     }
                     if let Some(d) = parse_density_line(&out.output) {
                         density = Some(d);
@@ -653,6 +662,8 @@ fn measure_cells(
             ("workload.agent_fork_us", "us", &mut agent_fork),
             ("workload.dynamic_run_us", "us", &mut dyn_run),
             ("workload.dynamic_template_us", "us", &mut dyn_template),
+            ("workload.numpy_cold_us", "us", &mut numpy_cold),
+            ("workload.numpy_warm_us", "us", &mut numpy_warm),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
             ("cell.parallel_us", "us", &mut parallel),
@@ -786,6 +797,13 @@ fn parse_dynamic_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("run_ns")?, field("template_ns")?))
+}
+
+/// `(cold_ns, warm_ns)` of the numpy line of a `bench-cell` kernel (absent
+/// when the packages were not packed).
+fn parse_numpy_line(output: &str) -> Option<(u64, u64)> {
+    let field = |key| crate::profile::field(output, "rhizo-numpy", key);
+    Some((field("cold_ns")?, field("warm_ns")?))
 }
 
 /// `(idle_bytes, suspended_bytes)` of the density line of a `bench-cell`
@@ -2186,6 +2204,14 @@ mod tests {
             "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-dynamic run_ns=812000 template_ns=95000\n";
         assert_eq!(parse_dynamic_line(out), Some((812_000, 95_000)));
         assert_eq!(parse_dynamic_line("rhizo-dynamic run_ns=1"), None);
+    }
+
+    #[test]
+    fn numpy_line_is_parsed() {
+        let out = "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-numpy cold_ns=90000000 warm_ns=400000\n";
+        assert_eq!(parse_numpy_line(out), Some((90_000_000, 400_000)));
+        assert_eq!(parse_numpy_line("rhizo-numpy cold_ns=1"), None);
+        assert_eq!(parse_numpy_line("rhizo-numpyx cold_ns=1 warm_ns=2"), None);
     }
 
     #[test]

@@ -12,8 +12,8 @@ mod expected {
     include!("../../cells/expected.rs");
 }
 use expected::{
-    AGENT_TRANSCRIPT, AGENT_TURNS, CPYTHON_ARGV, CPYTHON_STDOUT, DYNAMIC, Ending, PROGRAMS,
-    PYTHON_COMMAND, PYTHON_STDOUT,
+    AGENT_TRANSCRIPT, AGENT_TURNS, CPYTHON_ARGV, CPYTHON_STDOUT, DYNAMIC, Ending, NUMPY_ARGV,
+    NUMPY_STDOUT, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT, REQUESTS_ARGV, REQUESTS_STDOUT,
 };
 
 /// Why the check cannot run on this host, if it cannot.
@@ -72,7 +72,59 @@ pub fn check(dir: &Path) -> Result {
     }
     check_python(dir, &scratch)?;
     check_cpython(&scratch)?;
-    check_dynamic()
+    check_dynamic()?;
+    check_packages()
+}
+
+/// The packages' CPython (`crate::packages`), when built: run natively from
+/// the top of its tree with an empty environment, as in a cell, numpy's
+/// script prints [`NUMPY_STDOUT`], and the requests script, given the
+/// host's fake model, [`REQUESTS_STDOUT`].
+fn check_packages() -> Result {
+    let root = crate::packages::root();
+    if !root.join(NUMPY_ARGV[0]).exists() {
+        crate::report::text("[xtask] packages not built (RHIZO_CPYTHON_SRC unset): skipped");
+        return Ok(());
+    }
+    let url = format!(
+        "http://127.0.0.1:{}",
+        crate::hostnet::llm_server("127.0.0.1", 0)?
+    );
+    let [python, flag, script] = REQUESTS_ARGV;
+    for (argv, stdout) in [
+        (&NUMPY_ARGV[..], NUMPY_STDOUT),
+        (&[python, flag, script, &url][..], REQUESTS_STDOUT),
+    ] {
+        let out = Command::new(root.join(argv[0]))
+            .arg0(argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .current_dir(&root)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || text != stdout {
+            return Err(Failure::new(
+                "differential",
+                format!("`{}` behaves differently on Linux", argv[2]),
+            )
+            .location(format!("cells/{}", argv[2].replace("app/", "python/")))
+            .expected(format!("exit 0, stdout {stdout:?} (cells/expected.rs)"))
+            .actual(format!(
+                "{:?}, stdout {text:?}, stderr {:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ))
+            .hint("Linux is the reference: fix the script or the expectation")
+            .reproduce(format!(
+                "cd {} && env -i {}",
+                root.display(),
+                argv.join(" ")
+            ))
+            .into_error());
+        }
+    }
+    Ok(())
 }
 
 /// The dynamically linked programs packed for cells (`crate::dynamic`), run

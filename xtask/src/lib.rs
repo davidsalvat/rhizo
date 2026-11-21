@@ -18,6 +18,7 @@ mod demo;
 mod deps;
 mod differential;
 mod dynamic;
+mod packages;
 pub mod hostnet;
 mod profile;
 mod refguest;
@@ -37,6 +38,11 @@ const KERNEL_PACKAGE: &str = "rhizo-kernel";
 /// Test programs run as cells (bare-metal targets only).
 const CELLS_PACKAGE: &str = "rhizo-cells";
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
+/// Memory of the in-kernel test VMs (`ktest`, `ktest-smp`), in MiB: the
+/// packages cell's files (numpy) are embedded, decoded and mapped (design
+/// D4 of `add-pip-packages`).
+pub(crate) const KTEST_MEMORY_MIB: u32 = 512;
+
 /// Virtual CPUs of the `ktest-smp` step (spec `multi-core`).
 pub(crate) const SMP_CPUS: u32 = 4;
 /// Timeout for the self-check that expects a hanging kernel.
@@ -425,6 +431,7 @@ fn cmd_test(args: &RunArgs) -> Result {
                 kernel.clone(),
                 RunOptions {
                     network: true,
+                    memory_mib: KTEST_MEMORY_MIB,
                     shard: shard(i, shards),
                     ..opts
                 },
@@ -446,6 +453,7 @@ fn cmd_test(args: &RunArgs) -> Result {
                     // virtio-mmio in `ktest`, so both transports run on AArch64.
                     pci_card: true,
                     cpus: SMP_CPUS,
+                    memory_mib: KTEST_MEMORY_MIB,
                     shard: shard(i, shards),
                     ..opts
                 },
@@ -1021,6 +1029,7 @@ fn cmd_ci() -> Result {
         &Guest::Rhizo(kernel),
         RunOptions {
             network: true,
+            memory_mib: KTEST_MEMORY_MIB,
             ..q35.run_options(test_timeout()?)
         },
     )?;
@@ -1198,6 +1207,7 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     build_micropython(&out)?;
     cpython::build(&out)?;
     dynamic::build(&out)?;
+    packages::build(&out)?;
     Ok(out)
 }
 

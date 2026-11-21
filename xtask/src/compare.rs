@@ -305,17 +305,7 @@ pub fn cpython_in_vm(
     if let Some(reason) = Vmm::Firecracker.unavailable_reason(accel) {
         return Err(reason);
     }
-    let program = scratch.join("linux_cpython_static");
-    let source = workspace_root().join("bench/host/linux_cpython.c");
-    let status = Command::new(crate::c_compiler())
-        .args(["-static", "-O2", "-o"])
-        .arg(&program)
-        .arg(&source)
-        .status()
-        .map_err(|e| format!("cannot run the C compiler: {e}"))?;
-    if !status.success() {
-        return Err(format!("cannot compile {}", source.display()));
-    }
+    let program = static_init("linux_cpython", scratch)?;
     let mut files = Vec::new();
     collect(&root, "", &mut files)?;
     let server = workspace_root().join("bench/host/cpython_forkserver.py");
@@ -380,6 +370,83 @@ pub fn cpython_in_vm(
         .into_iter()
         .map(|(name, mut values)| metric(name, "linux-process", "firecracker", "us", &mut values))
         .collect())
+}
+
+/// `bench/host/<name>.c` compiled statically into `scratch`, the `/init` of
+/// a Linux guest.
+fn static_init(name: &str, scratch: &Path) -> Result<PathBuf> {
+    let program = scratch.join(format!("{name}_static"));
+    let source = workspace_root().join(format!("bench/host/{name}.c"));
+    let status = Command::new(crate::c_compiler())
+        .args(["-static", "-O2", "-o"])
+        .arg(&program)
+        .arg(&source)
+        .status()
+        .map_err(|e| format!("cannot run the C compiler: {e}"))?;
+    if !status.success() {
+        return Err(format!("cannot compile {}", source.display()));
+    }
+    Ok(program)
+}
+
+/// Parses a `linux-numpy cold_us=<x> warm_us=<y>` line.
+pub fn parse_numpy_line(text: &str) -> Option<(f64, f64)> {
+    let line = &text[text.find("linux-numpy ")?..];
+    let field = |key: &str| -> Option<f64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("cold_us")?, field("warm_us")?))
+}
+
+/// numpy on Linux in the same Firecracker VM as the cells (design D6 of
+/// `add-pip-packages`): the packages cell's files in the guest's initramfs,
+/// `bench/host/linux_numpy.c` as `/init`. Cold: fork and exec of the numpy
+/// script; warm: a fork of a CPython process that imported numpy
+/// (`numpy_forkserver.py`).
+pub fn numpy_in_vm(accel: Accel, scratch: &Path) -> Result<Vec<Metric>> {
+    let root = crate::packages::root();
+    if !root.join("usr/bin/python3").exists() {
+        return Err("packages not built (RHIZO_CPYTHON_SRC unset)".into());
+    }
+    if let Some(reason) = Vmm::Firecracker.unavailable_reason(accel) {
+        return Err(reason);
+    }
+    let program = static_init("linux_numpy", scratch)?;
+    let mut files = Vec::new();
+    collect(&root, "", &mut files)?;
+    let server = workspace_root().join("bench/host/numpy_forkserver.py");
+    files.push(("app/numpy_forkserver.py".into(), read(&server)?));
+    let entries: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let initramfs = refguest::initramfs_with(&read(&program)?, &entries);
+    let samples = boot_guest(&initramfs, scratch, "linux-numpy", None, parse_numpy_line)?;
+    report::text(&format!(
+        "numpy inside firecracker on {}: {} boots",
+        arch::current().id(),
+        samples.len()
+    ));
+    let (mut cold, mut warm): (Vec<f64>, Vec<f64>) = samples.into_iter().unzip();
+    Ok(vec![
+        metric(
+            "workload.numpy_cold_us",
+            "linux-process",
+            "firecracker",
+            "us",
+            &mut cold,
+        ),
+        metric(
+            "workload.numpy_warm_us",
+            "linux-process",
+            "firecracker",
+            "us",
+            &mut warm,
+        ),
+    ])
 }
 
 /// Every file and directory under `dir` as initramfs entries named from
@@ -1047,6 +1114,14 @@ mod tests {
             (00.012345) Restore finished successfully. Tasks resumed.\n\n";
         assert_eq!(criu_log_seconds(log), Some(0.012345));
         assert_eq!(criu_log_seconds("no timestamps"), None);
+    }
+
+    #[test]
+    fn numpy_line_is_found_among_console_noise() {
+        let line = "[  1.2] junk linux-numpy cold_us=180000.5 warm_us=900.25";
+        assert_eq!(parse_numpy_line(line), Some((180_000.5, 900.25)));
+        assert_eq!(parse_numpy_line("linux-numpy cold_us=1 warm_us=failed"), None);
+        assert_eq!(parse_numpy_line("linux-numpy failed: no numpy"), None);
     }
 
     #[test]
