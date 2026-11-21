@@ -31,6 +31,7 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
     ),
     ("rhizo-sched", &[]),
     ("rhizo-prof", &[]),
+    ("rhizo-control", &[]),
     (
         "rhizo-snapshot",
         &[
@@ -56,10 +57,12 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
             "rhizo-net",
             "rhizo-virtio",
             "rhizo-prof",
+            "rhizo-control",
         ],
     ),
     ("rhizo-cells", &[]),
-    ("xtask", &["rhizo-fs"]),
+    ("xtask", &["rhizo-fs", "rhizo-control"]),
+    ("rhizo-cli", &["rhizo-control", "xtask"]),
 ];
 
 /// Workspace-internal edges `(from, to)` found in `cargo metadata` output.

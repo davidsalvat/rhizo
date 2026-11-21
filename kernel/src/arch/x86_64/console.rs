@@ -25,6 +25,26 @@ pub fn init(kind: ConsoleKind) {
 #[derive(Debug, Clone, Copy)]
 pub struct BootConsole;
 
+/// The control channel (change `add-control-plane`): the serial port, both
+/// ways, shared with the console's text; it needs `console=serial`.
+#[cfg(feature = "control")]
+pub mod control {
+    use super::{Ordering, Serial, USE_DEBUG_PORT};
+
+    /// The next byte the host sent, if one is waiting.
+    pub fn read_byte() -> Option<u8> {
+        if USE_DEBUG_PORT.load(Ordering::Relaxed) {
+            return None;
+        }
+        Serial::com1().read_byte()
+    }
+
+    /// Sends `bytes` (a frame) to the host as they are.
+    pub fn write(bytes: &[u8]) {
+        Serial::com1().write_raw(bytes);
+    }
+}
+
 impl Console for BootConsole {
     fn write_bytes(&mut self, bytes: &[u8]) {
         if USE_DEBUG_PORT.load(Ordering::Relaxed) {

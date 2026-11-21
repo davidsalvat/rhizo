@@ -7,7 +7,8 @@
 //!   `for_each_ram`, `for_each_reserved`, `map_devices`; in builds that run
 //!   cells, `for_each_virtio_mmio`, `pci_ecam`, `pci_window`, `map_device`
 //!   and `Mmio` (a device's registers)
-//! - `console`: `init`, `BootConsole`; `power`: `init`, `Machine`
+//! - `console`: `init`, `BootConsole`; in control builds, `control::{read_byte,
+//!   write}` (the UART both ways); `power`: `init`, `Machine`
 //! - `cpu`: `init`, `supports_1gib_pages`, `activate`, `CpuTlb`
 //! - `timer`: `Counter`, `cycles_to_ns`
 //! - `user` (cell builds only): `enter_user`, `Trap`, `release_user`,
