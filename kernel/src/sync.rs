@@ -47,14 +47,14 @@ impl<T> Global<T> {
     }
 
     /// The value, without locking: `&mut self` proves nobody else has it.
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     pub fn get_mut(&mut self) -> &mut T {
         self.0.get_mut()
     }
 
     /// The value, the lock gone: owning the global proves nobody else has
     /// it.
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     pub fn into_inner(self) -> T {
         self.0.into_inner()
     }
