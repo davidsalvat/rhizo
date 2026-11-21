@@ -139,6 +139,8 @@ macro_rules! suite {
             ktest_case!(template_of_a_threaded_program),
             ktest_case!(every_cpu_has_its_number_and_own_stack),
             ktest_case!(kernel_globals_are_safe_across_cpus),
+            ktest_case!(timed_waits_last_as_long_on_every_cpu),
+            ktest_case!(idle_cpus_wake_only_for_deadlines),
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
@@ -2528,6 +2530,53 @@ fn kernel_globals_are_safe_across_cpus() {
         heap_before.live,
         "every allocation freed"
     );
+}
+
+/// A 20 ms wait on each CPU's own timer lasts 20 ms by the counter, on
+/// the secondary CPUs as on the boot CPU (spec `multi-core`: x86_64
+/// secondary CPUs once kept the local APIC timer's reset divider, and
+/// such a wait ended after 1.3 ms on QEMU). The longest of three tries, as
+/// another interrupt may end a wait early.
+fn timed_waits_last_as_long_on_every_cpu() {
+    const WAIT_NS: u64 = 20_000_000;
+    for cpu in 0..crate::smp::count() {
+        let took = (0..3)
+            .map(|_| {
+                if cpu == 0 {
+                    crate::cell::timed_wait(WAIT_NS)
+                } else {
+                    crate::smp::post(cpu, crate::cell::timed_wait, WAIT_NS);
+                    crate::smp::join(cpu)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (WAIT_NS * 9 / 10..WAIT_NS * 10).contains(&took),
+            "CPU {cpu}: a {WAIT_NS} ns wait took {took} ns"
+        );
+    }
+}
+
+/// Every CPU idles while one cell sleeps 300 ms: the CPUs leave their
+/// waits a handful of times in all, not at every slice (spec `multi-core`,
+/// idle CPUs use no time: each idle CPU once looked again every 10 ms while
+/// a cell slept), and the sleeper still ends on time.
+fn idle_cpus_wake_only_for_deadlines() {
+    use crate::prof::{self, Count};
+    let now = || arch::timer::cycles_to_ns(arch::timer::Counter.cycles()).unwrap_or(0);
+    let mut host = Host::new();
+    let id = spawn(&mut host, "sleeper", &[b"300"]);
+    let (w0, t0) = (prof::get(Count::IdleWakeups), now());
+    host.run(|h| h.finished(id).is_some());
+    let (wakeups, took) = (prof::get(Count::IdleWakeups) - w0, now() - t0);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "slept ok\n".into()));
+    let cpus = crate::smp::count() as u64;
+    assert!(
+        wakeups <= 4 * cpus,
+        "{cpus} CPUs left their waits {wakeups} times in 300 ms"
+    );
+    assert!(took < 400_000_000, "the 300 ms sleeper took {took} ns");
 }
 
 /// Every CPU online, as a mask.
