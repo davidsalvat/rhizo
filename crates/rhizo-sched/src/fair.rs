@@ -148,14 +148,17 @@ struct Clock {
 
 /// How the entries of a [`Scheduler`](crate::Scheduler) share the CPUs.
 /// `()` is round robin, at no cost: every hook does nothing and is
-/// compiled away.
+/// compiled away. `Option<Fair>` chooses at run time: round robin while
+/// `None`, at the cost of a test in each hook.
 pub trait Share {
-    /// Whether a CPU picks among its queue by weight rather than taking the
-    /// first entry.
-    const BY_WEIGHT: bool = false;
-
     /// No weight, nothing used, for `cpus` CPUs.
     fn new(cpus: usize) -> Self;
+
+    /// Whether a CPU picks among its queue by weight rather than taking the
+    /// first entry.
+    fn by_weight(&self) -> bool {
+        false
+    }
 
     /// Whether a cap holds the entry known by `key` out of the run queues,
     /// and until when.
@@ -167,17 +170,68 @@ pub trait Share {
     fn arrive(&mut self, _cpu: usize, _key: u32, _peers: impl Iterator<Item = u32>) {}
 
     /// Of the runnable entries `keys`, the position of the one for `cpu` to
-    /// run (only with [`BY_WEIGHT`](Self::BY_WEIGHT)).
+    /// run (only [`by_weight`](Self::by_weight)).
     fn pick(&mut self, _cpu: usize, _keys: impl Iterator<Item = u32> + Clone) -> usize {
         0
     }
 
     /// Lets the caps whose period ended by `now` run again.
     fn release(&mut self, _now: u64) {}
+
+    /// Charges `ns` of CPU time on `cpu`, ending at `now`, to the entry
+    /// known by `key`; returns the capped nodes whose cap it used up.
+    fn charge(&mut self, _cpu: usize, _key: u32, _ns: u64, _now: u64) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// Whether the entry known by `key` counts against `node`'s cap.
+    fn under(&self, _key: u32, _node: u32) -> bool {
+        false
+    }
 }
 
 impl Share for () {
     fn new(_cpus: usize) -> Self {}
+}
+
+/// Round robin while `None`; by weight once a [`Fair`] is put in.
+impl Share for Option<Fair> {
+    fn new(_cpus: usize) -> Self {
+        None
+    }
+
+    fn by_weight(&self) -> bool {
+        self.is_some()
+    }
+
+    fn held(&self, key: u32) -> Option<u64> {
+        self.as_ref()?.held(key)
+    }
+
+    fn arrive(&mut self, cpu: usize, key: u32, peers: impl Iterator<Item = u32>) {
+        if let Some(f) = self {
+            f.arrive(cpu, key, peers);
+        }
+    }
+
+    fn pick(&mut self, cpu: usize, keys: impl Iterator<Item = u32> + Clone) -> usize {
+        self.as_mut().map_or(0, |f| f.pick(cpu, keys))
+    }
+
+    fn release(&mut self, now: u64) {
+        if let Some(f) = self {
+            f.release(now);
+        }
+    }
+
+    fn charge(&mut self, cpu: usize, key: u32, ns: u64, now: u64) -> Vec<u32> {
+        self.as_mut()
+            .map_or_else(Vec::new, |f| f.charge(cpu, key, ns, now))
+    }
+
+    fn under(&self, key: u32, node: u32) -> bool {
+        self.as_ref().is_some_and(|f| f.under(key, node))
+    }
 }
 
 /// Weights, virtual times and caps, by identifier: entries share the CPUs
@@ -192,8 +246,6 @@ pub struct Fair {
 }
 
 impl Share for Fair {
-    const BY_WEIGHT: bool = true;
-
     fn new(cpus: usize) -> Self {
         Self {
             domains: BTreeMap::new(),
@@ -201,6 +253,10 @@ impl Share for Fair {
             caps: BTreeMap::new(),
             clocks: alloc::vec![Clock::default(); cpus],
         }
+    }
+
+    fn by_weight(&self) -> bool {
+        true
     }
 
     fn held(&self, key: u32) -> Option<u64> {
@@ -286,6 +342,51 @@ impl Share for Fair {
             }
         }
     }
+
+    /// Charges `ns` of CPU time on `cpu`, ending at `now`, to the cell
+    /// known by `key`, its domain and its capped nodes; returns the nodes
+    /// whose cap it used up.
+    fn charge(&mut self, cpu: usize, key: u32, ns: u64, now: u64) -> Vec<u32> {
+        let Some(m) = self.cells.get_mut(&key) else {
+            return Vec::new();
+        };
+        let clock = &mut self.clocks[cpu];
+        if clock.weight != 0 {
+            clock.vtime += Account::scaled(ns, clock.weight);
+        }
+        m.account.charge(ns);
+        if let Some(a) = self.domains.get_mut(&m.domain) {
+            a.charge(ns);
+        }
+        let period = now / PERIOD_NS;
+        let mut spent = Vec::new();
+        for node in &m.capped {
+            let Some(cap) = self.caps.get_mut(node) else {
+                continue;
+            };
+            if cap.period != period {
+                *cap = Cap {
+                    period,
+                    used: 0,
+                    until: None,
+                    ..*cap
+                };
+            }
+            cap.used += ns;
+            if cap.used >= cap.budget && cap.until.is_none() {
+                cap.until = Some((period + 1) * PERIOD_NS);
+                spent.push(*node);
+            }
+        }
+        spent
+    }
+
+    /// Whether the cell known by `key` counts against `node`'s cap.
+    fn under(&self, key: u32, node: u32) -> bool {
+        self.cells
+            .get(&key)
+            .is_some_and(|m| m.capped.contains(&node))
+    }
 }
 
 impl Fair {
@@ -326,6 +427,16 @@ impl Fair {
         self.cells.remove(&key);
     }
 
+    /// Forgets the cells and capped nodes whose identifier `keep` refuses
+    /// (they left the tree), and the domains none of the others is in.
+    pub fn retain(&mut self, keep: impl Fn(u32) -> bool) {
+        self.cells.retain(|&key, _| keep(key));
+        self.caps.retain(|&node, _| keep(node));
+        let cells = &self.cells;
+        self.domains
+            .retain(|&d, _| cells.values().any(|m| m.domain == d));
+    }
+
     /// Sets or removes the CPU cap of `node`: at most `cap_ns` of CPU time
     /// per [`PERIOD_NS`] for the cells that name it.
     pub fn set_cap(&mut self, node: u32, cap_ns: Option<u64>) {
@@ -352,51 +463,6 @@ impl Fair {
             return (u32::MAX, None, None);
         };
         (m.domain, self.domains.get(&m.domain), Some(&m.account))
-    }
-
-    /// Charges `ns` of CPU time on `cpu`, ending at `now`, to the cell
-    /// known by `key`, its domain and its capped nodes; returns the nodes
-    /// whose cap it used up.
-    pub(crate) fn charge(&mut self, cpu: usize, key: u32, ns: u64, now: u64) -> Vec<u32> {
-        let Some(m) = self.cells.get_mut(&key) else {
-            return Vec::new();
-        };
-        let clock = &mut self.clocks[cpu];
-        if clock.weight != 0 {
-            clock.vtime += Account::scaled(ns, clock.weight);
-        }
-        m.account.charge(ns);
-        if let Some(a) = self.domains.get_mut(&m.domain) {
-            a.charge(ns);
-        }
-        let period = now / PERIOD_NS;
-        let mut spent = Vec::new();
-        for node in &m.capped {
-            let Some(cap) = self.caps.get_mut(node) else {
-                continue;
-            };
-            if cap.period != period {
-                *cap = Cap {
-                    period,
-                    used: 0,
-                    until: None,
-                    ..*cap
-                };
-            }
-            cap.used += ns;
-            if cap.used >= cap.budget && cap.until.is_none() {
-                cap.until = Some((period + 1) * PERIOD_NS);
-                spent.push(*node);
-            }
-        }
-        spent
-    }
-
-    /// Whether the cell known by `key` counts against `node`'s cap.
-    pub(crate) fn under(&self, key: u32, node: u32) -> bool {
-        self.cells
-            .get(&key)
-            .is_some_and(|m| m.capped.contains(&node))
     }
 }
 
@@ -533,6 +599,74 @@ mod fair_shares {
             })
             .collect();
         assert_eq!(order, [1, 2, 3, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_switchable_scheduler_is_round_robin_until_a_fair_is_put_in() {
+        let mut s = Scheduler::switchable(1);
+        for key in [1, 2, 101] {
+            s.place(key);
+        }
+        let turns = |s: &mut Scheduler<u32, Option<Fair>>, n| -> Vec<u32> {
+            (0..n)
+                .map(|_| {
+                    let k = s.next(0, 0).unwrap();
+                    s.requeue_charged(0, k, || (SLICE_NS, 0));
+                    k
+                })
+                .collect()
+        };
+        assert_eq!(turns(&mut s, 6), [1, 2, 101, 1, 2, 101], "round robin");
+        // Domain 0 holds cells 1 and 2, domain 1 cell 101: by weight, 101
+        // runs every other slice.
+        let fair = s.shares().insert(Fair::new(1));
+        for (key, domain, share) in [(1, 0, WHOLE / 2), (2, 0, WHOLE / 2), (101, 1, WHOLE)] {
+            fair.set_domain(domain, DEFAULT_WEIGHT);
+            fair.set_cell(key, domain, share, Vec::new());
+        }
+        let got = turns(&mut s, 40);
+        let other = got.iter().filter(|&&k| k == 101).count();
+        assert_eq!(other, 20, "{got:?}");
+        *s.shares() = None;
+        let got = turns(&mut s, 30);
+        assert_eq!(got.iter().filter(|&&k| k == 101).count(), 10, "{got:?}");
+    }
+
+    #[test]
+    fn requeue_charged_holds_a_subtree_past_its_cap() {
+        let mut s = Scheduler::switchable(1);
+        let fair = s.shares().insert(Fair::new(1));
+        fair.set_domain(0, DEFAULT_WEIGHT);
+        fair.set_cap(7, Some(SLICE_NS));
+        fair.set_cell(1, 0, WHOLE, alloc::vec![7]);
+        s.place(1);
+        let k = s.next(0, 0).unwrap();
+        let mut asked = false;
+        s.requeue_charged(0, k, || {
+            asked = true;
+            (SLICE_NS, SLICE_NS)
+        });
+        assert!(asked, "the slice is asked while sharing by weight");
+        assert_eq!(s.runnable(), 0, "held until the period ends");
+        assert_eq!(s.next_wake(), Some(PERIOD_NS));
+        assert_eq!(s.next(0, PERIOD_NS), Some(1), "back at the next period");
+        *s.shares() = None;
+        s.requeue_charged(0, 1, || unreachable!("not asked while round robin"));
+        assert_eq!(s.runnable(), 1);
+    }
+
+    #[test]
+    fn retain_forgets_cells_caps_and_empty_domains() {
+        let mut s = Scheduler::fair(1);
+        domains(&mut s, &[100, 100], &[2, 1]);
+        s.shares().set_cap(0, Some(PERIOD_NS / 10));
+        s.shares().set_cell(0, 0, WHOLE / 2, alloc::vec![0]);
+        s.shares().retain(|key| key != 0 && key != 100);
+        assert!(s.shares().cells.contains_key(&1));
+        assert!(!s.shares().cells.contains_key(&0));
+        assert!(s.shares().caps.is_empty(), "node 0 left");
+        let domains: Vec<u32> = s.shares().domains.keys().copied().collect();
+        assert_eq!(domains, [0], "domain 1 has no cell left");
     }
 
     proptest! {

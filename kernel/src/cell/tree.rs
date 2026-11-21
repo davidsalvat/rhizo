@@ -54,6 +54,7 @@ impl Host {
         };
         cell.renumber(pid);
         cell.domain = cell.id;
+        self.reshare_if_by_weight();
         true
     }
 
@@ -80,9 +81,14 @@ impl Host {
                 (copy.cell.pid, copy.cell.domain) = (pid, domain);
             }
         };
-        self.tree
+        let entered = self
+            .tree
             .add_copies(source, ids, &|_| used, &mut placed)
-            .is_ok()
+            .is_ok();
+        if entered {
+            self.reshare_if_by_weight();
+        }
+        entered
     }
 
     /// Places a cell restored from `snapshot`'s state, not yet run: under
@@ -99,6 +105,7 @@ impl Host {
         {
             (cell.pid, cell.domain) = (n.pid(), n.domain());
             self.suspended.swap_remove(at);
+            self.reshare_if_by_weight();
             return true;
         }
         let spec = Spec {
@@ -109,6 +116,7 @@ impl Host {
             return false;
         };
         (cell.pid, cell.domain) = (pid, cell.id);
+        self.reshare_if_by_weight();
         true
     }
 
@@ -199,5 +207,6 @@ impl Host {
             }
         }
         self.settling = false;
+        self.reshare_if_by_weight();
     }
 }

@@ -96,9 +96,19 @@ impl<T: Keyed> Scheduler<T, Fair> {
     pub fn fair(cpus: usize) -> Self {
         Self::with(cpus)
     }
+}
 
+impl<T: Keyed> Scheduler<T, Option<Fair>> {
+    /// An empty scheduler for `cpus` CPUs (at least one), round robin until
+    /// a [`Fair`] is put in its [`shares`](Self::shares).
+    pub fn switchable(cpus: usize) -> Self {
+        Self::with(cpus)
+    }
+}
+
+impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// The weights and caps, to set when the tree changes.
-    pub fn shares(&mut self) -> &mut Fair {
+    pub fn shares(&mut self) -> &mut F {
         &mut self.share
     }
 
@@ -149,8 +159,24 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         }
     }
 
-    fn push(&mut self, cpu: usize, entry: T) {
-        let key = entry.key();
+    /// Puts `entry`, known by `key`, at the end of `cpu`'s queue, with one
+    /// test of how entries share: by weight, one that `arrives` (it did not
+    /// just run) is not owed back what it did not use while idle, and one a
+    /// cap holds sleeps until its period ends.
+    fn push(&mut self, cpu: usize, key: u32, entry: T, arrives: bool) {
+        if self.share.by_weight() {
+            return self.push_by_weight(cpu, key, entry, arrives);
+        }
+        self.queue(cpu, key, entry);
+    }
+
+    /// [`push`](Self::push) while entries share by weight.
+    #[inline(never)]
+    fn push_by_weight(&mut self, cpu: usize, key: u32, entry: T, arrives: bool) {
+        if arrives {
+            let peers = self.queues[cpu].iter().map(|e| e.1);
+            self.share.arrive(cpu, key, peers);
+        }
         self.enqueue(cpu, key, entry);
     }
 
@@ -160,17 +186,13 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         if let Some(until) = self.share.held(key) {
             return self.sleep(entry, until);
         }
-        self.queues[cpu].push_back((self.arrivals, key, entry));
-        self.arrivals += 1;
+        self.queue(cpu, key, entry);
     }
 
-    /// The entry known by `key` becomes runnable on `cpu` (it did not just
-    /// run): what it did not use while idle is not owed back.
-    fn arrive(&mut self, cpu: usize, key: u32) {
-        if F::BY_WEIGHT {
-            let peers = self.queues[cpu].iter().map(|e| e.1);
-            self.share.arrive(cpu, key, peers);
-        }
+    /// Puts `entry` at the end of `cpu`'s queue.
+    fn queue(&mut self, cpu: usize, key: u32, entry: T) {
+        self.queues[cpu].push_back((self.arrivals, key, entry));
+        self.arrivals += 1;
     }
 
     /// Takes, of the entries in the queues of CPUs `queues`, the one owed
@@ -199,8 +221,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// returns that CPU.
     pub fn place(&mut self, entry: T) -> usize {
         let cpu = self.shortest();
-        self.arrive(cpu, entry.key());
-        self.push(cpu, entry);
+        self.push(cpu, entry.key(), entry, true);
         cpu
     }
 
@@ -209,14 +230,42 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// than the shortest; then at the end of the shortest. Returns the CPU
     /// whose queue it joined.
     pub fn requeue(&mut self, cpu: usize, entry: T) -> usize {
+        let cpu = self.back_to(cpu);
+        self.push(cpu, entry.key(), entry, false);
+        cpu
+    }
+
+    /// [`requeue`](Self::requeue) after [`charge`](Self::charge): the slice
+    /// `entry` just ran, whose length and end `slice` gives, asked only
+    /// while entries share by weight. One test of how they share for both.
+    pub fn requeue_charged(
+        &mut self,
+        cpu: usize,
+        entry: T,
+        slice: impl FnOnce() -> (u64, u64),
+    ) -> usize {
+        let key = entry.key();
+        if self.share.by_weight() {
+            let (ns, now) = slice();
+            self.charge(cpu, key, ns, now);
+            let to = self.back_to(cpu);
+            self.enqueue(to, key, entry);
+            return to;
+        }
+        let to = self.back_to(cpu);
+        self.queue(to, key, entry);
+        to
+    }
+
+    /// Where an entry that just ran on `cpu` goes back: `cpu`'s queue,
+    /// unless it holds more entries than the shortest.
+    fn back_to(&self, cpu: usize) -> usize {
         let shortest = self.shortest();
-        let cpu = if self.queues[cpu].len() > self.queues[shortest].len() {
+        if self.queues[cpu].len() > self.queues[shortest].len() {
             shortest
         } else {
             cpu
-        };
-        self.push(cpu, entry);
-        cpu
+        }
     }
 
     /// Puts `entry` to sleep until `wake_at` (nanoseconds, same clock as
@@ -272,8 +321,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
             return false;
         };
         f(&mut entry);
-        self.arrive(cpu, key);
-        self.push(cpu, entry);
+        self.push(cpu, key, entry, true);
         true
     }
 
@@ -296,22 +344,25 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// has seen each: what
     /// [`next`](Self::next) does first, for a caller that wants to know
     /// when an entry became runnable.
-    pub fn wake_due(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
+    pub fn wake_due(&mut self, cpu: usize, now: u64, f: impl FnMut(&mut T)) {
         self.share.release(now);
+        self.wake_sleepers(cpu, now, f);
+    }
+
+    /// [`wake_due`](Self::wake_due) but for the caps it lets run again.
+    fn wake_sleepers(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
         // The due ones are at the front: no search, nothing else moves (an
         // entry a cap still holds goes back to sleep, later than `now`).
         while let Some((_, key, mut entry)) = self.sleeping.pop_front_if(|e| e.0 <= now) {
             f(&mut entry);
-            self.arrive(cpu, key);
-            self.enqueue(cpu, key, entry);
+            self.push(cpu, key, entry, true);
         }
         while let Some(&(d, key)) = self.deadlines.first()
             && d <= now
         {
             if let Some(mut entry) = self.take_waiting(key) {
                 f(&mut entry);
-                self.arrive(cpu, key);
-                self.push(cpu, entry);
+                self.push(cpu, key, entry, true);
             }
         }
     }
@@ -332,27 +383,43 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// waited longest in another CPU's queue (by weight: the one there owed
     /// the most).
     pub fn next(&mut self, cpu: usize, now: u64) -> Option<T> {
-        self.wake_due(cpu, now, |_| {});
-        let from = if self.queues[cpu].is_empty() {
-            self.oldest(Some(cpu))?
-        } else {
-            cpu
-        };
-        if F::BY_WEIGHT {
-            return self.take_by_weight(cpu, from..from + 1);
+        if self.share.by_weight() {
+            return self.next_by_weight(cpu, now);
         }
+        self.wake_sleepers(cpu, now, |_| {});
+        let from = self.next_from(cpu)?;
         self.queues[from].pop_front().map(|(_, _, e)| e)
+    }
+
+    /// [`next`](Self::next) while entries share by weight.
+    #[inline(never)]
+    fn next_by_weight(&mut self, cpu: usize, now: u64) -> Option<T> {
+        self.wake_due(cpu, now, |_| {});
+        let from = self.next_from(cpu)?;
+        self.take_by_weight(cpu, from..from + 1)
+    }
+
+    /// The queue `cpu` takes from: its own, or the one whose first entry
+    /// has waited longest.
+    fn next_from(&self, cpu: usize) -> Option<usize> {
+        if self.queues[cpu].is_empty() {
+            self.oldest(Some(cpu))
+        } else {
+            Some(cpu)
+        }
     }
 
     /// Wakes the sleepers whose time has come (onto CPU 0's queue) and
     /// returns the entry that has waited longest in any queue (by weight:
     /// the one owed the most CPU time in all of them).
     pub fn next_oldest(&mut self, now: u64) -> Option<T> {
-        self.wake_due(0, now, |_| {});
-        let from = self.oldest(None)?;
-        if F::BY_WEIGHT {
+        if self.share.by_weight() {
+            self.wake_due(0, now, |_| {});
+            self.oldest(None)?;
             return self.take_by_weight(0, 0..self.queues.len());
         }
+        self.wake_sleepers(0, now, |_| {});
+        let from = self.oldest(None)?;
         self.queues[from].pop_front().map(|(_, _, e)| e)
     }
 

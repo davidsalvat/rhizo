@@ -1585,6 +1585,49 @@ the test above, reported), and no regression of `cell.switch_ns`,
 tree section (format version 11) and into `run`, `load`, `limits` and
 template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
 
+**As built in phase 1 (task 1.9c, kernel wiring).**
+
+- **When the host shares by weight.** Round robin per cell already gives
+  each domain exactly its weight's part while every node is a root (alone
+  in its domain) of the default weight without a cap, which is every cell
+  until the tree says otherwise. So the host stays round robin then, and
+  shares by weight as soon as one node is not plain (a child, a weight
+  other than 100, a cap), and goes back to round robin when none is left.
+  The scheduler's policy is `Option<Fair>`: round robin while `None`.
+- **Cost of the choice.** Each locked section of the scheduler tests the
+  policy once: taking a cell (`next`), and putting it back (charging and
+  requeueing in one call, `requeue_charged`; a filed cell is charged
+  apart). A copy of a plain cell, a root of default weight and a resumed
+  cell keep the host round robin, so spawn, fork and resume test the policy
+  without computing anything. Measured with `--icount-only` against the
+  commit this branched from: `cell.switch_insns` 876 to 875 (x86_64) and
+  817 to 820 (AArch64, +0.37 %); every other figure within +0.5 %.
+- **Cost of the domain pick.** `cell.switch_domains_ns` (reported) is the
+  switch with two domains while the host shares by weight: 2,137
+  instructions on x86_64 and 1,899 on AArch64, against 875 and 820, so
+  about 1,100 to 1,300 instructions per switch: the pick builds the list
+  of domains with work and looks each key up in ordered maps, and the end
+  of the slice reads the clock and charges the cell, its domain and its
+  capped nodes. Accepted for now: only trees that use weights or caps pay
+  it, and it is a cost per switch, not per system call.
+- **Shares are computed when the tree changes.** The host recomputes every
+  cell's domain, flattened share and capped nodes (`fair::flatten`) after
+  a spawn, a copy, a resume, a placement and each settled end, only while
+  it shares by weight; virtual times and cap use carry over. That is
+  O(cells) per tree change in that mode.
+- **Slices and caps.** The kernel charges the time from taking a cell to
+  giving it back (a gang: from the last CPU that joined it, so a gang's
+  slice counts once, not once per CPU). A cap is checked at the end of a
+  slice, and a slice lasts up to two timer ticks (a cell is preempted at
+  its second): a capped subtree overshoots by up to one such slice per
+  period for each CPU running it.
+- **Placement and weights from tests.** Until the tree operations of task
+  1.9 and protocol version 4 (task 1.11) reach the kernel, in-kernel tests
+  and benchmarks place cells and set weights and caps with
+  `Host::set_cpu_share`; those operations call `reshare` once they change
+  the tree, and `--cpu-weight` and `--cpu-max` come with version 4.
+- `sched.domain_share_pct`: 49 under `-icount` on AArch64.
+
 Alternatives:
 
 - One scheduling entity per tree level, as Linux's group scheduling.

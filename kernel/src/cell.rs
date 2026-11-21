@@ -36,7 +36,7 @@ use rhizo_mm::paging::{PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_net::Net;
 use rhizo_prof::Part;
-use rhizo_sched::{Gangs, IdleTimer, Keyed, SLICE_NS, Scheduler, TagPool};
+use rhizo_sched::{Fair, Gangs, IdleTimer, Keyed, SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::{Data, Snapshot};
 
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
@@ -55,6 +55,7 @@ mod ops;
 mod pages;
 mod sched;
 mod services;
+mod shares;
 mod slice;
 mod snapshot;
 mod sockets;

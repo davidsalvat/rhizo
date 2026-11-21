@@ -91,7 +91,8 @@ impl Host {
     pub fn new() -> Self {
         Self {
             shared: Global::new(Shared {
-                sched: Scheduler::new(crate::smp::count()),
+                sched: Scheduler::switchable(crate::smp::count()),
+                taken: [0; MAX_CPUS],
                 tags: TagPool::new(MAX_TAG.load(Ordering::Relaxed)),
                 ended: Vec::new(),
                 running: 0,

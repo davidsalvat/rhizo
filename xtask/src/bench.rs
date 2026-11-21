@@ -557,6 +557,7 @@ fn measure_cells(
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         let mut syscall = Vec::new();
         let mut switch_fp = Vec::new();
+        let (mut switch_domains, mut share_pct) = (Vec::new(), Vec::new());
         let (mut syscall_kpti, mut switch_kpti, mut run_kpti) =
             (Vec::new(), Vec::new(), Vec::new());
         // The PMU's passes, where the guest has one (spec `profiling`).
@@ -645,6 +646,13 @@ fn measure_cells(
                     {
                         switch_fp.push(ns as f64);
                     }
+                    let shares = |key| crate::profile::field(&out.output, "rhizo-shares", key);
+                    if let Some(ns) = shares("switch_ns") {
+                        switch_domains.push(ns as f64);
+                    }
+                    if let Some(pct) = shares("domain_share_pct") {
+                        share_pct.push(pct as f64);
+                    }
                     for (name, value) in crate::profile::pmu_passes(&out.output) {
                         let unit = if name.ends_with("_insns") {
                             "insns"
@@ -727,6 +735,8 @@ fn measure_cells(
             ("cell.switch_ns", "ns", &mut switch),
             ("cell.switch_untagged_ns", "ns", &mut untagged),
             ("cell.switch_fp_ns", "ns", &mut switch_fp),
+            ("cell.switch_domains_ns", "ns", &mut switch_domains),
+            ("sched.domain_share_pct", "%", &mut share_pct),
             ("cell.suspend_us", "us", &mut suspend),
             ("cell.resume_us", "us", &mut resume),
             ("cell.resume_eager_us", "us", &mut eager),

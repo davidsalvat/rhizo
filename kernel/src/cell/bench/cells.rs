@@ -387,6 +387,67 @@ pub(super) fn switch_ns(mut host: Host) -> u64 {
     rounds[2]
 }
 
+/// [`switch_ns`] with the two cells in two domains while cells share the
+/// CPUs by weight (design D23 of `add-cell-hierarchy`): an `idle` cell
+/// placed under the first one makes the host pick a domain, then a cell of
+/// it, by virtual time. What the domain pick costs a switch.
+pub(super) fn switch_domains_ns() -> u64 {
+    const YIELDS: u64 = 2000;
+    let mut host = Host::new();
+    let mut rounds = [0u64; 5];
+    for round in &mut rounds {
+        let mut spawn = |name: &'static str| {
+            host.spawn(test_image(name), &[name.as_bytes()], false, false)
+                .expect("spawn")
+        };
+        let (a, b, idle) = (spawn("yielder"), spawn("yielder"), spawn("idle"));
+        assert!(host.set_cpu_share(idle, Some(a), 100, u32::MAX));
+        let t0 = bench_clock();
+        host.run(|h| h.finished(a).is_some() && h.finished(b).is_some());
+        let t1 = bench_clock();
+        *round = bench_ns(t1 - t0).unwrap_or(0) / (2 * YIELDS);
+    }
+    rounds.sort_unstable();
+    rounds[2]
+}
+
+/// The share of one CPU a domain of one spinning cell gets next to a
+/// domain of 16, with equal weights, over 1 s, in percent (design D23 of
+/// `add-cell-hierarchy`): 50 when domains share by weight, 6 by round
+/// robin per cell.
+pub(super) fn domain_share_pct() -> u64 {
+    let mut host = Host::new();
+    let spinner = |host: &mut Host, parent| {
+        let id = host
+            .spawn(test_image("spin"), &[b"spin"], false, false)
+            .expect("spawn spin");
+        let quota = Quota {
+            cpu_ns: u64::MAX - 1, // counted, never reached
+            ..Quota::NONE
+        };
+        assert!(host.set_quota(id, quota));
+        assert!(host.set_cpu_share(id, parent, 100, u32::MAX));
+        id
+    };
+    let root = spinner(&mut host, None);
+    let mut cells = alloc::vec![root];
+    for _ in 0..15 {
+        cells.push(spinner(&mut host, Some(root)));
+    }
+    let one = spinner(&mut host, None);
+    cells.push(one);
+    let t0 = now_ns();
+    while now_ns() - t0 < 1_000_000_000 {
+        host.step();
+    }
+    let used: Vec<u64> = cells.iter().map(|&c| host.cpu_ns(c).unwrap_or(0)).collect();
+    for c in cells {
+        host.kill(c);
+    }
+    let all: u64 = used.iter().sum();
+    100 * used[16] / all.max(1)
+}
+
 /// Median over 5 rounds of the time per switch between two `fp_regs`
 /// cells that yield to each other 2000 times each with values in every
 /// FP/SIMD register (change `lazy-fp-switch`): the run of both to their
