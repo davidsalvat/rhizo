@@ -1,7 +1,8 @@
 //! `rhizo`: boots a Rhizo VM with the control kernel and runs, lists,
-//! suspends, resumes, forks and kills its cells, and talks to an agent in
-//! one (spec `control-plane`, changes `add-control-plane` and
-//! `add-interactive-chat`). Linux hosts only. Policy lives here: which
+//! suspends, resumes, forks, freezes and kills its cells, saves and loads
+//! them as files, and talks to an agent in one (spec `control-plane`,
+//! changes `add-control-plane`, `add-interactive-chat` and
+//! `snapshots-on-disk`). Linux hosts only. Policy lives here: which
 //! programs a template starts with which files, and when to suspend or
 //! fork, are this tool's choices; the kernel only executes requests.
 
@@ -65,6 +66,13 @@ fn main() -> ExitCode {
                 println!("resumed {id} in {}", reply.timing());
                 Ok(())
             }
+            Command::Freeze(id) => {
+                let reply = Client::connect(&dir)?.call(&Request::Freeze(id))?;
+                println!("froze {id} into a template in {}", reply.timing());
+                Ok(())
+            }
+            Command::Save { id, file } => save(&mut Client::connect(&dir)?, id, &file),
+            Command::Load { file, template } => load(&mut Client::connect(&dir)?, &file, template),
             Command::Kill(id) => {
                 let reply = Client::connect(&dir)?.call(&Request::Kill(id))?;
                 println!("killed {id} in {}", reply.timing());
@@ -256,6 +264,118 @@ fn attach(client: &mut Client, id: u32) -> Result<(), String> {
     }
 }
 
+/// `rhizo save`: the kernel's chunks, written to `file` once all came.
+fn save(client: &mut Client, id: u32, file: &std::path::Path) -> Result<(), String> {
+    let t0 = Instant::now();
+    let request = client.send(&Request::Save(id))?;
+    let mut bytes = Vec::new();
+    let ns = loop {
+        match client.next()? {
+            (r, Message::Data(data)) if r == request => bytes.extend(data),
+            (r, Message::Done { ns, body }) if r == request => {
+                if body != Body::Bytes(bytes.len() as u64) {
+                    return Err(format!(
+                        "the kernel sent {} bytes, then {body:?}",
+                        bytes.len()
+                    ));
+                }
+                break ns;
+            }
+            (r, Message::Failed { error, message, .. }) if r == request => {
+                return Err(refusal(error, &message));
+            }
+            _ => {}
+        }
+    };
+    let took = t0.elapsed();
+    let tmp = file.with_extension("partial");
+    std::fs::write(&tmp, &bytes)
+        .and_then(|()| std::fs::rename(&tmp, file))
+        .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+    println!(
+        "saved {id} to {} ({}) in {} (round trip {}, {})",
+        file.display(),
+        size(bytes.len()),
+        duration(ns),
+        duration(took.as_nanos() as u64),
+        rate(bytes.len(), took)
+    );
+    Ok(())
+}
+
+/// `rhizo load`: the file in chunks, all sent before the replies are read.
+fn load(client: &mut Client, file: &std::path::Path, template: bool) -> Result<(), String> {
+    let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let t0 = Instant::now();
+    let opened = client.call(&Request::Load {
+        size: bytes.len() as u64,
+        template,
+    })?;
+    let &Body::Cell(cell) = &opened.body else {
+        return Err(format!("unexpected reply {:?}", opened.body));
+    };
+    let mut sent = Vec::new();
+    for chunk in bytes.chunks(rhizo_control::CHUNK) {
+        sent.push(client.send(&Request::LoadData {
+            cell,
+            data: chunk.to_vec(),
+        })?);
+    }
+    let (mut ns, mut first_error) = (opened.ns, None);
+    for request in sent {
+        let reply = loop {
+            match client.next()? {
+                (r, message) if r == request => break message,
+                _ => {}
+            }
+        };
+        match reply {
+            Message::Done { ns: n, .. } => ns += n,
+            Message::Failed { error, message, .. } => {
+                first_error.get_or_insert_with(|| refusal(error, &message));
+            }
+            other => return Err(format!("unexpected reply {other:?}")),
+        }
+    }
+    if let Some(e) = first_error {
+        return Err(format!("{}: {e}", file.display()));
+    }
+    let took = t0.elapsed();
+    println!(
+        "loaded {} as {} {cell} ({}) in {} (round trip {}, {})",
+        file.display(),
+        if template {
+            "template"
+        } else {
+            "suspended cell"
+        },
+        size(bytes.len()),
+        duration(ns),
+        duration(took.as_nanos() as u64),
+        rate(bytes.len(), took)
+    );
+    Ok(())
+}
+
+fn refusal(error: rhizo_control::Error, message: &[u8]) -> String {
+    if message.is_empty() {
+        error.as_str().to_string()
+    } else {
+        format!("{}: {}", error.as_str(), String::from_utf8_lossy(message))
+    }
+}
+
+fn size(bytes: usize) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1 << 20) as f64)
+}
+
+fn rate(bytes: usize, took: Duration) -> String {
+    format!(
+        "{:.2} MiB/s",
+        bytes as f64 / (1 << 20) as f64 / took.as_secs_f64().max(1e-9)
+    )
+}
+
 fn describe(state: State) -> String {
     match state {
         State::Running => "running".into(),
@@ -263,6 +383,7 @@ fn describe(state: State) -> String {
         State::Exited(code) => format!("exited {code}"),
         State::Fault => "faulted".into(),
         State::Killed => "killed".into(),
+        State::Template => "template".into(),
     }
 }
 
@@ -291,11 +412,12 @@ fn cmd_stats(dir: &Dir) -> Result<(), String> {
     };
     let mib = |b: u64| b as f64 / (1 << 20) as f64;
     println!(
-        "cells: {} running, {} suspended ({:.1} MiB of snapshots), {} ended\n\
+        "cells: {} running, {} suspended ({:.1} MiB of snapshots), {} templates, {} ended\n\
          memory: {:.1} MiB free of {:.1} MiB\n(in {})",
         s.running,
         s.suspended,
         mib(s.snapshot_bytes),
+        s.templates,
         s.ended,
         mib(s.memory_free),
         mib(s.memory_total),

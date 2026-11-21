@@ -5,9 +5,14 @@
 //! or kill them is the host's business (`rhizo`, design D1).
 //!
 //! A cell keeps its identifier for its whole life here, and identifiers
-//! count up by one for each cell the host starts or forks: the kernel's own
-//! cell identifiers, which a resume also takes, stay behind this table
-//! (change `fix-cli-nits`).
+//! count up by one for each cell the host starts, forks or loads: the
+//! kernel's own cell identifiers, which a resume also takes, stay behind
+//! this table (change `fix-cli-nits`).
+//!
+//! Snapshots leave and enter as bytes (change `snapshots-on-disk`): a
+//! save streams a suspended cell's or a template's exported snapshot in
+//! chunks, and a load gathers the chunks the host sends, then validates
+//! them as the untrusted input they are (`Snapshot::from_bytes`).
 
 use crate::arch::console::control as link;
 use crate::arch::timer::{self, Counter};
@@ -16,12 +21,13 @@ use crate::memory;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use rhizo_cell::quota::Quota;
 use rhizo_control::{
-    Body, CellInfo, Decoder, Error, Item, Message, Request, Run, State, Stats, VERSION,
+    Body, CHUNK, CellInfo, Decoder, Error, Item, Message, Request, Run, State, Stats, VERSION,
 };
 use rhizo_hal::CycleCounter;
 use rhizo_mm::FRAME_SIZE;
-use rhizo_snapshot::Snapshot;
+use rhizo_snapshot::{FormatError, Snapshot};
 
 /// How often the boot CPU looks at the serial line while it has nothing to
 /// run: often right after a request, less when the host is quiet (design
@@ -44,7 +50,17 @@ enum Place {
     /// Running as this kernel cell.
     Live(u32),
     Suspended(Snapshot),
+    /// A template, as this kernel template.
+    Template(u32),
     Ended(State),
+}
+
+/// A snapshot the host is sending, to become cell `id`.
+struct Load {
+    id: u32,
+    bytes: Vec<u8>,
+    size: usize,
+    template: bool,
 }
 
 /// A cell the host started, and what it printed that the host has not had.
@@ -67,6 +83,8 @@ struct Server {
     decoder: Decoder,
     /// Frames and refusals read, not yet handled.
     items: Vec<Item>,
+    /// Snapshots being loaded.
+    loads: Vec<Load>,
 }
 
 /// A request's outcome.
@@ -88,6 +106,7 @@ pub fn serve() {
         next: 1,
         decoder: Decoder::new(),
         items: Vec::new(),
+        loads: Vec::new(),
     };
     // Cells may talk to the host's network as soon as they start.
     server.host.wire_address(10_000_000_000);
@@ -256,17 +275,24 @@ impl Server {
                 if n == 0 || n > MAX_FORK {
                     return Err((Error::Failed, format!("from 1 to {MAX_FORK} children")));
                 }
-                let cell = self.live(target)?;
-                let children = self
-                    .host
-                    .fork(cell, n as usize)
-                    .ok_or((Error::NoMemory, String::from("the children do not fit")))?;
+                let children = match self.entry(target)?.place {
+                    Place::Template(template) => self.from_template(template, n),
+                    _ => {
+                        let cell = self.live(target)?;
+                        self.host.fork(cell, n as usize)
+                    }
+                }
+                .ok_or((Error::NoMemory, String::from("the children do not fit")))?;
                 let image = self.entry(target)?.image.clone();
                 let ids = children
                     .into_iter()
                     .map(|child| self.add(image.clone(), child))
                     .collect();
                 Ok(Body::Cells(ids))
+            }
+            Request::Kill(target) if self.loads.iter().any(|l| l.id == target) => {
+                self.loads.retain(|l| l.id != target);
+                Ok(Body::None)
             }
             Request::Kill(target) => {
                 let entry = self.entry(target)?;
@@ -276,6 +302,9 @@ impl Server {
                         self.reap();
                     }
                     Place::Suspended(snapshot) => cell::close_parked(&snapshot),
+                    Place::Template(template) => {
+                        self.host.drop_template(template);
+                    }
                     // Killing a cell that ended forgets it.
                     Place::Ended(_) => self.cells.retain(|e| e.id != target),
                 }
@@ -297,7 +326,134 @@ impl Server {
             Request::Shutdown => Ok(Body::None),
             Request::Input { cell, data } => self.input(cell, Some(&data)),
             Request::CloseInput(cell) => self.input(cell, None),
+            Request::Freeze(target) => {
+                let cell = self.live(target)?;
+                let out = self.host.take_output(cell).unwrap_or_default();
+                if !self.host.freeze(cell) {
+                    return refuse(Error::NotRunning);
+                }
+                let entry = self.entry(target)?;
+                keep(&mut entry.out, &out);
+                entry.place = Place::Template(cell);
+                Ok(Body::None)
+            }
+            Request::Save(target) => self.save(id, target),
+            Request::Load { size, template } => {
+                let size = usize::try_from(size).unwrap_or(usize::MAX);
+                let mut bytes = Vec::new();
+                if !cell::cells_may_take(size as u64) || bytes.try_reserve_exact(size).is_err() {
+                    return Err((Error::NoMemory, format!("{size} bytes do not fit")));
+                }
+                let id = self.next;
+                self.next += 1;
+                self.loads.push(Load {
+                    id,
+                    bytes,
+                    size,
+                    template,
+                });
+                Ok(Body::Cell(id))
+            }
+            Request::LoadData { cell, data } => self.load_data(cell, &data),
         }
+    }
+
+    /// Cells made from template `template`, all or none.
+    fn from_template(&mut self, template: u32, n: u32) -> Option<Vec<u32>> {
+        let mut children = Vec::new();
+        for _ in 0..n {
+            match self.host.spawn_from_template(template, true, false) {
+                Some(child) => children.push(child),
+                None => {
+                    for child in children {
+                        self.host.kill(child);
+                    }
+                    self.reap();
+                    return None;
+                }
+            }
+        }
+        Some(children)
+    }
+
+    /// Streams the snapshot of suspended cell or template `target` to the
+    /// host as request `id`'s data (design D2 of `snapshots-on-disk`).
+    fn save(&mut self, id: u32, target: u32) -> Outcome {
+        let bytes = match &self.entry(target)?.place {
+            Place::Suspended(snapshot) => {
+                let size = snapshot.heap_bytes() as u64 + snapshot.shared_bytes();
+                if !cell::cells_may_take(size) {
+                    return Err((Error::NoMemory, String::from("the file does not fit")));
+                }
+                snapshot.export(&crate::memory::DirectMap)
+            }
+            &Place::Template(template) => self
+                .host
+                .template_snapshot(template)
+                .ok_or((Error::NoMemory, String::from("the file does not fit")))?
+                .export(&crate::memory::DirectMap),
+            _ => {
+                return Err((
+                    Error::NotSuspended,
+                    String::from("only a suspended cell or a template is saved"),
+                ));
+            }
+        };
+        for chunk in bytes.chunks(CHUNK) {
+            send(id, &Message::Data(chunk.to_vec()));
+        }
+        Ok(Body::Bytes(bytes.len() as u64))
+    }
+
+    /// Adds `data` to the snapshot loading as `target`; with its last bytes,
+    /// validates it and makes it a suspended cell or a template (design D3
+    /// of `snapshots-on-disk`).
+    fn load_data(&mut self, target: u32, data: &[u8]) -> Outcome {
+        let i = self
+            .loads
+            .iter()
+            .position(|l| l.id == target)
+            .ok_or((Error::NoCell, String::new()))?;
+        let load = &mut self.loads[i];
+        if data.len() > load.size - load.bytes.len() {
+            self.loads.swap_remove(i);
+            return Err((
+                Error::BadSnapshot,
+                String::from("more bytes than the load announced"),
+            ));
+        }
+        load.bytes.extend_from_slice(data);
+        if load.bytes.len() < load.size {
+            return Ok(Body::None);
+        }
+        let Load {
+            id,
+            bytes,
+            template,
+            ..
+        } = self.loads.swap_remove(i);
+        let mut snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE)
+            .map_err(|e| (Error::BadSnapshot, describe(e)))?;
+        // It gets no more than a cell the host starts (design D4).
+        snapshot.cap_quota(Quota::DEFAULT);
+        let place = if template {
+            let t = self
+                .host
+                .load_template(snapshot)
+                .map_err(|_| (Error::NoMemory, String::from("the template does not fit")))?;
+            Place::Template(t)
+        } else {
+            Place::Suspended(snapshot)
+        };
+        self.cells.push(Entry {
+            id,
+            image: b"loaded".to_vec(),
+            place,
+            cell: 0,
+            out: Vec::new(),
+            watchers: Vec::new(),
+        });
+        Ok(Body::Cell(id))
     }
 
     /// Writes into a cell's standard input, or closes it (design D1 of
@@ -389,6 +545,7 @@ impl Server {
                     stats.suspended += 1;
                     stats.snapshot_bytes += s.heap_bytes() as u64;
                 }
+                Place::Template(_) => stats.templates += 1,
                 Place::Ended(_) => stats.ended += 1,
             }
         }
@@ -471,7 +628,35 @@ fn state_of(place: &Place) -> State {
         Place::Suspended(s) => State::Suspended {
             bytes: s.heap_bytes() as u64,
         },
+        Place::Template(_) => State::Template,
         Place::Ended(state) => *state,
+    }
+}
+
+/// Why bytes are not a snapshot this kernel loads, for people (spec
+/// `snapshots`, files).
+fn describe(e: FormatError) -> String {
+    let arch = |m: u16| match m {
+        62 => "x86_64",
+        183 => "aarch64",
+        _ => "an unknown architecture",
+    };
+    match e {
+        FormatError::Truncated => String::from("truncated"),
+        FormatError::BadMagic => String::from("not a Rhizo snapshot"),
+        FormatError::Version(v) => format!(
+            "snapshot format version {v}; this kernel reads version {}",
+            rhizo_snapshot::VERSION
+        ),
+        FormatError::Machine { expected, found } => format!(
+            "taken on {}; this kernel runs on {}",
+            arch(found),
+            arch(expected)
+        ),
+        FormatError::Checksum => {
+            String::from("checksum mismatch: the file is damaged or truncated")
+        }
+        other => format!("invalid snapshot: {other:?}"),
     }
 }
 

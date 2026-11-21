@@ -110,7 +110,7 @@ impl Relay {
             payload: payload.to_vec(),
         }) {
             Ok(Message::Done { .. }) => !route.stream,
-            Ok(Message::Output { .. }) => false,
+            Ok(Message::Output { .. } | Message::Data(_)) => false,
             _ => true,
         };
         let sent = route

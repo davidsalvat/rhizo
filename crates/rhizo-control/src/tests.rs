@@ -100,6 +100,16 @@ fn every_request_round_trips() {
             data: vec![0x01; MAX_INPUT],
         },
         Request::CloseInput(10),
+        Request::Freeze(11),
+        Request::Save(12),
+        Request::Load {
+            size: 40 << 20,
+            template: true,
+        },
+        Request::LoadData {
+            cell: 13,
+            data: vec![0x01; CHUNK],
+        },
     ];
     for (id, request) in requests.iter().enumerate() {
         let found = frames(&request.encode(id as u32));
@@ -157,6 +167,11 @@ fn every_message_round_trips() {
                     image: b"hog".to_vec(),
                     state: State::Killed,
                 },
+                CellInfo {
+                    id: 6,
+                    image: b"cpython".to_vec(),
+                    state: State::Template,
+                },
             ]),
         },
         Message::Done {
@@ -165,6 +180,7 @@ fn every_message_round_trips() {
                 running: 1,
                 suspended: 2,
                 ended: 3,
+                templates: 4,
                 snapshot_bytes: 4,
                 memory_total: 128 << 20,
                 memory_free: 64 << 20,
@@ -183,6 +199,12 @@ fn every_message_round_trips() {
             cell: 8,
             state: State::Exited(0),
         },
+        Message::Failed {
+            ns: 7,
+            error: Error::BadSnapshot,
+            message: b"checksum".to_vec(),
+        },
+        Message::Data(vec![0x01, b'Z', 0, 0xff]),
     ];
     for message in &messages {
         let found = frames(&message.encode(77));
@@ -301,6 +323,24 @@ fn input_is_bounded_and_its_flag_checked() {
     let last = run.len() - 1;
     run[last] = 2;
     assert_eq!(Request::decode(&frames(&run)[0]), Err(Error::Malformed));
+    // Snapshot bytes come in chunks of at most `CHUNK`, and `load`'s
+    // template flag is 0 or 1.
+    let big = Request::LoadData {
+        cell: 1,
+        data: vec![0; CHUNK + 1],
+    };
+    assert_eq!(
+        Request::decode(&frames(&big.encode(4))[0]),
+        Err(Error::TooLarge)
+    );
+    let mut load = Request::Load {
+        size: 1,
+        template: false,
+    }
+    .encode(5);
+    let last = load.len() - 1;
+    load[last] = 2;
+    assert_eq!(Request::decode(&frames(&load)[0]), Err(Error::Malformed));
 }
 
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
@@ -343,6 +383,10 @@ fn request() -> impl Strategy<Value = Request> {
         Just(Request::Shutdown),
         (any::<u32>(), bytes()).prop_map(|(cell, data)| Request::Input { cell, data }),
         any::<u32>().prop_map(Request::CloseInput),
+        any::<u32>().prop_map(Request::Freeze),
+        any::<u32>().prop_map(Request::Save),
+        (any::<u64>(), any::<bool>()).prop_map(|(size, template)| Request::Load { size, template }),
+        (any::<u32>(), bytes()).prop_map(|(cell, data)| Request::LoadData { cell, data }),
     ]
 }
 
@@ -353,6 +397,7 @@ fn state() -> impl Strategy<Value = State> {
         any::<i32>().prop_map(State::Exited),
         Just(State::Fault),
         Just(State::Killed),
+        Just(State::Template),
     ]
 }
 
@@ -375,6 +420,7 @@ fn message() -> impl Strategy<Value = Message> {
             running,
             suspended,
             ended,
+            templates: 4,
             snapshot_bytes: 1,
             memory_total: 2,
             memory_free: 3,
@@ -383,13 +429,14 @@ fn message() -> impl Strategy<Value = Message> {
     prop_oneof![
         any::<u8>().prop_map(|version| Message::Hello { version }),
         (any::<u64>(), body).prop_map(|(ns, body)| Message::Done { ns, body }),
-        (any::<u64>(), 1u8..=10, bytes()).prop_map(|(ns, code, message)| Message::Failed {
+        (any::<u64>(), 1u8..=11, bytes()).prop_map(|(ns, code, message)| Message::Failed {
             ns,
             error: Error::from_code(code).expect("a code"),
             message
         }),
         (any::<u32>(), bytes()).prop_map(|(cell, data)| Message::Output { cell, data }),
         (any::<u32>(), state()).prop_map(|(cell, state)| Message::Ended { cell, state }),
+        bytes().prop_map(Message::Data),
     ]
 }
 
@@ -476,6 +523,21 @@ proptest! {
         match Request::decode(&Frame { kind: 0x0b, id: 1, payload }) {
             Ok(Request::Input { data, .. }) => {
                 prop_assert!(data.len() <= MAX_INPUT && data.len() == len as usize);
+            }
+            Ok(other) => prop_assert!(false, "decoded as {:?}", other),
+            Err(e) => prop_assert!(e == Error::Malformed || e == Error::TooLarge),
+        }
+    }
+
+    /// Any `load-data` payload decodes within its bound or is refused.
+    #[test]
+    fn any_load_data_payload_is_bounded(cell in any::<u32>(), len in any::<u32>(), tail in proptest::collection::vec(any::<u8>(), 0..64)) {
+        let mut payload = cell.to_le_bytes().to_vec();
+        payload.extend(len.to_le_bytes());
+        payload.extend(&tail);
+        match Request::decode(&Frame { kind: 0x10, id: 1, payload }) {
+            Ok(Request::LoadData { data, .. }) => {
+                prop_assert!(data.len() <= CHUNK && data.len() == len as usize);
             }
             Ok(other) => prop_assert!(false, "decoded as {:?}", other),
             Err(e) => prop_assert!(e == Error::Malformed || e == Error::TooLarge),

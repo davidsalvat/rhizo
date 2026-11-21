@@ -130,11 +130,7 @@ impl Client {
                 ns,
                 round_trip,
             }),
-            Message::Failed { error, message, .. } => Err(if message.is_empty() {
-                error.as_str().to_string()
-            } else {
-                format!("{}: {}", error.as_str(), String::from_utf8_lossy(&message))
-            }),
+            Message::Failed { error, message, .. } => Err(crate::refusal(error, &message)),
             other => Err(format!("unexpected reply {other:?}")),
         }
     }
