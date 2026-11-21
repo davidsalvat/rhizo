@@ -20,11 +20,16 @@ const TCP_BUF: usize = 64 << 10;
 /// Datagrams and bytes a UDP socket buffers to and from the wire.
 const UDP_PACKETS: usize = 16;
 const UDP_BYTES: usize = 64 << 10;
-/// A connection that gets no answer gives up after this long.
+/// A connection whose SYN gets no answer gives up after this long.
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// A closed connection whose peer does not close is aborted after this
 /// long (as Linux's FIN_WAIT_2 timeout does).
 const LINGER: Duration = Duration::from_secs(60);
+/// Frames one [`Net::poll_wire`] takes from the card at most: a ring of the
+/// virtio-net driver (`rhizo_virtio::QUEUE_SIZE`). Without it a flood from
+/// the network kept the polling CPU in `smoltcp` for as long as it lasted
+/// (finding S22 of `docs/security.md`).
+pub(crate) const POLL_FRAMES: usize = 64;
 
 /// How the card gets its address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,10 +63,11 @@ impl core::fmt::Debug for Wire {
     }
 }
 
-/// The card as `smoltcp` sees it.
+/// The card as `smoltcp` sees it, handing over at most [`POLL_FRAMES`].
 pub(crate) struct Phy<'a> {
     link: &'a mut dyn NetLink,
     frame: Vec<u8>,
+    left: usize,
 }
 
 impl<'a> Phy<'a> {
@@ -69,6 +75,7 @@ impl<'a> Phy<'a> {
         Self {
             link,
             frame: Vec::new(),
+            left: POLL_FRAMES,
         }
     }
 }
@@ -102,6 +109,10 @@ impl Device for Phy<'_> {
         Self: 'b;
 
     fn receive(&mut self, _: Instant) -> Option<(Rx<'_>, Tx<'_>)> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
         let frame = &mut self.frame;
         frame.clear();
         if !self.link.recv(&mut |f| frame.extend_from_slice(f)) {
@@ -209,14 +220,17 @@ impl Net {
             .is_some_and(|w| w.sockets.iter().count() > usize::from(w.dhcp.is_some()))
     }
 
-    /// Moves frames between the card and `smoltcp`, runs its timers and
-    /// counts what changed. Returns when it wants to run again
-    /// (nanoseconds from now), if it knows.
+    /// Moves frames between the card and `smoltcp` (at most
+    /// [`POLL_FRAMES`] received), runs its timers and counts what changed.
+    /// Returns when it wants to run again (nanoseconds from now; 0 when it
+    /// took all it may and more may wait), if it knows.
     pub fn poll_wire(&mut self, link: &mut dyn NetLink, now_ns: u64) -> Option<u64> {
         let wire = self.wire.as_mut()?;
         let now = instant(now_ns);
         let mut phy = Phy::new(link);
-        if wire.iface.poll(now, &mut phy, &mut wire.sockets) == PollResult::SocketStateChanged {
+        let changed = wire.iface.poll(now, &mut phy, &mut wire.sockets);
+        let more = phy.left == 0;
+        if changed == PollResult::SocketStateChanged {
             self.changes += 1;
             // Every socket on the wire may have changed; connections that
             // opened are marked, so a later close is a reset, not a refusal.
@@ -230,11 +244,17 @@ impl Net {
                     ..
                 } = &mut s.state
                 {
-                    let state = wire.sockets.get::<tcp::Socket>(*handle).state();
+                    let socket = wire.sockets.get_mut::<tcp::Socket>(*handle);
                     *ever_open = !matches!(
-                        state,
+                        socket.state(),
                         tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Closed
                     );
+                    if *ever_open {
+                        // The timeout is for the handshake: `smoltcp` 0.14
+                        // would also abort a connection idle for that long
+                        // (finding S23 of `docs/security.md`).
+                        socket.set_timeout(None);
+                    }
                 }
             }
         }
@@ -275,6 +295,9 @@ impl Net {
             }
             !done
         });
+        if more {
+            return Some(0);
+        }
         wire.iface
             .poll_delay(now, &wire.sockets)
             .map(|d| d.total_micros() * 1000)
