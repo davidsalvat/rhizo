@@ -111,7 +111,7 @@ The full picture, and what the kernel still needs for it, is in
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in eight stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running agent in microseconds), real programs (threads, networking, Python, every core), proven with numbers (fair comparisons with Linux, VMs and sandboxes, and a security review), a real agent (calls a model, explores branches, pauses between turns) and scale and compatibility (thousands of busy cells, dynamically linked programs and Node.js). Vision: the product, with downloadable agents and your own model." width="800">
+    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in eight stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running agent in microseconds), real programs (threads, networking, Python, every core), proven with numbers (fair comparisons with Linux, VMs and sandboxes, and a security review), a real agent (calls a model, explores branches, pauses between turns) and scale and compatibility (thousands of busy cells, dynamically linked programs, Node.js, numpy from PyPI, KPTI). Vision: the product, with downloadable agents and your own model." width="800">
   </picture>
 </p>
 
@@ -137,8 +137,12 @@ again:
   </picture>
 </p>
 
-- **Suspend / resume.** A snapshot is a versioned, self-contained image of the
-  cell. Resume is lazy: pages come back on first touch.
+- **Suspend / resume.** A snapshot is a versioned image of the cell. Resume
+  is lazy: pages come back on first touch. A snapshot refers to the pages
+  the cell still shares with its template or its forks instead of copying
+  them, so 50 agents of one template, 45 of them suspended, take 6.6 MB
+  on x86_64 (60 MB when snapshots copied every page); a snapshot exported as bytes
+  stands alone.
 - **Fork(n).** Children share the parent's pages, and even its page tables,
   until one of them writes.
 - **Templates.** Freeze a cell after its warm-up, then start new cells from it
@@ -152,19 +156,32 @@ again:
 - **Multi-core.** Cells run in parallel on up to 16 CPUs; CPUs that no
   other cell needs run more threads of a running cell at once (TLB
   shootdowns on x86_64); only system calls on sockets take turns.
-- **CPython.** Unmodified CPython 3.13 (static) runs as a cell, its standard
-  library in the cell's own files; a template frozen after its imports
-  answers each request without starting the interpreter again.
+- **CPython and packages from PyPI.** Unmodified CPython 3.13 runs as a
+  cell, its standard library in the cell's own files; a template frozen
+  after its imports answers each request without starting the interpreter
+  again. A dynamically linked build loads packages installed from their
+  PyPI wheels, C extensions included: numpy (with OpenBLAS) and requests.
+  From a warm template, numpy's computation takes about as long as in a
+  Linux process forked from a warm interpreter; a cold start is about 10 %
+  slower than Linux's.
 - **Node.js.** The official Node.js 24 build, dynamically linked and
   unmodified, runs as a cell with `--jitless` (V8's compiler wants memory
-  both writable and executable, which cells refuse).
+  both writable and executable, which cells refuse). A cell forked from
+  Node.js frozen after its warm-up answers in about 4.5 ms, against 36 ms
+  from a cold start (a Linux process cannot fork Node.js: 32 ms cold).
 - **Control plane.** `rhizo`, a command-line tool on the host, drives a
   running kernel over its serial line: `rhizo up`, `run`, `ps`, `fork`,
   `suspend`, `resume`, `attach`, `kill`, `down`; `rhizo chat` is an
   interactive conversation with an agent in a cell, whose tools run in
   the cell, and which can be suspended and picked up later.
-- **Isolation, reviewed.** An adversarial review of the cell boundary, with
-  hostile cells and property tests that keep it fixed:
+- **Quotas.** The host can cap each cell's memory, CPU time, descriptors
+  and sockets; a cell past its quota is refused or ended, not its
+  neighbours, and its quotas travel with its snapshots and forks.
+- **Isolation, reviewed.** Two adversarial reviews of the cell boundary and
+  one of frames from the network, with hostile cells, property tests and a
+  network fuzzer that keep the findings fixed. The kernel is unmapped
+  while cell code runs on x86_64 CPUs open to Meltdown (KPTI; E0PD on
+  AArch64), and kept out of cell memory (SMEP, SMAP, PAN).
   [`docs/security.md`](docs/security.md) lists the threat model, the
   findings and what is still open;
   [`docs/audit-scope.md`](docs/audit-scope.md) scopes an external audit.
@@ -224,7 +241,7 @@ on the same machine, with the same clock:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/measured-dark.svg">
-    <img src="docs/img/measured.svg" alt="Bar chart, lower is better, bars to scale within each comparison. A cell against a Linux process in the same kind of VM: fork, fork and write 50 MiB, running hello, resume against CRIU, CPython cold and from a warm template, and MicroPython warm against cold. For scale: resuming a whole Firecracker VM or gVisor sandbox, and running hello in gVisor. The values are in the tables below." width="800">
+    <img src="docs/img/measured.svg" alt="Bar chart, lower is better, bars to scale within each comparison. A cell against a Linux process in the same kind of VM: fork, fork and write 50 MiB, running hello, resume against CRIU, CPython cold and from a warm template, numpy from PyPI wheels cold and from a warm template, a Node.js request from a warm template against cold starts, and MicroPython warm against cold. For scale: resuming a whole Firecracker VM or gVisor sandbox, and running hello in gVisor. The values are in the tables below." width="800">
   </picture>
 </p>
 
@@ -243,6 +260,20 @@ tables). Shared runners are noisy, so figures move between runs; publishable
 numbers will come from a dedicated machine. How benchmarks, environments and baselines work:
 [`bench/README.md`](bench/README.md).
 
+Two reference workloads run the kernel the way its two kinds of users
+will ([`bench/README.md`](bench/README.md#reference-workloads)), on every
+VMM of the same run:
+
+- **Laptop**: 50 agents opened from one template in a 512 MiB VM, 45 of
+  them suspended, take 6.6 MB together; opening one takes 5 µs (83 µs on
+  Firecracker), and while every agent waits the VM's CPUs wake about once
+  a second.
+- **Server**: 10,000 busy cells in a 1 GiB VM with one vCPU, 36,000 to
+  46,000 operations per second; the 99th percentile of the time a cell
+  waits for the CPU (2 to 6 ms) is gated like the other figures. Pushed
+  until memory runs out (about 46,000 idle cells), the kernel refuses new
+  cells cleanly and gets every byte back, its heap included.
+
 <details>
 <summary>Boot time and the full comparison table</summary>
 
@@ -256,10 +287,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 8.1 | 9.1 | 193.3 | 194.7 | 20 |
-| Cloud Hypervisor | 6.6 | 13.7 | 96.4 | 106.1 | 20 |
-| QEMU microvm | 41.4 | 42.0 | — | — | 20 |
-| QEMU q35 | 59.5 | 61.8 | 173.8 | 176.2 | 20 |
+| Firecracker | 7.7 | 8.6 | 194.3 | 196.8 | 20 |
+| Cloud Hypervisor | 6.3 | 13.5 | 102.9 | 109.6 | 20 |
+| QEMU microvm | 42.3 | 43.8 | — | — | 20 |
+| QEMU q35 | 60.8 | 62.0 | 177.1 | 181.3 | 20 |
 
 ### A cell against a Linux process, in the same kind of VM
 
@@ -267,10 +298,10 @@ Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux gue
 
 | Operation | Rhizo cell | Linux process, same VM | Linux process, host |
 |---|---:|---:|---:|
-| The `fork` call, holding 50 MiB written | 1.1 µs | 86.5 µs | 823.4 µs |
-| Fork, then the child writes all 50 MiB and exits | 3.82 ms | 21.57 ms | 19.78 ms |
-| Start a program and run it to its exit (`hello`) | 7.1 µs | 595.9 µs | 94.9 µs |
-| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.2 µs / 590.9 µs | — | 2.34 ms (CRIU) |
+| The `fork` call, holding 50 MiB written | 1.4 µs | 87.3 µs | 891.7 µs |
+| Fork, then the child writes all 50 MiB and exits | 4.77 ms | 23.94 ms | 23.51 ms |
+| Start a program and run it to its exit (`hello`) | 7.0 µs | 600.3 µs | 97.2 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.3 µs / 585.8 µs | — | 2.58 ms (CRIU) |
 
 ### Whole VMs and sandboxes, for scale
 
@@ -278,8 +309,8 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 7.1 µs | 193.25 ms | 65.01 ms |
-| Resume a suspended environment until it runs (eager for the cell) | 590.9 µs | 3.71 ms | 92.86 ms |
+| Start a program and run it to its exit (`hello`) | 7.0 µs | 194.26 ms | 64.24 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 585.8 µs | 3.68 ms | 94.35 ms |
 
 ### A real interpreter
 
@@ -287,15 +318,29 @@ CPython (static, 3.13.18) answering one agent tool call (`cells/python/agent_dem
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 16.95 ms | 18.28 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.83 ms (4.4× faster) | 5.48 ms |
+| Cold, from its executable (interpreter start, imports, warm-up) | 17.10 ms | 18.30 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.85 ms (4.4× faster) | 5.58 ms |
 
 MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
 
 | Started | Time |
 |---|---:|
 | Cold, from its executable (interpreter start, imports, warm-up) | 3.43 ms |
-| Forked from a template frozen after the warm-up | 495.4 µs (6.9× faster) |
+| Forked from a template frozen after the warm-up | 499.4 µs (6.9× faster) |
+
+numpy and its OpenBLAS, installed from their PyPI wheels into a dynamically linked CPython, computing on arrays (`cells/python/numpy_demo.py`: a linear solve, a ufunc, a matrix product), in a cell and as a Linux process in the same Firecracker VM:
+
+| Started | Rhizo cell | Linux process |
+|---|---:|---:|
+| Cold (interpreter start, `import numpy`, compute) | 68.81 ms | 61.56 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after `import numpy` | 15.08 ms (4.6× faster) | 16.06 ms |
+
+Node.js (the official build, dynamically linked, run unmodified with `--jitless`) answering one agent tool call (`cells/node/demo.js`), in a cell and as a Linux process in the same Firecracker VM (Node.js cannot fork itself, so the process has no warm row):
+
+| Started | Rhizo cell | Linux process |
+|---|---:|---:|
+| Cold, from its executable (`ld.so`, V8 start-up, warm-up) | 35.91 ms | 31.94 ms |
+| Forked from Node.js frozen after its warm-up | 4.48 ms (8.0× faster) | — |
 
 ### Both architectures, in instructions
 
@@ -303,12 +348,12 @@ Retired instructions per operation, counted under QEMU with `-icount` (the same 
 
 | Operation | x86_64 | AArch64 |
 |---|---:|---:|
-| Switch between two cells | 862 | 818 |
-| Create the `hello` cell | 28,400 | 50,768 |
-| Run `hello` from start to exit | 89,026 | 123,040 |
-| Fork a cell holding 50 MiB | 6,617 | 7,424 |
-| A static glibc program, cold | 35,428,187 | 39,872,288 |
-| The same, forked from a warm template | 76,717 | 92,560 |
+| Switch between two cells | 885 | 831 |
+| Create the `hello` cell | 28,338 | 51,488 |
+| Run `hello` from start to exit | 89,161 | 124,480 |
+| Fork a cell holding 50 MiB | 6,697 | 7,504 |
+| A static glibc program, cold | 35,444,511 | 39,887,984 |
+| The same, forked from a warm template | 77,261 | 92,736 |
 
 Environment: `ci`, KVM: yes, measured 2026-11-21. Regenerate with
 `cargo xtask bench --readme`.
