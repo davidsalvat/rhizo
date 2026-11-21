@@ -9,7 +9,7 @@ use crate::bench::{Metric, summarize};
 use crate::report::Failure;
 use crate::vmm::{self, Accel, Guest, RunOptions, Vmm};
 use crate::{Profile, Result, arch, build_kernel, report, target_dir, workspace_root};
-use rhizo_control::{Body, Decoder, Frame, Item, Message, Request, Run};
+use rhizo_control::{Body, Decoder, Frame, Item, Message, Request, Run, State};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -222,14 +222,21 @@ impl Vm {
         self.stdin.clone()
     }
 
+    /// Sends `request` without waiting for its reply; returns its
+    /// identifier.
+    pub fn submit(&mut self, request: &Request) -> Result<u32> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&request.encode(id))?;
+        Ok(id)
+    }
+
     /// Sends `request` and waits for its reply (other frames are dropped,
     /// text kept in [`console`](Self::console)); returns the reply and the
     /// round trip as the host saw it.
     pub fn call(&mut self, request: &Request) -> Result<(Message, Duration)> {
-        let id = self.next_id;
-        self.next_id += 1;
         let t0 = Instant::now();
-        self.send(&request.encode(id))?;
+        let id = self.submit(request)?;
         loop {
             match self.next(Duration::from_secs(60)) {
                 Some(Event::Frame(f)) if f.id == id => {
@@ -356,6 +363,8 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
             }
         }
     }
+    samples.extend(first_outputs(&mut vm)?);
+    samples.extend(serial_probes(&mut vm)?);
     let cpython = crate::cpython::root().join("usr/bin/python3").exists();
     if cpython {
         samples.push(("chat.turn_us", chat_turns(&mut vm, vmm)?));
@@ -375,7 +384,14 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
     };
     let mut metrics: Vec<Metric> = samples
         .into_iter()
-        .map(|(name, values)| metric(name, "us", values))
+        .map(|(name, values)| {
+            let unit = if name.ends_with("_ns_per_byte") {
+                "ns"
+            } else {
+                "us"
+            };
+            metric(name, unit, values)
+        })
         .collect();
     let qemu = matches!(vmm, Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35);
     if cpython && qemu {
@@ -386,6 +402,206 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
         vm.shutdown();
     }
     Ok(metrics)
+}
+
+/// Cells started per boot and timed to their first output.
+const FIRST_OUTPUT_ROUNDS: usize = 20;
+
+/// A cell started until the host had the first bytes it printed, as the
+/// host saw it.
+struct FirstOutput {
+    /// From sending the request that starts it to the first output read.
+    total: Duration,
+    /// The start request's round trip.
+    reply: Duration,
+    /// The kernel's own time for that request.
+    kernel: Duration,
+    /// From sending the `output` request to the first output read.
+    watch: Duration,
+}
+
+/// Starts one cell with `start` (`run`, or `fork` into one), streams its
+/// output until the first bytes come, waits for its end and forgets it.
+fn first_output(vm: &mut Vm, start: &Request) -> Result<FirstOutput> {
+    let t0 = Instant::now();
+    let (body, ns, reply) = match vm.call(start)? {
+        (Message::Done { body, ns }, took) => (body, ns, took),
+        (other, _) => return Err(format!("{start:?} failed: {other:?}")),
+    };
+    let cell = match body {
+        Body::Cell(cell) => cell,
+        Body::Cells(cells) if cells.len() == 1 => cells[0],
+        other => return Err(format!("{start:?} returned {other:?}")),
+    };
+    let t1 = Instant::now();
+    let watch = vm.submit(&Request::Output(cell))?;
+    let mut first = None;
+    loop {
+        match vm.next(Duration::from_secs(60)) {
+            Some(Event::Frame(f)) if f.id == watch => match Message::decode(&f) {
+                Ok(Message::Output { .. }) => {
+                    first.get_or_insert_with(Instant::now);
+                }
+                Ok(Message::Ended { state, .. }) => match first {
+                    Some(_) if state == State::Exited(0) => break,
+                    _ => return Err(format!("cell {cell} ended: {state:?}")),
+                },
+                Ok(Message::Done { .. }) => {}
+                other => return Err(format!("watching cell {cell}: {other:?}")),
+            },
+            Some(Event::Text(t)) => vm.console.extend(t),
+            Some(Event::Exited) | None => {
+                return Err(format!(
+                    "cell {cell} printed nothing; console:\n{}",
+                    String::from_utf8_lossy(&vm.console)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    done(vm, &Request::Kill(cell))?; // it ended: forget it
+    let first = first.expect("output came before the end");
+    Ok(FirstOutput {
+        total: first - t0,
+        reply,
+        kernel: Duration::from_nanos(ns),
+        watch: first - t1,
+    })
+}
+
+/// Spawn and fork to first output (spec `benchmarks`, change
+/// `measure-control-path`): `hello` run from its executable, and a
+/// `sleeper` forked from a template frozen in its sleep (the child wakes
+/// at once, prints `woken` and exits), each with where its time went.
+fn first_outputs(vm: &mut Vm) -> Result<Vec<(&'static str, Vec<f64>)>> {
+    let us = |d: Duration| d.as_secs_f64() * 1e6;
+    let hello = Request::Run(Run {
+        image: b"hello".to_vec(),
+        argv: vec![b"hello".to_vec()],
+        ..Run::default()
+    });
+    let (Body::Cell(template), _) = done(
+        vm,
+        &Request::Run(Run {
+            image: b"sleeper".to_vec(),
+            argv: ["sleeper", "3600000", "yield"]
+                .iter()
+                .map(|a| a.as_bytes().to_vec())
+                .collect(),
+            ..Run::default()
+        }),
+    )?
+    else {
+        return Err("`run` returned no cell".into());
+    };
+    let watch = vm.submit(&Request::Output(template))?;
+    loop {
+        match vm.next(Duration::from_secs(60)) {
+            Some(Event::Frame(f)) if f.id == watch => {
+                if let Ok(Message::Output { .. }) = Message::decode(&f) {
+                    break; // `ready`
+                }
+            }
+            Some(Event::Text(t)) => vm.console.extend(t),
+            Some(Event::Exited) | None => return Err("the sleeper printed nothing".into()),
+            Some(_) => {}
+        }
+    }
+    // With no request to serve the kernel runs it into its sleep: frozen
+    // before, a child would sleep the hour.
+    thread::sleep(Duration::from_millis(100));
+    done(vm, &Request::Freeze(template))?;
+    let fork = Request::Fork {
+        cell: template,
+        n: 1,
+    };
+    let names = [
+        "control.spawn_to_first_output_us",
+        "breakdown.control.spawn_reply_us",
+        "breakdown.control.spawn_kernel_us",
+        "breakdown.control.spawn_watch_us",
+        "control.fork_to_first_output_us",
+        "breakdown.control.fork_reply_us",
+        "breakdown.control.fork_kernel_us",
+        "breakdown.control.fork_watch_us",
+    ];
+    let mut samples: Vec<(&str, Vec<f64>)> = names.iter().map(|&n| (n, Vec::new())).collect();
+    for _ in 0..FIRST_OUTPUT_ROUNDS {
+        for (i, start) in [&hello, &fork].into_iter().enumerate() {
+            let f = first_output(vm, start)?;
+            for (j, d) in [f.total, f.reply, f.kernel, f.watch]
+                .into_iter()
+                .enumerate()
+            {
+                samples[4 * i + j].1.push(us(d));
+            }
+        }
+    }
+    done(vm, &Request::Kill(template))?;
+    done(vm, &Request::Kill(template))?;
+    Ok(samples)
+}
+
+/// Bytes of the frames that time the serial line per byte.
+const PROBE_BYTES: usize = 1024;
+/// Quiet before an idle round trip: longer than the kernel keeps looking
+/// at the serial line often after a request.
+const QUIET: Duration = Duration::from_millis(300);
+/// Idle round trips per boot.
+const IDLE_ROUND_TRIPS: usize = 10;
+
+/// Where a round trip's time goes (change `measure-control-path`): the
+/// kernel's time for a `list`; what each byte costs each way, from
+/// requests the kernel refuses at once, against a `list`: a `write-file` of
+/// [`PROBE_BYTES`] to no cell (bytes in), and a `run` of an executable
+/// whose [`PROBE_BYTES`]-byte name the refusal repeats (bytes in and out);
+/// and a `list` after [`QUIET`], when the kernel looks less often.
+fn serial_probes(vm: &mut Vm) -> Result<Vec<(&'static str, Vec<f64>)>> {
+    let in_only = Request::WriteFile {
+        cell: u32::MAX,
+        path: b"/probe".to_vec(),
+        data: vec![0; PROBE_BYTES],
+    };
+    let both_ways = Request::Run(Run {
+        image: vec![b'x'; PROBE_BYTES],
+        ..Run::default()
+    });
+    let mut timed = |request: &Request, quiet: Duration| -> Result<(f64, f64)> {
+        let rounds = if quiet.is_zero() {
+            OP_ROUNDS
+        } else {
+            IDLE_ROUND_TRIPS
+        };
+        let (mut took, mut kernel) = (Vec::new(), Vec::new());
+        for _ in 0..rounds {
+            thread::sleep(quiet);
+            let (reply, d) = vm.call(request)?;
+            let ns = match reply {
+                Message::Done { ns, .. } | Message::Failed { ns, .. } => ns,
+                other => return Err(format!("{request:?}: {other:?}")),
+            };
+            took.push(d.as_secs_f64() * 1e6);
+            kernel.push(ns as f64 / 1e3);
+        }
+        Ok((summarize(&mut took).0, summarize(&mut kernel).0))
+    };
+    let (list, list_kernel) = timed(&Request::List, Duration::ZERO)?;
+    let (into, _) = timed(&in_only, Duration::ZERO)?;
+    let (both, _) = timed(&both_ways, Duration::ZERO)?;
+    let (idle, _) = timed(&Request::List, QUIET)?;
+    let per_byte = |us: f64| us.max(0.0) * 1e3 / PROBE_BYTES as f64;
+    Ok(vec![
+        ("breakdown.control.roundtrip_kernel_us", vec![list_kernel]),
+        (
+            "breakdown.control.serial_in_ns_per_byte",
+            vec![per_byte(into - list)],
+        ),
+        (
+            "breakdown.control.serial_out_ns_per_byte",
+            vec![per_byte(both - into)],
+        ),
+        ("breakdown.control.idle_roundtrip_us", vec![idle]),
+    ])
 }
 
 /// The host's fake model as the guest on `vmm` reaches it.
