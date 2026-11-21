@@ -173,7 +173,7 @@ pub fn index() -> usize {
 
 /// Prepares the per-CPU data of secondary CPU `cpu`, whose exception stack
 /// tops at `exception_stack`; returns its address (for `TPIDR_EL1`).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub(super) fn percpu(cpu: usize, exception_stack: u64) -> u64 {
     let p = &PERCPU[cpu];
     p.index.store(cpu as u64, Ordering::Relaxed);
@@ -188,9 +188,9 @@ pub(super) static EMPTY_ROOT: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 extern "C" fn rhizo_exception_handler(esr: u64, far: u64, elr: u64, _vector: u64) -> ! {
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     let guard = crate::smp::stack_guard(index());
-    #[cfg(not(any(feature = "ktest", feature = "bench-cell")))]
+    #[cfg(not(feature = "cells"))]
     let guard = super::boot::layout::stack_guard();
     exception::report_aarch64(
         &mut BootConsole,

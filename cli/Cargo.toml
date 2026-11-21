@@ -1,0 +1,32 @@
+[package]
+name = "rhizo-cli"
+description = "rhizo: start a Rhizo VM and run, suspend, resume, fork and kill its cells (Linux hosts)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "rhizo"
+path = "src/main.rs"
+
+[dependencies]
+# The control protocol spoken with the control kernel.
+rhizo-control = { path = "../crates/rhizo-control" }
+# Building the control kernel, launching VMMs and the host's side of their
+# network: the same code as `cargo xtask` (design D5 of `add-control-plane`).
+xtask = { path = "../xtask" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+# Same as the workspace, except that a command-line tool prints by design.
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+redundant_clone = "warn"
+needless_pass_by_value = "warn"
+unused_self = "warn"

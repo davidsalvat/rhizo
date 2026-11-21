@@ -1,70 +1,102 @@
 # Demo: an agent in a cell, with your own model
 
-`cargo xtask demo agent` boots Rhizo and runs a real agent in a cell: CPython
-3.13 with `cells/python/agent_loop.py`, talking over HTTP to a model you run
-on your machine through any OpenAI-compatible `/v1/chat/completions` API
-with tool calls (Ollama, llama.cpp's `llama-server`). It runs three turns
-(the model asks for a tool, the cell runs it: a computation and a file
-written and read back), with the host suspending and resuming the cell
-between turns while its connection to the model stays open; then, at a
-decision point, the host freezes the agent and forks it into three branches
-that each explore a different tool result over a connection of their own.
+`rhizo` is Rhizo's control-plane tool: `rhizo up` boots a Rhizo VM whose
+kernel serves requests, and the other commands run, list, suspend, resume,
+fork and kill its cells. The kernel only executes; what to run and when to
+suspend or fork is decided by `rhizo` on the host.
+
+`rhizo run python-agent` runs a real agent in a cell: CPython 3.13 with
+`cells/python/agent_loop.py`, talking over HTTP to a model you run on your
+machine through any OpenAI-compatible `/v1/chat/completions` API with tool
+calls (Ollama, llama.cpp's `llama-server`). It runs three turns (the model
+asks for a tool, the cell runs it: a computation and a file written and
+read back), with `rhizo` suspending and resuming the cell after every turn
+while its connection to the model stays open; then, at the agent's
+decision point, `rhizo` forks it into three branches that each explore a
+different tool result over a connection of their own.
 
 Every step is printed as it happens, with its time split between the model
 and Rhizo:
 
 ```text
-[rhizo] cell: CPython with `agent_loop.py`, model `http://10.0.2.2:18080`
+$ rhizo up
+rhizo is up: qemu-microvm (x86_64), 256 MiB, 1 CPU, kernel answering 90 ms after launch; control round trip 1577 us; state in /home/me/.rhizo
+$ rhizo run python-agent --llm http://127.0.0.1:11434 --model qwen2.5:1.5b
+[rhizo] cell 1: CPython with `agent_loop.py`, model `qwen2.5:1.5b` at http://10.0.2.2:11434 as the guest sees it; started in 22.8 ms (round trip 36.0 ms)
 [agent] user: Explore the sums and keep notes.
-[turn 1] model (11.9 ms): I think the sums look fine.
-[turn 1] no tool call: asked again (python 7.6 ms)
-[rhizo] suspended between turns in 39231 us (15467 KiB snapshot, connection parked), resumed (Lazy) in 6809 us
-[turn 2] model (20.0 ms): calls compute(n=900, seed=3)
-[turn 2] tool: value=4050, 1 notes (python and tool 60.9 ms)
+[turn 1] model (8.5 ms): I think the sums look fine.
+[turn 1] no tool call: asked again (python 5.7 ms)
+[rhizo] suspended between turns (15431 KiB snapshot, connection parked) in 24.8 ms (round trip 32.8 ms), resumed in 3235 us (round trip 10.2 ms)
+[turn 2] model (11.6 ms): calls compute(n=2100, seed=3)
+[turn 2] tool: value=9450, 1 notes (python and tool 56.6 ms)
 ...
 [agent] decision point: asking for a fork
-[branch 0] running
-[rhizo] froze the agent at its decision point and forked 3 branches (copy-on-write, own connections): all running after 117202 us
-[branch 1] explores variant 1 of the last result: value=4003
-[branch 2 turn] model (21.4 ms): calls compute(n=1200, seed=3)
+[rhizo] forked the agent at its decision point into 3 branches (cells [5, 6, 7], copy-on-write, own connections) in 8454 us (round trip 17.3 ms)
+[branch 1] running
+[branch 2] explores variant 2 of the last result: value=6968
+[rhizo] all 3 branches running 106.8 ms after the fork request
 ...
-rhizo-demo done in 1732 ms: 3 suspend and resume (median 36090 us), fork into 3 branches 117202 us
+[branch 0 turn] tool: value=10800, 4 notes (python and tool 3.4 ms)
+rhizo-demo done in 1238 ms: 3 suspend and resume (median 28.0 ms), fork into 3 branches 8454 us (kernel times)
+$ rhizo ps
+ID     STATE                  IMAGE
+1      killed                 cpython
+5      exited 0               cpython
+6      exited 0               cpython
+7      exited 0               cpython
+(4 cells, listed in 187 us (round trip 975 us))
+$ rhizo down
 ```
 
 (Under emulation, against a stand-in model that answers at once.)
 
 `[agent]`, `[turn N]` and `[branch N]` lines come from the agent in the
 cell (model time: request sent until the whole answer is read; Python time:
-the rest of the turn); `[rhizo]` lines come from the kernel's host.
+the rest of the turn). `[rhizo]` lines come from `rhizo`: the first time is
+the kernel's own for the operation, the round trip is what the host saw.
+Model answers are shown whole, on one line.
 
-This is a demo: CI runs the same agent against a deterministic fake model
-instead (`workload.agent_*` metrics in `bench/README.md`), so no model is
-downloaded there.
+`cargo xtask demo agent --llm URL --model NAME [--vmm V]` does the same in
+one command: it builds the control kernel and `rhizo`, then runs `rhizo up`,
+`rhizo run python-agent` and `rhizo down`.
+
+This is a demo: CI runs the same agent through `rhizo` against a
+deterministic fake model instead (`cargo xtask test --only control`, and the
+`workload.agent_*` and `control.*` metrics in `bench/README.md`), so no
+model is downloaded there.
 
 ## What you need
 
 - Everything in the README's "Try it" section, plus `zlib1g-dev`.
 - CPython's pinned source, built into the cell on first use (a few
   minutes, then cached under `target/cpython`). It is built natively, so
-  the kernel's architecture must be the host's: `--arch x86_64` on an
-  x86_64 machine, `--arch aarch64` (the default) on an ARM one.
+  the kernel's architecture is the host's (`rhizo up` picks it).
 
 ```bash
 curl -LO https://www.python.org/ftp/python/3.13.18/Python-3.13.18.tar.xz
 export RHIZO_CPYTHON_SRC=$PWD/Python-3.13.18.tar.xz
 ```
 
+- `rhizo` itself, from the checkout:
+
+```bash
+cargo build -p rhizo-cli
+alias rhizo=$PWD/target/debug/rhizo
+```
+
 - A model that can call tools. Small ones work: Qwen2.5 1.5B Instruct,
   Llama 3.2 3B Instruct. When a model answers without calling the tool
-  (small ones sometimes do), the turn still completes: its reply is shown
-  and the agent asks again.
+  (small ones often do), the turn still completes: its reply is shown and
+  the agent asks again.
 
 ## With Ollama
 
 ```bash
 ollama serve &
 ollama pull qwen2.5:1.5b
-cargo xtask --arch x86_64 demo agent --llm http://127.0.0.1:11434 --model qwen2.5:1.5b
+rhizo up
+rhizo run python-agent --llm http://127.0.0.1:11434 --model qwen2.5:1.5b
+rhizo down
 ```
 
 ## With llama.cpp
@@ -74,16 +106,41 @@ what turns its output into tool calls:
 
 ```bash
 llama-server -m qwen2.5-1.5b-instruct-q4_k_m.gguf --jinja --port 8080 &
-cargo xtask --arch x86_64 demo agent --llm http://127.0.0.1:8080 --model qwen2.5
+rhizo up
+rhizo run python-agent --llm http://127.0.0.1:8080 --model qwen2.5
+rhizo down
 ```
 
 (`llama-server` serves the one model it loaded, whatever `--model` says.)
 
+## Driving cells by hand
+
+`rhizo up` builds the control kernel on first use (or takes `--kernel`) and
+leaves a small background server that owns the VM; its state (the control
+socket, the kernel's console in `console.log`) is in `~/.rhizo`, or
+`--state DIR`, or `$RHIZO_STATE`. Then:
+
+```bash
+rhizo run hello                       # a program the kernel holds, to its end
+rhizo run idle --detach               # prints `cell N started`
+rhizo suspend N                       # snapshot kept in the kernel
+rhizo resume N                        # same identifier
+rhizo fork N 3                        # three copy-on-write children
+rhizo attach N                        # its output until it ends
+rhizo kill N                          # a second kill forgets it
+rhizo run python --file /app/x.py='print(6*7)' -- /app/x.py
+rhizo ps
+rhizo stats
+```
+
+Every command prints the kernel's time and the round trip.
+
 ## Which VMM, and where the guest finds the model
 
-`--vmm` picks the virtual machine (default: QEMU `microvm` on x86_64, QEMU
-`virt` on AArch64). Give `--llm` as the host sees the model; `xtask`
-rewrites a loopback address to the host's address as the guest sees it:
+`rhizo up --vmm` picks the virtual machine (default: QEMU `microvm` on
+x86_64, QEMU `virt` on AArch64); `--memory`, `--cpus` and `--accel` set the
+rest. Give `--llm` as the host sees the model; `rhizo` rewrites a loopback
+address to the host's address as the guest sees it:
 
 | VMM | Guest network | The host, seen from the guest | The model must listen on |
 |---|---|---|---|
@@ -94,9 +151,9 @@ rewrites a loopback address to the host's address as the guest sees it:
 For Firecracker and Cloud Hypervisor, make the model listen beyond the
 loopback: `OLLAMA_HOST=0.0.0.0 ollama serve`, or `llama-server --host
 0.0.0.0`. Both need KVM, and the tap devices need password-less `sudo`
-(`xtask` creates them). Another IPv4 address in `--llm` is passed as it is:
-QEMU's user network reaches other machines; the tap devices have no route
-beyond the host.
+(`rhizo up` creates them). Another IPv4 address in `--llm` is passed as it
+is: QEMU's user network reaches other machines; the tap devices have no
+route beyond the host.
 
 QEMU uses KVM when `/dev/kvm` is usable; `--accel tcg` forces emulation.
 
@@ -109,8 +166,9 @@ conversations. Rhizo's own steps, measured by the kernel:
 | Step | With KVM (CI's figures, fake model) | Under emulation (TCG) |
 |---|---|---|
 | Python and tool, per turn | about 0.1 ms | 5 to 100 ms |
-| Suspend (15 MiB snapshot) plus resume | about 2.7 ms (eager resume) | 30 to 45 ms (lazy resume) |
-| Fork into 3 branches until all run | about 1.2 ms | about 120 ms |
+| Suspend (15 MiB snapshot) plus resume | about 2.7 ms (eager resume) | 25 to 55 ms (lazy resume) |
+| Fork into 3 branches | about 1.2 ms | 10 to 80 ms |
+| A request's round trip from the host | `control.roundtrip_us` | 0.3 to 3 ms |
 
 Under emulation everything in the guest is 10 to 100 times slower, but the
 model runs natively on the host, so the demo stays usable.
@@ -121,11 +179,13 @@ model runs natively on the host, so the demo stays usable.
   `add-agent-workload`), so hosted APIs over HTTPS are out of reach; run
   the model locally, or put a plain-HTTP proxy next to it.
 - **IPv4 addresses**, not host names, in `--llm`.
-- **The guest polls its network card.** Waiting for the model costs no CPU
-  in the host's sense only between polls; a turn's model time includes up
-  to one polling period.
-- **One run.** Three turns, three branches, then the VM stops; the cell's
-  files and snapshots are not kept.
-- **Memory.** The guest has 128 MiB: the agent and its three branches fit
-  (they share their pages copy-on-write), a much longer conversation may
-  not.
+- **The guest polls.** Its network card and its serial line (the control
+  channel) are polled: a turn's model time includes up to one polling
+  period, and an idle control kernel wakes every 2 ms (design D4 of
+  `add-control-plane`).
+- **The serial line is the control channel** on every VMM (design D2 of
+  `add-control-plane`): fine for requests and output, slow for bulk data.
+- **Snapshots stay in the VM's memory**; `rhizo down` drops them.
+- **Memory.** `rhizo up` gives the guest 256 MiB: the agent and its three
+  branches fit easily (they share their pages copy-on-write).
+- **Linux hosts only.**
