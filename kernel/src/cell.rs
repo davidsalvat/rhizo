@@ -3207,15 +3207,24 @@ pub fn agent(
         suspend_resume_ns: Vec::new(),
         fork_ns: 0,
     };
-    // Its turns: after each, it pauses in a sleep, where the host suspends
-    // and resumes it; the last pause before the fork is its long sleep.
+    // Its turns: after each, it prints the turn's line and pauses briefly;
+    // the host suspends and resumes it once the line is out (a pause of a
+    // millisecond can pass unseen on a loaded host, so the host does not
+    // wait for it). At its decision point it waits, asleep, for `/branch`.
     let mut seen = 0;
     loop {
         let printed = |host: &mut Host, id: u32| {
             host.output(id)
                 .is_some_and(|o| o.len() > seen && o.ends_with(b"\n"))
         };
-        while !(host.asleep(id) && printed(host, id)) {
+        let turn_done = |host: &mut Host, id: u32| {
+            host.output(id).is_some_and(|o| {
+                let body = &o[..o.len() - 1];
+                let start = body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                body[start..].starts_with(b"turn ")
+            })
+        };
+        while !(printed(host, id) && (host.asleep(id) || turn_done(host, id))) {
             if host.finished(id).is_some() || now_ns() > end {
                 return Err(said(host, id));
             }
