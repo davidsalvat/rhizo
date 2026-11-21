@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 536" width="800" height="536" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>The numbers that matter</title>
+<desc>Six headline figures from one benchmark run. Node.js, ready to answer, forked from a warm template: 5.57 ms (warm fork 5.57 ms, cold start 46.17 ms); with its JIT, cold is 17% faster. numpy from PyPI wheels, forked after import numpy: 18.41 ms (Rhizo cell 18.41 ms, Linux process 19.12 ms); cold: cell 85.51 ms, Linux 76.98 ms. 50 agents on a laptop, 45 of them suspended: 6.6 MB (shared snapshots 6.6 MB, full copies (before) 60 MB); snapshots point at shared pages. A template saved to a file, loaded into a fresh VM: 4.1× sooner (loaded template 13.90 ms, cold agent 56.42 ms); to its first answer (QEMU). Host operation on one cell, how long other cells stall: 17 µs (now 17 µs, every CPU stopped 121 µs); 7× shorter. 10,000 busy cells, 1 vCPU, 99th percentile wait to wake: 1.4–4.1 ms; 40k–46k operations/s.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1f9d6b"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#0a5cc2"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8a6100"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b42318"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="535" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">The numbers that matter</text>
+<text x="24" y="64" font-size="14" fill="#4b5c55">Medians from one CI run with KVM (Firecracker unless noted); bars to scale within each card</text>
+<rect x="24" y="84" width="240" height="196" rx="14" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="40" y="110" font-size="14.5" fill="#0e2a20" font-weight="700">Node.js, ready to answer</text>
+<text x="40" y="129" font-size="12.5" fill="#4b5c55">forked from a warm template</text>
+<text x="40" y="168" font-size="28" fill="#146c4a" font-weight="700">5.57 ms</text>
+<text x="40" y="196" font-size="12.5" fill="#0e2a20">warm fork</text>
+<text x="248" y="196" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="end">5.57 ms</text>
+<rect x="40" y="202" width="25.1" height="10" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="40" y="228" font-size="12.5" fill="#4b5c55">cold start</text>
+<text x="248" y="228" font-size="12.5" fill="#4b5c55" text-anchor="end">46.17 ms</text>
+<rect x="40" y="234" width="208.0" height="10" rx="3" fill="#77818b" stroke="#77818b" stroke-width="0"/>
+<text x="40" y="264" font-size="12.5" fill="#146c4a" font-weight="700">with its JIT, cold is 17% faster</text>
+<rect x="280" y="84" width="240" height="196" rx="14" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="296" y="110" font-size="14.5" fill="#0e2a20" font-weight="700">numpy from PyPI wheels</text>
+<text x="296" y="129" font-size="12.5" fill="#4b5c55">forked after import numpy</text>
+<text x="296" y="168" font-size="28" fill="#146c4a" font-weight="700">18.41 ms</text>
+<text x="296" y="196" font-size="12.5" fill="#0e2a20">Rhizo cell</text>
+<text x="504" y="196" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="end">18.41 ms</text>
+<rect x="296" y="202" width="200.2" height="10" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="296" y="228" font-size="12.5" fill="#4b5c55">Linux process</text>
+<text x="504" y="228" font-size="12.5" fill="#4b5c55" text-anchor="end">19.12 ms</text>
+<rect x="296" y="234" width="208.0" height="10" rx="3" fill="#77818b" stroke="#77818b" stroke-width="0"/>
+<text x="296" y="264" font-size="12.5" fill="#146c4a" font-weight="700">cold: cell 85.51 ms, Linux 76.98 ms</text>
+<rect x="536" y="84" width="240" height="196" rx="14" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="552" y="110" font-size="14.5" fill="#0e2a20" font-weight="700">50 agents on a laptop</text>
+<text x="552" y="129" font-size="12.5" fill="#4b5c55">45 of them suspended</text>
+<text x="552" y="168" font-size="28" fill="#146c4a" font-weight="700">6.6 MB</text>
+<text x="552" y="196" font-size="12.5" fill="#0e2a20">shared snapshots</text>
+<text x="760" y="196" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="end">6.6 MB</text>
+<rect x="552" y="202" width="22.7" height="10" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="552" y="228" font-size="12.5" fill="#4b5c55">full copies (before)</text>
+<text x="760" y="228" font-size="12.5" fill="#4b5c55" text-anchor="end">60 MB</text>
+<rect x="552" y="234" width="208.0" height="10" rx="3" fill="#77818b" stroke="#77818b" stroke-width="0"/>
+<text x="552" y="264" font-size="12.5" fill="#146c4a" font-weight="700">snapshots point at shared pages</text>
+<rect x="24" y="296" width="240" height="196" rx="14" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="40" y="322" font-size="14.5" fill="#0e2a20" font-weight="700">A template saved to a file</text>
+<text x="40" y="341" font-size="12.5" fill="#4b5c55">loaded into a fresh VM</text>
+<text x="40" y="380" font-size="28" fill="#146c4a" font-weight="700">4.1× sooner</text>
+<text x="40" y="408" font-size="12.5" fill="#0e2a20">loaded template</text>
+<text x="248" y="408" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="end">13.90 ms</text>
+<rect x="40" y="414" width="51.3" height="10" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="40" y="440" font-size="12.5" fill="#4b5c55">cold agent</text>
+<text x="248" y="440" font-size="12.5" fill="#4b5c55" text-anchor="end">56.42 ms</text>
+<rect x="40" y="446" width="208.0" height="10" rx="3" fill="#77818b" stroke="#77818b" stroke-width="0"/>
+<text x="40" y="476" font-size="12.5" fill="#146c4a" font-weight="700">to its first answer (QEMU)</text>
+<rect x="280" y="296" width="240" height="196" rx="14" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="296" y="322" font-size="14.5" fill="#0e2a20" font-weight="700">Host operation on one cell</text>
+<text x="296" y="341" font-size="12.5" fill="#4b5c55">how long other cells stall</text>
+<text x="296" y="380" font-size="28" fill="#146c4a" font-weight="700">17 µs</text>
+<text x="296" y="408" font-size="12.5" fill="#0e2a20">now</text>
+<text x="504" y="408" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="end">17 µs</text>
+<rect x="296" y="414" width="29.4" height="10" rx="3" fill="#1f9d6b" stroke="#1f9d6b" stroke-width="0"/>
+<text x="296" y="440" font-size="12.5" fill="#4b5c55">every CPU stopped</text>
+<text x="504" y="440" font-size="12.5" fill="#4b5c55" text-anchor="end">121 µs</text>
+<rect x="296" y="446" width="208.0" height="10" rx="3" fill="#77818b" stroke="#77818b" stroke-width="0"/>
+<text x="296" y="476" font-size="12.5" fill="#146c4a" font-weight="700">7× shorter</text>
+<rect x="536" y="296" width="240" height="196" rx="14" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="552" y="322" font-size="14.5" fill="#0e2a20" font-weight="700">10,000 busy cells, 1 vCPU</text>
+<text x="552" y="341" font-size="12.5" fill="#4b5c55">99th percentile wait to wake</text>
+<text x="552" y="380" font-size="28" fill="#146c4a" font-weight="700">1.4–4.1 ms</text>
+<text x="552" y="412" font-size="12.5" fill="#4b5c55">range over four VMMs,</text>
+<text x="552" y="432" font-size="12.5" fill="#4b5c55">the slowest: Firecracker</text>
+<text x="552" y="476" font-size="12.5" fill="#146c4a" font-weight="700">40k–46k operations/s</text>
+<text x="24" y="518" font-size="12.5" fill="#4b5c55">Shared runners are noisy: figures move between runs. The tables hold every value.</text>
+</svg>

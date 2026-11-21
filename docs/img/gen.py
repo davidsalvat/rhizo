@@ -16,9 +16,9 @@ next to x86_64's (pass it to `--readme` too, as a second `--from`).
 import json
 import math
 import sys
-from pathlib import Path
 
-OUT = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True  # no __pycache__ next to the images
+from svg import OUT, Svg, both  # noqa: E402
 RESULTS = json.load(open(sys.argv[1]))
 for extra in sys.argv[2:]:
     RESULTS["metrics"] += json.load(open(extra))["metrics"]
@@ -112,171 +112,6 @@ SECURITY = (OUT.parent / "security.md").exists()
 PY_COLD = median("workload.python_cold_us")
 PY_WARM = median("workload.python_warm_us")
 IDLE_KB = median("cell.idle_bytes", vmm=None) / 1000
-FONT = "Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif"
-W = 800
-
-THEMES = {
-    "light": dict(
-        bg="#ffffff", border="#d0d7de", text="#0e2a20", muted="#4b5c55",
-        box="#f3f5f4", boxline="#c3ccc8",
-        cell="#eafaf2", cellline="#1f9d6b", accent="#146c4a",
-        bar="#1f9d6b", other="#8c959f", warn="#875a00", warnfill="#fff4d6",
-        done="#16784f", donetext="#ffffff", arrow="#57706a", pending="#8c959f",
-    ),
-    "dark": dict(
-        bg="#0d1117", border="#30363d", text="#e6edf3", muted="#9ba7b3",
-        box="#161b22", boxline="#3d444d",
-        cell="#0f2a1f", cellline="#63d4a0", accent="#63d4a0",
-        bar="#63d4a0", other="#768390", warn="#e3b341", warnfill="#2e2513",
-        done="#63d4a0", donetext="#0e2a20", arrow="#8b98a5", pending="#768390",
-    ),
-}
-
-
-def esc(s):
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-class Svg:
-    def __init__(self, t, h, title, desc):
-        self.t, self.h, self.parts = t, h, []
-        self.head = (
-            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {h}" '
-            f'width="{W}" height="{h}" role="img" font-family="{FONT}">\n'
-            f"<title>{esc(title)}</title>\n<desc>{esc(desc)}</desc>\n"
-            '<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" '
-            'markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
-            f'<path d="M0 0L10 5L0 10z" fill="{t["arrow"]}"/></marker></defs>\n'
-            f'<rect class="bg" x="0.5" y="0.5" width="{W-1}" height="{h-1}" rx="12" '
-            f'fill="{t["bg"]}" stroke="{t["border"]}"/>\n'
-        )
-
-    def add(self, s):
-        self.parts.append(s)
-
-    def rect(self, x, y, w, h, fill, stroke, rx=8, dash=False, sw=1.5):
-        d = ' stroke-dasharray="5 4"' if dash else ""
-        self.add(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" '
-                 f'fill="{fill}" stroke="{stroke}" stroke-width="{sw}"{d}/>')
-
-    def text(self, x, y, s, size=16, fill=None, weight=400, anchor="start"):
-        fill = fill or self.t["text"]
-        a = f' text-anchor="{anchor}"' if anchor != "start" else ""
-        w = f' font-weight="{weight}"' if weight != 400 else ""
-        self.add(f'<text x="{x}" y="{y}" font-size="{size}" fill="{fill}"{w}{a}>{esc(s)}</text>')
-
-    def line(self, x1, y1, x2, y2, color=None, arrow=True, sw=1.8, dash=False):
-        color = color or self.t["arrow"]
-        m = ' marker-end="url(#a)"' if arrow else ""
-        d = ' stroke-dasharray="4 4"' if dash else ""
-        self.add(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{color}" '
-                 f'stroke-width="{sw}"{m}{d}/>')
-
-    def path(self, d, color=None, arrow=True, sw=1.8):
-        color = color or self.t["arrow"]
-        m = ' marker-end="url(#a)"' if arrow else ""
-        self.add(f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{sw}"{m}/>')
-
-    def save(self, name):
-        (OUT / name).write_text(self.head + "\n".join(self.parts) + "\n</svg>\n")
-
-
-# ---------------------------------------------------------------- stack
-def stack(t):
-    s = Svg(t, 470, "The stack today versus Rhizo",
-            "Today an agent runs on orchestrator, host Linux, a VMM or userspace "
-            "kernel and often a guest Linux. With Rhizo, cells run directly on "
-            "a kernel whose operations are create, suspend, resume and fork.")
-    lx, rx, cw = 32, 424, 344
-    s.text(lx, 46, "Today", 20, weight=700)
-    s.text(rx, 46, "With Rhizo", 20, fill=t["accent"], weight=700)
-    s.line(400, 30, 400, 400, color=t["border"], arrow=False, sw=1)
-    layers = ["Orchestrator", "Host Linux", "VMM or userspace kernel",
-              "Guest Linux (often)", "Agent code"]
-    y, bh, gap = 70, 48, 20
-    for i, name in enumerate(layers):
-        last = i == len(layers) - 1
-        s.rect(lx, y, cw, bh, t["cell"] if last else t["box"],
-               t["cellline"] if last else t["boxline"])
-        s.text(lx + cw / 2, y + 30, name, 17, anchor="middle",
-               weight=600 if last else 400)
-        if not last:
-            s.line(lx + cw / 2, y + bh, lx + cw / 2, y + bh + gap - 2)
-        y += bh + gap
-    # Rhizo side
-    s.rect(rx, 70, cw, bh, t["box"], t["boxline"])
-    s.text(rx + cw / 2, 100, "Orchestrator", 17, anchor="middle")
-    s.line(rx + cw / 2, 118, rx + cw / 2, 136)
-    s.rect(rx, 138, cw, 84, t["cell"], t["cellline"], sw=2)
-    s.text(rx + cw / 2, 170, "Rhizo kernel", 19, weight=700, anchor="middle")
-    s.text(rx + cw / 2, 198, "create · suspend · resume · fork", 15,
-           fill=t["muted"], anchor="middle")
-    cy = 262
-    xs = [rx + 6, rx + 120, rx + 234]
-    for x in xs:
-        s.line(x + 52, 222, x + 52, cy - 2)
-        s.rect(x, cy, 104, 76, t["cell"], t["cellline"], rx=38)
-        s.text(x + 52, cy + 34, "cell", 16, weight=600, anchor="middle")
-        s.text(x + 52, cy + 55, "agent code", 14, fill=t["muted"], anchor="middle")
-    s.text(rx + cw / 2, 370, "thousands per node, most asleep", 14,
-           fill=t["muted"], anchor="middle")
-    s.text(lx, 432, "Snapshots, clones and isolation", 15, fill=t["muted"])
-    s.text(lx, 454, "are added from the outside.", 15, fill=t["muted"])
-    s.text(rx, 432, "Snapshot, resume and fork are", 15, fill=t["muted"])
-    s.text(rx, 454, "native operations of the kernel.", 15, fill=t["muted"])
-    return s
-
-
-# ---------------------------------------------------------------- lifecycle
-def lifecycle(t):
-    s = Svg(t, 440, "What a cell can do",
-            "A cell is created from a static executable. A running cell can be "
-            "suspended into a snapshot and resumed, forked into copy-on-write "
-            "children, or frozen as a template that new cells start from.")
-    # executable
-    s.rect(24, 168, 150, 64, t["box"], t["boxline"])
-    s.text(99, 196, "Static Linux", 15, anchor="middle")
-    s.text(99, 216, "executable", 15, anchor="middle")
-    s.line(174, 200, 248, 200)
-    s.text(211, 190, "create", 14, fill=t["muted"], anchor="middle", weight=600)
-    # running cell
-    s.rect(250, 160, 220, 80, t["cell"], t["cellline"], rx=24, sw=2)
-    s.text(360, 196, "Running cell", 17, weight=700, anchor="middle")
-    s.text(360, 218, "memory · registers · files", 14, fill=t["muted"], anchor="middle")
-    # snapshot (top)
-    s.rect(290, 24, 140, 56, t["box"], t["boxline"], dash=True)
-    s.text(360, 57, "Snapshot", 16, weight=600, anchor="middle")
-    s.line(330, 158, 330, 82)
-    s.line(390, 82, 390, 158)
-    s.text(320, 125, "suspend", 14, fill=t["muted"], anchor="end", weight=600)
-    s.text(400, 116, "resume", 14, fill=t["muted"], weight=600)
-    s.text(400, 136, us(RESUME), 14, fill=t["accent"], weight=700)
-    # children (right)
-    s.line(470, 200, 562, 200)
-    s.text(516, 190, "fork(n)", 14, fill=t["muted"], anchor="middle", weight=600)
-    s.text(516, 222, us(FORK), 14, fill=t["accent"], anchor="middle", weight=700)
-    for i, (dx, dy) in enumerate([(0, 0), (12, 12), (24, 24)][::-1]):
-        s.rect(564 + dx, 150 + dy, 170, 64, t["cell"], t["cellline"], rx=32)
-    s.text(564 + 85, 150 + 30, "Children", 16, weight=600, anchor="middle")
-    s.text(564 + 85, 150 + 50, "copy-on-write", 14, fill=t["muted"], anchor="middle")
-    s.text(661, 266, "share pages until one writes", 14, fill=t["muted"],
-           anchor="middle")
-    # template (bottom)
-    s.line(360, 242, 360, 320)
-    s.text(370, 286, "freeze", 14, fill=t["muted"], weight=600)
-    s.rect(290, 322, 140, 56, t["box"], t["boxline"], dash=True)
-    s.text(360, 355, "Template", 16, weight=600, anchor="middle")
-    s.line(430, 350, 562, 350)
-    s.text(496, 340, "start", 14, fill=t["muted"], anchor="middle", weight=600)
-    s.text(496, 372, us(TEMPLATE), 14, fill=t["accent"], anchor="middle", weight=700)
-    s.rect(564, 318, 170, 64, t["cell"], t["cellline"], rx=32)
-    s.text(649, 346, "New cells", 16, weight=600, anchor="middle")
-    s.text(649, 366, "already warmed up", 14, fill=t["muted"], anchor="middle")
-    s.text(24, 420, "Times: medians on a GitHub-hosted runner with KVM (see the chart below).",
-           14, fill=t["muted"])
-    return s
-
-
 # ---------------------------------------------------------------- chart
 def chart(t):
     def linux(label, value, at):
@@ -423,13 +258,11 @@ def scorecard(t):
                fill=t["accent"] if met else t["text"])
         s.text(x + 18, 160, note, 14, fill=t["muted"])
         if met:
-            s.rect(x + 18, 180, 74, 28, t["done"], t["done"], rx=14, sw=0)
-            s.text(x + 55, 199, "✓ Met", 14, fill=t["donetext"], weight=700,
-                   anchor="middle")
+            dot(s, t, x + 27, 194, "done")
+            s.text(x + 44, 199, "Met", 14, fill=t["accent"], weight=700)
         else:
-            s.rect(x + 18, 180, 112, 28, t["warnfill"], t["warn"], rx=14, sw=1.5)
-            s.text(x + 74, 199, "In progress", 14, fill=t["warn"], weight=700,
-                   anchor="middle")
+            dot(s, t, x + 27, 194, "now")
+            s.text(x + 44, 199, "In progress", 14, fill=t["warn"], weight=700)
         x += cw + gap
     return s
 
@@ -486,6 +319,94 @@ def arches(t):
     return s
 
 
+# ---------------------------------------------------------------- highlights
+# `laptop.memory_bytes` on Firecracker before snapshots referred to shared
+# frames (PR #87, `add-shared-snapshots`): no longer measured, so quoted.
+LAPTOP_FULL_COPY = 60_424_192
+
+
+def rhizo_values(name):
+    return [m["median"] for m in RESULTS["metrics"] if m["name"] == name and m["guest"] == "rhizo"]
+
+
+def highlights(t):
+    """The README's headline figures as cards, or None without them."""
+    node_jit = median("workload.node_jit_cold_us", required=False)
+    laptop = median("laptop.memory_bytes", required=False)
+    loaded = median("snapshot.loaded_answer_us", vmm="qemu-microvm", required=False)
+    cold_answer = median("snapshot.cold_answer_us", vmm="qemu-microvm", required=False)
+    stall = median("cell.host_op_stall_us", required=False)
+    stopped = median("cell.host_op_stall_stopped_us", required=False)
+    wake = rhizo_values("density.wake_p99_us")
+    ops = rhizo_values("density.ops_per_s")
+    need = [NODE_WARM, NODE_COLD, node_jit, NP_WARM, LX_NP_WARM, laptop, loaded,
+            cold_answer, stall, stopped, wake, ops]
+    if not all(need):
+        return None
+    jit = round((1 - node_jit / NODE_COLD) * 100)
+    cards = [
+        ("Node.js, ready to answer", "forked from a warm template", us(NODE_WARM),
+         [("warm fork", NODE_WARM, us(NODE_WARM), True),
+          ("cold start", NODE_COLD, us(NODE_COLD), False)],
+         f"with its JIT, cold is {jit}% faster"),
+        ("numpy from PyPI wheels", "forked after import numpy", us(NP_WARM),
+         [("Rhizo cell", NP_WARM, us(NP_WARM), True),
+          ("Linux process", LX_NP_WARM, us(LX_NP_WARM), False)],
+         f"cold: cell {us(NP_COLD)}, Linux {us(LX_NP_COLD)}"),
+        ("50 agents on a laptop", "45 of them suspended", f"{laptop / 1e6:.1f} MB",
+         [("shared snapshots", laptop, f"{laptop / 1e6:.1f} MB", True),
+          ("full copies (before)", LAPTOP_FULL_COPY, f"{LAPTOP_FULL_COPY / 1e6:.0f} MB",
+           False)],
+         "snapshots point at shared pages"),
+        ("A template saved to a file", "loaded into a fresh VM",
+         f"{cold_answer / loaded:.1f}× sooner",
+         [("loaded template", loaded, us(loaded), True),
+          ("cold agent", cold_answer, us(cold_answer), False)],
+         "to its first answer (QEMU)"),
+        ("Host operation on one cell", "how long other cells stall", us(stall),
+         [("now", stall, us(stall), True),
+          ("every CPU stopped", stopped, us(stopped), False)],
+         f"{stopped / stall:.0f}× shorter"),
+        ("10,000 busy cells, 1 vCPU", "99th percentile wait to wake",
+         f"{min(wake) / 1000:.1f}–{max(wake) / 1000:.1f} ms", None,
+         f"{min(ops) / 1000:.0f}k–{max(ops) / 1000:.0f}k operations/s"),
+    ]
+    cw, ch, gap, top = 240, 196, 16, 84
+    h = top + 2 * ch + gap + 44
+    s = Svg(t, h, "The numbers that matter",
+            "Six headline figures from one benchmark run. " + " ".join(
+                f"{a}, {b}: {v}" + (" (" + ", ".join(f"{n} {lab}" for n, _, lab, _ in bars)
+                                    + ")" if bars else "") + f"; {foot}."
+                for a, b, v, bars, foot in cards))
+    s.text(24, 40, "The numbers that matter", 20, weight=700)
+    s.text(24, 64, "Medians from one CI run with KVM (Firecracker unless noted); "
+           "bars to scale within each card", 14, fill=t["muted"])
+    for i, (a, b, v, bars, foot) in enumerate(cards):
+        x = 24 + (i % 3) * (cw + gap)
+        y = top + (i // 3) * (ch + gap)
+        s.rect(x, y, cw, ch, t["box"], t["boxline"], rx=14)
+        s.text(x + 16, y + 26, a, 14.5, weight=700)
+        s.text(x + 16, y + 45, b, 12.5, fill=t["muted"])
+        s.text(x + 16, y + 84, v, 28, weight=700, fill=t["accent"])
+        if bars:
+            longest = max(val for _, val, _, _ in bars)
+            for j, (name, val, lab, rh) in enumerate(bars):
+                by = y + 112 + j * 32
+                s.text(x + 16, by, name, 12.5, fill=t["text"] if rh else t["muted"])
+                s.text(x + cw - 16, by, lab, 12.5, anchor="end", weight=700 if rh else 400,
+                       fill=t["text"] if rh else t["muted"])
+                c = t["bar"] if rh else t["other"]
+                s.rect(x + 16, by + 6, round(max(3.0, val / longest * (cw - 32)), 1), 10,
+                       c, c, rx=3, sw=0)
+        else:
+            s.text(x + 16, y + 116, "range over four VMMs,", 12.5, fill=t["muted"])
+            s.text(x + 16, y + 136, "the slowest: Firecracker", 12.5, fill=t["muted"])
+        s.text(x + 16, y + ch - 16, foot, 12.5, weight=700, fill=t["accent"])
+    s.text(24, h - 18, "Shared runners are noisy: figures move between runs. The tables "
+           "hold every value.", 12.5, fill=t["muted"])
+    return s
+
+
 # ---------------------------------------------------------------- roadmap
 BOOT_MS = median("boot.time_to_ready_ms")
 AGENT_FORK = median("workload.agent_fork_us", required=False)
@@ -523,6 +444,8 @@ STAGES = [
       has("workload.dynamic_run_us"), has("workload.node_warm_us"),
       has("workload.numpy_warm_us"), has("cell.syscall_kpti_ns")], "now",
      (f"{DENSITY:,.0f}", "busy cells in one VM") if DENSITY else None),
+    ("Families and modules", "Agents in walled families; abilities added as signed modules",
+     [False], "next", None),
     ("The product", "Download a ready agent in two clicks, bring your own model",
      [False], "vision", None),
 ]
@@ -539,13 +462,13 @@ def roadmap(t):
                 f"{name} ({ {'done': 'done', 'now': 'in progress', 'next': 'next', 'vision': 'vision'}[k]}): "
                 f"{line.lower()}" + (f", {f[0]} {f[1]}" if f and k == "done" else "") + "."
                 for name, line, k, f in rows))
-    s.text(24, 40, f"Proof of concept: {ndone} of {len(rows)} stages done", 20, weight=700)
+    s.text(24, 40, f"Where Rhizo stands: {ndone} of {len(rows)} stages done", 20, weight=700)
     for lx, kind, lab in [(24, "done", "Done"), (110, "now", "In progress"),
-                          (236, "next", "Next"), (318, "vision", "Vision")]:
+                          (236, "next", "Designed"), (350, "vision", "Vision")]:
         dot(s, t, lx + 9, 70, kind)
         s.text(lx + 24, 75, lab, 14, fill=t["muted"])
     rail = 52
-    s.line(rail, top + rh / 2, rail, top + rh * (len(rows) - 0.5), color=t["border"],
+    s.line(rail, top + rh / 2, rail, top + rh * (len(rows) - 0.5), color=t["boxline"],
            arrow=False, sw=2)
     y = top
     for name, line, kind, fig in rows:
@@ -562,172 +485,10 @@ def roadmap(t):
             s.text(776, cy - 4, "in progress", 14, weight=700, fill=t["warn"], anchor="end")
         elif kind == "vision":
             s.text(776, cy - 4, "vision", 14, weight=700, fill=t["muted"], anchor="end")
+        elif kind == "next":
+            s.text(776, cy - 4, "designed", 14, weight=700, fill=t["warn"], anchor="end")
+            s.text(776, cy + 17, "docs/cell-hierarchy.md", 13, fill=t["muted"], anchor="end")
         y += rh
-    return s
-
-
-# ---------------------------------------------------------------- vision
-def tag(s, t, x, y, planned, word="measured"):
-    """A small 'planned' (or `word`) label ending at x."""
-    s.text(x, y, "planned" if planned else word, 12, weight=700,
-           fill=t["muted"] if planned else t["accent"], anchor="end")
-
-
-def layers(t):
-    s = Svg(t, 488, "Simple on top, deep below",
-            "Layers of Rhizo. On top, what the user sees: a two-click app and a "
-            "template catalog (both planned) and their agents. A line separates "
-            "it from what the user does not see: agent cells that are created, "
-            f"suspended, resumed and forked in microseconds (fork {us(FORK)}, "
-            f"resume {us(RESUME)}, measured), and below them the Rhizo kernel, "
-            "which rebuilds the foundations: memory, scheduler, isolation, "
-            "network and snapshots.")
-    s.text(24, 40, "Simple on top, deep below", 20, weight=700)
-    s.text(24, 64, "The user sees two clicks; the kernel does the hard work.", 14,
-           fill=t["muted"])
-    boxes = [("Two-click app", "pick, open, done", True),
-             ("Template catalog", "ready environments", True),
-             ("Your agents", "Python, tools, files", False)]
-    for i, (name, sub, planned) in enumerate(boxes):
-        x = 24 + i * 256
-        s.rect(x, 92, 240, 72, t["box"], t["boxline"], dash=planned)
-        s.text(x + 16, 122, name, 16, weight=700)
-        s.text(x + 16, 146, sub, 14, fill=t["muted"])
-        tag(s, t, x + 228, 122, planned, "built")
-    s.line(24, 192, 776, 192, color=t["boxline"], arrow=False, sw=1.5, dash=True)
-    s.text(24, 184, "what you see", 13, fill=t["muted"], weight=600)
-    s.text(24, 210, "what you don't", 13, fill=t["muted"], weight=600)
-    s.rect(24, 224, 752, 84, t["cell"], t["cellline"], rx=24, sw=2)
-    s.text(48, 258, "Agent cells", 18, weight=700)
-    s.text(48, 284, "create · suspend · resume · fork", 14, fill=t["muted"])
-    s.text(752, 258, f"fork {us(FORK)} · resume {us(RESUME)}", 16, weight=700,
-           fill=t["accent"], anchor="end")
-    tag(s, t, 752, 284, False)
-    s.line(400, 310, 400, 332)
-    s.rect(24, 334, 752, 116, t["box"], t["boxline"])
-    s.text(48, 364, "Rhizo kernel: the foundations, rebuilt for agents", 17, weight=700)
-    parts = ["Memory", "Scheduler", "Isolation", "Network", "Snapshots"]
-    bw = (720 - 4 * 12) / 5
-    for i, name in enumerate(parts):
-        x = 40 + i * (bw + 12)
-        s.rect(round(x, 1), 380, round(bw, 1), 52, t["bg"], t["boxline"], rx=6)
-        s.text(round(x + bw / 2, 1), 412, name, 15, anchor="middle")
-    s.text(24, 476, "Solid: built and measured. Dashed: planned.", 13, fill=t["muted"])
-    return s
-
-
-def clicks(t):
-    steps = [
-        ("Pick a template", "a ready Python, data or Node agent", None, None),
-        ("Download it", "one compressed snapshot", None, None),
-        ("Open an agent", "the snapshot resumes", us(RESUME), "resume from memory"),
-        ("Open ten more", "ten forks, no extra memory until they write",
-         us(FORK), "per fork"),
-        ("Suspend, come back later", "the agent waits as a snapshot",
-         f"{IDLE_KB:.0f} KB", "per idle agent"),
-    ]
-    rh, top = 76, 92
-    h = top + rh * len(steps) + 40
-    s = Svg(t, h, "Two clicks",
-            "The user's path: " + " ".join(
-                f"{i + 1}. {n}: {d}" + (f" ({v} {c}, measured)." if v else " (planned).")
-                for i, (n, d, v, c) in enumerate(steps)))
-    s.text(24, 40, "Two clicks", 20, weight=700)
-    s.text(24, 64, "What opening agents looks like for the user.", 14, fill=t["muted"])
-    s.line(52, top + 32, 52, top + rh * (len(steps) - 1) + 32, color=t["border"],
-           arrow=False, sw=2)
-    for i, (name, desc, value, cap) in enumerate(steps):
-        y = top + i * rh
-        s.rect(88, y, 688, 64, t["box"] if value is None else t["cell"],
-               t["boxline"] if value is None else t["cellline"], dash=value is None)
-        s.add(f'<circle cx="52" cy="{y + 32}" r="15" fill="{t["bg"]}" '
-              f'stroke="{t["cellline"] if value else t["pending"]}" stroke-width="2"/>')
-        s.text(52, y + 37, str(i + 1), 14, weight=700, anchor="middle")
-        s.text(108, y + 28, name, 16, weight=700)
-        s.text(108, y + 50, desc, 14, fill=t["muted"])
-        if value:
-            s.text(756, y + 28, value, 16, weight=700, fill=t["accent"], anchor="end")
-            s.text(756, y + 50, cap, 13, fill=t["muted"], anchor="end")
-        else:
-            tag(s, t, 756, y + 28, True)
-    s.text(24, h - 16, "Solid: built and measured. Dashed: planned.", 13, fill=t["muted"])
-    return s
-
-
-def model(t):
-    s = Svg(t, 470, "The model beside Rhizo",
-            "Local architecture. On the user's computer, any model runtime "
-            "(Ollama, llama.cpp, vLLM) runs on the host GPU or NPU with one shared "
-            "copy of the weights. Next to it, the Rhizo VM runs agent cells, "
-            "including a fork, and each agent keeps its own state in its cell. "
-            "Cells talk to the model over a local socket, and the Rhizo app "
-            "coordinates both. The app and the socket are planned.")
-    s.text(24, 40, "The model beside Rhizo", 20, weight=700)
-    s.text(24, 64, "Any model, any runtime, full GPU speed; agents in cells.", 14,
-           fill=t["muted"])
-    s.rect(24, 80, 752, 360, t["bg"], t["border"], rx=12)
-    s.text(40, 104, "Your computer (Linux, macOS or Windows)", 14, fill=t["muted"],
-           weight=600)
-    s.rect(40, 118, 720, 50, t["box"], t["boxline"], dash=True)
-    s.text(60, 149, "Rhizo app: starts the VM, picks the model, manages agents", 15,
-           weight=600)
-    tag(s, t, 744, 149, True)
-    s.line(160, 168, 160, 196)
-    s.line(580, 168, 580, 196)
-    # model side
-    s.rect(40, 198, 240, 88, t["box"], t["boxline"])
-    s.text(56, 226, "Model runtime", 16, weight=700)
-    s.text(56, 248, "Ollama, llama.cpp, vLLM…", 14, fill=t["muted"])
-    s.text(56, 270, "weights: one shared copy", 14, fill=t["muted"])
-    s.line(160, 286, 160, 316, arrow=False)
-    s.rect(40, 318, 240, 56, t["box"], t["boxline"])
-    s.text(160, 351, "GPU / NPU", 16, weight=700, anchor="middle")
-    # socket
-    s.line(290, 242, 398, 242, dash=True)
-    s.line(398, 262, 290, 262, dash=True)
-    s.text(344, 230, "local socket", 13, fill=t["muted"], anchor="middle", weight=600)
-    s.text(344, 284, "planned", 12, fill=t["muted"], anchor="middle", weight=700)
-    # Rhizo VM
-    s.rect(400, 198, 360, 226, t["cell"], t["cellline"], rx=16, sw=2)
-    s.text(416, 224, "Rhizo VM", 16, weight=700)
-    s.text(416, 246, "on KVM today; macOS and Windows planned", 13, fill=t["muted"])
-    for i, (name, sub) in enumerate([("agent A", "cell"), ("agent B", "cell"),
-                                     ("agent B′", "fork of B")]):
-        x = 416 + i * 112
-        s.rect(x, 262, 104, 64, t["bg"], t["cellline"], rx=28)
-        s.text(x + 52, 290, name, 15, weight=700, anchor="middle")
-        s.text(x + 52, 310, sub, 13, fill=t["muted"], anchor="middle")
-    s.text(416, 356, "Each agent's state (program, history,", 13, fill=t["muted"])
-    s.text(416, 376, "files) lives in its cell: that is what", 13, fill=t["muted"])
-    s.text(416, 396, "Rhizo suspends, resumes and forks.", 13, fill=t["muted"])
-    s.text(24, 460, "Solid: built today. Dashed: planned.", 13, fill=t["muted"])
-    return s
-
-
-def markets(t):
-    s = Svg(t, 340, "Two markets, one engine",
-            "Servers (B2B): density, cost per agent, an API. Local AI (B2C): an "
-            "app, downloadable templates, your own model. Both products are "
-            "planned; they run on the same engine, the Rhizo kernel and its "
-            "agent cells, which is built today.")
-    s.text(24, 40, "Two markets, one engine", 20, weight=700)
-    for x, title, lines in [
-            (24, "Servers (B2B)", ["many agents per machine", "low cost per agent",
-                                   "an API to create, fork, resume"]),
-            (412, "Your computer (B2C)", ["a two-click app", "downloadable templates",
-                                          "your own local model"])]:
-        s.rect(x, 64, 364, 140, t["box"], t["boxline"], dash=True)
-        s.text(x + 20, 94, title, 17, weight=700)
-        tag(s, t, x + 348, 94, True)
-        for i, ln in enumerate(lines):
-            s.text(x + 20, 124 + i * 24, "· " + ln, 14, fill=t["muted"])
-        s.line(x + 182, 204, x + 182, 236)
-    s.rect(24, 238, 752, 68, t["cell"], t["cellline"], rx=20, sw=2)
-    s.text(400, 268, "One engine: the Rhizo kernel and its agent cells", 17, weight=700,
-           anchor="middle")
-    s.text(400, 291, "density, security and compatibility serve both", 14,
-           fill=t["muted"], anchor="middle")
-    s.text(24, 322, "Solid: built today. Dashed: planned.", 13, fill=t["muted"])
     return s
 
 
@@ -749,12 +510,7 @@ def dot(s, t, x, y, kind):
               f'stroke="{t["pending"]}" stroke-width="2" stroke-dasharray="3 2.5"/>')
 
 
-for name, fn in [("stack", stack), ("lifecycle", lifecycle), ("measured", chart),
-                 ("scorecard", scorecard), ("roadmap", roadmap), ("layers", layers),
-                 ("clicks", clicks), ("model", model), ("markets", markets),
-                 ("arches", arches)]:
-    for theme, t in THEMES.items():
-        svg = fn(t)
-        if svg:
-            svg.save(f"{name}{'-dark' if theme == 'dark' else ''}.svg")
+for name, fn in [("highlights", highlights), ("measured", chart), ("scorecard", scorecard),
+                 ("roadmap", roadmap), ("arches", arches)]:
+    both(name, fn)
 print("ok")

@@ -470,4 +470,9 @@ results with `--from`). Prefer numbers from the `dedicated` environment.
 A second `--from` with the AArch64 job's results adds a table of
 instructions per operation on both architectures (a metric in both files
 is an error); `python3 docs/img/gen.py bench-results.json
-bench-results-aarch64.json` draws the same as `docs/img/arches.svg`.
+bench-results-aarch64.json` draws the same as `docs/img/arches.svg`, with
+the README's other charts. The README's hand-drawn diagrams, which hold no
+measurements, come from `python3 docs/img/diagrams.py`. `node
+docs/img/check.js` renders every image in light and dark and fails on text
+without 12 units of padding, clipped or overlapping elements, misplaced
+arrows and contrast under WCAG AA.

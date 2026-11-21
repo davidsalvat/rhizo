@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 506" width="800" height="506" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>A cell, a container and a microVM</title>
+<desc>Three ways to give an agent its own space. A container shares the host's Linux kernel with every other container; pausing and cloning are added from outside. A microVM gives each agent a virtual machine with its own guest Linux kernel: strong walls, but a whole operating system to boot and keep per agent. A Rhizo cell runs on one Rhizo kernel inside one VM, many cells side by side, each in its own address space; create, pause, resume and clone are operations of that kernel.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#63d4a0"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#79b8ff"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#f2c14e"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ff8a80"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="505" rx="12" fill="#0d1117" stroke="#30363d"/>
+<text x="24" y="40" font-size="20" fill="#e6edf3" font-weight="700">Three ways to give an agent a room of its own</text>
+<text x="142.0" y="92" font-size="18" fill="#e6edf3" font-weight="700" text-anchor="middle">Container</text>
+<rect x="24" y="336" width="236" height="42" rx="8" fill="#0d1117" stroke="#6e7681" stroke-width="1.3"/>
+<text x="142.0" y="361.5" font-size="13" fill="#e6edf3" text-anchor="middle">Hardware</text>
+<text x="400.0" y="92" font-size="18" fill="#e6edf3" font-weight="700" text-anchor="middle">MicroVM</text>
+<rect x="282" y="336" width="236" height="42" rx="8" fill="#0d1117" stroke="#6e7681" stroke-width="1.3"/>
+<text x="400.0" y="361.5" font-size="13" fill="#e6edf3" text-anchor="middle">Hardware</text>
+<text x="658.0" y="92" font-size="18" fill="#63d4a0" font-weight="700" text-anchor="middle">Rhizo cell</text>
+<rect x="540" y="336" width="236" height="42" rx="8" fill="#0d1117" stroke="#6e7681" stroke-width="1.3"/>
+<text x="658.0" y="361.5" font-size="13" fill="#e6edf3" text-anchor="middle">Hardware</text>
+<text x="142.0" y="116" font-size="12.5" fill="#9ba7b3" text-anchor="middle">light, but one kernel for all</text>
+<text x="400.0" y="116" font-size="12.5" fill="#9ba7b3" text-anchor="middle">a whole OS per agent</text>
+<text x="658.0" y="116" font-size="12.5" fill="#9ba7b3" text-anchor="middle">many cells, one kernel built for them</text>
+<rect x="24" y="240" width="236" height="90" rx="8" fill="#3a1d1d" stroke="#b5524a" stroke-width="1.3"/>
+<text x="142.0" y="280" font-size="14" fill="#e6edf3" font-weight="700" text-anchor="middle">Host Linux kernel</text>
+<text x="142.0" y="302" font-size="12.5" fill="#ff8a80" font-weight="700" text-anchor="middle">shared by every container</text>
+<rect x="24" y="192" width="236" height="42" rx="8" fill="#161b22" stroke="#6e7681" stroke-width="1.3"/>
+<text x="142.0" y="217.5" font-size="13" fill="#e6edf3" text-anchor="middle">Container runtime</text>
+<rect x="24" y="138" width="114" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="81.0" y="166.5" font-size="13" fill="#e6edf3" font-weight="700" text-anchor="middle">agent</text>
+<rect x="146" y="138" width="114" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="203.0" y="166.5" font-size="13" fill="#e6edf3" font-weight="700" text-anchor="middle">agent</text>
+<rect x="282" y="288" width="236" height="42" rx="8" fill="#161b22" stroke="#6e7681" stroke-width="1.3"/>
+<text x="400.0" y="313.5" font-size="13" fill="#e6edf3" text-anchor="middle">Host Linux + KVM</text>
+<rect x="282" y="240" width="114" height="42" rx="8" fill="#161b22" stroke="#6e7681" stroke-width="1.3"/>
+<text x="339.0" y="265.5" font-size="13" fill="#e6edf3" text-anchor="middle">VMM</text>
+<rect x="282" y="192" width="114" height="42" rx="8" fill="#161b22" stroke="#6e7681" stroke-width="1.3"/>
+<text x="339.0" y="217.5" font-size="13" fill="#e6edf3" text-anchor="middle">Guest Linux</text>
+<rect x="282" y="138" width="114" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="339.0" y="166.5" font-size="13" fill="#e6edf3" font-weight="700" text-anchor="middle">agent</text>
+<rect x="404" y="240" width="114" height="42" rx="8" fill="#161b22" stroke="#6e7681" stroke-width="1.3"/>
+<text x="461.0" y="265.5" font-size="13" fill="#e6edf3" text-anchor="middle">VMM</text>
+<rect x="404" y="192" width="114" height="42" rx="8" fill="#161b22" stroke="#6e7681" stroke-width="1.3"/>
+<text x="461.0" y="217.5" font-size="13" fill="#e6edf3" text-anchor="middle">Guest Linux</text>
+<rect x="404" y="138" width="114" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="461.0" y="166.5" font-size="13" fill="#e6edf3" font-weight="700" text-anchor="middle">agent</text>
+<rect x="540" y="288" width="236" height="42" rx="8" fill="#161b22" stroke="#6e7681" stroke-width="1.3"/>
+<text x="658.0" y="313.5" font-size="13" fill="#e6edf3" text-anchor="middle">Host + one VMM</text>
+<rect x="540" y="192" width="236" height="90" rx="8" fill="#0f2a1f" stroke="#63d4a0" stroke-width="2"/>
+<text x="658.0" y="232" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="middle">Rhizo kernel</text>
+<text x="658.0" y="254" font-size="12.5" fill="#63d4a0" font-weight="700" text-anchor="middle">create · pause · resume · clone</text>
+<rect x="540" y="138" width="53" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="566.5" y="166.5" font-size="12.5" fill="#e6edf3" font-weight="700" text-anchor="middle">cell</text>
+<rect x="601" y="138" width="53" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="627.5" y="166.5" font-size="12.5" fill="#e6edf3" font-weight="700" text-anchor="middle">cell</text>
+<rect x="662" y="138" width="53" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="688.5" y="166.5" font-size="12.5" fill="#e6edf3" font-weight="700" text-anchor="middle">cell</text>
+<rect x="723" y="138" width="53" height="48" rx="8" fill="#0f2440" stroke="#3f7dc4" stroke-width="1.3"/>
+<text x="749.5" y="166.5" font-size="12.5" fill="#e6edf3" font-weight="700" text-anchor="middle">cell</text>
+<g transform="translate(26.5 391.5) scale(0.625)" fill="none" stroke="#ff8a80" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></g>
+<text x="50" y="404" font-size="13.5" fill="#9ba7b3">walls: one shared kernel</text>
+<g transform="translate(26.5 417.5) scale(0.625)" fill="none" stroke="#63d4a0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="50" y="430" font-size="13.5" fill="#e6edf3">starts fast</text>
+<g transform="translate(26.5 443.5) scale(0.625)" fill="none" stroke="#ff8a80" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></g>
+<text x="50" y="456" font-size="13.5" fill="#9ba7b3">pause, clone: added outside</text>
+<g transform="translate(284.5 391.5) scale(0.625)" fill="none" stroke="#63d4a0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="308" y="404" font-size="13.5" fill="#e6edf3">walls: a kernel per agent</text>
+<g transform="translate(284.5 417.5) scale(0.625)" fill="none" stroke="#ff8a80" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></g>
+<text x="308" y="430" font-size="13.5" fill="#9ba7b3">boots a whole OS</text>
+<g transform="translate(284.5 443.5) scale(0.625)" fill="none" stroke="#ff8a80" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></g>
+<text x="308" y="456" font-size="13.5" fill="#9ba7b3">pause, clone: whole VM copies</text>
+<g transform="translate(542.5 391.5) scale(0.625)" fill="none" stroke="#63d4a0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="566" y="404" font-size="13.5" fill="#e6edf3">walls: own address spaces</text>
+<g transform="translate(542.5 417.5) scale(0.625)" fill="none" stroke="#63d4a0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="566" y="430" font-size="13.5" fill="#e6edf3">starts in microseconds</text>
+<g transform="translate(542.5 443.5) scale(0.625)" fill="none" stroke="#63d4a0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="566" y="456" font-size="13.5" fill="#e6edf3">pause, clone: built in</text>
+<text x="24" y="488" font-size="12.5" fill="#9ba7b3">Containers and microVMs can be paused and copied too, with tools added around them (CRIU, VM snapshots).</text>
+</svg>

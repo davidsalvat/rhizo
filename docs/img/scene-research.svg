@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 190" width="360" height="190" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>A researcher freezes and replays an experiment</title>
+<desc>A timeline of an experiment with saved points; the researcher goes back to a saved point and replays the run from it exactly.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1f9d6b"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#0a5cc2"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8a6100"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b42318"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="359" height="189" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<g transform="translate(26 40) scale(1.66667)" fill="none" stroke="#0e2a20" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6M10 2v6L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 8V2"/><path d="M7 15h10"/></g>
+<line x1="36" y1="120" x2="330" y2="120" stroke="#858f8a" stroke-width="2"/>
+<circle cx="100" cy="120" r="7" fill="#1f9d6b" stroke="none" stroke-width="1.5"/>
+<circle cx="170" cy="120" r="7" fill="#8a6100" stroke="none" stroke-width="1.5"/>
+<circle cx="240" cy="120" r="7" fill="#1f9d6b" stroke="none" stroke-width="1.5"/>
+<circle cx="300" cy="120" r="7" fill="#1f9d6b" stroke="none" stroke-width="1.5"/>
+<g transform="translate(140 88) scale(0.833333)" fill="none" stroke="#8a6100" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 22V3"/><path d="M5 4h12l-2.5 4L17 12H5"/></g>
+<text x="170" y="152" font-size="12" fill="#8a6100" font-weight="700" text-anchor="middle">frozen</text>
+<path d="M300 113 C 290 60, 196 60, 175 115" fill="none" stroke="#146c4a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#a)"/>
+<text x="238" y="52" font-size="12" fill="#146c4a" font-weight="700" text-anchor="middle">replay from here</text>
+<text x="330" y="176" font-size="12" fill="#4b5c55" text-anchor="end">same state, every time</text>
+</svg>

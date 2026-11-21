@@ -1677,8 +1677,13 @@ pub fn chart_svg(results: &Results, dark: bool) -> String {
     const BAR_H: f64 = 16.0;
     const GROUP_H: f64 = 56.0;
     const TOP: f64 = 70.0;
+    // Margin around everything, so nothing touches the image's edge.
+    const PAD: f64 = 12.0;
     const RHIZO: &str = "#2563eb";
     const LINUX: &str = "#f97316";
+    // Bar outlines: orange alone is 2.8:1 on white, its outline 5.2:1 (WCAG
+    // asks 3:1 of graphics).
+    let linux_edge = if dark { LINUX } else { "#c2410c" };
     // 6.2:1 on white, 6.6:1 on #0d1117.
     let text = if dark { "#9ba7b3" } else { "#57606a" };
     // The speed-up label in Rhizo's blue: 5.2:1 on white; on the dark page
@@ -1699,52 +1704,65 @@ pub fn chart_svg(results: &Results, dark: bool) -> String {
         .collect();
     let max = ready.iter().map(|m| m.median).fold(1.0, f64::max);
     let plot_w = WIDTH - LABEL_W - RIGHT_W;
-    let height = TOP + GROUP_H * vmms.len() as f64 + 40.0;
+    let height = TOP + GROUP_H * vmms.len() as f64 + 40.0 + 2.0 * PAD;
+    let full = WIDTH + 2.0 * PAD;
 
     let mut svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{WIDTH}\" height=\"{height}\" \
-         viewBox=\"0 0 {WIDTH} {height}\" font-family=\"-apple-system, Segoe UI, Helvetica, Arial, sans-serif\" \
-         font-size=\"13\" fill=\"{text}\">\n"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{full}\" height=\"{height}\" \
+         viewBox=\"0 0 {full} {height}\" role=\"img\" font-family=\"-apple-system, Segoe UI, Helvetica, Arial, sans-serif\" \
+         font-size=\"13\" fill=\"{text}\">\n  <title>Boot time: Rhizo against a reference Linux guest</title>\n  \
+         <desc>Time from launching the VMM to the guest being ready, median, lower is better, per VMM: \
+         Rhizo bars next to the reference Linux guest's, with the speed-up.</desc>\n"
     );
-    svg += "  <text x=\"0\" y=\"22\" font-size=\"16\" font-weight=\"600\">Time from VMM launch to guest ready \
-         (median, lower is better)</text>\n";
+    svg += &format!(
+        "  <text x=\"{PAD}\" y=\"{}\" font-size=\"16\" font-weight=\"600\">Time from VMM launch to guest ready \
+         (median, lower is better)</text>\n",
+        22.0 + PAD
+    );
     for (i, (label, color)) in [("Rhizo", RHIZO), ("Linux (reference guest)", LINUX)]
         .iter()
         .enumerate()
     {
-        let x = i as f64 * 120.0;
+        let x = PAD + i as f64 * 120.0;
+        let edge = if i == 0 { RHIZO } else { linux_edge };
         svg += &format!(
-            "  <rect x=\"{x}\" y=\"36\" width=\"12\" height=\"12\" rx=\"2\" fill=\"{color}\"/>\n  \
-             <text x=\"{}\" y=\"47\">{label}</text>\n",
-            x + 18.0
+            "  <rect x=\"{x}\" y=\"{}\" width=\"12\" height=\"12\" rx=\"2\" fill=\"{color}\" stroke=\"{edge}\"/>\n  \
+             <text x=\"{}\" y=\"{}\">{label}</text>\n",
+            36.0 + PAD,
+            x + 18.0,
+            47.0 + PAD
         );
     }
     for (row, vmm) in vmms.iter().enumerate() {
-        let y0 = TOP + row as f64 * GROUP_H;
+        let y0 = PAD + TOP + row as f64 * GROUP_H;
         svg += &format!(
             "  <text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-weight=\"600\">{}</text>\n",
-            LABEL_W - 12.0,
+            PAD + LABEL_W - 12.0,
             y0 + BAR_H + 4.0,
             vmm_label(vmm)
         );
         let rhizo = median_of(&ready, "rhizo", vmm);
         let linux = median_of(&ready, "linux", vmm);
-        for (k, (metric, color)) in [(rhizo, RHIZO), (linux, LINUX)].into_iter().enumerate() {
+        for (k, (metric, color, edge)) in [(rhizo, RHIZO, RHIZO), (linux, LINUX, linux_edge)]
+            .into_iter()
+            .enumerate()
+        {
             let y = y0 + k as f64 * (BAR_H + 4.0);
+            let x = PAD + LABEL_W;
             match metric {
                 Some(m) => {
                     let w = (m.median / max * plot_w).max(2.0);
                     svg += &format!(
-                        "  <rect x=\"{LABEL_W}\" y=\"{y}\" width=\"{w:.1}\" height=\"{BAR_H}\" rx=\"3\" fill=\"{color}\"/>\n  \
+                        "  <rect x=\"{x}\" y=\"{y}\" width=\"{w:.1}\" height=\"{BAR_H}\" rx=\"3\" fill=\"{color}\" stroke=\"{edge}\"/>\n  \
                          <text x=\"{:.1}\" y=\"{:.1}\">{:.1} ms</text>\n",
-                        LABEL_W + w + 6.0,
+                        x + w + 6.0,
                         y + BAR_H - 3.0,
                         m.median
                     );
                 }
                 None => {
                     svg += &format!(
-                        "  <text x=\"{LABEL_W}\" y=\"{:.1}\" font-style=\"italic\">not measured</text>\n",
+                        "  <text x=\"{x}\" y=\"{:.1}\" font-style=\"italic\">not measured</text>\n",
                         y + BAR_H - 3.0
                     );
                 }
@@ -1753,16 +1771,16 @@ pub fn chart_svg(results: &Results, dark: bool) -> String {
         if let (Some(r), Some(l)) = (rhizo, linux) {
             svg += &format!(
                 "  <text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-weight=\"600\" fill=\"{accent}\">{:.0}× faster</text>\n",
-                WIDTH - 4.0,
+                PAD + WIDTH,
                 y0 + BAR_H + 4.0,
                 l.median / r.median
             );
         }
     }
     svg += &format!(
-        "  <text x=\"0\" y=\"{}\" font-size=\"12\">Environment: {}, KVM: {}, {}. \
+        "  <text x=\"{PAD}\" y=\"{}\" font-size=\"12\">Environment: {}, KVM: {}, {}. \
          Generated by cargo xtask bench --readme.</text>\n</svg>\n",
-        height - 10.0,
+        height - 10.0 - PAD,
         results.environment,
         if results.kvm { "yes" } else { "no" },
         results.date

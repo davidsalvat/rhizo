@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="800" height="450" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Rhizo: a home for AI agents</title>
+<desc>An AI agent is downloaded ready to use from a catalogue and starts in an instant inside a sealed cell. It works with your own model. It can be paused and resumed like saving a game, and cloned into branches that try different ideas in parallel, keeping the best one.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#63d4a0"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#79b8ff"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#f2c14e"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ff8a80"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="449" rx="12" fill="#0d1117" stroke="#30363d"/>
+<rect x="206" y="24" width="570" height="400" rx="30" fill="#0d1117" stroke="#63d4a0" stroke-width="2" stroke-dasharray="5 4"/>
+<circle cx="236" cy="56" r="17" fill="#63d4a0" stroke="none" stroke-width="1.5"/>
+<g transform="translate(226.225 46.225) scale(0.814583)" fill="none" stroke="#0d1117" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.4 9-8 11-4.6-2-8-6-8-11V5z" fill="none"/><path d="M8.5 12l2.5 2.5 4.5-5"/></g>
+<text x="262" y="52" font-size="17" fill="#63d4a0" font-weight="700">Sealed off</text>
+<text x="262" y="71" font-size="13" fill="#9ba7b3">nothing gets in or out unless you allow it</text>
+<rect x="24" y="40" width="158" height="156" rx="16" fill="#161b22" stroke="#6e7681" stroke-width="1.5"/>
+<g transform="translate(58 71) scale(1.25)" fill="none" stroke="#9ba7b3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></g>
+<g transform="translate(88 65) scale(1.25)" fill="none" stroke="#79b8ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></g>
+<g transform="translate(118 71) scale(1.25)" fill="none" stroke="#9ba7b3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></g>
+<text x="103" y="136" font-size="16" fill="#e6edf3" font-weight="700" text-anchor="middle">Ready-made</text>
+<text x="103" y="156" font-size="16" fill="#e6edf3" font-weight="700" text-anchor="middle">agents</text>
+<text x="103" y="177" font-size="13" fill="#9ba7b3" text-anchor="middle">download and go</text>
+<path d="M182 120 C 220 120, 230 206, 266 206" fill="none" stroke="#79b8ff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#b)"/>
+<circle cx="205" cy="140" r="13" fill="#79b8ff" stroke="none" stroke-width="1.5"/>
+<g transform="translate(197.525 132.525) scale(0.622917)" fill="none" stroke="#0d1117" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></g>
+<rect x="24" y="262" width="158" height="150" rx="16" fill="#161b22" stroke="#6e7681" stroke-width="1.5"/>
+<g transform="translate(83 286) scale(1.66667)" fill="none" stroke="#79b8ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></g>
+<text x="103" y="358" font-size="16" fill="#e6edf3" font-weight="700" text-anchor="middle">Your own model</text>
+<text x="103" y="378" font-size="13" fill="#9ba7b3" text-anchor="middle">Ollama, llama.cpp,</text>
+<text x="103" y="396" font-size="13" fill="#9ba7b3" text-anchor="middle">any API</text>
+<path d="M182 320 C 225 320, 235 252, 266 252" fill="none" stroke="#79b8ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#b)" stroke-dasharray="4 4"/>
+<rect x="266" y="178" width="136" height="104" rx="30" fill="#0f2a1f" stroke="#63d4a0" stroke-width="2.5"/>
+<g transform="translate(313 195) scale(1.75)" fill="none" stroke="#63d4a0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="13" rx="4" fill="#0d1117"/><path d="M12 7V3.5"/><circle cx="12" cy="3" r="1.3"/><circle cx="9" cy="13" r="1.6" fill="#63d4a0" stroke="none"/><circle cx="15" cy="13" r="1.6" fill="#63d4a0" stroke="none"/><path d="M9.5 17h5"/></g>
+<text x="334" y="266" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="middle">Your agent</text>
+<circle cx="398" cy="182" r="16" fill="#f2c14e" stroke="none" stroke-width="1.5"/>
+<g transform="translate(388.8 172.8) scale(0.766667)" fill="none" stroke="#0d1117" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7z" fill="#0d1117" stroke="none"/></g>
+<text x="334" y="132" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="middle">Starts in an instant</text>
+<text x="334" y="151" font-size="13" fill="#9ba7b3" text-anchor="middle">microseconds, not seconds</text>
+<path d="M402 230 C 470 230, 500 135, 592 135" fill="none" stroke="#f2c14e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#o)"/>
+<path d="M402 230 C 470 230, 500 237, 592 237" fill="none" stroke="#63d4a0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#g)"/>
+<path d="M402 230 C 470 230, 500 339, 592 339" fill="none" stroke="#63d4a0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#g)"/>
+<text x="496" y="98" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="middle">Clone it</text>
+<text x="496" y="117" font-size="13" fill="#9ba7b3" text-anchor="middle">try ideas in parallel</text>
+<rect x="592" y="104" width="172" height="62" rx="22" fill="#0f2a1f" stroke="#f2c14e" stroke-width="2.5"/>
+<g transform="translate(609 122) scale(1.08333)" fill="none" stroke="#63d4a0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="13" rx="4" fill="none"/><path d="M12 7V3.5"/><circle cx="12" cy="3" r="1.3"/><circle cx="9" cy="13" r="1.6" fill="#63d4a0" stroke="none"/><circle cx="15" cy="13" r="1.6" fill="#63d4a0" stroke="none"/><path d="M9.5 17h5"/></g>
+<text x="644" y="130" font-size="14" fill="#e6edf3" font-weight="700">Branch A</text>
+<text x="644" y="149" font-size="12.5" fill="#f2c14e" font-weight="700">the best: keep it</text>
+<circle cx="760" cy="108" r="13" fill="#f2c14e" stroke="none" stroke-width="1.5"/>
+<g transform="translate(752.525 100.525) scale(0.622917)" fill="none" stroke="#0d1117" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5l2.9 6 6.6.8-4.9 4.5 1.3 6.5L12 17l-5.9 3.3 1.3-6.5-4.9-4.5 6.6-.8z" fill="#0d1117" stroke="none"/></g>
+<rect x="592" y="206" width="172" height="62" rx="22" fill="#161b22" stroke="#768390" stroke-width="1.5"/>
+<g transform="translate(609 224) scale(1.08333)" fill="none" stroke="#768390" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="13" rx="4" fill="none"/><path d="M12 7V3.5"/><circle cx="12" cy="3" r="1.3"/><circle cx="9" cy="13" r="1.6" fill="#768390" stroke="none"/><circle cx="15" cy="13" r="1.6" fill="#768390" stroke="none"/><path d="M9.5 17h5"/></g>
+<text x="644" y="232" font-size="14" fill="#9ba7b3" font-weight="700">Branch B</text>
+<text x="644" y="251" font-size="12.5" fill="#9ba7b3">drop it</text>
+<g transform="translate(737 230) scale(0.583333)" fill="none" stroke="#768390" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></g>
+<rect x="592" y="308" width="172" height="62" rx="22" fill="#161b22" stroke="#768390" stroke-width="1.5"/>
+<g transform="translate(609 326) scale(1.08333)" fill="none" stroke="#768390" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="13" rx="4" fill="none"/><path d="M12 7V3.5"/><circle cx="12" cy="3" r="1.3"/><circle cx="9" cy="13" r="1.6" fill="#768390" stroke="none"/><circle cx="15" cy="13" r="1.6" fill="#768390" stroke="none"/><path d="M9.5 17h5"/></g>
+<text x="644" y="334" font-size="14" fill="#9ba7b3" font-weight="700">Branch C</text>
+<text x="644" y="353" font-size="12.5" fill="#9ba7b3">drop it</text>
+<g transform="translate(737 332) scale(0.583333)" fill="none" stroke="#768390" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></g>
+<text x="230" y="326" font-size="15" fill="#e6edf3" font-weight="700">Pause and resume, like saving a game</text>
+<rect x="230" y="340" width="100" height="64" rx="10" fill="#0d1117" stroke="#6e7681" stroke-width="1.5"/>
+<g transform="translate(243 361) scale(0.916667)" fill="none" stroke="#9ba7b3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h11l3 3v15H5z"/><path d="M8 3v5h7V3"/><rect x="8" y="13" width="8" height="6" rx="1"/></g>
+<text x="274" y="368" font-size="13" fill="#e6edf3" font-weight="700">Save 1</text>
+<text x="274" y="386" font-size="12" fill="#9ba7b3">turn 2</text>
+<rect x="338" y="340" width="100" height="64" rx="10" fill="#0d1117" stroke="#6e7681" stroke-width="1.5"/>
+<g transform="translate(351 361) scale(0.916667)" fill="none" stroke="#9ba7b3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h11l3 3v15H5z"/><path d="M8 3v5h7V3"/><rect x="8" y="13" width="8" height="6" rx="1"/></g>
+<text x="382" y="368" font-size="13" fill="#e6edf3" font-weight="700">Save 2</text>
+<text x="382" y="386" font-size="12" fill="#9ba7b3">turn 5</text>
+<rect x="446" y="340" width="100" height="64" rx="10" fill="#0d1117" stroke="#63d4a0" stroke-width="2"/>
+<g transform="translate(459 361) scale(0.916667)" fill="none" stroke="#63d4a0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h11l3 3v15H5z"/><path d="M8 3v5h7V3"/><rect x="8" y="13" width="8" height="6" rx="1"/></g>
+<text x="490" y="368" font-size="13" fill="#e6edf3" font-weight="700">Save 3</text>
+<text x="490" y="386" font-size="12" fill="#9ba7b3">now</text>
+</svg>
