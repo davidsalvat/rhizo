@@ -190,10 +190,26 @@ impl<'a> FrameAllocator<'a> {
                 .is_some_and(|end| end <= self.frames),
             "freeing frame {addr:#x} outside managed memory"
         );
-        if let Some(frame) = (first..first + count).find(|&f| self.is_free(f)) {
-            panic!("double free of frame {:#x}", frame as u64 * FRAME_SIZE);
+        if count == 1 {
+            // Most frees: one bit.
+            let (word, bit) = (first / BITS, 1u64 << (first % BITS));
+            if self.bitmap[word] & bit != 0 {
+                panic!("double free of frame {addr:#x}");
+            }
+            self.bitmap[word] |= bit;
+        } else {
+            // A word at a time (change `fast-frame-free`): a 2 MiB page is
+            // checked and freed in eight steps, not 512.
+            let free =
+                words(first, first + count).find_map(|(i, mask)| match self.bitmap[i] & mask {
+                    0 => None,
+                    hit => Some(i * BITS + hit.trailing_zeros() as usize),
+                });
+            if let Some(frame) = free {
+                panic!("double free of frame {:#x}", frame as u64 * FRAME_SIZE);
+            }
+            self.update_range(first, first + count, true);
         }
-        self.update_range(first, first + count, true);
         self.free += count;
         self.hint = self.hint.min(first);
         self.top = self.top.max((first + count - 1) / BITS);
@@ -219,20 +235,11 @@ impl<'a> FrameAllocator<'a> {
     /// a word at a time. Returns how many bits changed.
     fn update_range(&mut self, first: usize, last: usize, free: bool) -> usize {
         let mut changed = 0;
-        let mut frame = first;
-        while frame < last {
-            let bit = frame % BITS;
-            let n = (BITS - bit).min(last - frame);
-            let mask = if n == BITS {
-                u64::MAX
-            } else {
-                ((1u64 << n) - 1) << bit
-            };
-            let word = &mut self.bitmap[frame / BITS];
+        for (i, mask) in words(first, last) {
+            let word = &mut self.bitmap[i];
             let before = *word;
             *word = if free { before | mask } else { before & !mask };
             changed += (before ^ *word).count_ones() as usize;
-            frame += n;
         }
         changed
     }
@@ -259,6 +266,27 @@ impl<'a> FrameAllocator<'a> {
     fn is_free(&self, frame: usize) -> bool {
         self.bitmap[frame / BITS] & (1 << (frame % BITS)) != 0
     }
+}
+
+/// The bitmap words holding frames `[first, last)`, each with the mask of
+/// those frames' bits.
+fn words(first: usize, last: usize) -> impl Iterator<Item = (usize, u64)> {
+    let mut frame = first;
+    core::iter::from_fn(move || {
+        if frame >= last {
+            return None;
+        }
+        let bit = frame % BITS;
+        let n = (BITS - bit).min(last - frame);
+        let mask = if n == BITS {
+            u64::MAX
+        } else {
+            ((1u64 << n) - 1) << bit
+        };
+        let word = frame / BITS;
+        frame += n;
+        Some((word, mask))
+    })
 }
 
 #[cfg(test)]
@@ -454,6 +482,33 @@ mod tests {
         let f = fa.alloc().unwrap();
         fa.free(f);
         fa.free(f);
+    }
+
+    #[test]
+    #[should_panic(expected = "double free of frame 0x64000")]
+    fn double_free_inside_a_run_names_its_lowest_free_frame() {
+        let mut bits = [0u64; 4];
+        let mut fa = allocator(&mut bits, 256);
+        fa.add_free_region(0, 256 * FRAME_SIZE);
+        // A run across three bitmap words, frames 60 to 139.
+        let run = fa.alloc_contiguous(140).unwrap();
+        fa.free(100 * FRAME_SIZE);
+        fa.free(130 * FRAME_SIZE);
+        fa.free_contiguous(run + 60 * FRAME_SIZE, 80);
+    }
+
+    #[test]
+    fn runs_across_words_free_every_frame_once() {
+        let mut bits = [0u64; 4];
+        let mut fa = allocator(&mut bits, 256);
+        fa.add_free_region(0, 256 * FRAME_SIZE);
+        let run = fa.alloc_contiguous(200).unwrap();
+        fa.free_contiguous(run + 3 * FRAME_SIZE, 190);
+        assert_eq!(fa.free_frames(), 56 + 190);
+        assert!(fa.is_allocated(run + 2 * FRAME_SIZE));
+        assert!(!fa.is_allocated(run + 3 * FRAME_SIZE));
+        assert!(!fa.is_allocated(run + 192 * FRAME_SIZE));
+        assert!(fa.is_allocated(run + 193 * FRAME_SIZE));
     }
 
     #[test]
