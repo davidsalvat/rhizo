@@ -492,14 +492,48 @@ impl<F, M, T, A, S> fmt::Debug for Context<'_, F, M, T, A, S> {
 impl<F: EntryFormat, M: PhysicalMemory, T, A, S> Context<'_, F, M, T, A, S> {
     /// Copies cell memory at `addr` into `out`.
     fn read(&mut self, addr: u64, out: &mut [u8]) -> Result<(), memory::Fault> {
-        let pager = &mut WxPager::new(&mut *self.pager, self.wx);
-        memory::read(&self.pt, self.mem, pager, addr, out)
+        user_read(&self.pt, self.mem, self.pager, self.wx, addr, out)
     }
 
     /// Copies `data` to cell memory at `addr`.
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), memory::Fault> {
-        let pager = &mut WxPager::new(&mut *self.pager, self.wx);
-        memory::write(&self.pt, self.mem, pager, addr, data)
+        user_write(&self.pt, self.mem, self.pager, self.wx, addr, data)
+    }
+}
+
+/// Copies cell memory at `addr` into `out` through `pager`, which also
+/// backs the pages of the write-or-execute ranges `wx` not mapped yet
+/// (design D5 of `node-jit`); a cell without ranges copies as before.
+#[inline(always)]
+pub(crate) fn user_read<F: EntryFormat, M: PhysicalMemory>(
+    pt: &PageTable<F>,
+    mem: &mut M,
+    pager: &mut dyn Pager<F, M>,
+    wx: &WxRanges,
+    addr: u64,
+    out: &mut [u8],
+) -> Result<(), memory::Fault> {
+    if wx.ranges().is_empty() {
+        memory::read(pt, mem, pager, addr, out)
+    } else {
+        memory::read(pt, mem, &mut WxPager::new(pager, wx), addr, out)
+    }
+}
+
+/// Copies `data` to cell memory at `addr` as [`user_read`] reads it.
+#[inline(always)]
+pub(crate) fn user_write<F: EntryFormat, M: PhysicalMemory>(
+    pt: &PageTable<F>,
+    mem: &mut M,
+    pager: &mut dyn Pager<F, M>,
+    wx: &WxRanges,
+    addr: u64,
+    data: &[u8],
+) -> Result<(), memory::Fault> {
+    if wx.ranges().is_empty() {
+        memory::write(pt, mem, pager, addr, data)
+    } else {
+        memory::write(pt, mem, &mut WxPager::new(pager, wx), addr, data)
     }
 }
 

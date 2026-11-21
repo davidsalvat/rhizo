@@ -306,7 +306,10 @@ impl<F: EntryFormat> PageTable<F> {
     /// and writable. Returns the leaf's slot and level, or `None` if there is
     /// no leaf (the walk stops at the first empty entry). The upper half is
     /// the kernel's, shared by every cell on x86_64: never walked, so no cell
-    /// write or mapping change reaches it (spec `isolation`).
+    /// write or mapping change reaches it (spec `isolation`). Inlined: it is
+    /// most of a copy-on-write fault, and with `resolve_exec` calling it too
+    /// the compiler would otherwise make it a call of its own.
+    #[inline(always)]
     fn walk_private(
         &self,
         mem: &mut impl PhysicalMemory,

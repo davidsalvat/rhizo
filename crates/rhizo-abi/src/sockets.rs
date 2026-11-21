@@ -453,6 +453,7 @@ impl Scatter {
         pt: &PageTable<F>,
         mem: &mut M,
         pager: &mut dyn Pager<F, M>,
+        wx: &rhizo_cell::space::WxRanges,
         mut piece: &[u8],
     ) -> bool {
         while !piece.is_empty() {
@@ -460,7 +461,9 @@ impl Scatter {
                 return true;
             };
             let n = (len - self.off).min(piece.len() as u64) as usize;
-            if memory::write(pt, mem, pager, base.wrapping_add(self.off), &piece[..n]).is_err() {
+            if crate::user_write(pt, mem, pager, wx, base.wrapping_add(self.off), &piece[..n])
+                .is_err()
+            {
                 self.faulted = true;
                 return false;
             }
@@ -492,12 +495,12 @@ fn recv_into<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         return (0, None, false);
     }
     let (pt, mem) = (&cx.pt, &mut *cx.mem);
-    let pager = &mut crate::WxPager::new(&mut *cx.pager, cx.wx);
+    let (pager, wx) = (&mut *cx.pager, &*cx.wx);
     let got = cx
         .net
         .net()
         .recv(h, len as usize, flags & MSG_PEEK != 0, &mut |piece| {
-            into.put(pt, mem, pager, piece)
+            into.put(pt, mem, pager, wx, piece)
         });
     match got {
         Ok(r) if r.len == 0 && into.faulted => (-EFAULT, None, false),

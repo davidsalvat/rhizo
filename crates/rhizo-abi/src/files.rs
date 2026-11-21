@@ -109,9 +109,9 @@ pub(crate) fn read<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         let at = addr.wrapping_add(done);
         let n = piece(at, len - done);
         let (pt, mem) = (&cx.pt, &mut *cx.mem);
-        let pager = &mut crate::WxPager::new(&mut *cx.pager, cx.wx);
+        let (pager, wx) = (&mut *cx.pager, &*cx.wx);
         let got = cx.fs.read_with(fd, start + done, n, |src| {
-            memory::write(pt, mem, pager, at, src).is_ok()
+            crate::user_write(pt, mem, pager, wx, at, src).is_ok()
         });
         match got {
             Ok(Some(0)) => break,
@@ -163,9 +163,9 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
             break;
         }
         let (pt, mem) = (&cx.pt, &mut *cx.mem);
-        let pager = &mut crate::WxPager::new(&mut *cx.pager, cx.wx);
+        let (pager, wx) = (&mut *cx.pager, &*cx.wx);
         let wrote = cx.fs.write_with(fd, start + done, n, |dst| {
-            memory::read(pt, mem, pager, at, dst).is_ok()
+            crate::user_read(pt, mem, pager, wx, at, dst).is_ok()
         });
         match wrote {
             Ok(Some(n)) => done += n as u64,

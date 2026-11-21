@@ -115,12 +115,13 @@ pub(crate) fn read_pipe<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         return 0;
     }
     let (pt, mem) = (&cx.pt, &mut *cx.mem);
-    let pager = &mut crate::WxPager::new(&mut *cx.pager, cx.wx);
+    let (pager, wx) = (&mut *cx.pager, &*cx.wx);
     let (mut done, mut faulted) = (0u64, false);
     let got = cx
         .fs
         .read_pipe(fd, len.min(usize::MAX as u64) as usize, &mut |piece| {
-            faulted = memory::write(pt, mem, pager, addr.wrapping_add(done), piece).is_err();
+            faulted =
+                crate::user_write(pt, mem, pager, wx, addr.wrapping_add(done), piece).is_err();
             done += piece.len() as u64;
             !faulted
         });

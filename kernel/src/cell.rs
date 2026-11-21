@@ -898,7 +898,8 @@ impl Pager<Format, DirectMap> for CellPager<'_, '_> {
         {
             return true;
         }
-        (write && resolve_write(pt, self.1, addr)) || grow_stack(pt, &mut cell_frames(self.2), addr)
+        (write && resolve_write(pt, self.1, addr, None))
+            || grow_stack(pt, &mut cell_frames(self.2), addr)
     }
 
     fn discard(&mut self, addr: u64, len: u64) {
@@ -955,7 +956,19 @@ fn release_frame(phys: u64, size: PageSize) {
 /// Not metered (design D1 of `add-cell-quotas`): a copy replaces the cell's
 /// reference to a shared frame or table by its own, so the meter would
 /// charge one frame and credit one back.
-fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bool {
+///
+/// A write by the instruction at `pc` (cell code, not a system call) to the
+/// running write-or-execute page it runs from is refused: no change of
+/// state lets it complete (spec `linux-abi`, design D3 of `node-jit`).
+fn resolve_write(
+    pt: &PageTable<Format>,
+    tlb: &mut CellTlb<'_>,
+    addr: u64,
+    pc: Option<u64>,
+) -> bool {
+    if pc.is_some_and(|pc| writes_own_code(pt, pc, addr)) {
+        return false;
+    }
     let _p = cost::scope(Part::Cow);
     let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, tlb, addr) == Ok(true);
     if resolved {
@@ -975,6 +988,30 @@ fn back_wx(live: &Live, pt: &PageTable<Format>, addr: u64) -> bool {
         && sharing(live.shares, || {
             space::back_wx(pt, mem, &mut CpuTlb, frames, &live.wx, addr)
         })
+}
+
+/// A fault of `live`'s code on `cpu`, run alone, resolved for its
+/// write-or-execute memory (design D3 and D5 of `node-jit`): a page of a
+/// range backed, or a writing page made running. Kept out of the cell loop,
+/// whose other paths are hot.
+#[cold]
+#[inline(never)]
+fn wx_fault(live: &mut Live, pt: &PageTable<Format>, cpu: usize, fault: &UserFault) -> bool {
+    if fault
+        .missing_page()
+        .is_some_and(|addr| back_wx(live, pt, addr))
+    {
+        return true;
+    }
+    let resolved = fault.exec_denied().is_some_and(|addr| {
+        sharing(live.shares, || {
+            resolve_exec(pt, &mut CellTlb::new(None), addr)
+        })
+    });
+    if resolved {
+        live.clean = flushed_by_kernel_on(cpu);
+    }
+    resolved
 }
 
 /// Makes the write-or-execute page holding `addr`, writing, running for an
@@ -1639,31 +1676,13 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                 }
                 Trap::Fault(fault)
                     if fault.write_denied().is_some_and(|addr| {
-                        !writes_own_code(&pt, live.cell.regs().pc, addr)
-                            && sharing(live.shares, || {
-                                resolve_write(&pt, &mut CellTlb::new(None), addr)
-                            })
-                    }) =>
-                {
-                    prof::add(Count::CowFaults, 1);
-                    live.clean = flushed_by_kernel_on(cpu);
-                    continue;
-                }
-                // Write-or-execute pages (design D3 and D5 of `node-jit`).
-                Trap::Fault(fault)
-                    if fault
-                        .missing_page()
-                        .is_some_and(|addr| back_wx(&live, &pt, addr)) =>
-                {
-                    continue;
-                }
-                Trap::Fault(fault)
-                    if fault.exec_denied().is_some_and(|addr| {
                         sharing(live.shares, || {
-                            resolve_exec(&pt, &mut CellTlb::new(None), addr)
+                            let pc = Some(live.cell.regs().pc);
+                            resolve_write(&pt, &mut CellTlb::new(None), addr, pc)
                         })
                     }) =>
                 {
+                    prof::add(Count::CowFaults, 1);
                     live.clean = flushed_by_kernel_on(cpu);
                     continue;
                 }
@@ -1673,6 +1692,9 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     continue;
                 }
                 Trap::Fault(fault) => {
+                    if wx_fault(&mut live, &pt, cpu, &fault) {
+                        continue;
+                    }
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
                         echo: live.echo,
@@ -1997,9 +2019,8 @@ impl GangCell {
             }
         }
         if let Some(addr) = fault.write_denied()
-            && !writes_own_code(&pt, pc, addr)
             && sharing(live.shares, || {
-                resolve_write(&pt, &mut CellTlb::new(Some((gang, cpu))), addr)
+                resolve_write(&pt, &mut CellTlb::new(Some((gang, cpu))), addr, Some(pc))
             })
         {
             return true;
@@ -2861,7 +2882,9 @@ impl Host {
         let mut live = self.new_live(cell, capture, echo, fork_files(fs));
         live.frames.set_used(1); // its root
         live.shares = true;
-        live.wx = wx.clone();
+        if !wx.ranges().is_empty() {
+            live.wx = wx.clone();
+        }
         Some(live)
     }
 
