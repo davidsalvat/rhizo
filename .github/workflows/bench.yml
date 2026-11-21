@@ -1,0 +1,160 @@
+name: bench
+
+# Timing benchmarks and their gate (change `faster-ci`, spec `benchmarks`):
+# every metric in full, the timing ones gated at the wide `ci` thresholds,
+# on each push to main and every night. Pull requests are gated on
+# instruction counts only (ci.yml). A failing gate opens or updates an issue
+# naming the metrics, the run and the commits since the last green run. The
+# README's tables come from this workflow's `bench-results-N` annotations.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Benchmarks and timing gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      failed: ${{ steps.failed.outputs.metrics }}
+    env:
+      # Downloads and packs the pinned Node.js build (xtask/src/tools.rs)
+      # and runs its tests and benchmarks (change `add-node-workload`).
+      RHIZO_NODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          qemu: qemu-system-x86
+          sources: "true"
+      - name: Check KVM
+        run: ls -l /dev/kvm
+
+      - name: Install CRIU for the comparison
+        # CRIU from Ubuntu's archive, else the CRIU project's PPA; when both
+        # fail the CRIU comparison is skipped with the reason.
+        run: |
+          sudo apt-get install -y criu || {
+            sudo add-apt-repository -y ppa:criu/ppa && sudo apt-get update && sudo apt-get install -y criu
+          } || echo "CRIU not installed"
+          criu --version || true
+      - name: Install gVisor (runsc) for the comparison
+        # A fixed gVisor release, checked against its published SHA-512
+        # (Ubuntu's runsc is a 2023 build that fails on this runner).
+        run: |
+          base=https://storage.googleapis.com/gvisor/releases/release/20240603.0/x86_64
+          curl --fail --silent --show-error --location -O "$base/runsc" -O "$base/runsc.sha512"
+          sha512sum -c runsc.sha512
+          sudo install -m 755 runsc /usr/local/bin/runsc
+          runsc --version
+
+      - name: Benchmarks and regression gate
+        run: cargo xtask --arch x86_64 bench --env ci --check --output bench-results.json 2>&1 | tee bench.log; exit "${PIPESTATUS[0]}"
+
+      - name: Name the failing metrics
+        id: failed
+        if: failure()
+        run: |
+          metrics=$(grep -oE 'benchmark (regression|not measured): [^ ]+' bench.log 2>/dev/null | sed 's/^benchmark //' | sort -u | head -40 | tr '\n' ';' || true)
+          echo "metrics=${metrics:-the job failed before the gate (see the run)}" >> "$GITHUB_OUTPUT"
+
+      - name: Save the CPython build
+        # Also when a later check failed: the build itself is done once its
+        # recipe stamp exists.
+        if: always() && steps.setup.outputs.cpython-hit != 'true' && hashFiles('target/cpython/*/recipe') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: target/cpython
+          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
+
+      - name: Publish results
+        # Annotations are cut at 4 KB and GitHub keeps 10 per step: the
+        # medians, then the full results as compact JSON (indented, they
+        # took more than 39 pieces and lost their end) in numbered pieces
+        # of 3000 bytes, ten per step (the steps below).
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            echo "::notice title=bench-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results.json | tr '\n' ' ')"
+            jq -c . bench-results.json | tr -d '\n' | fold -w 3000 | nl -nln -w1 -s' ' > bench-pieces.txt
+            sed -n '1,9p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+          fi
+      - name: Publish results (pieces 10 to 19)
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '10,19p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+          fi
+      - name: Publish results (pieces 20 to 29)
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '20,29p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+          fi
+      - name: Publish results (pieces 30 to 39)
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '30,39p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+            [ "$(wc -l < bench-pieces.txt)" -le 39 ] || echo "::warning title=bench-results::more than 39 pieces; add a publishing step"
+          fi
+
+  report:
+    # The only job with write access, and only to issues: it runs no code
+    # from the repository, only `gh api` on the failed run's metadata.
+    name: Open or update the timing-gate issue
+    needs: bench
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          METRICS: ${{ needs.bench.outputs.failed }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          title="bench: timing gate failing on main"
+          good=$(gh api "repos/$REPO/actions/workflows/bench.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty')
+          if [ -n "$good" ]; then
+            commits=$(gh api "repos/$REPO/compare/$good...$SHA" --jq '.commits[] | "- \(.sha[0:7]) \(.commit.message | split("\n")[0])"' | tail -n 50)
+            since="Commits since the last green timing run ($good):"
+          else
+            commits="" since="No green timing run of this workflow yet."
+          fi
+          body=$(printf 'The timing gate failed on `%s` (%s, %s).\n\nMetrics:\n%s\n\n%s\n%s\n\nReproduce: `cargo xtask --arch x86_64 bench --env ci --check`. A real regression is fixed or justified with a baseline update (rule 8); runner noise is noted here and the gate rerun.\n' \
+            "${SHA:0:7}" "$EVENT" "$RUN" "$(tr ';' '\n' <<< "$METRICS" | sed '/^$/d; s/^/- /')" "$since" "$commits")
+          number=$(gh api "repos/$REPO/issues?state=open&per_page=100" --jq ".[] | select(.pull_request == null and .title == \"$title\") | .number" | head -n 1)
+          if [ -n "$number" ]; then
+            gh api "repos/$REPO/issues/$number/comments" -f body="$body" --jq .html_url
+          else
+            gh api "repos/$REPO/issues" -f title="$title" -f body="$body" --jq .html_url
+          fi

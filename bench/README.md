@@ -297,7 +297,7 @@ of retired instructions, the same on every run and every host (without the
 network card, the only input from outside). These are the
 `<metric>_insns/rhizo/<vmm>-icount` metrics, gated at +2 %
 (`thresholds_pct.instructions`). `--no-icount` skips them; `--icount-only`
-measures nothing else (the AArch64 CI job, below). Where the guest has a
+measures nothing else (the instruction-count CI jobs, below). Where the guest has a
 PMU that counts instructions (QEMU's AArch64 CPU), its passes give the
 figures they cover, exactly, and the clock the rest (the fork benchmarks;
 AArch64's generic timer ticks every 16 instructions under `-icount`).
@@ -357,8 +357,8 @@ baseline by more than its threshold:
 
 | Environment | Where | Timing threshold | Deterministic threshold |
 |---|---|---|---|
-| `ci` | GitHub-hosted runners (shared, noisy) | +100 % on time to ready; TSC cycles recorded but not gated | +1 %; instructions under `-icount` +2 % |
-| `ci-arm` | The AArch64 CI job (`ubuntu-24.04-arm`, no KVM): `--icount-only`, instructions on `qemu-virt-icount` | — (no timings) | instructions under `-icount` +2 % |
+| `ci` | GitHub-hosted runners (shared, noisy): every metric on main and nightly (`bench.yml`), the `-icount` ones alone on pull requests | +100 % on time to ready; TSC cycles recorded but not gated | +1 %; instructions under `-icount` +2 % |
+| `ci-arm` | The AArch64 instruction-count CI job (`ubuntu-24.04-arm`, no KVM): `--icount-only`, instructions on `qemu-virt-icount` | — (no timings) | instructions under `-icount` +2 % |
 | `dedicated` | A self-hosted runner labelled `rhizo-bench`: bare metal or a pinned VM with KVM, fixed CPU frequency, nothing else running | +5 % | +1 %; instructions under `-icount` +2 % |
 
 Breakdowns (`breakdown.`) and lock waits (`lock.`) are recorded but not gated
@@ -370,6 +370,25 @@ machines whose TSC frequencies differ, so cycle counts are not comparable
 between runs there. The `ci` gate therefore only catches gross regressions
 (for example, a boot that doubles); the `dedicated` run is the precise one. It runs from the `bench-dedicated` workflow, started manually
 (Actions → bench-dedicated → Run workflow) once such a runner is registered.
+
+## Where the gates run (change `faster-ci`)
+
+A timing gate on a shared runner fails on noise often enough to cost
+re-runs (three of the last four re-run pull requests before this change
+were timing regressions that passed on the same commit), and a pull
+request waited for the whole 6-minute timing run. So CI splits them:
+
+| When | What runs | Gate |
+|---|---|---|
+| Pull request touching code | `cargo xtask bench --icount-only --check`: x86_64 (`icount-x86_64`, environment `ci`) and AArch64 (`icount-aarch64`, `ci-arm`), each figure counted once (they are deterministic: no medians) | Blocking: `-icount` metrics only, +2 % |
+| Push to main, nightly, manual (`.github/workflows/bench.yml`) | `cargo xtask --arch x86_64 bench --env ci --check`: every metric, timings over `--runs` boots, the comparisons, and the metrics with no instruction count (density percentiles, network round trips, wall times on Firecracker and Cloud Hypervisor, deterministic sizes) | The full `ci` gate; a failure opens or updates the issue "bench: timing gate failing on main" with the metrics, the run and the commits since the last green timing run |
+| Push to main | The AArch64 instruction counts again (`icount-aarch64` in `ci.yml`), for the README | `ci-arm` |
+
+`--icount-only --check` compares only metrics of the VMM that ran (as
+for any `--check`), so on a pull request the timing metrics of the `ci`
+baseline are neither measured nor reported missing. A pull request that
+expects to change timings can still run `bench.yml` by hand on its
+branch (Actions → bench → Run workflow) and quote the result.
 
 ## AArch64 in CI: instruction counts, no timings
 
@@ -395,7 +414,8 @@ The AArch64 job's step "Report whether this runner offers KVM" keeps
 watching for a change.
 
 Timings under emulation would measure QEMU's translator, so the AArch64
-job (`ci-arm64` in `.github/workflows/ci.yml`) runs, after its checks:
+instruction-count job (`icount-aarch64` in `.github/workflows/ci.yml`, next
+to the AArch64 tests in `ci-arm64`) runs:
 
 ```bash
 cargo xtask --arch aarch64 bench --icount-only --env ci-arm --check --output bench-results-aarch64.json
@@ -404,7 +424,7 @@ cargo xtask --arch aarch64 bench --icount-only --env ci-arm --check --output ben
 the same instruction counts as x86_64's, on `qemu-virt-icount`, gated at
 +2 % against the `ci-arm` baseline (breakdowns and lock waits ungated). It
 publishes them as `bench-aarch64-medians` and `bench-aarch64-results-N`
-annotations, apart from the x86_64 job's `bench-results-N`.
+annotations, apart from the x86_64 `bench-results-N` of `bench.yml`.
 
 ## Measuring on real ARM64 hardware (`dedicated`)
 
@@ -447,16 +467,16 @@ A baseline changes only on purpose, in a pull request that explains why:
 cargo xtask bench --env dedicated --update-baseline
 ```
 
-CI publishes its measured results as an annotation named `bench-results` on
-the `bench` job; to adopt them as the `ci` baseline, save that JSON to a file
-and run:
+CI publishes its measured results as annotations named `bench-results-N`
+on the `bench` job of the `bench` workflow (runs on main, nightly); to adopt
+them as the `ci` baseline, join them in order into a file and run:
 
 ```bash
 cargo xtask bench --from results.json --env ci --update-baseline
 ```
 
-The AArch64 job's `bench-aarch64-results-N` annotations, joined in order,
-are the `ci-arm` results:
+The `icount-aarch64` job's `bench-aarch64-results-N` annotations (take a
+run on main), joined in order, are the `ci-arm` results:
 
 ```bash
 cargo xtask bench --from results-aarch64.json --env ci-arm --update-baseline
