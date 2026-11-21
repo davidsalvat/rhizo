@@ -46,9 +46,12 @@ pub enum Count {
     /// Cells made with no address-space tag left: every switch to them
     /// flushes the TLB.
     Untagged,
+    /// Write-or-execute pages changed between writing and running by a
+    /// fault (change `node-jit`).
+    WxFlips,
 }
 
-const COUNTS: usize = 10;
+const COUNTS: usize = 11;
 static COUNTERS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 /// When a system call last changed a socket (nanoseconds since boot).
 static NET_CHANGED_AT: AtomicU64 = AtomicU64::new(0);

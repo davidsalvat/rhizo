@@ -735,7 +735,7 @@ mod tests {
         wx.add(4 * P, 6 * P).unwrap(); // already there: no new range
         wx.add(2 * P, 4 * P).unwrap(); // joins two: one fewer
         assert_eq!(wx.ranges().len(), MAX_WX_RANGES - 1);
-        let mut trimmed = full.clone();
+        let mut trimmed = full;
         trimmed.remove(0, P).unwrap(); // trims a range: as many
         assert_eq!(trimmed.ranges().len(), MAX_WX_RANGES);
         // Splitting one range in two at the bound is refused unchanged.

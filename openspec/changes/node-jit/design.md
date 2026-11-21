@@ -127,12 +127,20 @@ touch, and at most 64 per cell (spec `isolation`): an `mmap` or
 `mprotect` with `PROT_NONE` and `mprotect` with anything else than both
 rights remove the part of the ranges they cover first, then do what they
 did before (an `mprotect` to read-only over an untouched part backs it
-with zeroed pages, as for other reserved addresses). `execve` clears them.
+with zeroed pages, as for other reserved addresses). Every change to the
+ranges is computed and checked first: a call that would need a 65th range
+(a new one, or a split, as Linux's `munmap` can fail when a split needs one
+mapping too many) fails with `ENOMEM` having changed nothing. An `mprotect`
+with both rights checks every page before it changes one, and skips a hole
+one empty table entry at a time (V8's 512 MiB at once), unless a lazily
+resumed cell still has pages pending, which may sit in a hole.
 
 They live where the cell's files live, in the kernel's record of a live
 cell, and system calls reach them through `Context::wx` as they reach the
-files: user-memory access (`Context::read`, `Context::write`) backs a page
-of a range it faults on and retries. Alternatives: in `Cell` (system calls
+files: user-memory access (`Context::read`, `Context::write`, and the
+piecewise copies of files, pipes and sockets) goes through a pager that
+backs a page of a range it faults on (`Pager::back_wx`, the kernel's
+allocator behind it) and retries. Alternatives: in `Cell` (system calls
 get `&mut Cell` and the `Context` separately, so user-memory access, which
 only has the `Context`, could not see them); markers in invalid page-table
 entries (every walk that skips invalid entries, clone, snapshot, unmap,
@@ -210,7 +218,8 @@ its own page), suspended and resumed eagerly and lazily, and on 4 CPUs
 `workload.node_jit_cold_us` and `workload.node_jit_warm_us` are measured
 exactly as `workload.node_cold_us` and `workload.node_warm_us` (which keep
 `--jitless`), without the flag, in the same `node` benchmark kernel
-(`--workload node` measures all of them). `workload.node_jit_flips` is the
-number of changes between writing and running in one cold run (the median
-run's), the cost that W^X adds to the JIT. Figures from CI are in the pull
-request.
+(`--workload node` measures all of them; its line `rhizo-node-jit`).
+`workload.node_jit_flips` is the number of changes between writing and
+running in one more cold run, counted after the timed ones (counting adds
+to every system call), the cost in faults that W^X adds to the JIT.
+Figures from CI are in the pull request.

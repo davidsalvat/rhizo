@@ -68,6 +68,17 @@ impl UserFault {
             .flatten()
     }
 
+    /// The address of an instruction fetch refused by permissions (a page
+    /// fault with the present and instruction-fetch bits set), if that is
+    /// what it was: possibly a write-or-execute page that is writing
+    /// (change `node-jit`).
+    pub fn exec_denied(&self) -> Option<u64> {
+        let info = &self.0;
+        (info.vector == exception::PAGE_FAULT && info.error_code & 0b1_0001 == 0b1_0001)
+            .then_some(info.fault_address)
+            .flatten()
+    }
+
     /// Whether the kernel answered the fault by emulating the instruction
     /// (the AArch64 ID registers): never on x86_64, where cell code reads
     /// what it needs of the CPU itself (`CPUID`).

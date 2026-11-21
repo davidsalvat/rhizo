@@ -462,9 +462,15 @@ pub struct Context<'a, F, M, T, A, S> {
 
 /// A pager that also backs the pages of the write-or-execute ranges `wx`
 /// that are not mapped yet, through `pager` (design D5 of `node-jit`).
-struct WxPager<'a, F, M> {
+pub(crate) struct WxPager<'a, F, M> {
     pager: &'a mut dyn Pager<F, M>,
     wx: &'a WxRanges,
+}
+
+impl<'a, F, M> WxPager<'a, F, M> {
+    pub(crate) fn new(pager: &'a mut dyn Pager<F, M>, wx: &'a WxRanges) -> Self {
+        Self { pager, wx }
+    }
 }
 
 impl<F: EntryFormat, M: PhysicalMemory> Pager<F, M> for WxPager<'_, F, M> {
@@ -485,19 +491,13 @@ impl<F, M, T, A, S> fmt::Debug for Context<'_, F, M, T, A, S> {
 impl<F: EntryFormat, M: PhysicalMemory, T, A, S> Context<'_, F, M, T, A, S> {
     /// Copies cell memory at `addr` into `out`.
     fn read(&mut self, addr: u64, out: &mut [u8]) -> Result<(), memory::Fault> {
-        let pager = &mut WxPager {
-            pager: &mut *self.pager,
-            wx: self.wx,
-        };
+        let pager = &mut WxPager::new(&mut *self.pager, self.wx);
         memory::read(&self.pt, self.mem, pager, addr, out)
     }
 
     /// Copies `data` to cell memory at `addr`.
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), memory::Fault> {
-        let pager = &mut WxPager {
-            pager: &mut *self.pager,
-            wx: self.wx,
-        };
+        let pager = &mut WxPager::new(&mut *self.pager, self.wx);
         memory::write(&self.pt, self.mem, pager, addr, data)
     }
 }

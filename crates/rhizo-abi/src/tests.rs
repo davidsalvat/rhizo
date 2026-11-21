@@ -1526,6 +1526,15 @@ fn wx_memory_comes_on_first_touch() {
         w.pt().translate(&w.mem, at + FRAME_SIZE).is_none(),
         "one page"
     );
+    // And a read from a pipe (pieces copied by the pipe's own path).
+    assert_eq!(w.call(59, &[DATA, 0]).0, 0, "pipe2");
+    let fds = w.peek(DATA, 8);
+    let (rd, wr) = (u64::from(fds[0]), u64::from(fds[4]));
+    w.poke(DATA + 64, b"jit!");
+    assert_eq!(w.call(64, &[wr, DATA + 64, 4]).0, 4);
+    let piped = code + (150 << 20) + 100;
+    assert_eq!(w.call(63, &[rd, piped, 4]).0, 4, "read into it");
+    assert_eq!(w.peek(piped, 4), b"jit!");
     // Another protection takes its part out (and backs it, as reserved
     // addresses are); so does munmap.
     let ro = code + (200 << 20);

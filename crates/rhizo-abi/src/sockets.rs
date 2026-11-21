@@ -491,7 +491,8 @@ fn recv_into<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     if ty == Type::Stream && len == 0 {
         return (0, None, false);
     }
-    let (pt, mem, pager) = (&cx.pt, &mut *cx.mem, &mut *cx.pager);
+    let (pt, mem) = (&cx.pt, &mut *cx.mem);
+    let pager = &mut crate::WxPager::new(&mut *cx.pager, cx.wx);
     let got = cx
         .net
         .net()

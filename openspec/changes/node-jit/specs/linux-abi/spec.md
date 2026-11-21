@@ -39,9 +39,9 @@ write-or-execute pages.
 ### Requirement: Write-or-execute ranges
 `munmap`, `MAP_FIXED`, and `mprotect` with any protection other than
 writable and executable SHALL first drop the part of the write-or-execute
-ranges they cover, and `execve` SHALL drop them all. A cell SHALL have at
-most 64 ranges; a call that would need more SHALL fail with `ENOMEM` and
-change nothing.
+ranges they cover. A cell SHALL have at most 64 ranges; a call that would
+need more, a new range or a split, SHALL fail with `ENOMEM` and change
+nothing.
 
 #### Scenario: Unmapped part
 - **WHEN** a cell unmaps part of a write-or-execute range it never touched, then touches it

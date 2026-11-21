@@ -156,8 +156,9 @@ again:
   library in the cell's own files; a template frozen after its imports
   answers each request without starting the interpreter again.
 - **Node.js.** The official Node.js 24 build, dynamically linked and
-  unmodified, runs as a cell with `--jitless` (V8's compiler wants memory
-  both writable and executable, which cells refuse).
+  unmodified, runs as a cell with its JIT: V8 asks for memory both
+  writable and executable, and the kernel gives it pages that are either,
+  changed on faults, never both (change `node-jit`).
 - **Control plane.** `rhizo`, a command-line tool on the host, drives a
   running kernel over its serial line: `rhizo up`, `run`, `ps`, `fork`,
   `suspend`, `resume`, `attach`, `kill`, `down`; `rhizo chat` is an

@@ -14,7 +14,7 @@ const OPTIONAL: [&str; 7] = [
 /// not built, and take no memory from the cells a benchmark runs (its guest
 /// has 128 MiB, and the 50 MiB fork benchmark needs most of it). The C
 /// cells here are those no benchmark runs.
-const TEST_ONLY: [&str; 9] = [
+const TEST_ONLY: [&str; 10] = [
     "distro-files",
     "libc_alloc",
     "libc_deep_stack",
@@ -22,6 +22,7 @@ const TEST_ONLY: [&str; 9] = [
     "libc_float",
     "libc_hwcap",
     "libc_hello",
+    "libc_jit",
     "libc_net",
     "libc_threads",
 ];

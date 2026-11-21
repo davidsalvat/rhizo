@@ -4,12 +4,12 @@
 
 - [ ] 1.1 `PageFlags::WRITE_OR_EXEC` in both entry formats (D2); verify `cargo test -p rhizo-mm write_or_exec`
 - [ ] 1.2 `resolve_exec`, and `resolve_write` for write-or-execute pages, alone, after a fork, in clones (D3, D6); verify `cargo test -p rhizo-mm wx`
-- [ ] 1.3 Property test: no leaf both writable and executable after any sequence of operations (D2); verify `cargo test -p rhizo-mm never_writable_and_executable`
+- [ ] 1.3 Property test: no leaf both writable and executable after any sequence of operations (D2); verify `cargo test -p rhizo-mm model`
 
 ## 2. Cell memory and system calls
 
 - [ ] 2.1 `space::WxRanges` and backing a page of a range (D5); verify `cargo test -p rhizo-cell wx`
-- [ ] 2.2 `mmap`, `mprotect`, `munmap`, `execve` and user-memory access with write-or-execute memory, `Context::wx` (D5); verify `cargo test -p rhizo-abi wx`
+- [ ] 2.2 `mmap`, `mprotect`, `munmap` and user-memory access with write-or-execute memory, `Context::wx`, `Pager::back_wx` (D5); verify `cargo test -p rhizo-abi wx` and `cargo test -p rhizo-abi hostile`
 
 ## 3. Snapshots
 

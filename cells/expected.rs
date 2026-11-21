@@ -141,6 +141,13 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("poke_kernel", "", Ending::Fault),
     ("scrub", "ready\nzero ok\n", Ending::Exit(0)),
     ("rewrite", "ready\nown ok\n", Ending::Exit(0)),
+    // Code written at run time (spec `workloads`, change `node-jit`).
+    (
+        "libc_jit",
+        "first 7\nreserved 8\nrewritten 11\nready\nown code ok\nzero page ok\n\
+         syscall into code ok\nturns 200 ok\nbounce ok\njit ok\n",
+        Ending::Exit(0),
+    ),
 ];
 
 /// Hostile test cells run only in the kernel (spec `isolation`): random
@@ -187,12 +194,13 @@ pub const CPYTHON_STDOUT: &str = "warm\n\
      cpython ok\n";
 
 /// Node.js (`cells/node/demo.js`, packed only with `RHIZO_NODE`; change
-/// `add-node-workload`): its command line, in a cell holding the files
+/// `add-node-workload`), with its JIT (change `node-jit`): its command
+/// line, in a cell holding the files
 /// `xtask` packs and on Linux in a directory laid out the same way, without
 /// and with the URL of the host's fake model, and what it prints. The
 /// script pauses after `warm`, where a host may freeze it as a template.
 #[allow(dead_code)]
-pub const NODE_ARGV: [&str; 3] = ["/usr/bin/node", "--jitless", "/app/demo.js"];
+pub const NODE_ARGV: [&str; 2] = ["/usr/bin/node", "/app/demo.js"];
 #[allow(dead_code)]
 pub const NODE_STDOUT: &str = "warm\n\
      {\"tool\":\"summarize\",\"top_words\":[\"RESUME\",\"SNAPSHOT\",\"AGENT\"],\
