@@ -54,9 +54,11 @@ fn main() -> i32 {
         }
         if step % 10 == 5 {
             sleep_ns(1_000_000);
-        } else {
-            yield_now();
         }
+        // Every step ends in a yield, so every step ends a scheduling step,
+        // even one whose sleep is already over when the thread blocks (the
+        // kernel then runs the thread on in the same slice).
+        yield_now();
     }
     0
 }
