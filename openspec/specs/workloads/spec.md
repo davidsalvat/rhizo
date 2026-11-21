@@ -68,3 +68,152 @@ checks SHALL report that they did not run.
 #### Scenario: Not built
 - **WHEN** `RHIZO_CPYTHON_SRC` is not set
 - **THEN** the in-kernel test and the differential check say CPython was not built, and pass
+
+### Requirement: Parallel threaded programs
+A static glibc program that splits a computation between `pthread_create`
+threads, which take work and add their results under a mutex and signal a
+condition variable the first thread waits on, SHALL run as a cell, print
+what it prints on Linux, its threads running on several CPUs at once when
+the CPUs are idle.
+
+#### Scenario: Parallel sum against Linux
+- **WHEN** `parsum` runs as a cell
+- **THEN** its output and exit status equal those of the same binary on Linux
+
+### Requirement: Distribution programs in cells
+Dynamically linked programs SHALL run as cells unmodified, with the
+distribution's interpreter and libraries in the cell's files, and print
+what they print on Linux run the same way (from the top of the same files,
+with an empty environment): a C program linked dynamically with glibc,
+and, where the cells' architecture is the host's, the host's `ls`, `sort`
+and `python3`. Programs not packed SHALL be reported as not run.
+
+#### Scenario: Coreutils
+- **WHEN** `ls data` and `sort data/fruit` run as cells holding the distribution's `ls`, `sort`, `ld.so` and their libraries
+- **THEN** each prints the output recorded from Linux and exits with 0
+
+#### Scenario: A dynamically linked interpreter
+- **WHEN** the distribution's `python3 -S app/demo.py` runs as a cell, its script importing `json`, whose C accelerator it loads with `dlopen`
+- **THEN** it prints the output recorded from Linux and exits with 0
+
+#### Scenario: Same behavior on Linux
+- **WHEN** the differential check runs each packed program natively from the top of the packed tree with an empty environment
+- **THEN** each prints the recorded output and exits with 0
+
+### Requirement: A real agent end to end
+A CPython agent SHALL run as a cell, turn after turn talking over one
+kept-alive HTTP connection to the host's fake model and running the tool it
+asks for; the host SHALL suspend and resume it between turns without
+resetting its connection, and fork it into branches at its decision point.
+Its transcript SHALL equal the one it prints as a Linux process.
+
+#### Scenario: Turns, suspends and branches
+- **WHEN** the agent runs 3 turns, suspended and lazily resumed after each, then forks into 3 branches that each run one more turn
+- **THEN** its transcript equals the recorded one, the model's request count on its connection goes on across every suspend, and every branch exits with 0
+
+#### Scenario: Nothing stays open
+- **WHEN** the host that ran the agent is dropped
+- **THEN** the kernel holds no socket
+
+#### Scenario: Same transcript on Linux
+- **WHEN** the differential check runs the same CPython and agent natively in `linux` mode against the same fake model
+- **THEN** it prints the recorded transcript and nothing on standard error
+
+#### Scenario: Not available
+- **WHEN** CPython is not built or there is no network card and model server
+- **THEN** the in-kernel test says it did not run, and passes
+
+### Requirement: The host's safe points in a cell
+The host SHALL be able to tell whether a live cell sleeps (none of its
+threads can run, and one waits for a deadline, none for a descriptor), and
+to create or replace a file in a live cell's own files.
+
+#### Scenario: Branch number
+- **WHEN** the host writes `/branch` into a cell started from a template and the cell reads it
+- **THEN** the cell reads what the host wrote, and the template and the other cells started from it do not see it
+
+### Requirement: Any OpenAI-compatible model
+The agent SHALL take the model's base URL and name as arguments, speak
+`/v1/chat/completions` with tools, read answers sent whole or in chunks,
+and complete a turn whose answer calls no tool by asking again.
+
+#### Scenario: A model that does not call the tool
+- **WHEN** the agent runs as a Linux process against a model that answers every request with text, in chunks
+- **THEN** every turn and branch completes with that reply and the agent exits with 0
+
+### Requirement: Live demo with a real model
+`cargo xtask demo agent --llm URL --model NAME` SHALL boot the kernel with a
+network card on the chosen VMM, under KVM or emulation, and run the agent
+against that model for three turns with a suspend and resume between turns
+and a fork into three branches, printing each step as it happens with the
+model's time apart from the time spent in the cell and by the host.
+
+#### Scenario: Demo against a local model
+- **WHEN** a developer runs the demo against a model listening on the host's loopback, on QEMU
+- **THEN** the guest reaches it at 10.0.2.2, each turn and branch is printed with its model and Python times, each suspend, resume and the fork with the host's times, and the run ends with `rhizo-demo done`
+
+### Requirement: A conversational agent
+The CPython agent SHALL have a conversation mode (`agent_chat.py URL
+MODEL`) that reads one user message per line from its standard input,
+keeps the whole conversation in the cell, answers each message through the
+OpenAI-compatible API, shows answers whole (with or without tool calls),
+reconnects once when its connection to the model is gone, ends each answer
+with a line giving the model's time and its own, and ends at the end of its
+input. The scripted agent SHALL be unchanged.
+
+#### Scenario: Tool call then answer
+- **WHEN** the fake model answers a message with a snippet call and then with text quoting the snippet's output
+- **THEN** the agent shows the call, the snippet's output and the answer, then its timing line
+
+### Requirement: Tools inside the cell
+The conversational agent SHALL run the tools the model calls inside the
+cell: a Python snippet (output capped at 4000 characters, stopped after a
+time limit), read a file, write a file, list a directory; a tool's error
+SHALL be a result the model reads.
+
+#### Scenario: A snippet that does not end
+- **WHEN** a snippet prints and then loops forever
+- **THEN** it is stopped after its time limit, and the result holds what it printed and that it was stopped
+
+### Requirement: Scratch directory in the CPython cell
+The CPython cell's files SHALL include an empty, writable `/tmp` directory
+next to `/usr/lib/python3.13` and `/app`.
+
+#### Scenario: A program writes a scratch file
+- **WHEN** code running in the CPython cell writes `/tmp/out.txt` and reads it back
+- **THEN** both succeed, and the file travels with the cell through fork and suspend
+
+### Requirement: Node.js in a cell
+The official Linux build of a pinned Node.js LTS release, dynamically
+linked, SHALL run unmodified as a cell with `--jitless`, started from the
+cell's files with its interpreter and libraries, and print what the same
+files print on Linux with an empty environment, HTTP requests through the
+network card with `node:http` included.
+
+#### Scenario: Agent request
+- **WHEN** Node.js runs `/app/demo.js` with `--jitless` in a cell holding the packed files
+- **THEN** it prints the output recorded from Linux, nothing else, and exits with 0
+
+#### Scenario: A request to the host
+- **WHEN** it runs with the URL of the host's fake model server
+- **THEN** it also prints the tool call the model answered, as on Linux
+
+#### Scenario: Same behavior on Linux
+- **WHEN** the differential check runs the same files natively on a Linux host of the same architecture
+- **THEN** they print the recorded output and nothing on standard error
+
+### Requirement: Node.js only where downloaded
+Where Node.js is not downloaded (`RHIZO_NODE` unset), the Node.js checks
+SHALL report that they did not run, and pass.
+
+#### Scenario: Not downloaded
+- **WHEN** `RHIZO_NODE` is not set
+- **THEN** the Node.js test step and the differential check say Node.js was not packed, and pass
+
+### Requirement: Warm Node.js templates
+A Node.js cell suspended after its warm-up SHALL resume, fork and serve as
+a template, every copy answering without warming up again.
+
+#### Scenario: Warm Node.js template
+- **WHEN** cells are forked from Node.js frozen after it printed `warm`, or resumed from its snapshot taken there and forked
+- **THEN** each prints only the answer and exits with 0

@@ -55,6 +55,21 @@ wake-up interrupt, without missing a wake-up sent just before it waits.
 - **WHEN** the boot CPU hands a function to an idle CPU
 - **THEN** the idle CPU runs it and the boot CPU gets its result
 
+### Requirement: One idle CPU keeps the earliest deadline
+Of the idle CPUs, one at most SHALL program its timer, for the earliest
+deadline of the cells that are not running; the others SHALL wait for a
+wake-up interrupt only. While a CPU idles, an idle CPU's timer SHALL cover
+the earliest deadline: a CPU that takes work while none does SHALL wake an
+idle CPU to take that deadline over.
+
+#### Scenario: One cell sleeping
+- **WHEN** one cell sleeps 300 ms while every other CPU of 4 vCPUs idles
+- **THEN** the CPUs leave their waits at most a few times each, not at every slice, and the cell ends within 400 ms
+
+#### Scenario: The CPU holding the timer takes work
+- **WHEN** the idle CPU whose timer covers the earliest deadline takes work while another CPU idles
+- **THEN** the other CPU is woken and programs its timer for that deadline
+
 ### Requirement: Kernel globals across CPUs
 Kernel globals (frame allocator, heap, and every other `sync::Global`)
 SHALL be safe to use from all CPUs at once: a CPU that finds a global held
@@ -92,6 +107,18 @@ tag, since that CPU last dropped it.
 - **WHEN** forks of a cell and templates run, write and exit on 4 vCPUs
 - **THEN** each sees only its own writes, as on one CPU
 
+### Requirement: Translations shrunk under running threads
+Where invalidation is per CPU (x86_64), when the translations of a cell
+shrink while other CPUs run its code, those CPUs SHALL be interrupted and
+SHALL NOT run the cell's code again until the change is complete, so that
+once the system call or fault that shrank them returns, and before any
+frame it freed is reused, no CPU can reach the old translation. Where
+invalidation is broadcast (AArch64), no interrupt SHALL be sent for it.
+
+#### Scenario: Unmapped under a reader
+- **WHEN** one thread of a cell reads a page in a loop on one CPU while another thread of the cell unmaps it on another CPU and then raises a flag
+- **THEN** the reader never reads the page after it has seen the flag: its next read faults and the cell ends with a fault
+
 ### Requirement: CPUs let go of the cells they give back
 A CPU SHALL no longer use a cell's tables or hold its FP/SIMD state once it
 has given the cell back, so another CPU can run the cell, or free it, at
@@ -104,11 +131,16 @@ once.
 ### Requirement: Cells stopped before host operations
 Suspend, resume, fork, freeze, kill and spawn SHALL act on cells none of
 whose threads runs on any CPU: they happen between runs, after every CPU
-gave back its cell.
+gave back every cell, including the cells whose threads ran on several
+CPUs at once.
 
 #### Scenario: Suspend between parallel runs
 - **WHEN** `counter` runs next to spinning cells on 4 vCPUs, and is suspended and resumed from its snapshot's bytes after every few slices until it exits
 - **THEN** its whole output is the uninterrupted one
+
+#### Scenario: A cell on several CPUs
+- **WHEN** `parsum` computing with 4 threads on 4 vCPUs is suspended and resumed from its snapshot's bytes, or forked, between runs of a few slices, until it exits
+- **THEN** the resumed cell and every child print the uninterrupted output
 
 ### Requirement: Shared copy-on-write memory changes one CPU at a time
 Changes to page tables and frames that cells share copy-on-write (resolving
@@ -127,3 +159,37 @@ free, contiguous or not.
 #### Scenario: No two free frames together
 - **WHEN** every other free frame is taken and the kernel allocates 1 MiB
 - **THEN** the allocation succeeds, holds what is written, and its frames come back when it is freed
+
+### Requirement: System calls without sockets do not take turns
+A system call that uses no socket SHALL NOT wait for the kernel's sockets
+lock. A system call that uses sockets SHALL hold that lock from its first
+use of a socket until it has joined the wait queues of the sockets it
+looked at. The scheduler SHALL take the lock only when a change woke
+waiters that were not woken yet.
+
+#### Scenario: Pipes, counters and epoll
+- **WHEN** a cell writes and reads a pipe and an event counter, and waits on an `epoll` instance holding only the counter
+- **THEN** none of these calls reaches the sockets, and a call creating a socket does
+
+#### Scenario: Cells making system calls on every CPU
+- **WHEN** four cells per CPU write and read their own pipe 20,000 times each, on 4 CPUs at once
+- **THEN** they finish and `cell.syscall_scaling_pct` is reported
+
+### Requirement: The same time on every CPU
+Every CPU's timer SHALL count time at the boot CPU's rate: a time slice and
+a timed wait of the kernel SHALL last as long on any CPU as on the boot
+CPU, as measured by the counter.
+
+#### Scenario: A timed wait on each CPU
+- **WHEN** each CPU in turn waits 20 ms on its own timer, on 4 vCPUs
+- **THEN** each wait lasts at least 18 ms by the counter
+
+### Requirement: Timed waits end without a timer storm
+A CPU that waits for a deadline with its timer SHALL go back to its
+periodic tick without its timer ever being periodic with a period shorter
+than the tick, whatever the length of the wait, so that a VMM emulating
+the timer is never asked to fire it faster than the tick.
+
+#### Scenario: Back to the tick after any wait
+- **WHEN** the register writes of a wait of 0 ns, 16 ns, 10 ms or any other length, then of the return to the tick, are applied in order
+- **THEN** after each write the timer is one-shot, masked, or periodic with the tick's count, and after the last it is periodic with the tick's count
