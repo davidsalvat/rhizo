@@ -424,7 +424,7 @@ fn probe_refuses_what_it_cannot_drive() {
     assert_eq!(card(d).0.err(), Some(ProbeError::Version(1)));
     let mut d = Device::new();
     d.id = 0;
-    assert_eq!(card(d).0.err(), Some(ProbeError::NotNet(0)));
+    assert_eq!(card(d).0.err(), Some(ProbeError::Other(0)));
     let mut d = Device::new();
     d.features = [F_MAC, 0];
     assert_eq!(card(d).0.err(), Some(ProbeError::Features));

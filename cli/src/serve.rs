@@ -1,9 +1,10 @@
 //! The background server `rhizo up` leaves running (design D5 of
-//! `add-control-plane`): it owns the VMM, whose standard input and output
-//! carry the control channel, and relays frames between the kernel and the
-//! clients of its Unix socket, giving each request an identifier of its own
-//! so that replies and output go back to the client that asked. The
-//! kernel's console text goes to the console log.
+//! `add-control-plane`): it owns the VMM, and the control channel to its
+//! kernel (the VM's vsock, else the serial line on the VMM's standard input
+//! and output: change `control-over-vsock`), and relays frames between the
+//! kernel and the clients of its Unix socket, giving each request an
+//! identifier of its own so that replies and output go back to the client
+//! that asked. The kernel's console text goes to the console log.
 
 use crate::args::Up;
 use crate::state::{Dir, Info};

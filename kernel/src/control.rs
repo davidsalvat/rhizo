@@ -1,6 +1,8 @@
 //! The control kernel (spec `control-plane`, change `add-control-plane`):
 //! after booting it serves the host's requests on the serial line, the
-//! console's own, instead of running tests or benchmarks. It only does what
+//! console's own, or, once the host connects to its virtio socket device,
+//! on that stream (change `control-over-vsock`), instead of running tests
+//! or benchmarks. It only does what
 //! it is asked: which programs, with which files and when to suspend, fork
 //! or kill them is the host's business (`rhizo`, design D1).
 //!
@@ -15,7 +17,6 @@
 //! way, then validates it as the untrusted input it is
 //! (`Snapshot::from_bytes`).
 
-use crate::arch::console::control as link;
 use crate::arch::timer::{self, Counter};
 use crate::cell::{self, Ending, Host, Resume, now_ns};
 use crate::memory;
@@ -30,9 +31,9 @@ use rhizo_hal::CycleCounter;
 use rhizo_mm::FRAME_SIZE;
 use rhizo_snapshot::{FormatError, Snapshot};
 
-/// How often the boot CPU looks at the serial line while it has nothing to
-/// run: often right after a request, less when the host is quiet (design
-/// D4).
+/// How often the boot CPU looks at the control channel while it has
+/// nothing to run: often right after a request, less when the host is quiet
+/// (design D4).
 const LOOK_FAST_NS: u64 = 50_000;
 const LOOK_SLOW_NS: u64 = 2_000_000;
 /// How long after a request the kernel keeps looking often.
@@ -76,6 +77,36 @@ struct Server {
     decoder: Decoder,
     /// Frames and refusals read, not yet handled.
     items: Vec<Item>,
+    /// Whether frames go over the vsock stream (else the serial line).
+    on_vsock: bool,
+}
+
+/// The control channel: the vsock stream while the host is connected to
+/// it, the serial line otherwise (design D2 of `control-over-vsock`).
+mod link {
+    use crate::arch::console::control as serial;
+    use crate::vsock;
+
+    /// Whether the host is connected over vsock (the device is polled).
+    pub fn on_vsock() -> bool {
+        vsock::poll()
+    }
+
+    /// The next byte the host sent, if one is waiting.
+    pub fn read_byte() -> Option<u8> {
+        if vsock::poll() {
+            vsock::read_byte()
+        } else {
+            serial::read_byte()
+        }
+    }
+
+    /// Sends `bytes` (a frame) to the host as they are.
+    pub fn write(bytes: &[u8]) {
+        if !vsock::write(bytes) {
+            serial::write(bytes);
+        }
+    }
 }
 
 /// A request's outcome.
@@ -97,9 +128,11 @@ pub fn serve() {
         next: 1,
         decoder: Decoder::new(),
         items: Vec::new(),
+        on_vsock: false,
     };
     // Cells may talk to the host's network as soon as they start.
     server.host.wire_address(10_000_000_000);
+    crate::vsock::init();
     send(0, &Message::Hello { version: VERSION });
     let mut fast_until = 0;
     loop {
@@ -138,6 +171,7 @@ pub fn serve() {
             host,
             decoder,
             items,
+            on_vsock,
             ..
         } = &mut server;
         host.look_every(Some(every));
@@ -149,6 +183,7 @@ pub fn serve() {
             }
             !items.is_empty()
                 || decoder.in_frame()
+                || crate::vsock::connected() != *on_vsock
                 || h.has_finished()
                 || (!watched.is_empty() && now_ns() >= flush_at)
                 || watched.iter().any(|&cell| h.has_output(cell))
@@ -157,8 +192,17 @@ pub fn serve() {
 }
 
 impl Server {
-    /// Reads what the host sent; a frame begun is read to its end.
+    /// Reads what the host sent; a frame begun is read to its end. A new
+    /// vsock connection is greeted, and frames go there from then on.
     fn read(&mut self) {
+        let on_vsock = link::on_vsock();
+        if on_vsock != self.on_vsock {
+            self.on_vsock = on_vsock;
+            self.decoder = Decoder::new();
+            if on_vsock {
+                send(0, &Message::Hello { version: VERSION });
+            }
+        }
         let mut last = now_ns();
         loop {
             match link::read_byte() {

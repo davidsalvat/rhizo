@@ -2,13 +2,15 @@
 //! design D1 and D2 of `add-virtio-pci`).
 //!
 //! A function's configuration space is a [`DeviceRegisters`] over its 4 KiB
-//! ECAM page. [`net_regions`] recognizes a virtio network function, sizes
-//! its memory BARs, gives an address to those the firmware left without
-//! one, turns on memory decoding and bus mastering, and finds the
-//! structures its vendor capabilities point to. The kernel maps them and
-//! hands them back as a [`Transport`] to [`VirtioNet::probe_pci`].
+//! ECAM page. [`regions`] recognizes a virtio function of a given type
+//! (network card, socket device), sizes its memory BARs, gives an address
+//! to those the firmware left without one, turns on memory decoding and bus
+//! mastering, and finds the structures its vendor capabilities point to.
+//! The kernel maps them and hands them back as a [`Transport`] to
+//! [`VirtioNet::probe_pci`] or [`VirtioVsock::probe_pci`].
 //!
 //! [`VirtioNet::probe_pci`]: crate::VirtioNet::probe_pci
+//! [`VirtioVsock::probe_pci`]: crate::vsock::VirtioVsock::probe_pci
 
 use rhizo_hal::DeviceRegisters;
 
@@ -16,9 +18,10 @@ use rhizo_hal::DeviceRegisters;
 pub const FUNCTION_BYTES: u64 = 4096;
 /// Vendor ID of virtio devices.
 pub const VIRTIO_VENDOR: u16 = 0x1af4;
-/// Device ID of a modern virtio network device (0x1040 + 1).
-const NET_MODERN: u16 = 0x1041;
-/// Device ID of a transitional one (its subsystem ID is the device type).
+/// Device IDs of modern virtio devices: this plus the device type.
+const MODERN: u32 = 0x1040;
+/// Device ID of a transitional network device (its subsystem ID is the
+/// device type).
 const NET_TRANSITIONAL: u16 = 0x1000;
 
 /// Configuration-space offsets (PCI Local Bus 3.0, section 6.1).
@@ -96,10 +99,10 @@ impl Window {
     }
 }
 
-/// Where the registers of a virtio network function are: each a physical
-/// address and a length in bytes.
+/// Where the registers of a virtio function are: each a physical address
+/// and a length in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NetRegions {
+pub struct Regions {
     pub common: (u64, u64),
     pub notify: (u64, u64),
     /// Bytes between the notification addresses of consecutive
@@ -115,12 +118,13 @@ pub struct Transport<R> {
     pub(crate) notify: R,
     pub(crate) notify_multiplier: u32,
     pub(crate) device: R,
-    /// Offset in `notify` of each queue's notification address.
-    pub(crate) notify_at: [usize; 2],
+    /// Each queue's `queue_notify_off`: its notification address is that
+    /// times `notify_multiplier` into `notify`.
+    pub(crate) notify_off: [u16; 3],
 }
 
 impl<R> Transport<R> {
-    /// The registers at the addresses of [`NetRegions`]: common
+    /// The registers at the addresses of [`Regions`]: common
     /// configuration, notifications and device configuration.
     pub fn new(common: R, notify: R, notify_multiplier: u32, device: R) -> Self {
         Self {
@@ -128,20 +132,21 @@ impl<R> Transport<R> {
             notify,
             notify_multiplier,
             device,
-            notify_at: [0; 2],
+            notify_off: [0; 3],
         }
     }
 }
 
-/// Whether the function behind `cfg` is a virtio network device.
-pub fn is_virtio_net(cfg: &mut impl DeviceRegisters) -> bool {
+/// Whether the function behind `cfg` is a virtio device of type `device`
+/// ([`NET_DEVICE`](crate::NET_DEVICE), [`VSOCK_DEVICE`](crate::VSOCK_DEVICE)).
+pub fn is_virtio(cfg: &mut impl DeviceRegisters, device: u32) -> bool {
     let id = cfg.read32(0);
     if id as u16 != VIRTIO_VENDOR {
         return false;
     }
     match (id >> 16) as u16 {
-        NET_MODERN => true,
-        NET_TRANSITIONAL => cfg.read32(SUBSYSTEM) >> 16 == 1,
+        d if u32::from(d) == MODERN + device => true,
+        NET_TRANSITIONAL => device == crate::NET_DEVICE && cfg.read32(SUBSYSTEM) >> 16 == 1,
         _ => false,
     }
 }
@@ -268,16 +273,17 @@ fn structures(cfg: &mut impl DeviceRegisters) -> [Option<(Structure, u32)>; 3] {
     found
 }
 
-/// Sets up the virtio network function behind `cfg` for the driver: its
-/// memory BARs get addresses (from `window` for those the firmware left
-/// without one), memory decoding and bus mastering are turned on, and the
-/// result says where its structures are. `Ok(None)`: not a virtio network
-/// device.
-pub fn net_regions(
+/// Sets up the virtio function of type `device` behind `cfg` for the
+/// driver: its memory BARs get addresses (from `window` for those the
+/// firmware left without one), memory decoding and bus mastering are turned
+/// on, and the result says where its structures are. `Ok(None)`: not a
+/// virtio device of that type.
+pub fn regions(
     cfg: &mut impl DeviceRegisters,
+    device: u32,
     window: Option<&mut Window>,
-) -> Result<Option<NetRegions>, PciError> {
-    if !is_virtio_net(cfg) {
+) -> Result<Option<Regions>, PciError> {
+    if !is_virtio(cfg, device) {
         return Ok(None);
     }
     let mut bars = memory_bars(cfg);
@@ -301,7 +307,7 @@ pub fn net_regions(
     }
     let command = cfg.read32(COMMAND) & 0xffff;
     cfg.write32(COMMAND, command | MEMORY_SPACE | BUS_MASTER);
-    Ok(Some(NetRegions {
+    Ok(Some(Regions {
         common: regions[0],
         notify: regions[1],
         notify_multiplier: found[1].map_or(0, |(_, m)| m),
@@ -312,6 +318,9 @@ pub fn net_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NET_DEVICE, VSOCK_DEVICE};
+
+    const NET_MODERN: u16 = 0x1041;
 
     /// A function's configuration space: plain bytes, except BARs, which
     /// read back their size mask after all ones are written.
@@ -455,16 +464,33 @@ mod tests {
 
     #[test]
     fn recognizes_modern_and_transitional_network_devices() {
-        assert!(is_virtio_net(&mut Config::new(VIRTIO_VENDOR, NET_MODERN)));
-        assert!(is_virtio_net(&mut qemu_net()));
+        let is_net = |c: &mut Config| is_virtio(c, NET_DEVICE);
+        assert!(is_net(&mut Config::new(VIRTIO_VENDOR, NET_MODERN)));
+        assert!(is_net(&mut qemu_net()));
         let mut block = Config::new(VIRTIO_VENDOR, NET_TRANSITIONAL);
         block.put32(SUBSYSTEM, 2 << 16);
-        assert!(!is_virtio_net(&mut block), "a transitional block device");
-        assert!(!is_virtio_net(&mut Config::new(VIRTIO_VENDOR, 0x1042)));
-        assert!(!is_virtio_net(&mut Config::new(0x8086, NET_MODERN)));
+        assert!(!is_net(&mut block), "a transitional block device");
+        assert!(!is_net(&mut Config::new(VIRTIO_VENDOR, 0x1042)));
+        assert!(!is_net(&mut Config::new(0x8086, NET_MODERN)));
+        assert!(!is_net(&mut Config::new(0xffff, 0xffff)), "no device");
+    }
+
+    #[test]
+    fn recognizes_a_socket_device() {
+        assert!(is_virtio(
+            &mut Config::new(VIRTIO_VENDOR, 0x1053),
+            VSOCK_DEVICE
+        ));
+        assert!(!is_virtio(
+            &mut Config::new(VIRTIO_VENDOR, 0x1053),
+            NET_DEVICE
+        ));
+        assert!(!is_virtio(&mut qemu_net(), VSOCK_DEVICE));
+        let mut net = Config::new(VIRTIO_VENDOR, NET_TRANSITIONAL);
+        net.put32(SUBSYSTEM, 1 << 16);
         assert!(
-            !is_virtio_net(&mut Config::new(0xffff, 0xffff)),
-            "no device"
+            !is_virtio(&mut net, VSOCK_DEVICE),
+            "only network cards are transitional here"
         );
     }
 
@@ -520,7 +546,9 @@ mod tests {
             next: 0x1000_0800,
             end: 0x1001_0000,
         };
-        let r = net_regions(&mut c, Some(&mut window)).unwrap().unwrap();
+        let r = regions(&mut c, NET_DEVICE, Some(&mut window))
+            .unwrap()
+            .unwrap();
         assert_eq!(c.get32(BAR0 + 4), 0x1000_1000, "BAR 1, aligned");
         assert_eq!(c.get32(BAR0 + 16), 0x1000_4000 | 0b1100, "BAR 4, aligned");
         assert_eq!(c.get32(BAR0 + 20), 0);
@@ -528,7 +556,7 @@ mod tests {
         assert_eq!(window.next, 0x1000_8000);
         assert_eq!(
             r,
-            NetRegions {
+            Regions {
                 common: (0x1000_4000, 0x1000),
                 notify: (0x1000_7000, 0x1000),
                 notify_multiplier: 4,
@@ -546,19 +574,19 @@ mod tests {
     fn firmware_addresses_are_kept() {
         let mut c = qemu_net();
         c.bar(4, 0x4000, 0b1100, 0x80_0000_0000);
-        let r = net_regions(&mut c, None).unwrap().unwrap();
+        let r = regions(&mut c, NET_DEVICE, None).unwrap().unwrap();
         assert_eq!(r.common, (0x80_0000_0000, 0x1000));
     }
 
     #[test]
     fn refuses_what_it_cannot_reach() {
         assert_eq!(
-            net_regions(&mut Config::new(0x8086, 0x10d3), None),
+            regions(&mut Config::new(0x8086, 0x10d3), NET_DEVICE, None),
             Ok(None),
             "not virtio"
         );
         assert_eq!(
-            net_regions(&mut qemu_net(), None),
+            regions(&mut qemu_net(), NET_DEVICE, None),
             Err(PciError::Bar(4)),
             "no address and no window"
         );
@@ -567,26 +595,26 @@ mod tests {
             end: 0x1000_2000,
         };
         assert_eq!(
-            net_regions(&mut qemu_net(), Some(&mut small)),
+            regions(&mut qemu_net(), NET_DEVICE, Some(&mut small)),
             Err(PciError::Bar(4)),
             "window too small"
         );
         let mut c = Config::new(VIRTIO_VENDOR, NET_MODERN);
         c.bar(0, 0x1000, 0, 0x1000_0000);
         assert_eq!(
-            net_regions(&mut c, None),
+            regions(&mut c, NET_DEVICE, None),
             Err(PciError::Capability(COMMON_CFG)),
             "no capabilities"
         );
         c.virtio_caps(0);
         assert_eq!(
-            net_regions(&mut c, None),
+            regions(&mut c, NET_DEVICE, None),
             Err(PciError::Capability(NOTIFY_CFG)),
             "structures past the end of the BAR"
         );
         c.virtio_caps(5);
         assert_eq!(
-            net_regions(&mut c, None),
+            regions(&mut c, NET_DEVICE, None),
             Err(PciError::Capability(COMMON_CFG)),
             "a BAR that does not exist"
         );
@@ -597,10 +625,10 @@ mod tests {
         let mut c = qemu_net();
         c.bytes[0x71] = 0x40; // notify points back to common
         c.bar(4, 0x4000, 0b1100, 0x8000_0000);
-        assert!(net_regions(&mut c, None).unwrap().is_some());
+        assert!(regions(&mut c, NET_DEVICE, None).unwrap().is_some());
         c.bytes[0x51] = 0x40; // ISR loops before device and notify
         assert_eq!(
-            net_regions(&mut c, None),
+            regions(&mut c, NET_DEVICE, None),
             Err(PciError::Capability(NOTIFY_CFG))
         );
     }
@@ -634,7 +662,7 @@ mod tests {
                     }
                 }
                 let mut w = window.map(|(next, end)| Window { next, end });
-                if let Ok(Some(r)) = net_regions(&mut c, w.as_mut()) {
+                if let Ok(Some(r)) = regions(&mut c, NET_DEVICE, w.as_mut()) {
                     let bars = memory_bars(&mut c);
                     for (addr, len) in [r.common, r.notify, r.device] {
                         let inside = bars.iter().flatten().any(|b| {
