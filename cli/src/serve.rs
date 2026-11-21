@@ -58,6 +58,13 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
     let _ = fs::remove_file(dir.socket());
     let listener = UnixListener::bind(dir.socket())
         .map_err(|e| format!("cannot listen on {}: {e}", dir.socket().display()))?;
+    // It may be outside the state directory (a long path): its user alone
+    // connects, whatever the umask.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.socket(), fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot restrict {}: {e}", dir.socket().display()))?;
+    }
     Info {
         pid: std::process::id(),
         vmm_pid: vm.pid(),

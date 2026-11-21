@@ -5,8 +5,10 @@
 //!
 //! [`Stream`] is the protocol alone, with no device: it takes the packets
 //! the device received, checks each as untrusted input, and says which to
-//! send. It holds at most one connection at a time. [`VirtioVsock`] moves
-//! packets between the rings and the stream's owner.
+//! send. It holds at most one connection at a time. [`Gate`] admits a
+//! connection only once its first bytes are a secret (change
+//! `authenticate-control-channel`). [`VirtioVsock`] moves packets between
+//! the rings and the stream's owner.
 
 use crate::{
     DESC_F_WRITE, DeviceRegisters, PhysicalMemory, ProbeError, QUEUE_SIZE, Queue, Transport,
@@ -338,8 +340,13 @@ impl Stream {
         }
     }
 
+    /// The address of the peer that holds the connection, if any.
+    pub fn peer(&self) -> Option<(u64, u32)> {
+        self.peer.map(|p| (p.cid, p.port))
+    }
+
     /// Resets the connection.
-    fn reset(&mut self) -> Change {
+    pub fn reset(&mut self) -> Change {
         if let Some(p) = self.peer {
             self.push(self.header(p.cid, p.port, self.port, op::RST, 0));
         }
@@ -352,6 +359,173 @@ impl Stream {
         self.rx.clear();
         self.tx.clear();
     }
+}
+
+/// Bytes of the secret a connection presents first.
+pub const SECRET_LEN: usize = 32;
+/// How long a connection may take to present the secret, from the first
+/// [`Gate::expire`] that sees it.
+pub const PROVE_WITHIN_NS: u64 = 2_000_000_000;
+
+/// A [`Stream`] that admits a connection only once the first
+/// [`SECRET_LEN`] bytes it sends are the secret (change
+/// `authenticate-control-channel`). Until then nothing it sends is read
+/// and nothing is written to it. A wrong secret, one not given within
+/// [`PROVE_WITHIN_NS`], or another peer's request resets it, and the
+/// stream keeps listening. An admitted connection is held as by the stream
+/// alone.
+#[derive(Debug)]
+pub struct Gate {
+    stream: Stream,
+    secret: [u8; SECRET_LEN],
+    /// The number of the connection admitted.
+    admitted: Option<u32>,
+    /// The connection presenting the secret: its number, and when
+    /// [`expire`](Self::expire) first saw it.
+    proving: Option<(u32, Option<u64>)>,
+    proof: [u8; SECRET_LEN],
+    have: usize,
+    refused: u32,
+}
+
+impl Gate {
+    /// A gate on `stream`, which admits connections that present `secret`.
+    pub fn new(stream: Stream, secret: [u8; SECRET_LEN]) -> Self {
+        Self {
+            stream,
+            secret,
+            admitted: None,
+            proving: None,
+            proof: [0; SECRET_LEN],
+            have: 0,
+            refused: 0,
+        }
+    }
+
+    /// Takes a packet the device received (as [`Stream::take`]); a
+    /// connection is [`Connected`](Change::Connected) once admitted. A
+    /// request from another peer replaces a connection that has not
+    /// presented the secret, so none holds the only connection without it.
+    pub fn take(&mut self, h: &Header, data: &[u8]) -> Option<Change> {
+        let before = self.connection();
+        let ours = (h.dst_cid, h.dst_port) == (self.stream.cid, self.stream.port);
+        if h.op == op::REQUEST
+            && ours
+            && before.is_none()
+            && self
+                .stream
+                .peer()
+                .is_some_and(|p| p != (h.src_cid, h.src_port))
+        {
+            self.refuse();
+        }
+        let change = self.stream.take(h, data);
+        self.prove();
+        let after = self.connection();
+        if after.is_some() && after != before {
+            Some(Change::Connected)
+        } else if before.is_some() && change == Some(Change::Closed) {
+            change
+        } else {
+            None
+        }
+    }
+
+    /// Reads the secret's bytes from the connection presenting it, and
+    /// admits or refuses it once all have come: never before, so a wrong
+    /// byte tells nothing about where it is.
+    fn prove(&mut self) {
+        let Some(c) = self.stream.connection() else {
+            (self.admitted, self.proving) = (None, None);
+            return;
+        };
+        if self.admitted == Some(c) {
+            return;
+        }
+        if self.proving.is_none_or(|(p, _)| p != c) {
+            (self.admitted, self.proving, self.have) = (None, Some((c, None)), 0);
+        }
+        while self.have < SECRET_LEN {
+            let Some(byte) = self.stream.read(c) else {
+                return;
+            };
+            self.proof[self.have] = byte;
+            self.have += 1;
+        }
+        if same(&self.proof, &self.secret) {
+            (self.admitted, self.proving) = (Some(c), None);
+        } else {
+            self.refuse();
+        }
+    }
+
+    /// Resets the connection presenting the secret, and counts it.
+    fn refuse(&mut self) {
+        self.stream.reset();
+        self.proving = None;
+        self.refused = self.refused.wrapping_add(1);
+    }
+
+    /// Resets the connection presenting the secret if it has taken
+    /// [`PROVE_WITHIN_NS`] since the first call that saw it; `now` is a
+    /// monotonic time in nanoseconds.
+    pub fn expire(&mut self, now: u64) {
+        match &mut self.proving {
+            Some((_, since @ None)) => *since = Some(now),
+            Some((_, Some(since))) if now.wrapping_sub(*since) >= PROVE_WITHIN_NS => {
+                self.refuse();
+            }
+            _ => {}
+        }
+    }
+
+    /// Connections refused, ever (wrapping).
+    pub fn refused(&self) -> u32 {
+        self.refused
+    }
+
+    /// The number of the connection admitted, while it is held.
+    pub fn connection(&self) -> Option<u32> {
+        self.admitted
+            .filter(|&c| self.stream.connection() == Some(c))
+    }
+
+    /// The next byte the admitted connection `connection` sent (as
+    /// [`Stream::read`]).
+    pub fn read(&mut self, connection: u32) -> Option<u8> {
+        if self.connection() != Some(connection) {
+            return None;
+        }
+        self.stream.read(connection)
+    }
+
+    /// Whether bytes of the admitted connection wait to be read.
+    pub fn has_input(&self) -> bool {
+        self.connection().is_some() && self.stream.has_input()
+    }
+
+    /// Queues `bytes` for the admitted connection (as [`Stream::write`]);
+    /// `false` if none is admitted.
+    pub fn write(&mut self, bytes: &[u8]) -> bool {
+        self.connection().is_some() && self.stream.write(bytes)
+    }
+
+    /// As [`Stream::next_packet`].
+    pub fn next_packet(&mut self, max: usize, out: &mut Vec<u8>) -> Option<Header> {
+        self.stream.next_packet(max, out)
+    }
+
+    /// As [`Stream::sending`].
+    pub fn sending(&self) -> bool {
+        self.stream.sending()
+    }
+}
+
+/// Whether `a` and `b` are equal, in a time that does not depend on where
+/// they differ.
+fn same(a: &[u8; SECRET_LEN], b: &[u8; SECRET_LEN]) -> bool {
+    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
+    core::hint::black_box(diff) == 0
 }
 
 /// Packet slots per queue: a header descriptor chained to a payload one.

@@ -118,6 +118,16 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// The kernel's generator, seeded from the hardware by [`init`]: each cell
 /// splits its own off it (design D2 of `add-crypto-random`).
 static RANDOM: Global<Batched> = Global::new(Batched::new(Generator::from_key([0; 32])));
+/// Whether [`RANDOM`] was seeded from the hardware.
+static RANDOM_STRONG: AtomicBool = AtomicBool::new(false);
+
+/// Fills `out` from the kernel's generator (after [`init`]); `false` if it
+/// was not seeded from the hardware, so `out` is predictable.
+#[cfg(feature = "control")]
+pub fn random_bytes(out: &mut [u8]) -> bool {
+    RANDOM.with(|g| g.fill(out));
+    RANDOM_STRONG.load(Ordering::Relaxed)
+}
 /// The network card's address last reported on the console (0: none).
 static WIRE_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Shortest time between two polls of the network card while cells run.
@@ -135,6 +145,7 @@ pub fn init(smp: Option<u16>) -> usize {
     let (generator, strong) =
         random::seeded(&mut crate::arch::random::HardwareEntropy, Counter.cycles());
     RANDOM.with(|g| *g = Batched::new(generator));
+    RANDOM_STRONG.store(strong, Ordering::Relaxed);
     if !strong {
         use core::fmt::Write;
         let _ = writeln!(

@@ -49,6 +49,7 @@ jobs:
           cargo test -p rhizo-abi -- hostile:: exec::
           cargo test -p rhizo-snapshot -- hostile::
           cargo test -p rhizo-virtio -- hostile::
+          cargo test -p rhizo-virtio -- vsock::
           cargo test -p rhizo-cell -- hostile
           cargo test -p rhizo-net -- hostile::
 
