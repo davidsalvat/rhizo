@@ -313,6 +313,7 @@ fn server(console: &mut impl Console) {
     let (mut next_op, mut turn, mut child) = (t0, 0, None);
     let (mut host_cycles, mut host_ops) = (0u64, 0u64);
     let (mut suspend_ns, mut resume_ns, mut fork_ns) = (Vec::new(), Vec::new(), Vec::new());
+    let mut kill_ns = Vec::new();
     // From the run's stop condition: the other CPUs, if any, keep running
     // their cells meanwhile (design D1 of `host-ops-per-cell`). It is asked
     // after every slice, so it does nothing more than read the clock until
@@ -335,6 +336,7 @@ fn server(console: &mut impl Console) {
                 let c0 = Counter.cycles();
                 if let Some(id) = child.take() {
                     host.kill(id);
+                    kill_ns.push(Counter.cycles() - c0);
                 }
                 turn = (turn + 1) % workers.len();
                 let (id, kind) = workers[turn];
@@ -425,7 +427,7 @@ fn server(console: &mut impl Console) {
         "rhizo-server-breakdown elapsed_ns={elapsed} idle_ns={} syscall_ns={} sched_ns={} \
          host_ns={} syscalls={} runs={} wakes={} io_woken={} net_changes={} cow_faults={} \
          lazy_faults={} interrupts={} untagged={untagged} host_ops={host_ops} suspend_ns={} resume_ns={} fork_ns={} \
-         sched_max_ns={} wake_max_ns={} settle_ns={}",
+         kill_ns={} sched_max_ns={} wake_max_ns={} settle_ns={}",
         cyc(report.count(Count::IdleCycles)),
         cyc(sys.sum()),
         cyc(report.count(Count::SchedCycles)),
@@ -441,6 +443,7 @@ fn server(console: &mut impl Console) {
         cyc(median(&mut suspend_ns)),
         cyc(median(&mut resume_ns)),
         cyc(median(&mut fork_ns)),
+        cyc(median(&mut kill_ns)),
         report.sched.max(),
         report.wake.max(),
         report.settled_ns,

@@ -56,6 +56,15 @@ pub struct Scheduler<T> {
     /// deadline, most often the latest, joins at the back, neither moving
     /// the others (change `host-ops-per-cell`).
     sleeping: VecDeque<(u64, u32, T)>,
+    /// Where to find a sleeper by its key without searching the sleep list
+    /// (design D2 of `heap-caches-cell-index`): at the slot of the key's low
+    /// bits, the wake time of the last entry put to sleep with such a key,
+    /// whose place a binary search then finds. Written only by
+    /// [`sleep`](Self::sleep), never as entries move, so a slot may be stale
+    /// (the sleeper woke, or another key took the slot): a lookup checks the
+    /// key it finds there, and searches the list when it is not the right
+    /// one. At least as many slots as sleepers, a power of two.
+    hints: Vec<u64>,
     /// By key (design D2 of `add-socket-wait-queues`), with their deadline
     /// if any.
     waiting: BTreeMap<u32, (Option<u64>, T)>,
@@ -70,6 +79,7 @@ impl<T: Keyed> Scheduler<T> {
             queues: (0..cpus.max(1)).map(|_| VecDeque::new()).collect(),
             arrivals: 0,
             sleeping: VecDeque::new(),
+            hints: Vec::new(),
             waiting: BTreeMap::new(),
             deadlines: BTreeSet::new(),
         }
@@ -113,8 +123,35 @@ impl<T: Keyed> Scheduler<T> {
     /// Puts `entry` to sleep until `wake_at` (nanoseconds, same clock as
     /// `now`).
     pub fn sleep(&mut self, entry: T, wake_at: u64) {
+        let key = entry.key();
         let at = self.sleeping.partition_point(|&(t, _, _)| t <= wake_at);
-        self.sleeping.insert(at, (wake_at, entry.key(), entry));
+        self.sleeping.insert(at, (wake_at, key, entry));
+        if self.sleeping.len() > self.hints.len() {
+            self.grow_hints();
+        }
+        let slot = key as usize & (self.hints.len() - 1);
+        self.hints[slot] = wake_at;
+    }
+
+    /// Doubles the hints' slots, filled again from the sleep list.
+    #[cold]
+    fn grow_hints(&mut self) {
+        let slots = (2 * self.sleeping.len()).next_power_of_two();
+        self.hints = alloc::vec![0; slots];
+        for &(wake, key, _) in &self.sleeping {
+            self.hints[key as usize & (slots - 1)] = wake;
+        }
+    }
+
+    /// The place in the sleep list of the sleeper known by `key`, if its
+    /// hint still tells it: the entries waking at the hinted time are
+    /// contiguous, found by a binary search.
+    fn hinted(&self, key: u32) -> Option<usize> {
+        let slots = self.hints.len();
+        let wake = *self.hints.get(key as usize & slots.checked_sub(1)?)?;
+        let first = self.sleeping.partition_point(|&(t, _, _)| t < wake);
+        let mut run = self.sleeping.range(first..).take_while(|e| e.0 == wake);
+        run.position(|e| e.1 == key).map(|i| first + i)
     }
 
     /// Makes `entry`, known by `key` (unique among waiting entries), wait
@@ -225,6 +262,10 @@ impl<T: Keyed> Scheduler<T> {
     /// with its wake time if it was sleeping (a waiting entry is returned
     /// as runnable: what it waits for is checked again when it runs).
     pub fn remove(&mut self, key: u32) -> Option<(T, Option<u64>)> {
+        if let Some(i) = self.hinted(key) {
+            let (wake, _, entry) = self.sleeping.remove(i)?;
+            return Some((entry, Some(wake)));
+        }
         for queue in &mut self.queues {
             if let Some(i) = queue.iter().position(|e| e.1 == key) {
                 return queue.remove(i).map(|(_, _, e)| (e, None));
@@ -251,6 +292,9 @@ impl<T: Keyed> Scheduler<T> {
 
     /// The entry known by `key` (runnable, waiting or sleeping).
     pub fn find(&self, key: u32) -> Option<&T> {
+        if let Some(i) = self.hinted(key) {
+            return self.sleeping.get(i).map(|(_, _, e)| e);
+        }
         if let Some((_, e)) = self.waiting.get(&key) {
             return Some(e);
         }
@@ -264,6 +308,9 @@ impl<T: Keyed> Scheduler<T> {
 
     /// The entry known by `key` (runnable, waiting or sleeping), mutably.
     pub fn find_mut(&mut self, key: u32) -> Option<&mut T> {
+        if let Some(i) = self.hinted(key) {
+            return self.sleeping.get_mut(i).map(|(_, _, e)| e);
+        }
         if let Some((_, e)) = self.waiting.get_mut(&key) {
             return Some(e);
         }
@@ -366,6 +413,51 @@ mod tests {
         fn key(&self) -> u32 {
             *self as u32
         }
+    }
+
+    impl<T: Keyed> Scheduler<T> {
+        /// The entry known by `key`, and its wake time if it sleeps, by
+        /// searching every place: what the hints must agree with.
+        fn find_linear(&self, key: u32) -> Option<(&T, Option<u64>)> {
+            if let Some((_, e)) = self.waiting.get(&key) {
+                return Some((e, None));
+            }
+            let queued = self.queues.iter().flatten().map(|e| (e, None));
+            let asleep = self.sleeping.iter().map(|e| (e, Some(e.0)));
+            queued
+                .chain(asleep)
+                .find(|(e, _)| e.1 == key)
+                .map(|((_, _, e), wake)| (e, wake))
+        }
+    }
+
+    #[test]
+    fn sleepers_are_found_by_key_through_stale_and_shared_slots() {
+        let mut s = Scheduler::new(2);
+        // Keys 1 and 9 share a slot once there are 8 slots.
+        for key in [1u32, 2, 3, 9] {
+            s.sleep(key, 100 + key as u64);
+        }
+        assert_eq!(s.hints.len(), 8);
+        assert_eq!(s.find(1), Some(&1), "its slot holds 9's time");
+        assert_eq!(s.find(9), Some(&9));
+        // Woken: its slot still tells where it slept.
+        assert_eq!(s.next(0, 102), Some(1));
+        assert_eq!(s.next(0, 102), Some(2));
+        s.requeue(1, 2);
+        assert_eq!(s.find(2), Some(&2), "runnable now, found in a queue");
+        assert_eq!(s.remove(2), Some((2, None)));
+        s.sleep(2, 103); // the same time as 3
+        assert_eq!(s.remove(2), Some((2, Some(103))));
+        assert_eq!(s.remove(3), Some((3, Some(103))));
+        assert_eq!(s.remove(2), None);
+        assert_eq!(s.find(17), None, "a key no entry has");
+        // Parked for good: many entries at the same time.
+        for key in 20..40 {
+            s.sleep(key, u64::MAX);
+        }
+        assert_eq!(s.remove(33), Some((33, Some(u64::MAX))));
+        assert_eq!(s.len(), 1 + 19, "9 and the parked ones");
     }
 
     #[test]
@@ -757,7 +849,82 @@ mod tests {
         TagPool::new(4).free(2);
     }
 
+    /// What happens to the scheduler in [`hints_agree_with_a_search`].
+    #[derive(Debug, Clone)]
+    enum Move {
+        Place(u32),
+        Sleep(u32, u64),
+        Wait(u32, Option<u64>),
+        Next(usize, u64),
+        Wake(usize, u32),
+        Remove(u32),
+        Change(u32),
+    }
+
+    fn a_move() -> impl Strategy<Value = Move> {
+        // Few keys, spread so that several share each slot.
+        let key = (0u32..12, 0u32..3).prop_map(|(k, m)| k + 64 * m);
+        prop_oneof![
+            key.clone().prop_map(Move::Place),
+            (key.clone(), 0u64..40).prop_map(|(k, t)| Move::Sleep(k, t)),
+            (key.clone(), proptest::option::of(0u64..40)).prop_map(|(k, d)| Move::Wait(k, d)),
+            (0usize..2, 0u64..40).prop_map(|(c, t)| Move::Next(c, t)),
+            (0usize..2, key.clone()).prop_map(|(c, k)| Move::Wake(c, k)),
+            key.clone().prop_map(Move::Remove),
+            key.prop_map(Move::Change),
+        ]
+    }
+
     proptest! {
+        /// Whatever entries come and go, finding, changing and removing by
+        /// key give what a search of every place gives.
+        #[test]
+        fn hints_agree_with_a_search(moves in proptest::collection::vec(a_move(), 1..200)) {
+            // Entries are (key, version): the key is what the scheduler
+            // keeps, the version what a change made.
+            #[derive(Debug, Clone, Copy, PartialEq)]
+            struct E(u32, u32);
+            impl Keyed for E {
+                fn key(&self) -> u32 {
+                    self.0
+                }
+            }
+            let mut s = Scheduler::new(2);
+            let mut held = std::collections::BTreeSet::new();
+            let mut now = 0;
+            for m in moves {
+                match m {
+                    Move::Place(k) if held.insert(k) => { s.place(E(k, 0)); }
+                    Move::Sleep(k, t) if held.insert(k) => s.sleep(E(k, 0), now + t),
+                    Move::Wait(k, d) if held.insert(k) => s.wait(k, E(k, 0), d.map(|d| now + d)),
+                    Move::Next(cpu, t) => {
+                        now += t;
+                        // Run and give back at once, or leave it out.
+                        if let Some(e) = s.next(cpu, now) {
+                            if e.0 % 2 == 0 { s.requeue(cpu, e); } else { held.remove(&e.0); }
+                        }
+                    }
+                    Move::Wake(cpu, k) => { s.wake(cpu, k, |_| {}); }
+                    Move::Remove(k) => {
+                        let want = s.find_linear(k).map(|(&e, w)| (e, w));
+                        prop_assert_eq!(s.remove(k), want);
+                        held.remove(&k);
+                    }
+                    Move::Change(k) => {
+                        if let Some(e) = s.find_mut(k) {
+                            e.1 += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                for k in (0..12).flat_map(|k| [k, k + 64, k + 128]) {
+                    let want = s.find_linear(k).map(|(e, _)| e);
+                    prop_assert_eq!(s.find(k), want, "key {}", k);
+                    prop_assert_eq!(want.is_some(), held.contains(&k), "key {}", k);
+                }
+            }
+        }
+
         /// Whatever the mix of adds, sleeps and steps, every entry comes out
         /// exactly once, never before its wake time.
         #[test]
