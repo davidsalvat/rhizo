@@ -10,15 +10,15 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
-const ME: [u8; 4] = [10, 0, 0, 2];
-const PEER: [u8; 4] = [10, 0, 0, 1];
-const MS: u64 = 1_000_000;
+pub(crate) const ME: [u8; 4] = [10, 0, 0, 2];
+pub(crate) const PEER: [u8; 4] = [10, 0, 0, 1];
+pub(crate) const MS: u64 = 1_000_000;
 
 /// The other end of the wire: echoes TCP on port 80 and UDP on port 53.
-struct Peer {
+pub(crate) struct Peer {
     iface: Interface,
     sockets: SocketSet<'static>,
-    link: QueueLink,
+    pub(crate) link: QueueLink,
     tcp: SocketHandle,
     udp: SocketHandle,
     /// Whether it closes its side once the client closed its own.
@@ -44,15 +44,22 @@ fn listener() -> tcp::Socket<'static> {
 
 impl Peer {
     fn new() -> Self {
+        Self::at([2, 0, 0, 0, 0, 1], PEER)
+    }
+
+    /// A peer with MAC address `mac` and address `ip`/24.
+    pub(crate) fn at(mac: [u8; 6], ip: [u8; 4]) -> Self {
         let mut link = QueueLink {
-            mac: [2, 0, 0, 0, 0, 1],
+            mac,
             ..QueueLink::default()
         };
         let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(link.mac)));
         let mut phy = Phy::new(&mut link);
         let mut iface = Interface::new(config, &mut phy, Instant::from_micros(0));
         iface.update_ip_addrs(|a| {
-            a.push(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24)).unwrap();
+            let [a0, a1, a2, a3] = ip;
+            a.push(IpCidr::new(IpAddress::v4(a0, a1, a2, a3), 24))
+                .unwrap();
         });
         let mut sockets = SocketSet::new(Vec::new());
         let mut udp = udp::Socket::new(
@@ -73,7 +80,7 @@ impl Peer {
         }
     }
 
-    fn step(&mut self, now: u64) {
+    pub(crate) fn step(&mut self, now: u64) {
         let mut phy = Phy::new(&mut self.link);
         self.iface.poll(
             Instant::from_micros((now / 1000) as i64),
@@ -499,4 +506,41 @@ fn a_connection_the_peer_ends_between_requests_is_replaced_at_once() {
     assert_eq!(w.net.send(s, b"turn 2", None), Ok(6));
     w.run(5);
     assert_eq!(drain(&mut w.net, s).unwrap(), b"turn 2");
+}
+
+/// A card under a flood from the network: it always has one more frame.
+struct Flood {
+    taken: usize,
+}
+
+impl rhizo_hal::NetLink for Flood {
+    fn mac(&self) -> [u8; 6] {
+        [2, 0, 0, 0, 0, 2]
+    }
+    fn send(&mut self, _: &[u8]) -> bool {
+        true
+    }
+    fn recv(&mut self, take: &mut dyn FnMut(&[u8])) -> bool {
+        self.taken += 1;
+        assert!(
+            self.taken < 100_000,
+            "the flood held the kernel in poll_wire"
+        );
+        take(&[0xff; 60]);
+        true
+    }
+}
+
+#[test]
+fn a_flood_from_the_wire_lets_the_kernel_go() {
+    let mut net = Net::new();
+    let mut link = Flood { taken: 0 };
+    let config = WireConfig::Static {
+        addr: ME,
+        prefix: 24,
+        gateway: None,
+    };
+    net.attach(&mut link, config, 0, 7);
+    assert_eq!(net.poll_wire(&mut link, MS), Some(0), "poll again soon");
+    assert_eq!(link.taken, wire::POLL_FRAMES, "one ring of frames per poll");
 }
