@@ -22,20 +22,35 @@ pub const STDLIB: &str = "usr/lib/python3.13";
 
 /// C extension modules built into the executable. The standard library's
 /// other C modules are not built at all (`make python` builds no shared
-/// module): what is left out needs what cells do not have (sockets,
-/// processes, `dlopen`) or is not used by the workload.
+/// module): what is left out needs what cells do not have (processes,
+/// `dlopen`) or is not used by the workloads. For the agent (design D2 of
+/// `add-agent-workload`): sockets, `select` and `array` (imported by
+/// `socket`) for its connection to its model, `unicodedata` for the `idna`
+/// codec `getaddrinfo` encodes host names with, and the hash modules
+/// `hashlib` imports (HACL* and BLAKE2 code in CPython's tree, no OpenSSL).
 const SETUP_LOCAL: &str = "\
 *static*
 _bisect _bisectmodule.c
+_blake2 _blake2/blake2module.c _blake2/blake2b_impl.c _blake2/blake2s_impl.c
 _datetime _datetimemodule.c
 _heapq _heapqmodule.c
 _json _json.c
+_md5 md5module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_MD5.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
 _random _randommodule.c
+_sha1 sha1module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA1.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha2 sha2module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA2.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha3 sha3module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA3.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_socket socketmodule.c
 _struct _struct.c
+array arraymodule.c
 binascii binascii.c
 math mathmodule.c
+select selectmodule.c
+unicodedata unicodedata.c
 zlib zlibmodule.c
 ";
+/// The scripts a CPython cell runs, from `cells/python` to `/app`.
+pub const SCRIPTS: [&str; 2] = ["agent_demo.py", "agent_loop.py"];
 /// Linked statically, with its segments on 2 MiB boundaries so the kernel
 /// maps whole 2 MiB pieces of them with 2 MiB pages (design D2 of
 /// `add-large-image-pages`).
@@ -54,7 +69,7 @@ fn dir() -> PathBuf {
 }
 
 /// The tree a CPython cell sees (`usr/bin/python3`, the standard library under
-/// [`STDLIB`], `app/agent_demo.py`), as a directory on the host; present
+/// [`STDLIB`], the [`SCRIPTS`] in `app`), as a directory on the host; present
 /// once [`build`] has built CPython.
 pub fn root() -> PathBuf {
     dir().join("root")
@@ -92,11 +107,19 @@ pub fn build(out: &Path) -> Result {
     ] {
         std::fs::create_dir_all(&d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
     }
-    let script = crate::workspace_root().join("cells/python/agent_demo.py");
-    std::fs::copy(&script, root.join("app/agent_demo.py")).map_err(|e| e.to_string())?;
-    let pack = crate::workspace_root().join("cells/python/pack_stdlib.py");
+    let scripts = crate::workspace_root().join("cells/python");
+    for script in SCRIPTS {
+        std::fs::copy(scripts.join(script), root.join("app").join(script))
+            .map_err(|e| e.to_string())?;
+    }
+    let pack = scripts.join("pack_stdlib.py");
     let mut cmd = Command::new(&python);
-    cmd.env_clear().arg(&pack).arg(&script).arg(&stdlib);
+    // From the build directory: a script may write files where it runs.
+    cmd.env_clear()
+        .current_dir(dir())
+        .arg(&pack)
+        .arg(&stdlib)
+        .args(SCRIPTS.map(|s| scripts.join(s)));
     run(
         &mut cmd,
         "pack the standard library",
@@ -110,12 +133,18 @@ pub fn build(out: &Path) -> Result {
     write_if_changed(&files, &encode(&root)?)
 }
 
+/// The interpreter as built, with its symbols (the cell runs a stripped
+/// copy; spec `profiling` names the functions of its samples from this).
+pub fn interpreter() -> PathBuf {
+    dir().join(format!("Python-{VERSION}")).join("python")
+}
+
 /// Builds `python` from the tarball unless the build directory already
 /// holds one built with the same recipe; returns its path.
 fn build_interpreter(tarball: &Path) -> Result<PathBuf> {
     let dir = dir();
     let src = dir.join(format!("Python-{VERSION}"));
-    let python = src.join("python");
+    let python = interpreter();
     let recipe = format!("{VERSION} {}\n{SETUP_LOCAL}", CONFIGURE.join(" ")) + LDFLAGS;
     let stamp = dir.join("recipe");
     if python.exists() && std::fs::read_to_string(&stamp).ok().as_deref() == Some(&recipe) {

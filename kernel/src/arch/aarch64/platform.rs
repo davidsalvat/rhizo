@@ -130,6 +130,13 @@ pub fn for_each_virtio_mmio(mut f: impl FnMut(u64)) {
     let _ = device_tree().for_each_compatible(b"virtio,mmio", |r| f(r.base));
 }
 
+/// The performance monitors' overflow interrupt (INTID) from the device
+/// tree, if it lists one.
+#[cfg(feature = "sampling")]
+pub fn pmu_interrupt() -> Option<u32> {
+    device_tree().pmu_interrupt().ok().flatten()
+}
+
 /// The ECAM base of PCI bus 0: the generic host bridge of the device tree
 /// (QEMU `virt`, Cloud Hypervisor).
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]

@@ -12,6 +12,8 @@ extern crate alloc;
 mod arch;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod cell;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod cost;
 mod heap;
 mod memory;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]

@@ -8,10 +8,12 @@ mod arch;
 mod bench;
 mod compare;
 mod cpython;
+mod demo;
 mod deps;
 mod differential;
 mod dynamic;
 mod hostnet;
+mod profile;
 mod refguest;
 mod report;
 mod tools;
@@ -47,7 +49,9 @@ Commands:
       --vmm <name>           qemu-microvm (default), qemu-q35, firecracker,
                              cloud-hypervisor
       --machine <microvm|q35>  Shorthand for the QEMU VMMs
-      --accel <auto|kvm|tcg> QEMU acceleration (default auto: KVM if usable)
+      --accel <auto|kvm|tcg|icount>
+                             QEMU acceleration (default auto: KVM if usable;
+                             icount: emulated, clock counts instructions)
       --gdb                  QEMU only: wait for a debugger on localhost:1234
   test [--vmm <name>] [--accel <a>] [--only <step>]
                              Host tests, boot check, in-kernel tests and
@@ -65,13 +69,27 @@ Commands:
       --update-baseline      Store the results as the baseline for --env
       --readme               Regenerate the README benchmark section
       --no-reference         Skip the reference Linux guest
+      --no-icount            Skip the instruction counts under QEMU -icount
       --workload <laptop|server>
                              Only this reference workload (both run by
                              default, after the cell figures)
       --soak                 The long versions of the workloads (weekly)
       --cells <n>            Cells of the server workload (default 10000)
       --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
+  profile [options]          Run the workloads (cell loop, fork_touch, CPython
+                             cold) sampled and accounted; write folded stacks
+                             per workload (cells' functions, kernel parts) and
+                             per system call
+      --vmm <name>           VMM (default: QEMU's default machine)
+      --accel <a>            QEMU acceleration
+      --out <dir>            Where to write them (default target/profile)
+      --per-cell             One frame per cell under the image
   ci                         Everything CI runs: fmt, clippy, test
+  demo agent --llm <url> --model <name> [--vmm <name>] [--accel <a>]
+                             The CPython agent in a cell against a real
+                             OpenAI-compatible model (Ollama, llama-server),
+                             shown live; needs RHIZO_CPYTHON_SRC
+                             (docs/demo.md)
   mutants                    Mutation testing of rhizo-mm and rhizo-core
                              (needs cargo-mutants; slow, runs weekly in CI)
   help                       Show this message
@@ -115,7 +133,9 @@ fn main() -> ExitCode {
         Some("run") => RunArgs::parse(rest).and_then(|a| cmd_run(&a)),
         Some("test") => RunArgs::parse(rest).and_then(|a| cmd_test(&a)),
         Some("bench") => bench::Options::parse(rest).and_then(|o| bench::cmd(&o)),
+        Some("profile") => profile::ProfileArgs::parse(rest).and_then(|a| profile::cmd(&a)),
         Some("ci") => cmd_ci(),
+        Some("demo") => demo::cmd(rest),
         Some("mutants") => cmd_mutants(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{HELP}");
@@ -900,7 +920,7 @@ fn cmd_ci() -> Result {
 
     let features = [""]
         .into_iter()
-        .chain(["ktest", "bench-cell"])
+        .chain(["ktest", "bench-cell", "bench-cell,profile"])
         .chain(SELF_CHECKS.iter().map(|c| c.feature));
     step("clippy (cells)");
     cargo(&[

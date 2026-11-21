@@ -12,6 +12,8 @@
 //! - `timer`: `Counter`, `cycles_to_ns`
 //! - `user` (cell builds only): `enter_user`, `Trap`, `release_user`,
 //!   `sync_code`; `platform::{MACHINE, ABI, CELL_ROOT_HAS_KERNEL_HALF}`
+//! - `pmu` (cell builds only): `init`, `read`, `Counts` (retired
+//!   instructions and core cycles, where the CPU or hypervisor has counters)
 //! - `tests::ALL` (in-kernel tests specific to the architecture)
 
 #[cfg(target_arch = "aarch64")]
