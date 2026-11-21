@@ -31,6 +31,8 @@ const HIGHER_IS_BETTER: [&str; 3] = ["density.cells", "density.ops_per_s", "dens
 pub enum Only {
     Laptop,
     Server,
+    /// The Node.js workload (change `add-node-workload`).
+    Node,
 }
 
 /// Options for `cargo xtask bench`.
@@ -125,9 +127,10 @@ impl Options {
                     o.workload = Some(match value("--workload")?.as_str() {
                         "laptop" => Only::Laptop,
                         "server" => Only::Server,
+                        "node" => Only::Node,
                         other => {
                             return Err(format!(
-                                "unknown workload `{other}` (expected laptop or server)"
+                                "unknown workload `{other}` (expected laptop, server or node)"
                             ));
                         }
                     });
@@ -323,6 +326,8 @@ fn measure(opts: &Options) -> Result<Results> {
         let (mut metrics, mut skipped) = (Vec::new(), Vec::new());
         if opts.icount_only {
             crate::profile::measure_icount(&mut metrics, &mut skipped)?;
+        } else if opts.workload == Some(Only::Node) {
+            measure_node(opts, &mut metrics, &mut skipped)?;
         } else {
             crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
         }
@@ -410,6 +415,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    measure_node(opts, &mut metrics, &mut skipped)?;
     crate::control::measure(&opts.vmms, opts.accel, &mut metrics, &mut skipped)?;
     crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
@@ -445,6 +451,10 @@ fn measure_comparisons(
         match crate::compare::cpython_in_vm(opts.accel, &scratch, skipped) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
+        }
+        match crate::compare::node_in_vm(opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("workload.node_cold_us/linux-process/firecracker".into(), e)),
         }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
@@ -786,6 +796,93 @@ fn parse_python_line(output: &str) -> Option<(u64, u64)> {
 
 /// `(cold_ns, warm_ns)` of the CPython line of a `bench-cell` kernel
 /// (absent when CPython was not built).
+/// Node.js metrics (change `add-node-workload`): a `bench-cell` kernel
+/// built with Node.js embedded, in a VM with the memory it needs, prints
+/// `rhizo-node cold_ns=<median> warm_ns=<median>`; each VMM boots it a few
+/// times. Skipped with the reason when Node.js is not packed.
+fn measure_node(
+    opts: &Options,
+    metrics: &mut Vec<Metric>,
+    skipped: &mut Vec<(String, String)>,
+) -> Result {
+    if let Some(why) = crate::node_unavailable_reason() {
+        skipped.push(("workload.node_*".into(), why));
+        return Ok(());
+    }
+    let guest = Guest::Rhizo(build_kernel(Profile::Release, &["bench-cell", "node"])?);
+    let run_opts = RunOptions {
+        stop_at_ready: false,
+        timeout: RUN_TIMEOUT,
+        echo: false,
+        accel: opts.accel,
+        gdb: false,
+        network: false,
+        pci_card: false,
+        cpus: 1,
+        memory_mib: crate::NODE_MEMORY_MIB,
+        bench: None,
+        shard: None,
+        control: false,
+    };
+    for &vmm in &opts.vmms {
+        if vmm.unavailable_reason(opts.accel).is_some() {
+            continue; // already reported by the boot benchmark
+        }
+        report::text(&format!("Node.js on {}", vmm.id()));
+        let (mut cold, mut warm) = (Vec::new(), Vec::new());
+        for _ in 0..opts.runs.clamp(1, 3) {
+            let out = vmm::run(vmm, &guest, run_opts)?;
+            match parse_node_line(&out.output) {
+                Some((c, w)) if out.result != VmResult::Failed => {
+                    cold.push(c as f64 / 1000.0);
+                    warm.push(w as f64 / 1000.0);
+                }
+                _ => {
+                    skipped.push((
+                        format!("workload.node_*/{}", vmm.id()),
+                        format!(
+                            "no `rhizo-node` line ({:?}); output:\n{}",
+                            out.result, out.output
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        for (name, values) in [
+            ("workload.node_cold_us", &mut cold),
+            ("workload.node_warm_us", &mut warm),
+        ] {
+            if !values.is_empty() {
+                let (median, p90) = summarize(values);
+                metrics.push(Metric {
+                    name: name.into(),
+                    guest: "rhizo".into(),
+                    vmm: Some(vmm.id().into()),
+                    unit: "us".into(),
+                    median,
+                    p90,
+                    runs: values.len(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `(cold_ns, warm_ns)` of the `rhizo-node` line of a Node.js `bench-cell`
+/// kernel.
+fn parse_node_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-node "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("cold_ns")?, field("warm_ns")?))
+}
+
 fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
     let line = output.lines().find(|l| l.starts_with("rhizo-cpython "))?;
     let field = |key: &str| -> Option<u64> {
@@ -2344,6 +2441,15 @@ mod tests {
             us("workload.cpython_warm_us", "rhizo", 1500.0),
         ]));
         assert!(only_cell.contains("| 30.00 ms | — |"), "{only_cell}");
+    }
+
+    #[test]
+    fn node_line_is_parsed() {
+        assert_eq!(
+            parse_node_line("rhizo-ready\nrhizo-node cold_ns=90000000 warm_ns=4000000\n"),
+            Some((90_000_000, 4_000_000))
+        );
+        assert_eq!(parse_node_line("rhizo-node not packed\n"), None);
     }
 
     #[test]

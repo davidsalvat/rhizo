@@ -695,6 +695,13 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             "`rhizo fork N 2` makes two cells",
             "`forked N into [A, B]`",
         )?;
+        // A resume takes no identifier: the children are the next two.
+        let n: u32 = cell.parse().unwrap_or_default();
+        must(
+            children == [(n + 1).to_string(), (n + 2).to_string()],
+            "a fork's cells take the next identifiers, after a suspend and resume",
+            &format!("`forked {n} into [{}, {}]`", n + 1, n + 2),
+        )?;
         for c in children.iter().chain([&cell]) {
             ok(&["kill", c])?;
         }
@@ -884,6 +891,16 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
     let result = scenario();
     let down = ok(&["down"]);
     result.and(down.map(|_| ()))?;
+    let mut left: Vec<String> = std::fs::read_dir(&state)
+        .map_err(|e| format!("cannot read {}: {e}", state.display()))?
+        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+        .collect();
+    left.sort();
+    must(
+        left == ["console.log"],
+        &format!("`rhizo down` leaves only the console log, not {left:?}"),
+        "[\"console.log\"]",
+    )?;
     let _ = std::fs::remove_dir_all(&state);
     Ok(())
 }

@@ -38,6 +38,7 @@ pub mod errno {
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
     pub const EINVAL: i64 = 22;
+    pub const ESRCH: i64 = 3;
     pub const ENODEV: i64 = 19;
     pub const ENOTTY: i64 = 25;
     pub const ESPIPE: i64 = 29;
@@ -170,6 +171,13 @@ enum Sys {
     Statx,
     SchedGetaffinity,
     Fadvise64,
+    Gettimeofday,
+    ClockGetres,
+    Capget,
+    Prctl,
+    SchedGetparam,
+    SchedGetscheduler,
+    IoUringSetup,
 }
 
 impl Arch {
@@ -278,6 +286,13 @@ impl Arch {
             (Arch::Aarch64, 291) | (Arch::X86_64, 332) => Statx,
             (Arch::Aarch64, 123) | (Arch::X86_64, 204) => SchedGetaffinity,
             (Arch::Aarch64, 223) | (Arch::X86_64, 221) => Fadvise64,
+            (Arch::Aarch64, 169) | (Arch::X86_64, 96) => Gettimeofday,
+            (Arch::Aarch64, 114) | (Arch::X86_64, 229) => ClockGetres,
+            (Arch::Aarch64, 90) | (Arch::X86_64, 125) => Capget,
+            (Arch::Aarch64, 167) | (Arch::X86_64, 157) => Prctl,
+            (Arch::Aarch64, 121) | (Arch::X86_64, 143) => SchedGetparam,
+            (Arch::Aarch64, 120) | (Arch::X86_64, 145) => SchedGetscheduler,
+            (Arch::Aarch64, 425) | (Arch::X86_64, 425) => IoUringSetup,
             _ => return None,
         })
     }
@@ -585,6 +600,14 @@ impl Abi {
             Some(Sys::Uname) => uname(cx, self.arch, a[0]),
             Some(Sys::ClockGettime) => clock_gettime(cx, a[0], a[1]),
             Some(Sys::Time) => time(cx, a[0]),
+            Some(Sys::Gettimeofday) => gettimeofday(cx, a[0], a[1]),
+            Some(Sys::ClockGetres) => clock_getres(cx, a[0], a[1]),
+            Some(Sys::Capget) => capget(cx, a[0], a[1]),
+            Some(Sys::Prctl) => prctl(cx, a[0], a[1]),
+            Some(Sys::SchedGetparam) => sched_policy(cell, cx, a[0], Some(a[1])),
+            Some(Sys::SchedGetscheduler) => sched_policy(cell, cx, a[0], None),
+            // Declined on purpose, as `rseq`: libuv falls back to `epoll`.
+            Some(Sys::IoUringSetup) => -ENOSYS,
             Some(Sys::Getrandom) => getrandom(cx, a[0], a[1]),
             // Signals are not delivered yet: accept, report no previous state.
             Some(Sys::RtSigaction) => zero_out(cx, a[2], 32),
@@ -1038,6 +1061,107 @@ fn time<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         return -EFAULT;
     }
     now
+}
+
+/// `gettimeofday`: the time since the epoch as a `timeval` at `tv`, and an
+/// empty `timezone` at `tz` (each unless null).
+fn gettimeofday<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    tv: u64,
+    tz: u64,
+) -> i64 {
+    let ns = cx.services.realtime_ns();
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+    out[8..].copy_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
+    match (tv, tz) {
+        (0, _) => {}
+        _ if put(cx, tv, &out) != 0 => return -EFAULT,
+        _ => {}
+    }
+    if tz != 0 { put(cx, tz, &[0; 8]) } else { 0 }
+}
+
+/// `clock_getres`: every clock `clock_gettime` reads counts nanoseconds.
+fn clock_getres<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    clock: u64,
+    addr: u64,
+) -> i64 {
+    match clock {
+        0 | 1 | 4..=7 if addr == 0 => 0,
+        0 | 1 | 4..=7 => put(cx, addr, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]),
+        _ => -EINVAL,
+    }
+}
+
+/// `capget`: a cell holds no capabilities (nothing outside it to be
+/// privileged over). Versions 1 to 3 of the header are understood; another
+/// is answered with version 3, as Linux does.
+fn capget<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    header: u64,
+    data: u64,
+) -> i64 {
+    const V1: u32 = 0x1998_0330;
+    const V3: u32 = 0x2008_0522;
+    let mut head = [0u8; 8];
+    if cx.read(header, &mut head).is_err() {
+        return -EFAULT;
+    }
+    let sets = match u32::from_le_bytes([head[0], head[1], head[2], head[3]]) {
+        V1 => 1,
+        0x2007_1026 | V3 => 2,
+        _ => {
+            return match put(cx, header, &V3.to_le_bytes()) {
+                0 if data == 0 => 0,
+                0 => -EINVAL,
+                e => e,
+            };
+        }
+    };
+    // Each set: effective, permitted, inheritable (32 bits each).
+    if data == 0 {
+        0
+    } else {
+        put(cx, data, &[0; 24][..12 * sets])
+    }
+}
+
+/// `prctl`: a thread may name itself (the name is not kept: nothing reads
+/// it back but `PR_GET_NAME`, which finds it empty); any other option is
+/// unknown (`EINVAL`).
+fn prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    option: u64,
+    arg: u64,
+) -> i64 {
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    match option {
+        PR_SET_NAME => 0,
+        PR_GET_NAME => put(cx, arg, &[0; 16]),
+        _ => -EINVAL,
+    }
+}
+
+/// `sched_getparam` (with `param`) and `sched_getscheduler` of thread
+/// `pid` (0: the caller): every thread has the normal policy
+/// (`SCHED_OTHER`, 0) and priority 0.
+fn sched_policy<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cell: &Cell,
+    cx: &mut Context<'_, F, M, T, A, S>,
+    pid: u64,
+    param: Option<u64>,
+) -> i64 {
+    let known =
+        |id: u64| id == u64::from(cell.id) || cell.threads.iter().any(|t| u64::from(t.tid) == id);
+    match param {
+        _ if (pid as i64) < 0 => -EINVAL,
+        _ if pid != 0 && !known(pid) => -ESRCH,
+        Some(addr) => put(cx, addr, &[0; 4]),
+        None => 0,
+    }
 }
 
 fn getrandom<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
