@@ -10,18 +10,22 @@
 extern crate alloc;
 
 mod arch;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 mod cell;
+#[cfg(feature = "control")]
+mod control;
+#[cfg(feature = "cells")]
+mod cost;
 mod heap;
 mod memory;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 mod prof;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 mod smp;
 mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 mod wire;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod workloads;
@@ -65,11 +69,12 @@ pub extern "C" fn kernel_main(boot_arg: u64, entry_cycles: u64) -> ! {
     rhizo_core::boot::report_ready(&mut console, entry_cycles, ready);
 
     // Builds that run cells set up preemption and the other CPUs.
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     rhizo_core::boot::report_cpus(&mut console, cell::init(options.smp));
 
     #[cfg(feature = "ktest")]
-    let status = rhizo_core::ktest::run(&mut console, &[tests::ALL, arch::tests::ALL]);
+    let status =
+        rhizo_core::ktest::run(&mut console, &[tests::ALL, arch::tests::ALL], options.shard);
 
     #[cfg(feature = "bench-cell")]
     cell::bench(&mut console);
@@ -84,6 +89,10 @@ pub extern "C" fn kernel_main(boot_arg: u64, entry_cycles: u64) -> ! {
         );
         ExitStatus::Success
     };
+
+    // A control kernel serves the host until it asks for the power off.
+    #[cfg(feature = "control")]
+    control::serve();
 
     Machine.exit(status)
 }

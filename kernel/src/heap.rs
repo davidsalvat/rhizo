@@ -21,17 +21,17 @@ impl PageSource for FramePages {
             _ => f.alloc_contiguous(count),
         })
         .flatten();
-        #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+        #[cfg(feature = "cells")]
         let Some(phys) = phys else {
             return window::alloc(count);
         };
-        #[cfg(not(any(feature = "ktest", feature = "bench-cell")))]
+        #[cfg(not(feature = "cells"))]
         let phys = phys?;
         NonNull::new(DirectMap::virt(phys) as *mut u8)
     }
 
     unsafe fn free_pages(&mut self, ptr: NonNull<u8>, count: usize) {
-        #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+        #[cfg(feature = "cells")]
         if window::contains(ptr) {
             return window::free(ptr, count);
         }
@@ -45,7 +45,7 @@ impl PageSource for FramePages {
 /// a window of the kernel half. Addresses are handed out once and never
 /// reused, so no CPU can reach new memory through a stale translation of a
 /// freed allocation.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod window {
     use crate::memory::{self, with_frames};
     use core::ptr::NonNull;
@@ -138,6 +138,12 @@ unsafe impl GlobalAlloc for KernelAllocator {
 static ALLOCATOR: KernelAllocator = KernelAllocator {
     heap: Global::new(Heap::new(FramePages)),
 };
+
+/// How often CPUs waited for the kernel heap (spec `profiling`).
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+pub fn contention() -> rhizo_core::sync::Contention {
+    ALLOCATOR.heap.contention()
+}
 
 /// Pages the kernel heap holds and its live allocations.
 #[cfg_attr(

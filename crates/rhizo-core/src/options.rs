@@ -17,7 +17,9 @@
 //! - `bench=laptop` or `bench=server`: the reference workload a benchmark
 //!   kernel runs instead of its cell figures (spec `benchmarks`), with
 //!   `cells=N` (target cells, 1 to 65535), `secs=N` (seconds of load, 1 to
-//!   65535) and `llm=ADDR:PORT` (the host's fake model server)
+//!   65535) and `llm=ADDR:PORT` (the host's model server, fake or real)
+//! - `shard=I/N`: an in-kernel test build runs only the tests whose position
+//!   is `I` modulo `N` (`0 <= I < N`), so several VMs share the tests
 
 use rhizo_hal::PhysicalMemory;
 
@@ -87,6 +89,8 @@ pub struct BootOptions {
     pub secs: Option<u16>,
     /// The host's fake model server (`llm=ADDR:PORT`).
     pub llm: Option<([u8; 4], u16)>,
+    /// The share of the in-kernel tests to run (`shard=I/N`): `(I, N)`.
+    pub shard: Option<(u16, u16)>,
 }
 
 impl Default for BootOptions {
@@ -101,6 +105,7 @@ impl Default for BootOptions {
             cells: None,
             secs: None,
             llm: None,
+            shard: None,
         }
     }
 }
@@ -206,12 +211,22 @@ impl BootOptions {
                         options.cells = Some(n);
                     } else if let Some(n) = word.strip_prefix(b"secs=").and_then(parse_count) {
                         options.secs = Some(n);
+                    } else if let Some(v) = word.strip_prefix(b"shard=") {
+                        options.shard = shard(v).or(options.shard);
                     }
                 }
             }
         }
         options
     }
+}
+
+/// `I/N` with `0 <= I < N <= 65535`.
+fn shard(value: &[u8]) -> Option<(u16, u16)> {
+    let slash = value.iter().position(|&b| b == b'/')?;
+    let n = parse_count(&value[slash + 1..])?;
+    let i = u16::try_from(number(&value[..slash])?).ok()?;
+    (i < n).then_some((i, n))
 }
 
 /// A count from 1 to 65535 (with [`number`]'s syntax, which the other
@@ -261,6 +276,20 @@ mod tests {
     #[test]
     fn cpu_limit() {
         assert_eq!(BootOptions::parse(b"smp=4").smp, Some(4));
+        assert_eq!(BootOptions::parse(b"shard=0/3").shard, Some((0, 3)));
+        assert_eq!(
+            BootOptions::parse(b"shard=2/3 console=e9").shard,
+            Some((2, 3))
+        );
+        for bad in [
+            &b"shard=3/3"[..],
+            b"shard=1/0",
+            b"shard=1",
+            b"shard=/2",
+            b"shard=a/2",
+        ] {
+            assert_eq!(BootOptions::parse(bad).shard, None, "{bad:?}");
+        }
         assert_eq!(BootOptions::parse(b"console=e9 smp=1").smp, Some(1));
         assert_eq!(BootOptions::parse(b"smp=2 smp=3").smp, Some(3));
         for bad in [
@@ -331,6 +360,10 @@ mod tests {
             Some(([10, 0, 2, 2], 7777))
         );
         assert_eq!(BootOptions::parse(b"echo=10.0.2.2:70000").echo, None);
+        let both = BootOptions::parse(b"echo=10.0.2.2:7 llm=172.16.0.1:8080");
+        assert_eq!(both.echo, Some(([10, 0, 2, 2], 7)));
+        assert_eq!(both.llm, Some(([172, 16, 0, 1], 8080)));
+        assert_eq!(BootOptions::parse(b"llm=172.16.0.1").llm, None);
     }
 
     #[test]

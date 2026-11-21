@@ -438,6 +438,29 @@ fn x86_64_numbers_and_registers() {
 }
 
 #[test]
+fn call_numbers_names_and_socket_calls_for_reports() {
+    let mut w = World::new(Arch::X86_64);
+    w.cell.regs_mut().gpr[0] = 41;
+    assert_eq!(Arch::X86_64.call_number(&w.cell), 41);
+    assert_eq!(
+        format!("{:?}", Arch::X86_64.call_name(41).unwrap()),
+        "Socket"
+    );
+    assert_eq!(
+        format!("{:?}", Arch::Aarch64.call_name(63).unwrap()),
+        "Read"
+    );
+    assert!(Arch::X86_64.call_name(9999).is_none());
+    assert!(Arch::X86_64.is_socket_call(41));
+    assert!(Arch::Aarch64.is_socket_call(206), "sendto");
+    assert!(
+        !Arch::Aarch64.is_socket_call(63),
+        "read is not only for sockets"
+    );
+    assert!(!Arch::X86_64.is_socket_call(9999));
+}
+
+#[test]
 fn clocks_uname_random_and_signals() {
     let mut w = World::new(Arch::Aarch64);
     w.services.clock = 3_000_000_123;
@@ -734,6 +757,31 @@ fn descriptors_dup_and_fcntl() {
     assert_eq!(w.call(46, &[0, 2]).0, -EINVAL, "not a file");
     assert_eq!(w.call(82 /* fsync */, &[fd]).0, 0);
     assert_eq!(w.call(82, &[77]).0, -EBADF);
+}
+
+#[test]
+fn ioctl_sets_non_blocking_and_close_on_exec() {
+    const IOCTL: u64 = 16;
+    const FCNTL: u64 = 72;
+    let mut w = World::new(Arch::X86_64);
+    let p = name(&mut w, "/x");
+    let fd = w
+        .call(2 /* open */, &[p, 0x42 /* O_CREAT|O_RDWR */, 0o644])
+        .0 as u64;
+    w.poke(DATA, &1u32.to_le_bytes());
+    assert_eq!(w.call(IOCTL, &[fd, 0x5421 /* FIONBIO */, DATA]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 3 /* F_GETFL */]).0, 0x802, "O_NONBLOCK");
+    w.poke(DATA, &0u32.to_le_bytes());
+    assert_eq!(w.call(IOCTL, &[fd, 0x5421, DATA]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 3]).0, 2, "blocking again");
+    assert_eq!(w.call(IOCTL, &[fd, 0x5421, 0xdead_0000]).0, -EFAULT);
+    assert_eq!(w.call(IOCTL, &[fd, 0x5451 /* FIOCLEX */, 0]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 1 /* F_GETFD */]).0, 1);
+    assert_eq!(w.call(IOCTL, &[fd, 0x5450 /* FIONCLEX */, 0]).0, 0);
+    assert_eq!(w.call(FCNTL, &[fd, 1]).0, 0);
+    assert_eq!(w.call(IOCTL, &[77, 0x5451, 0]).0, -EBADF);
+    assert_eq!(w.call(IOCTL, &[77, 0x5421, DATA]).0, -EBADF);
+    assert_eq!(w.call(IOCTL, &[fd, 0x5401 /* TCGETS */, DATA]).0, -ENOTTY);
 }
 
 #[test]

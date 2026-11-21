@@ -339,6 +339,46 @@ fn x86_64_state_that_would_fault_in_the_kernel_is_refused() {
     assert!(Snapshot::from_bytes(b, Machine::X86_64).is_ok());
 }
 
+/// Frames without any 2 MiB run free.
+struct Fragmented(CountingFrames);
+
+impl Frames for Fragmented {
+    fn alloc(&mut self) -> Option<u64> {
+        self.0.alloc()
+    }
+    fn alloc_large(&mut self) -> Option<u64> {
+        None
+    }
+    fn free(&mut self, phys: u64, size: PageSize) {
+        self.0.free(phys, size);
+    }
+    fn share(&mut self, phys: u64) {
+        self.0.share(phys);
+    }
+    fn is_shared(&self, phys: u64) -> bool {
+        self.0.is_shared(phys)
+    }
+}
+
+#[test]
+fn a_large_page_comes_back_in_small_pages_without_a_large_frame() {
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(4096));
+    let original = cell::<X86_64>(&mut mem, &mut frames);
+    let snap = Snapshot::capture::<X86_64>(Machine::Aarch64, &original, &Fs::new(), &[], 0, &mem);
+    assert_eq!(snap.page(2).size, PageSize::Large);
+    let mut frames = Fragmented(frames);
+    let pt = PageTable::<X86_64>::new(&mut mem, &mut || frames.alloc()).unwrap();
+    snap.restore_page(2, &pt, &mut mem, &mut frames).unwrap();
+    let big = 0x4000_0000_0000;
+    for at in [big, big + 0x1000, big + 0x1f_f000] {
+        let t = pt.translate(&mem, at).unwrap();
+        assert_eq!((t.size, t.flags), (PageSize::Small, RW), "{at:#x}");
+    }
+    let mut buf = [0u8; 8];
+    rhizo_cell::memory::copy_from(&pt, &mem, 0x4000_001f_fff8, &mut buf).unwrap();
+    assert_eq!(&buf, b"big page");
+}
+
 #[test]
 fn restore_failure_returns_the_frame() {
     let snap = Snapshot::from_bytes(sample(), Machine::Aarch64).unwrap();

@@ -316,6 +316,11 @@ cargo xtask bench
 cargo xtask --arch x86_64 bench
 ```
 
+A CPython agent in a cell talking to your own local model (Ollama or
+llama.cpp), forked and suspended live through `rhizo`, the control plane's
+command-line tool (`rhizo up`, `rhizo run python-agent`, `rhizo ps`,
+`rhizo fork`, `rhizo down`): [docs/demo.md](docs/demo.md).
+
 `cargo xtask check` is the fast loop (format, lints, host tests, crate rules)
 and `cargo xtask ci` runs everything CI runs. AArch64 is the primary
 architecture: 16-bit ASIDs and TLB invalidation broadcast in hardware suit

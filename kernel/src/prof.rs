@@ -57,6 +57,10 @@ pub fn on() -> bool {
 }
 
 /// Clears every histogram and count, then counts until [`stop`].
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
 pub fn start() {
     LATENCY.with(|l| match l {
         Some(h) => h.iter_mut().for_each(Histogram::clear),
@@ -74,6 +78,10 @@ pub fn start() {
 }
 
 /// Stops counting; returns what was counted since [`start`].
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
 pub fn stop() -> Report {
     ON.store(false, Ordering::Release);
     let (sched, wake) = LATENCY.with(|l| {
@@ -105,6 +113,10 @@ pub fn add(count: Count, n: u64) {
 }
 
 /// The value of a count kept always.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
 pub fn get(count: Count) -> u64 {
     COUNTERS[count as usize].load(Ordering::Relaxed)
 }
@@ -210,6 +222,10 @@ impl Ready {
 
 /// What was counted between [`start`] and [`stop`].
 #[derive(Debug, Default)]
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
 pub struct Report {
     /// Joined a run queue to running, in nanoseconds.
     pub sched: Histogram,
@@ -221,6 +237,10 @@ pub struct Report {
     pub counts: [u64; COUNTS],
 }
 
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
 impl Report {
     /// A count.
     pub fn count(&self, c: Count) -> u64 {

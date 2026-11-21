@@ -144,18 +144,34 @@ pub enum Accel {
     Kvm,
     /// Always emulate (TCG).
     Tcg,
+    /// Emulate, counting instructions (TCG with `-icount shift=0`): the
+    /// guest's clock advances one nanosecond per instruction, so a kernel
+    /// timing itself measures retired instructions, the same on every run
+    /// (spec `profiling`).
+    Icount,
 }
 
 impl Accel {
-    /// Parses `auto`, `kvm` or `tcg`.
+    /// Parses `auto`, `kvm`, `tcg` or `icount`.
     pub fn parse(name: &str) -> Result<Self> {
         match name {
             "auto" => Ok(Accel::Auto),
             "kvm" => Ok(Accel::Kvm),
             "tcg" => Ok(Accel::Tcg),
+            "icount" => Ok(Accel::Icount),
             other => Err(format!(
-                "unknown accelerator `{other}` (expected auto, kvm or tcg)"
+                "unknown accelerator `{other}` (expected auto, kvm, tcg or icount)"
             )),
+        }
+    }
+
+    /// The name [`parse`](Self::parse) reads.
+    pub fn id(self) -> &'static str {
+        match self {
+            Accel::Auto => "auto",
+            Accel::Kvm => "kvm",
+            Accel::Tcg => "tcg",
+            Accel::Icount => "icount",
         }
     }
 
@@ -163,7 +179,7 @@ impl Accel {
         match self {
             Accel::Auto => kvm_available(),
             Accel::Kvm => true,
-            Accel::Tcg => false,
+            Accel::Tcg | Accel::Icount => false,
         }
     }
 }
@@ -316,6 +332,29 @@ pub struct RunOptions {
     pub memory_mib: u32,
     /// A reference workload for a `bench-cell` Rhizo kernel.
     pub bench: Option<Bench>,
+    /// The share of the in-kernel tests this VM runs (`shard=I/N`).
+    pub shard: Option<(u16, u16)>,
+    /// A control kernel (spec `control-plane`): its console is the serial
+    /// line, both ways, on the VMM's standard input and output, also where
+    /// the kernel would otherwise use a debug port.
+    pub control: bool,
+}
+
+/// The console and exit options of a Rhizo kernel on `vmm`.
+fn rhizo_args(vmm: Vmm, kvm: bool, opts: &RunOptions) -> String {
+    let args = vmm.rhizo_cmdline(kvm);
+    if opts.control {
+        args.replace("console=e9", "console=serial")
+    } else {
+        args.to_string()
+    }
+}
+
+/// The `shard=I/N` option for a Rhizo command line, if any.
+fn shard_arg(opts: &RunOptions) -> String {
+    opts.shard
+        .map(|(i, n)| format!(" shard={i}/{n}"))
+        .unwrap_or_default()
 }
 
 /// Parses `rhizo-ready cycles=<n>` from console output.
@@ -326,7 +365,7 @@ pub fn parse_ready_cycles(output: &str) -> Option<u64> {
 }
 
 /// Builds the command that launches `guest` on `vmm`.
-fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
+pub fn command(vmm: Vmm, guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
     match vmm {
         Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => Ok(qemu_command(vmm, guest, opts)),
         Vmm::Firecracker => firecracker_command(guest, opts, scratch),
@@ -388,6 +427,11 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
         .args(["-smp", &opts.cpus.to_string()])
         .args(["-display", "none", "-no-reboot"])
         .args(["-accel", if kvm { "kvm" } else { "tcg" }]);
+    if opts.accel == Accel::Icount {
+        // Time jumps over idle periods instead of following the host's
+        // clock, so nothing depends on the host.
+        cmd.args(["-icount", "shift=0,sleep=off"]);
+    }
     if vmm != Vmm::QemuVirt {
         cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     } else if !kvm {
@@ -396,12 +440,12 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
     }
     match guest {
         Guest::Rhizo(kernel) => {
-            if vmm == Vmm::QemuVirt {
+            if vmm == Vmm::QemuVirt || opts.control {
                 cmd.args(["-serial", "stdio"]);
             } else {
                 cmd.args(["-debugcon", "stdio", "-serial", "none"]);
             }
-            let mut args = vmm.rhizo_cmdline(kvm).to_string();
+            let mut args = rhizo_args(vmm, kvm, opts);
             if opts.network
                 && let crate::hostnet::Network::Qemu { cmdline } = crate::hostnet::for_vmm(vmm)
             {
@@ -422,6 +466,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(vmm);
             }
+            args += &shard_arg(opts);
             cmd.arg("-kernel").arg(kernel).args(["-append", &args]);
         }
         Guest::ReferenceLinux { kernel, initramfs } => {
@@ -445,7 +490,7 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
         Guest::Rhizo(kernel) => (
             kernel.clone(),
             None,
-            Vmm::Firecracker.rhizo_cmdline(true).to_string(),
+            rhizo_args(Vmm::Firecracker, true, opts),
         ),
         Guest::ReferenceLinux { kernel, initramfs } => (
             kernel.clone(),
@@ -466,6 +511,9 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     }
     if let (Some(bench), Guest::Rhizo(_)) = (opts.bench, guest) {
         args += &bench.cmdline(Vmm::Firecracker);
+    }
+    if matches!(guest, Guest::Rhizo(_)) {
+        args += &shard_arg(opts);
     }
     let initrd_json = match &initrd {
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
@@ -498,7 +546,7 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
         .args(["--console", "off"]);
     match guest {
         Guest::Rhizo(kernel) => {
-            let mut args = Vmm::CloudHypervisor.rhizo_cmdline(true).to_string();
+            let mut args = rhizo_args(Vmm::CloudHypervisor, true, opts);
             if opts.network
                 && let crate::hostnet::Network::Tap { tap, cmdline } =
                     crate::hostnet::for_vmm(Vmm::CloudHypervisor)
@@ -510,8 +558,9 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(Vmm::CloudHypervisor);
             }
+            args += &shard_arg(opts);
             cmd.arg("--kernel").arg(kernel).args(["--cmdline", &args]);
-            if arch::current() == Arch::X86_64 {
+            if arch::current() == Arch::X86_64 && !opts.control {
                 cmd.args(["--serial", "off", "--debug-console", "tty"]);
             } else {
                 cmd.args(["--serial", "tty"]);

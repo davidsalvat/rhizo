@@ -172,6 +172,8 @@ fn laptop(
             idle_secs,
             llm_delay_ms: opts.llm_delay_ms,
         }),
+        shard: None,
+        control: false,
     };
     let mut samples: BTreeMap<(&str, &str), Vec<f64>> = BTreeMap::new();
     for _ in 0..opts.runs.clamp(1, 3) {
@@ -276,6 +278,8 @@ fn server(opts: &Options, vmm: Vmm, guest: &Guest, metrics: &mut Vec<Metric>) ->
             cells: opts.cells,
             secs,
         }),
+        shard: None,
+        control: false,
     };
     let runs = if opts.soak { 1 } else { opts.runs.clamp(1, 3) };
     let mut samples: BTreeMap<(&str, &str), Vec<f64>> = BTreeMap::new();

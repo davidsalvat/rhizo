@@ -7,11 +7,15 @@
 //!   `for_each_ram`, `for_each_reserved`, `map_devices`; in builds that run
 //!   cells, `for_each_virtio_mmio`, `pci_ecam`, `pci_window`, `map_device`
 //!   and `Mmio` (a device's registers)
-//! - `console`: `init`, `BootConsole`; `power`: `init`, `Machine`
+//! - `console`: `init`, `BootConsole`; in control builds, `control::{read_byte,
+//!   write}` (the UART both ways); `power`: `init`, `Machine`
 //! - `cpu`: `init`, `supports_1gib_pages`, `activate`, `CpuTlb`
 //! - `timer`: `Counter`, `cycles_to_ns`
 //! - `user` (cell builds only): `enter_user`, `Trap`, `release_user`,
 //!   `sync_code`; `platform::{MACHINE, ABI, CELL_ROOT_HAS_KERNEL_HALF}`
+//! - `random` (cell builds only): `HardwareEntropy` (`rhizo_hal::Entropy`)
+//! - `pmu` (cell builds only): `init`, `read`, `Counts` (retired
+//!   instructions and core cycles, where the CPU or hypervisor has counters)
 //! - `tests::ALL` (in-kernel tests specific to the architecture)
 
 #[cfg(target_arch = "aarch64")]

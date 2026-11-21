@@ -77,6 +77,19 @@ pub trait PhysicalMemory {
         }
     }
 
+    /// Copies `len` bytes from physical address `from` to `to` (ranges that
+    /// do not overlap, any alignment).
+    fn copy(&mut self, from: u64, to: u64, len: u64) {
+        let mut buf = [0u8; 512];
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(buf.len() as u64) as usize;
+            self.read_bytes(from + done, &mut buf[..n]);
+            self.write_bytes(to + done, &buf[..n]);
+            done += n as u64;
+        }
+    }
+
     /// Copies `data` to physical address `phys` (any alignment).
     fn write_bytes(&mut self, phys: u64, data: &[u8]) {
         for (i, &byte) in data.iter().enumerate() {
@@ -86,6 +99,16 @@ pub trait PhysicalMemory {
             self.write_u64(p & !7, (word & !(0xff << shift)) | ((byte as u64) << shift));
         }
     }
+}
+
+/// A hardware source of unpredictable bits: a random-number instruction
+/// (RDSEED, RDRAND, RNDR) or device. Core logic never reads one directly:
+/// it is given what the source produced, so it stays deterministic on the
+/// host.
+pub trait Entropy {
+    /// Fills `out` with unpredictable bytes; `false` if the source is
+    /// missing or failed, and `out` must not be relied on.
+    fn fill(&mut self, out: &mut [u8]) -> bool;
 }
 
 /// The processor's cache of address translations.
@@ -130,7 +153,7 @@ pub trait NetLink {
 /// In-memory test doubles for host tests.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use super::{Console, CycleCounter, NetLink, PhysicalMemory, Tlb};
+    use super::{Console, CycleCounter, Entropy, NetLink, PhysicalMemory, Tlb};
     use std::cell::Cell;
     use std::collections::{BTreeMap, VecDeque};
     use std::string::String;
@@ -254,6 +277,24 @@ pub mod testing {
         }
     }
 
+    /// An entropy source whose bytes the test chooses: `Some(b)` gives `b`,
+    /// `b + 1`, ... (wrapping), `None` is a missing source.
+    #[derive(Debug, Default)]
+    pub struct FakeEntropy(pub Option<u8>);
+
+    impl Entropy for FakeEntropy {
+        fn fill(&mut self, out: &mut [u8]) -> bool {
+            let Some(next) = self.0.as_mut() else {
+                return false;
+            };
+            for byte in out {
+                *byte = *next;
+                *next = next.wrapping_add(1);
+            }
+            true
+        }
+    }
+
     /// A TLB that records every flushed page.
     #[derive(Debug, Default)]
     pub struct RecordingTlb {
@@ -287,6 +328,18 @@ mod tests {
             mem.read_u64(0x1000) >> 24,
             u64::from_le_bytes(*b"rhizo\0\0\0")
         );
+    }
+
+    #[test]
+    fn copies_move_any_length_between_ranges() {
+        let mut mem = FakePhysicalMemory::new();
+        let data: Vec<u8> = (0..1500u32).map(|i| (i * 7) as u8).collect();
+        mem.write_bytes(0x1001, &data);
+        mem.copy(0x1001, 0x8003, data.len() as u64);
+        let mut back = vec![0u8; data.len() + 1];
+        mem.read_bytes(0x8003, &mut back);
+        assert_eq!(&back[..data.len()], &data[..]);
+        assert_eq!(back[data.len()], 0, "nothing past the end");
     }
 
     #[test]
