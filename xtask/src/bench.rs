@@ -624,6 +624,7 @@ fn measure_cells(
         }
         let (mut parallel, mut scaling, mut ipi_wake) = (Vec::new(), Vec::new(), Vec::new());
         let (mut thread_scaling, mut shootdown) = (Vec::new(), Vec::new());
+        let mut syscall_scaling = Vec::new();
         for _ in 0..opts.runs.clamp(1, 3) {
             let smp = RunOptions {
                 cpus: crate::SMP_CPUS,
@@ -641,6 +642,12 @@ fn measure_cells(
                             .push(100.0 * s.threads4_ns as f64 * 4.0 / s.threads1_ns as f64);
                     }
                     shootdown.push(s.shootdown_ns as f64 / 1000.0);
+                    if s.syscalls_serial_ns > 0 {
+                        syscall_scaling.push(
+                            100.0 * s.syscalls_parallel_ns as f64 * s.cpus as f64
+                                / s.syscalls_serial_ns as f64,
+                        );
+                    }
                 }
                 _ => {
                     skipped.push((
@@ -696,6 +703,7 @@ fn measure_cells(
             ("cell.thread_scaling_pct", "%", &mut thread_scaling),
             ("cell.shootdown_us", "us", &mut shootdown),
             ("cell.syscall_ns", "ns", &mut syscall),
+            ("cell.syscall_scaling_pct", "%", &mut syscall_scaling),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
                 let why = match crate::hostnet::for_vmm(vmm) {
@@ -876,6 +884,10 @@ struct SmpLine {
     threads1_ns: u64,
     threads4_ns: u64,
     shootdown_ns: u64,
+    /// 4 `piper` cells per CPU making system calls, one CPU after the other
+    /// and on every CPU (design D3 of `split-sockets-lock`).
+    syscalls_serial_ns: u64,
+    syscalls_parallel_ns: u64,
 }
 
 fn parse_smp_line(output: &str) -> Option<SmpLine> {
@@ -894,6 +906,8 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         threads1_ns: field("threads1_ns")?,
         threads4_ns: field("threads4_ns")?,
         shootdown_ns: field("shootdown_ns")?,
+        syscalls_serial_ns: field("syscalls_serial_ns")?,
+        syscalls_parallel_ns: field("syscalls_parallel_ns")?,
     })
 }
 
@@ -2425,7 +2439,8 @@ mod tests {
         assert_eq!(
             parse_smp_line(
                 "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000 \
-                 threads1_ns=400 threads4_ns=110 shootdown_ns=3000\n"
+                 threads1_ns=400 threads4_ns=110 shootdown_ns=3000 syscalls_serial_ns=900 \
+                 syscalls_parallel_ns=250\n"
             ),
             Some(SmpLine {
                 cpus: 4,
@@ -2435,6 +2450,8 @@ mod tests {
                 threads1_ns: 400,
                 threads4_ns: 110,
                 shootdown_ns: 3000,
+                syscalls_serial_ns: 900,
+                syscalls_parallel_ns: 250,
             })
         );
         assert_eq!(parse_smp_line("rhizo-smp cpus=4 serial_ns=1\n"), None);
