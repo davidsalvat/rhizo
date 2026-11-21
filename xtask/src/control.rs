@@ -355,48 +355,59 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
             }
         }
     }
-    if crate::cpython::root().join("usr/bin/python3").exists() {
+    let cpython = crate::cpython::root().join("usr/bin/python3").exists();
+    if cpython {
         samples.push(("chat.turn_us", chat_turns(&mut vm, vmm)?));
     }
-    vm.shutdown();
-    Ok(samples
+    let metric = |name: &str, unit: &str, mut values: Vec<f64>| {
+        let runs = values.len();
+        let (median, p90) = summarize(&mut values);
+        Metric {
+            name: name.into(),
+            guest: "rhizo".into(),
+            vmm: Some(vmm.id().into()),
+            unit: unit.into(),
+            median,
+            p90,
+            runs,
+        }
+    };
+    let mut metrics: Vec<Metric> = samples
         .into_iter()
-        .map(|(name, mut values)| {
-            let runs = values.len();
-            let (median, p90) = summarize(&mut values);
-            Metric {
-                name: name.into(),
-                guest: "rhizo".into(),
-                vmm: Some(vmm.id().into()),
-                unit: "us".into(),
-                median,
-                p90,
-                runs,
-            }
-        })
-        .collect())
+        .map(|(name, values)| metric(name, "us", values))
+        .collect();
+    let qemu = matches!(vmm, Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35);
+    if cpython && qemu {
+        for (name, unit, value) in snapshot_files(vm, vmm, kernel, opts)? {
+            metrics.push(metric(name, unit, vec![value]));
+        }
+    } else {
+        vm.shutdown();
+    }
+    Ok(metrics)
 }
 
-/// Turns timed per boot for `chat.turn_us`.
-const CHAT_TURNS: usize = 20;
-
-/// The Rhizo side of interactive turns (spec `benchmarks`, design D6 of
-/// `add-interactive-chat`): a chat agent against the host's fake model,
-/// each turn timed from the host's `input` request to the agent's last line
-/// read back, less the time the agent waited for the model.
-fn chat_turns(vm: &mut Vm, vmm: Vmm) -> Result<Vec<f64>> {
+/// The host's fake model as the guest on `vmm` reaches it.
+fn fake_model(vmm: Vmm) -> Result<String> {
     let bind = match vmm {
         Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
         other => crate::hostnet::host_address(other),
     };
     let port = crate::hostnet::llm_server(bind, 0)?;
-    let url = format!("http://{}:{port}", crate::hostnet::host_address(vmm));
+    Ok(format!(
+        "http://{}:{port}",
+        crate::hostnet::host_address(vmm)
+    ))
+}
+
+/// Starts the chat agent against the model at `url` and watches it.
+fn chat_agent(vm: &mut Vm, url: &str) -> Result<u32> {
     let (Body::Cell(cell), _) = done(
         vm,
         &Request::Run(Run {
             image: b"cpython".to_vec(),
             files_from: b"cpython-files".to_vec(),
-            argv: ["/usr/bin/python3", "/app/agent_chat.py", &url, "fake"]
+            argv: ["/usr/bin/python3", "/app/agent_chat.py", url, "fake"]
                 .iter()
                 .map(|a| a.as_bytes().to_vec())
                 .collect(),
@@ -408,23 +419,236 @@ fn chat_turns(vm: &mut Vm, vmm: Vmm) -> Result<Vec<f64>> {
         return Err("`run` returned no cell".into());
     };
     done(vm, &Request::Output(cell))?;
+    Ok(cell)
+}
+
+/// Sends chat cell `cell` a message and waits for its turn to end.
+fn chat_turn(vm: &mut Vm, cell: u32, partial: &mut Vec<u8>, turn: usize) -> Result<ChatTurn> {
+    done(
+        vm,
+        &Request::Input {
+            cell,
+            data: format!("Turn {turn}: what is the sum?\n").into_bytes(),
+        },
+    )?;
+    loop {
+        if let Some(turn) = ChatTurn::parse(&chat_line(vm, cell, partial)?) {
+            return Ok(turn);
+        }
+    }
+}
+
+/// How long the host's end of a snapshot transfer waits for the guest.
+const TRANSFER_WAIT: Duration = Duration::from_secs(60);
+
+/// How long a connection to the host's end of a transfer may take to send
+/// its token.
+const TOKEN_WAIT: Duration = Duration::from_secs(2);
+
+/// The host's end of a snapshot transfer (design D2 of `snapshots-on-disk`):
+/// a TCP listener the guest on a VMM reaches through its network card. It
+/// takes only a connection from the guest's address that first sends the
+/// request's token: another local process can neither read a file being
+/// loaded nor pass bytes off as a saved cell.
+#[derive(Debug)]
+pub struct Transfer {
+    listener: std::net::TcpListener,
+    /// Where the guest's connections come from, as the host sees them.
+    guest: std::net::IpAddr,
+    /// Where the guest reaches it, and the token.
+    pub host: rhizo_control::Host,
+}
+
+/// A random token, from the host's generator.
+fn token() -> Result<u64> {
+    let mut b = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| format!("no random token: {e}"))?;
+    Ok(u64::from_le_bytes(b))
+}
+
+impl Transfer {
+    /// A listener for the guest on `vmm`, where it reaches the host.
+    pub fn new(vmm: Vmm) -> Result<Self> {
+        let guest_sees = crate::hostnet::host_address(vmm);
+        let bind = match vmm {
+            Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
+            _ => guest_sees,
+        };
+        let listener = std::net::TcpListener::bind((bind, 0))
+            .and_then(|l| l.set_nonblocking(true).map(|()| l))
+            .map_err(|e| format!("cannot listen on {bind} for the transfer: {e}"))?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let ip: std::net::Ipv4Addr = guest_sees.parse().map_err(|e| format!("{e}"))?;
+        let guest = crate::hostnet::guest_address(vmm)
+            .parse()
+            .map_err(|e| format!("{e}"))?;
+        Ok(Self {
+            listener,
+            guest,
+            host: rhizo_control::Host {
+                ip: ip.octets(),
+                port,
+                token: token()?,
+            },
+        })
+    }
+
+    /// The guest's connection, within [`TRANSFER_WAIT`]: from its address
+    /// and with the token first; any other is closed unanswered.
+    fn accept(&self) -> Result<std::net::TcpStream> {
+        let deadline = Instant::now() + TRANSFER_WAIT;
+        loop {
+            match self.listener.accept() {
+                Ok((mut stream, peer)) => {
+                    let mut got = [0u8; 8];
+                    let admitted = peer.ip() == self.guest
+                        && stream.set_nonblocking(false).is_ok()
+                        && stream.set_read_timeout(Some(TOKEN_WAIT)).is_ok()
+                        && stream.read_exact(&mut got).is_ok()
+                        && u64::from_le_bytes(got) == self.host.token
+                        && stream.set_read_timeout(None).is_ok();
+                    if admitted {
+                        return Ok(stream);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() > deadline {
+                        return Err("the guest did not connect for the transfer".into());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(format!("transfer: {e}")),
+            }
+        }
+    }
+
+    /// Receives, in a thread, everything the guest sends until it closes.
+    pub fn receive(self) -> thread::JoinHandle<Result<Vec<u8>>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            self.accept()?
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("transfer: {e}"))?;
+            Ok(bytes)
+        })
+    }
+
+    /// Sends `bytes` to the guest, in a thread.
+    pub fn send(self, bytes: Vec<u8>) -> thread::JoinHandle<Result> {
+        thread::spawn(move || {
+            let mut stream = self.accept()?;
+            stream
+                .write_all(&bytes)
+                .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+                .map_err(|e| format!("transfer: {e}"))
+        })
+    }
+}
+
+/// The snapshot of suspended cell or template `cell`, and the round trip
+/// that brought it.
+fn save(vm: &mut Vm, vmm: Vmm, cell: u32) -> Result<(Vec<u8>, Duration)> {
+    let transfer = Transfer::new(vmm)?;
+    let host = transfer.host;
+    let received = transfer.receive();
+    let t0 = Instant::now();
+    done(vm, &Request::Save { cell, host })?;
+    let took = t0.elapsed();
+    let bytes = received.join().map_err(|_| "the transfer panicked")??;
+    Ok((bytes, took))
+}
+
+/// Loads `bytes` as a suspended cell or a template; the cell, and the round
+/// trip.
+fn load(vm: &mut Vm, vmm: Vmm, bytes: Vec<u8>, template: bool) -> Result<(u32, Duration)> {
+    let transfer = Transfer::new(vmm)?;
+    let (host, size) = (transfer.host, bytes.len() as u64);
+    let sent = transfer.send(bytes);
+    let (Body::Cell(cell), took) = done(
+        vm,
+        &Request::Load {
+            size,
+            template,
+            host,
+        },
+    )?
+    else {
+        return Err("`load` returned no cell".into());
+    };
+    sent.join().map_err(|_| "the transfer panicked")??;
+    Ok((cell, took))
+}
+
+/// Snapshot files (spec `benchmarks`, design D6 of `snapshots-on-disk`):
+/// the chat agent frozen into a template after one turn, saved, and loaded
+/// into a freshly booted VM, where a cell of it answers; then a cold start
+/// on that VM.
+fn snapshot_files(
+    mut vm: Vm,
+    vmm: Vmm,
+    kernel: &Path,
+    opts: RunOptions,
+) -> Result<Vec<(&'static str, &'static str, f64)>> {
+    let us = |d: Duration| d.as_secs_f64() * 1e6;
+    let url = fake_model(vmm)?;
+    let agent = chat_agent(&mut vm, &url)?;
     let mut partial = Vec::new();
-    while chat_line(vm, &mut partial)? != CHAT_READY {}
+    while chat_line(&mut vm, agent, &mut partial)? != CHAT_READY {}
+    chat_turn(&mut vm, agent, &mut partial, 0)?;
+    done(&mut vm, &Request::Freeze(agent))?;
+    let (file, saved) = save(&mut vm, vmm, agent)?;
+    vm.shutdown();
+    let mut vm = Vm::start(vmm, kernel, opts, Stdio::null())?;
+    let size = file.len();
+    let (template, loaded) = load(&mut vm, vmm, file, true)?;
+    let t0 = Instant::now();
+    let (Body::Cells(cells), _) = done(
+        &mut vm,
+        &Request::Fork {
+            cell: template,
+            n: 1,
+        },
+    )?
+    else {
+        return Err("`fork` returned no cells".into());
+    };
+    done(&mut vm, &Request::Output(cells[0]))?;
+    let mut partial = Vec::new();
+    chat_turn(&mut vm, cells[0], &mut partial, 1)?;
+    let loaded_answer = t0.elapsed();
+    let t0 = Instant::now();
+    let cold = chat_agent(&mut vm, &url)?;
+    let mut partial = Vec::new();
+    while chat_line(&mut vm, cold, &mut partial)? != CHAT_READY {}
+    chat_turn(&mut vm, cold, &mut partial, 0)?;
+    let cold_answer = t0.elapsed();
+    vm.shutdown();
+    Ok(vec![
+        ("snapshot.save_us", "us", us(saved)),
+        ("snapshot.load_us", "us", us(loaded)),
+        ("snapshot.file_bytes", "bytes", size as f64),
+        ("snapshot.loaded_answer_us", "us", us(loaded_answer)),
+        ("snapshot.cold_answer_us", "us", us(cold_answer)),
+    ])
+}
+
+/// Turns timed per boot for `chat.turn_us`.
+const CHAT_TURNS: usize = 20;
+
+/// The Rhizo side of interactive turns (spec `benchmarks`, design D6 of
+/// `add-interactive-chat`): a chat agent against the host's fake model,
+/// each turn timed from the host's `input` request to the agent's last line
+/// read back, less the time the agent waited for the model.
+fn chat_turns(vm: &mut Vm, vmm: Vmm) -> Result<Vec<f64>> {
+    let cell = chat_agent(vm, &fake_model(vmm)?)?;
+    let mut partial = Vec::new();
+    while chat_line(vm, cell, &mut partial)? != CHAT_READY {}
     let mut samples = Vec::new();
     for turn in 0..CHAT_TURNS {
         let t0 = Instant::now();
-        done(
-            vm,
-            &Request::Input {
-                cell,
-                data: format!("Turn {turn}: what is the sum?\n").into_bytes(),
-            },
-        )?;
-        let turn = loop {
-            if let Some(turn) = ChatTurn::parse(&chat_line(vm, &mut partial)?) {
-                break turn;
-            }
-        };
+        let turn = chat_turn(vm, cell, &mut partial, turn)?;
         let total = t0.elapsed().as_nanos() as u64;
         samples.push(total.saturating_sub(turn.model_ns) as f64 / 1e3);
     }
@@ -433,8 +657,8 @@ fn chat_turns(vm: &mut Vm, vmm: Vmm) -> Result<Vec<f64>> {
     Ok(samples)
 }
 
-/// The next line a watched cell prints.
-fn chat_line(vm: &mut Vm, partial: &mut Vec<u8>) -> Result<String> {
+/// The next line watched cell `cell` prints.
+fn chat_line(vm: &mut Vm, cell: u32, partial: &mut Vec<u8>) -> Result<String> {
     loop {
         if let Some(end) = partial.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = partial.drain(..=end).collect();
@@ -442,8 +666,8 @@ fn chat_line(vm: &mut Vm, partial: &mut Vec<u8>) -> Result<String> {
         }
         match vm.next(CHAT_STEP) {
             Some(Event::Frame(f)) => match Message::decode(&f) {
-                Ok(Message::Output { data, .. }) => partial.extend(data),
-                Ok(Message::Ended { state, .. }) => {
+                Ok(Message::Output { cell: c, data }) if c == cell => partial.extend(data),
+                Ok(Message::Ended { cell: c, state }) if c == cell => {
                     return Err(format!("the chat agent ended: {state:?}"));
                 }
                 _ => {}
@@ -601,7 +825,7 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         let stderr = String::from_utf8_lossy(&out.stderr);
         log.borrow_mut()
             .push_str(&format!("$ rhizo {}\n{stdout}{stderr}", words.join(" ")));
-        Ok((out.status.success(), stdout))
+        Ok((out.status.success(), format!("{stdout}{stderr}")))
     };
     let fail = |what: &str, expected: &str| {
         let console = std::fs::read_to_string(state.join("console.log")).unwrap_or_default();
@@ -632,17 +856,25 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         }
     };
     let kernel_path = kernel.to_string_lossy().into_owned();
-    ok(&[
-        "up",
-        "--vmm",
-        vmm.id(),
-        "--arch",
-        arch::current().id(),
-        "--accel",
-        accel.id(),
-        "--kernel",
-        &kernel_path,
-    ])?;
+    let up = || {
+        ok(&[
+            "up",
+            "--vmm",
+            vmm.id(),
+            "--arch",
+            arch::current().id(),
+            "--accel",
+            accel.id(),
+            "--kernel",
+            &kernel_path,
+        ])
+    };
+    up()?;
+    // Saved snapshots live beside the state, which `down` empties.
+    let files = state.with_extension("files");
+    let _ = std::fs::remove_dir_all(&files);
+    std::fs::create_dir_all(&files)
+        .map_err(|e| format!("cannot create {}: {e}", files.display()))?;
     let scenario = || -> Result {
         // A program the kernel holds, shown to its end.
         let out = ok(&["run", "hello"])?;
@@ -897,6 +1129,135 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             for other in children[1..].iter().chain([&parent]) {
                 ok(&["kill", other])?;
             }
+            // Snapshots as files (spec `snapshots`, change
+            // `snapshots-on-disk`): a conversation frozen into a template
+            // and another suspended, each after one turn, saved, then
+            // loaded into a fresh VM, where two cells of the template and
+            // the resumed cell each answer a turn right.
+            let template_file = files.join("agent-template.rhz");
+            let cell_file = files.join("agent-cell.rhz");
+            let path = |p: &Path| p.to_string_lossy().into_owned();
+            let one_turn = || -> Result<String> {
+                let mut c = chat(&["chat", "--llm", &llm, "--model", "fake"])?;
+                let started = c.until("[rhizo] ready").map_err(|e| fail(&e, "ready"))?;
+                let id = started
+                    .split_once("[rhizo] chat cell ")
+                    .and_then(|(_, rest)| rest.split_once(':'))
+                    .map(|(id, _)| id.to_string())
+                    .ok_or_else(|| fail("`rhizo chat` names its cell", "`chat cell N:`"))?;
+                let turn = step(&mut c, expected::CHAT_MESSAGES[0], "[rhizo] model ")?;
+                must(
+                    answers_right(&turn),
+                    "the agent answers before it is saved",
+                    "the sum its snippet printed",
+                )?;
+                step(&mut c, "/suspend", "[rhizo] suspended cell")?;
+                c.finish().map_err(|e| fail(&e, "an exit"))?;
+                Ok(id)
+            };
+            let template = one_turn()?;
+            ok(&["resume", &template])?;
+            ok(&["freeze", &template])?;
+            let out = ok(&["ps"])?;
+            must(
+                line_of(&out, &template, "template"),
+                "`rhizo ps` lists the frozen cell as a template",
+                "a line `N template ...`",
+            )?;
+            let out = ok(&["save", &template, &path(&template_file)])?;
+            must(
+                out.contains(&format!("saved {template} to ")) && out.contains("MiB/s"),
+                "`rhizo save` reports the file, its size and its rate",
+                "`saved N to FILE (... MiB) in ... (round trip ..., ... MiB/s)`",
+            )?;
+            let suspended = one_turn()?;
+            ok(&["save", &suspended, &path(&cell_file)])?;
+            refused(&["save", "99999", &path(&cell_file)])?;
+            ok(&["down"])?;
+            up()?;
+            let out = ok(&["load", &path(&template_file), "--template"])?;
+            let loaded = out
+                .split_once(" as template ")
+                .and_then(|(_, rest)| rest.split(' ').next())
+                .map(String::from)
+                .ok_or_else(|| {
+                    fail(
+                        "`rhizo load --template` names the template",
+                        "`as template N`",
+                    )
+                })?;
+            let out = ok(&["fork", &loaded, "2"])?;
+            let copies: Vec<String> = out
+                .split(['[', ']'])
+                .nth(1)
+                .unwrap_or_default()
+                .split(", ")
+                .filter(|c| !c.is_empty())
+                .map(String::from)
+                .collect();
+            must(
+                copies.len() == 2,
+                "`rhizo fork` makes two cells of a loaded template",
+                "`forked N into [A, B]`",
+            )?;
+            let answer = |id: &str, then: &str| -> Result {
+                let mut c = chat(&["chat", id])?;
+                let said = c
+                    .until("[rhizo] talking to cell")
+                    .map_err(|e| fail(&e, "talking"))?;
+                must(
+                    said.contains(then),
+                    &format!("`rhizo chat {id}` talks to the loaded cell"),
+                    then,
+                )?;
+                let turn = step(&mut c, expected::CHAT_MESSAGES[1], "[rhizo] model ")?;
+                must(
+                    answers_right(&turn),
+                    &format!("cell {id}, loaded after a reboot, answers right"),
+                    "the sum its snippet printed",
+                )?;
+                c.finish().map_err(|e| fail(&e, "an exit"))?;
+                Ok(())
+            };
+            for copy in &copies {
+                answer(copy, "")?;
+            }
+            let out = ok(&["load", &path(&cell_file)])?;
+            let resumed = out
+                .split_once(" as suspended cell ")
+                .and_then(|(_, rest)| rest.split(' ').next())
+                .map(String::from)
+                .ok_or_else(|| fail("`rhizo load` names the cell", "`as suspended cell N`"))?;
+            answer(&resumed, "resumed in")?;
+            // Damaged, cut and foreign files are refused, with the reason.
+            let bytes = std::fs::read(&cell_file).map_err(|e| e.to_string())?;
+            let mut damaged = bytes.clone();
+            damaged[bytes.len() / 2] ^= 0x40;
+            let mut foreign = bytes.clone();
+            let other: u16 = match arch::current() {
+                arch::Arch::X86_64 => 183,
+                arch::Arch::Aarch64 => 62,
+            };
+            foreign[12..14].copy_from_slice(&other.to_le_bytes());
+            for (name, contents, reason) in [
+                ("damaged", damaged, "checksum mismatch"),
+                (
+                    "cut",
+                    bytes[..bytes.len() / 2].to_vec(),
+                    "checksum mismatch",
+                ),
+                ("foreign", foreign, "taken on "),
+            ] {
+                let file = files.join(format!("{name}.rhz"));
+                std::fs::write(&file, contents).map_err(|e| e.to_string())?;
+                let (loaded, said) = rhizo_run(&["load", &path(&file)])?;
+                must(
+                    !loaded && said.contains(reason),
+                    &format!("a {name} file is refused with the reason"),
+                    reason,
+                )?;
+            }
+            ok(&["kill", &loaded])?;
         } else {
             report::text("[xtask] control: CPython not built, the agent part did not run");
         }
@@ -921,12 +1282,82 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         "[\"console.log\"]",
     )?;
     let _ = std::fs::remove_dir_all(&state);
+    let _ = std::fs::remove_dir_all(&files);
     Ok(())
+}
+
+/// Whether a turn of the chat agent against the fake model answers right:
+/// the sum of the squares below the number its snippet uses.
+fn answers_right(turn: &str) -> bool {
+    let number = |after: &str, end: char| {
+        turn.split_once(after)?
+            .1
+            .split(end)
+            .next()?
+            .parse::<u64>()
+            .ok()
+    };
+    match (number("range(", ')'), number("The snippet printed ", '.')) {
+        (Some(n), Some(sum)) => n > 0 && sum == (n - 1) * n * (2 * n - 1) / 6,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host's end of a transfer takes only the connection that sends
+    /// the request's token first (design D2 of `snapshots-on-disk`): an
+    /// impostor that connects first gets nothing of a file being loaded,
+    /// and its bytes are not taken for a saved cell.
+    #[test]
+    fn transfers_take_only_the_token_s_connection() {
+        use std::net::TcpStream;
+        let connect = |t: &rhizo_control::Host, token: u64, data: &[u8]| {
+            let mut s = TcpStream::connect(("127.0.0.1", t.port)).unwrap();
+            s.write_all(&token.to_le_bytes()).unwrap();
+            s.write_all(data).unwrap();
+            s
+        };
+        // Save: the impostor's bytes are dropped, the guest's kept.
+        let t = Transfer::new(Vmm::QemuMicrovm).unwrap();
+        let host = t.host;
+        let received = t.receive();
+        let mut impostor = connect(&host, host.token ^ 1, b"not the cell");
+        let mut rest = Vec::new();
+        let _ = impostor.read_to_end(&mut rest); // closed, or reset
+        assert!(rest.is_empty(), "closed unanswered");
+        drop(connect(&host, host.token, b"the cell"));
+        assert_eq!(received.join().unwrap().unwrap(), b"the cell");
+        // Load: the impostor reads nothing, the guest the whole file.
+        let t = Transfer::new(Vmm::QemuMicrovm).unwrap();
+        let host = t.host;
+        let sent = t.send(b"the file".to_vec());
+        let mut impostor = connect(&host, host.token.wrapping_add(1), b"");
+        let mut leaked = Vec::new();
+        let _ = impostor.read_to_end(&mut leaked);
+        assert!(leaked.is_empty(), "nothing for the impostor");
+        let mut guest = connect(&host, host.token, b"");
+        let mut file = Vec::new();
+        guest.read_to_end(&mut file).unwrap();
+        assert_eq!(file, b"the file");
+        sent.join().unwrap().unwrap();
+        // Tokens differ from one transfer to the next.
+        assert_ne!(
+            host.token,
+            Transfer::new(Vmm::QemuMicrovm).unwrap().host.token
+        );
+    }
+
+    #[test]
+    fn answers_are_checked() {
+        let turn = "  [tool] run_python\n      print(sum(i * i for i in range(641)))\n\
+                    The snippet printed 87586240.\n";
+        assert!(answers_right(turn));
+        assert!(!answers_right(&turn.replace("87586240", "87586241")));
+        assert!(!answers_right("The snippet printed 5."));
+    }
 
     #[test]
     fn the_chat_agent_s_turn_lines_are_read() {

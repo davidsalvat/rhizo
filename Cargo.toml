@@ -43,3 +43,9 @@ debug = false
 # too, which run under emulation (design D1 of add-crypto-random).
 [profile.dev.package.rhizo-core]
 opt-level = 3
+
+# A snapshot file's checksum is computed over tens of MiB at every export
+# and import, which in-kernel tests do at every step under emulation
+# (design D1 of snapshots-on-disk).
+[profile.dev.package.rhizo-snapshot]
+opt-level = 3

@@ -281,7 +281,7 @@ fn server(opts: &Options, vmm: Vmm, guest: &Guest, metrics: &mut Vec<Metric>) ->
         gdb: false,
         network: false,
         pci_card: false,
-        cpus: 1,
+        cpus: opts.cpus,
         memory_mib: SERVER_MEMORY_MIB,
         bench: Some(Bench::Server {
             cells: opts.cells,

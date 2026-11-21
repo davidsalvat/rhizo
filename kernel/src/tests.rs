@@ -102,6 +102,8 @@ macro_rules! suite {
             ktest_case!(a_woken_cell_runs_at_once),
             ktest_case!(a_wake_before_the_sleep_is_kept),
             ktest_case!(a_wait_on_descriptors_keeps_no_time),
+            ktest_case!(a_suspended_wait_on_descriptors_keeps_its_time_left),
+            ktest_case!(a_template_travels_as_bytes),
             ktest_case!(hostile_pointers_get_efault),
             ktest_case!(cell_cannot_write_kernel_memory),
             ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
@@ -156,6 +158,7 @@ macro_rules! suite {
             ktest_case!(kernel_globals_are_safe_across_cpus),
             ktest_case!(timed_waits_last_as_long_on_every_cpu),
             ktest_case!(idle_cpus_wake_only_for_deadlines),
+            ktest_case!(a_run_with_a_time_limit_ends_on_time),
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
@@ -1544,6 +1547,75 @@ fn a_wait_on_descriptors_keeps_no_time() {
         ended(&host, woken),
         (Ending::Exit(0), "ready\ntimed out\n".into())
     );
+}
+
+/// A cell suspended 1.5 s into a 2 s wait in `epoll_pwait`, then resumed
+/// from its exported snapshot, times out about 0.5 s after the resume, not
+/// 2 s (design D5 of `snapshots-on-disk`: its snapshot keeps the call's
+/// time left).
+fn a_suspended_wait_on_descriptors_keeps_its_time_left() {
+    const WAIT_NS: u64 = 2_000_000_000;
+    const BEFORE_NS: u64 = 1_500_000_000;
+    let mut host = Host::new();
+    let id = spawn(&mut host, "sleeper", &[b"2000", b"epoll"]);
+    while !(host.output(id) == Some(b"ready\n") && host.waits(id)) {
+        host.step();
+    }
+    let waited = crate::cell::now_ns();
+    while crate::cell::now_ns() - waited < BEFORE_NS {
+        crate::cell::timed_wait(BEFORE_NS / 10);
+    }
+    let bytes = host.suspend(id).expect("live").export(&DirectMap);
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let left: Vec<u64> = snapshot.deadlines(0).iter().map(|d| d.1).collect();
+    assert!(
+        matches!(left[..], [ns] if ns > 0 && ns <= WAIT_NS - BEFORE_NS),
+        "time left {left:?}"
+    );
+    let t0 = crate::cell::now_ns();
+    let id = host
+        .resume(snapshot, Resume::Lazy, true, false)
+        .expect("resume");
+    host.run(|h| h.finished(id).is_some());
+    let took = crate::cell::now_ns() - t0;
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "timed out\n".into()));
+    assert!(took < BEFORE_NS, "timed out {took} ns after the resume");
+}
+
+/// A template saved as bytes and loaded back (design D3 of
+/// `snapshots-on-disk`) is a template: never run, its copies start where
+/// it was frozen and keep no time (an hour in `epoll_pwait` times out at
+/// once), and every frame comes back once both templates are dropped.
+fn a_template_travels_as_bytes() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let id = spawn(&mut host, "sleeper", &[b"3600000", b"epoll"]);
+    while !(host.output(id) == Some(b"ready\n") && host.waits(id)) {
+        host.step();
+    }
+    assert!(host.freeze(id));
+    let bytes = host
+        .template_snapshot(id)
+        .expect("a template")
+        .export(&DirectMap);
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let loaded = host.load_template(snapshot).expect("fits");
+    assert!(host.drop_template(id));
+    assert!(host.template_snapshot(id).is_none(), "dropped");
+    let copies: Vec<u32> = (0..2)
+        .map(|_| host.spawn_from_template(loaded, true, false).expect("copy"))
+        .collect();
+    for _ in 0..6 {
+        if copies.iter().any(|&c| host.finished(c).is_none()) {
+            host.step();
+        }
+    }
+    for c in copies {
+        assert_eq!(ended(&host, c), (Ending::Exit(0), "timed out\n".into()));
+    }
+    assert!(host.drop_template(loaded));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
 }
 
 // --- H13: isolation under attack (spec `isolation`) -------------------------
@@ -3293,6 +3365,33 @@ fn idle_cpus_wake_only_for_deadlines() {
         "{cpus} CPUs left their waits {wakeups} times in 300 ms"
     );
     assert!(took < 400_000_000, "the 300 ms sleeper took {took} ns");
+}
+
+/// Cells that sleep an hour while every CPU idles: a run limited to 50 ms
+/// ends soon after its limit (500 ms leaves room for an emulated machine on
+/// a busy host, far below the hardware's longest wait, 2 s or more), again
+/// and again, whichever CPU's timer holds the hour (spec `scheduling`, change `fix-lost-wakeup-smp`). Before,
+/// on several CPUs the boot CPU waited for a wake-up only, when another
+/// CPU's timer held the hour, and the run outlived its limit by that hour.
+fn a_run_with_a_time_limit_ends_on_time() {
+    let now = || arch::timer::cycles_to_ns(arch::timer::Counter.cycles()).unwrap_or(0);
+    let mut host = Host::new();
+    let ids: Vec<u32> = (0..crate::smp::count())
+        .map(|_| spawn(&mut host, "sleeper", &[b"3600000"]))
+        .collect();
+    for round in 0..20 {
+        let t0 = now();
+        host.run_until(t0 + 50_000_000, |_| false);
+        let took = now() - t0;
+        assert!(
+            took < 500_000_000,
+            "round {round}: a run limited to 50 ms took {took} ns"
+        );
+    }
+    for id in ids {
+        assert!(host.asleep(id), "cell {id} still sleeps its hour");
+        assert!(host.kill(id));
+    }
 }
 
 /// Every CPU online, as a mask.

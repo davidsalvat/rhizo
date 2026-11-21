@@ -12,9 +12,11 @@
 //!          (version 8) the quotas: memory bytes, CPU ns, CPU ns used,
 //!          files (low 32 bits) and sockets (high 32 bits)  (8 x u64)
 //! threads  per thread, the current one first: tid, clear_tid, wait kind
-//!          (0 runnable, 1 sleep, 2 futex), futex address, futex bitset,
-//!          time left in ns (u64::MAX: no deadline), pc, sp, gpr[31], tls,
-//!          flags, fp[66]                          (107 x u64, 856 bytes each)
+//!          (0 runnable, 1 sleep, 2 futex, 3 descriptors), futex address,
+//!          futex bitset, time left in ns (u64::MAX: no deadline; version
+//!          10: for kinds 0 and 3, that of the call on descriptors the
+//!          thread makes again), pc, sp, gpr[31], tls, flags, fp[66]
+//!                                                 (107 x u64, 856 bytes each)
 //! ranges   per write-or-execute range: start u64, end u64 (version 9)
 //! records  per page: virt u64, data offset u64, size u8 (0 = 4 KiB,
 //!          1 = 2 MiB), permissions u8 (1 W, 2 USER, 4 NX, 8 write-or-
@@ -30,6 +32,10 @@
 //! ```
 //!
 //! Every value is little endian; records are sorted by address.
+//!
+//! The exported form, which leaves the kernel (a file, design D1 of
+//! `snapshots-on-disk`), is these bytes followed by their CRC-32C
+//! (4 bytes); [`Snapshot::from_bytes`] checks it after the header.
 //!
 //! In the kernel, a snapshot refers to the pages its cell shared with
 //! another (a template, a fork, a loaded image) instead of copying them
@@ -59,7 +65,7 @@ use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 const HEADER: usize = 24;
 const STATE: usize = 8 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.
@@ -72,6 +78,8 @@ const RANGE: usize = 16;
 const REFERS: usize = 18;
 /// "No deadline" in a thread's time left.
 const NO_DEADLINE: u64 = u64::MAX;
+/// Bytes of the checksum that ends the exported form.
+const CHECKSUM: usize = 4;
 
 /// Why bytes are not a snapshot this kernel can resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +92,8 @@ pub enum FormatError {
     Version(u32),
     /// Taken on another architecture.
     Machine { expected: u16, found: u16 },
+    /// The checksum does not match: the bytes were damaged or cut.
+    Checksum,
     /// Record `index` is malformed: size, permissions, address, alignment,
     /// order or data offset.
     BadPage { index: usize },
@@ -208,14 +218,16 @@ fn decode_flags(b: u8) -> Option<PageFlags> {
 }
 
 /// The words of thread `t` in the format; deadlines become time left after
-/// `now` (at least 1 ns, so a due deadline stays a deadline).
-fn thread_words(t: &Thread, now: u64) -> impl Iterator<Item = u64> + '_ {
+/// `now` (at least 1 ns, so a due deadline stays a deadline). `kept` is the
+/// deadline of the call on descriptors a runnable thread makes again.
+fn thread_words(t: &Thread, kept: Option<u64>, now: u64) -> impl Iterator<Item = u64> + '_ {
     let left = |until: u64| until.saturating_sub(now).max(1);
     let (kind, addr, bitset, time) = match t.wait {
         // A thread waiting on descriptors is back at its system-call
-        // instruction: it runs and makes its call again (design D3 of
-        // `add-sockets-and-poll`).
-        Wait::Ready | Wait::Io { .. } => (0, 0, 0, NO_DEADLINE),
+        // instruction: it makes its call again with the time it had left
+        // (design D3 of `add-sockets-and-poll`, D5 of `snapshots-on-disk`).
+        Wait::Ready => (0, 0, 0, kept.map_or(NO_DEADLINE, left)),
+        Wait::Io { until } => (3, 0, 0, until.map_or(NO_DEADLINE, left)),
         Wait::Sleep(until) => (1, 0, 0, left(until)),
         Wait::Futex {
             addr,
@@ -242,9 +254,10 @@ fn thread_words(t: &Thread, now: u64) -> impl Iterator<Item = u64> + '_ {
 
 impl Snapshot {
     /// Captures `cell` (not running), its write-or-execute ranges `wx` and
-    /// the user half of its page table; its threads' deadlines are kept as
-    /// time left after monotonic time `now`. `files` refers to its sockets
-    /// by index in `sockets`.
+    /// the user half of its page table; its threads' deadlines, and
+    /// `deadlines` (thread, deadline) of the calls on descriptors they make
+    /// again, are kept as time left after monotonic time `now`. `files`
+    /// refers to its sockets by index in `sockets`.
     ///
     /// Every table of the cell is made its own first, without copying a
     /// page ([`PageTable::unshare_tables`]); then a page other cells share
@@ -257,6 +270,7 @@ impl Snapshot {
     pub fn capture<F: EntryFormat>(
         machine: Machine,
         cell: &Cell,
+        deadlines: &[(u32, u64)],
         wx: &WxRanges,
         files: &Fs,
         sockets: &[Record],
@@ -313,7 +327,11 @@ impl Snapshot {
             cell.cpu_ns,
             cell.quota.files as u64 | (cell.quota.sockets as u64) << 32,
         ];
-        let words = cell.threads.iter().flat_map(|t| thread_words(t, now));
+        let kept = |tid| deadlines.iter().find(|d| d.0 == tid).map(|d| d.1);
+        let words = cell
+            .threads
+            .iter()
+            .flat_map(|t| thread_words(t, kept(t.tid), now));
         let ranges = ranges.iter().flat_map(|&(start, end)| [start, end]);
         for v in state.into_iter().chain(words).chain(ranges) {
             put(&v.to_le_bytes());
@@ -353,15 +371,28 @@ impl Snapshot {
 
     /// The snapshot as bytes that stand alone, to leave the kernel: the
     /// contents of the frames it refers to are written in their place
-    /// (design D2 of `add-shared-snapshots`), and its references dropped.
-    pub fn export(mut self, mem: &impl PhysicalMemory) -> Vec<u8> {
+    /// (design D2 of `add-shared-snapshots`), then the checksum (D1 of
+    /// `snapshots-on-disk`). The snapshot keeps its references.
+    pub fn export(&self, mem: &impl PhysicalMemory) -> Vec<u8> {
+        let mut b = self.standalone(mem);
+        let sum = crc32c(&b);
+        b.extend_from_slice(&sum.to_le_bytes());
+        b
+    }
+
+    /// The snapshot's bytes with its frames' contents in place.
+    fn standalone(&self, mem: &impl PhysicalMemory) -> Vec<u8> {
         if self.frames == 0 {
-            return core::mem::take(&mut self.bytes);
+            let mut b = Vec::with_capacity(self.bytes.len() + CHECKSUM);
+            b.extend_from_slice(&self.bytes);
+            return b;
         }
         let (records, pages) = (self.records(), self.page_count());
         let data_len: u64 = (0..pages).map(|i| self.page(i).size.bytes()).sum();
         let tail = &self.bytes[self.files_at()..];
-        let mut b = Vec::with_capacity(records + pages * RECORD + data_len as usize + tail.len());
+        let mut b = Vec::with_capacity(
+            records + pages * RECORD + data_len as usize + tail.len() + CHECKSUM,
+        );
         b.extend_from_slice(&self.bytes[..records]);
         let mut offset = 0u64;
         for i in 0..pages {
@@ -400,9 +431,10 @@ impl Snapshot {
             .sum()
     }
 
-    /// Validates `bytes` as a snapshot for `machine`.
-    pub fn from_bytes(bytes: Vec<u8>, machine: Machine) -> Result<Self, FormatError> {
-        if bytes.len() < HEADER + STATE {
+    /// Validates `bytes`, the exported form of a snapshot, for `machine`:
+    /// its header, then its checksum, then everything it holds.
+    pub fn from_bytes(mut bytes: Vec<u8>, machine: Machine) -> Result<Self, FormatError> {
+        if bytes.len() < HEADER + STATE + CHECKSUM {
             return Err(FormatError::Truncated);
         }
         if &bytes[..8] != MAGIC {
@@ -418,6 +450,16 @@ impl Snapshot {
                 expected: machine as u16,
                 found,
             });
+        }
+        let end = bytes.len() - CHECKSUM;
+        let mut sum = [0; CHECKSUM];
+        sum.copy_from_slice(&bytes[end..]);
+        if crc32c(&bytes[..end]) != u32::from_le_bytes(sum) {
+            return Err(FormatError::Checksum);
+        }
+        bytes.truncate(end);
+        if bytes.len() < HEADER + STATE {
+            return Err(FormatError::Truncated);
         }
         let mut snapshot = Self {
             bytes,
@@ -558,7 +600,7 @@ impl Snapshot {
             let w = |i: usize| u64_at(&self.bytes, HEADER + STATE + index * THREAD + i * 8);
             let (tid, kind, addr, bitset, time) = (w(0), w(2), w(3), w(4), w(5));
             let wait_ok = match kind {
-                0 => addr == 0 && bitset == 0 && time == NO_DEADLINE,
+                0 | 3 => addr == 0 && bitset == 0,
                 1 => addr == 0 && bitset == 0 && time != NO_DEADLINE,
                 2 => {
                     addr.is_multiple_of(4)
@@ -604,6 +646,25 @@ impl Snapshot {
         }
     }
 
+    /// Lowers the cell's quotas to at most `most`, field by field: a
+    /// snapshot from outside never gets more than the host gives a new cell
+    /// (spec `isolation`, design D4 of `snapshots-on-disk`).
+    pub fn cap_quota(&mut self, most: Quota) {
+        let q = self.state().quota;
+        let words = [
+            (4, q.memory.min(most.memory)),
+            (5, q.cpu_ns.min(most.cpu_ns)),
+            (
+                7,
+                q.files.min(most.files) as u64 | (q.sockets.min(most.sockets) as u64) << 32,
+            ),
+        ];
+        for (i, v) in words {
+            let at = HEADER + i * 8;
+            self.bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
     /// The cell's threads, their deadlines taken as time left after
     /// monotonic time `now`.
     pub fn threads(&self, now: u64) -> Threads {
@@ -617,6 +678,7 @@ impl Snapshot {
                     bitset: w(4) as u32,
                     until: until(w(5)),
                 },
+                3 => Wait::Io { until: until(w(5)) },
                 _ => Wait::Ready,
             };
             let mut regs = Registers {
@@ -643,6 +705,18 @@ impl Snapshot {
         // Validated by `from_bytes` or written by `capture`: never empty.
         Threads::from_parts((0..self.thread_count()).map(thread).collect(), next_tid)
             .unwrap_or_else(|| Threads::new(Thread::new(1, Registers::default())))
+    }
+
+    /// The deadlines of the calls on descriptors the threads make again
+    /// (thread, deadline), taken as time left after monotonic time `now`.
+    pub fn deadlines(&self, now: u64) -> Vec<(u32, u64)> {
+        (0..self.thread_count())
+            .filter_map(|index| {
+                let w = |i: usize| u64_at(&self.bytes, HEADER + STATE + index * THREAD + i * 8);
+                let calls = matches!(w(2), 0 | 3) && w(5) != NO_DEADLINE;
+                calls.then(|| (w(0) as u32, now.saturating_add(w(5))))
+            })
+            .collect()
     }
 
     /// Where the files section starts (its length).
@@ -814,6 +888,53 @@ impl Snapshot {
             cpu_ns: s.cpu_ns,
         }
     }
+}
+
+/// CRC-32C (Castagnoli, reflected, as iSCSI and ext4 use it) of `bytes`,
+/// eight bytes at a time ("slicing by 8"): a file of tens of MiB is checked
+/// twice per round trip, and test builds run under emulation.
+fn crc32c(bytes: &[u8]) -> u32 {
+    const TABLES: [[u32; 256]; 8] = {
+        let mut t = [[0u32; 256]; 8];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                c = if c & 1 != 0 {
+                    c >> 1 ^ 0x82f6_3b78
+                } else {
+                    c >> 1
+                };
+                bit += 1;
+            }
+            t[0][i] = c;
+            i += 1;
+        }
+        let mut k = 1;
+        while k < 8 {
+            let mut i = 0;
+            while i < 256 {
+                let c = t[k - 1][i];
+                t[k][i] = c >> 8 ^ t[0][(c & 0xff) as usize];
+                i += 1;
+            }
+            k += 1;
+        }
+        t
+    };
+    let byte = |c: u32, b: u8| TABLES[0][((c ^ b as u32) & 0xff) as usize] ^ c >> 8;
+    let mut words = bytes.chunks_exact(8);
+    let mut c = !0u32;
+    for w in &mut words {
+        let mut word = [0; 8];
+        word.copy_from_slice(w);
+        let v = u64::from_le_bytes(word) ^ c as u64;
+        c = (0..8).fold(0, |acc, k| {
+            acc ^ TABLES[7 - k][(v >> (8 * k) & 0xff) as usize]
+        });
+    }
+    !words.remainder().iter().fold(c, |c, &b| byte(c, b))
 }
 
 #[cfg(test)]

@@ -21,6 +21,14 @@ cell to be quiet (tests that compare outputs after a run, `Drop`). The
 server workload (`density.*`) makes its suspend, resume, fork and kill from
 `stop` now.
 
+`Host::run_until(at, stop)` (change `fix-lost-wakeup-smp`) passes `stop`
+the same `&mut Host`. The boot CPU, idle, waits no later than `at`, which
+`stop` may bring forward for its next call with `Host::ask_by(t)`: the
+server workload runs one `run_until` to its deadline and asks by its next
+operation, so operations stay on time while another CPU's timer holds the
+cells' deadlines, without ending the run (and stopping every CPU) at each
+operation.
+
 ## D2. Taking one cell: claim, interrupt only its CPUs, wait
 
 Every operation starts by taking its cell out of the scheduler under the

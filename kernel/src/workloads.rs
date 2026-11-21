@@ -262,6 +262,13 @@ fn server(console: &mut impl Console) {
                 .spawn(test_image("worker"), &argv, true, false)
                 .expect("spawn a worker");
             wait_for(&mut host, id, b"ready\n", 1);
+            // Frozen only once in its hour's sleep, which its forks find
+            // expired: a slice that ends between `ready` and the sleep would
+            // leave every fork to start that sleep (change
+            // `fix-lost-wakeup-smp`).
+            while !host.asleep(id) {
+                host.step();
+            }
             assert!(host.freeze(id));
             id
         })
@@ -310,14 +317,17 @@ fn server(console: &mut impl Console) {
     // their cells meanwhile (design D1 of `host-ops-per-cell`). It is asked
     // after every slice, so it does nothing more than read the clock until
     // an operation is due: every slice's cost is a queued cell's latency.
+    // The boot CPU, idle, wakes for the next operation and the deadline
+    // whichever CPU's timer holds the cells' deadlines (change
+    // `fix-lost-wakeup-smp`).
     loop {
-        host.run(|host| {
+        host.run_until(deadline, |host| {
             let now = now_ns();
             if now >= stop_ops {
                 if let Some(id) = child.take() {
                     host.kill(id);
                 }
-                return now >= deadline;
+                return false;
             }
             if now >= next_op {
                 next_op = now + HOST_PERIOD_NS;
@@ -348,6 +358,7 @@ fn server(console: &mut impl Console) {
                 }
                 host_cycles += Counter.cycles() - c0;
             }
+            host.ask_by(next_op);
             false
         });
         // The run ended by itself (no cell can run again) or at the deadline.
