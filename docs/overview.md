@@ -113,7 +113,8 @@ start it again.
 - **Isolation, reviewed.** Two adversarial reviews of the cell boundary and
   one of frames from the network, with hostile cells, property tests and a
   network fuzzer that keep the findings fixed. The kernel is unmapped while
-  cell code runs on x86_64 CPUs open to Meltdown (KPTI; E0PD on AArch64), and
+  cell code runs on x86_64 CPUs open to Meltdown (KPTI; E0PD on AArch64),
+  FP/SIMD state switches eagerly against LazyFP, and the kernel is
   kept out of cell memory (SMEP, SMAP, PAN). [`security.md`](security.md)
   lists the threat model, the findings and what is still open;
   [`audit-scope.md`](audit-scope.md) scopes an external audit, which has not

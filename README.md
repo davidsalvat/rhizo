@@ -315,14 +315,14 @@ map and [`openspec/specs/`](openspec/specs/) how each part behaves.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/security-dark.svg">
-    <img src="docs/img/security.svg" alt="Who is trusted. Untrusted: hostile cells running any code and any system call, snapshot files anyone may write, and network frames from any host on the link; all reach the Rhizo kernel, which checks every input at the boundary with its own address space per cell, quotas on memory, CPU and sockets, KPTI and E0PD against Meltdown, SMEP, SMAP and PAN to keep the kernel out of cell memory, write-or-execute pages even for JIT code, and zeroed memory. Trusted: the host's control requests, still decoded defensively, and the VMM, firmware and hardware, out of scope. Assurance: three internal reviews with 23 findings fixed or worked around, fuzzers and hostile cells that keep them fixed, and an external audit that is scoped but not done yet." width="800">
+    <img src="docs/img/security.svg" alt="Everything that reaches the Rhizo kernel from cells, snapshot files and the network is untrusted: hostile cells, hostile snapshot files and hostile network frames. The host's control requests are trusted but decoded defensively; the VMM and hardware are trusted. The kernel defends with privilege levels and own address spaces, quotas, KPTI, E0PD, eager FP/SIMD switching, SMEP, SMAP and PAN, write-or-execute pages, and zeroed memory. Three internal reviews and the fixes since then dealt with 26 findings and fuzzers keep them fixed; an external audit is scoped but not done yet." width="800">
   </picture>
 </p>
 
 Rhizo's isolation has been reviewed three times from the inside, and the
-reviews' 23 findings are fixed (one worked around), with fuzzers and hostile
-cells in CI that keep them fixed. Timing side channels other than Meltdown
-are not covered yet. **No external audit has been done**: its scope, ranked
+reviews and the work since have dealt with 26 findings (25 fixed, one worked
+around), with fuzzers and hostile cells in CI that keep them fixed. Timing
+side channels other than Meltdown and LazyFP are not covered yet. **No external audit has been done**: its scope, ranked
 by risk and estimated at about 39 auditor-days, is ready in
 [`docs/audit-scope.md`](docs/audit-scope.md). The threat model, every finding
 and what is still open: [`docs/security.md`](docs/security.md).

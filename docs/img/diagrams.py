@@ -625,9 +625,9 @@ def security(t):
             "network is untrusted: hostile cells, hostile snapshot files and hostile "
             "network frames. The host's control requests are trusted but decoded "
             "defensively; the VMM and hardware are trusted. The kernel defends with "
-            "privilege levels and own address spaces, quotas, KPTI and E0PD, SMEP, SMAP "
+            "privilege levels and own address spaces, quotas, KPTI, E0PD, eager FP/SIMD switching, SMEP, SMAP "
             "and PAN, write-or-execute pages, and zeroed memory. Three internal reviews "
-            "fixed or worked around 23 findings and fuzzers keep them fixed; an external audit is scoped "
+            "and the fixes since then dealt with 26 findings and fuzzers keep them fixed; an external audit is scoped "
             "but not done yet.")
     heading(s, "Who is trusted, and what stands in the way")
     # Untrusted inputs.
@@ -647,7 +647,7 @@ def security(t):
     s.text(76, 226, "Rhizo kernel: every input checked at the boundary", 16, weight=700)
     chips = [("Own address space", "per cell, lower half only"),
              ("Quotas", "memory, CPU, sockets"),
-             ("KPTI · E0PD", "Meltdown closed"),
+             ("KPTI · E0PD · eager FP", "Meltdown, LazyFP closed"),
              ("SMEP · SMAP · PAN", "kernel stays out"),
              ("Write or execute", "never both, JIT too"),
              ("Zeroed memory", "nothing leaks on reuse")]
@@ -668,7 +668,7 @@ def security(t):
     s.text(426, 462, "trusted, out of scope", 12.5, fill=t["muted"])
     # Assurance.
     s.line(24, 496, 776, 496, color=t["boxline"], arrow=False, sw=1)
-    items = [("check", "3 internal reviews", "22 findings fixed, 1 worked around", t["accent"]),
+    items = [("check", "26 findings so far", "25 fixed, 1 worked around", t["accent"]),
              ("check", "Fuzzers, hostile cells", "calls, snapshots, frames", t["accent"]),
              ("eye", "External audit", "scoped, not done yet", t["warn"])]
     for i, (ic, a, b, c) in enumerate(items):

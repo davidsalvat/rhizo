@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 586" width="800" height="586" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Security: trust boundaries and defences</title>
-<desc>Everything that reaches the Rhizo kernel from cells, snapshot files and the network is untrusted: hostile cells, hostile snapshot files and hostile network frames. The host's control requests are trusted but decoded defensively; the VMM and hardware are trusted. The kernel defends with privilege levels and own address spaces, quotas, KPTI and E0PD, SMEP, SMAP and PAN, write-or-execute pages, and zeroed memory. Three internal reviews fixed or worked around 23 findings and fuzzers keep them fixed; an external audit is scoped but not done yet.</desc>
+<desc>Everything that reaches the Rhizo kernel from cells, snapshot files and the network is untrusted: hostile cells, hostile snapshot files and hostile network frames. The host's control requests are trusted but decoded defensively; the VMM and hardware are trusted. The kernel defends with privilege levels and own address spaces, quotas, KPTI, E0PD, eager FP/SIMD switching, SMEP, SMAP and PAN, write-or-execute pages, and zeroed memory. Three internal reviews and the fixes since then dealt with 26 findings and fuzzers keep them fixed; an external audit is scoped but not done yet.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#63d4a0"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#79b8ff"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#f2c14e"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff8a80"/></marker><marker id="c" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#63d4a0"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="585" rx="12" fill="#0d1117" stroke="#30363d"/>
 <text x="24" y="40" font-size="20" fill="#e6edf3" font-weight="700">Who is trusted, and what stands in the way</text>
@@ -34,8 +34,8 @@
 <text x="330" y="292" font-size="12.5" fill="#9ba7b3">memory, CPU, sockets</text>
 <rect x="532" y="246" width="228" height="62" rx="10" fill="#0d1117" stroke="#63d4a0" stroke-width="1.2"/>
 <g transform="translate(545 268) scale(0.75)" fill="none" stroke="#63d4a0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
-<text x="574" y="273" font-size="14" fill="#e6edf3" font-weight="700">KPTI · E0PD</text>
-<text x="574" y="292" font-size="12.5" fill="#9ba7b3">Meltdown closed</text>
+<text x="574" y="273" font-size="14" fill="#e6edf3" font-weight="700">KPTI · E0PD · eager FP</text>
+<text x="574" y="292" font-size="12.5" fill="#9ba7b3">Meltdown, LazyFP closed</text>
 <rect x="44" y="316" width="228" height="62" rx="10" fill="#0d1117" stroke="#63d4a0" stroke-width="1.2"/>
 <g transform="translate(57 338) scale(0.75)" fill="none" stroke="#63d4a0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
 <text x="86" y="343" font-size="14" fill="#e6edf3" font-weight="700">SMEP · SMAP · PAN</text>
@@ -57,8 +57,8 @@
 <text x="426" y="462" font-size="12.5" fill="#9ba7b3">trusted, out of scope</text>
 <line x1="24" y1="496" x2="776" y2="496" stroke="#6e7681" stroke-width="1"/>
 <g transform="translate(30 512) scale(0.833333)" fill="none" stroke="#63d4a0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
-<text x="60" y="519" font-size="14" fill="#e6edf3" font-weight="700">3 internal reviews</text>
-<text x="60" y="538" font-size="12.5" fill="#9ba7b3">22 findings fixed, 1 worked around</text>
+<text x="60" y="519" font-size="14" fill="#e6edf3" font-weight="700">26 findings so far</text>
+<text x="60" y="538" font-size="12.5" fill="#9ba7b3">25 fixed, 1 worked around</text>
 <g transform="translate(284 512) scale(0.833333)" fill="none" stroke="#63d4a0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
 <text x="314" y="519" font-size="14" fill="#e6edf3" font-weight="700">Fuzzers, hostile cells</text>
 <text x="314" y="538" font-size="12.5" fill="#9ba7b3">calls, snapshots, frames</text>
