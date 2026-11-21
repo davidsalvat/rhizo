@@ -35,8 +35,11 @@ Alternative: an owner per frame, credited to whoever took it. Rejected
 for now: 4 bytes per frame of global state for a precision the bound above
 already gives.
 
-File data stays out: it has its own bound per cell (64 MiB of data, 4096
-names), and counting it would need hooks in `rhizo-fs` on every free. A
+File data stays out: it has its own bound per cell (`rhizo_fs::DATA_MAX`
+of data, 4096 names), and counting it would need hooks in `rhizo-fs` on
+every free. A cell's memory is therefore bounded by its quota plus
+`DATA_MAX`; a host that needs a tighter bound waits for file data to be
+metered (its own change). A
 hole or a page past the end of a mapped file is not file data: it is the
 cell's alone, never kept by the page cache, so it comes from the cell's
 frames and is counted (finding S20).

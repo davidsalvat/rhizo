@@ -35,7 +35,7 @@ host has no way to say how much one cell may use.
 ### Out of scope
 
 Cells setting their own limits (`setrlimit` stays a no-op), file data
-(already bounded per cell: 64 MiB of data and 4096 names), kernel heap
+(already bounded per cell: `DATA_MAX` of data and 4096 names), kernel heap
 used for a cell's threads and sockets (bounded by the counts), and
 hierarchies of quotas shared by several cells.
 

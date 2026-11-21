@@ -147,8 +147,9 @@ and at most 256 sockets (S21).
   the quota, `mmap` and `brk` answer `ENOMEM`; a fault that needs a frame
   kills the cell, as when memory runs out. Frames given back are credited
   (never below zero), so a forked cell holds at most its quota plus what it
-  inherited (counted to its parent). File data (64 MiB) and names (4096)
-  keep their own bounds per cell.
+  inherited (counted to its parent). File data (`rhizo_fs::DATA_MAX`) and
+  names (4096) keep their own bounds per cell, outside the memory quota: a
+  cell may hold that much file data above its quota.
 - **CPU time**, over the cell's life and its system calls included:
   counted per slice; past the quota the cell ends (`Ending::OutOfCpu`,
   `cell N killed: CPU time quota used up`) at the end of that slice, at
@@ -537,7 +538,7 @@ These are not fixed by this change; each needs its own design.
 
 | # | Severity | Item |
 |---|---|---|
-| O1 | — | **Closed by `add-cell-quotas`** (see *Quotas*). What remains: a cell without a quota may still take all memory down to the reserve, as before; file data and names are bounded per cell but not by the memory quota; a cell may hold its quota plus what it inherited from a fork. |
+| O1 | — | **Closed by `add-cell-quotas`** (see *Quotas*). What remains: a cell without a quota may still take all memory down to the reserve, as before; file data (up to `DATA_MAX`) and names are bounded per cell but not by the memory quota, so a cell holds at most its memory quota plus `DATA_MAX` of file data; a cell may hold its quota plus what it inherited from a fork. |
 | O2 | Medium | **Kernel time proportional to what a cell holds.** A call runs without preemption: reading or writing up to 64 MiB of file data, `getrandom` or `write` over gigabytes of the cell's own memory, or mapping and zeroing a large region delays every other cell for as long as it takes. Bounded by the cell's own memory, not by a time slice. |
 | O3 | High on affected CPUs | **Side channels are out of scope.** Caches, branch predictors, speculation and timing are not reviewed. On x86_64 the kernel half is mapped (supervisor only) in every cell's table, with no KPTI: on CPUs vulnerable to Meltdown a cell could read kernel memory. Cells see a nanosecond clock. |
 | O4 | — | **Closed by `add-crypto-random`** (see *Randomness*). What remains: a CPU without a hardware random source (an AArch64 host without FEAT_RNG under KVM) falls back to the cycle counter, and the boot says `getrandom is predictable`; there is no virtio-rng driver yet. |
