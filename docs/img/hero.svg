@@ -28,7 +28,7 @@
 <circle cx="398" cy="182" r="16" fill="#8a6100" stroke="none" stroke-width="1.5"/>
 <g transform="translate(388.8 172.8) scale(0.766667)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7z" fill="#ffffff" stroke="none"/></g>
 <text x="334" y="132" font-size="15" fill="#0e2a20" font-weight="700" text-anchor="middle">Starts in an instant</text>
-<text x="334" y="151" font-size="13" fill="#4b5c55" text-anchor="middle">microseconds, not seconds</text>
+<text x="334" y="151" font-size="13" fill="#4b5c55" text-anchor="middle">milliseconds, not seconds</text>
 <path d="M402 230 C 480 230, 520 127, 556 127 H 592" fill="none" stroke="#8a6100" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#o)"/>
 <path d="M402 230 C 480 230, 520 230, 556 230 H 592" fill="none" stroke="#1f9d6b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#g)"/>
 <path d="M402 230 C 480 230, 520 333, 556 333 H 592" fill="none" stroke="#1f9d6b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#g)"/>

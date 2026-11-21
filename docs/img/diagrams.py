@@ -145,7 +145,7 @@ def hero(t):
     s.text(334, 266, "Your agent", 15, weight=700, anchor="middle")
     badge(s, 398, 182, 16, "bolt", t["gold"], t["bg"])
     s.text(334, 132, "Starts in an instant", 15, weight=700, anchor="middle")
-    s.text(334, 151, "microseconds, not seconds", 13, fill=t["muted"], anchor="middle")
+    s.text(334, 151, "milliseconds, not seconds", 13, fill=t["muted"], anchor="middle")
 
     # Fork into branches; keep the best.
     ys = [96, 199, 302]
@@ -759,7 +759,7 @@ def modules(t):
             "python plus numpy, plus pandas; node). An agent asks to add numpy; the kernel "
             "checks the whitelist, budget and egress, asks the parent for sensitive "
             "modules, and forks a child from the warm template, reached over a channel. "
-            "Adding a module never grants network access.")
+            "Adding a module, even the requests library, never grants network access.")
     heading(s, "Next: abilities as child cells, from a signed catalogue")
     tagline(s, 776, 20, "designed, not built yet")
     s.text(24, 104, "Building a module", 14, weight=700, fill=t["muted"])
@@ -814,7 +814,7 @@ def modules(t):
     s.path("M590 451 H 455 V 370", color=t["gold"], dash=True, arrow=False, sw=2.2)
     s.text(466, 440, "channel", 12, fill=t["gold"], weight=700)
     s.path("M194 357 C 280 357, 300 470, 400 470 H 590", dash=True)
-    s.text(250, 520, "Adding requests grants no internet:", 12.5, fill=t["muted"])
+    s.text(250, 520, "Adding the \u201crequests\u201d library grants no internet:", 12.5, fill=t["muted"])
     s.text(250, 538, "a module never gets more egress than its agent.", 12.5, fill=t["muted"])
     return s
 

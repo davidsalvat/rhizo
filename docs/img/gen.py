@@ -426,7 +426,7 @@ STAGES = [
      [True], "next", (f"{BOOT_MS:.0f} ms", "to boot (Firecracker)")),
     ("The cell", "Runs ordinary Linux programs, each sealed off from the rest",
      [True], "next", (f"{IDLE_KB:.0f} KB", "per idle cell")),
-    ("Native operations", "Pause, resume or copy a running agent in microseconds",
+    ("Native operations", "Pause, resume or copy a running cell in microseconds",
      [True], "next", (us(FORK), "to fork a 50 MiB agent")),
     ("Real programs", "Threads, networking, Python and every processor core",
      [THREADS, LOOPBACK, CPY_WARM, SCALING], "next",

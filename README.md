@@ -28,8 +28,9 @@ work that it cannot break out of. Today that room is borrowed from tools built
 for something else, so it is slow to open, heavy to keep and costly to copy.
 
 **Rhizo is an operating system kernel built for agents from the ground up.**
-Each agent lives in a **cell**. A cell opens in microseconds, sleeps for
-almost nothing while the agent waits for its model, can be saved and picked
+Each agent lives in a **cell**. A cell starts in microseconds and a real
+agent forked from a warm template answers within a few milliseconds; it sleeps
+for almost nothing while the agent waits for its model, can be saved and picked
 up later exactly where it was, and can be cloned in an instant so ten copies
 try ten ideas at once and you keep the best one. One day you will download
 ready-made agents in two clicks and run them with your own model, on your
@@ -332,7 +333,7 @@ and what is still open: [`docs/security.md`](docs/security.md).
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in nine stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running agent in microseconds), real programs (threads, networking, Python, every core), proven with numbers (fair comparisons with Linux, VMs and sandboxes, and reviews), a real agent (calls a model, explores branches, pauses between turns) and scale and compatibility (ten thousand busy cells, Node.js, numpy from PyPI). Designed: families and modules. Vision: the product, ready agents in two clicks with your own model." width="800">
+    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in nine stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running cell in microseconds), real programs (threads, networking, Python, every core), proven with numbers (fair comparisons with Linux, VMs and sandboxes, and reviews), a real agent (calls a model, explores branches, pauses between turns) and scale and compatibility (ten thousand busy cells, Node.js, numpy from PyPI). Designed: families and modules. Vision: the product, ready agents in two clicks with your own model." width="800">
   </picture>
 </p>
 
@@ -351,7 +352,7 @@ catalogue.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/modules-dark.svg">
-    <img src="docs/img/modules.svg" alt="Designed, not built yet: modular cells. Building a module: packages from PyPI over verified TLS go through rhizo proxy, which serves only lockfile files with their SHA-256 checked, to a builder cell in its own domain that builds the same tree twice; the operator reviews and signs it with minisign (Ed25519) into a catalogue of signed snapshot files and manifests. Using a module: templates form a tree that shares memory (python, python with numpy, plus pandas, and node). A small static chat agent asks to add numpy; the kernel checks the whitelist and the budget, asks the parent for sensitive modules and never grants more egress, then forks a numpy child cell from the template, reached over a channel. Adding requests grants no internet." width="800">
+    <img src="docs/img/modules.svg" alt="Designed, not built yet: modular cells. Building a module: packages from PyPI over verified TLS go through rhizo proxy, which serves only lockfile files with their SHA-256 checked, to a builder cell in its own domain that builds the same tree twice; the operator reviews and signs it with minisign (Ed25519) into a catalogue of signed snapshot files and manifests. Using a module: templates form a tree that shares memory (python, python with numpy, plus pandas, and node). A small static chat agent asks to add numpy; the kernel checks the whitelist and the budget, asks the parent for sensitive modules and never grants more egress, then forks a numpy child cell from the template, reached over a channel. Adding the requests library grants no internet access." width="800">
   </picture>
 </p>
 
