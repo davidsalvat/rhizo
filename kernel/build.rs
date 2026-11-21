@@ -42,6 +42,12 @@ fn main() {
 /// spawning them fails with `NotElf`, which the in-kernel tests report.
 fn embed_cells() {
     println!("cargo:rerun-if-env-changed=RHIZO_CELLS_DIR");
+    // An optional cell that is not built is not watched (cargo would run
+    // this script again on every build for a missing file): `xtask` builds
+    // it only once its source is given, which these variables say (change
+    // `fix-cli-nits`).
+    println!("cargo:rerun-if-env-changed=RHIZO_MICROPYTHON_SRC");
+    println!("cargo:rerun-if-env-changed=RHIZO_CPYTHON_SRC");
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
     // Rust cells (cells/src/bin/*.rs) and C cells (cells/c/*.c).
     let mut names: Vec<String> = Vec::new();
@@ -84,9 +90,11 @@ fn embed_cells() {
             Some(_) if TEST_ONLY.contains(&name.as_str()) && !ktest => Vec::new(),
             Some(dir) => {
                 let path = Path::new(dir).join(name);
-                println!("cargo:rerun-if-changed={}", path.display());
                 match std::fs::read(&path) {
-                    Ok(data) => data,
+                    Ok(data) => {
+                        println!("cargo:rerun-if-changed={}", path.display());
+                        data
+                    }
                     Err(_) if OPTIONAL.contains(&name.as_str()) => Vec::new(),
                     Err(e) => panic!("{}: {e}", path.display()),
                 }
