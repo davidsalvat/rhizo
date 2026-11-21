@@ -18,10 +18,26 @@ pub(super) const ALL: &[TestCase] = &[
 /// Memory that is not leaked: frames free in the allocator plus frames the
 /// kernel heap holds (it keeps some small-object pages for reuse), and
 /// the heap's live allocations; measured with no image kept loaded (spec
-/// `cells`, image cache: those frames are the kernel's until dropped).
+/// `cells`, image cache: those frames are the kernel's until dropped) and
+/// no connection through the card still closing ([`settle_wire`]).
 pub(super) fn memory_balance() -> (u64, usize) {
+    settle_wire();
     crate::cell::drop_images();
     (free_or_in_heap(), crate::heap::stats().live)
+}
+
+/// Waits until every connection through the network card has finished
+/// closing (`smoltcp` keeps one until its peer acknowledges the close),
+/// polling the card for at most 10 seconds: what an earlier test left
+/// closing is not counted against a later one (change
+/// `shard-kernel-tests`), and a connection that never closes fails.
+pub(super) fn settle_wire() {
+    let mut host = Host::new();
+    let end = crate::cell::now_ns() + 10_000_000_000;
+    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
+        host.wire_address(0);
+    }
+    assert!(!crate::cell::wire_busy(), "the card's connections closed");
 }
 
 /// Frames free in the allocator plus the frames the kernel heap holds: the
