@@ -10,7 +10,22 @@ pub static ALL: &[TestCase] = &[
     ktest_case!(user_guards_are_on),
     ktest_case!(a_cell_reads_the_counter),
     ktest_case!(the_timer_is_never_periodic_with_a_short_count),
+    ktest_case!(the_clock_runs_at_the_apic_timer_s_rate),
 ];
+
+/// The TSC's conversion to time, however it was found (KVM's clock, CPUID,
+/// the PIT or 10 ms of the APIC timer), agrees within 0.05% with 50 ms of
+/// the local APIC timer, which counts at 1 GHz on KVM and QEMU (change
+/// `fix-tcg-clock-rate`): under emulation the calibration made cells'
+/// clocks 0.3 to 1.5% slow, up to a second per 65 s model call.
+fn the_clock_runs_at_the_apic_timer_s_rate() {
+    let hz = super::irq::tsc_hz_over(50_000_000).expect("the APIC timer runs");
+    let second = super::timer::cycles_to_ns(hz).expect("the TSC frequency is known");
+    assert!(
+        second.abs_diff(1_000_000_000) < 500_000,
+        "one second of the APIC timer reads as {second} ns ({hz} TSC cycles)"
+    );
+}
 
 /// With KPTI (on for every in-kernel test), the kernel half of a cell's
 /// tables maps the entry code and nothing of the kernel's memory: not the

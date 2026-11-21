@@ -72,24 +72,53 @@ fn read(reg: u32) -> u32 {
 /// QEMU): the last resort of the TSC calibration, for QEMU without KVM or
 /// a PIT.
 pub fn tsc_hz() -> Option<u64> {
+    tsc_hz_over(10_000_000)
+}
+
+/// TSC frequency measured against `counts` of the APIC timer (one count per
+/// nanosecond), then the periodic tick restarted. Each end of the window
+/// is the tightest of several readings of the timer between two of the TSC
+/// (design D1 of `fix-tcg-clock-rate`): under emulation, code run for the
+/// first time is translated between two reads, which put the measured
+/// frequency 0.3 to 1.5% too high and made cells' clocks that much slow.
+pub fn tsc_hz_over(counts: u32) -> Option<u64> {
     if !available() {
         return None;
     }
-    use rhizo_hal::CycleCounter;
-    let tsc = super::timer::Counter;
     write(DIVIDE, 0b1011); // divide by 1
     write(LVT_TIMER, (1 << 16) | TIMER_VECTOR as u32); // masked
     write(INITIAL_COUNT, u32::MAX);
-    let (t0, c0) = (tsc.cycles(), read(CURRENT_COUNT));
+    counter_reading(); // warm-up: translates the reading code under emulation
+    let (t0, c0) = counter_reading();
     let mut c1 = c0;
-    while c0 - c1 < 10_000_000 && c1 != 0 {
+    while c0 - c1 < counts && c1 != 0 {
         c1 = read(CURRENT_COUNT);
     }
-    let t1 = tsc.cycles();
+    let (t1, c1) = counter_reading();
     write(DIVIDE, 0b0011);
     tick();
-    let counts = (c0 - c1) as u64;
-    (counts > 0).then(|| ((t1 - t0) as u128 * 1_000_000_000 / counts as u128) as u64)
+    let elapsed = c0.saturating_sub(c1) as u64;
+    (elapsed > 0).then(|| ((t1 - t0) as u128 * 1_000_000_000 / elapsed as u128) as u64)
+}
+
+/// The APIC timer's current count and the TSC at that moment: of
+/// `READINGS` reads of the count, the one with the fewest TSC cycles
+/// between the TSC reads around it, timed at their midpoint.
+#[inline(never)]
+fn counter_reading() -> (u64, u32) {
+    use rhizo_hal::CycleCounter;
+    const READINGS: usize = 8;
+    let tsc = super::timer::Counter;
+    let mut best = (u64::MAX, 0, 0);
+    for _ in 0..READINGS {
+        let before = tsc.cycles();
+        let count = read(CURRENT_COUNT);
+        let width = tsc.cycles() - before;
+        if width < best.0 {
+            best = (width, before + width / 2, count);
+        }
+    }
+    (best.1, best.2)
 }
 
 /// (Re)starts the periodic tick.

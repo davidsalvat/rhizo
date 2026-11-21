@@ -176,7 +176,7 @@ SHALL close the agent's input. With input that is not a terminal, each
 line SHALL be echoed instead of a prompt.
 
 #### Scenario: A conversation with branches, suspended and resumed
-- **WHEN** the `control` test step types into `rhizo chat` against the fake model two messages, `/fork 2`, `/branches`, `/switch` to a branch, a message and `/suspend`, then runs `rhizo chat` on that branch, types a message and closes its input
+- **WHEN** the `control` test step types into `rhizo chat` against the fake model two messages, `/fork 2`, `/branches`, `/switch` to a branch, a message and `/suspend`, then runs `rhizo chat` on that branch, types a message, then two messages at once, and closes its input
 - **THEN** `/branches` lists three running cells, `rhizo chat N` says it resumed the branch, every turn prints its model and Rhizo times, the agent exits with 0, and the conversation equals the recorded transcript on x86_64 and AArch64
 
 ### Requirement: Chat commands
@@ -216,3 +216,12 @@ left there but that log.
 #### Scenario: Down
 - **WHEN** the `control` test step runs `rhizo down`
 - **THEN** the state directory holds only `console.log`
+
+### Requirement: Lines typed during a turn
+A line typed while `rhizo chat` works on another SHALL wait for it to end,
+and the chat SHALL say at once that it is queued. A prompt SHALL be shown
+once per line, never in front of a line already typed.
+
+#### Scenario: Two lines typed at once
+- **WHEN** two messages are typed at once into `rhizo chat`
+- **THEN** it prints `[rhizo] queued for the next turn` once, answers the first message, then the second

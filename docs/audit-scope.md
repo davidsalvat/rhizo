@@ -10,7 +10,12 @@ audit to answer. The internal reviews it builds on are in
 
 It describes `main` as of commit `ad7c3ee` (November 2026). Line counts
 were taken with `wc -l` on that commit; "code" excludes test modules and
-test files, "tests" counts them.
+test files, "tests" counts them. Changes merged since then that touch the
+scope are noted where they apply: per-cell quotas (`add-cell-quotas`,
+closing S20, S21 and O1), KPTI and E0PD (`add-kpti`, closing the
+Meltdown part of O3), snapshots that refer to shared frames
+(`add-shared-snapshots`) and the network review (`fuzz-wire-packets`,
+S22, S23).
 
 ## 1. System overview
 
@@ -90,26 +95,25 @@ the fuzzer is not coverage-guided and runs on the host.
 | Kernel integrity | No cell, snapshot, image or packet can read or write kernel memory, change kernel page-table entries, run code at EL1 / ring 0, or make the kernel panic or hang. | [`isolation`](../openspec/specs/isolation/spec.md), [`virtual-memory`](../openspec/specs/virtual-memory/spec.md), [`cpu-exceptions`](../openspec/specs/cpu-exceptions/spec.md) |
 | Isolation between cells | A cell reaches only its own memory, threads, registers, files and sockets. Shared frames (fork, templates, page cache, 2 MiB image pages) are never writable by a sharer. A Unix socket is reachable only through a name in the cell's own files. | [`isolation`](../openspec/specs/isolation/spec.md), [`fork`](../openspec/specs/fork/spec.md), [`networking`](../openspec/specs/networking/spec.md), [`multi-core`](../openspec/specs/multi-core/spec.md) |
 | No leak across reuse | Every frame given to a cell is zeroed or fully written. Forks, template copies and resumes never share random generator state. A parked TCP connection is re-attached only with its unguessable key. An ended cell's memory is mapped for no one. | [`isolation`](../openspec/specs/isolation/spec.md), [`snapshots`](../openspec/specs/snapshots/spec.md) |
-| Hostile input is refused or contained | Snapshot bytes and ELF images are refused, or produce a cell that reaches nothing beyond its own resources. Control frames never panic the decoder and never make it allocate more than it received. | [`snapshots`](../openspec/specs/snapshots/spec.md), [`cells`](../openspec/specs/cells/spec.md), control-plane (see section 9) |
+| Hostile input is refused or contained | Snapshot bytes and ELF images are refused, or produce a cell that reaches nothing beyond its own resources. Control frames never panic the decoder and never make it allocate more than it received. | [`snapshots`](../openspec/specs/snapshots/spec.md), [`cells`](../openspec/specs/cells/spec.md), [`control-plane`](../openspec/specs/control-plane/spec.md) |
 | Bounded kernel work and memory per call | Range walks skip empty space; names, captured output and console reports are bounded per cell. | [`isolation`](../openspec/specs/isolation/spec.md) |
 
 ### Out of scope
 
-- **Denial of service by resource exhaustion, until quotas land.** One cell
-  can take all memory down to the kernel's reserve (O1), hold half of the
-  kernel-wide socket pool (S21), zero free memory through file holes
-  (S20), or delay others for as long as one long call takes (O2). The
-  kernel must survive these; other cells may be refused. Per-cell quotas
-  are in [PR #61](https://github.com/davidsalvat/rhizo/pull/61)
-  (`add-cell-quotas`, open). A *kernel crash or hang* from exhaustion is in
-  scope.
+- **Denial of service by a cell without quotas.** Per-cell quotas of
+  memory, CPU time, descriptors and sockets landed after `ad7c3ee`
+  (`add-cell-quotas`, [PR #61](https://github.com/davidsalvat/rhizo/pull/61);
+  S20, S21 and O1 fixed): a cell over a quota is refused or ended, not its
+  neighbours. Still out of scope: a cell the host gave no memory quota
+  taking memory down to the kernel's reserve, and one long call delaying
+  others (O2). A *kernel crash or hang* from exhaustion, and getting past
+  a quota, are in scope.
 - **Side channels** beyond what is already mitigated: caches, branch
   predictors, speculative execution (Spectre, MDS, L1TF), timing, the
-  nanosecond clock cells see. In particular **Meltdown is not mitigated on
-  `main`**: on x86_64 the kernel half is mapped (supervisor only) in every
-  cell's table, with no KPTI (O3). KPTI for x86_64 and E0PD for AArch64 are
-  in [PR #63](https://github.com/davidsalvat/rhizo/pull/63) (`add-kpti`,
-  open).
+  nanosecond clock cells see. Meltdown is mitigated since `add-kpti`
+  ([PR #63](https://github.com/davidsalvat/rhizo/pull/63), merged after
+  `ad7c3ee`): KPTI on x86_64 CPUs that need it, E0PD on AArch64 where the
+  CPU has it (O3). Whether that mitigation is complete is in scope (Q3).
 - **VMM, firmware and hardware bugs**, and a malicious device model
   (virtio is reviewed for robustness only).
 - **The build and supply chain** beyond `cargo deny` (licenses, advisories,
@@ -196,9 +200,8 @@ review's area table says how each area was reviewed.
 
 | Status | Findings |
 |---|---|
-| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S22 (Medium); S9, S10, S11, S17, S19 (Low); S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5). |
-| Accepted until quotas | S20 (Low, file holes mapped without asking memory first), S21 (Medium, kernel-wide pool of 4096 sockets), O1 (no per-cell quota), O2 (call time proportional to what a cell holds). Fix proposed in [PR #61](https://github.com/davidsalvat/rhizo/pull/61), open. |
-| Open | O3 (side channels; no KPTI on x86_64: [PR #63](https://github.com/davidsalvat/rhizo/pull/63), open), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies). See [Known limitations](security.md#known-limitations-and-open-findings). |
+| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S21, S22 (Medium); S9, S10, S11, S17, S19, S20 (Low), S20 and S21 by `add-cell-quotas`; S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5). |
+| Open | O1 remainder (a cell without a memory quota; file data outside the memory quota), O2 (call time proportional to what a cell holds), O3 remainder (side channels other than Meltdown, which `add-kpti` closed; an AArch64 CPU with neither E0PD nor CSV3 is reported, not protected), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies). See [Known limitations](security.md#known-limitations-and-open-findings). |
 
 ### Fuzzers (property tests)
 
@@ -279,9 +282,9 @@ Ordered by what we most want answered.
   sanitising, `DF`/`AC` clearing (S13), FP/SIMD state handed between cells.
 - Q2. On x86_64, NMI and machine check have no IST stack (O5). Is any
   other exception reachable in the window before the stack switch?
-- Q3. Without KPTI on `main`, what kernel data can a cell read on a
-  Meltdown-vulnerable CPU? If PR #63 has landed by the audit, is its
-  trampoline mapping minimal and are the CR3 switches complete?
+- Q3. Is the KPTI mapping that cells see on x86_64 (`add-kpti`: entry
+  pages, per-CPU data, descriptor tables and trap stacks) minimal, and are
+  the CR3 switches complete on every entry and exit path?
 
 **P2. User memory and page tables (ranks 3, 4).**
 
@@ -417,12 +420,12 @@ reviewing both architectures. Sizes are from section 3.
 
 Adjustments:
 
-- If PR #61 (quotas) and PR #63 (KPTI) land before the audit, add about
-  2 days to review them (frame metering on every path; the x86_64 entry
-  trampoline and CR3 switching), and move DoS by exhaustion into scope.
-- [PR #87](https://github.com/davidsalvat/rhizo/pull/87) (open) changes
-  snapshots to refer to shared frames instead of copying them; if it
-  lands, add about 1 day to rank 6.
+- Quotas (PR #61) and KPTI (PR #63) have landed since `ad7c3ee`: add
+  about 2 days to review them (frame metering on every path; the x86_64
+  entry trampoline and CR3 switching).
+- [PR #87](https://github.com/davidsalvat/rhizo/pull/87)
+  (`add-shared-snapshots`, merged) changed snapshots to refer to shared
+  frames instead of copying them: add about 1 day to rank 6.
 - A reduced engagement of about 20 days would cover P1, P2 and Q10 to Q12,
   and leave the rest to the internal reviews.
 
@@ -431,9 +434,7 @@ in-scope files as a diff.
 
 ## Notes on the specs
 
-The control plane's requirements are still in the unarchived change
-[`openspec/changes/add-control-plane`](../openspec/changes/add-control-plane/specs/control-plane/spec.md)
-(one task, its benchmarks, is open), so `openspec/specs/` has no
-`control-plane` capability yet. Several other merged changes are not yet
-archived either; until they are, read `openspec/changes/<id>/specs/` next
-to `openspec/specs/` for the current behavior.
+Every merged change is archived, so `openspec/specs/` (the
+[`control-plane`](../openspec/specs/control-plane/spec.md) capability
+among them) is the current behavior. A change still under review lives in
+`openspec/changes/<id>/`.

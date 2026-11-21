@@ -49,6 +49,7 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use rhizo_cell::elf::Machine;
 use rhizo_cell::quota::Quota;
@@ -280,14 +281,22 @@ impl Snapshot {
         files.encode(&mut encoded);
         let mut records = Vec::new();
         rhizo_net::encode_records(sockets, &mut records);
-        // Sized once: growing past the pages would copy them all again.
-        let mut b = Vec::with_capacity(data_start + data_len + 16 + encoded.len() + records.len());
-        b.extend_from_slice(MAGIC);
-        b.extend_from_slice(&VERSION.to_le_bytes());
-        b.extend_from_slice(&(machine as u16).to_le_bytes());
-        b.extend_from_slice(&[0, 0]);
-        b.extend_from_slice(&(pages as u32).to_le_bytes());
-        b.extend_from_slice(&(threads as u32).to_le_bytes());
+        // Allocated zeroed at its final size, then filled in place: no copy
+        // of the pages when it grows, and no zeroing loop, which unoptimized
+        // builds run a byte at a time.
+        let data_end = data_start + data_len;
+        let mut b = vec![0u8; data_end + 16 + encoded.len() + records.len()];
+        let mut rec = 0;
+        let mut put = |bytes: &[u8]| {
+            b[rec..rec + bytes.len()].copy_from_slice(bytes);
+            rec += bytes.len();
+        };
+        put(MAGIC);
+        put(&VERSION.to_le_bytes());
+        put(&(machine as u16).to_le_bytes());
+        put(&[0, 0]);
+        put(&(pages as u32).to_le_bytes());
+        put(&(threads as u32).to_le_bytes());
         let state = [
             cell.brk_start,
             cell.brk,
@@ -304,11 +313,9 @@ impl Snapshot {
             .iter()
             .flat_map(|t| thread_words(t, kept(t.tid), now));
         for v in state.into_iter().chain(words) {
-            b.extend_from_slice(&v.to_le_bytes());
+            put(&v.to_le_bytes());
         }
         // Records and data in one walk: both places are known now.
-        let mut rec = b.len();
-        b.resize(data_start + data_len, 0);
         let (mut offset, mut i) = (0u64, 0);
         pt.for_each_lower_leaf(mem, &mut |virt, phys, size, flags| {
             let r = &mut b[rec..rec + RECORD];
@@ -327,10 +334,12 @@ impl Snapshot {
             rec += RECORD;
             i += 1;
         });
-        b.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
-        b.extend_from_slice(&encoded);
-        b.extend_from_slice(&(records.len() as u64).to_le_bytes());
-        b.extend_from_slice(&records);
+        let mut tail = data_end;
+        for part in [&encoded, &records] {
+            b[tail..tail + 8].copy_from_slice(&(part.len() as u64).to_le_bytes());
+            b[tail + 8..tail + 8 + part.len()].copy_from_slice(part);
+            tail += 8 + part.len();
+        }
         Self {
             bytes: b,
             frames: refers.iter().filter(|&&r| r).count(),
