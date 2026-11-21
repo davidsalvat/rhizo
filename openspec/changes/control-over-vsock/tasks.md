@@ -19,6 +19,6 @@
 ## 4. Record
 
 - [x] 4.1 `cargo xtask bench --workload control` before and after on one runner, in the design (*Measurements*)
-- [ ] 4.2 `bench/baseline.json`: Cloud Hypervisor's control figures added in `ci`; existing `control.` values only lowered, from `bench` workflow runs of this branch
+- [x] 4.2 `bench/baseline.json`: Cloud Hypervisor's control figures added in `ci`; existing `control.` values only lowered, from `bench` workflow runs of this branch
 - [x] 4.3 `bench/README.md` and `AGENTS.md` (code map): the channel
-- [ ] 4.4 `openspec validate control-over-vsock --strict`, `cargo xtask check`, `cargo xtask ci` on both architectures
+- [x] 4.4 `openspec validate control-over-vsock --strict`, `cargo xtask check`, `cargo xtask ci` on both architectures

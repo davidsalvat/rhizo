@@ -263,5 +263,30 @@ event loop). It was not broken down further.
 `cloud-hypervisor`, which had none; the existing `control.` values of
 `qemu-microvm`, `qemu-q35` and `firecracker` are lowered to what this
 change measures, so that a return to the serial line would fail the gate.
-No value rises. The values are the mean of the medians of `bench`
-workflow runs of this branch (*Baseline runs* below).
+`chat.turn_us`, which crosses the same channel, is lowered (and added for
+`cloud-hypervisor`) the same way. No value rises. The values are the mean
+of the medians of two `bench` workflow runs of this branch's commit
+(`0ad5374`), runs 44938481371 and 44938483458, which both passed the `ci`
+gate and agree within a few percent:
+
+| Figure, µs | VMM | Run 44938481371 | Run 44938483458 |
+|---|---|---|---|
+| `control.spawn_to_first_output_us` | `qemu-microvm` | 240 | 242 |
+| | `qemu-q35` | 243 | 250 |
+| | `firecracker` | 234 | 243 |
+| | `cloud-hypervisor` | 251 | 246 |
+| `control.fork_to_first_output_us` | `qemu-microvm` | 236 | 237 |
+| | `qemu-q35` | 236 | 247 |
+| | `firecracker` | 231 | 232 |
+| | `cloud-hypervisor` | 249 | 252 |
+| `control.roundtrip_us` | `qemu-microvm` | 112 | 113 |
+| | `qemu-q35` | 112 | 112 |
+| | `firecracker` | 104 | 104 |
+| | `cloud-hypervisor` | 108 | 112 |
+
+The `ci` threshold (100 %) still leaves room for a slow runner, and fails
+a return to the serial line (ten times slower).
+
+AArch64 has no KVM in CI; under emulation (`qemu-virt`, TCG, the
+`ubuntu-24.04-arm` runner's `vhost-vsock`) a round trip took 109 µs and a
+spawn to first output 352 µs, where the serial line took milliseconds.
