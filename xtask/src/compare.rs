@@ -158,6 +158,7 @@ pub fn linux_process_in_vm(cells: &Path, accel: Accel, scratch: &Path) -> Result
         scratch,
         "linux-process",
         None,
+        256,
         parse_process_sample,
     )?;
     report::text(&format!(
@@ -175,12 +176,14 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 /// Boots a Linux guest in Firecracker with `initramfs` three times and
 /// returns what `parse` finds in the first console line it accepts, per
 /// boot (`what` names the line in errors). `network`: a tap device for a
-/// network card, and words added to the guest's command line.
+/// network card, and words added to the guest's command line; `memory_mib`:
+/// the guest's memory.
 fn boot_guest<T: Send + 'static>(
     initramfs: &[u8],
     scratch: &Path,
     what: &str,
     network: Option<(&str, &str)>,
+    memory_mib: u32,
     parse: fn(&str) -> Option<T>,
 ) -> Result<Vec<T>> {
     let binary = tools::firecracker()?;
@@ -203,7 +206,7 @@ fn boot_guest<T: Send + 'static>(
         format!(
             "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}, \
              \"initrd_path\": {:?}}}, \"drives\": [], \"network-interfaces\": [{interfaces}], \
-             \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": 256}}}}",
+             \"machine-config\": {{\"vcpu_count\": 1, \"mem_size_mib\": {memory_mib}}}}}",
             kernel.display().to_string(),
             format!("{}{extra}", crate::vmm::linux_cmdline(Vmm::Firecracker)),
             image.display().to_string()
@@ -334,6 +337,7 @@ pub fn cpython_in_vm(
             .as_ref()
             .ok()
             .map(|(tap, words)| (*tap, words.as_str())),
+        256,
         parse_cpython_line,
     )?;
     report::text(&format!(
@@ -380,6 +384,71 @@ pub fn cpython_in_vm(
         .into_iter()
         .map(|(name, mut values)| metric(name, "linux-process", "firecracker", "us", &mut values))
         .collect())
+}
+
+/// Node.js on Linux in the same Firecracker VM as the cells (change
+/// `add-node-workload`): the files of the Node.js cell in the guest's
+/// initramfs, `bench/host/linux_node.c` as `/init`, which forks and execs
+/// `node --jitless /app/demo.js` until it exits. The guest gets the memory
+/// of the Node.js cells' VM: the initramfs alone is over 100 MiB, unpacked
+/// once more. Node.js cannot fork itself: there is no warm figure.
+pub fn node_in_vm(accel: Accel, scratch: &Path) -> Result<Vec<Metric>> {
+    let root = &crate::dynamic::roots()[2];
+    if !root.join(crate::dynamic::NODE).exists() {
+        return Err("Node.js not packed (RHIZO_NODE unset)".into());
+    }
+    if let Some(reason) = Vmm::Firecracker.unavailable_reason(accel) {
+        return Err(reason);
+    }
+    let program = scratch.join("linux_node_static");
+    let source = workspace_root().join("bench/host/linux_node.c");
+    let status = Command::new(crate::c_compiler())
+        .args(["-static", "-O2", "-o"])
+        .arg(&program)
+        .arg(&source)
+        .status()
+        .map_err(|e| format!("cannot run the C compiler: {e}"))?;
+    if !status.success() {
+        return Err(format!("cannot compile {}", source.display()));
+    }
+    let mut files = Vec::new();
+    collect(root, "", &mut files)?;
+    let entries: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let initramfs = refguest::initramfs_with(&read(&program)?, &entries);
+    drop(files);
+    let samples = boot_guest(
+        &initramfs,
+        scratch,
+        "linux-node",
+        None,
+        crate::NODE_MEMORY_MIB,
+        parse_node_line,
+    )?;
+    report::text(&format!(
+        "node inside firecracker on {}: {} boots",
+        arch::current().id(),
+        samples.len()
+    ));
+    let mut cold = samples;
+    Ok(vec![metric(
+        "workload.node_cold_us",
+        "linux-process",
+        "firecracker",
+        "us",
+        &mut cold,
+    )])
+}
+
+/// The cold figure of a `linux-node cold_us=<x>` line.
+pub fn parse_node_line(text: &str) -> Option<f64> {
+    let line = &text[text.find("linux-node ")?..];
+    line.split_whitespace()
+        .find_map(|kv| kv.strip_prefix("cold_us="))?
+        .parse()
+        .ok()
 }
 
 /// Every file and directory under `dir` as initramfs entries named from
@@ -1071,6 +1140,14 @@ mod tests {
             None
         );
         assert_eq!(parse_cpython_line("linux-process fork_us=1"), None);
+    }
+
+    #[test]
+    fn node_line_is_found_among_console_noise() {
+        let line = "[  1.2] junk linux-node cold_us=41000.5\r\n";
+        assert_eq!(parse_node_line(line), Some(41000.5));
+        assert_eq!(parse_node_line("linux-node failed: |oops"), None);
+        assert_eq!(parse_node_line("linux-process fork_us=1"), None);
     }
 
     #[test]

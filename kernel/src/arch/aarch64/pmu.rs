@@ -180,11 +180,16 @@ pub fn start_sampling(period: u64) -> bool {
     true
 }
 
-/// Stops sampling on this CPU.
+/// Stops sampling on this CPU. `PERIOD` is shared by every CPU: the first
+/// CPU to stop clears it, so each CPU disables its own counter and
+/// interrupt whatever it reads there (a CPU left counting kept an overflow
+/// nobody cleared, and its interrupt fired without end once a cell ran
+/// there).
 #[cfg(feature = "sampling")]
 pub fn stop_sampling() {
-    if PERIOD.swap(0, Ordering::Relaxed) == 0 {
-        return;
+    PERIOD.store(0, Ordering::Relaxed);
+    if INTID.load(Ordering::Relaxed) == 0 {
+        return; // sampling never started
     }
     write_sys!("pmcntenclr_el0", 1 << 1);
     write_sys!("pmintenclr_el1", 1 << 1);

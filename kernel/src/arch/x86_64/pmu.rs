@@ -221,14 +221,15 @@ pub fn start_sampling(period: u64) -> bool {
     true
 }
 
-/// Stops sampling on this CPU.
+/// Stops sampling on this CPU. `PERIOD` is shared by every CPU: the first
+/// CPU to stop clears it, so each CPU disables its own counter and
+/// interrupt whatever it reads there (a CPU left counting would overflow
+/// with nobody to clear it).
 #[cfg(feature = "sampling")]
 pub fn stop_sampling() {
-    if PERIOD.swap(0, Ordering::Relaxed) == 0 {
-        return;
-    }
-    super::irq::sample_interrupt(false);
+    PERIOD.store(0, Ordering::Relaxed);
     if let Some(m) = msrs() {
+        super::irq::sample_interrupt(false);
         // SAFETY: counter 2 is the sampling counter `start_sampling` set.
         unsafe { wrmsr(m.select + 2 * m.stride, 0) };
     }

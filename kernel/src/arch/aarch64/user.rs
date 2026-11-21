@@ -218,7 +218,7 @@ pub fn pan_on() -> bool {
 }
 
 /// Enables FP/SIMD on this CPU for cells (and for the save and load
-/// above), and PAN. The boot CPU calls it through [`init_tags`]; the
+/// above), PAN, and cells' reads of the virtual counter. The boot CPU calls it through [`init_tags`]; the
 /// others once at bring-up, with the boot CPU's `TCR_EL1` (ASID size)
 /// already copied.
 pub fn init_cpu() {
@@ -236,6 +236,12 @@ pub fn init_cpu() {
             options(nostack)
         );
     }
+    // SAFETY: CNTKCTL_EL1 = EL0VCTEN only: cells may read the virtual
+    // counter and its frequency (`CNTVCT_EL0`, `CNTFRQ_EL0`), as on Linux;
+    // the physical counter and both timers stay the kernel's. Its reset
+    // value is UNKNOWN, so every CPU sets it (design D8 of
+    // `add-node-workload`). EL1's own use of the timer is unaffected.
+    unsafe { asm!("msr cntkctl_el1, {}", "isb", in(reg) 1u64 << 1, options(nostack)) };
     USER_ROOT[index()].store(EMPTY_ROOT.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
