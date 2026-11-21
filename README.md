@@ -157,7 +157,8 @@ again:
 - **Isolation, reviewed.** An adversarial review of the cell boundary, with
   hostile cells and property tests that keep it fixed:
   [`docs/security.md`](docs/security.md) lists the threat model, the
-  findings and what is still open.
+  findings and what is still open;
+  [`docs/audit-scope.md`](docs/audit-scope.md) scopes an external audit.
 
 ## Thesis
 
