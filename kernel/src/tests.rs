@@ -2010,12 +2010,12 @@ fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
 
 // --- C.3: Node.js ------------------------------------------------------------
 
-/// Spawns Node.js on `/app/demo.js` (`expected::NODE_ARGV`), with the
-/// model's URL when given.
+/// Spawns Node.js on `/app/demo.js` (`expected::NODE_ARGV`) with the
+/// script's arguments `args`.
 #[cfg(feature = "node")]
-fn spawn_node(host: &mut Host, files: &rhizo_fs::Fs, url: Option<&str>) -> u32 {
+fn spawn_node(host: &mut Host, files: &rhizo_fs::Fs, args: &[&str]) -> u32 {
     let mut argv: Vec<&[u8]> = expected::NODE_ARGV.iter().map(|a| a.as_bytes()).collect();
-    argv.extend(url.map(str::as_bytes));
+    argv.extend(args.iter().map(|a| a.as_bytes()));
     host.spawn_file(files.clone(), argv[0], &argv, &[], true, true)
         .unwrap_or_else(|e| panic!("cannot spawn Node.js: {e:?}"))
 }
@@ -2039,7 +2039,7 @@ fn node_answers_as_on_linux() {
             .expect("the network card got an address");
     }
     let before = memory_balance();
-    let id = spawn_node(&mut host, &files, None);
+    let id = spawn_node(&mut host, &files, &[]);
     host.run(|h| h.finished(id).is_some());
     assert_eq!(
         ended(&host, id),
@@ -2058,7 +2058,7 @@ fn node_answers_as_on_linux() {
     };
     let mut host = Host::new();
     let url = alloc::format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
-    let id = spawn_node(&mut host, &files, Some(&url));
+    let id = spawn_node(&mut host, &files, &[&url]);
     host.run(|h| h.finished(id).is_some());
     let want = alloc::format!("{}{}", expected::NODE_STDOUT, expected::NODE_MODEL_LINE);
     assert_eq!(ended(&host, id), (Ending::Exit(0), want));
@@ -2080,7 +2080,7 @@ fn a_node_cell_suspends_resumes_and_forks() {
         .expect("warm first");
     let mut host = Host::new();
     let warm = |host: &mut Host| {
-        let id = spawn_node(host, &files, None);
+        let id = spawn_node(host, &files, &["wait"]);
         while host.output(id) != Some(b"warm\n") {
             assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
             host.step();

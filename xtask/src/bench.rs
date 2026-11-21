@@ -452,6 +452,10 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
         }
+        match crate::compare::node_in_vm(opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("workload.node_cold_us/linux-process/firecracker".into(), e)),
+        }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("firecracker-snapshot".into(), e)),

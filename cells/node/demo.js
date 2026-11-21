@@ -1,10 +1,11 @@
 // An agent-like request handled by Node.js in a cell (spec `workloads`,
-// change `add-node-workload`): warm up, say "warm" and pause briefly (a host
-// may freeze the cell there as a template), then answer one tool call:
-// parse its JSON, run regular expressions over its text, fold it through
-// closures, and reply in JSON. Given a model server's URL, it then asks the
-// model over HTTP (`node:http`) and prints the tool call it got back.
-// Deterministic: the same output on Linux and in a cell.
+// change `add-node-workload`): warm up, say "warm" (with the argument
+// `wait`, then pause 50 ms: a host may freeze the cell there as a template),
+// then answer one tool call: parse its JSON, run regular expressions over
+// its text, fold it through closures, and reply in JSON. Given a model
+// server's URL, it then asks the model over HTTP (`node:http`) and prints
+// the tool call it got back. Deterministic: the same output on Linux and in
+// a cell.
 "use strict";
 const http = require("node:http");
 
@@ -125,10 +126,13 @@ async function main() {
   answer(toolCall(1)); // warm-up: every path once (what a template keeps)
   const request = toolCall(42);
   console.log("warm");
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  const args = process.argv.slice(2);
+  if (args.includes("wait")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
   const reply = answer(request);
   console.log(reply);
-  const url = process.argv[2];
+  const url = args.find((a) => a.startsWith("http://"));
   if (url) {
     console.log(`model: ${await ask(url, reply)}`);
   }

@@ -3201,26 +3201,27 @@ fn python() -> Option<(u64, u64)> {
 #[cfg(feature = "bench-cell")]
 fn node() -> Option<(u64, u64)> {
     const ROUNDS: usize = 7;
-    const ARGV: [&[u8]; 3] = [b"/usr/bin/node", b"--jitless", b"/app/demo.js"];
+    const ARGV: [&[u8]; 4] = [b"/usr/bin/node", b"--jitless", b"/app/demo.js", b"wait"];
     let files = node_files()?;
     let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
-    let spawn = |host: &mut Host| {
-        host.spawn_file(files.clone(), ARGV[0], &ARGV, &[], true, false)
+    // Cold runs do not pause; the template does, after `warm`.
+    let spawn = |host: &mut Host, argv: &[&[u8]]| {
+        host.spawn_file(files.clone(), argv[0], argv, &[], true, false)
             .expect("spawn")
     };
     let (mut cold, mut warm) = (Vec::new(), Vec::new());
     for round in 0..=ROUNDS {
         host.finished.clear();
         let t0 = bench_clock();
-        let id = spawn(&mut host);
+        let id = spawn(&mut host, &ARGV[..3]);
         host.run(|h| h.finished(id).is_some());
         if round > 0 {
             cold.push(ns(t0, bench_clock()));
         }
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
-    let template = spawn(&mut host);
+    let template = spawn(&mut host, &ARGV);
     while host.output(template) != Some(b"warm\n") {
         host.step();
     }
