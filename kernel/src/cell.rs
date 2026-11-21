@@ -835,6 +835,14 @@ impl Pager<Format, DirectMap> for CellPager<'_, '_> {
     }
 }
 
+/// The instruction at `pc` in the cell with tables `pt`, if it is mapped
+/// (for the faults the kernel answers by emulating the instruction).
+fn instruction(pt: &PageTable<Format>, pc: u64) -> Option<u32> {
+    let mut word = [0; 4];
+    rhizo_cell::memory::copy_from(pt, &DirectMap, pc, &mut word).ok()?;
+    Some(u32::from_le_bytes(word))
+}
+
 /// Grows the stack of the cell with tables `pt` to cover `addr` (design D5
 /// of `add-cpython`), if memory allows.
 fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
@@ -1461,6 +1469,11 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     live.clean = flushed_on(cpu);
                     continue;
                 }
+                Trap::Fault(fault)
+                    if fault.emulate(live.cell.regs_mut(), |pc| instruction(&pt, pc)) =>
+                {
+                    continue;
+                }
                 Trap::Fault(fault) => {
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
@@ -1915,6 +1928,12 @@ fn run_gang(
                         break None;
                     }
                 }
+                // Under the cell lock: no other CPU changes its tables.
+                Trap::Fault(fault)
+                    if gang.locked(shared, ptr, |_| {
+                        let pt = PageTable::<Format>::from_root(gang.root);
+                        fault.emulate(&mut regs, |pc| instruction(&pt, pc))
+                    }) => {}
                 Trap::Fault(fault) => {
                     if !gang.locked(shared, ptr, |cell| cell.fault(gang, cpu, &fault)) {
                         break None;
@@ -2834,6 +2853,17 @@ pub fn bench(console: &mut impl Console) {
         };
         return;
     }
+    // The packages' kernel measures numpy only (its VM has the memory).
+    if cfg!(feature = "packages") {
+        let _ = match numpy() {
+            Some((cold, warm)) => writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-numpy cold_ns={cold} warm_ns={warm}"
+            ),
+            None => writeln!(rhizo_hal::ConsoleWriter(console), "rhizo-numpy not packed"),
+        };
+        return;
+    }
     if let Some(workload) = crate::wire::options().bench {
         crate::workloads::run(console, workload);
         return;
@@ -3057,6 +3087,61 @@ fn benchmarks(console: &mut impl Console) {
             "rhizo-dynamic run_ns={run} template_ns={template}"
         );
     }
+}
+
+/// numpy from its wheel (design D5 of `add-pip-packages`): the packages'
+/// CPython started from its files, importing numpy and computing, run to
+/// its exit after a first run that keeps the file pages; and forked from a
+/// template frozen once numpy was imported (`ready`). Robust figures over
+/// 10 runs each; `None` when the packages were not packed.
+#[cfg(feature = "bench-cell")]
+fn numpy() -> Option<(u64, u64)> {
+    const RUNS: usize = 10;
+    const PATH: &[u8] = b"usr/bin/python3";
+    const ARGV: [&[u8]; 3] = [PATH, b"-s", b"app/numpy_demo.py"];
+    let files = packages_files()?;
+    let ns = |t0: u64, t1: u64| timer::cycles_to_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let mut cold = Vec::with_capacity(RUNS);
+    for i in 0..=RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_file(files.clone(), PATH, &ARGV, &[], true, false)
+            .expect("spawn");
+        host.run(|h| h.finished(id).is_some());
+        let t = ns(t0, Counter.cycles());
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+        if i > 0 {
+            cold.push(t);
+        }
+    }
+    let template = host
+        .spawn_file(
+            files,
+            PATH,
+            &[ARGV[0], ARGV[1], ARGV[2], b"wait"],
+            &[],
+            true,
+            false,
+        )
+        .expect("spawn");
+    while host.output(template) != Some(b"ready\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let mut warm = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let t0 = Counter.cycles();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, Counter.cycles()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    Some((robust(&mut cold), robust(&mut warm)))
 }
 
 /// `bench-cell` with `profile`: the cost of a copy-on-write fault and the
@@ -3386,6 +3471,19 @@ pub fn dynamic_files() -> Option<Fs> {
 pub fn distro_files() -> Option<Fs> {
     static FILES: Global<Option<Fs>> = Global::new(None);
     decoded(&FILES, "distro-files")
+}
+
+/// The files of the dynamically linked CPython with packages from PyPI
+/// (`packages-files`: numpy, requests and what they need, change
+/// `add-pip-packages`), as [`dynamic_files`]; packed natively only, with
+/// CPython, and embedded in the `packages` kernels only.
+#[cfg_attr(
+    not(any(feature = "packages", feature = "bench-cell")),
+    allow(dead_code, reason = "used by the package tests and benchmark")
+)]
+pub fn packages_files() -> Option<Fs> {
+    static FILES: Global<Option<Fs>> = Global::new(None);
+    decoded(&FILES, "packages-files")
 }
 
 /// The files of Node.js (`node-files`: the official build, its interpreter

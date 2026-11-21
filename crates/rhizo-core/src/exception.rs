@@ -133,6 +133,77 @@ pub fn aarch64_class_name(ec: u64) -> &'static str {
     }
 }
 
+/// A read of an ID register by cell code (`MRS Xt, <reg>` with op0 3, op1 0,
+/// CRn 0, CRm 0 to 7: `MIDR_EL1`, `ID_AA64ISAR0_EL1`...), which EL0 cannot
+/// do (change `add-pip-packages`): the kernel answers it as Linux does
+/// for programs told so by `HWCAP_CPUID`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdRegisterRead {
+    /// The destination register (31: `XZR`, the value is dropped).
+    pub rt: usize,
+    /// `CRm` and `op2`: which register of the ID space.
+    pub crm: u8,
+    pub op2: u8,
+}
+
+impl IdRegisterRead {
+    /// The read an EL0 exception stands for, if it is one: a trapped
+    /// system register access (class 0x18, decoded from the syndrome) or an
+    /// undefined instruction (class 0x0, decoded from the instruction
+    /// `insn` returns, the word at the faulting address).
+    pub fn decode(esr: u64, insn: impl FnOnce() -> Option<u32>) -> Option<Self> {
+        // (op0, op1, CRn, CRm, op2, Rt, read)
+        let (op0, op1, crn, crm, op2, rt, read) = match (esr >> 26) & 0x3f {
+            0x18 => {
+                let iss = esr as u32 & 0x1ff_ffff;
+                let f = |shift: u32, bits: u32| (iss >> shift) & ((1 << bits) - 1);
+                (
+                    f(20, 2),
+                    f(14, 3),
+                    f(10, 4),
+                    f(1, 4),
+                    f(17, 3),
+                    f(5, 5),
+                    f(0, 1) == 1,
+                )
+            }
+            0x00 => {
+                let insn = insn()?;
+                let f = |shift: u32, bits: u32| (insn >> shift) & ((1 << bits) - 1);
+                // MRS: 1101_0101_0011 in bits 31-20 (L set, op0 2 or 3).
+                (
+                    f(19, 2),
+                    f(16, 3),
+                    f(12, 4),
+                    f(8, 4),
+                    f(5, 3),
+                    f(0, 5),
+                    insn >> 20 == 0xd53,
+                )
+            }
+            _ => return None,
+        };
+        (read && op0 == 3 && op1 == 0 && crn == 0 && crm < 8).then_some(Self {
+            rt: rt as usize,
+            crm: crm as u8,
+            op2: op2 as u8,
+        })
+    }
+
+    /// The value cell code reads: the CPU's `MIDR_EL1` and `REVIDR_EL1`
+    /// (`midr`, `revidr`) as they are, `MPIDR_EL1` with only bit 31 set (no
+    /// CPU numbers: a cell may run on any), and zero for every other
+    /// register (features are told by the auxiliary vector, not here).
+    pub fn value(&self, midr: u64, revidr: u64) -> u64 {
+        match (self.crm, self.op2) {
+            (0, 0) => midr,
+            (0, 5) => 1 << 31,
+            (0, 6) => revidr,
+            _ => 0,
+        }
+    }
+}
+
 /// Prints an AArch64 exception report, in the same shape as the x86_64 one:
 ///
 /// ```text
@@ -199,6 +270,38 @@ fn write_aarch64(console: &mut impl Console, prefix: fmt::Arguments<'_>, info: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_register_reads_are_decoded_from_the_instruction_or_the_syndrome() {
+        let undefined = 0; // class 0x0
+        let read = |insn: u32| IdRegisterRead::decode(undefined, || Some(insn));
+        // mrs x3, midr_el1
+        let midr = read(0xd538_0003).expect("an ID register read");
+        assert_eq!((midr.rt, midr.value(0x410f_d0c1, 7)), (3, 0x410f_d0c1));
+        // mrs x0, mpidr_el1; mrs x1, revidr_el1; mrs x2, id_aa64isar0_el1
+        assert_eq!(read(0xd538_00a0).map(|r| r.value(1, 7)), Some(1 << 31));
+        assert_eq!(read(0xd538_00c1).map(|r| r.value(1, 7)), Some(7));
+        assert_eq!(
+            read(0xd538_0602).map(|r| (r.rt, r.value(1, 7))),
+            Some((2, 0))
+        );
+        // Not ID registers: mrs x0, ctr_el0 (op1 3); msr midr_el1, x0 (a
+        // write); a plain instruction (nop); no instruction readable.
+        for insn in [0xd53b_0020, 0xd518_0000, 0xd503_201f] {
+            assert_eq!(read(insn), None, "{insn:#x}");
+        }
+        assert_eq!(IdRegisterRead::decode(undefined, || None), None);
+        // Class 0x18 (FEAT_IDST): op0 3, Rt 5, read; the same as a write.
+        let trapped = (0x18 << 26) | (3 << 20) | (5 << 5);
+        let r = IdRegisterRead::decode(trapped | 1, || panic!("not read"));
+        assert_eq!(r.map(|r| (r.rt, r.value(9, 0))), Some((5, 9)));
+        assert_eq!(IdRegisterRead::decode(trapped, || None), None);
+        // Any other exception, such as a data abort, is none.
+        assert_eq!(
+            IdRegisterRead::decode(0x9200_0005, || panic!("not read")),
+            None
+        );
+    }
     use rhizo_hal::testing::RecordingConsole;
 
     #[test]

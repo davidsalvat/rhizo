@@ -69,7 +69,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: target/cpython
-          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
+          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
 
       - name: Cache the Node.js download
         uses: actions/cache@v4
@@ -87,7 +87,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: target/cpython
-          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
+          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
 
       - name: Report the failure as an annotation
         if: failure()
@@ -158,7 +158,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: target/cpython
-          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
+          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
 
       - name: Cache the Node.js download
         uses: actions/cache@v4
@@ -182,7 +182,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: target/cpython
-          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
+          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
 
       - name: Publish the instruction counts
         # As the x86_64 bench job, under their own title so the README
@@ -311,7 +311,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: target/cpython
-          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
+          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
 
       - name: Cache downloaded VMMs and reference guest
         uses: actions/cache@v4
@@ -347,7 +347,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: target/cpython
-          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
+          key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
 
       - name: Publish results
         # Annotations are cut at 4 KB and GitHub keeps 10 per step: the

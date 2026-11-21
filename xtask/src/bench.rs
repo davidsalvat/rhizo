@@ -327,7 +327,7 @@ fn measure(opts: &Options) -> Result<Results> {
         if opts.icount_only {
             crate::profile::measure_icount(&mut metrics, &mut skipped)?;
         } else if opts.workload == Some(Only::Node) {
-            measure_node(opts, &mut metrics, &mut skipped)?;
+            measure_runtime(opts, &mut metrics, &mut skipped, &NODE)?;
         } else {
             crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
         }
@@ -415,7 +415,8 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
-    measure_node(opts, &mut metrics, &mut skipped)?;
+    measure_runtime(opts, &mut metrics, &mut skipped, &NODE)?;
+    measure_runtime(opts, &mut metrics, &mut skipped, &NUMPY)?;
     crate::control::measure(&opts.vmms, opts.accel, &mut metrics, &mut skipped)?;
     crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
@@ -451,6 +452,10 @@ fn measure_comparisons(
         match crate::compare::cpython_in_vm(opts.accel, &scratch, skipped) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
+        }
+        match crate::compare::numpy_in_vm(opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("workload.numpy_*/linux-process/firecracker".into(), e)),
         }
         match crate::compare::node_in_vm(opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
@@ -796,20 +801,57 @@ fn parse_python_line(output: &str) -> Option<(u64, u64)> {
 
 /// `(cold_ns, warm_ns)` of the CPython line of a `bench-cell` kernel
 /// (absent when CPython was not built).
-/// Node.js metrics (change `add-node-workload`): a `bench-cell` kernel
-/// built with Node.js embedded, in a VM with the memory it needs, prints
-/// `rhizo-node cold_ns=<median> warm_ns=<median>`; each VMM boots it a few
-/// times. Skipped with the reason when Node.js is not packed.
-fn measure_node(
+/// A runtime too large for the cell benchmark kernel, measured by a
+/// `bench-cell` kernel of its own, the only one embedding its files, in a
+/// VM with the memory it needs.
+struct Runtime {
+    /// The kernel feature that embeds it.
+    feature: &'static str,
+    /// Its metrics (`workload.<name>_cold_us`, `_warm_us`) and its line
+    /// (`rhizo-<name> cold_ns=<median> warm_ns=<median>`, parsed by `parse`).
+    name: &'static str,
+    parse: fn(&str) -> Option<(u64, u64)>,
+    /// What it is called in reports.
+    title: &'static str,
+    /// Why it is not packed, if it is not.
+    unavailable: fn() -> Option<String>,
+    memory_mib: u32,
+}
+
+/// Node.js (change `add-node-workload`).
+const NODE: Runtime = Runtime {
+    feature: "node",
+    name: "node",
+    parse: parse_node_line,
+    title: "Node.js",
+    unavailable: crate::node_unavailable_reason,
+    memory_mib: crate::NODE_MEMORY_MIB,
+};
+
+/// The packages' CPython computing with numpy (change `add-pip-packages`).
+const NUMPY: Runtime = Runtime {
+    feature: "packages",
+    name: "numpy",
+    parse: parse_numpy_line,
+    title: "numpy",
+    unavailable: crate::packages_unavailable_reason,
+    memory_mib: crate::PACKAGES_MEMORY_MIB,
+};
+
+/// The metrics of runtime `rt`: its kernel prints its line; each VMM boots
+/// it a few times. Skipped with the reason when it is not packed.
+fn measure_runtime(
     opts: &Options,
     metrics: &mut Vec<Metric>,
     skipped: &mut Vec<(String, String)>,
+    rt: &Runtime,
 ) -> Result {
-    if let Some(why) = crate::node_unavailable_reason() {
-        skipped.push(("workload.node_*".into(), why));
+    let all = format!("workload.{}_*", rt.name);
+    if let Some(why) = (rt.unavailable)() {
+        skipped.push((all, why));
         return Ok(());
     }
-    let guest = Guest::Rhizo(build_kernel(Profile::Release, &["bench-cell", "node"])?);
+    let guest = Guest::Rhizo(build_kernel(Profile::Release, &["bench-cell", rt.feature])?);
     let run_opts = RunOptions {
         stop_at_ready: false,
         timeout: RUN_TIMEOUT,
@@ -819,7 +861,7 @@ fn measure_node(
         network: false,
         pci_card: false,
         cpus: 1,
-        memory_mib: crate::NODE_MEMORY_MIB,
+        memory_mib: rt.memory_mib,
         bench: None,
         shard: None,
         control: false,
@@ -828,21 +870,21 @@ fn measure_node(
         if vmm.unavailable_reason(opts.accel).is_some() {
             continue; // already reported by the boot benchmark
         }
-        report::text(&format!("Node.js on {}", vmm.id()));
+        report::text(&format!("{} on {}", rt.title, vmm.id()));
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 3) {
             let out = vmm::run(vmm, &guest, run_opts)?;
-            match parse_node_line(&out.output) {
+            match (rt.parse)(&out.output) {
                 Some((c, w)) if out.result != VmResult::Failed => {
                     cold.push(c as f64 / 1000.0);
                     warm.push(w as f64 / 1000.0);
                 }
                 _ => {
                     skipped.push((
-                        format!("workload.node_*/{}", vmm.id()),
+                        format!("{all}/{}", vmm.id()),
                         format!(
-                            "no `rhizo-node` line ({:?}); output:\n{}",
-                            out.result, out.output
+                            "no `rhizo-{}` line ({:?}); output:\n{}",
+                            rt.name, out.result, out.output
                         ),
                     ));
                     break;
@@ -850,13 +892,13 @@ fn measure_node(
             }
         }
         for (name, values) in [
-            ("workload.node_cold_us", &mut cold),
-            ("workload.node_warm_us", &mut warm),
+            (format!("workload.{}_cold_us", rt.name), &mut cold),
+            (format!("workload.{}_warm_us", rt.name), &mut warm),
         ] {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
                 metrics.push(Metric {
-                    name: name.into(),
+                    name,
                     guest: "rhizo".into(),
                     vmm: Some(vmm.id().into()),
                     unit: "us".into(),
@@ -929,6 +971,13 @@ fn parse_dynamic_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("run_ns")?, field("template_ns")?))
+}
+
+/// `(cold_ns, warm_ns)` of the numpy line of a `bench-cell` kernel (absent
+/// when the packages were not packed).
+fn parse_numpy_line(output: &str) -> Option<(u64, u64)> {
+    let field = |key| crate::profile::field(output, "rhizo-numpy", key);
+    Some((field("cold_ns")?, field("warm_ns")?))
 }
 
 /// `(idle_bytes, suspended_bytes)` of the density line of a `bench-cell`
@@ -2490,6 +2539,15 @@ mod tests {
             "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-dynamic run_ns=812000 template_ns=95000\n";
         assert_eq!(parse_dynamic_line(out), Some((812_000, 95_000)));
         assert_eq!(parse_dynamic_line("rhizo-dynamic run_ns=1"), None);
+    }
+
+    #[test]
+    fn numpy_line_is_parsed() {
+        let out =
+            "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-numpy cold_ns=90000000 warm_ns=400000\n";
+        assert_eq!(parse_numpy_line(out), Some((90_000_000, 400_000)));
+        assert_eq!(parse_numpy_line("rhizo-numpy cold_ns=1"), None);
+        assert_eq!(parse_numpy_line("rhizo-numpyx cold_ns=1 warm_ns=2"), None);
     }
 
     #[test]

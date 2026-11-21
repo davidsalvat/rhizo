@@ -304,15 +304,11 @@ pub fn start_at<F: EntryFormat>(
     if let Some(kernel) = kernel {
         pt.share_upper_half(mem, kernel);
     }
-    let stack = elf::build_stack(
-        &pt,
-        mem,
-        &mut || frames.alloc(),
-        &layout.aux,
-        argv,
-        envp,
-        random,
-    );
+    let aux = elf::Aux {
+        hwcap: machine.hwcap(),
+        ..layout.aux
+    };
+    let stack = elf::build_stack(&pt, mem, &mut || frames.alloc(), &aux, argv, envp, random);
     match stack {
         Ok(sp) => {
             let mut cell = Cell::new(id, pt.root(), layout.pc, sp, layout.brk_start);

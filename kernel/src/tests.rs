@@ -82,6 +82,7 @@ macro_rules! suite {
             ktest_case!(fork_allocates_only_a_root),
             ktest_case!(spawn_from_template_runs_like_the_program),
             ktest_case!(real_libc_programs_behave_as_on_linux),
+            ktest_case!(cells_learn_the_cpu_as_on_linux),
             ktest_case!(fp_state_is_private_to_each_cell),
             ktest_case!(fp_state_survives_suspend_and_resume),
             ktest_case!(warm_template_of_a_real_program),
@@ -165,6 +166,7 @@ macro_rules! suite {
     feature = "ktest-user-read",
     feature = "ktest-user-exec",
     feature = "node",
+    feature = "packages",
 )))]
 /// Every in-kernel test case, in execution order.
 pub static ALL: &[TestCase] = suite!();
@@ -176,6 +178,18 @@ pub static ALL: &[TestCase] = &[
     ktest_case!(console_output_works),
     ktest_case!(node_answers_as_on_linux),
     ktest_case!(a_node_cell_suspends_resumes_and_forks),
+];
+
+/// The package tests (change `add-pip-packages`), alone in the kernel
+/// built with the packages embedded, whose VM has the memory they need.
+/// requests first: the network card gets its address there, which takes
+/// memory for good, before numpy's test checks that none is left behind.
+#[cfg(feature = "packages")]
+pub static ALL: &[TestCase] = &[
+    ktest_case!(console_output_works),
+    ktest_case!(requests_gets_from_the_host_as_on_linux),
+    ktest_case!(numpy_from_a_wheel_computes_as_on_linux),
+    ktest_case!(a_cell_that_imported_numpy_suspends_resumes_and_forks),
 ];
 
 /// In self-check builds the regular suite is compiled but not run (it runs
@@ -190,6 +204,7 @@ pub static ALL: &[TestCase] = &[
     feature = "ktest-user-read",
     feature = "ktest-user-exec",
     feature = "node",
+    feature = "packages",
 ))]
 #[allow(dead_code, reason = "the suite runs in the regular `ktest` build")]
 static SUITE: &[TestCase] = suite!();
@@ -1062,6 +1077,14 @@ fn real_libc_programs_behave_as_on_linux() {
     for name in ["libc_hello", "libc_alloc", "libc_float"] {
         run_expected(name);
     }
+}
+
+/// What a program learns of the CPU is what Linux tells it (spec
+/// `linux-abi`): on AArch64, `AT_HWCAP` with FP, Advanced SIMD and
+/// `HWCAP_CPUID`, and ID registers read at EL0 answered by the kernel
+/// (`MIDR_EL1` the CPU's, `MPIDR_EL1` only bit 31).
+fn cells_learn_the_cpu_as_on_linux() {
+    run_expected("libc_hwcap");
 }
 
 /// Two FP programs holding values in FP/SIMD registers across yields, run
@@ -2113,6 +2136,130 @@ fn a_node_cell_suspends_resumes_and_forks() {
     host.run(|h| all.iter().all(|&id| h.finished(id).is_some()));
     for id in all {
         assert_eq!(ended(&host, id), (Ending::Exit(0), rest.into()));
+    }
+}
+
+// --- C.2: packages from PyPI --------------------------------------------------
+
+/// The files of the packages' CPython, or `None` (said on the console)
+/// when they were not packed.
+#[cfg(feature = "packages")]
+fn packages() -> Option<rhizo_fs::Fs> {
+    let files = crate::cell::packages_files();
+    if files.is_none() {
+        arch::console::BootConsole.write_bytes(b"(packages not packed: not run) ");
+    }
+    files
+}
+
+/// Spawns the packages' CPython with `argv` (spec `workloads`, packages
+/// from PyPI).
+#[cfg(feature = "packages")]
+fn spawn_python(host: &mut Host, files: &rhizo_fs::Fs, argv: &[&str]) -> u32 {
+    spawn_dynamic(host, files, expected::NUMPY_ARGV[0], argv)
+}
+
+/// numpy from its manylinux wheel: CPython opens its extension modules and
+/// the OpenBLAS they need with `dlopen`, and the computation prints what it
+/// prints on Linux (`cells/expected.rs`, by the differential check). Once
+/// the kept file pages are dropped, every frame and heap allocation is
+/// back.
+#[cfg(feature = "packages")]
+fn numpy_from_a_wheel_computes_as_on_linux() {
+    let Some(files) = packages() else { return };
+    let before = memory_balance();
+    let mut host = Host::new();
+    let id = spawn_python(&mut host, &files, &expected::NUMPY_ARGV);
+    host.run(|h| h.finished(id).is_some());
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::NUMPY_STDOUT.into())
+    );
+    drop(host);
+    assert!(crate::cell::drop_images(), "file pages were kept");
+    assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// requests (with urllib3, idna, charset_normalizer and certifi) makes an
+/// HTTP GET to the host's fake model through the network card and prints
+/// what a Linux process prints of the answer.
+#[cfg(feature = "packages")]
+fn requests_gets_from_the_host_as_on_linux() {
+    let Some(files) = packages() else { return };
+    let Some((ip, port)) = crate::wire::options().llm else {
+        arch::console::BootConsole.write_bytes(b"(no network card and model server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card got an address"
+    );
+    let url = alloc::format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+    let [python, flag, script] = expected::REQUESTS_ARGV;
+    let id = spawn_python(&mut host, &files, &[python, flag, script, &url]);
+    let end = crate::cell::now_ns() + 600_000_000_000;
+    while host.finished(id).is_none() && crate::cell::now_ns() < end {
+        host.step();
+    }
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::REQUESTS_STDOUT.into())
+    );
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0);
+    // Its connection finishes closing with the host: the kernel goes back
+    // to holding nothing for it.
+    let mut host = Host::new();
+    let end = crate::cell::now_ns() + 10_000_000_000;
+    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
+        host.wire_address(0);
+    }
+    assert!(!crate::cell::wire_busy(), "the card's connections closed");
+}
+
+/// The template case: a cell that imported numpy, suspended and resumed
+/// from the snapshot's bytes, forked, and frozen as a template, every copy
+/// finishes the computation without importing numpy again.
+#[cfg(feature = "packages")]
+fn a_cell_that_imported_numpy_suspends_resumes_and_forks() {
+    let Some(files) = packages() else { return };
+    let [python, flag, script] = expected::NUMPY_ARGV;
+    let mut host = Host::new();
+    let ready = |host: &mut Host| {
+        let id = spawn_python(host, &files, &[python, flag, script, "wait"]);
+        while host.output(id) != Some(b"ready\n") {
+            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
+            host.step();
+        }
+        id
+    };
+    let id = ready(&mut host);
+    let bytes = host.suspend(id).expect("live").into_bytes();
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let resumed = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    let children = host.fork(resumed, 2).expect("fork");
+    let template = ready(&mut host);
+    assert!(host.freeze(template));
+    let from_template: Vec<u32> = (0..2)
+        .map(|_| {
+            host.spawn_from_template(template, true, true)
+                .expect("fork")
+        })
+        .collect();
+    let all: Vec<u32> = [resumed]
+        .into_iter()
+        .chain(children)
+        .chain(from_template)
+        .collect();
+    host.run(|h| all.iter().all(|&id| h.finished(id).is_some()));
+    for id in all {
+        assert_eq!(
+            ended(&host, id),
+            (Ending::Exit(0), expected::NUMPY_STDOUT.into())
+        );
     }
 }
 

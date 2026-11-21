@@ -37,6 +37,11 @@ ktest-user-exec = ["ktest"]
 # 100 MiB, so only here); with `ktest`, run the Node.js tests only, with
 # `bench-cell`, measure the Node.js workload only. Their VMs get more memory.
 node = []
+# Packages from PyPI (change `add-pip-packages`): embed `packages-files`
+# (65 MiB: the dynamically linked CPython, numpy, requests); with `ktest`,
+# run the package tests only, with `bench-cell`, measure numpy only. Their
+# VMs get more memory.
+packages = []
 # Benchmark build: spawn and run the hello cell repeatedly and print
 # `rhizo-cell spawn_ns=<median>` (`cargo xtask bench`).
 bench-cell = ["cells"]

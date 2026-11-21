@@ -67,6 +67,17 @@ impl UserFault {
             .flatten()
     }
 
+    /// Whether the kernel answered the fault by emulating the instruction
+    /// (the AArch64 ID registers): never on x86_64, where cell code reads
+    /// what it needs of the CPU itself (`CPUID`).
+    #[allow(
+        clippy::unused_self,
+        reason = "the interface of AArch64's, which decodes the fault"
+    )]
+    pub fn emulate(&self, _regs: &mut Registers, _insn: impl FnOnce(u64) -> Option<u32>) -> bool {
+        false
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_exception(console, cell, &self.0);
