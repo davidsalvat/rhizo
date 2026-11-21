@@ -210,15 +210,57 @@
       "workload.python_warm_us/rhizo/qemu-q35": 501.731,
       "workload.warm_insns/rhizo/qemu-microvm-icount": 76646.0
     },
+    "ci-arm": {
+      "breakdown.cell_loop.copy_insns/rhizo/qemu-virt-icount": 3956288.0,
+      "breakdown.cell_loop.cow_insns/rhizo/qemu-virt-icount": 0.0,
+      "breakdown.cell_loop.entry_exit_insns/rhizo/qemu-virt-icount": 29232.0,
+      "breakdown.cell_loop.fault_insns/rhizo/qemu-virt-icount": 0.0,
+      "breakdown.cell_loop.frames_insns/rhizo/qemu-virt-icount": 740784.0,
+      "breakdown.cell_loop.idle_insns/rhizo/qemu-virt-icount": 0.0,
+      "breakdown.cell_loop.lock_insns/rhizo/qemu-virt-icount": 0.0,
+      "breakdown.cell_loop.net_insns/rhizo/qemu-virt-icount": 1024.0,
+      "breakdown.cell_loop.other_insns/rhizo/qemu-virt-icount": 195952.0,
+      "breakdown.cell_loop.sched_insns/rhizo/qemu-virt-icount": 66752.0,
+      "breakdown.cell_loop.spawn_insns/rhizo/qemu-virt-icount": 1628192.0,
+      "breakdown.cell_loop.syscall_insns/rhizo/qemu-virt-icount": 89808.0,
+      "breakdown.cell_loop.teardown_insns/rhizo/qemu-virt-icount": 1917520.0,
+      "breakdown.cell_loop.total_insns/rhizo/qemu-virt-icount": 8630016.0,
+      "breakdown.cell_loop.user_insns/rhizo/qemu-virt-icount": 4464.0,
+      "breakdown.fork_touch.copy_insns/rhizo/qemu-virt-icount": 26220688.0,
+      "breakdown.fork_touch.cow_insns/rhizo/qemu-virt-icount": 20352.0,
+      "breakdown.fork_touch.entry_exit_insns/rhizo/qemu-virt-icount": 4320.0,
+      "breakdown.fork_touch.fault_insns/rhizo/qemu-virt-icount": 0.0,
+      "breakdown.fork_touch.frames_insns/rhizo/qemu-virt-icount": 157520.0,
+      "breakdown.fork_touch.idle_insns/rhizo/qemu-virt-icount": 0.0,
+      "breakdown.fork_touch.lock_insns/rhizo/qemu-virt-icount": 0.0,
+      "breakdown.fork_touch.net_insns/rhizo/qemu-virt-icount": 336.0,
+      "breakdown.fork_touch.other_insns/rhizo/qemu-virt-icount": 12640.0,
+      "breakdown.fork_touch.sched_insns/rhizo/qemu-virt-icount": 1344.0,
+      "breakdown.fork_touch.spawn_insns/rhizo/qemu-virt-icount": 6864.0,
+      "breakdown.fork_touch.syscall_insns/rhizo/qemu-virt-icount": 1008.0,
+      "breakdown.fork_touch.teardown_insns/rhizo/qemu-virt-icount": 8896.0,
+      "breakdown.fork_touch.total_insns/rhizo/qemu-virt-icount": 26728736.0,
+      "breakdown.fork_touch.user_insns/rhizo/qemu-virt-icount": 294768.0,
+      "cell.cow_fault_insns/rhizo/qemu-virt-icount": 2576.0,
+      "cell.fork_insns/rhizo/qemu-virt-icount": 7424.0,
+      "cell.fork_touch_insns/rhizo/qemu-virt-icount": 26685568.0,
+      "cell.run_insns/rhizo/qemu-virt-icount": 123056.0,
+      "cell.spawn_from_template_insns/rhizo/qemu-virt-icount": 7376.0,
+      "cell.spawn_insns/rhizo/qemu-virt-icount": 50768.0,
+      "cell.switch_insns/rhizo/qemu-virt-icount": 832.0,
+      "cell.switch_untagged_insns/rhizo/qemu-virt-icount": 835.0,
+      "workload.cold_insns/rhizo/qemu-virt-icount": 39872528.0,
+      "workload.warm_insns/rhizo/qemu-virt-icount": 92592.0
+    },
     "dedicated": {}
   },
   "thresholds_pct": {
     "deterministic": 1,
+    "instructions": 2,
     "timing": {
       "ci": 100,
       "dedicated": 5
-    },
-    "instructions": 2
+    }
   },
   "ungated": {
     "ci": [
@@ -230,6 +272,10 @@
       "density.sched_p99_us",
       "density.wake_p99_us",
       "density.wasted_wakeups_pct",
+      "breakdown.",
+      "lock."
+    ],
+    "ci-arm": [
       "breakdown.",
       "lock."
     ],
