@@ -220,6 +220,13 @@ jobs:
         run: cargo xtask --arch x86_64 test --only ktest-smp --vmm cloud-hypervisor
       - name: Node.js tests on Firecracker
         run: cargo xtask --arch x86_64 test --only ktest-node --vmm firecracker
+      # The control plane over vsock, strangers included (change
+      # `authenticate-control-channel`): the step fails if it fell back to
+      # the serial line.
+      - name: Control plane on Firecracker (vsock)
+        run: cargo xtask --arch x86_64 test --only control --vmm firecracker
+      - name: Control plane on Cloud Hypervisor (vsock)
+        run: cargo xtask --arch x86_64 test --only control --vmm cloud-hypervisor
       - name: Save the CPython build
         if: always() && steps.setup.outputs.cpython-hit != 'true' && hashFiles('target/cpython/*/recipe') != ''
         uses: actions/cache/save@v4

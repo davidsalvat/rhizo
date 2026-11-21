@@ -74,6 +74,7 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
         return Err(crate::client::upgrade(vm.protocol)); // dropping the VM ends it
     }
     let _ = console.write_all(&std::mem::take(&mut vm.console));
+    let _ = writeln!(console, "[rhizo] control frames over {}", vm.channel);
     let _ = fs::remove_file(dir.socket());
     let listener = UnixListener::bind(dir.socket())
         .map_err(|e| format!("cannot listen on {}: {e}", dir.socket().display()))?;

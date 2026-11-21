@@ -135,6 +135,24 @@ the host's connection before its secret arrives. Both are denial of
 service by a local user (attacker 5 of the audit scope), with no access
 to any cell. `xtask` reports the failed hello and stops the VM.
 
+## D6. The vsock path runs in pull requests
+
+Before this change CI never drove a control kernel over vsock in a pull
+request: `vhost_vsock_usable` looked for `/dev/vhost-vsock` before loading
+the module that creates it, so QEMU fell back to the serial line, and the
+KVM job ran no control step. A fallback is silent by design (a user
+without the device still gets a working channel), which hid it.
+
+- On a CI runner the module is loaded (`modprobe vhost_vsock`, `udevadm
+  settle`) before the device is looked for.
+- The `control` step prints the channel it used. On a CI runner, a VMM
+  that has a socket device there (Firecracker, Cloud Hypervisor, QEMU
+  with KVM) must use vsock: the stranger check and `rhizo up`'s
+  `console.log` line (`[rhizo] control frames over ...`) both fail the
+  step on a fallback.
+- The KVM job runs the step on Firecracker and Cloud Hypervisor; the
+  x86_64 job already runs it on `qemu-microvm` with KVM.
+
 ## Measurements
 
 Not on the per-request path: one 32-byte write when the host connects,

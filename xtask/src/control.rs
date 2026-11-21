@@ -1293,9 +1293,6 @@ fn read_reply(stream: &mut UnixStream, id: u32) -> Result<Message> {
 fn strangers_are_refused(vmm: Vmm, accel: Accel, kernel: &Path, reproduce: &str) -> Result {
     let opts = run_options(accel, 1, vmm::DEFAULT_MEMORY_MIB);
     let mut vm = Vm::boot(vmm, kernel, opts, Stdio::null())?;
-    let (Some(v), Some(secret)) = (vm.vsock, vm.secret()) else {
-        return Ok(());
-    };
     let fail = |vm: &Vm, what: &str, expected: &str, actual: &str| {
         Failure::new("control", what)
             .expected(expected)
@@ -1307,6 +1304,23 @@ fn strangers_are_refused(vmm: Vmm, accel: Accel, kernel: &Path, reproduce: &str)
             .reproduce(reproduce)
             .into_error()
     };
+    let (Some(v), Some(secret)) = (vm.vsock, vm.secret()) else {
+        let why = match vm.vsock {
+            None => vm.channel.clone(),
+            Some(_) => String::from("serial line (the kernel gave no vsock secret)"),
+        };
+        report::text(&format!("[xtask] control: frames over the {why}"));
+        if vsock_required(vmm, accel) {
+            return Err(fail(
+                &vm,
+                "on a CI runner a VMM with a socket device carries the control frames over vsock",
+                "vsock",
+                &why,
+            ));
+        }
+        return Ok(());
+    };
+    report::text("[xtask] control: frames over vsock, strangers checked");
     let power_off = Request::Shutdown.encode(1);
     let mut wrong = secret;
     wrong[SECRET_LEN - 1] ^= 1;
@@ -1383,6 +1397,15 @@ fn strangers_are_refused(vmm: Vmm, accel: Accel, kernel: &Path, reproduce: &str)
 pub fn build_rhizo() -> Result<PathBuf> {
     crate::cargo(&["build", "-p", "rhizo-cli", "--bin", "rhizo"])?;
     Ok(target_dir().join("debug").join("rhizo"))
+}
+
+/// Whether the control frames must take vsock: on a CI runner (`CI` set),
+/// on a VMM that has a socket device there (Firecracker, Cloud Hypervisor,
+/// and QEMU with KVM, whose runners get `/dev/vhost-vsock`), so that a
+/// fallback to the serial line never hides the vsock path (change
+/// `authenticate-control-channel`).
+fn vsock_required(vmm: Vmm, accel: Accel) -> bool {
+    std::env::var_os("CI").is_some() && (vmm.requires_kvm() || accel.uses_kvm())
 }
 
 /// The `control` test step (spec `control-plane`): boots `kernel` with
@@ -1471,6 +1494,11 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         !console.contains(SECRET_LINE),
         "the vsock secret stays out of the console log",
         "no secret line in `console.log`",
+    )?;
+    must(
+        !vsock_required(vmm, accel) || console.contains("[rhizo] control frames over vsock"),
+        "on a CI runner `rhizo up` carries the control frames over vsock",
+        "`[rhizo] control frames over vsock` in `console.log`",
     )?;
     let mode = std::fs::metadata(&state).map_or(0, |m| {
         std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777
