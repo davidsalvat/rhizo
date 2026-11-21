@@ -359,6 +359,7 @@ fn test_steps() -> Vec<&'static str> {
         "boot",
         "ktest",
         "ktest-smp",
+        "ktest-node",
         "control",
     ];
     steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
@@ -457,6 +458,26 @@ fn cmd_test(args: &RunArgs) -> Result {
             ));
         }
     }
+    if args.wants("ktest-node") {
+        match node_unavailable_reason() {
+            Some(why) => report::text(&format!("[xtask] Node.js tests not run: {why}")),
+            None => jobs.push(Job::vm(
+                format!("Node.js in cells on {} CPUs", NODE_CPUS),
+                keep_kernel(
+                    "ktest-node",
+                    &build_kernel(Profile::Debug, &["ktest", "node"])?,
+                )?,
+                RunOptions {
+                    network: true,
+                    cpus: NODE_CPUS,
+                    memory_mib: NODE_MEMORY_MIB,
+                    ..opts
+                },
+                Check::Ktest { cpus: NODE_CPUS },
+                args.reproduce("ktest-node"),
+            )),
+        }
+    }
     if args.wants("control") {
         let kernel = keep_kernel("control", &build_kernel(Profile::Debug, &["control"])?)?;
         jobs.push(Job {
@@ -490,6 +511,23 @@ fn cmd_test(args: &RunArgs) -> Result {
         ));
     }
     run_jobs(args.vmm, &jobs, parallel)
+}
+
+/// Memory of the VMs that run Node.js (change `add-node-workload`): its
+/// files embedded in the kernel and decoded into a cell file system (over
+/// 100 MiB each), the file pages it maps, and its heap.
+pub(crate) const NODE_MEMORY_MIB: u32 = 1024;
+/// CPUs of the Node.js test VM: its threads run on several at once.
+const NODE_CPUS: u32 = 2;
+
+/// Why the Node.js kernels are not built, if they are not: Node.js is
+/// downloaded only with `RHIZO_NODE` set, and packed natively only (as the
+/// distribution's programs: its libraries are the host's).
+pub(crate) fn node_unavailable_reason() -> Option<String> {
+    if env::var_os("RHIZO_NODE").is_none() {
+        return Some("RHIZO_NODE is not set".into());
+    }
+    differential::unavailable_reason().map(|why| format!("it is packed natively only ({why})"))
 }
 
 /// Most in-kernel test VMs one step is split into.

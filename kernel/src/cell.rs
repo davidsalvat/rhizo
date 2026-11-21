@@ -232,8 +232,10 @@ const KEPT_IMAGES: usize = 4;
 /// reserve) and given back before any cell is refused memory (D4).
 static IMAGES: Global<Images<KEPT_IMAGES>> = Global::new(Images::new());
 
-/// Most file pages kept (design D1 of `add-dynamic-linking`): 64 MiB.
-const KEPT_PAGES: usize = 16384;
+/// Most file pages kept (design D1 of `add-dynamic-linking`): 256 MiB, as
+/// much as a cell may hold in files (Node.js maps over 100 MiB of its own;
+/// change `add-node-workload`).
+const KEPT_PAGES: usize = 65536;
 
 /// Pages of files mapped into cells, kept by content (spec `cells`, file
 /// pages shared between cells): one read-only frame for every mapping of the
@@ -3225,6 +3227,18 @@ pub fn dynamic_files() -> Option<Fs> {
 pub fn distro_files() -> Option<Fs> {
     static FILES: Global<Option<Fs>> = Global::new(None);
     decoded(&FILES, "distro-files")
+}
+
+/// The files of Node.js (`node-files`: the official build, its interpreter
+/// and libraries, `/app/demo.js`; change `add-node-workload`), as
+/// [`dynamic_files`]; embedded in the `node` kernels only.
+#[cfg_attr(
+    not(feature = "node"),
+    allow(dead_code, reason = "used by the Node.js tests and benchmark")
+)]
+pub fn node_files() -> Option<Fs> {
+    static FILES: Global<Option<Fs>> = Global::new(None);
+    decoded(&FILES, "node-files")
 }
 
 /// The file system packed as test image `name`, decoded into `slot` the
