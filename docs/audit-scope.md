@@ -8,7 +8,7 @@ audit to answer. The internal reviews it builds on are in
 [`security.md`](security.md); the requirements are in
 [`openspec/specs/`](../openspec/specs/).
 
-It describes `main` as of commit `48c0dd3` (November 2026). Line counts
+It describes `main` as of commit `ad7c3ee` (November 2026). Line counts
 were taken with `wc -l` on that commit; "code" excludes test modules and
 test files, "tests" counts them.
 
@@ -48,7 +48,7 @@ to the cell. There is no KASLR and no secrecy about the kernel's layout.
 
 | # | Boundary | Who is on the other side | Trust |
 |---|---|---|---|
-| B1 | **Cell to kernel**: exceptions, system calls (100 Linux calls decoded, both calling conventions), page faults, timer interrupts | Arbitrary code at EL0 / ring 3 | **Untrusted.** The main boundary. |
+| B1 | **Cell to kernel**: exceptions, system calls (107 Linux calls decoded, both calling conventions), page faults, timer interrupts | Arbitrary code at EL0 / ring 3 | **Untrusted.** The main boundary. |
 | B2 | **Cell to cell**: shared frames after fork and template copies, shared page cache, loopback and Unix sockets, the kernel-wide socket and port pools | Another hostile cell | **Untrusted.** |
 | B3 | **Snapshot bytes to kernel**: `Snapshot::from_bytes`, `Fs::decode`, socket records | Whoever wrote the snapshot | **Untrusted by design**, for downloadable templates ([`vision.md`](vision.md)). On `main` no production path reads snapshot bytes from outside the kernel yet: the control kernel keeps snapshots in memory, and only in-kernel tests round-trip bytes. The decoder is built and fuzzed for that future input. |
 | B4 | **Cell files to program loader**: `Host::spawn_file` and `rhizo_abi::exec` start an executable and its `PT_INTERP` interpreter from the cell's own files | A cell that wrote those files | **Untrusted** (ELF headers are hostile). |
@@ -119,7 +119,7 @@ reviewed or fuzzed as such; we ask the audit to cover it (section 6).
   Q15).
 - **Builds other than the ones cells run in**: the cost accounting and
   sampling features (`profile`, `sampling`) and benchmark-only code
-  (`kernel/src/cell.rs` from `pub fn run`, line 2790, on).
+  (`kernel/src/cell.rs` from `pub fn run`, line 2792, on).
 
 ## 3. In-scope components, ranked by risk
 
@@ -131,21 +131,21 @@ only), see section 4.
 
 | Rank | Area | Boundary | Files | Code LOC | Test LOC | Why this rank |
 |---|---|---|---|---|---|---|
-| 1 | **Kernel entry and exit, privileged state** | B1 | `kernel/src/arch/x86_64/{user,cpu,irq}.rs`, `kernel/src/arch/aarch64/{user,cpu,irq}.rs` | 358 + 608 + 288 + 404 + 270 + 287 = 2,215 | in `kernel/src/tests.rs` | Assembly and system registers on two architectures: `SWAPGS`, `SYSRET`/`IRET` return paths, `SPSR_EL1`/`RFLAGS` sanitising, FP/SIMD lazy switching, SMEP/SMAP, PAN/PXN. Not fuzzed; read and exercised by hostile cells only. |
-| 2 | **System-call layer** (`rhizo-abi`) | B1, B2 | `crates/rhizo-abi/src/{lib,files,sockets,poll,threads,pages,exec}.rs` | 1,266 + 656 + 875 + 461 + 228 + 108 + 83 = 3,677 | 2,922 | Every argument of 100 calls; futexes, `clone`/`clone3`, `epoll`, `sendmsg`/`recvmsg`, file `mmap` and the page cache shared by content between cells. Fuzzed on the host with test doubles. |
+| 1 | **Kernel entry and exit, privileged state** | B1 | `kernel/src/arch/x86_64/{user,cpu,irq}.rs`, `kernel/src/arch/aarch64/{user,cpu,irq}.rs` | 358 + 608 + 288 + 410 + 270 + 287 = 2,221 | in `kernel/src/tests.rs` | Assembly and system registers on two architectures: `SWAPGS`, `SYSRET`/`IRET` return paths, `SPSR_EL1`/`RFLAGS` sanitising, FP/SIMD lazy switching, SMEP/SMAP, PAN/PXN. Not fuzzed; read and exercised by hostile cells only. |
+| 2 | **System-call layer** (`rhizo-abi`) | B1, B2 | `crates/rhizo-abi/src/{lib,files,sockets,poll,threads,pages,exec}.rs` | 1,390 + 656 + 875 + 461 + 228 + 108 + 83 = 3,801 | 2,986 | Every argument of 107 calls; futexes, `clone`/`clone3`, `epoll`, `sendmsg`/`recvmsg`, file `mmap` and the page cache shared by content between cells. Fuzzed on the host with test doubles. |
 | 3 | **User memory access and address spaces** (`rhizo-cell`) | B1, B4 | `crates/rhizo-cell/src/{memory,space,elf,threads,lib,images}.rs` | 166 + 287 + 590 + 317 + 492 + 65 = 1,917 | 1,393 | `memory.rs` is the only way into cell memory: it translates in the cell's own table and copies through the direct map, which SMAP/PAN do not guard. The ELF loader takes hostile headers (B4). |
 | 4 | **Page tables, copy-on-write, frames** (`rhizo-mm`) | B1, B2 | `crates/rhizo-mm/src/{paging,cow,frames,heap,memmap,lib}.rs` | 690 + 374 + 263 + 185 + 135 + 40 = 1,687 | 1,604 | Two entry formats (x86_64, AArch64), shared page tables between forks, 16-bit frame reference counts (S14), 2 MiB pages. Critical findings S1, S2, S12 were here. Mutation-tested weekly. |
-| 5 | **Cell host, SMP, gangs, TLB shootdown** | B1, B2 | `kernel/src/cell.rs` (host part, lines 1 to 2789 of 4,258), `kernel/src/smp.rs`, `kernel/src/arch/{x86_64,aarch64}/smp.rs`, `kernel/src/memory.rs`, `kernel/src/sync.rs`, `crates/rhizo-sched/src/{lib,gangs,idle}.rs`, `crates/rhizo-core/src/sync.rs` | 2,789 + 193 + 346 + 206 + 308 + 79 + 530 + 216 = 4,667 | 668 (sched) + 109 (sync) + in-kernel | Threads of one cell on several CPUs, the cell lock, the x86_64 clean-CPU set and shootdown interrupts, break-before-make on AArch64, freeing a cell from the last CPU to leave it. Races are tested by running them (`racer`), not by a model checker. |
+| 5 | **Cell host, SMP, gangs, TLB shootdown** | B1, B2 | `kernel/src/cell.rs` (host part, lines 1 to 2791 of 4,335), `kernel/src/smp.rs`, `kernel/src/arch/{x86_64,aarch64}/smp.rs`, `kernel/src/memory.rs`, `kernel/src/sync.rs`, `crates/rhizo-sched/src/{lib,gangs,idle}.rs`, `crates/rhizo-core/src/sync.rs` | 2,791 + 193 + 346 + 206 + 308 + 79 + 530 + 216 = 4,669 | 668 (sched) + 109 (sync) + in-kernel | Threads of one cell on several CPUs, the cell lock, the x86_64 clean-CPU set and shootdown interrupts, break-before-make on AArch64, freeing a cell from the last CPU to leave it. Races are tested by running them (`racer`), not by a model checker. |
 | 6 | **Snapshot decode and restore** | B3 | `crates/rhizo-snapshot/src/lib.rs`, `crates/rhizo-fs/src/codec.rs`, `crates/rhizo-net/src/record.rs`; restore and lazy resume in `kernel/src/cell.rs` (`Lazy`, `Host::resume`) | 574 + 535 + 239 = 1,348 | 609 (snapshot) | Fully attacker-controlled bytes once templates are downloaded; validates page records, threads, registers, the file tree and socket records. Fuzzed, no finding in D.2. Format version 7 on `main`. |
 | 7 | **Sockets and the TCP/IP stack** (`rhizo-net`, `smoltcp`) | B2, B5 | `crates/rhizo-net/src/{lib,wire}.rs`, `kernel/src/wire.rs`, plus `smoltcp` 0.14 (features `medium-ethernet`, `proto-ipv4`, `socket-tcp`, `socket-udp`, `socket-dhcpv4`) | 1,383 + 525 + 159 = 2,067 (Rhizo) | 1,297 | Shared by all cells: ports, backlogs, buffers, parked connections (S15, S21). Remote packets have not been in a review's threat model (B5). |
 | 8 | **In-memory file system** (`rhizo-fs`, outside the codec) | B1, B2 | `crates/rhizo-fs/src/{lib,io}.rs` | 1,222 + 601 = 1,823 | 962 | Per-cell tree, descriptors, pipes, `epoll`, file blocks shared copy-on-write between forks; limits from S5. |
-| 9 | **Control protocol and control kernel** | B7, B8 | `crates/rhizo-control/src/lib.rs`, `kernel/src/control.rs`, UART receive in `kernel/src/arch/{x86_64,aarch64}/console.rs`; host side `cli/src/{serve,client,state}.rs` | 742 + 478 = 1,220 (kernel side); `cli` 1,679 in all | 494 (control) + 248 (cli) | Host is trusted, so the risk is in decoding robustness and in output framing (can a cell make kernel console text contain a frame?). Fuzzed by property tests; reviewed by neither D.1 nor D.2. |
+| 9 | **Control protocol and control kernel** | B7, B8 | `crates/rhizo-control/src/lib.rs`, `kernel/src/control.rs`, UART receive in `kernel/src/arch/{x86_64,aarch64}/console.rs`; host side `cli/src/{serve,client,state}.rs` | 742 + 485 = 1,227 (kernel side); `cli` 1,698 in all | 494 (control) + 274 (cli) | Host is trusted, so the risk is in decoding robustness and in output framing (can a cell make kernel console text contain a frame?). Fuzzed by property tests; reviewed by neither D.1 nor D.2. |
 | 10 | **virtio drivers** | B6 | `crates/rhizo-virtio/src/{lib,pci}.rs` | 481 + 311 = 792 | 839 | Trusted device; robustness only. S17 found by the configuration-space fuzzer. |
 | 11 | **Boot-time parsing** | B9 | `crates/rhizo-core/src/{fdt,acpi,options}.rs`, `crates/rhizo-mm/src/memmap.rs` | 490 + 216 + 261 + 135 = 1,102 | 696 + 107 | Input from the trusted VMM and firmware. Listed for completeness; low priority. |
 
-For orientation, the whole kernel crate is 15,028 lines (12,091 code,
-2,937 in its test files), and the library crates hold 29,650 lines (17,081
-code, 12,569 tests). Benchmark, profiling and test code inside `kernel/src` is not in
+For orientation, the whole kernel crate is 15,269 lines (12,200 code,
+3,069 in its test files), and the library crates hold 29,838 lines (17,205
+code, 12,633 tests). Benchmark, profiling and test code inside `kernel/src` is not in
 scope.
 
 ## 4. `unsafe` code
@@ -153,12 +153,12 @@ scope.
 Counted on `main` with `grep`, excluding comments. Every block must carry a
 `// SAFETY:` comment (rule 5 of [`AGENTS.md`](../AGENTS.md); the workspace
 denies `unsafe_op_in_unsafe_fn` and warns on `undocumented_unsafe_blocks`
-in clippy, which CI runs with `-D warnings`). There are 167 `SAFETY:`
+in clippy, which CI runs with `-D warnings`). There are 168 `SAFETY:`
 comments in all.
 
 | Crate | `unsafe {}` blocks | `unsafe fn` | `unsafe impl` | `#[unsafe(...)]` | `unsafe extern` | Where |
 |---|---|---|---|---|---|---|
-| `kernel` | 149 (6 in `tests.rs`) | 10 | 2 | 6 | 9 | Arch code: `aarch64/user.rs` 18, `aarch64/irq.rs` 14, `x86_64/cpu.rs` 12, `x86_64/user.rs` 11, `x86_64/irq.rs` 10, `aarch64/platform.rs` 10, `memory.rs` 8, `cell.rs` 6, the rest 5 or fewer per file. 81 `asm!` sites and `global_asm!` in 7 files (boot, SMP start, entry and exception vectors). |
+| `kernel` | 150 (6 in `tests.rs`) | 10 | 2 | 6 | 9 | Arch code: `aarch64/user.rs` 19, `aarch64/irq.rs` 14, `x86_64/cpu.rs` 12, `x86_64/user.rs` 11, `x86_64/irq.rs` 10, `aarch64/platform.rs` 10, `memory.rs` 8, `cell.rs` 6, the rest 5 or fewer per file. 82 `asm!` sites and `global_asm!` in 7 files (boot, SMP start, entry and exception vectors). |
 | `rhizo-mm` | 11 | 3 | 1 | 0 | 0 | `heap.rs` only (kernel heap allocator; run under Miri in CI). |
 | `rhizo-core` | 3 | 0 | 1 | 0 | 0 | `sync.rs` only (the spinlock behind kernel globals). |
 | `rhizo-abi`, `rhizo-cell`, `rhizo-fs`, `rhizo-net`, `rhizo-snapshot`, `rhizo-virtio`, `rhizo-control`, `rhizo-sched`, `rhizo-hal`, `rhizo-prof` | 0 | 0 | 0 | 0 | 0 | None. Not enforced by `#![forbid(unsafe_code)]` today. |
@@ -228,7 +228,7 @@ PROPTEST_RNG_SEED=$RANDOM PROPTEST_CASES=4096 cargo test -p rhizo-snapshot -- ho
 ### Hostile cells in the kernel
 
 Programs in `cells/src/bin` run as cells by the in-kernel suite
-(`kernel/src/tests.rs`, 114 tests) on both architectures, with 1 and 4
+(`kernel/src/tests.rs`, 117 tests) on both architectures, with 1 and 4
 CPUs: `fuzz` (20,000 random calls next to a well-behaved cell),
 `hostile_ptrs`, `fault_kernel`, `poke_kernel`, `hog`, `storm`, `spin`,
 `scrub`, `namer`, `rewrite`, `flags`, `dice`, `sharer`, `racer`. Self-checks
@@ -242,7 +242,7 @@ on a kernel access to a cell page.
   `MIRIFLAGS=-Zmiri-disable-isolation`).
 - **Mutation testing** of `rhizo-mm` and `rhizo-core`, weekly:
   `cargo xtask mutants` (needs `cargo-mutants`).
-- **Host tests**: 481 `#[test]` functions plus the property tests above.
+- **Host tests**: 486 `#[test]` functions plus the property tests above.
 - **Dependency policy**: `cargo deny check` (licenses, advisories,
   sources) and `cargo machete` in CI.
 - **Differential check**: the cells' expected outputs
@@ -393,7 +393,7 @@ reviewing both architectures. Sizes are from section 3.
 | Ramp-up: architecture, specs, threat model, building and running the suites | 2 | 24 capability specs and two prior reviews to absorb; tooling is one command per step. |
 | Entry, exit, privileged state (rank 1) | 5 | About 2,200 lines of dense architecture code with inline and global assembly on two instruction sets; highest privilege; never fuzzed. |
 | Cell host, SMP, gangs, TLB shootdown (rank 5) | 5 | About 4,700 lines, much of it concurrent; needs reasoning about interleavings and memory ordering on hardware, which tests cannot show. |
-| System-call layer (rank 2) | 5 | About 3,700 lines over 100 calls, but no `unsafe` and already fuzzed; the time goes to threads, futexes, sockets and the shared page cache. |
+| System-call layer (rank 2) | 5 | About 3,800 lines over 107 calls, but no `unsafe` and already fuzzed; the time goes to threads, futexes, sockets and the shared page cache. |
 | User memory, address spaces, ELF (rank 3) | 3 | About 1,900 lines; `memory.rs` is short and central, the ELF loader takes hostile input. |
 | Page tables, COW, frames (rank 4) | 3 | About 1,700 lines with subtle invariants in two entry formats; past Critical findings were here, but it is the best tested crate. |
 | Snapshot decode and restore (rank 6) | 3 | About 1,350 lines of decoders plus the restore and lazy-resume paths; fully attacker-controlled input. |
@@ -401,7 +401,7 @@ reviewing both architectures. Sizes are from section 3.
 | File system (rank 8) | 1.5 | About 1,800 lines, no `unsafe`, fuzzed through decoded file systems. |
 | Control protocol and host framing (rank 9) | 1.5 | About 1,200 lines on the kernel side; trusted peer, so mostly decoder robustness and Q12. |
 | virtio and boot-time parsing (ranks 10, 11) | 1 | Trusted inputs; robustness only. |
-| `unsafe` sweep across `kernel`, `rhizo-mm`, `rhizo-core` | 2 | 163 blocks, 13 `unsafe fn`, 4 `unsafe impl`: each `SAFETY:` argument checked, beyond those already met in the areas above. |
+| `unsafe` sweep across `kernel`, `rhizo-mm`, `rhizo-core` | 2 | 164 blocks, 13 `unsafe fn`, 4 `unsafe impl`: each `SAFETY:` argument checked, beyond those already met in the areas above. |
 | Report, proof-of-concept inputs, retest | 3 | Writing up, building reproductions, retesting fixes. |
 | **Total** | **39** | About 8 weeks for one auditor, or 4 to 5 weeks for two working in parallel (P1 and P2 to one, P3 and P4 to the other). |
 
