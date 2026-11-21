@@ -1659,3 +1659,118 @@ fn wx_ranges_are_bounded() {
     assert_eq!(w.pager.wx.ranges().len(), space::MAX_WX_RANGES);
     assert_eq!(w.pager.wx.ranges()[0], (middle, first + 3 * FRAME_SIZE));
 }
+
+const MADVISE: u64 = 233;
+const MADV_WIPEONFORK: u64 = 18;
+const MADV_KEEPONFORK: u64 = 19;
+
+/// `MADV_WIPEONFORK` marks mapped memory and `MADV_KEEPONFORK` unmarks it
+/// (design D22 of `add-cell-hierarchy`); `munmap` and `MAP_FIXED` take
+/// their part out, `mprotect` keeps it. Addresses not mapped are refused
+/// with `ENOMEM`, an unaligned start or part of a 2 MiB page with
+/// `EINVAL`, and other advice changes nothing.
+#[test]
+fn wipeonfork_marks_and_keeponfork_unmarks() {
+    let mut w = World::new(Arch::Aarch64);
+    let anon = MAP_ANONYMOUS | MAP_PRIVATE;
+    let at = w.call(MMAP, &[0, 4 * FRAME_SIZE, 3, anon, u64::MAX, 0]).0 as u64;
+    assert_eq!(w.call(MADVISE, &[at, 4 * FRAME_SIZE, 4]).0, 0, "DONTNEED");
+    assert_eq!(w.pager.wx.wiped(), &[]);
+    assert_eq!(w.call(MADVISE, &[at, 100, MADV_WIPEONFORK]).0, 0);
+    assert_eq!(w.pager.wx.wiped(), &[(at, at + FRAME_SIZE)], "whole pages");
+    let end = at + 4 * FRAME_SIZE;
+    assert_eq!(w.call(MADVISE, &[at, 4 * FRAME_SIZE, MADV_WIPEONFORK]).0, 0);
+    assert_eq!(w.pager.wx.wiped(), &[(at, end)]);
+    let second = at + FRAME_SIZE;
+    assert_eq!(w.call(MADVISE, &[second, FRAME_SIZE, MADV_KEEPONFORK]).0, 0);
+    assert_eq!(
+        w.pager.wx.wiped(),
+        &[(at, second), (second + FRAME_SIZE, end)]
+    );
+    assert_eq!(w.call(226, &[at, FRAME_SIZE, 1]).0, 0, "mprotect keeps it");
+    assert_eq!(w.pager.wx.wiped()[0], (at, second));
+    assert_eq!(w.call(MUNMAP, &[end - FRAME_SIZE, FRAME_SIZE]).0, 0);
+    let fixed = at + 2 * FRAME_SIZE;
+    let got = w.call(MMAP, &[fixed, FRAME_SIZE, 3, anon | MAP_FIXED, u64::MAX, 0]);
+    assert_eq!(got.0 as u64, fixed);
+    assert_eq!(w.pager.wx.wiped(), &[(at, second)]);
+    assert!(w.pager.wx.ranges().is_empty());
+    // Refused, nothing changed.
+    let marks = w.pager.wx.clone();
+    let wipe = MADV_WIPEONFORK;
+    assert_eq!(w.call(MADVISE, &[end - FRAME_SIZE, 10, wipe]).0, -ENOMEM);
+    assert_eq!(w.call(MADVISE, &[at + 8, 10, wipe]).0, -EINVAL);
+    let big = w.call(MMAP, &[0, 2 << 20, 3, anon, u64::MAX, 0]).0 as u64;
+    assert_eq!(w.call(MADVISE, &[big, FRAME_SIZE, wipe]).0, -EINVAL);
+    assert_eq!(w.pager.wx, marks);
+    assert_eq!(w.call(MADVISE, &[big, 2 << 20, wipe]).0, 0, "a whole page");
+    assert_eq!(w.call(MADVISE, &[at, end - at, MADV_KEEPONFORK]).0, -ENOMEM);
+    assert_eq!(w.call(MADVISE, &[at, second - at, MADV_KEEPONFORK]).0, 0);
+    assert_eq!(w.pager.wx.wiped(), &[(big, big + (2 << 20))]);
+}
+
+/// A copy of a cell (here its fork) reads zero in its wipe ranges, with
+/// each page's permissions, while the source keeps its contents and pages
+/// outside the ranges stay shared (design D22 of `add-cell-hierarchy`).
+#[test]
+fn wipeonfork_pages_read_zero_in_a_copy() {
+    let mut w = World::new(Arch::Aarch64);
+    w.poke(DATA, &1u64.to_le_bytes());
+    assert_eq!(w.call(MADVISE, &[DATA, FRAME_SIZE, MADV_WIPEONFORK]).0, 0);
+    assert_eq!(w.call(MADVISE, &[RO, FRAME_SIZE, MADV_WIPEONFORK]).0, 0);
+    let anon = MAP_ANONYMOUS | MAP_PRIVATE;
+    let kept = w.call(MMAP, &[0, FRAME_SIZE, 3, anon, u64::MAX, 0]).0 as u64;
+    w.poke(kept, b"kept");
+    let ro_before = w.pt().translate(&w.mem, RO).unwrap();
+    let child = w.pt().fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    let wiped = w.pager.wx.wiped().to_vec();
+    let mut tlb = RecordingTlb::default();
+    space::wipe(&child, &mut w.mem, &mut tlb, &mut w.frames, &wiped).unwrap();
+    let read = |w: &World, pt: &PageTable<Aarch64>, at: u64| {
+        let mut out = [0u8; 8];
+        memory::copy_from(pt, &w.mem, at, &mut out).unwrap();
+        out
+    };
+    assert_eq!(read(&w, &child, DATA), [0; 8], "wiped in the copy");
+    assert_eq!(read(&w, &w.pt(), DATA), 1u64.to_le_bytes(), "the source's");
+    let ro = child.translate(&w.mem, RO).unwrap();
+    assert_ne!(ro.phys, ro_before.phys, "a frame of its own");
+    assert!(!ro.flags.is_writable(), "still read only");
+    let data = child.translate(&w.mem, DATA).unwrap();
+    assert!(
+        data.flags.is_writable() && data.flags.contains(PageFlags::NO_EXECUTE),
+        "{:?}",
+        data.flags
+    );
+    assert_eq!(&read(&w, &child, kept)[..4], b"kept", "shared as before");
+    assert_eq!(
+        child.translate(&w.mem, kept).unwrap().phys,
+        w.pt().translate(&w.mem, kept).unwrap().phys
+    );
+}
+
+/// A cell reads its copy generation in `/run/rhizo/generation`, 8 bytes
+/// little endian, as it is when opened; the file is read only (design D22
+/// of `add-cell-hierarchy`).
+#[test]
+fn copy_generation_reads_in_run_rhizo() {
+    const EROFS: i64 = 30;
+    let mut w = World::new(Arch::Aarch64);
+    let p = name(&mut w, "/run/rhizo/generation");
+    let fd = w.call(OPENAT, &[AT_FDCWD, p, 0x8_0000 /* O_CLOEXEC */]).0;
+    assert_eq!(fd, 3);
+    assert_eq!(w.call(READ, &[3, DATA, 100]).0, 8);
+    assert_eq!(w.peek(DATA, 8), 0u64.to_le_bytes());
+    assert_eq!(w.call(READ, &[3, DATA, 100]).0, 0);
+    w.cell.generation = 3;
+    assert_eq!(w.call(LSEEK, &[3, 0, 0]).0, 0);
+    assert_eq!(w.call(READ, &[3, DATA, 8]).0, 8);
+    assert_eq!(w.peek(DATA, 8), 0u64.to_le_bytes(), "as when opened");
+    assert_eq!(w.call(WRITE, &[3, DATA, 8]).0, -EBADF);
+    assert_eq!(w.call(CLOSE, &[3]).0, 0);
+    assert_eq!(w.call(OPENAT, &[AT_FDCWD, p, 0]).0, 3);
+    assert_eq!(w.call(READ, &[3, DATA, 8]).0, 8);
+    assert_eq!(w.peek(DATA, 8), 3u64.to_le_bytes());
+    assert_eq!(w.call(OPENAT, &[AT_FDCWD, p, 1]).0, -EROFS);
+    assert_eq!(w.call(OPENAT, &[AT_FDCWD, p, 0x42]).0, -EROFS);
+}

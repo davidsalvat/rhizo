@@ -1462,6 +1462,33 @@ ranges in snapshots, like the write-or-execute ranges. Nothing on system
 calls, switches or forks of cells that never use `MADV_WIPEONFORK`.
 Templates pay one file read per request.
 
+**As built in phase 1 (task 1.8b).**
+
+- The generation and the sticky bit are fields of the cell (the bit fits
+  in its padding). The wipe ranges share the one word the cell already
+  keeps for its write-or-execute ranges, so a cell without either still
+  pays one word.
+- Opening `/run/rhizo/generation` gives a file that no name refers to,
+  holding the value at the time of the open. It is matched by that
+  absolute path only, until the `/run/rhizo` directory of phase 2 (task
+  2.4) holds it.
+- A fork or a copy of a template replaces the pages of its wipe ranges with
+  zeroed frames that keep the same permissions. A snapshot holds those
+  pages as zeros, so no resume or load ever gets their contents, and no
+  file does either.
+- Until the tree section of format version 11 (task 1.10) holds them, the
+  generation, the sticky bit and the wipe ranges stay beside a snapshot in
+  the kernel. A cell loaded from a file gets a generation drawn from the
+  kernel's generator (never 0, below 2^62), not a count: the file does
+  not say what the cell saw, and a template that was itself a copy saw 1.
+  Counting would let two loads of it miss the change and draw the same
+  numbers. The loaded cell has no ranges and the bit clear.
+- The bit is set when a socket call of the cell reaches the network card.
+  The kernel's publication check refuses a template whose bit is set,
+  unless the host attests. Publishing (task 1.8a), the audit record (task
+  1.9b), and setting the bit for messages, handles and views (phases 2 and
+  3) come with their tasks.
+
 Alternatives:
 
 - The kernel reseeds user-space generators by writing into them.

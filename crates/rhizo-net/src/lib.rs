@@ -292,12 +292,19 @@ pub struct Ports {
     pub key: u32,
     /// The next port to try; 0 before the first.
     pub next: u16,
+    /// The call reached the network card (set here, never cleared): the
+    /// cell may now hold a secret (design D22 of `add-cell-hierarchy`).
+    pub out: bool,
 }
 
 impl Ports {
     /// The ports of the cell with identifier `key`, none taken yet.
     pub const fn new(key: u32) -> Self {
-        Self { key, next: 0 }
+        Self {
+            key,
+            next: 0,
+            out: false,
+        }
     }
 }
 
@@ -411,6 +418,13 @@ impl Net {
     /// the call left them.
     pub fn leave(&mut self) -> Option<Ports> {
         self.caller.take()
+    }
+
+    /// Notes that the calling cell's call reaches the network card.
+    fn went_out(&mut self) {
+        if let Some(caller) = &mut self.caller {
+            caller.out = true;
+        }
     }
 
     /// Where the ephemeral ports of the cell with `key` start: anywhere in
@@ -645,7 +659,7 @@ impl Net {
     fn ephemeral(&mut self, me: Handle, ty: Type) -> Result<u16> {
         let span = (EPHEMERAL.end() - EPHEMERAL.start()) as u32 + 1;
         let mut next = match self.caller {
-            Some(Ports { key, next: 0 }) => self.first_port(key),
+            Some(Ports { key, next: 0, .. }) => self.first_port(key),
             Some(Ports { next, .. }) => next,
             None => self.next_port,
         };
@@ -864,6 +878,7 @@ impl Net {
         if self.wire_addr().is_none() {
             return Err(Error::NetUnreach);
         }
+        self.went_out();
         if ty == Type::Dgram {
             self.autobind(h, ANY)?;
             self.get_mut(h)?.remote = Some(Addr::Inet { ip, port });
@@ -998,6 +1013,7 @@ impl Net {
             return Err(Error::MsgSize);
         }
         if !is_loopback(ip) {
+            self.went_out();
             self.autobind(h, ANY)?;
             let Some(Addr::Inet { port: mine, .. }) = self.get(h)?.local else {
                 return Err(Error::Invalid);

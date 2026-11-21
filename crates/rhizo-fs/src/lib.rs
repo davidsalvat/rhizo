@@ -624,6 +624,32 @@ impl Tables {
             .inspect_err(|_| self.descs[desc as usize] = None)
     }
 
+    /// Opens, read only, a new file holding `data` (at most one block)
+    /// that no name refers to: it goes when its last descriptor closes.
+    /// How the kernel hands a cell a value of its own, such as its copy
+    /// generation (design D22 of `add-cell-hierarchy`).
+    pub fn open_data(&mut self, data: &[u8]) -> Result<Fd> {
+        let ino = self.alloc_inode(Inode {
+            links: 0,
+            node: Node::File(File::default()),
+        })?;
+        let desc = self.new_desc(Target::Inode(ino), 0); // O_RDONLY
+        let Ok(fd) = self.new_fd(desc, 0, false) else {
+            self.descs[desc as usize] = None;
+            self.maybe_free(ino);
+            return Err(Error::TooManyFiles);
+        };
+        let written = self.write_with(fd, 0, data.len(), |dst| {
+            dst.copy_from_slice(data);
+            dst.len() == data.len()
+        });
+        if written != Ok(Some(data.len())) {
+            self.close(fd)?;
+            return Err(Error::NoSpace);
+        }
+        Ok(fd)
+    }
+
     /// `close`.
     pub fn close(&mut self, fd: Fd) -> Result<()> {
         let (d, _) = self

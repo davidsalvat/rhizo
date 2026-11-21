@@ -182,89 +182,204 @@ pub const WX_WRITING: PageFlags = PageFlags::USER
 /// Most write-or-execute ranges a cell may have (spec `isolation`).
 pub const MAX_WX_RANGES: usize = 64;
 
-/// A cell's write-or-execute ranges (design D5 of `node-jit`): addresses it
-/// asked writable and executable with no memory behind them yet, whose
-/// pages come zeroed, writing, the first time they are touched. Sorted,
-/// page aligned, never empty, never touching, at most [`MAX_WX_RANGES`].
+/// A cell's marked ranges: two lists of page-aligned `(start, end)` pairs,
+/// each sorted, never empty, never touching, at most [`MAX_WX_RANGES`]:
+///
+/// - its write-or-execute ranges (design D5 of `node-jit`): addresses it
+///   asked writable and executable with no memory behind them yet, whose
+///   pages come zeroed, writing, the first time they are touched;
+/// - its wipe ranges (`MADV_WIPEONFORK`, design D22 of
+///   `add-cell-hierarchy`): memory that reads as zero in every copy of the
+///   cell ([`wipe`]).
+///
 /// One word while there are none, as for nearly every cell: making,
 /// forking and dropping a cell costs nothing more.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(
-    clippy::box_collection,
-    reason = "one word in every live cell, not three: the extra allocation is only for cells with ranges"
-)]
-pub struct WxRanges(Option<Box<Vec<(u64, u64)>>>);
+pub struct WxRanges(Option<Box<Marks>>);
 
-/// More write-or-execute ranges than [`MAX_WX_RANGES`] would be needed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Marks {
+    wx: Vec<(u64, u64)>,
+    wipe: Vec<(u64, u64)>,
+}
+
+/// More ranges than [`MAX_WX_RANGES`] would be needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooManyRanges;
 
+/// Whether `ranges` keep the rules of [`WxRanges`] and lie within the
+/// cell's addresses.
+fn valid(ranges: &[(u64, u64)]) -> bool {
+    let aligned = |a: u64| a.is_multiple_of(FRAME_SIZE);
+    ranges.len() <= MAX_WX_RANGES
+        && ranges
+            .iter()
+            .all(|&(s, e)| aligned(s) && aligned(e) && s < e && e <= USER_END)
+        && ranges.windows(2).all(|w| w[0].1 < w[1].0)
+}
+
 impl WxRanges {
-    /// The ranges `ranges` (`(start, end)` pairs), if they keep the rules
-    /// above and lie within the cell's addresses.
+    /// The write-or-execute ranges `ranges` (`(start, end)` pairs), if they
+    /// keep the rules above and lie within the cell's addresses.
     pub fn from_ranges(ranges: Vec<(u64, u64)>) -> Option<Self> {
-        let aligned = |a: u64| a.is_multiple_of(FRAME_SIZE);
-        let valid = ranges.len() <= MAX_WX_RANGES
-            && ranges
-                .iter()
-                .all(|&(s, e)| aligned(s) && aligned(e) && s < e && e <= USER_END)
-            && ranges.windows(2).all(|w| w[0].1 < w[1].0);
-        valid.then(|| Self::of(ranges))
+        valid(&ranges).then(|| Self::of(ranges, Vec::new()))
     }
 
-    fn of(ranges: Vec<(u64, u64)>) -> Self {
-        Self((!ranges.is_empty()).then(|| Box::new(ranges)))
+    /// These ranges with `wipe` as their wipe ranges, if those keep the
+    /// rules above.
+    pub fn with_wiped(self, wipe: Vec<(u64, u64)>) -> Option<Self> {
+        let wx = self.0.map_or_else(Vec::new, |m| m.wx);
+        valid(&wipe).then(|| Self::of(wx, wipe))
     }
 
-    /// The ranges, in address order.
+    fn of(wx: Vec<(u64, u64)>, wipe: Vec<(u64, u64)>) -> Self {
+        Self((!wx.is_empty() || !wipe.is_empty()).then(|| Box::new(Marks { wx, wipe })))
+    }
+
+    /// The write-or-execute ranges, in address order.
     pub fn ranges(&self) -> &[(u64, u64)] {
-        self.0.as_deref().map_or(&[], Vec::as_slice)
+        self.0.as_deref().map_or(&[], |m| m.wx.as_slice())
     }
 
-    /// Whether `addr` lies in a range.
+    /// The wipe ranges, in address order.
+    pub fn wiped(&self) -> &[(u64, u64)] {
+        self.0.as_deref().map_or(&[], |m| m.wipe.as_slice())
+    }
+
+    /// Whether `addr` lies in a write-or-execute range.
     pub fn contains(&self, addr: u64) -> bool {
         self.ranges().iter().any(|&(s, e)| (s..e).contains(&addr))
     }
 
-    /// Adds `start..end` (page aligned), merged with the ranges it overlaps
-    /// or touches. Changes nothing if that would make too many.
+    /// Adds `start..end` (page aligned) to the write-or-execute ranges,
+    /// merged with those it overlaps or touches. Changes nothing if that
+    /// would make too many.
     pub fn add(&mut self, start: u64, end: u64) -> Result<(), TooManyRanges> {
-        if start >= end {
-            return Ok(());
-        }
-        let list = self.ranges();
-        let first = list.partition_point(|&(_, e)| e < start);
-        let last = list.partition_point(|&(s, _)| s <= end);
-        if first == last && list.len() == MAX_WX_RANGES {
-            return Err(TooManyRanges);
-        }
-        let merged = list[first..last]
-            .iter()
-            .fold((start, end), |(s, e), &(rs, re)| (s.min(rs), e.max(re)));
-        self.0.get_or_insert_default().splice(first..last, [merged]);
-        Ok(())
+        self.change(start, end, true, |m| &mut m.wx)
     }
 
-    /// Removes `start..end` from the ranges. Changes nothing if splitting a
-    /// range in two would make too many.
+    /// Removes `start..end` from the write-or-execute ranges. Changes
+    /// nothing if splitting a range in two would make too many.
     pub fn remove(&mut self, start: u64, end: u64) -> Result<(), TooManyRanges> {
-        let list = self.ranges();
-        let first = list.partition_point(|&(_, e)| e <= start);
-        let last = list.partition_point(|&(s, _)| s < end);
-        if first == last {
+        self.change(start, end, false, |m| &mut m.wx)
+    }
+
+    /// Adds `start..end` (page aligned) to the wipe ranges
+    /// (`MADV_WIPEONFORK`), as [`add`](Self::add) does.
+    pub fn wipe(&mut self, start: u64, end: u64) -> Result<(), TooManyRanges> {
+        self.change(start, end, true, |m| &mut m.wipe)
+    }
+
+    /// Removes `start..end` from the wipe ranges (`MADV_KEEPONFORK`, or the
+    /// memory unmapped), as [`remove`](Self::remove) does.
+    pub fn keep(&mut self, start: u64, end: u64) -> Result<(), TooManyRanges> {
+        self.change(start, end, false, |m| &mut m.wipe)
+    }
+
+    /// Adds `start..end` to the list `list` picks, or removes it; a cell
+    /// with no ranges allocates nothing unless it adds one.
+    fn change(
+        &mut self,
+        start: u64,
+        end: u64,
+        add: bool,
+        list: fn(&mut Marks) -> &mut Vec<(u64, u64)>,
+    ) -> Result<(), TooManyRanges> {
+        if start >= end || (!add && self.0.is_none()) {
             return Ok(());
         }
-        let left = (list[first].0 < start).then(|| (list[first].0, start));
-        let right = (list[last - 1].1 > end).then(|| (end, list[last - 1].1));
-        let kept = left.iter().chain(right.iter()).count();
-        if list.len() - (last - first) + kept > MAX_WX_RANGES {
-            return Err(TooManyRanges);
+        let marks = self.0.get_or_insert_default();
+        let result = if add {
+            add_to(list(marks), start, end)
+        } else {
+            remove_from(list(marks), start, end)
+        };
+        if marks.wx.is_empty() && marks.wipe.is_empty() {
+            self.0 = None;
         }
-        let mut list = core::mem::take(self).0.map_or_else(Vec::new, |b| *b);
-        list.splice(first..last, left.into_iter().chain(right));
-        *self = Self::of(list);
-        Ok(())
+        result
     }
+}
+
+/// Adds `start..end` to `list`, merged with the ranges it overlaps or
+/// touches. Changes nothing if that would make too many.
+fn add_to(list: &mut Vec<(u64, u64)>, start: u64, end: u64) -> Result<(), TooManyRanges> {
+    let first = list.partition_point(|&(_, e)| e < start);
+    let last = list.partition_point(|&(s, _)| s <= end);
+    if first == last && list.len() == MAX_WX_RANGES {
+        return Err(TooManyRanges);
+    }
+    let merged = list[first..last]
+        .iter()
+        .fold((start, end), |(s, e), &(rs, re)| (s.min(rs), e.max(re)));
+    list.splice(first..last, [merged]);
+    Ok(())
+}
+
+/// Removes `start..end` from `list`. Changes nothing if splitting a range
+/// in two would make too many.
+fn remove_from(list: &mut Vec<(u64, u64)>, start: u64, end: u64) -> Result<(), TooManyRanges> {
+    let first = list.partition_point(|&(_, e)| e <= start);
+    let last = list.partition_point(|&(s, _)| s < end);
+    if first == last {
+        return Ok(());
+    }
+    let left = (list[first].0 < start).then(|| (list[first].0, start));
+    let right = (list[last - 1].1 > end).then(|| (end, list[last - 1].1));
+    let kept = left.iter().chain(right.iter()).count();
+    if list.len() - (last - first) + kept > MAX_WX_RANGES {
+        return Err(TooManyRanges);
+    }
+    list.splice(first..last, left.into_iter().chain(right));
+    Ok(())
+}
+
+/// Makes every page mapped in `ranges` (a cell's wipe ranges) read as zero
+/// in the copy whose tables `pt` are (design D22 of `add-cell-hierarchy`):
+/// its frame goes, shared or not, and a zeroed one takes its place with the
+/// same permissions. A write-or-execute page is only unmapped: its range
+/// brings a zeroed one back on first touch. Addresses not mapped stay so.
+/// Fails, part done, when a 2 MiB page lies partly outside a range or no
+/// frame is left; the caller then drops the copy.
+pub fn wipe<F: EntryFormat>(
+    pt: &PageTable<F>,
+    mem: &mut impl PhysicalMemory,
+    tlb: &mut impl Tlb,
+    frames: &mut impl Frames,
+    ranges: &[(u64, u64)],
+) -> Result<(), MapError> {
+    for &(start, end) in ranges {
+        let mut at = start;
+        while at < end {
+            if pt.translate(mem, at).is_none() {
+                at = pt.hole_end(mem, at).unwrap_or(at + FRAME_SIZE).min(end);
+                continue;
+            }
+            // Its own tables first: a page shared after a fork then shows
+            // as copy-on-write rather than read only.
+            pt.unshare_path(mem, frames, at)?;
+            let t = pt.translate(mem, at).ok_or(MapError::OutOfFrames)?;
+            let (size, flags) = (t.size.bytes(), t.flags);
+            let base = at & !(size - 1);
+            if base < start || base + size > end {
+                return Err(MapError::OutOfFrames);
+            }
+            unmap(pt, mem, tlb, frames, base, size).map_err(|_| MapError::OutOfFrames)?;
+            if !flags.contains(PageFlags::WRITE_OR_EXEC) {
+                // A copy-on-write page was writable for the cell.
+                let mut kept = PageFlags::USER;
+                if flags.is_writable() || flags.contains(PageFlags::COPY_ON_WRITE) {
+                    kept = kept | PageFlags::WRITABLE;
+                }
+                if flags.contains(PageFlags::NO_EXECUTE) {
+                    kept = kept | PageFlags::NO_EXECUTE;
+                }
+                map_anonymous(pt, mem, tlb, frames, base, size, kept)?;
+            }
+            at = base + size;
+        }
+    }
+    Ok(())
 }
 
 /// Backs the page containing `addr` with a zeroed write-or-execute page,

@@ -651,7 +651,8 @@ impl Abi {
             Some(Sys::Readlink | Sys::Readlinkat) => -ENOENT,
             // Cells run as root of their own world: uid, gid 0; no parent.
             Some(Sys::Ids | Sys::Getppid) => 0,
-            Some(Sys::Sigaltstack | Sys::Madvise) => 0,
+            Some(Sys::Sigaltstack) => 0,
+            Some(Sys::Madvise) => madvise(cx, a[0], a[1], a[2]),
             Some(Sys::Futex) => match threads::futex(cell, cx, a) {
                 Some(result) => result,
                 None => return Outcome::Block,
@@ -661,8 +662,8 @@ impl Abi {
             Some(Sys::Stat | Sys::Lstat) => {
                 files::newfstatat(cx, self.arch, AT_FDCWD, a[0], a[1], 0)
             }
-            Some(Sys::Openat) => files::openat(cx, self.arch, a[0], a[1], a[2]),
-            Some(Sys::Open) => files::openat(cx, self.arch, AT_FDCWD, a[0], a[1]),
+            Some(Sys::Openat) => files::openat(cx, self.arch, cell, a[0], a[1], a[2]),
+            Some(Sys::Open) => files::openat(cx, self.arch, cell, AT_FDCWD, a[0], a[1]),
             Some(Sys::Close) => files::close(cx, a[0]),
             Some(Sys::Read) => files::read(cx, a[0], a[1], a[2], None),
             Some(Sys::Pread) => match a[3] as i64 {
@@ -760,17 +761,22 @@ impl Abi {
     /// `close-cross-cell-leaks`).
     fn with_ports<'c, F, M, T, A, S>(
         &mut self,
-        cell: &Cell,
+        cell: &mut Cell,
         cx: &mut Context<'c, F, M, T, A, S>,
         call: impl FnOnce(&mut Context<'c, F, M, T, A, S>) -> i64,
     ) -> i64 {
         let ports = Ports {
             key: cell.id,
             next: self.next_port,
+            out: false,
         };
         cx.net.net().enter(ports);
         let result = call(cx);
-        self.next_port = cx.net.net().leave().map_or(0, |p| p.next);
+        let ports = cx.net.net().leave();
+        self.next_port = ports.map_or(0, |p| p.next);
+        // A cell that reached the network card may hold a secret from
+        // outside (design D22 of `add-cell-hierarchy`).
+        cell.exposed |= ports.is_some_and(|p| p.out);
         result
     }
 
@@ -894,22 +900,28 @@ fn page_flags(prot: u64) -> PageFlags {
 
 /// The write-or-execute ranges `wx` once `addr..end` is taken out of them,
 /// and added back when `add`, or `None` when nothing changes; checked
-/// before anything else changes (design D5 of `node-jit`). A cell whose
-/// pager keeps no ranges (`None`) can have none.
+/// before anything else changes (design D5 of `node-jit`). When `unmap`,
+/// the range also leaves the wipe ranges (design D22 of
+/// `add-cell-hierarchy`). A cell whose pager keeps no ranges (`None`) can
+/// have none.
 fn wx_after(
     wx: Option<&mut WxRanges>,
     addr: u64,
     end: u64,
     add: bool,
+    unmap: bool,
 ) -> Result<Option<WxRanges>, TooManyRanges> {
     let Some(wx) = wx else {
         return if add { Err(TooManyRanges) } else { Ok(None) };
     };
-    if wx.ranges().is_empty() && !add {
+    if !add && wx.ranges().is_empty() && (!unmap || wx.wiped().is_empty()) {
         return Ok(None);
     }
     let mut after = wx.clone();
     after.remove(addr, end)?;
+    if unmap {
+        after.keep(addr, end)?;
+    }
     if add {
         after.add(addr, end)?;
     }
@@ -997,7 +1009,7 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     if prot != 0 && !wx && anonymous && !cx.services.can_store(len) {
         return -ENOMEM; // refused before any of it is zeroed
     }
-    let Ok(ranges) = wx_after(cx.pager.wx(), addr, addr + len, wx) else {
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, addr + len, wx, fixed) else {
         return -ENOMEM;
     };
     if fixed {
@@ -1045,7 +1057,7 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     if len == 0 || !addr.is_multiple_of(FRAME_SIZE) || end > STACK_TOP {
         return -EINVAL;
     }
-    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, false) else {
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, false, true) else {
         return -ENOMEM; // as Linux, when a split needs one area too many
     };
     match space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr) {
@@ -1056,6 +1068,58 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         }
         Err(_) => -EINVAL,
     }
+}
+
+/// `madvise`: advice is taken and ignored, except `MADV_WIPEONFORK` and
+/// `MADV_KEEPONFORK` (design D22 of `add-cell-hierarchy`), which add the
+/// cell's memory in `addr..addr + len` to its wipe ranges, which read as
+/// zero in every copy of the cell, or take it out. As on Linux, the range
+/// must be mapped (`ENOMEM`); here no 2 MiB page may lie partly outside it
+/// (`EINVAL`).
+fn madvise<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+    len: u64,
+    advice: u64,
+) -> i64 {
+    const MADV_WIPEONFORK: u64 = 18;
+    const MADV_KEEPONFORK: u64 = 19;
+    if advice != MADV_WIPEONFORK && advice != MADV_KEEPONFORK {
+        return 0;
+    }
+    let Some(end) = addr
+        .checked_add(len)
+        .map(|e| align_up(e, FRAME_SIZE))
+        .filter(|&e| e <= USER_END && addr.is_multiple_of(FRAME_SIZE))
+    else {
+        return -EINVAL;
+    };
+    let mut at = addr;
+    while at < end {
+        // Pages still in a snapshot, or of a stack still to grow, first.
+        let t = cx.pt.translate(cx.mem, at).or_else(|| {
+            cx.pager
+                .page_in(&cx.pt, cx.mem, at, false)
+                .then(|| cx.pt.translate(cx.mem, at))?
+        });
+        let Some(t) = t else {
+            return -ENOMEM;
+        };
+        let base = at & !(t.size.bytes() - 1);
+        if base < addr || base + t.size.bytes() > end {
+            return -EINVAL;
+        }
+        at = base + t.size.bytes();
+    }
+    let Some(marks) = cx.pager.wx() else {
+        return -EINVAL;
+    };
+    let done = if advice == MADV_WIPEONFORK {
+        marks.wipe(addr, end)
+    } else {
+        marks.keep(addr, end)
+    };
+    if done.is_ok() { 0 } else { -ENOMEM }
 }
 
 /// `sysinfo`, as the cell sees itself (design D1 of
@@ -1362,7 +1426,7 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     };
     // Write-or-execute ranges lose what this call covers, or take it all
     // (design D5 of `node-jit`); checked before anything changes.
-    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, is_wx(prot)) else {
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, is_wx(prot), false) else {
         return -ENOMEM;
     };
     if is_wx(prot) {

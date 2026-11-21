@@ -201,6 +201,7 @@ fn console<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     arch: Arch,
+    cell: &Cell,
     dir: u64,
     addr: u64,
     flags: u64,
@@ -211,6 +212,9 @@ pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         let access = flags & O_ACCMODE;
         if access == 3 {
             return Err(-EINVAL);
+        }
+        if name == GENERATION {
+            return generation(cx, cell, access, flags);
         }
         let how = OpenFlags {
             read: access != 1,
@@ -232,6 +236,36 @@ pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         Ok(fd as i64)
     };
     run().unwrap_or_else(|e| e)
+}
+
+/// Where a cell reads its copy generation (design D22 of
+/// `add-cell-hierarchy`), by this absolute path only.
+const GENERATION: &[u8] = b"/run/rhizo/generation";
+
+/// Opens the cell's copy generation: 8 bytes, little endian, as they are
+/// when it is opened, in a file of its own that no name refers to. Read
+/// only (`EROFS`).
+fn generation<F, M, T, A, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    cell: &Cell,
+    access: u64,
+    flags: u64,
+) -> Result<i64, i64> {
+    const EROFS: i64 = 30;
+    if access != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
+        return Err(-EROFS);
+    }
+    if !cx.services.can_store(NAME_BYTES) {
+        return Err(-ENOSPC);
+    }
+    let fd = cx
+        .fs
+        .open_data(&cell.generation.to_le_bytes())
+        .map_err(err)?;
+    if flags & O_CLOEXEC != 0 {
+        let _ = cx.fs.cloexec(fd, Some(true));
+    }
+    Ok(fd.into())
 }
 
 pub(crate) fn close<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, fd: u64) -> i64 {
