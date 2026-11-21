@@ -2,7 +2,7 @@
 
 ## 1. Format
 
-- [x] 1.1 Format version 9: waits on descriptors and kept call deadlines with their time left, `Snapshot::deadlines` (D5); verify `cargo test -p rhizo-snapshot waits_on_descriptors`
+- [x] 1.1 Format version 10: waits on descriptors and kept call deadlines with their time left, `Snapshot::deadlines` (D5); verify `cargo test -p rhizo-snapshot waits_on_descriptors`
 - [x] 1.2 Exported form with its CRC-32C, checked after the header, `export(&self)` (D1); verify `cargo test -p rhizo-snapshot` (`rejects_what_it_cannot_resume`, `the_checksum_is_crc32c`, `shared_pages_are_referred_to_*`)
 - [x] 1.3 `cap_quota` and the hostile-snapshot property tests on the sealed form (D4); verify `cargo test -p rhizo-snapshot` (`quotas_from_outside_are_capped`, `hostile::*`, `records_that_refer_to_frames_are_refused`)
 

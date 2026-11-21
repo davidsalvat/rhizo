@@ -21,7 +21,7 @@ fixed here.
 
 ## What Changes
 
-- **Snapshot format version 9.** A thread waiting on descriptors is
+- **Snapshot format version 10.** A thread waiting on descriptors is
   recorded as such (wait kind 3) with the time its call had left, and a
   runnable thread with the time left of the call it makes again; a resumed
   cell's calls end when they would have.
@@ -41,7 +41,7 @@ fixed here.
 - **Transport: the serial line, measured.** The control channel carries
   the chunks; the design gives the measured rates and the faster path
   (a virtio-blk exchange disk) as follow-up.
-- **Tests**: format v9 and the checksum on the host, the hostile-snapshot
+- **Tests**: format v10 and the checksum on the host, the hostile-snapshot
   property tests on the sealed (import) form, two in-kernel tests (a wait
   on descriptors keeps its time left across suspend; a template travels as
   bytes), and the `control` step: the CPython chat agent frozen into a
@@ -65,7 +65,7 @@ architectures.
 
 ### Modified Capabilities
 
-- `snapshots`: format version 9 (time left of waits on descriptors), the
+- `snapshots`: format version 10 (time left of waits on descriptors), the
   exported form with its checksum, files across boots.
 - `control-plane`: templates, `save` and `load` (protocol version 3), the
   `rhizo` commands.
@@ -75,7 +75,7 @@ architectures.
 
 ## Impact
 
-`crates/rhizo-snapshot` (version 9, checksum, `cap_quota`, `deadlines`,
+`crates/rhizo-snapshot` (version 10, checksum, `cap_quota`, `deadlines`,
 `export(&self)`), `crates/rhizo-control` (version 3), `kernel/src/cell.rs`
 (`Host::load_template`, `template_snapshot`, `drop_template`, deadlines
 across suspend and resume), `kernel/src/control.rs`, `kernel/src/tests.rs`,

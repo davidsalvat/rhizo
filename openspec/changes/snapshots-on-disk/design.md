@@ -12,7 +12,7 @@ architecture took it (ELF machine).
 `from_bytes` checks, in order: the header (magic, version, machine), the
 checksum, then everything the snapshot holds, as before. The order gives
 the clearest reason: a file of another version or architecture says so
-(`snapshot format version 8; this kernel reads version 9`, `taken on
+(`snapshot format version 8; this kernel reads version 10`, `taken on
 aarch64; this kernel runs on x86_64`) rather than a checksum mismatch,
 while any other damage, a cut file included, reads `checksum mismatch:
 the file is damaged or truncated`. The checksum is stripped once checked,
@@ -138,7 +138,7 @@ The control plane gains:
 - `load --template` restores the snapshot eagerly into a cell that never
   enters the scheduler and becomes a template (`Host::load_template`).
 
-A loaded template's threads wait as they waited when frozen (format v9,
+A loaded template's threads wait as they waited when frozen (format v10,
 D5), so its copies time out their waits on descriptors at once, as copies
 of the original did (`fast-node-template`).
 
@@ -169,15 +169,15 @@ makes the checksum right again for 9 cases in 10 (as a hostile file has
 it), so the edits reach the checks behind it, and leaves it wrong for the
 rest; the random-bytes test seals every case.
 
-## D5. Format version 9: waits on descriptors keep their time left
+## D5. Format version 10: waits on descriptors keep their time left
 
 A thread blocked in `poll`, `select` or `epoll_wait` is back at its system
 call instruction and makes the call again when it runs; the call's
 deadline lives in the host's record of the live cell (`Live::deadlines`),
-not in the thread. Version 8 wrote such a thread as runnable without time,
+not in the thread. Versions up to 9 wrote such a thread as runnable without time,
 so a resumed cell started the call's timeout over.
 
-Version 9 keeps the thread word layout and gives two meanings to the time
+Version 10 keeps the thread word layout and gives two meanings to the time
 word:
 
 - wait kind 3 (new): waiting on descriptors, with the time its wait had

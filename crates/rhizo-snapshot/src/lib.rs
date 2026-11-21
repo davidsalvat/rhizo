@@ -6,20 +6,21 @@
 //! copies each page exactly once.
 //!
 //! ```text
-//! header   "RHZSNAP1", version u32, machine u16, reserved u16, pages u32,
-//!          threads u32                                       (24 bytes)
+//! header   "RHZSNAP1", version u32, machine u16, write-or-execute
+//!          ranges u16 (version 9), pages u32, threads u32    (24 bytes)
 //! state    brk_start, brk, mmap_next, next thread identifier, then
 //!          (version 8) the quotas: memory bytes, CPU ns, CPU ns used,
 //!          files (low 32 bits) and sockets (high 32 bits)  (8 x u64)
 //! threads  per thread, the current one first: tid, clear_tid, wait kind
 //!          (0 runnable, 1 sleep, 2 futex, 3 descriptors), futex address,
 //!          futex bitset, time left in ns (u64::MAX: no deadline; version
-//!          9: for kinds 0 and 3, that of the call on descriptors the
+//!          10: for kinds 0 and 3, that of the call on descriptors the
 //!          thread makes again), pc, sp, gpr[31], tls, flags, fp[66]
 //!                                                 (107 x u64, 856 bytes each)
+//! ranges   per write-or-execute range: start u64, end u64 (version 9)
 //! records  per page: virt u64, data offset u64, size u8 (0 = 4 KiB,
-//!          1 = 2 MiB), permissions u8 (1 W, 2 USER, 4 NX), 6 zero bytes
-//!                                                     (24 bytes each)
+//!          1 = 2 MiB), permissions u8 (1 W, 2 USER, 4 NX, 8 write-or-
+//!          execute: version 9), 6 zero bytes          (24 bytes each)
 //! data     page contents, in record order
 //! files    length u64, then the cell's file system as `rhizo_fs` encodes
 //!          it (tree, open descriptions and descriptors, pipes, event
@@ -53,7 +54,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rhizo_cell::elf::Machine;
 use rhizo_cell::quota::Quota;
-use rhizo_cell::space::Frames;
+use rhizo_cell::space::{Frames, WxRanges};
 use rhizo_cell::threads::{Thread, Threads, Wait};
 use rhizo_cell::{Cell, Registers, USER_END};
 use rhizo_fs::Fs;
@@ -64,13 +65,15 @@ use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 const HEADER: usize = 24;
 const STATE: usize = 8 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.
 const THREAD_WORDS: usize = 6 + 35 + 66;
 const THREAD: usize = THREAD_WORDS * 8;
 const RECORD: usize = 24;
+/// Bytes of a write-or-execute range: start and end.
+const RANGE: usize = 16;
 /// The first reserved byte of a record, 1 if it refers to a frame.
 const REFERS: usize = 18;
 /// "No deadline" in a thread's time left.
@@ -97,6 +100,9 @@ pub enum FormatError {
     /// Thread `index` is malformed: identifier (zero, repeated or not below
     /// the next one), wait kind, futex address or bitset; or there is none.
     BadThread { index: usize },
+    /// The write-or-execute ranges are unaligned, empty, out of order,
+    /// touching, past `USER_END` or too many.
+    BadRanges,
     /// The files section does not decode to a consistent file system.
     BadFiles,
     /// The sockets section does not decode, or its records do not match
@@ -148,6 +154,9 @@ pub struct Snapshot {
     /// Records that refer to a frame.
     frames: usize,
     release: Release,
+    /// Where the page records start (after the threads and ranges), read
+    /// once: every page lookup needs it.
+    records: usize,
 }
 
 impl PartialEq for Snapshot {
@@ -183,11 +192,12 @@ fn encode_flags(f: PageFlags) -> u8 {
     (f.contains(PageFlags::WRITABLE) || f.contains(PageFlags::COPY_ON_WRITE)) as u8
         | ((f.contains(PageFlags::USER) as u8) << 1)
         | ((f.contains(PageFlags::NO_EXECUTE) as u8) << 2)
+        | ((f.contains(PageFlags::WRITE_OR_EXEC) as u8) << 3)
 }
 
 fn decode_flags(b: u8) -> Option<PageFlags> {
     let mut f = PageFlags::USER;
-    if b & 2 == 0 || b & !7 != 0 {
+    if b & 2 == 0 || b & !15 != 0 {
         return None; // only user pages, no unknown bits
     }
     if b & 1 != 0 {
@@ -196,8 +206,15 @@ fn decode_flags(b: u8) -> Option<PageFlags> {
     if b & 4 != 0 {
         f = f | PageFlags::NO_EXECUTE;
     }
-    // W^X: writable pages are never executable.
-    (!(f.is_writable() && f.is_executable())).then_some(f)
+    // W^X: writable pages are never executable, and a write-or-execute
+    // page is one of the two (writing or running), never neither.
+    let wx = b & 8 != 0;
+    if wx {
+        f = f | PageFlags::WRITE_OR_EXEC;
+    }
+    let ok =
+        !(f.is_writable() && f.is_executable()) && (!wx || f.is_writable() == !f.is_executable());
+    ok.then_some(f)
 }
 
 /// The words of thread `t` in the format; deadlines become time left after
@@ -236,11 +253,11 @@ fn thread_words(t: &Thread, kept: Option<u64>, now: u64) -> impl Iterator<Item =
 }
 
 impl Snapshot {
-    /// Captures `cell` (not running) and the user half of its page table;
-    /// its threads' deadlines, and `deadlines` (thread, deadline) of the
-    /// calls on descriptors they make again, are kept as time left after
-    /// monotonic time `now`. `files` refers to its sockets by index in
-    /// `sockets`.
+    /// Captures `cell` (not running), its write-or-execute ranges `wx` and
+    /// the user half of its page table; its threads' deadlines, and
+    /// `deadlines` (thread, deadline) of the calls on descriptors they make
+    /// again, are kept as time left after monotonic time `now`. `files`
+    /// refers to its sockets by index in `sockets`.
     ///
     /// Every table of the cell is made its own first, without copying a
     /// page ([`PageTable::unshare_tables`]); then a page other cells share
@@ -254,6 +271,7 @@ impl Snapshot {
         machine: Machine,
         cell: &Cell,
         deadlines: &[(u32, u64)],
+        wx: &WxRanges,
         files: &Fs,
         sockets: &[Record],
         now: u64,
@@ -276,7 +294,8 @@ impl Snapshot {
             refers.push(refer);
         });
         let (pages, threads) = (refers.len(), cell.threads.len());
-        let data_start = HEADER + STATE + threads * THREAD + pages * RECORD;
+        let ranges = wx.ranges();
+        let data_start = HEADER + STATE + threads * THREAD + ranges.len() * RANGE + pages * RECORD;
         let mut encoded = Vec::new();
         files.encode(&mut encoded);
         let mut records = Vec::new();
@@ -294,7 +313,8 @@ impl Snapshot {
         put(MAGIC);
         put(&VERSION.to_le_bytes());
         put(&(machine as u16).to_le_bytes());
-        put(&[0, 0]);
+        // At most 64 ranges (`WxRanges`).
+        put(&(ranges.len() as u16).to_le_bytes());
         put(&(pages as u32).to_le_bytes());
         put(&(threads as u32).to_le_bytes());
         let state = [
@@ -312,7 +332,8 @@ impl Snapshot {
             .threads
             .iter()
             .flat_map(|t| thread_words(t, kept(t.tid), now));
-        for v in state.into_iter().chain(words) {
+        let ranges = ranges.iter().flat_map(|&(start, end)| [start, end]);
+        for v in state.into_iter().chain(words).chain(ranges) {
             put(&v.to_le_bytes());
         }
         // Records and data in one walk: both places are known now.
@@ -344,6 +365,7 @@ impl Snapshot {
             bytes: b,
             frames: refers.iter().filter(|&&r| r).count(),
             release,
+            records: data_start - pages * RECORD,
         }
     }
 
@@ -439,19 +461,24 @@ impl Snapshot {
         if bytes.len() < HEADER + STATE {
             return Err(FormatError::Truncated);
         }
-        let snapshot = Self {
+        let mut snapshot = Self {
             bytes,
             frames: 0,
             release: |_, _| {},
+            records: 0,
         };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
-        let records = HEADER + STATE + snapshot.thread_count() * THREAD;
+        let records = snapshot.ranges_at() + snapshot.range_count() * RANGE;
+        snapshot.records = records;
         let data_start = records + pages * RECORD;
         if snapshot.bytes.len() < data_start {
             return Err(FormatError::Truncated);
         }
         snapshot.check_threads(machine)?;
+        if WxRanges::from_ranges(snapshot.range_list()).is_none() {
+            return Err(FormatError::BadRanges);
+        }
         let mut expected_offset = 0u64;
         let mut prev_end = 0u64;
         for index in 0..pages {
@@ -526,9 +553,40 @@ impl Snapshot {
         self.u32_at(20)
     }
 
+    fn range_count(&self) -> usize {
+        u16::from_le_bytes([self.bytes[14], self.bytes[15]]) as usize
+    }
+
+    /// Where the write-or-execute ranges start.
+    fn ranges_at(&self) -> usize {
+        HEADER + STATE + self.thread_count() * THREAD
+    }
+
     /// Where the page records start.
     fn records(&self) -> usize {
-        HEADER + STATE + self.thread_count() * THREAD
+        self.records
+    }
+
+    /// The write-or-execute ranges as stored (the size was checked).
+    fn range_list(&self) -> Vec<(u64, u64)> {
+        let at = self.ranges_at();
+        (0..self.range_count())
+            .map(|i| {
+                (
+                    u64_at(&self.bytes, at + i * RANGE),
+                    u64_at(&self.bytes, at + i * RANGE + 8),
+                )
+            })
+            .collect()
+    }
+
+    /// The cell's write-or-execute ranges (design D7 of `node-jit`).
+    pub fn wx(&self) -> WxRanges {
+        if self.range_count() == 0 {
+            return WxRanges::default();
+        }
+        // Validated by `from_bytes` or written by `capture`.
+        WxRanges::from_ranges(self.range_list()).unwrap_or_default()
     }
 
     /// Validates the threads (`from_bytes`; the size was checked).

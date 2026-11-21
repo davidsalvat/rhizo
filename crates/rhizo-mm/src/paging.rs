@@ -31,6 +31,12 @@ impl PageFlags {
     /// Read-only only because the page is shared after a fork: a write makes
     /// a private copy (reported by `flags`, never passed to `map`).
     pub const COPY_ON_WRITE: Self = Self(1 << 4);
+    /// A page the cell asked writable and executable (change `node-jit`):
+    /// never both in the tables, it is either writing (`WRITABLE` or
+    /// `COPY_ON_WRITE`, with `NO_EXECUTE`) or running (read-only,
+    /// executable), and faults change it from one to the other. A software
+    /// bit of the entry; callers pass it with the writing state.
+    pub const WRITE_OR_EXEC: Self = Self(1 << 5);
 
     /// Read-only, executable, kernel-only, normal memory.
     pub const fn empty() -> Self {
@@ -130,6 +136,9 @@ pub trait EntryFormat {
     fn with_table_writable(entry: u64, writable: bool) -> u64;
     /// A leaf entry that allows (or forbids) writes.
     fn with_leaf_writable(entry: u64, writable: bool) -> u64;
+    /// A leaf entry that allows (or forbids) instruction fetches, at the
+    /// privilege its page is for (user pages: from the cell only).
+    fn with_leaf_executable(entry: u64, executable: bool) -> u64;
     /// A leaf entry with the copy-on-write mark set or cleared (a bit the
     /// hardware ignores).
     fn with_cow(entry: u64, cow: bool) -> u64;
@@ -149,6 +158,8 @@ mod x86 {
     pub const NO_EXECUTE: u64 = 1 << 63;
     /// Available to software: the copy-on-write mark.
     pub const COW: u64 = 1 << 9;
+    /// Available to software: a write-or-execute page.
+    pub const WX: u64 = 1 << 10;
     pub const ADDR: u64 = 0x000f_ffff_ffff_f000;
 }
 
@@ -174,6 +185,9 @@ impl EntryFormat for X86_64 {
         }
         if size != PageSize::Small {
             e |= x86::HUGE;
+        }
+        if flags.contains(PageFlags::WRITE_OR_EXEC) {
+            e |= x86::WX;
         }
         e
     }
@@ -207,6 +221,9 @@ impl EntryFormat for X86_64 {
         if entry & x86::COW != 0 {
             f = f | PageFlags::COPY_ON_WRITE;
         }
+        if entry & x86::WX != 0 {
+            f = f | PageFlags::WRITE_OR_EXEC;
+        }
         f
     }
 
@@ -227,6 +244,14 @@ impl EntryFormat for X86_64 {
             entry | x86::WRITABLE
         } else {
             entry & !x86::WRITABLE
+        }
+    }
+
+    fn with_leaf_executable(entry: u64, executable: bool) -> u64 {
+        if executable {
+            entry & !x86::NO_EXECUTE
+        } else {
+            entry | x86::NO_EXECUTE
         }
     }
 
@@ -266,6 +291,8 @@ mod a64 {
     pub const UXN: u64 = 1 << 54;
     /// Reserved for software in leaf descriptors: the copy-on-write mark.
     pub const COW: u64 = 1 << 55;
+    /// Reserved for software in leaf descriptors: a write-or-execute page.
+    pub const WX: u64 = 1 << 56;
     /// Table descriptors: `APTable[1]`, no writes at the levels below.
     pub const AP_TABLE_READ_ONLY: u64 = 1 << 62;
     pub const ADDR: u64 = 0x0000_ffff_ffff_f000;
@@ -303,6 +330,9 @@ impl EntryFormat for Aarch64 {
                 e |= a64::PXN;
             }
         }
+        if flags.contains(PageFlags::WRITE_OR_EXEC) {
+            e |= a64::WX;
+        }
         e
     }
 
@@ -339,6 +369,9 @@ impl EntryFormat for Aarch64 {
         if entry & a64::COW != 0 {
             f = f | PageFlags::COPY_ON_WRITE;
         }
+        if entry & a64::WX != 0 {
+            f = f | PageFlags::WRITE_OR_EXEC;
+        }
         f
     }
 
@@ -364,6 +397,15 @@ impl EntryFormat for Aarch64 {
         } else {
             entry | a64::AP_READ_ONLY
         }
+    }
+
+    fn with_leaf_executable(entry: u64, executable: bool) -> u64 {
+        let xn = if entry & a64::AP_EL0 != 0 {
+            a64::UXN
+        } else {
+            a64::PXN
+        };
+        if executable { entry & !xn } else { entry | xn }
     }
 
     fn with_cow(entry: u64, cow: bool) -> u64 {
@@ -1278,6 +1320,33 @@ mod tests {
         ));
     }
 
+    /// The write-or-execute mark is a bit the hardware leaves to software
+    /// (x86_64 bit 10, AArch64 bit 56), next to the copy-on-write one, and
+    /// changes no permission.
+    #[test]
+    fn write_or_exec_bit_in_both_encodings() {
+        let writing = PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+        let running = PageFlags::USER;
+        for flags in [writing, running] {
+            let wx = flags | PageFlags::WRITE_OR_EXEC;
+            assert_eq!(
+                X86_64::leaf(0x5000, PageSize::Small, wx),
+                X86_64::leaf(0x5000, PageSize::Small, flags) | 1 << 10
+            );
+            assert_eq!(
+                Aarch64::leaf(0x5000, PageSize::Small, wx),
+                Aarch64::leaf(0x5000, PageSize::Small, flags) | 1 << 56
+            );
+        }
+        // Neither mark hides the other.
+        let cow = X86_64::with_cow(X86_64::leaf(0, PageSize::Small, writing), true);
+        let both = X86_64::flags(cow | 1 << 10);
+        assert!(both.contains(PageFlags::COPY_ON_WRITE | PageFlags::WRITE_OR_EXEC));
+        let cow = Aarch64::with_cow(Aarch64::leaf(0, PageSize::Small, writing), true);
+        let both = Aarch64::flags(cow | 1 << 56);
+        assert!(both.contains(PageFlags::COPY_ON_WRITE | PageFlags::WRITE_OR_EXEC));
+    }
+
     #[test]
     fn flags_round_trip_through_both_encodings() {
         use PageFlags as F;
@@ -1289,6 +1358,8 @@ mod tests {
             F::USER,
             F::USER | F::WRITABLE | F::NO_EXECUTE,
             F::DEVICE | F::WRITABLE | F::NO_EXECUTE,
+            F::USER | F::WRITABLE | F::NO_EXECUTE | F::WRITE_OR_EXEC,
+            F::USER | F::WRITE_OR_EXEC,
         ];
         for flags in all {
             for size in [PageSize::Small, PageSize::Large, PageSize::Huge] {

@@ -93,13 +93,12 @@ fn check_node() -> Result {
         "http://127.0.0.1:{}",
         crate::hostnet::llm_server("127.0.0.1", 0)?
     );
-    let script = root.join(NODE_ARGV[2].trim_start_matches('/'));
+    let script = root.join(NODE_ARGV[1].trim_start_matches('/'));
     for (url, stdout) in [
         (None, NODE_STDOUT.to_string()),
         (Some(url), format!("{NODE_STDOUT}{NODE_MODEL_LINE}")),
     ] {
         let out = Command::new(&node)
-            .arg(NODE_ARGV[1])
             .arg(&script)
             .args(&url)
             .env_clear()
@@ -121,9 +120,8 @@ fn check_node() -> Result {
                     ))
                     .hint("Linux is the reference: fix the script or the expectation")
                     .reproduce(format!(
-                        "env -i {} {} {} {}",
+                        "env -i {} {} {}",
                         node.display(),
-                        NODE_ARGV[1],
                         script.display(),
                         url.unwrap_or_default()
                     ))
