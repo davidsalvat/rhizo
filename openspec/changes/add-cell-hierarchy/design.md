@@ -1605,7 +1605,7 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   and `push` stay inlined into their callers with the by-weight path out
   of line. Measured with `--icount-only` against `main` (e655beb):
   `cell.switch_insns` 875, unchanged (x86_64), and 817 to 819 (AArch64);
-  `cell.resume_insns` +4 and +4; `cell.spawn_insns` +78 (x86_64, +0.28 %:
+  `cell.resume_insns` +5 and -1; `cell.spawn_insns` +78 (x86_64, +0.28 %:
   code generation around the spawn path, whose helpers the tests' and
   benchmarks' placements now also call) and +2; `cell.fork_insns` +22 and
   +16; every other figure within +0.53 %.
@@ -1635,9 +1635,9 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
     section learns the queues again (O(entries), on tree changes only).
 - **Cost of sharing by weight.** `cell.switch_domains_insns` (gated with
   `-icount`, ±2 %) is the switch with the two cells in two domains and a
-  third, waiting cell placed under the first: 1,372 instructions on
-  x86_64 and 1,280 on AArch64. The same three cells in round robin take
-  887 and 829, so sharing by weight costs 485 and 451 instructions per
+  third, waiting cell placed under the first: 1,374 instructions on
+  x86_64 and 1,285 on AArch64. The same three cells in round robin take
+  887 and 829, so sharing by weight costs 487 and 456 instructions per
   switch (it was 1,250 and 1,070 with ordered maps, a list built at each
   pick and 64-bit divisions). Of those, measured with callgrind on the
   library alone (x86_64, `lto = "fat"` as the kernel builds, 105

@@ -178,6 +178,15 @@ fn benchmarks(console: &mut impl Console) {
             f[3]
         );
     }
+    // A switch while cells share by weight (design D23 of
+    // `add-cell-hierarchy`). Right after the forks: the AArch64
+    // runner's instruction counts keep only what is printed before its
+    // run's time limit.
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-shares switch_ns={}",
+        switch_domains_ns()
+    );
     let (cold, warm) = workload();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -265,22 +274,16 @@ fn benchmarks(console: &mut impl Console) {
         "rhizo-ops syscall_ns={}",
         bench_ns(syscall_ticks()).unwrap_or(0)
     );
-    // Cells sharing by weight (design D23 of `add-cell-hierarchy`): a
-    // switch with a domain pick in every pass, the shares in time only.
-    // After the other cell figures, whose heap it would leave otherwise.
-    let _ = write!(
-        rhizo_hal::ConsoleWriter(console),
-        "rhizo-shares switch_ns={}",
-        switch_domains_ns()
-    );
+    // How evenly domains share a CPU (design D23 of `add-cell-hierarchy`):
+    // a second of time, so in timed runs only, and last of the cell
+    // figures.
     if CLOCK.load(Ordering::Relaxed) == CLOCK_TIME {
-        let _ = write!(
+        let _ = writeln!(
             rhizo_hal::ConsoleWriter(console),
-            " domain_share_pct={}",
+            "rhizo-share domain_share_pct={}",
             domain_share_pct()
         );
     }
-    let _ = writeln!(rhizo_hal::ConsoleWriter(console));
     // Last: its files stay decoded in the kernel heap.
     if let Some((run, template)) = dynamic() {
         let _ = writeln!(

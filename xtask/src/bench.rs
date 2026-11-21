@@ -646,11 +646,11 @@ fn measure_cells(
                     {
                         switch_fp.push(ns as f64);
                     }
-                    let shares = |key| crate::profile::field(&out.output, "rhizo-shares", key);
-                    if let Some(ns) = shares("switch_ns") {
+                    let field = |line, key| crate::profile::field(&out.output, line, key);
+                    if let Some(ns) = field("rhizo-shares", "switch_ns") {
                         switch_domains.push(ns as f64);
                     }
-                    if let Some(pct) = shares("domain_share_pct") {
+                    if let Some(pct) = field("rhizo-share", "domain_share_pct") {
                         share_pct.push(pct as f64);
                     }
                     for (name, value) in crate::profile::pmu_passes(&out.output) {
