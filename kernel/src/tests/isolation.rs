@@ -9,8 +9,8 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
     ktest_case!(syscall_storm_does_not_starve_others),
     ktest_case!(memory_hog_is_refused_and_others_run),
-    ktest_case!(fresh_memory_never_holds_another_cells_data),
-    ktest_case!(names_cannot_fill_kernel_memory),
+    ktest_case!(fresh_memory_never_holds_another_cells_data, 32),
+    ktest_case!(names_cannot_fill_kernel_memory, 91),
     ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
 ];
 

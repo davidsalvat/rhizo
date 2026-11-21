@@ -79,12 +79,7 @@ fn requests_gets_from_the_host_as_on_linux() {
     assert_eq!(crate::cell::open_sockets(), 0);
     // Its connection finishes closing with the host: the kernel goes back
     // to holding nothing for it.
-    let mut host = Host::new();
-    let end = crate::cell::now_ns() + 10_000_000_000;
-    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
-        host.wire_address(0);
-    }
-    assert!(!crate::cell::wire_busy(), "the card's connections closed");
+    settle_wire();
 }
 
 /// The template case: a cell that imported numpy, suspended and resumed

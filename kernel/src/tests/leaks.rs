@@ -8,9 +8,9 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(ephemeral_ports_do_not_show_other_cells_binds),
     ktest_case!(memory_pressure_keeps_the_pages_other_cells_map),
     ktest_case!(cells_run_alike_with_and_without_kpti),
-    ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
+    ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel, 42),
     ktest_case!(flags_a_cell_sets_stay_in_the_cell),
-    ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
+    ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel, 41),
     ktest_case!(hardware_entropy_works_where_present),
     ktest_case!(no_two_cells_draw_the_same_random_bytes),
 ];
