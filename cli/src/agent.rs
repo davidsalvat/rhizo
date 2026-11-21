@@ -7,7 +7,7 @@
 
 use crate::args;
 use crate::client::{Client, Reply, duration};
-use rhizo_control::{Body, Message, Request, Run, State};
+use rhizo_control::{Body, Egress, Message, Placement, Request, Run, State};
 use std::collections::HashMap;
 use std::time::Instant;
 use xtask::vmm::Vmm;
@@ -33,6 +33,20 @@ pub fn guest_endpoint(url: &str, vmm: Vmm) -> Result<String, String> {
         other => return Err(format!("`{other}`: give the model's IPv4 address")),
     };
     Ok(format!("{host}:{port}"))
+}
+
+/// Where an agent goes (spec `control-plane`): a root with egress `model`,
+/// the model endpoint `endpoint` (`IP:PORT`) and nothing else, as `rhizo
+/// chat` and the agent templates pass `--egress model` themselves. A
+/// kernel of protocol 3 has no egress: the root it makes every cell.
+pub fn agent_placement(client: &Client, endpoint: &str) -> Result<Placement, String> {
+    if !client.current() {
+        return Ok(Placement::root());
+    }
+    Ok(Placement {
+        egress: Egress::Rules(vec![crate::tree::endpoint_rule(endpoint)?]),
+        ..Placement::root()
+    })
 }
 
 fn say(text: &str) {
@@ -68,10 +82,8 @@ pub fn run(client: &mut Client, run: &args::Run) -> Result<(), String> {
     let started = Instant::now();
     let vmm = Vmm::parse(&client.info.vmm)?;
     let model = run.model.clone().unwrap_or_default();
-    let url = format!(
-        "http://{}",
-        guest_endpoint(run.llm.as_deref().unwrap_or_default(), vmm)?
-    );
+    let endpoint = guest_endpoint(run.llm.as_deref().unwrap_or_default(), vmm)?;
+    let url = format!("http://{endpoint}");
     let live = !run.transcript;
     let mut argv: Vec<Vec<u8>> = [
         "/usr/bin/python3",
@@ -87,10 +99,17 @@ pub fn run(client: &mut Client, run: &args::Run) -> Result<(), String> {
     if live {
         argv.push(b"live".to_vec());
     }
+    let placement = if run.place.is_default() {
+        agent_placement(client, &endpoint)?
+    } else {
+        let model = Some(crate::tree::endpoint_rule(&endpoint)?);
+        run.place.placement(model)?
+    };
     let reply = client.call(&Request::Run(Run {
         image: b"cpython".to_vec(),
         files_from: b"cpython-files".to_vec(),
         argv,
+        placement,
         ..Run::default()
     }))?;
     let &Body::Cell(agent) = &reply.body else {
@@ -184,10 +203,7 @@ pub fn run(client: &mut Client, run: &args::Run) -> Result<(), String> {
                 suspends.push(s.ns + r.ns);
             } else if asks_for_fork(&line, live) && branches.is_empty() {
                 fork_started = Some(Instant::now());
-                let f = client.call(&Request::Fork {
-                    cell: agent,
-                    n: BRANCHES,
-                })?;
+                let f = client.call(&Request::fork(agent, BRANCHES))?;
                 fork_ns = f.ns;
                 branches = cells(&f)?;
                 for (b, &child) in branches.iter().enumerate() {
