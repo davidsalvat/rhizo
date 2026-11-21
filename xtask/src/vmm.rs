@@ -144,17 +144,23 @@ pub enum Accel {
     Kvm,
     /// Always emulate (TCG).
     Tcg,
+    /// Emulate, counting instructions (TCG with `-icount shift=0`): the
+    /// guest's clock advances one nanosecond per instruction, so a kernel
+    /// timing itself measures retired instructions, the same on every run
+    /// (spec `profiling`).
+    Icount,
 }
 
 impl Accel {
-    /// Parses `auto`, `kvm` or `tcg`.
+    /// Parses `auto`, `kvm`, `tcg` or `icount`.
     pub fn parse(name: &str) -> Result<Self> {
         match name {
             "auto" => Ok(Accel::Auto),
             "kvm" => Ok(Accel::Kvm),
             "tcg" => Ok(Accel::Tcg),
+            "icount" => Ok(Accel::Icount),
             other => Err(format!(
-                "unknown accelerator `{other}` (expected auto, kvm or tcg)"
+                "unknown accelerator `{other}` (expected auto, kvm, tcg or icount)"
             )),
         }
     }
@@ -163,7 +169,7 @@ impl Accel {
         match self {
             Accel::Auto => kvm_available(),
             Accel::Kvm => true,
-            Accel::Tcg => false,
+            Accel::Tcg | Accel::Icount => false,
         }
     }
 }
@@ -269,6 +275,12 @@ pub enum Bench {
     Laptop { idle_secs: u16, llm_delay_ms: u32 },
     /// `bench=server cells=N secs=S`.
     Server { cells: u16, secs: u16 },
+    /// `bench=agent-demo model=NAME llm=ADDR`: the CPython agent's live
+    /// demo against a model at `ADDR` (`IP:PORT` as the guest sees it).
+    AgentDemo {
+        llm: &'static str,
+        model: &'static str,
+    },
 }
 
 impl Bench {
@@ -285,6 +297,9 @@ impl Bench {
                 format!(" bench=laptop secs={idle_secs}{llm}")
             }
             Bench::Server { cells, secs } => format!(" bench=server cells={cells} secs={secs}"),
+            Bench::AgentDemo { llm, model } => {
+                format!(" bench=agent-demo model={model} llm={llm}")
+            }
         }
     }
 }
@@ -316,6 +331,15 @@ pub struct RunOptions {
     pub memory_mib: u32,
     /// A reference workload for a `bench-cell` Rhizo kernel.
     pub bench: Option<Bench>,
+    /// The share of the in-kernel tests this VM runs (`shard=I/N`).
+    pub shard: Option<(u16, u16)>,
+}
+
+/// The `shard=I/N` option for a Rhizo command line, if any.
+fn shard_arg(opts: &RunOptions) -> String {
+    opts.shard
+        .map(|(i, n)| format!(" shard={i}/{n}"))
+        .unwrap_or_default()
 }
 
 /// Parses `rhizo-ready cycles=<n>` from console output.
@@ -388,6 +412,11 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
         .args(["-smp", &opts.cpus.to_string()])
         .args(["-display", "none", "-no-reboot"])
         .args(["-accel", if kvm { "kvm" } else { "tcg" }]);
+    if opts.accel == Accel::Icount {
+        // Time jumps over idle periods instead of following the host's
+        // clock, so nothing depends on the host.
+        cmd.args(["-icount", "shift=0,sleep=off"]);
+    }
     if vmm != Vmm::QemuVirt {
         cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     } else if !kvm {
@@ -422,6 +451,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(vmm);
             }
+            args += &shard_arg(opts);
             cmd.arg("-kernel").arg(kernel).args(["-append", &args]);
         }
         Guest::ReferenceLinux { kernel, initramfs } => {
@@ -467,6 +497,9 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
     if let (Some(bench), Guest::Rhizo(_)) = (opts.bench, guest) {
         args += &bench.cmdline(Vmm::Firecracker);
     }
+    if matches!(guest, Guest::Rhizo(_)) {
+        args += &shard_arg(opts);
+    }
     let initrd_json = match &initrd {
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
         None => String::new(),
@@ -510,6 +543,7 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(Vmm::CloudHypervisor);
             }
+            args += &shard_arg(opts);
             cmd.arg("--kernel").arg(kernel).args(["--cmdline", &args]);
             if arch::current() == Arch::X86_64 {
                 cmd.args(["--serial", "off", "--debug-console", "tty"]);

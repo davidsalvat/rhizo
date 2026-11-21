@@ -87,7 +87,9 @@ This repository uses spec-driven development with
 Requires the Rust toolchain (via rustup), `qemu-system-aarch64` and, for the
 second architecture, `qemu-system-x86_64`, plus gcc with a static glibc for
 the C cells (`gcc`, `libc6-dev`; to cross-build, `gcc-aarch64-linux-gnu` or
-`gcc-x86-64-linux-gnu`). Every `cargo xtask` command takes
+`gcc-x86-64-linux-gnu`), and `zlib1g-dev` to build the CPython cell
+(when `RHIZO_CPYTHON_SRC` names its tarball; it is built natively on each
+architecture). Every `cargo xtask` command takes
 `--arch aarch64` (default) or `--arch x86_64` right after `xtask`.
 
 The feedback loop, fastest first:
@@ -102,6 +104,13 @@ The feedback loop, fastest first:
 | `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates) |
 | `cargo xtask mutants` | long | Mutation testing (weekly in CI) |
 
+- `cargo xtask test` builds every kernel first, then runs its steps at once
+  on the host's CPUs and prints each step with its time; a failing step
+  shows its console output. `RHIZO_JOBS=N` sets the CPUs it uses
+  (`RHIZO_JOBS=1`: one step at a time, output live). Firecracker, Cloud
+  Hypervisor and `--gdb` run one step at a time. `RHIZO_SHARDS=N` splits
+  the in-kernel tests over `N` VMs (opt-in: see
+  `openspec/changes/speed-up-feedback-loop/design.md`).
 - Add `--json` to `check`, `test`, `ci` or `bench` for one JSON object per
   line on stdout (`step`, `failure`, `data`, `summary`).
 - Every failure prints `FAILED <kind>` with `where`, `expected`, `actual`,
@@ -134,17 +143,11 @@ The feedback loop, fastest first:
 | `crates/rhizo-virtio` | virtio-mmio (version 2) and modern virtio-pci transports (PCI functions, BARs, capabilities), split virtqueues and the network device, through `rhizo-hal` registers and memory | `rhizo-hal` |
 | `crates/rhizo-abi` | Linux system calls of cells (both conventions), files through the cell's `rhizo-fs`, file mappings and the page cache that shares them by content, starting a program from the cell's files (`exec`, `PT_INTERP`), threads (`clone`, `clone3`, futexes), pipes, `poll`/`select`/`epoll`, sockets through `rhizo-net`, `EFAULT`/`ENOSYS`, scheduling outcomes (yield, block, exit) | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs`, `rhizo-net` |
 | `crates/rhizo-snapshot` | Snapshot format of a suspended cell (versioned, little endian, threads, files and sockets sections), capture from and restore into a page table | `rhizo-hal`, `rhizo-mm`, `rhizo-cell`, `rhizo-fs`, `rhizo-net` |
-<<<<<<< HEAD
-| `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list, waiting set and time slice (time and CPU passed in, never read); address-space tag pool | — |
-| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio` |
+| `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list, waiting set and time slice (time and CPU passed in, never read); cells whose threads run on several CPUs (`Gangs`); address-space tag pool | — |
+| `crates/rhizo-prof` | Cost accounting: where a CPU's time goes, in exclusive parts and per system call (ticks passed in, never read), and the breakdown lines the benchmarks print | — |
+| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, threads of one cell on several CPUs (gangs, the cell lock, x86_64 TLB shootdowns), the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); cost accounting hooks (`src/cost.rs`, feature `profile`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio`, `rhizo-prof` |
 | `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building), and dynamically linked (`c/dynamic`); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
 | `xtask` | Developer tooling (host only); builds the static CPython cell and encodes its files (`cpython.rs`); packs the dynamically linked programs with their interpreter and libraries (`dynamic.rs`) | `rhizo-fs` |
-=======
-| `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list, waiting set and time slice (time and CPU passed in, never read); cells whose threads run on several CPUs (`Gangs`); address-space tag pool | — |
-| `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, threads of one cell on several CPUs (gangs, the cell lock, x86_64 TLB shootdowns), the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio` |
-| `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
-| `xtask` | Developer tooling (host only); builds the static CPython cell and encodes its files (`cpython.rs`) | `rhizo-fs` |
->>>>>>> origin/main
 
 Planned crates are created by the milestone that adds their code, not
 before.
@@ -161,8 +164,10 @@ shared kernel code may use: `boot`, `platform`, `console`, `power`, `cpu`,
 `timer`, `tests`, and, compiled only in builds that run cells, `user`
 (entering and leaving cell code, address-space tags), `irq` (the
 preemption timer and the wake-up between CPUs; interrupts arrive only
-while cell code runs or a CPU idles) and `smp` (starting the other CPUs,
-waking them, idling). `cpu::index()` is the running CPU's number (0 for the
+while cell code runs or a CPU idles), `smp` (starting the other CPUs,
+waking them, idling) and `pmu` (performance counters: retired
+instructions and core cycles, where the guest has them). `cpu::index()` is
+the running CPU's number (0 for the
 boot CPU). Anything instruction-set specific (assembly, system
 registers, ports, MMIO registers, entry encodings) goes behind it. New arch
 hooks are written for AArch64 first and must reach x86_64 in the same

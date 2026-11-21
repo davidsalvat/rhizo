@@ -182,6 +182,31 @@ pub const CPYTHON_STDOUT: &str = "warm\n\
      \"tool\": \"summarize\", \"top_words\": [\"KERNEL\", \"FORK\", \"PAGE\"]}\n\
      cpython ok\n";
 
+/// The CPython agent (`cells/python/agent_loop.py`, change
+/// `add-agent-workload`) after [`AGENT_TURNS`] turns with the host's fake
+/// model: its transcript, the same as a Linux process (`linux` mode) and as
+/// a cell suspended after every turn and forked at its decision point
+/// (`cell` mode). `conn_requests` counts the requests on the agent's
+/// connection: it keeps counting across suspends, and each branch has a
+/// connection of its own.
+#[allow(dead_code)]
+pub const AGENT_TURNS: usize = 3;
+#[allow(dead_code)]
+pub const AGENT_TRANSCRIPT: &str = "\
+turn 1 call_37dd1708 n=804 seed=565 value=209594 notes=1 sha=8834d66e conn_requests=1
+turn 2 call_87b7d3a8 n=624 seed=963 value=305024 notes=2 sha=9fd0492f conn_requests=2
+turn 3 call_4801f3f6 n=898 seed=808 value=334680 notes=3 sha=2e6a15fb conn_requests=3
+fork
+branch 0
+branch 0 value=334680
+branch 0 turn call_6094ead6 n=942 seed=305 value=121891 notes=5 sha=2374c347 conn_requests=1
+branch 1
+branch 1 value=320113
+branch 1 turn call_49db5b55 n=797 seed=645 value=254942 notes=5 sha=ba5adce1 conn_requests=1
+branch 2
+branch 2 value=360156
+branch 2 turn call_9848ba8f n=635 seed=988 value=305130 notes=5 sha=fb723766 conn_requests=1
+";
 /// Dynamically linked programs (change `add-dynamic-linking`) in the files
 /// `xtask` packs: the executable's path in them, its `argv` and what it
 /// prints; each exits with 0. They run from the top of those files (`/` in

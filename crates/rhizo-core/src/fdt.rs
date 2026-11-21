@@ -107,6 +107,18 @@ fn list_contains(value: &[u8], wanted: &[u8]) -> bool {
     value.split(|&b| b == 0).any(|s| s == wanted)
 }
 
+/// The GIC interrupt identifier of the first specifier of an `interrupts`
+/// property (three cells: an SPI `n` is 32 + `n`, a PPI 16 + `n`).
+fn gic_intid(value: &[u8]) -> Option<u32> {
+    let kind = read_cells(value, 1)?;
+    let n = u32::try_from(read_cells(value.get(4..)?, 1)?).ok()?;
+    match kind {
+        0 => n.checked_add(32),
+        1 => n.checked_add(16),
+        _ => None,
+    }
+}
+
 /// Strips the trailing NUL of a string property.
 fn string(value: &[u8]) -> &[u8] {
     value.strip_suffix(&[0]).unwrap_or(value)
@@ -348,16 +360,7 @@ impl<'a> Fdt<'a> {
         mut f: impl FnMut(Region, Option<u32>),
     ) -> Result<(), FdtError> {
         self.compatible_regs(compatible, 0, |r, irqs| {
-            let cell = |i: usize| {
-                let b = irqs?.get(i * 4..i * 4 + 4)?;
-                Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-            };
-            let irq = match (cell(0), cell(1)) {
-                (Some(0), Some(n)) => n.checked_add(32),
-                (Some(1), Some(n)) => n.checked_add(16),
-                _ => None,
-            };
-            f(r, irq);
+            f(r, irqs.and_then(gic_intid));
             true
         })
     }
@@ -374,6 +377,37 @@ impl<'a> Fdt<'a> {
         self.compatible_regs(compatible, index, |r, _| {
             found = Some(r);
             false
+        })?;
+        Ok(found)
+    }
+
+    /// The interrupt identifier (GIC INTID) of the performance monitors'
+    /// overflow interrupt: the first `interrupts` entry of the
+    /// `arm,armv8-pmuv3` node (a PPI, `<1 n flags>`, is INTID 16 + n; an
+    /// SPI, `<0 n flags>`, 32 + n).
+    pub fn pmu_interrupt(&self) -> Result<Option<u32>, FdtError> {
+        let mut matches = [false; MAX_DEPTH + 1];
+        let mut interrupts: [Option<&'a [u8]>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
+        let mut found = None;
+        self.walk(|event| {
+            match event {
+                Event::Begin { depth, .. } => {
+                    matches[depth + 1] = false;
+                    interrupts[depth + 1] = None;
+                }
+                Event::Prop { depth, name, value } => match name {
+                    b"compatible" => matches[depth] = list_contains(value, b"arm,armv8-pmuv3"),
+                    b"interrupts" => interrupts[depth] = Some(value),
+                    _ => {}
+                },
+                Event::End { depth } => {
+                    if let (true, Some(value)) = (matches[depth + 1], interrupts[depth + 1]) {
+                        found = gic_intid(value);
+                        return false;
+                    }
+                }
+            }
+            true
         })?;
         Ok(found)
     }
@@ -515,6 +549,12 @@ mod tests {
             let n = ((base - 0x0a00_0000) / 0x200) as u32;
             assert_eq!(irq, Some(32 + 16 + n), "transport at {base:#x}");
         }
+    }
+
+    #[test]
+    fn finds_the_pmu_interrupt() {
+        let fdt = Fdt::new(QEMU_VIRT_GICV3).unwrap();
+        assert_eq!(fdt.pmu_interrupt().unwrap(), Some(23), "PPI 7");
     }
 
     #[test]

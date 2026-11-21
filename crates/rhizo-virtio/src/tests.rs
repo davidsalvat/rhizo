@@ -449,7 +449,11 @@ fn received_frames_interrupt_once_asked_and_until_acknowledged() {
     while card.recv(&mut |_| got += 1) {}
     assert_eq!(got, 3);
     assert!(dev.borrow_mut().deliver(&[4; 60]));
-    assert_eq!(dev.borrow().interrupts, 2, "a frame after the acknowledgment");
+    assert_eq!(
+        dev.borrow().interrupts,
+        2,
+        "a frame after the acknowledgment"
+    );
     card.acknowledge();
     card.acknowledge();
     assert_eq!(dev.borrow().isr, 0, "acknowledging nothing changes nothing");
