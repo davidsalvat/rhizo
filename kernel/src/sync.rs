@@ -42,6 +42,7 @@ impl<T> Global<T> {
     ///
     /// # Panics
     /// If this CPU holds it already.
+    #[cfg(feature = "cells")]
     pub fn lock(&self) -> rhizo_core::sync::Guard<'_, T> {
         #[cfg(feature = "profile")]
         return self.0.lock_waiting(
