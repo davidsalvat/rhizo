@@ -8,7 +8,7 @@
 
 - [x] 2.1 `Shared::on_cpu`, `CLAIM` and the claim slot; `take_cell`, `with_live`, `admit`; every host operation through them; `stop` gets `&mut Host` (D1, D2, D3); verify the in-kernel `mixed_host_operations_during_a_run_are_invisible` with `ktest-smp` on both architectures
 - [x] 2.2 `progress` and `Host::watch`; verify the in-kernel `host_operations_leave_other_cells_running` with `ktest-smp` on both architectures
-- [ ] 2.3 Existing isolation, fork and snapshot tests unchanged; verify `cargo xtask test` and `cargo xtask --arch x86_64 test`, and `ktest-smp` ten times on each architecture
+- [x] 2.3 Existing isolation, fork and snapshot tests unchanged; verify `cargo xtask test` and `cargo xtask --arch x86_64 test`, and `ktest-smp` ten times on each architecture
 - [x] 2.4 The server workload operates from the stop condition (D1); verify `cargo xtask bench --workload server` at 10,000 cells, before and after
 
 ## 3. Benchmarks
