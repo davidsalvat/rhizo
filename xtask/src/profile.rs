@@ -167,6 +167,7 @@ pub fn measure(
         shard: None,
         selfcheck: None,
         control: false,
+        vsock: None,
     };
     for &vmm in &opts.vmms {
         if vmm.unavailable_reason(opts.accel).is_some() {
@@ -256,6 +257,7 @@ fn icount(
         shard: None,
         selfcheck: None,
         control: false,
+        vsock: None,
     };
     let mut samples = Samples::default();
     for guest in [&plain, profiled] {
@@ -536,6 +538,7 @@ pub fn cmd(args: &ProfileArgs) -> Result {
         shard: None,
         selfcheck: None,
         control: false,
+        vsock: None,
     };
     let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
     if run.result == VmResult::Failed {

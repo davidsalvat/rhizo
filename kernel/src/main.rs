@@ -25,6 +25,8 @@ mod smp;
 mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
+#[cfg(feature = "control")]
+mod vsock;
 #[cfg(feature = "cells")]
 mod wire;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]

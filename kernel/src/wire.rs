@@ -13,7 +13,7 @@ use core::fmt::Write;
 use rhizo_core::options::{BootOptions, IpOption};
 use rhizo_hal::{ConsoleWriter, NetLink};
 use rhizo_net::{Net, WireConfig};
-use rhizo_virtio::{ProbeError, VirtioNet, pci};
+use rhizo_virtio::{NET_DEVICE, ProbeError, VirtioNet, pci};
 
 type Card = VirtioNet<Mmio, DirectMap>;
 
@@ -50,7 +50,7 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
         }
         match VirtioNet::probe(Mmio::new(base), DirectMap, alloc) {
             Ok(c) => card = Some((format!("virtio-mmio {base:#x}"), c)),
-            Err(ProbeError::NotNet(_)) => {}
+            Err(ProbeError::Other(_)) => {}
             Err(e) => {
                 let _ = writeln!(
                     ConsoleWriter(&mut BootConsole),
@@ -112,7 +112,7 @@ fn pci_card(alloc: &mut dyn FnMut() -> Option<u64>) -> Option<(String, Card)> {
             report(&e, device);
             return None;
         }
-        let regions = match pci::net_regions(&mut Mmio::new(config), window.as_mut()) {
+        let regions = match pci::regions(&mut Mmio::new(config), NET_DEVICE, window.as_mut()) {
             Ok(Some(regions)) => regions,
             Ok(None) => continue,
             Err(e) => {

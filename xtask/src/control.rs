@@ -1,25 +1,29 @@
-//! A control kernel on a VMM, driven over its serial line (spec
-//! `control-plane`, design D2 of `add-control-plane`): the VMM's standard
-//! input carries requests, its standard output the kernel's console text
-//! and its replies. `rhizo up` keeps one of these behind a socket; the
-//! benchmark times requests through one; the `control` test step drives
-//! `rhizo` itself against one.
+//! A control kernel on a VMM (spec `control-plane`, design D2 of
+//! `add-control-plane`): the VMM's standard output carries the kernel's
+//! console text; requests and replies go over the VM's virtio socket device
+//! where it has one (change `control-over-vsock`), else over the serial
+//! line, the VMM's standard input and output. `rhizo up` keeps one of these
+//! behind a socket; the benchmark times requests through one; the `control`
+//! test step drives `rhizo` itself against one.
 
 use crate::bench::{Metric, summarize};
 use crate::report::Failure;
 use crate::vmm::{self, Accel, Guest, RunOptions, Vmm};
 use crate::{Profile, Result, arch, build_kernel, report, target_dir, workspace_root};
-use rhizo_control::{Body, Decoder, Frame, Item, Message, Request, Run, State};
-use std::io::{Read, Write};
+use rhizo_control::{Body, Decoder, Frame, Item, Message, Request, Run, State, VSOCK_PORT};
+use std::io::{self as stdio, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long a control kernel may take to boot and say hello.
 pub const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a booted control kernel's vsock may take to answer.
+const VSOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The line the chat agent (`cells/python/agent_chat.py`, change
 /// `add-interactive-chat`) prints once it reads its input.
@@ -70,17 +74,25 @@ pub enum Event {
     Exited,
 }
 
+/// Where frames go: the serial line, or the vsock stream once connected.
+type Link = Box<dyn Write + Send>;
+
 /// Sends frames to a VM, from any thread.
-#[derive(Debug, Clone)]
-pub struct Writer(Arc<Mutex<ChildStdin>>);
+#[derive(Clone)]
+pub struct Writer(Arc<Mutex<Link>>);
+
+impl std::fmt::Debug for Writer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Writer")
+    }
+}
 
 impl Writer {
     /// Sends bytes (whole frames) to the kernel.
     pub fn send(&self, bytes: &[u8]) -> Result {
-        let mut stdin = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        stdin
-            .write_all(bytes)
-            .and_then(|()| stdin.flush())
+        let mut link = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        link.write_all(bytes)
+            .and_then(|()| link.flush())
             .map_err(|e| format!("cannot write to the VM: {e}"))
     }
 }
@@ -94,6 +106,119 @@ pub struct Vm {
     /// Console text seen by [`call`](Self::call), for error reports.
     pub console: Vec<u8>,
     next_id: u32,
+    /// The VM's socket device, if it has one.
+    vsock: Option<vmm::Vsock>,
+    /// Where the frames go, for people: `vsock`, or the serial line and
+    /// why.
+    pub channel: String,
+}
+
+/// Decodes what `from` carries into `tx` until it ends; then, if
+/// `vmm_output`, tells that the VMM ended.
+fn read_frames(mut from: impl Read, tx: &Sender<Event>, vmm_output: bool) {
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = from.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        let mut text = Vec::new();
+        for &byte in &buf[..n] {
+            match decoder.push(byte) {
+                Some(Item::Text(b)) => text.push(b),
+                Some(Item::Frame(frame)) => {
+                    if !text.is_empty() {
+                        let _ = tx.send(Event::Text(std::mem::take(&mut text)));
+                    }
+                    let _ = tx.send(Event::Frame(frame));
+                }
+                Some(Item::Bad { id, error }) => {
+                    let _ = tx.send(Event::Bad { id, error });
+                }
+                None => {}
+            }
+        }
+        if !text.is_empty() {
+            let _ = tx.send(Event::Text(text));
+        }
+    }
+    if vmm_output {
+        let _ = tx.send(Event::Exited);
+    }
+}
+
+/// Connects to the control kernel's port on `vsock`, retrying while the
+/// VMM or the kernel is not ready, for at most [`VSOCK_TIMEOUT`].
+fn connect(vsock: vmm::Vsock) -> stdio::Result<(Box<dyn Read + Send>, Link)> {
+    let deadline = Instant::now() + VSOCK_TIMEOUT;
+    loop {
+        let attempt = match vsock {
+            vmm::Vsock::Unix { .. } => connect_unix(&vsock.socket()),
+            vmm::Vsock::Vhost { cid } => connect_vhost(cid).and_then(|f| {
+                let reader: Box<dyn Read + Send> = Box::new(f.try_clone()?);
+                Ok((reader, Box::new(f) as Link))
+            }),
+        };
+        match attempt {
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            result => return result,
+        }
+    }
+}
+
+/// Firecracker's and Cloud Hypervisor's vsock: a Unix socket where
+/// `CONNECT <port>` asks for a connection to the guest's port, and
+/// `OK <host port>` says it is made.
+fn connect_unix(path: &Path) -> stdio::Result<(Box<dyn Read + Send>, Link)> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(VSOCK_TIMEOUT))?;
+    stream.write_all(format!("CONNECT {VSOCK_PORT}\n").as_bytes())?;
+    // A byte at a time: the guest's bytes follow the line.
+    let mut line = Vec::new();
+    let mut byte = [0u8];
+    while line.len() < 64 {
+        stream.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    if !line.starts_with(b"OK ") {
+        let line = String::from_utf8_lossy(&line).into_owned();
+        return Err(stdio::Error::other(format!("the VMM answered {line:?}")));
+    }
+    stream.set_read_timeout(None)?;
+    Ok((Box::new(stream.try_clone()?), Box::new(stream)))
+}
+
+/// QEMU's `vhost-vsock`: an `AF_VSOCK` socket to the guest's port.
+fn connect_vhost(cid: u32) -> stdio::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: socket(2) with constant arguments; the result is checked.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(stdio::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a descriptor just opened, which nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: all-zero bytes are a valid `sockaddr_vm` (plain integers).
+    let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+    addr.svm_cid = cid;
+    addr.svm_port = VSOCK_PORT;
+    // SAFETY: `addr` is a `sockaddr_vm` alive across the call, whose size
+    // is given; `fd` is an open socket.
+    let r = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const addr).cast(),
+            size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        return Err(stdio::Error::last_os_error());
+    }
+    Ok(fd.into())
 }
 
 /// The run options of a control kernel on `vmm`: a network card where the
@@ -113,16 +238,25 @@ pub fn run_options(accel: Accel, cpus: u32, memory_mib: u32) -> RunOptions {
         shard: None,
         selfcheck: None,
         control: true,
+        vsock: None,
     }
 }
 
 impl Vm {
     /// Boots `kernel` (a `control` build) on `vmm` and waits for its hello.
     /// The VMM's error output goes to `stderr`.
-    pub fn start(vmm: Vmm, kernel: &Path, opts: RunOptions, stderr: Stdio) -> Result<Self> {
+    pub fn start(vmm: Vmm, kernel: &Path, mut opts: RunOptions, stderr: Stdio) -> Result<Self> {
         if let Some(reason) = vmm.unavailable_reason(opts.accel) {
             return Err(format!("{} is not available: {reason}", vmm.id()));
         }
+        let (vsock, channel) = match vmm::Vsock::for_vmm(vmm) {
+            Ok(v) => (Some(v), String::from("vsock")),
+            Err(why) => (None, format!("serial line ({why})")),
+        };
+        if let Some(v) = vsock {
+            let _ = std::fs::remove_file(v.socket());
+        }
+        opts.vsock = vsock;
         let scratch = crate::tools::dir()?;
         let mut cmd: Command =
             vmm::command(vmm, &Guest::Rhizo(kernel.to_path_buf()), &opts, &scratch)?;
@@ -136,61 +270,56 @@ impl Vm {
             .spawn()
             .map_err(|e| format!("cannot start {} (is it installed?): {e}", vmm.id()))?;
         let stdin = child.stdin.take().expect("stdin is piped");
-        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
         let (tx, events) = mpsc::channel();
-        thread::spawn(move || {
-            let mut decoder = Decoder::new();
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = stdout.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                let mut text = Vec::new();
-                for &byte in &buf[..n] {
-                    match decoder.push(byte) {
-                        Some(Item::Text(b)) => text.push(b),
-                        Some(Item::Frame(frame)) => {
-                            if !text.is_empty() {
-                                let _ = tx.send(Event::Text(std::mem::take(&mut text)));
-                            }
-                            let _ = tx.send(Event::Frame(frame));
-                        }
-                        Some(Item::Bad { id, error }) => {
-                            let _ = tx.send(Event::Bad { id, error });
-                        }
-                        None => {}
-                    }
-                }
-                if !text.is_empty() {
-                    let _ = tx.send(Event::Text(text));
-                }
-            }
-            let _ = tx.send(Event::Exited);
-        });
+        let serial = tx.clone();
+        thread::spawn(move || read_frames(stdout, &serial, true));
         let mut vm = Vm {
             child,
-            stdin: Writer(Arc::new(Mutex::new(stdin))),
+            stdin: Writer(Arc::new(Mutex::new(Box::new(stdin)))),
             events,
             console: Vec::new(),
             next_id: 1,
+            vsock,
+            channel,
         };
-        let deadline = Instant::now() + BOOT_TIMEOUT;
+        vm.hello(vmm, BOOT_TIMEOUT, "on its serial line")?;
+        if let Some(v) = vsock {
+            // From now on the frames take the stream (design D3 of
+            // `control-over-vsock`).
+            let (reader, writer) = connect(v).map_err(|e| {
+                format!(
+                    "cannot connect to the control kernel's vsock on {}: {e}",
+                    vmm.id()
+                )
+            })?;
+            thread::spawn(move || read_frames(reader, &tx, false));
+            *vm.stdin.0.lock().unwrap_or_else(|e| e.into_inner()) = writer;
+            vm.hello(vmm, VSOCK_TIMEOUT, "on its vsock")?;
+        }
+        Ok(vm)
+    }
+
+    /// Waits at most `timeout` for the kernel's hello; on failure, ends the
+    /// VMM.
+    fn hello(&mut self, vmm: Vmm, timeout: Duration, channel: &str) -> Result {
+        let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match vm.next(left) {
+            match self.next(left) {
                 Some(Event::Frame(f))
                     if matches!(Message::decode(&f), Ok(Message::Hello { .. })) =>
                 {
-                    return Ok(vm);
+                    return Ok(());
                 }
-                Some(Event::Text(t)) => vm.console.extend(t),
+                Some(Event::Text(t)) => self.console.extend(t),
                 Some(Event::Exited) | None => {
-                    let _ = vm.child.kill();
-                    let _ = vm.child.wait();
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
                     return Err(format!(
-                        "the control kernel on {} did not say hello; its console:\n{}",
+                        "the control kernel on {} did not say hello {channel}; its console:\n{}",
                         vmm.id(),
-                        String::from_utf8_lossy(&vm.console)
+                        String::from_utf8_lossy(&self.console)
                     ));
                 }
                 Some(_) => {}
@@ -278,6 +407,9 @@ impl Drop for Vm {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        if let Some(v @ vmm::Vsock::Unix { .. }) = self.vsock {
+            let _ = std::fs::remove_file(v.socket());
+        }
     }
 }
 
@@ -320,6 +452,7 @@ pub fn measure(
 fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
     let opts = run_options(accel, 1, vmm::DEFAULT_MEMORY_MIB);
     let mut vm = Vm::start(vmm, kernel, opts, Stdio::null())?;
+    report::text(&format!("  frames over the {}", vm.channel));
     let us = |d: Duration| d.as_secs_f64() * 1e6;
     let mut samples: Vec<(&str, Vec<f64>)> = vec![
         ("control.roundtrip_us", Vec::new()),
@@ -1523,6 +1656,47 @@ fn answers_right(turn: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake VMM's vsock socket that answers `CONNECT 1024` with `answer`,
+    /// then sends `hello` and returns what it reads back (4 bytes).
+    fn fake_vmm(path: &Path, answer: &'static [u8]) -> thread::JoinHandle<Vec<u8>> {
+        let _ = std::fs::remove_file(path);
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut line = [0u8; 13];
+            s.read_exact(&mut line).unwrap();
+            assert_eq!(&line, b"CONNECT 1024\n");
+            s.write_all(answer).unwrap();
+            s.write_all(b"hello").unwrap();
+            let mut back = vec![0u8; 4];
+            let _ = s.read_exact(&mut back);
+            back
+        })
+    }
+
+    /// Firecracker's and Cloud Hypervisor's handshake (design D4 of
+    /// `control-over-vsock`): the guest's bytes follow the `OK` line, and
+    /// another answer is a refusal.
+    #[test]
+    fn the_vmm_s_socket_connects_to_the_guest_s_port() {
+        let path = std::env::temp_dir().join(format!("rhizo-test-{}.sock", std::process::id()));
+        let vmm = fake_vmm(&path, b"OK 1073741824\n");
+        let (mut from, mut to) = connect_unix(&path).unwrap();
+        let mut got = [0u8; 5];
+        from.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello", "nothing of the guest's bytes is lost");
+        to.write_all(b"ping").unwrap();
+        assert_eq!(vmm.join().unwrap(), b"ping");
+        let vmm = fake_vmm(&path, b"no such port\n");
+        let refused = connect_unix(&path).err().map(|e| e.to_string());
+        assert_eq!(
+            refused.as_deref(),
+            Some("the VMM answered \"no such port\"")
+        );
+        drop(vmm);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// The host's end of a transfer takes only the connection that sends
     /// the request's token first (design D2 of `snapshots-on-disk`): an
