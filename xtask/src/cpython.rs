@@ -50,7 +50,7 @@ unicodedata unicodedata.c
 zlib zlibmodule.c
 ";
 /// The scripts a CPython cell runs, from `cells/python` to `/app`.
-pub const SCRIPTS: [&str; 2] = ["agent_demo.py", "agent_loop.py"];
+pub const SCRIPTS: [&str; 3] = ["agent_demo.py", "agent_loop.py", "agent_chat.py"];
 /// Linked statically, with its segments on 2 MiB boundaries so the kernel
 /// maps whole 2 MiB pieces of them with 2 MiB pages (design D2 of
 /// `add-large-image-pages`).
