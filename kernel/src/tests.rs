@@ -1459,6 +1459,8 @@ fn one_page_mapped_without_end_cannot_stop_the_kernel() {
     assert_eq!(ended(&host, other).0, Ending::Exit(0));
     drop(host);
     assert_eq!(memory_balance(), before, "every frame back");
+}
+
 /// The CPU's random-number instruction, where it has one, gives bytes that
 /// differ from one read to the next (QEMU's `max` CPU has it on both
 /// architectures; without it the boot says `getrandom` is predictable).
