@@ -750,10 +750,12 @@ rhizo_syscall_entry:
 
 unsafe extern "C" {
     fn rhizo_syscall_entry();
+    #[cfg(feature = "cells")]
     fn rhizo_syscall_entry_kpti();
 }
 
 /// Points this CPU's `SYSCALL` at the entry with KPTI or the one without.
+#[cfg(feature = "cells")]
 pub(super) fn set_syscall_entry(kpti: bool) {
     let entry = if kpti {
         rhizo_syscall_entry_kpti as *const ()

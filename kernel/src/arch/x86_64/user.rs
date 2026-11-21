@@ -77,7 +77,8 @@ impl UserFault {
 /// CR3 value (root and PCID) when a cell last ran on each CPU, and whether
 /// PCIDs are on.
 static USER_CR3: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-/// Whether each CPU's `SYSCALL` goes to the entry with KPTI.
+/// Whether each CPU's `SYSCALL` goes to the entry with KPTI (set as it
+/// enters a cell after [`set_kpti`]; off the path of every other entry).
 static KPTI_ENTRY: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 static PCID: AtomicBool = AtomicBool::new(false);
 /// FS base last written on each CPU (skipping the write when it does not
@@ -264,46 +265,27 @@ fn load_cr3(value: u64) {
 pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Trap {
     let cr3 = root | tag as u64;
     let cpu = index();
-    let kpti = KPTI.load(Ordering::Relaxed);
-    if KPTI_ENTRY[cpu].load(Ordering::Relaxed) != kpti {
-        super::cpu::set_syscall_entry(kpti);
-        KPTI_ENTRY[cpu].store(kpti, Ordering::Relaxed);
-    }
-    if kpti {
-        // The entry code loads it last, and the kernel's tables first on
-        // the way back (design D2 of `add-kpti`). An untagged cell shares
-        // PCID 0 with the kernel: its CR3 always flushes it, so no kernel
-        // translation stays cached while it runs.
-        let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
-        super::cpu::PERCPU.0[cpu].set_user_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
-    } else if USER_CR3[cpu].swap(cr3, Ordering::Relaxed) != cr3 || flush {
-        let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
-        load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
-    }
-    // SYSRETQ loads RIP from RCX and RFLAGS from R11, so it restores exactly
-    // what IRETQ would when they already hold those values, as after a
-    // system call. Threads of a cell share CR3, so this is a property of
-    // the registers entered, not of the last exit (design D9 of
-    // `add-threads`). It also needs a canonical lower-half RIP (else it
-    // faults in ring 0).
-    let user_flags = (regs.flags & 0xdd5) | 0x202;
-    let sysret =
-        regs.pc < 0x0000_8000_0000_0000 && regs.gpr[2] == regs.pc && regs.gpr[10] == user_flags;
-    if LAST_FS[cpu].swap(regs.tls, Ordering::Relaxed) != regs.tls {
-        // SAFETY: the FS base is the cell's thread pointer; the kernel does
-        // not use FS.
-        unsafe { wrmsr(FS_BASE, regs.tls) };
-    }
-    // SAFETY: `regs` lives across the call; the entry code returns to ring 3
-    // with user selectors and only the user flags, and comes back through
-    // the SYSCALL entry or a ring-3 exception, which restore the kernel
-    // stack and callee-saved registers.
-    let vector = unsafe {
-        if kpti {
-            rhizo_enter_cell_kpti(regs, sysret as u64)
-        } else {
-            rhizo_enter_cell(regs, sysret as u64)
+    // One test of KPTI on the way (design D2 of `add-kpti`): each case has
+    // its own copy of the entry code, and this path is the one from before.
+    let vector = if KPTI.load(Ordering::Relaxed) {
+        enter_with_kpti(cpu, cr3, tag, flush, regs)
+    } else {
+        if USER_CR3[cpu].swap(cr3, Ordering::Relaxed) != cr3 || flush {
+            // `set_kpti` puts every CPU on the kernel's tables: the first
+            // entry after it comes here and points `SYSCALL` at the entry
+            // without KPTI.
+            if KPTI_ENTRY[cpu].swap(false, Ordering::Relaxed) {
+                super::cpu::set_syscall_entry(false);
+            }
+            let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
+            load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
         }
+        let sysret = prepare_entry(cpu, regs);
+        // SAFETY: `regs` lives across the call; the entry code returns to
+        // ring 3 with user selectors and only the user flags, and comes back
+        // through the SYSCALL entry or a ring-3 exception, which restore the
+        // kernel stack and callee-saved registers.
+        unsafe { rhizo_enter_cell(regs, sysret as u64) }
     };
     debug_assert_eq!(
         kernel_flags() & (DF | AC),
@@ -336,6 +318,46 @@ pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Tra
         rip: regs.pc,
         fault_address: (vector == exception::PAGE_FAULT).then(read_cr2),
     }))
+}
+
+/// [`enter_user`] with KPTI: the cell's CR3 is loaded by the entry code,
+/// last, and the kernel's first on the way back. Kept apart so the path
+/// without KPTI stays as it was.
+#[cold]
+#[inline(never)]
+fn enter_with_kpti(cpu: usize, cr3: u64, tag: u16, flush: bool, regs: &mut Registers) -> u64 {
+    if !KPTI_ENTRY[cpu].swap(true, Ordering::Relaxed) {
+        super::cpu::set_syscall_entry(true);
+    }
+    // An untagged cell shares PCID 0 with the kernel: its CR3 always
+    // flushes it, so no kernel translation stays cached while it runs.
+    let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
+    super::cpu::PERCPU.0[cpu].set_user_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
+    let sysret = prepare_entry(cpu, regs);
+    // SAFETY: as in `enter_user`, through the entry pages and the cell's
+    // tables, which map them.
+    unsafe { rhizo_enter_cell_kpti(regs, sysret as u64) }
+}
+
+/// Loads the cell's thread pointer and says whether `SYSRETQ` can return
+/// to it.
+#[inline(always)]
+fn prepare_entry(cpu: usize, regs: &Registers) -> bool {
+    // SYSRETQ loads RIP from RCX and RFLAGS from R11, so it restores exactly
+    // what IRETQ would when they already hold those values, as after a
+    // system call. Threads of a cell share CR3, so this is a property of
+    // the registers entered, not of the last exit (design D9 of
+    // `add-threads`). It also needs a canonical lower-half RIP (else it
+    // faults in ring 0).
+    let user_flags = (regs.flags & 0xdd5) | 0x202;
+    let sysret =
+        regs.pc < 0x0000_8000_0000_0000 && regs.gpr[2] == regs.pc && regs.gpr[10] == user_flags;
+    if LAST_FS[cpu].swap(regs.tls, Ordering::Relaxed) != regs.tls {
+        // SAFETY: the FS base is the cell's thread pointer; the kernel does
+        // not use FS.
+        unsafe { wrmsr(FS_BASE, regs.tls) };
+    }
+    sysret
 }
 
 /// Switches CR3 back to the kernel's tables: call before freeing the tables

@@ -51,8 +51,10 @@ The entry code:
 
 With KPTI off, entering a cell and system calls cost nothing: both come
 in two copies, assembled from one macro, and the kernel enters a cell
-through the copy that matches KPTI and points each CPU's `LSTAR` at the
-matching system-call entry (checked as it enters a cell). The copies with
+through the copy that matches KPTI, behind one test, and points each
+CPU's `LSTAR` at the matching system-call entry the first time it enters
+a cell after KPTI changed (`set_kpti` makes every CPU load a CR3 then, a
+path off the common one). The copies with
 KPTI live in the entry pages; those without, in the kernel's code, are
 the code from before KPTI. Exceptions and interrupts share one entry
 (the IDT): there a zero CR3 in per-CPU data means no switch, one
