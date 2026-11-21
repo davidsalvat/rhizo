@@ -24,9 +24,12 @@ segment), a C++ runtime, a Fortran runtime and threads (OpenBLAS starts
 a pool at load). All of it is user space or already supported by
 `add-dynamic-linking`: `ld.so` handles `PT_TLS` of a library itself
 (static TLS surplus or dynamic TLS), and `clone`, futexes and
-`sched_getaffinity` are there. No kernel or ABI change was needed: numpy
-and requests run on C.1's loader and system calls as they are, and the
-tests below hold that.
+`sched_getaffinity` are there. No change to the loader or the system
+calls was needed: numpy and requests run on C.1's as they are, and the
+tests below hold that. The one call they make that Rhizo does not
+implement is `mbind` (OpenBLAS placing its buffers on a NUMA node): it
+fails with `ENOSYS`, as on a Linux kernel built without NUMA, and
+OpenBLAS goes on without it.
 
 Which CPython: the distribution's `python3` is already packed by
 `add-dynamic-linking`, but its version is the runner's (3.12 on Ubuntu
@@ -118,13 +121,20 @@ The tree is embedded in the kernel image, decoded into the kernel heap
 when first used (`rhizo_fs`, copy-on-write blocks shared by every cell
 given the files), and the mapped pages are kept in the page cache
 (`add-dynamic-linking` D1): about three times its size while a numpy
-cell runs. The test VMs (`ktest`, `ktest-smp`) grow from 128 MiB to
-512 MiB, and the cell benchmark VM from 256 MiB to 512 MiB; the boot
-check, the self-checks and the boot benchmarks keep 128 MiB. A larger
-guest does not change what the cell benchmarks measure (no metric
-depends on free memory; the 50 MiB fork benchmark is the one that needed
-the room). Mapping the embedded bytes directly (no decoded copy) would
-save a third; it is left for later.
+cell runs. A snapshot of a cell that imported numpy is self-contained
+(`add-dynamic-linking` D7): it holds the cell's files and every page it
+mapped, well over 100 MiB, and the test that resumes one from its bytes
+holds both at once. The test VMs (`ktest`, `ktest-smp`, and `ktest` on
+q35) grow from 128 MiB to 1 GiB, and the cell benchmark VM from 256 MiB
+to 512 MiB; the boot check, the self-checks and the boot benchmarks keep
+128 MiB. A larger guest does not change what the cell benchmarks measure
+(no metric depends on free memory; the 50 MiB fork benchmark is the one
+that needed the room). The memory pressure test asked twenty cells for
+16 MiB each, more than a 128 MiB VM holds; it now asks each for an
+eighth of the free memory, so that twenty want more than any VM holds.
+Mapping the embedded bytes directly (no decoded copy), and snapshots that
+refer to file pages by content instead of copying them, would save most
+of this; both are left for later.
 
 ## D5. Tests and metrics
 

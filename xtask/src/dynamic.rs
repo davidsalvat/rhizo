@@ -270,12 +270,8 @@ fn add_libraries(root: &Path, native: bool) -> Result {
         let origin = file.parent().unwrap_or(root);
         let vendored = |name: &str| {
             run_path.iter().any(|dir| {
-                dir.strip_prefix("$ORIGIN").is_some_and(|rel| {
-                    origin
-                        .join(rel.trim_start_matches('/'))
-                        .join(name)
-                        .exists()
-                })
+                dir.strip_prefix("$ORIGIN")
+                    .is_some_and(|rel| origin.join(rel.trim_start_matches('/')).join(name).exists())
             })
         };
         for name in needed {

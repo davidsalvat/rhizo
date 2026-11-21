@@ -1157,8 +1157,10 @@ fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
     })
 }
 
-/// Memory of the cell benchmark VM, in MiB.
-pub(crate) const CELL_BENCH_MEMORY_MIB: u32 = 256;
+/// Memory of the cell benchmark VM, in MiB: the 50 MiB fork benchmark,
+/// and the packages cell's files (numpy) embedded, decoded and mapped
+/// (design D4 of `add-pip-packages`).
+pub(crate) const CELL_BENCH_MEMORY_MIB: u32 = 512;
 
 /// Allowed regression, in percent, for `m` in `env`: instructions counted
 /// under QEMU's `-icount` are exact, so their threshold is narrow (spec
@@ -2208,7 +2210,8 @@ mod tests {
 
     #[test]
     fn numpy_line_is_parsed() {
-        let out = "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-numpy cold_ns=90000000 warm_ns=400000\n";
+        let out =
+            "rhizo-cpython cold_ns=1 warm_ns=2\nrhizo-numpy cold_ns=90000000 warm_ns=400000\n";
         assert_eq!(parse_numpy_line(out), Some((90_000_000, 400_000)));
         assert_eq!(parse_numpy_line("rhizo-numpy cold_ns=1"), None);
         assert_eq!(parse_numpy_line("rhizo-numpyx cold_ns=1 warm_ns=2"), None);

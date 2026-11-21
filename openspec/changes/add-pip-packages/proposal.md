@@ -44,9 +44,11 @@ imported numpy once saves.
   a Linux process in the comparison's Firecracker guest.
 - **Memory**: a cell may hold 128 MiB of file data instead of 64 MiB (the
   packed tree is 65 MiB: OpenBLAS alone is 24 MiB); the test VMs grow from
-  128 to 512 MiB and the cell benchmark VM from 256 to 512 MiB: numpy's
+  128 MiB to 1 GiB and the cell benchmark VM from 256 to 512 MiB: numpy's
   files are embedded in the kernel image, decoded into the heap and kept in
-  the page cache once mapped.
+  the page cache once mapped, and a snapshot of a cell that imported numpy
+  copies them. The memory pressure test, which asked for more than a
+  128 MiB VM holds, sizes its cells by the free memory instead.
 
 ### Out of scope
 

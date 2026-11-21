@@ -2946,7 +2946,14 @@ fn numpy() -> Option<(u64, u64)> {
         }
     }
     let template = host
-        .spawn_file(files, PATH, &[ARGV[0], ARGV[1], ARGV[2], b"wait"], &[], true, false)
+        .spawn_file(
+            files,
+            PATH,
+            &[ARGV[0], ARGV[1], ARGV[2], b"wait"],
+            &[],
+            true,
+            false,
+        )
         .expect("spawn");
     while host.output(template) != Some(b"ready\n") {
         host.step();

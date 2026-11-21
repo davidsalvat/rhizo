@@ -1120,7 +1120,10 @@ mod tests {
     fn numpy_line_is_found_among_console_noise() {
         let line = "[  1.2] junk linux-numpy cold_us=180000.5 warm_us=900.25";
         assert_eq!(parse_numpy_line(line), Some((180_000.5, 900.25)));
-        assert_eq!(parse_numpy_line("linux-numpy cold_us=1 warm_us=failed"), None);
+        assert_eq!(
+            parse_numpy_line("linux-numpy cold_us=1 warm_us=failed"),
+            None
+        );
         assert_eq!(parse_numpy_line("linux-numpy failed: no numpy"), None);
     }
 

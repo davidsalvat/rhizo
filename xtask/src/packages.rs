@@ -224,7 +224,10 @@ fn install(tarball: &Path) -> Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&src);
     for entry in std::fs::read_dir(stage.join(cpython::STDLIB)).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("config-")) {
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("config-"))
+        {
             let _ = std::fs::remove_dir_all(path);
         }
     }
@@ -251,13 +254,15 @@ fn fetch(wheel: &Wheel) -> Result<PathBuf> {
     let got = cpython::sha256(&part)?;
     if got != wheel.sha256 {
         let _ = std::fs::remove_file(&part);
-        return Err(Failure::new("build", "a downloaded wheel is not the pinned one")
-            .location(url.clone())
-            .expected(format!("SHA-256 {}", wheel.sha256))
-            .actual(got)
-            .hint("PyPI files never change: check the URL, or update the pin on purpose")
-            .reproduce(format!("curl -L {url} | sha256sum"))
-            .into_error());
+        return Err(
+            Failure::new("build", "a downloaded wheel is not the pinned one")
+                .location(url.clone())
+                .expected(format!("SHA-256 {}", wheel.sha256))
+                .actual(got)
+                .hint("PyPI files never change: check the URL, or update the pin on purpose")
+                .reproduce(format!("curl -L {url} | sha256sum"))
+                .into_error(),
+        );
     }
     std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
     Ok(path)

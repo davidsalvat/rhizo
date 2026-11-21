@@ -18,8 +18,8 @@ mod demo;
 mod deps;
 mod differential;
 mod dynamic;
-mod packages;
 pub mod hostnet;
+mod packages;
 mod profile;
 mod refguest;
 pub mod report;
@@ -39,9 +39,10 @@ const KERNEL_PACKAGE: &str = "rhizo-kernel";
 const CELLS_PACKAGE: &str = "rhizo-cells";
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
 /// Memory of the in-kernel test VMs (`ktest`, `ktest-smp`), in MiB: the
-/// packages cell's files (numpy) are embedded, decoded and mapped (design
-/// D4 of `add-pip-packages`).
-pub(crate) const KTEST_MEMORY_MIB: u32 = 512;
+/// packages cell's files (numpy) are embedded, decoded and mapped, and a
+/// snapshot of a cell that imported numpy holds those files and every page
+/// it mapped (design D4 of `add-pip-packages`).
+pub(crate) const KTEST_MEMORY_MIB: u32 = 1024;
 
 /// Virtual CPUs of the `ktest-smp` step (spec `multi-core`).
 pub(crate) const SMP_CPUS: u32 = 4;

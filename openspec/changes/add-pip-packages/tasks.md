@@ -7,7 +7,7 @@
 
 ## 2. Kernel tests
 
-- [ ] 2.1 In-kernel tests `numpy_from_a_wheel_computes_as_on_linux`, `requests_gets_from_the_host_as_on_linux` and `a_cell_that_imported_numpy_suspends_resumes_and_forks` (D5); test VMs with 512 MiB (D4); verify `cargo xtask test --only ktest` and `cargo xtask test --only ktest-smp` on both architectures
+- [ ] 2.1 In-kernel tests `numpy_from_a_wheel_computes_as_on_linux`, `requests_gets_from_the_host_as_on_linux` and `a_cell_that_imported_numpy_suspends_resumes_and_forks` (D5); test VMs with 1 GiB, the memory pressure test sized by free memory (D4); verify `cargo xtask test --only ktest` and `cargo xtask test --only ktest-smp` on both architectures
 
 ## 3. Benchmarks and documentation
 

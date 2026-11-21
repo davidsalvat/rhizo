@@ -1301,10 +1301,7 @@ fn memory_pressure_fails_cells_not_the_kernel() {
     // cells end before others start.
     let mib = alloc::format!("{}", (memory::free_bytes() >> 20) / 8 + 1);
     let mib = mib.as_bytes();
-    for (name, args) in [
-        ("ballast", &[&b"all"[..], mib][..]),
-        ("filer", &[mib][..]),
-    ] {
+    for (name, args) in [("ballast", &[&b"all"[..], mib][..]), ("filer", &[mib][..])] {
         let before = memory_balance();
         let (done, refused) = flood(name, args);
         assert!(
