@@ -16,8 +16,8 @@
 
 - [x] 3.1 `rhizo-node` line of the `node` benchmark kernel, `measure_node` and `--workload node` in `xtask/src/bench.rs` with a parser test (D5); verify `RHIZO_NODE=1 cargo xtask bench --workload node --vmm qemu-microvm --runs 1`
 - [x] 3.2 `bench/host/linux_node.c` and `compare::node_in_vm` (the Linux process in Firecracker, cold only) with a parser test; verify `cargo test -p xtask node_line` and the C program run natively in a root holding the packed files
-- [ ] 3.3 `bench/README.md` describes the metrics; CI sets `RHIZO_NODE` and caches `target/tools`; verify the CI benchmark gate passes with the new metrics present and no metric worse
+- [x] 3.3 `bench/README.md` describes the metrics; CI sets `RHIZO_NODE` and caches `target/tools`; verify the CI benchmark gate passes with the new metrics present and no metric worse
 
 ## 4. Documentation
 
-- [ ] 4.1 `AGENTS.md` names the `ktest-node` step, `RHIZO_NODE` and `cells/node`; the JIT design is recorded for the next change (D6); verify `openspec validate add-node-workload --strict`
+- [x] 4.1 `AGENTS.md` names the `ktest-node` step, `RHIZO_NODE` and `cells/node`; the JIT design is recorded for the next change (D6); verify `openspec validate add-node-workload --strict`

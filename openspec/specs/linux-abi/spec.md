@@ -18,10 +18,10 @@ Linux does.
 
 ### Requirement: Supported calls
 The kernel SHALL implement `write`, `writev`, `exit`, `exit_group`, `brk`,
-`mmap` (anonymous private), `munmap`, `getpid`, `gettid`,
-`set_tid_address`, `uname`, `clock_gettime`, `getrandom`, `rt_sigaction`,
-`rt_sigprocmask`, `ioctl` and, on x86_64, `arch_prctl`, with Linux semantics
-for the cases cells use in H2.
+`mmap` (anonymous private, and private file mappings), `munmap`, `getpid`,
+`gettid`, `set_tid_address`, `uname`, `clock_gettime`, `getrandom`,
+`rt_sigaction`, `rt_sigprocmask`, `ioctl` and, on x86_64, `arch_prctl`, with
+Linux semantics for the cases cells use in H2.
 
 #### Scenario: Console output
 - **WHEN** a cell writes to file descriptor 1 or 2
@@ -128,6 +128,15 @@ arenas); the pages it does not cover stay inaccessible.
 - **WHEN** a cell reserves 1 MiB with `PROT_NONE` and makes all but its lowest page readable and writable
 - **THEN** the pages read as zero and keep what is written, and touching the lowest page kills the cell with a fault report
 
+### Requirement: Inaccessible pages are freed
+`mprotect` with `PROT_NONE` (and `MAP_FIXED` with `PROT_NONE`) SHALL make
+pages inaccessible by freeing them: their contents are not kept, and in the
+mapping area their addresses stay reserved.
+
+#### Scenario: A gap between segments
+- **WHEN** a cell makes a mapped page inaccessible with `mprotect` and later readable and writable again
+- **THEN** the page holds no memory in between and reads as zero afterwards
+
 ### Requirement: Pipes and event counters
 The kernel SHALL implement `pipe2` (and `pipe` on x86_64) and `eventfd2`
 (and `eventfd` on x86_64) with Linux semantics: a pipe holds up to 64 KiB,
@@ -228,3 +237,111 @@ that range or in the guard page below it.
 #### Scenario: Beyond the limit
 - **WHEN** a cell touches an unmapped address below the 8 MiB stack limit
 - **THEN** the cell is killed with a fault report, as before
+
+### Requirement: File mappings
+`mmap` with `MAP_PRIVATE` of a regular file open for reading SHALL map the
+file's pages from a page-aligned offset: they read as the file, the bytes
+past its end as zero, and a write (where `PROT_WRITE` allows it) SHALL
+change only the cell's private copy, never the file or another mapping.
+`munmap` and `mprotect` SHALL work on file mappings as on anonymous ones.
+
+#### Scenario: A library mapped by the dynamic loader
+- **WHEN** a cell maps a file read-only, maps its middle page writable over it with `MAP_FIXED`, writes that page and maps the file again
+- **THEN** every mapping reads the file's bytes, only the written page holds the write, and the file is unchanged
+
+### Requirement: Refused file mappings
+A file mapping SHALL fail with `EACCES` for `PROT_WRITE` with `PROT_EXEC`
+(W^X) or a descriptor open only for writing, `EINVAL` for an offset not
+page aligned, `EBADF` for a descriptor that is not open, and `ENODEV` for
+one that is not a regular file and for `MAP_SHARED`.
+
+#### Scenario: Shared file mapping
+- **WHEN** a cell maps a file with `MAP_SHARED`
+- **THEN** it receives `-ENODEV`
+
+### Requirement: Fixed mappings
+`mmap` with `MAP_FIXED` SHALL map at the page-aligned address given, in
+place of whatever was mapped there (anonymous memory, a file, or nothing);
+an address that is not page aligned or a range past the cell's addresses
+SHALL fail with `EINVAL`, and the first page with `EPERM`.
+
+#### Scenario: Anonymous memory over a file
+- **WHEN** a cell maps a file and then anonymous memory over its last page with `MAP_FIXED`
+- **THEN** the call returns the address given and that page reads as zero
+
+### Requirement: Start-up calls of distribution programs
+The kernel SHALL implement `statx` (the fields `newfstatat` gives),
+`sysinfo` (uptime and the memory cells share; no swap, one process),
+`sched_getaffinity` (one CPU) and `fadvise64` (accepted, nothing to do),
+as coreutils and CPython call them at start-up.
+
+#### Scenario: Number of CPUs
+- **WHEN** a cell asks `sched_getaffinity` for its CPUs with a buffer of 128 bytes
+- **THEN** it receives 8 and a mask with CPU 0 only
+
+### Requirement: Descriptor ioctls
+`ioctl` SHALL implement `FIONBIO` (set or clear a descriptor's
+non-blocking mode, as `fcntl(F_SETFL)` with `O_NONBLOCK` does), `FIOCLEX`
+and `FIONCLEX` (set or clear close-on-exec) on any descriptor, with `EBADF`
+for a descriptor that is not open and `EFAULT` for an unreadable argument;
+any other request SHALL return `ENOTTY`.
+
+#### Scenario: Socket with a timeout
+- **WHEN** a cell switches a descriptor to non-blocking mode with `FIONBIO`, as CPython does for a socket with a timeout
+- **THEN** the call succeeds and `fcntl(F_GETFL)` reports `O_NONBLOCK`; switched back, it does not
+
+#### Scenario: Close-on-exec
+- **WHEN** a cell calls `FIOCLEX` then `FIONCLEX` on a descriptor
+- **THEN** `fcntl(F_GETFD)` reports `FD_CLOEXEC` after the first and not after the second
+
+#### Scenario: Other requests
+- **WHEN** a cell asks for a terminal's attributes with `TCGETS`
+- **THEN** the call returns `-ENOTTY`
+
+### Requirement: Time of day and clock resolution
+The kernel SHALL implement `gettimeofday` (the realtime clock in seconds
+and microseconds, an empty time zone; either pointer may be null) and
+`clock_getres` (one nanosecond for every clock `clock_gettime` reads,
+`EINVAL` for another), as libuv calls them; a bad pointer SHALL return
+`EFAULT`.
+
+#### Scenario: Time of day
+- **WHEN** a cell calls `gettimeofday` with a buffer for the time and one for the time zone
+- **THEN** it receives 0, the realtime clock's seconds and microseconds, and a zeroed time zone
+
+#### Scenario: Resolution of an unknown clock
+- **WHEN** a cell calls `clock_getres` for a clock `clock_gettime` does not read
+- **THEN** it receives `-EINVAL`
+
+### Requirement: Capabilities and thread names
+`capget` SHALL report that a cell holds no capabilities: versions 1 to 3 of
+the header get empty sets, another version is answered with version 3 in
+the header and `EINVAL`. `prctl` SHALL accept `PR_SET_NAME` (the name is
+not kept) and `PR_GET_NAME` (an empty name), and return `EINVAL` for any
+other option.
+
+#### Scenario: Capabilities of a cell
+- **WHEN** a cell calls `capget` with a version 3 header
+- **THEN** it receives 0 and empty effective, permitted and inheritable sets
+
+#### Scenario: A thread names itself
+- **WHEN** a cell calls `prctl` with `PR_SET_NAME`
+- **THEN** it receives 0
+
+### Requirement: Scheduling policy of threads
+`sched_getparam` and `sched_getscheduler` SHALL report the normal policy
+and priority 0 for the caller (0) or one of its threads, `ESRCH` for any
+other thread and `EINVAL` for a negative one.
+
+#### Scenario: Policy of another thread
+- **WHEN** a cell calls `sched_getscheduler` for a thread that is not one of its own
+- **THEN** it receives `-ESRCH`
+
+### Requirement: Declined calls
+`io_uring_setup` SHALL return `-ENOSYS` without being reported as an
+unsupported call, as `rseq` does: libraries that try it (libuv) fall back to
+calls cells have.
+
+#### Scenario: libuv probes io_uring
+- **WHEN** a cell calls `io_uring_setup`
+- **THEN** it receives `-ENOSYS` and the console shows nothing

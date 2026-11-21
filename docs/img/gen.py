@@ -468,6 +468,8 @@ def arches(t):
 
 # ---------------------------------------------------------------- roadmap
 BOOT_MS = median("boot.time_to_ready_ms")
+AGENT_FORK = median("workload.agent_fork_us", required=False)
+DENSITY = median("density.cells", required=False)
 
 
 def has(name, vmm="firecracker"):
@@ -493,11 +495,13 @@ STAGES = [
      (times(RUN, LINUX_SPAWN).replace("≈ ", "") if LINUX_SPAWN else "",
       "to start a program")),
     ("A real agent", "Calls a model, explores branches, pauses between turns",
-     [has("net.tcp_rtt_us"), has("net.tcp_rtt_us", "cloud-hypervisor"),
-      has("cell.tcp_resume_us"), has("workload.agent_turn_us")], "now", None),
+     [has("net.tcp_rtt_us"), has("cell.tcp_resume_us"), has("workload.agent_turn_us"),
+      has("workload.agent_fork_us")], "now",
+     (us(AGENT_FORK), "to fork a live agent three ways") if AGENT_FORK else None),
     ("Scale and compatibility", "Thousands of busy agents and everyday software, safely shared",
      [has("cell.shootdown_us"), has("density.wake_p99_us"),
-      has("workload.dynamic_run_us"), has("workload.node_warm_us")], "next", None),
+      has("workload.dynamic_run_us"), has("workload.node_warm_us")], "now",
+     (f"{DENSITY:,.0f}", "busy cells in one VM") if DENSITY else None),
     ("The product", "Download a ready agent in two clicks, bring your own model",
      [False], "vision", None),
 ]

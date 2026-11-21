@@ -20,5 +20,5 @@
 ## 4. Tests and metrics
 
 - [x] 4.1 `control` step of `cargo xtask test`; verify `cargo xtask --arch x86_64 test --only control` with CPython built
-- [ ] 4.2 `control.*` metrics in `cargo xtask bench`, documented in `bench/README.md`; the `ci` baseline gains them from a CI run; verify the CI benchmark job
+- [x] 4.2 `control.*` metrics in `cargo xtask bench`, documented in `bench/README.md`; the `ci` baseline gains them from a CI run; verify the CI benchmark job
 - [x] 4.3 `docs/demo.md`, README "Try it"; verify `openspec validate add-control-plane --strict`

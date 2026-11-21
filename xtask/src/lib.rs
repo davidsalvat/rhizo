@@ -535,7 +535,8 @@ const MAX_SHARDS: usize = 4;
 /// How many VMs share the in-kernel tests of one step: `RHIZO_SHARDS`
 /// (at most [`MAX_SHARDS`] and `parallel`), 1 by default. Splitting runs
 /// tests without the ones before them, which still exposes tests that
-/// depend on their order (`openspec/changes/speed-up-feedback-loop`), so it
+/// depend on their order (change `speed-up-feedback-loop`, archived in
+/// `openspec/changes/archive/2026-11-21-speed-up-feedback-loop`), so it
 /// is opt-in until they are fixed.
 fn shards(parallel: usize) -> usize {
     env::var("RHIZO_SHARDS")
