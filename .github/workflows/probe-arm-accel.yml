@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15, macos-26]
+        os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -60,7 +60,7 @@ jobs:
           brew install qemu >/dev/null 2>&1 || true
           qemu-system-aarch64 --version | head -1
           set +e
-          out=$(timeout 60 qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu host -m 512M \
+          out=$(perl -e 'alarm 60; exec @ARGV' qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu host -m 512M \
             -nodefaults -no-user-config -display none -no-reboot -serial stdio \
             -kernel kernel.img -append "console=serial exit=psci" 2>&1)
           code=$?
