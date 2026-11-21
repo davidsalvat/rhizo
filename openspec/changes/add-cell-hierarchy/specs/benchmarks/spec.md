@@ -27,6 +27,17 @@ two domains) with and without exclusive CPU sets, reported and not gated.
 - **WHEN** `cargo xtask bench` runs a `bench-cell` kernel with 4 vCPUs
 - **THEN** the results contain `net.egress_check_insns` and both `covert.cpu_bps` figures, and the gated metrics of system calls, switches, forks and loopback are within their thresholds
 
+### Requirement: Fairness metrics
+`cargo xtask bench` SHALL report `sched.domain_share_pct`, the CPU share
+of a domain of one spinning cell next to a domain of 16 on one CPU with
+equal weights, reported and not gated, while `cell.switch_ns`,
+`cell.parallel_us` and `cell.scaling_pct` with one domain stay within
+their thresholds.
+
+#### Scenario: Metric present
+- **WHEN** `cargo xtask bench` runs a `bench-cell` kernel
+- **THEN** the results contain `sched.domain_share_pct`, and the gated switch and parallel metrics pass
+
 ### Requirement: Channel metrics
 `cargo xtask bench` SHALL report `cell.channel_rtt_us` (two cells
 exchanging a 64-byte message over a channel, per round trip),

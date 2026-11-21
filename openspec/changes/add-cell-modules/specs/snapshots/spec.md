@@ -15,8 +15,8 @@ module request SHALL NOT be kept.
 ### Requirement: Pages shared with a base module
 A snapshot file SHALL be able to record a page as the same as a page of
 its base module, named by digest; it SHALL load only when that base is
-loaded with that digest, and its pages SHALL then map the base's frames
-copy-on-write.
+loaded and published with that digest, and its pages SHALL then map the
+base's frames copy-on-write.
 
 #### Scenario: Missing base
 - **WHEN** a file with base page records is decoded and no module with its base digest is loaded

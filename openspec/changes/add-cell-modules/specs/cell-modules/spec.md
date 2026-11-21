@@ -14,6 +14,27 @@ budget back.
 - **WHEN** an agent adds `numpy` and sends a computation over the module's `repl:python` channel
 - **THEN** it reads the result, its own memory map is unchanged, and killing the child gives back its budget
 
+### Requirement: Module children reseed
+A module's server SHALL check its copy generation before each request
+and, when it changed since the warm-up, reseed the generators its
+interpreter keeps in memory before running anything, so that no two
+children of one module template draw the same numbers.
+
+#### Scenario: Two agents add python
+- **WHEN** agents in two domains each add `python` and evaluate `random.random()` over its `repl:python` channel
+- **THEN** the two answers differ
+
+### Requirement: Module templates are public
+A loaded module SHALL be published (`add-cell-hierarchy`, public
+objects): shared across domains, its mapped pages loaded at
+publication. A builder's per-build token SHALL be dead before the
+builder is frozen, and the operator's signature SHALL be the attestation
+that the template holds no secret.
+
+#### Scenario: Token after the freeze
+- **WHEN** a builder is frozen and a copy of its template sends a request with its build token to the package proxy
+- **THEN** the proxy answers `403` and logs it
+
 ### Requirement: Sub-templates share their base
 A module made from another SHALL be a copy of its base's template,
 frozen after its installation, sharing copy-on-write every page it did

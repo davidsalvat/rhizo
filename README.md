@@ -361,7 +361,7 @@ needs them.
   so no fork bomb escapes them; capability handles whose rights only shrink;
   channels as the only way to talk; a private loopback per cell; egress
   policies per family (none, the model, an allowlist), checked on every
-  socket; and an inventory of the 40 shared resources that could leak
+  socket; and an inventory of the 42 shared resources that could leak
   between families, each closed or measured.
 - **Abilities as child cells.** An agent starts as a small static chat agent
   that can reach only its model. Each task that needs more adds a child cell,

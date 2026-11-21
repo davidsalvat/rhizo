@@ -70,19 +70,21 @@ reach.
 - **THEN** it reports `covert.cpu_bps`, and the inventory in `docs/security.md` cites it
 
 ### Requirement: Frames shared across domains stay held
-A template whose copies live in more than one domain SHALL keep its
-references to its frames after it is dropped, until its last copy ends,
-so that whether a cell's write to a shared page copies it never depends
-on another domain.
+A published template, the only kind whose copies live in more than one
+domain, SHALL keep its references to its frames after it is dropped,
+until its last copy ends, so that whether a cell's write to a shared
+page copies it never depends on another domain.
 
 #### Scenario: Template dropped under two domains
-- **WHEN** two domains run copies of one template, the template is dropped, and one domain's copies end
+- **WHEN** two domains run copies of one published template, the template is dropped, and one domain's copies end
 - **THEN** each write of the other domain's copies to a page they shared still makes a private copy
 
 ### Requirement: File pages kept per domain
-Pages of mapped files SHALL be shared only between cells of one domain:
-the page cache SHALL be keyed by domain and by contents, bounded and
-emptied per domain, and charged to the domain's root.
+Pages of mapped files SHALL be shared only between cells of one domain,
+except pages of public objects: the page cache SHALL be keyed by domain
+(or public) and by contents, bounded and emptied per domain, and charged
+to the domain's root; public pages SHALL be loaded when published and
+never evicted while published or mapped.
 
 #### Scenario: Flushing another domain
 - **WHEN** a cell maps more file pages than its domain may keep, while a cell of another domain maps a library page again and again

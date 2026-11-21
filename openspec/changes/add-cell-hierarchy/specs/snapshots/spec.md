@@ -32,15 +32,26 @@ into the current one; encoding SHALL write only the current version.
 - **THEN** the cell resumes with egress `none`, no handles, and the limits its new parent allows
 
 ### Requirement: Tree state in snapshots
-A snapshot SHALL hold the cell's limits and budget mode, its policy for
-when its parent ends, its egress policy and ceiling, its CPU set, its
-identifier in its domain and its label. Resumed in the kernel that took
-it, the cell SHALL come back under its parent; if the parent ended, that
-policy SHALL already have applied.
+A snapshot SHALL hold the cell's limits, budget mode, CPU weight and
+cap, its policy for when its parent ends, its egress policy and ceiling,
+its CPU set, identifier in its domain, label, copy generation,
+`MADV_WIPEONFORK` ranges and whether it may hold secrets. Resumed in the
+kernel that took it, the cell SHALL come back under its parent; if the
+parent ended, that policy SHALL already have applied.
 
 #### Scenario: Policy across suspend
 - **WHEN** a child with egress `model` and a 16 MiB limit is suspended and resumed
 - **THEN** it is under the same parent, with the same egress and limit
+
+### Requirement: Frames a snapshot refers to stay in the domain
+A snapshot in the kernel SHALL refer instead of copying only to frames
+of its cell's domain or of public objects. Moving a suspended cell to
+another domain SHALL turn its other references into private frames
+first.
+
+#### Scenario: Suspended cell moved by the host
+- **WHEN** a suspended fork that shares pages with its source is moved by the host into another domain and resumed
+- **THEN** it reads its pages as they were, and the source's later writes to them copy nothing on the resumed cell's side
 
 ### Requirement: Handles in snapshots
 A snapshot SHALL hold one record per handle (kind, rights, label, boot

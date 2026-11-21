@@ -28,3 +28,18 @@ other domains.
 #### Scenario: Busy neighbour
 - **WHEN** another domain makes and ends 500 cells between the start of two roots
 - **THEN** both roots read 1 from `getpid`
+
+### Requirement: Copies are told apart
+`madvise` SHALL accept `MADV_WIPEONFORK` and `MADV_KEEPONFORK` on
+private anonymous memory: in every copy of a cell (fork, template copy,
+load of a snapshot file, resume) the wiped ranges SHALL read as zero,
+and the source SHALL keep its contents. A copy's `getpid` SHALL differ
+from its source's, so libraries that detect a fork by it reseed.
+
+#### Scenario: Wiped page
+- **WHEN** a cell marks a page `MADV_WIPEONFORK`, writes 1 in it, and is forked, copied from a template of it and resumed from its snapshot
+- **THEN** each copy and the resumed cell read 0, and the source reads 1
+
+#### Scenario: Copy as a root
+- **WHEN** a root whose `getpid` is 1 is frozen as a published template and copied as a new root
+- **THEN** the copy's `getpid` is not 1
