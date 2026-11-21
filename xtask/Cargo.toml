@@ -13,6 +13,10 @@ serde_json = "1"
 rhizo-fs = { path = "../crates/rhizo-fs" }
 # The control protocol, to talk to a control kernel (`rhizo`, benchmarks).
 rhizo-control = { path = "../crates/rhizo-control" }
+# `AF_VSOCK` sockets, which the standard library lacks, to reach a control
+# kernel on QEMU's vhost-vsock (MIT OR Apache-2.0; design D4 of
+# `control-over-vsock`).
+libc = "0.2"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
