@@ -113,6 +113,90 @@ rhizo down
 
 (`llama-server` serves the one model it loaded, whatever `--model` says.)
 
+## Talk to an agent
+
+`rhizo chat` puts you in a conversation with an agent running in a cell:
+CPython with `cells/python/agent_chat.py`, which keeps the whole
+conversation in the cell and gives the model four tools that run inside
+it: a Python snippet (its output capped at 4000 characters, stopped after
+10 s), read a file, write a file, list a directory. Type a message, read
+the answer, type the next; after each answer `rhizo` prints the turn's
+time, the model's apart from Rhizo's.
+
+```text
+$ rhizo up
+$ rhizo chat --llm http://127.0.0.1:11434 --model qwen2.5:1.5b
+[rhizo] chat cell 1: CPython with `agent_chat.py`, model `qwen2.5:1.5b` at http://10.0.2.2:11434 as the guest sees it; started in 3481 us (round trip 10.4 ms)
+[rhizo] ready 586.2 ms after the request; type a message, /help for commands
+[1]> How many primes are there below 10000?
+  [tool] run_python
+      print(sum(all(n % d for d in range(2, int(n**0.5) + 1)) for n in range(2, 10000)))
+  [tool] ->
+      1229
+There are 1229 primes below 10000.
+[rhizo] model 2950.4 ms, rhizo 61.2 ms (agent in the cell 52.0 ms, delivery 9208 us)
+[1]> /fork 2
+[rhizo] forked cell 1 into [2, 3] (copy-on-write, the conversation shared) in 3949 us (round trip 6207 us); still on 1
+[1]> /switch 3
+[rhizo] now talking to cell 3
+[3]> Write them to /primes.txt instead.
+...
+[3]> /suspend
+[rhizo] suspended cell 3 (17208 KiB snapshot) in 531.7 ms (round trip 538.2 ms); `rhizo chat 3` resumes it
+$ rhizo chat 3
+[rhizo] talking to cell 3, resumed in 15.3 ms (round trip 16.4 ms); /help for commands
+[3]>
+```
+
+(An illustration under emulation: Rhizo's times are of the order the
+`control` test step measures against the fake model, the model's depends
+on yours. The benchmark's figure for a turn is `chat.turn_us`, see
+`bench/README.md`.)
+
+With Ollama or llama.cpp, as for the scripted demo (any model that calls
+tools; small ones sometimes answer without calling them, which is fine):
+
+```bash
+ollama serve & ollama pull qwen2.5:1.5b
+rhizo up
+rhizo chat --llm http://127.0.0.1:11434 --model qwen2.5:1.5b
+
+llama-server -m qwen2.5-1.5b-instruct-q4_k_m.gguf --jinja --port 8080 &
+rhizo chat --llm http://127.0.0.1:8080 --model qwen2.5
+```
+
+Inside a chat:
+
+| Type | What happens |
+|---|---|
+| a message | It goes to the agent's standard input; its answer, and each tool call with its result, is shown whole, then the time split |
+| `/fork K` | Forks the conversation into `K` new cells sharing its memory and history copy-on-write; you stay on the current one |
+| `/branches` | The branches this session knows (the first cell and those it forked or switched to), with their states |
+| `/switch N` | Talk to cell `N` from now on (resumed first if suspended) |
+| `/suspend` | Suspends the current branch and leaves; `rhizo chat N` resumes it later, history and files included |
+| `/exit` | Ends the current branch and leaves (other branches keep running: `rhizo ps`, `rhizo kill N`) |
+| `/help` | The commands |
+| Ctrl-D | Closes the agent's input: it ends, and the chat with it |
+
+`model` is the time the agent waited for the model's answers (requests
+sent until answers read); `rhizo` is everything else from Enter to the
+answer's last line: the agent's own work in the cell (JSON, tools,
+printing) and the delivery both ways (the kernel and the serial line).
+
+How it works: a cell started for a chat reads its standard input from a
+pipe whose write end the host holds; each line is a control request
+(`input`), and Ctrl-D closes the host's end (`close-input`). The pipe is
+part of the cell, so a suspended branch keeps unread input, and each fork
+gets its own copy; `rhizo` decides which branch you are talking to. With
+standard input from a file or a pipe, `rhizo chat` echoes each line
+(`> ...`) instead of prompting, so a conversation can be scripted: CI does
+exactly that against the fake model (`cargo xtask test --only control`).
+
+Limits: one conversation on screen; answers appear whole, not token by
+token; a turn cannot be interrupted (a snippet stops by itself after 10 s,
+but a single long call into C runs to its end); a new `rhizo chat N` knows
+only cell `N` until you fork or switch.
+
 ## Driving cells by hand
 
 `rhizo up` builds the control kernel on first use (or takes `--kernel`) and

@@ -1,11 +1,13 @@
 //! `rhizo`: boots a Rhizo VM with the control kernel and runs, lists,
-//! suspends, resumes, forks and kills its cells (spec `control-plane`,
-//! change `add-control-plane`). Linux hosts only. Policy lives here: which
+//! suspends, resumes, forks and kills its cells, and talks to an agent in
+//! one (spec `control-plane`, changes `add-control-plane` and
+//! `add-interactive-chat`). Linux hosts only. Policy lives here: which
 //! programs a template starts with which files, and when to suspend or
 //! fork, are this tool's choices; the kernel only executes requests.
 
 mod agent;
 mod args;
+mod chat;
 mod client;
 mod serve;
 mod state;
@@ -34,6 +36,7 @@ fn main() -> ExitCode {
                 agent::run(&mut Client::connect(&dir)?, &run)
             }
             Command::Run(run) => cmd_run(&dir, &run),
+            Command::Chat(chat) => chat::run(&mut Client::connect(&dir)?, &chat),
             Command::Ps => cmd_ps(&dir),
             Command::Stats => cmd_stats(&dir),
             Command::Fork { id, n } => {
@@ -211,6 +214,7 @@ fn template(run: &args::Run) -> Result<Run, String> {
             .collect(),
         envp: run.env.iter().map(|e| e.clone().into_bytes()).collect(),
         files,
+        input: false,
     })
 }
 

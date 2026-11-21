@@ -21,6 +21,39 @@ use std::time::{Duration, Instant};
 /// How long a control kernel may take to boot and say hello.
 pub const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The line the chat agent (`cells/python/agent_chat.py`, change
+/// `add-interactive-chat`) prints once it reads its input.
+pub const CHAT_READY: &str = "\x1eready";
+
+/// The line the chat agent prints after each answer: the time it waited
+/// for the model, and the whole turn in the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatTurn {
+    pub model_ns: u64,
+    pub agent_ns: u64,
+}
+
+impl ChatTurn {
+    /// The turn `line` (`\x1eturn model_ns=M agent_ns=A`) reports, if it is
+    /// one.
+    pub fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.strip_prefix("\x1eturn ")?.split(' ');
+        let mut field = |name: &str| {
+            fields
+                .next()?
+                .strip_prefix(name)?
+                .strip_prefix('=')?
+                .parse()
+                .ok()
+        };
+        let turn = ChatTurn {
+            model_ns: field("model_ns")?,
+            agent_ns: field("agent_ns")?,
+        };
+        fields.next().is_none().then_some(turn)
+    }
+}
+
 /// What the VM sent.
 #[derive(Debug)]
 pub enum Event {
@@ -280,7 +313,7 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
     let opts = run_options(accel, 1, vmm::DEFAULT_MEMORY_MIB);
     let mut vm = Vm::start(vmm, kernel, opts, Stdio::null())?;
     let us = |d: Duration| d.as_secs_f64() * 1e6;
-    let mut samples: [(&str, Vec<f64>); 6] = [
+    let mut samples: Vec<(&str, Vec<f64>)> = vec![
         ("control.roundtrip_us", Vec::new()),
         ("control.run_us", Vec::new()),
         ("control.suspend_us", Vec::new()),
@@ -322,6 +355,9 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
             }
         }
     }
+    if crate::cpython::root().join("usr/bin/python3").exists() {
+        samples.push(("chat.turn_us", chat_turns(&mut vm, vmm)?));
+    }
     vm.shutdown();
     Ok(samples
         .into_iter()
@@ -341,8 +377,196 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
         .collect())
 }
 
+/// Turns timed per boot for `chat.turn_us`.
+const CHAT_TURNS: usize = 20;
+
+/// The Rhizo side of interactive turns (spec `benchmarks`, design D6 of
+/// `add-interactive-chat`): a chat agent against the host's fake model,
+/// each turn timed from the host's `input` request to the agent's last line
+/// read back, less the time the agent waited for the model.
+fn chat_turns(vm: &mut Vm, vmm: Vmm) -> Result<Vec<f64>> {
+    let bind = match vmm {
+        Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
+        other => crate::hostnet::host_address(other),
+    };
+    let port = crate::hostnet::llm_server(bind, 0)?;
+    let url = format!("http://{}:{port}", crate::hostnet::host_address(vmm));
+    let (Body::Cell(cell), _) = done(
+        vm,
+        &Request::Run(Run {
+            image: b"cpython".to_vec(),
+            files_from: b"cpython-files".to_vec(),
+            argv: ["/usr/bin/python3", "/app/agent_chat.py", &url, "fake"]
+                .iter()
+                .map(|a| a.as_bytes().to_vec())
+                .collect(),
+            input: true,
+            ..Run::default()
+        }),
+    )?
+    else {
+        return Err("`run` returned no cell".into());
+    };
+    done(vm, &Request::Output(cell))?;
+    let mut partial = Vec::new();
+    while chat_line(vm, &mut partial)? != CHAT_READY {}
+    let mut samples = Vec::new();
+    for turn in 0..CHAT_TURNS {
+        let t0 = Instant::now();
+        done(
+            vm,
+            &Request::Input {
+                cell,
+                data: format!("Turn {turn}: what is the sum?\n").into_bytes(),
+            },
+        )?;
+        let turn = loop {
+            if let Some(turn) = ChatTurn::parse(&chat_line(vm, &mut partial)?) {
+                break turn;
+            }
+        };
+        let total = t0.elapsed().as_nanos() as u64;
+        samples.push(total.saturating_sub(turn.model_ns) as f64 / 1e3);
+    }
+    done(vm, &Request::Kill(cell))?;
+    done(vm, &Request::Kill(cell))?;
+    Ok(samples)
+}
+
+/// The next line a watched cell prints.
+fn chat_line(vm: &mut Vm, partial: &mut Vec<u8>) -> Result<String> {
+    loop {
+        if let Some(end) = partial.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = partial.drain(..=end).collect();
+            return Ok(String::from_utf8_lossy(&line[..end]).into_owned());
+        }
+        match vm.next(CHAT_STEP) {
+            Some(Event::Frame(f)) => match Message::decode(&f) {
+                Ok(Message::Output { data, .. }) => partial.extend(data),
+                Ok(Message::Ended { state, .. }) => {
+                    return Err(format!("the chat agent ended: {state:?}"));
+                }
+                _ => {}
+            },
+            Some(Event::Text(t)) => vm.console.extend(t),
+            Some(Event::Exited) | None => {
+                return Err(format!(
+                    "the chat agent printed nothing; console:\n{}",
+                    String::from_utf8_lossy(&vm.console)
+                ));
+            }
+            Some(Event::Bad { .. }) => {}
+        }
+    }
+}
+
 mod expected {
     include!("../../cells/expected.rs");
+}
+
+/// How long a chat step may take (CPython under emulation starts in
+/// seconds).
+const CHAT_STEP: Duration = Duration::from_secs(120);
+
+/// `rhizo chat` driven through pipes, as someone typing would; every line
+/// it prints goes to `log` as `chat| LINE`.
+struct Chat<'a> {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    lines: Receiver<String>,
+    log: &'a std::cell::RefCell<String>,
+}
+
+impl<'a> Chat<'a> {
+    fn start(
+        rhizo: &Path,
+        state: &Path,
+        words: &[&str],
+        log: &'a std::cell::RefCell<String>,
+    ) -> Result<Self> {
+        log.borrow_mut()
+            .push_str(&format!("$ rhizo {}\n", words.join(" ")));
+        let mut child = Command::new(rhizo)
+            .arg("--state")
+            .arg(state)
+            .args(words)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run {}: {e}", rhizo.display()))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let (tx, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(stdout))
+                .map_while(std::result::Result::ok)
+            {
+                let _ = tx.send(line);
+            }
+        });
+        Ok(Chat {
+            child,
+            stdin,
+            lines,
+            log,
+        })
+    }
+
+    /// The lines printed up to the first that starts with `end`, that one
+    /// included.
+    fn until(&mut self, end: &str) -> Result<String> {
+        let mut seen = String::new();
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(CHAT_STEP)
+                .map_err(|_| format!("`rhizo chat` printed no `{end}`"))?;
+            self.log.borrow_mut().push_str(&format!("chat| {line}\n"));
+            seen.push_str(&line);
+            seen.push('\n');
+            if line.starts_with("[rhizo] error") {
+                return Err(format!("`rhizo chat` said: {line}"));
+            }
+            if line.starts_with(end) {
+                return Ok(seen);
+            }
+        }
+    }
+
+    /// Types `line`, then reads up to `end`.
+    fn send(&mut self, line: &str, end: &str) -> Result<String> {
+        let stdin = self.stdin.as_mut().ok_or("the chat's input is closed")?;
+        stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("cannot type into `rhizo chat`: {e}"))?;
+        self.until(end)
+    }
+
+    /// Closes its input (Ctrl-D) and waits for it to end: whether it
+    /// succeeded, and what it printed last.
+    fn finish(mut self) -> Result<(bool, String)> {
+        drop(self.stdin.take());
+        let deadline = Instant::now() + CHAT_STEP;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                _ => return Err("`rhizo chat` did not end after its input closed".into()),
+            }
+        };
+        let rest: String = self.lines.iter().map(|l| format!("{l}\n")).collect();
+        for line in rest.lines() {
+            self.log.borrow_mut().push_str(&format!("chat| {line}\n"));
+        }
+        Ok((status.success(), rest))
+    }
+}
+
+impl Drop for Chat<'_> {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Builds the `rhizo` tool (debug) and returns its path.
@@ -561,6 +785,92 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
                 "the agent is suspended after every turn and forked at its decision point",
                 "one `suspended between turns` per turn, `forked the agent`, `rhizo-demo done`",
             )?;
+            // A conversation through `rhizo chat`, typed through a pipe.
+            let chat = |words: &[&str]| {
+                Chat::start(rhizo, &state, words, &log).map_err(|e| fail(&e, "a chat"))
+            };
+            let step = |chat: &mut Chat, line: &str, end: &str| {
+                chat.send(line, end).map_err(|e| fail(&e, end))
+            };
+            let mut first = chat(&["chat", "--llm", &llm, "--model", "fake"])?;
+            let started = first
+                .until("[rhizo] ready")
+                .map_err(|e| fail(&e, "ready"))?;
+            let parent = started
+                .split_once("[rhizo] chat cell ")
+                .and_then(|(_, rest)| rest.split_once(':'))
+                .map(|(id, _)| id.to_string())
+                .ok_or_else(|| fail("`rhizo chat` names its cell", "`chat cell N:`"))?;
+            for message in &expected::CHAT_MESSAGES[..2] {
+                step(&mut first, message, "[rhizo] model ")?;
+            }
+            let forked = step(&mut first, "/fork 2", "[rhizo] forked")?;
+            let children: Vec<String> = forked
+                .split_once("into [")
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map(|(ids, _)| ids.split(", ").map(String::from).collect())
+                .unwrap_or_default();
+            must(
+                children.len() == 2,
+                "`/fork 2` makes two branches",
+                "`forked cell N into [A, B]`",
+            )?;
+            let listed = step(&mut first, "/branches", "[rhizo] 3 branches")?;
+            must(
+                listed.matches(" running").count() == 3,
+                "`/branches` lists the conversation and its two branches, running",
+                "three `running` branches",
+            )?;
+            let branch = &children[0];
+            step(
+                &mut first,
+                &format!("/switch {branch}"),
+                "[rhizo] now talking",
+            )?;
+            step(&mut first, expected::CHAT_MESSAGES[2], "[rhizo] model ")?;
+            step(&mut first, "/suspend", "[rhizo] suspended cell")?;
+            must(
+                first.finish().map_err(|e| fail(&e, "an exit"))?.0,
+                "`/suspend` leaves the chat",
+                "`rhizo chat` exits with 0",
+            )?;
+            let mut again = chat(&["chat", branch])?;
+            let resumed = again
+                .until("[rhizo] talking to cell")
+                .map_err(|e| fail(&e, "talking"))?;
+            must(
+                resumed.contains("resumed in"),
+                "`rhizo chat N` resumes a suspended branch",
+                "`talking to cell N, resumed in ...`",
+            )?;
+            step(&mut again, expected::CHAT_MESSAGES[3], "[rhizo] model ")?;
+            let (exited, rest) = again.finish().map_err(|e| fail(&e, "an exit"))?;
+            must(
+                exited && rest.contains(&format!("[rhizo] cell {branch} exited 0")),
+                "the end of the chat's input ends the agent",
+                "`cell N exited 0`",
+            )?;
+            let transcript: String = log
+                .borrow()
+                .lines()
+                .filter(|l| l.starts_with("chat| "))
+                .map(|l| &l[6..])
+                .filter(|l| !l.starts_with("[rhizo]") && !l.starts_with("> /"))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            must(
+                transcript == expected::CHAT_TRANSCRIPT,
+                "the chat prints the recorded transcript",
+                expected::CHAT_TRANSCRIPT,
+            )?;
+            must(
+                log.borrow().matches("chat| [rhizo] model ").count() == 4,
+                "every turn prints the model's time apart from Rhizo's",
+                "four `[rhizo] model ..., rhizo ...` lines",
+            )?;
+            for other in children[1..].iter().chain([&parent]) {
+                ok(&["kill", other])?;
+            }
         } else {
             report::text("[xtask] control: CPython not built, the agent part did not run");
         }
@@ -576,4 +886,30 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
     result.and(down.map(|_| ()))?;
     let _ = std::fs::remove_dir_all(&state);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_chat_agent_s_turn_lines_are_read() {
+        assert_eq!(
+            ChatTurn::parse("\x1eturn model_ns=12 agent_ns=345"),
+            Some(ChatTurn {
+                model_ns: 12,
+                agent_ns: 345
+            })
+        );
+        for other in [
+            "turn model_ns=12 agent_ns=345",
+            "\x1eturn model_ns=12",
+            "\x1eturn model_ns=x agent_ns=1",
+            "\x1eturn agent_ns=1 model_ns=2",
+            "\x1eturn model_ns=1 agent_ns=2 more",
+            CHAT_READY,
+        ] {
+            assert_eq!(ChatTurn::parse(other), None, "{other:?}");
+        }
+    }
 }

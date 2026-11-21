@@ -15,8 +15,10 @@
 //! and the objects (`count: u32`, per slot a present byte, then `kind: u8`:
 //! 0 pipe, `readers: u32`, `writers: u32`, `len: u32`, bytes; 1 event
 //! counter, `count: u64`, `semaphore: u8`; 2 `epoll`, `entries: u32`, each
-//! `fd: u32`, `events: u32`, `data: u64`). A socket target's index is the
-//! kernel's business (a snapshot's socket record).
+//! `fd: u32`, `events: u32`, `data: u64`), then the host's input pipe
+//! (`u32`: the object index, `u32::MAX` for none; design D1 of
+//! `add-interactive-chat`). A socket target's index is the kernel's
+//! business (a snapshot's socket record).
 
 use super::*;
 
@@ -209,6 +211,7 @@ impl Tables {
                 }
             }
         }
+        out.extend_from_slice(&self.input.unwrap_or(u32::MAX).to_le_bytes());
     }
 
     fn decode(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
@@ -340,6 +343,7 @@ impl Tables {
             };
             objects.push(Some(Arc::new(object)));
         }
+        let input = Some(r.u32()?).filter(|&i| i != u32::MAX);
         if !r.0.is_empty() {
             return Err(DecodeError::Truncated);
         }
@@ -359,6 +363,8 @@ impl Tables {
             used,
             objects,
             released: Vec::new(),
+            input,
+
             changes: 0,
         })
     }
@@ -442,7 +448,22 @@ impl Tables {
                 return false;
             }
         }
-        // Each object is held by its descriptions, and only by them.
+        // The host's input is a pipe, its one write end outside the
+        // descriptions.
+        if let Some(i) = self.input {
+            match ends.get_mut(i as usize) {
+                Some(e) => e[1] += 1,
+                None => return false,
+            }
+            if !matches!(
+                self.objects[i as usize].as_deref(),
+                Some(Object::Pipe { .. })
+            ) {
+                return false;
+            }
+        }
+        // Each object is held by its descriptions (and the host), and only
+        // by them.
         for (i, slot) in self.objects.iter().enumerate() {
             let held = ends[i];
             let ok = match slot.as_deref() {

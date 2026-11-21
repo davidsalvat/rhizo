@@ -2556,6 +2556,44 @@ impl Host {
             .is_some_and(|l| l.fs.put_file(path, data).is_ok())
     }
 
+    /// Writes `data` into live cell `id`'s standard input from the host, or
+    /// closes the host's end of it when `data` is `None` (spec
+    /// `control-plane`, design D3 of `add-interactive-chat`), then wakes
+    /// its threads waiting on descriptors: they make their calls again and
+    /// find the bytes, or the end of file. `None` if the cell is not live.
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn input(&mut self, id: u32, data: Option<&[u8]>) -> Option<rhizo_fs::Result<()>> {
+        let mut live = self.state().sched.remove(|l| l.cell.id == id)?;
+        let result = match data {
+            // The bytes wait in the kernel heap, as a cell's own pipe writes.
+            Some(data) if !cells_may_take(data.len() as u64) => Err(rhizo_fs::Error::NoSpace),
+            Some(data) => live.fs.push_input(data),
+            None => live.fs.close_input(),
+        };
+        // Filed back from outside the scheduler, its threads waiting on
+        // descriptors make their calls again.
+        file(self.state(), None, live);
+        Some(result)
+    }
+
+    /// Whether live cell `id` has printed something not taken yet and
+    /// waits (none of its threads can run): the moment to send its output
+    /// on (design D3 of `add-interactive-chat`).
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn has_output(&self, id: u32) -> bool {
+        self.shared.with(|s| {
+            s.sched.find(|l| l.cell.id == id).is_some_and(|l| {
+                !l.cell.threads.is_runnable() && l.output.as_ref().is_some_and(|o| !o.is_empty())
+            })
+        })
+    }
+
     /// Ends the sleeps of live cell `id`'s threads and times out their timed
     /// waits, as an event from outside would (the benchmark host's stand-in
     /// for a user's message, design D1 of `add-reference-workloads`);

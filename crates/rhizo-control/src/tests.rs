@@ -38,6 +38,7 @@ fn run() -> Request {
         ],
         envp: vec![b"HOME=/".to_vec()],
         files: vec![(b"/branch".to_vec(), b"1".to_vec())],
+        input: true,
     })
 }
 
@@ -90,6 +91,15 @@ fn every_request_round_trips() {
         },
         Request::Stats,
         Request::Shutdown,
+        Request::Input {
+            cell: 8,
+            data: b"hello\n".to_vec(),
+        },
+        Request::Input {
+            cell: 9,
+            data: vec![0x01; MAX_INPUT],
+        },
+        Request::CloseInput(10),
     ];
     for (id, request) in requests.iter().enumerate() {
         let found = frames(&request.encode(id as u32));
@@ -260,6 +270,39 @@ fn malformed_payloads_are_refused() {
     assert_eq!(Request::decode(&frame(0x08, &write)), Err(Error::Malformed));
 }
 
+#[test]
+fn input_is_bounded_and_its_flag_checked() {
+    let frame = |kind, payload: Vec<u8>| Frame {
+        kind,
+        id: 1,
+        payload,
+    };
+    // One byte more than an `input` request may carry: refused as too
+    // large, while the frame itself is valid.
+    let big = Request::Input {
+        cell: 1,
+        data: vec![b'a'; MAX_INPUT + 1],
+    }
+    .encode(3);
+    let found = frames(&big);
+    assert_eq!(found.len(), 1);
+    assert_eq!(Request::decode(&found[0]), Err(Error::TooLarge));
+    // A length that claims more than the payload holds.
+    let mut short = 1u32.to_le_bytes().to_vec();
+    short.extend(((MAX_INPUT as u32) + 7).to_le_bytes());
+    short.extend(b"abc");
+    assert_eq!(Request::decode(&frame(0x0b, short)), Err(Error::Malformed));
+    assert_eq!(
+        Request::decode(&frame(0x0c, vec![1, 0, 0])),
+        Err(Error::Malformed)
+    );
+    // `run`'s input flag is 0 or 1.
+    let mut run = Request::Run(Run::default()).encode(1);
+    let last = run.len() - 1;
+    run[last] = 2;
+    assert_eq!(Request::decode(&frames(&run)[0]), Err(Error::Malformed));
+}
+
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..24)
 }
@@ -272,15 +315,19 @@ fn request() -> impl Strategy<Value = Request> {
             bytes(),
             list(),
             list(),
-            proptest::collection::vec((bytes(), bytes()), 0..3)
+            proptest::collection::vec((bytes(), bytes()), 0..3),
+            any::<bool>(),
         )
-            .prop_map(|(image, files_from, argv, envp, files)| Request::Run(Run {
-                image,
-                files_from,
-                argv,
-                envp,
-                files
-            })),
+            .prop_map(
+                |(image, files_from, argv, envp, files, input)| Request::Run(Run {
+                    image,
+                    files_from,
+                    argv,
+                    envp,
+                    files,
+                    input
+                })
+            ),
         Just(Request::List),
         any::<u32>().prop_map(Request::Suspend),
         any::<u32>().prop_map(Request::Resume),
@@ -294,6 +341,8 @@ fn request() -> impl Strategy<Value = Request> {
         }),
         Just(Request::Stats),
         Just(Request::Shutdown),
+        (any::<u32>(), bytes()).prop_map(|(cell, data)| Request::Input { cell, data }),
+        any::<u32>().prop_map(Request::CloseInput),
     ]
 }
 
@@ -415,6 +464,21 @@ proptest! {
         }
         if length_intact {
             prop_assert!(found.iter().any(|f| f.id == 2 && f.payload.is_empty()));
+        }
+    }
+
+    /// Any `input` payload decodes within its bound or is refused.
+    #[test]
+    fn any_input_payload_is_bounded(cell in any::<u32>(), len in any::<u32>(), tail in proptest::collection::vec(any::<u8>(), 0..64)) {
+        let mut payload = cell.to_le_bytes().to_vec();
+        payload.extend(len.to_le_bytes());
+        payload.extend(&tail);
+        match Request::decode(&Frame { kind: 0x0b, id: 1, payload }) {
+            Ok(Request::Input { data, .. }) => {
+                prop_assert!(data.len() <= MAX_INPUT && data.len() == len as usize);
+            }
+            Ok(other) => prop_assert!(false, "decoded as {:?}", other),
+            Err(e) => prop_assert!(e == Error::Malformed || e == Error::TooLarge),
         }
     }
 
