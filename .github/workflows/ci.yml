@@ -87,7 +87,7 @@ jobs:
           echo "::error title=ci-log::$(tail -c 3000 "$log" | tr -d '\r' | sed -e 's/%/%25/g' | tr '\n' '|')"
 
   ci-arm64:
-    name: AArch64 fmt, clippy, tests (QEMU virt)
+    name: AArch64 fmt, clippy, tests, instruction counts (QEMU virt)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -149,6 +149,12 @@ jobs:
       - name: Run all checks
         run: cargo xtask --arch aarch64 ci 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
 
+      - name: Instruction counts and regression gate
+        # GitHub's ARM64 runners have no KVM (bench/README.md), so AArch64
+        # gets the figures that are exact under emulation: instructions
+        # counted under QEMU -icount, gated in the `ci-arm` environment.
+        run: cargo xtask --arch aarch64 bench --icount-only --env ci-arm --check --output bench-results-aarch64.json 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
+
       - name: Save the CPython build
         # Also when a later check failed: the build itself is done once its
         # recipe stamp exists.
@@ -157,6 +163,22 @@ jobs:
         with:
           path: target/cpython
           key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs', 'xtask/src/packages.rs') }}
+
+      - name: Publish the instruction counts
+        # As the x86_64 bench job, under their own title so the README
+        # tools can tell the architectures apart: the medians, then the
+        # compact results in pieces of 3000 bytes (about 5; GitHub keeps 10
+        # per step).
+        if: always()
+        run: |
+          if [ -f bench-results-aarch64.json ]; then
+            echo "::notice title=bench-aarch64-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results-aarch64.json | tr '\n' ' ')"
+            jq -c . bench-results-aarch64.json | tr -d '\n' | fold -w 3000 | nl -nln -w1 -s' ' > bench-pieces.txt
+            sed -n '1,9p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-aarch64-results-${line%% *}::${line#* }"
+            done
+            [ "$(wc -l < bench-pieces.txt)" -le 9 ] || echo "::warning title=bench-aarch64::more than 9 pieces; add a publishing step"
+          fi
 
       - name: Report the failure as an annotation
         if: failure()
@@ -302,13 +324,14 @@ jobs:
 
       - name: Publish results
         # Annotations are cut at 4 KB and GitHub keeps 10 per step: the
-        # medians, then the full results in numbered pieces of 3000 bytes,
-        # ten per step (the steps below).
+        # medians, then the full results as compact JSON (indented, they
+        # took more than 39 pieces and lost their end) in numbered pieces
+        # of 3000 bytes, ten per step (the steps below).
         if: always()
         run: |
           if [ -f bench-results.json ]; then
             echo "::notice title=bench-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results.json | tr '\n' ' ')"
-            tr -d '\n' < bench-results.json | fold -w 3000 | nl -nln -w1 -s' ' > bench-pieces.txt
+            jq -c . bench-results.json | tr -d '\n' | fold -w 3000 | nl -nln -w1 -s' ' > bench-pieces.txt
             sed -n '1,9p' bench-pieces.txt | while IFS= read -r line; do
               echo "::notice title=bench-results-${line%% *}::${line#* }"
             done
@@ -336,4 +359,5 @@ jobs:
             sed -n '30,39p' bench-pieces.txt | while IFS= read -r line; do
               echo "::notice title=bench-results-${line%% *}::${line#* }"
             done
+            [ "$(wc -l < bench-pieces.txt)" -le 39 ] || echo "::warning title=bench-results::more than 39 pieces; add a publishing step"
           fi

@@ -23,14 +23,19 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// The protocol's version, in every frame.
-pub const VERSION: u8 = 1;
+/// The protocol's version, in every frame (2: standard input, design D2 of
+/// `add-interactive-chat`).
+pub const VERSION: u8 = 2;
 /// The bytes every frame starts with.
 pub const MAGIC: [u8; 2] = [0x01, b'Z'];
 /// Bytes of a frame before its payload.
 pub const HEADER_LEN: usize = 12;
 /// Largest payload a frame may carry.
 pub const MAX_PAYLOAD: usize = 1 << 20;
+/// Most bytes one `input` request may carry: what a cell's standard input
+/// holds (a pipe of 64 KiB), so an accepted request always fits an empty
+/// one.
+pub const MAX_INPUT: usize = 64 << 10;
 
 /// Frame kinds of requests, host to kernel.
 mod kind {
@@ -44,6 +49,8 @@ mod kind {
     pub const WRITE_FILE: u8 = 0x08;
     pub const STATS: u8 = 0x09;
     pub const SHUTDOWN: u8 = 0x0a;
+    pub const INPUT: u8 = 0x0b;
+    pub const CLOSE_INPUT: u8 = 0x0c;
     // Kernel to host.
     pub const HELLO: u8 = 0x80;
     pub const DONE: u8 = 0x81;
@@ -373,6 +380,9 @@ pub struct Run {
     pub envp: Vec<Vec<u8>>,
     /// Files written into its files before it starts: path and contents.
     pub files: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Whether its standard input comes from the host ([`Request::Input`]);
+    /// without it, reading descriptor 0 gives end of file.
+    pub input: bool,
 }
 
 /// A request, host to kernel.
@@ -404,6 +414,12 @@ pub enum Request {
     Stats,
     /// Power the machine off after replying.
     Shutdown,
+    /// Write bytes into a running cell's standard input (a cell started
+    /// with [`Run::input`]), whole or not at all; at most [`MAX_INPUT`].
+    Input { cell: u32, data: Vec<u8> },
+    /// Close the host's end of a running cell's standard input: once the
+    /// cell has read what is left, it reads end of file.
+    CloseInput(u32),
 }
 
 impl Request {
@@ -422,6 +438,7 @@ impl Request {
                 w.list(&run.files, |w, (path, data)| {
                     w.bytes(path).bytes(data);
                 });
+                w.u8(run.input as u8);
                 kind::RUN
             }
             Request::List => kind::LIST,
@@ -451,6 +468,14 @@ impl Request {
             }
             Request::Stats => kind::STATS,
             Request::Shutdown => kind::SHUTDOWN,
+            Request::Input { cell, data } => {
+                w.u32(*cell).bytes(data);
+                kind::INPUT
+            }
+            Request::CloseInput(cell) => {
+                w.u32(*cell);
+                kind::CLOSE_INPUT
+            }
         };
         encode_frame(kind, id, &w.0)
     }
@@ -465,6 +490,11 @@ impl Request {
                 argv: r.list(Reader::bytes)?,
                 envp: r.list(Reader::bytes)?,
                 files: r.list(|r| Ok((r.bytes()?, r.bytes()?)))?,
+                input: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Malformed),
+                },
             }),
             kind::LIST => Request::List,
             kind::SUSPEND => Request::Suspend(r.u32()?),
@@ -482,6 +512,15 @@ impl Request {
             },
             kind::STATS => Request::Stats,
             kind::SHUTDOWN => Request::Shutdown,
+            kind::INPUT => {
+                let cell = r.u32()?;
+                let data = r.bytes()?;
+                if data.len() > MAX_INPUT {
+                    return Err(Error::TooLarge);
+                }
+                Request::Input { cell, data }
+            }
+            kind::CLOSE_INPUT => Request::CloseInput(r.u32()?),
             _ => return Err(Error::UnknownKind),
         };
         r.end()?;

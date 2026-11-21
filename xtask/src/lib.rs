@@ -78,11 +78,14 @@ Commands:
       --env <name>           Environment label / baseline (ci, dedicated, local)
       --output <file>        Write results as JSON
       --from <file>          Use stored results instead of measuring
+                             (repeat to merge another architecture's)
       --check                Fail if a metric regressed beyond its threshold
       --update-baseline      Store the results as the baseline for --env
       --readme               Regenerate the README benchmark section
       --no-reference         Skip the reference Linux guest
       --no-icount            Skip the instruction counts under QEMU -icount
+      --icount-only          Only those instruction counts (hosts without
+                             KVM, such as GitHub's ARM64 runners)
       --workload <laptop|server>
                              Only this reference workload (both run by
                              default, after the cell figures)

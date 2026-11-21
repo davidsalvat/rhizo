@@ -209,6 +209,46 @@ branch 2
 branch 2 value=360156
 branch 2 turn call_9848ba8f n=635 seed=988 value=305130 notes=5 sha=fb723766 conn_requests=1
 ";
+/// What the `control` test step types into `rhizo chat` (change
+/// `add-interactive-chat`): two messages, a fork into two branches and a
+/// switch to the first, a message there, a suspend, and after `rhizo chat`
+/// resumed that branch, a last message.
+#[allow(dead_code)]
+pub const CHAT_MESSAGES: [&str; 4] = [
+    "What is the sum of the squares below some number?",
+    "And with another number?",
+    "On a branch now: once more?",
+    "After the resume: one last time?",
+];
+/// What the chat agent prints for [`CHAT_MESSAGES`] against the host's fake
+/// model, with each message as `rhizo chat` echoes it.
+#[allow(dead_code)]
+pub const CHAT_TRANSCRIPT: &str = "\
+> What is the sum of the squares below some number?
+  [tool] run_python
+      print(sum(i * i for i in range(710)))
+  [tool] ->
+      119051735
+The snippet printed 119051735.
+> And with another number?
+  [tool] run_python
+      print(sum(i * i for i in range(845)))
+  [tool] ->
+      200760170
+The snippet printed 200760170.
+> On a branch now: once more?
+  [tool] run_python
+      print(sum(i * i for i in range(660)))
+  [tool] ->
+      95614310
+The snippet printed 95614310.
+> After the resume: one last time?
+  [tool] run_python
+      print(sum(i * i for i in range(425)))
+  [tool] ->
+      25498300
+The snippet printed 25498300.
+";
 /// Dynamically linked programs (change `add-dynamic-linking`) in the files
 /// `xtask` packs: the executable's path in them, its `argv` and what it
 /// prints; each exits with 0. They run from the top of those files (`/` in
