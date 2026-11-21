@@ -527,6 +527,10 @@ pub fn init(smp: Option<u16>) -> usize {
         // Parked connections re-attach only in this boot (design D2 of
         // `keep-tcp-across-suspend`).
         net.set_boot(Counter.cycles());
+        // Parked records' keys cannot be guessed without it (finding S15).
+        let (random, _) = start_random();
+        let word = |i: usize| u64::from_le_bytes(random[i..i + 8].try_into().unwrap_or_default());
+        net.set_secret([word(0), word(8)]);
         crate::wire::init(net, now_ns(), Counter.cycles());
     });
     crate::smp::start(smp)
