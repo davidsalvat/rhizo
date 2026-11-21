@@ -127,7 +127,7 @@ impl<F: EntryFormat> PageTable<F> {
                         _ => None,
                     }
                     .ok_or(MapError::OutOfFrames)?;
-                    copy_frames(mem, page, copy, bytes);
+                    mem.copy(page, copy, bytes);
                     let private = F::with_cow(F::with_leaf_writable(entry, true), false);
                     mem.write_u64(to + i * 8, F::with_address(private, copy));
                 } else {
@@ -202,7 +202,7 @@ impl<F: EntryFormat> PageTable<F> {
             };
             let new = match copy {
                 Some(copy) => {
-                    copy_frames(mem, page, copy, size.bytes());
+                    mem.copy(page, copy, size.bytes());
                     F::with_address(writable, copy)
                 }
                 None if size == PageSize::Large => {
@@ -251,7 +251,7 @@ impl<F: EntryFormat> PageTable<F> {
             }
             table = if frames.is_shared(next) {
                 let copy = frames.alloc().ok_or(MapError::OutOfFrames)?;
-                copy_frames(mem, next, copy, FRAME_SIZE);
+                mem.copy(next, copy, FRAME_SIZE);
                 // Both copies now point at everything below: one more
                 // reference each, and no writes through either (invariant).
                 for i in 0..ENTRIES {
@@ -357,19 +357,11 @@ fn copy_as_small_pages<F: EntryFormat>(
             frames.free(table, PageSize::Small);
             return Err(MapError::OutOfFrames);
         };
-        copy_frames(mem, page + i * FRAME_SIZE, copy, FRAME_SIZE);
+        mem.copy(page + i * FRAME_SIZE, copy, FRAME_SIZE);
         let leaf = F::with_cow(F::leaf(copy, PageSize::Small, flags), false);
         mem.write_u64(table + i * 8, leaf);
     }
     Ok(table)
-}
-
-fn copy_frames(mem: &mut impl PhysicalMemory, from: u64, to: u64, bytes: u64) {
-    let mut buf = [0u8; 512];
-    for off in (0..bytes).step_by(buf.len()) {
-        mem.read_bytes(from + off, &mut buf);
-        mem.write_bytes(to + off, &buf);
-    }
 }
 
 #[cfg(test)]

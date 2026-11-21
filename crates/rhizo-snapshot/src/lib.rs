@@ -519,6 +519,8 @@ impl Snapshot {
     }
 
     /// Maps page `index` into `pt` with a fresh frame holding its contents.
+    /// A 2 MiB page comes back as 512 pages of 4 KiB when no 2 MiB run of
+    /// frames is free (as when it was first mapped).
     pub fn restore_page<F: EntryFormat>(
         &self,
         index: usize,
@@ -527,21 +529,29 @@ impl Snapshot {
         frames: &mut impl Frames,
     ) -> Result<(), MapError> {
         let page = self.page(index);
-        let phys = match page.size {
+        let large = match page.size {
             PageSize::Large => frames.alloc_large(),
-            _ => frames.alloc(),
+            _ => None,
+        };
+        let pieces = match large {
+            Some(phys) => alloc::vec![(page.virt, phys, page.size, page.data)],
+            None => page
+                .data
+                .chunks(rhizo_mm::FRAME_SIZE as usize)
+                .zip((page.virt..).step_by(rhizo_mm::FRAME_SIZE as usize))
+                .map(|(data, virt)| (virt, 0, PageSize::Small, data))
+                .collect(),
+        };
+        for (virt, phys, size, data) in pieces {
+            let phys = match size {
+                PageSize::Small => frames.alloc().ok_or(MapError::OutOfFrames)?,
+                _ => phys,
+            };
+            mem.write_bytes(phys, data);
+            pt.map(mem, &mut || frames.alloc(), virt, phys, size, page.flags)
+                .inspect_err(|_| frames.free(phys, size))?;
         }
-        .ok_or(MapError::OutOfFrames)?;
-        mem.write_bytes(phys, page.data);
-        pt.map(
-            mem,
-            &mut || frames.alloc(),
-            page.virt,
-            phys,
-            page.size,
-            page.flags,
-        )
-        .inspect_err(|_| frames.free(phys, page.size))
+        Ok(())
     }
 
     /// A cell `id` with root `root` (an empty user half, sharing the kernel

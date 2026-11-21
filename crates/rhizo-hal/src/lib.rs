@@ -77,6 +77,19 @@ pub trait PhysicalMemory {
         }
     }
 
+    /// Copies `len` bytes from physical address `from` to `to` (ranges that
+    /// do not overlap, any alignment).
+    fn copy(&mut self, from: u64, to: u64, len: u64) {
+        let mut buf = [0u8; 512];
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(buf.len() as u64) as usize;
+            self.read_bytes(from + done, &mut buf[..n]);
+            self.write_bytes(to + done, &buf[..n]);
+            done += n as u64;
+        }
+    }
+
     /// Copies `data` to physical address `phys` (any alignment).
     fn write_bytes(&mut self, phys: u64, data: &[u8]) {
         for (i, &byte) in data.iter().enumerate() {
@@ -315,6 +328,18 @@ mod tests {
             mem.read_u64(0x1000) >> 24,
             u64::from_le_bytes(*b"rhizo\0\0\0")
         );
+    }
+
+    #[test]
+    fn copies_move_any_length_between_ranges() {
+        let mut mem = FakePhysicalMemory::new();
+        let data: Vec<u8> = (0..1500u32).map(|i| (i * 7) as u8).collect();
+        mem.write_bytes(0x1001, &data);
+        mem.copy(0x1001, 0x8003, data.len() as u64);
+        let mut back = vec![0u8; data.len() + 1];
+        mem.read_bytes(0x8003, &mut back);
+        assert_eq!(&back[..data.len()], &data[..]);
+        assert_eq!(back[data.len()], 0, "nothing past the end");
     }
 
     #[test]
