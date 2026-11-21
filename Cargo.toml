@@ -38,3 +38,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+# The ChaCha20 generator runs on every getrandom: optimized in test builds
+# too, which run under emulation (design D1 of add-crypto-random).
+[profile.dev.package.rhizo-core]
+opt-level = 3

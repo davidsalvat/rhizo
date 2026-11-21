@@ -134,8 +134,8 @@ The feedback loop, fastest first:
 
 | Crate | Owns | May depend on (workspace) |
 |---|---|---|
-| `crates/rhizo-hal` | Hardware interfaces (traits: console, memory, TLB, device registers, network link) and host test doubles | — |
-| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT and MCFG reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), in-kernel test runner | `rhizo-hal` |
+| `crates/rhizo-hal` | Hardware interfaces (traits: console, memory, TLB, device registers, network link, entropy) and host test doubles | — |
+| `crates/rhizo-core` | Boot reports, boot options, device-tree reader, ACPI MADT and MCFG reader, CPU selection, the spinlock behind kernel globals, exception reports (both architectures), ChaCha20 random generator, in-kernel test runner | `rhizo-hal` |
 | `crates/rhizo-mm` | PVH memory map, frame allocator, page tables (`EntryFormat`: `X86_64`, `Aarch64`), copy-on-write that shares page tables (`cow`: `Frames` with reference counts, fork, copies with own tables, write resolution), kernel heap | `rhizo-hal` |
 | `crates/rhizo-cell` | Cells as plain data (their threads: registers, identifiers, futex, sleep and descriptor waits), ELF loader and initial stack (static executables loaded once, started many; executables and interpreters mapped from file pages), which executables stay loaded, user-memory access, cell address spaces (anonymous mappings, mappings of given frames, teardown) | `rhizo-hal`, `rhizo-mm` |
 | `crates/rhizo-fs` | A cell's in-memory file system: tree, file blocks shared copy-on-write between forks, descriptors, pipes, event counters, `epoll` instances, socket descriptors and Unix socket names, encoding for snapshots | — |
@@ -166,7 +166,8 @@ shared kernel code may use: `boot`, `platform`, `console`, `power`, `cpu`,
 `timer`, `tests`, and, compiled only in builds that run cells, `user`
 (entering and leaving cell code, address-space tags), `irq` (the
 preemption timer and the wake-up between CPUs; interrupts arrive only
-while cell code runs or a CPU idles), `smp` (starting the other CPUs,
+while cell code runs or a CPU idles), `random` (the CPU's hardware
+random source, as `rhizo_hal::Entropy`), `smp` (starting the other CPUs,
 waking them, idling) and `pmu` (performance counters: retired
 instructions and core cycles, where the guest has them). `cpu::index()` is
 the running CPU's number (0 for the

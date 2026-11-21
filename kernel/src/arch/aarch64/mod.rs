@@ -17,6 +17,8 @@ pub mod platform;
 pub mod pmu;
 pub mod power;
 #[cfg(feature = "cells")]
+pub mod random;
+#[cfg(feature = "cells")]
 pub mod smp;
 #[cfg(feature = "ktest")]
 pub mod tests;

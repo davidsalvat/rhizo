@@ -17,6 +17,8 @@ pub mod platform;
 pub mod pmu;
 pub mod port;
 pub mod power;
+#[cfg(feature = "cells")]
+pub mod random;
 pub mod serial;
 #[cfg(feature = "cells")]
 pub mod smp;
