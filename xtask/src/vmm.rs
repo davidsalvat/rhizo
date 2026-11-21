@@ -390,10 +390,14 @@ impl Vsock {
     }
 }
 
-/// Whether `/dev/vhost-vsock` opens for reading and writing, after a
-/// `sudo -n chmod 0666` if it exists and does not (CI runners leave it to
-/// `root:kvm`). The module is loaded first: loading it on the first open
-/// has udev set the old mode back.
+/// Whether `/dev/vhost-vsock` opens for reading and writing. On a CI runner
+/// (`CI` set), which is thrown away after the job, it is made so with
+/// `sudo -n chmod 0666` if it exists and does not (runners leave it to
+/// `root:kvm`); the module is loaded first, since loading it on the first
+/// open has udev set the old mode back. Elsewhere the host's permissions are
+/// never widened: any local user could then reach the guests, so the control
+/// line stays on serial until the user grants access (for example, by adding
+/// themselves to the device's group).
 fn vhost_vsock_usable() -> bool {
     const DEVICE: &str = "/dev/vhost-vsock";
     let opens = || {
@@ -413,7 +417,8 @@ fn vhost_vsock_usable() -> bool {
             .is_ok_and(|s| s.success())
     };
     opens()
-        || (Path::new(DEVICE).exists()
+        || (std::env::var_os("CI").is_some()
+            && Path::new(DEVICE).exists()
             && sudo(&["modprobe", "vhost_vsock"])
             && sudo(&["udevadm", "settle"])
             && sudo(&["chmod", "0666", DEVICE])
