@@ -32,6 +32,10 @@ Commands:
                              The CPython agent against an OpenAI-compatible
                              model: suspended and resumed after every turn,
                              forked into 3 branches at its decision point
+  chat --llm <url> --model <name>
+                             Talk to a new agent in a cell (CPython with
+                             tools that run in the cell); /help inside
+  chat <id>                  Talk to it again, resuming it if suspended
   ps                         List the cells
   stats                      Memory and cells of the VM
   fork <id> [n]              Fork a running cell into n (default 1)
@@ -65,6 +69,15 @@ pub enum FileValue {
     Host(PathBuf),
 }
 
+/// What `chat` talks to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chat {
+    /// A new chat cell against this model.
+    New { llm: String, model: String },
+    /// An existing chat cell.
+    Cell(u32),
+}
+
 /// Options of `run`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Run {
@@ -85,6 +98,7 @@ pub enum Command {
     /// The background server `up` starts (not for users).
     Serve(Up),
     Run(Run),
+    Chat(Chat),
     Ps,
     Stats,
     Fork {
@@ -150,6 +164,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         "up" => Command::Up(parse_up(args)?),
         "__serve" => Command::Serve(parse_up(args)?),
         "run" => Command::Run(parse_run(args)?),
+        "chat" => Command::Chat(parse_chat(args)?),
         "ps" | "list" => Command::Ps,
         "stats" => Command::Stats,
         "fork" => match args {
@@ -200,6 +215,32 @@ fn parse_up(args: &[String]) -> Result<Up, String> {
         return Err("the VM needs at least 64 MiB and one CPU".into());
     }
     Ok(up)
+}
+
+fn parse_chat(args: &[String]) -> Result<Chat, String> {
+    const USAGE: &str = "usage: rhizo chat --llm http://HOST:PORT --model NAME, or rhizo chat <id>";
+    let (mut llm, mut model) = (None, None);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match arg.as_str() {
+            "--llm" => llm = Some(value("--llm")?),
+            "--model" => model = Some(value("--model")?),
+            id if args.len() == 1 => return Ok(Chat::Cell(number("cell", id)?)),
+            other => return Err(format!("unexpected `{other}`; {USAGE}")),
+        }
+    }
+    match (llm, model) {
+        (Some(llm), Some(model)) if !model.is_empty() && !model.contains(char::is_whitespace) => {
+            Ok(Chat::New { llm, model })
+        }
+        (Some(_), Some(_)) => Err("the model's name cannot be empty or hold spaces".into()),
+        _ => Err(USAGE.into()),
+    }
 }
 
 fn parse_run(args: &[String]) -> Result<Run, String> {
@@ -362,6 +403,25 @@ mod tests {
         assert!(parse_words("run x --file /nothing").is_err());
         assert!(parse_words("run x --env NOVALUE").is_err());
         assert!(parse_words("run x --bogus").is_err());
+    }
+
+    #[test]
+    fn chat_starts_an_agent_or_talks_to_one() {
+        assert_eq!(
+            command("chat --llm http://127.0.0.1:8080 --model qwen2.5"),
+            Command::Chat(Chat::New {
+                llm: "http://127.0.0.1:8080".into(),
+                model: "qwen2.5".into()
+            })
+        );
+        assert_eq!(command("chat 12"), Command::Chat(Chat::Cell(12)));
+        assert!(parse_words("chat").is_err());
+        assert!(parse_words("chat x").is_err());
+        assert!(parse_words("chat 1 2").is_err());
+        assert!(parse_words("chat --llm http://h:1").is_err());
+        assert!(parse_words("chat --model m").is_err());
+        assert!(parse_words("chat --llm http://h:1 --model").is_err());
+        assert!(parse_words("chat --llm http://h:1 --model m 3").is_err());
     }
 
     #[test]

@@ -79,6 +79,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `control.resume_us/rhizo/<vmm>` | timing | `resume` of it (lazy: pages come back on first touch) |
 | `control.fork_us/rhizo/<vmm>` | timing | `fork` of it into one cell |
 | `control.kill_us/rhizo/<vmm>` | timing | `kill` of it. Each of these five over 20 rounds; each reply also carries the kernel's own time for the operation, which `rhizo` prints next to the round trip |
+| `chat.turn_us/rhizo/<vmm>` | timing | The Rhizo side of one interactive turn (change `add-interactive-chat`): on the same boot, when CPython is built, the chat agent (`cells/python/agent_chat.py`) against the host's fake model with no delay; each turn timed by the host from writing the `input` request (one line) to the VMM's standard input until it reads the agent's end-of-turn line back, less the time the agent waited for the model (its requests sent until their answers were read). What is left: the request on the serial line, waking the agent's read, CPython's work (JSON, one `run_python` snippet, printing), the answer's output and the serial line back. Median of 20 turns; `rhizo chat` prints the same split after every turn |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded
