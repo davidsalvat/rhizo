@@ -24,8 +24,8 @@ fn root_limits(quota: &Quota) -> Limits {
 impl Host {
     /// The tree of this host's cells.
     #[cfg_attr(
-        not(feature = "ktest"),
-        allow(dead_code, reason = "used by in-kernel tests")
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn tree(&self) -> &Tree {
         &self.tree
@@ -298,31 +298,127 @@ impl Host {
         if by != Actor::Host {
             return Err(TreeError::Denied);
         }
-        if !n.is_root() || n.children() > 0 || self.tree.get(parent).is_none() {
-            return Err(if self.tree.get(parent).is_none() {
-                TreeError::NotFound
-            } else {
-                TreeError::Invalid
-            });
+        if self.tree.get(parent).is_none() {
+            return Err(TreeError::NotFound);
         }
-        let saved = n.spec();
+        if !n.is_root() {
+            return Err(TreeError::Invalid);
+        }
+        self.place(id, parent, spec, 0)
+    }
+
+    /// Places cell `id`, which the host just made and which has no
+    /// children, under `parent` (`HOST`: as the root of a new domain) with
+    /// `spec` (protocol version 4: `run`, `load` and the fork of a
+    /// template, design D14 of `add-cell-hierarchy`). Under a parent its
+    /// limits are carved from the parent's free budget and its policies
+    /// must be within the parent's; as a root, a limit `spec` leaves
+    /// unlimited stays what it was. It never takes the number `skip` in
+    /// its new domain (a copy's source's, design D22; 0 for none). Refused,
+    /// with the cell back where it was, if the tree does not take it.
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
+    )]
+    pub fn place(
+        &mut self,
+        id: u32,
+        parent: u32,
+        mut spec: Spec,
+        skip: u32,
+    ) -> Result<(), TreeError> {
+        let n = self.tree.get(id).ok_or(TreeError::NotFound)?;
+        if n.children() > 0 {
+            return Err(TreeError::Invalid);
+        }
+        if parent != HOST && self.tree.get(parent).is_none() {
+            return Err(TreeError::NotFound);
+        }
+        let (saved, old, old_pid) = (n.spec(), n.parent(), n.pid());
+        if parent == HOST {
+            let (l, was) = (&mut spec.limits, saved.limits);
+            l.memory = if l.memory == u64::MAX {
+                was.memory
+            } else {
+                l.memory
+            };
+            l.cpu_ns = if l.cpu_ns == u64::MAX {
+                was.cpu_ns
+            } else {
+                l.cpu_ns
+            };
+            l.sockets = if l.sockets == u32::MAX {
+                was.sockets
+            } else {
+                l.sockets
+            };
+        }
         let used = self.usage(parent);
         self.tree.end(id, &mut fresh_domain)?; // a leaf: allocates nothing
-        if let Err(e) = self.tree.add_child(id, parent, spec, by, &|_| used) {
-            let _ = self.tree.add_root(id, saved, 0); // back where it was
+        let placed = if parent == HOST {
+            self.tree.add_root(id, spec, skip).map(|_| ())
+        } else {
+            self.tree
+                .add_child_unlike(id, parent, spec, Actor::Host, &|_| used, skip)
+        };
+        if let Err(e) = placed {
+            // Back where it was, under the number it had as a root.
+            let _ = if old == HOST {
+                self.tree
+                    .add_root(id, saved, u32::from(old_pid == 2))
+                    .map(|_| ())
+            } else {
+                let used = self.usage(old);
+                self.tree.add_child(id, old, saved, Actor::Host, &|_| used)
+            };
+            self.sync(id);
             return Err(e);
         }
         self.sync(id);
         self.sync_up(parent);
+        self.sync_up(old);
         // A cell placed before it ran: its thread takes its new number.
         let pid = self.tree.get(id).map_or(0, |n| n.pid());
         self.with_live(id, |live| {
             let t = &live.cell.threads;
-            if t.len() == 1 && t.current().tid == 1 {
+            if t.len() == 1 && t.current().tid == old_pid && live.cell.cpu_ns == 0 {
                 live.cell.renumber(pid);
             }
         });
         Ok(())
+    }
+
+    /// Sets cell `id`'s limits at `by`'s request (protocol version 4,
+    /// `limits`): within its parent's free budget, and never below what it
+    /// uses and its children reserved.
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn set_tree_limits(&mut self, id: u32, limits: Limits, by: Actor) -> Result<(), TreeError> {
+        let parent = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
+        let (own, theirs) = (self.usage(id), self.usage(parent));
+        let usage = |c: u32| if c == id { own } else { theirs };
+        self.tree.set_limits(id, limits, by, &usage)?;
+        self.sync(id);
+        self.sync_up(parent);
+        Ok(())
+    }
+
+    /// Sets cell `id`'s egress policy and ceiling at `by`'s request
+    /// (protocol version 4, `policy`): see `rhizo_cap::Tree::set_egress`.
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn set_policy(
+        &mut self,
+        id: u32,
+        egress: Egress,
+        ceiling: Egress,
+        by: Actor,
+    ) -> Result<(), TreeError> {
+        self.tree.set_egress(id, egress, ceiling, by)
     }
 
     /// Moves cell `id` under `to` (`HOST`: makes it a root) at `by`'s
@@ -330,8 +426,8 @@ impl Host {
     /// `rhizo_cap::Tree::reparent`. The cells whose budget, policy, domain
     /// or number changed get them.
     #[cfg_attr(
-        not(feature = "ktest"),
-        allow(dead_code, reason = "used by in-kernel tests")
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn reparent(&mut self, id: u32, to: u32, by: Actor) -> Result<(), TreeError> {
         let old = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
@@ -362,8 +458,8 @@ impl Host {
     /// kill): live cells are killed, templates dropped and suspended ones
     /// reported killed in [`finished`](Self::finished).
     #[cfg_attr(
-        not(feature = "ktest"),
-        allow(dead_code, reason = "used by in-kernel tests")
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn kill_tree(&mut self, id: u32, by: Actor) -> Result<(), TreeError> {
         if !self.tree.controls(by, id) {
@@ -381,8 +477,8 @@ impl Host {
     /// returns each suspended cell's identifier and snapshot. A cell whose
     /// snapshot does not fit keeps running.
     #[cfg_attr(
-        not(feature = "ktest"),
-        allow(dead_code, reason = "used by in-kernel tests")
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn suspend_tree(&mut self, id: u32, by: Actor) -> Result<Vec<(u32, Snapshot)>, TreeError> {
         if !self.tree.controls(by, id) {
