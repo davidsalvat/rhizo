@@ -41,13 +41,17 @@ pub struct Options {
     pub accel: Accel,
     pub env: String,
     pub output: Option<PathBuf>,
-    pub from: Option<PathBuf>,
+    /// Stored results to use instead of measuring: one file, or one per
+    /// architecture (`--from` repeated), merged.
+    pub from: Vec<PathBuf>,
     pub check: bool,
     pub update_baseline: bool,
     pub readme: bool,
     pub reference: bool,
     /// Also count instructions under QEMU with `-icount` (spec `profiling`).
     pub icount: bool,
+    /// Measure only the instruction counts under `-icount`.
+    pub icount_only: bool,
     /// Measure only this reference workload.
     pub workload: Option<Only>,
     /// The long versions of the workloads (the weekly soak).
@@ -66,12 +70,13 @@ impl Default for Options {
             accel: Accel::Auto,
             env: "local".into(),
             output: None,
-            from: None,
+            from: Vec::new(),
             check: false,
             update_baseline: false,
             readme: false,
             reference: true,
             icount: true,
+            icount_only: false,
             workload: None,
             soak: false,
             llm_delay_ms: 0,
@@ -109,12 +114,13 @@ impl Options {
                 "--accel" => o.accel = Accel::parse(&value("--accel")?)?,
                 "--env" => o.env = value("--env")?,
                 "--output" => o.output = Some(PathBuf::from(value("--output")?)),
-                "--from" => o.from = Some(PathBuf::from(value("--from")?)),
+                "--from" => o.from.push(PathBuf::from(value("--from")?)),
                 "--check" => o.check = true,
                 "--update-baseline" => o.update_baseline = true,
                 "--readme" => o.readme = true,
                 "--no-reference" => o.reference = false,
                 "--no-icount" => o.icount = false,
+                "--icount-only" => o.icount_only = true,
                 "--workload" => {
                     o.workload = Some(match value("--workload")?.as_str() {
                         "laptop" => Only::Laptop,
@@ -229,6 +235,23 @@ impl Results {
         })
     }
 
+    /// Adds the metrics of another run, such as the AArch64 job's
+    /// instruction counts next to the x86_64 benchmarks; this run's
+    /// environment, date and KVM label stay. A metric both runs measured is
+    /// an error: which one the README shows would be arbitrary.
+    fn merge(&mut self, other: Results) -> Result {
+        if let Some(m) = other
+            .metrics
+            .iter()
+            .find(|m| self.metrics.iter().any(|n| n.key() == m.key()))
+        {
+            return Err(format!("both results files measure {}", m.key()));
+        }
+        self.metrics.extend(other.metrics);
+        self.skipped.extend(other.skipped);
+        Ok(())
+    }
+
     fn from_json(v: &Value) -> Result<Self> {
         Ok(Self {
             environment: v["environment"].as_str().unwrap_or("unknown").into(),
@@ -257,13 +280,13 @@ impl Results {
 
 /// Entry point for `cargo xtask bench`.
 pub fn cmd(opts: &Options) -> Result {
-    let results = match &opts.from {
-        Some(path) => {
-            let text = fs::read_to_string(path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let value = serde_json::from_str(&text)
-                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
-            Results::from_json(&value)?
+    let results = match opts.from.split_first() {
+        Some((first, rest)) => {
+            let mut results = load_results(first)?;
+            for path in rest {
+                results.merge(load_results(path)?)?;
+            }
+            results
         }
         None => measure(opts)?,
     };
@@ -287,10 +310,22 @@ pub fn cmd(opts: &Options) -> Result {
     Ok(())
 }
 
+fn load_results(path: &std::path::Path) -> Result<Results> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let value = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+    Results::from_json(&value)
+}
+
 fn measure(opts: &Options) -> Result<Results> {
-    if opts.workload.is_some() {
+    if opts.workload.is_some() || opts.icount_only {
         let (mut metrics, mut skipped) = (Vec::new(), Vec::new());
-        crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
+        if opts.icount_only {
+            crate::profile::measure_icount(&mut metrics, &mut skipped)?;
+        } else {
+            crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
+        }
         return Ok(Results {
             environment: opts.env.clone(),
             date: today(),
@@ -1520,6 +1555,7 @@ pub fn readme_section(results: &Results) -> String {
         );
     }
     s += &comparison_table(results);
+    s += &architectures_table(results);
     s += &format!(
         "\nEnvironment: `{}`, KVM: {}, measured {}. Regenerate with\n`cargo xtask bench --readme`.\n",
         results.environment,
@@ -1679,6 +1715,82 @@ pub fn comparison_table(results: &Results) -> String {
             time(warm),
             c.median / w.median
         );
+    }
+    s
+}
+
+/// Operations of the instruction table, in the order shown.
+const ARCH_ROWS: [(&str, &str); 12] = [
+    (
+        "cell.syscall_insns",
+        "One system call round trip (`getpid`)",
+    ),
+    ("cell.switch_insns", "Switch between two cells"),
+    ("cell.spawn_insns", "Create the `hello` cell"),
+    ("cell.run_insns", "Run `hello` from start to exit"),
+    ("cell.fork_insns", "Fork a cell holding 50 MiB"),
+    ("cell.suspend_insns", "Suspend an 8 MiB cell"),
+    ("cell.resume_insns", "Resume it, lazily"),
+    ("cell.resume_eager_insns", "Resume it, eagerly"),
+    ("cell.pipe_rtt_insns", "Pipe round trip"),
+    ("cell.loopback_rtt_insns", "Loopback TCP round trip"),
+    ("workload.cold_insns", "A static glibc program, cold"),
+    (
+        "workload.warm_insns",
+        "The same, forked from a warm template",
+    ),
+];
+
+/// Retired instructions per operation under QEMU `-icount` on both
+/// architectures, when the results hold AArch64's (the AArch64 CI job
+/// merged with `--from`; change `add-aarch64-bench`).
+pub fn architectures_table(results: &Results) -> String {
+    let find = |name: &str, vmm: &str| {
+        results
+            .metrics
+            .iter()
+            .find(|m| m.name == name && m.guest == "rhizo" && m.vmm.as_deref() == Some(vmm))
+    };
+    let count = |m: Option<&Metric>| {
+        m.map_or_else(
+            || "—".to_string(),
+            |m| {
+                // Thousands separated by commas, as the other tables write them.
+                let digits = format!("{:.0}", m.median);
+                let mut out = String::new();
+                for (i, c) in digits.chars().enumerate() {
+                    if i > 0 && (digits.len() - i) % 3 == 0 {
+                        out.push(',');
+                    }
+                    out.push(c);
+                }
+                out
+            },
+        )
+    };
+    let rows: Vec<String> = ARCH_ROWS
+        .iter()
+        .filter_map(|&(name, what)| {
+            let arm = find(name, "qemu-virt-icount")?;
+            Some(format!(
+                "| {what} | {} | {} |\n",
+                count(find(name, "qemu-microvm-icount")),
+                count(Some(arm))
+            ))
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n### Both architectures, in instructions\n\n\
+         Retired instructions per operation, counted under QEMU with `-icount` (the same \
+         on every run and every host): x86_64 on `microvm`, AArch64 on `virt`. \
+         GitHub's ARM64 runners have no KVM, so AArch64 has no timings from CI.\n\n\
+         | Operation | x86_64 | AArch64 |\n|---|---:|---:|\n",
+    );
+    for row in rows {
+        s += &row;
     }
     s
 }
@@ -1994,6 +2106,63 @@ mod tests {
     }
 
     #[test]
+    fn architectures_table_needs_aarch64_and_shows_both() {
+        let x86 = metric(
+            "cell.run_insns",
+            "rhizo",
+            Some("qemu-microvm-icount"),
+            120456.0,
+        );
+        let r = results(vec![x86.clone()]);
+        assert_eq!(architectures_table(&r), "", "no AArch64 figures");
+        let r = results(vec![
+            metric("boot.time_to_ready_ms", "rhizo", Some("firecracker"), 4.2),
+            x86,
+            metric(
+                "cell.run_insns",
+                "rhizo",
+                Some("qemu-virt-icount"),
+                123233.0,
+            ),
+            metric("cell.fork_insns", "rhizo", Some("qemu-virt-icount"), 7424.0),
+        ]);
+        let s = architectures_table(&r);
+        assert!(
+            s.contains("| Run `hello` from start to exit | 120,456 | 123,233 |"),
+            "{s}"
+        );
+        assert!(
+            s.contains("| Fork a cell holding 50 MiB | — | 7,424 |"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("system call"),
+            "a row AArch64 lacks is left out"
+        );
+        assert!(readme_section(&r).contains("### Both architectures"));
+    }
+
+    #[test]
+    fn results_of_both_architectures_merge() {
+        let mut x86 = results(vec![
+            metric("image.size_bytes", "rhizo", None, 1.0),
+            metric("cell.run_insns", "rhizo", Some("qemu-microvm-icount"), 2.0),
+        ]);
+        let arm = results(vec![metric(
+            "cell.run_insns",
+            "rhizo",
+            Some("qemu-virt-icount"),
+            3.0,
+        )]);
+        x86.merge(arm).unwrap();
+        assert_eq!(x86.metrics.len(), 3);
+        assert_eq!(x86.environment, "ci", "the first run's label stays");
+        let twice = results(vec![metric("image.size_bytes", "rhizo", None, 4.0)]);
+        let err = x86.merge(twice).unwrap_err();
+        assert!(err.contains("image.size_bytes"), "{err}");
+    }
+
+    #[test]
     fn readme_section_has_chart_table_and_environment() {
         let r = results(vec![
             metric("boot.time_to_ready_ms", "rhizo", Some("firecracker"), 4.2),
@@ -2064,6 +2233,14 @@ mod tests {
         assert_eq!(o.runs, 5);
         assert_eq!(o.vmms, vec![Vmm::QemuQ35, Vmm::Firecracker]);
         assert!(o.check && o.env == "ci");
+        assert!(!o.icount_only && o.from.is_empty());
+        let args: Vec<String> = ["--icount-only", "--from", "a.json", "--from", "b.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let o = Options::parse(&args).unwrap();
+        assert!(o.icount_only);
+        assert_eq!(o.from, [PathBuf::from("a.json"), PathBuf::from("b.json")]);
         assert!(Options::parse(&["--runs".to_string(), "0".to_string()]).is_err());
         let args: Vec<String> = [
             "--workload",

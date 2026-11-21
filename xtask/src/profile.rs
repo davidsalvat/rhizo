@@ -82,6 +82,21 @@ pub fn pmu_passes(output: &str) -> Vec<(String, f64)> {
     out
 }
 
+/// The figures of a `bench-cell` run under `-icount`, in instructions: a
+/// PMU pass that counts instructions is exact, so its figures win; the
+/// clock (one nanosecond per instruction; AArch64's generic timer ticks
+/// every 16) gives the rest, such as the fork benchmarks, which the passes
+/// leave out.
+pub fn icount_figures(output: &str) -> Vec<(String, f64)> {
+    let mut figures: BTreeMap<String, f64> = counted(output, "insns").into_iter().collect();
+    figures.extend(
+        pmu_passes(output)
+            .into_iter()
+            .filter(|(name, _)| name.ends_with("_insns")),
+    );
+    figures.into_iter().collect()
+}
+
 /// What the kernel found to count with: `rhizo-pmu …` without its prefix.
 pub fn pmu_line(output: &str) -> Option<&str> {
     output
@@ -134,17 +149,7 @@ pub fn measure(
     metrics: &mut Vec<Metric>,
     skipped: &mut Vec<(String, String)>,
 ) -> Result {
-    // Kept apart: the next kernel build writes the same path.
-    let built = build_kernel(Profile::Release, &["bench-cell", "profile"])?;
-    let mut name = built.file_stem().unwrap_or_default().to_os_string();
-    name.push("-profile");
-    let kept = built.with_file_name(name);
-    let kept = match built.extension() {
-        Some(ext) => kept.with_extension(ext),
-        None => kept,
-    };
-    std::fs::copy(&built, &kept).map_err(|e| format!("cannot copy {}: {e}", built.display()))?;
-    let profiled = Guest::Rhizo(kept);
+    let profiled = profile_kernel()?;
     let one = RunOptions {
         stop_at_ready: false,
         timeout: RUN_TIMEOUT,
@@ -194,6 +199,28 @@ pub fn measure(
     Ok(())
 }
 
+/// Only the figures counted in instructions under QEMU with `-icount`
+/// (`--icount-only`): what a host without KVM measures exactly, such as
+/// GitHub's ARM64 runners (change `add-aarch64-bench`).
+pub fn measure_icount(metrics: &mut Vec<Metric>, skipped: &mut Vec<(String, String)>) -> Result {
+    icount(metrics, skipped, &profile_kernel()?)
+}
+
+/// Builds the `bench-cell` kernel with `profile`, kept apart: the next
+/// kernel build writes the same path.
+fn profile_kernel() -> Result<Guest> {
+    let built = build_kernel(Profile::Release, &["bench-cell", "profile"])?;
+    let mut name = built.file_stem().unwrap_or_default().to_os_string();
+    name.push("-profile");
+    let kept = built.with_file_name(name);
+    let kept = match built.extension() {
+        Some(ext) => kept.with_extension(ext),
+        None => kept,
+    };
+    std::fs::copy(&built, &kept).map_err(|e| format!("cannot copy {}: {e}", built.display()))?;
+    Ok(Guest::Rhizo(kept))
+}
+
 /// The benchmarks and breakdowns under QEMU with `-icount`, once each: the
 /// guest's clock counts its instructions, so every figure is a count of
 /// retired instructions, the same on every run and every host (spec
@@ -232,17 +259,7 @@ fn icount(
             skipped.push((label, format!("the run failed; output:\n{}", out.output)));
             return Ok(());
         }
-        // A PMU that counts instructions is exact; else the clock is.
-        let passes: Vec<_> = pmu_passes(&out.output)
-            .into_iter()
-            .filter(|(name, _)| name.ends_with("_insns"))
-            .collect();
-        let counts = if passes.is_empty() {
-            counted(&out.output, "insns")
-        } else {
-            passes
-        };
-        for (name, value) in counts {
+        for (name, value) in icount_figures(&out.output) {
             samples.add(name, "insns", value);
         }
         for (name, value) in breakdowns(&out.output) {
@@ -661,6 +678,18 @@ mod tests {
         assert_eq!(find(&c, "cell.syscall_insns"), Some(9.0));
         assert_eq!(find(&c, "cell.fork_insns"), None, "not printed");
         assert!(c.iter().all(|(n, _)| !n.contains("pt_frames")));
+    }
+
+    #[test]
+    fn icount_figures_take_the_pmu_pass_then_the_clock() {
+        let run = format!("{RUN}rhizo-fork fork_ns=70\n");
+        let f = icount_figures(&run);
+        assert_eq!(find(&f, "cell.spawn_insns"), Some(1000.0), "PMU pass wins");
+        assert_eq!(find(&f, "cell.syscall_insns"), Some(90.0));
+        assert_eq!(find(&f, "cell.fork_insns"), Some(70.0), "clock only");
+        assert!(f.iter().all(|(n, _)| n.ends_with("_insns")), "{f:?}");
+        let no_pmu = icount_figures("rhizo-cell spawn_ns=5\nrhizo-pmu none\n");
+        assert_eq!(no_pmu, [("cell.spawn_insns".to_string(), 5.0)]);
     }
 
     #[test]

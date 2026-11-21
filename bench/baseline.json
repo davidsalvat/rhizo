@@ -210,6 +210,7 @@
       "workload.python_warm_us/rhizo/qemu-q35": 501.731,
       "workload.warm_insns/rhizo/qemu-microvm-icount": 76646.0
     },
+    "ci-arm": {},
     "dedicated": {}
   },
   "thresholds_pct": {
@@ -232,6 +233,10 @@
       "density.sched_p99_us",
       "density.wake_p99_us",
       "density.wasted_wakeups_pct",
+      "breakdown.",
+      "lock."
+    ],
+    "ci-arm": [
       "breakdown.",
       "lock."
     ],
