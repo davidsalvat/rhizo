@@ -78,8 +78,7 @@ counters, its `epoll` instances and one record per socket
 connection, the boot identity of the kernel that parked it and its key
 there); resuming SHALL
 restore the first three as they were and the sockets as the `networking`
-capability says. A record whose fields are out of range SHALL make the
-snapshot invalid.
+capability says.
 
 #### Scenario: Pipe across suspend
 - **WHEN** a cell writes into a pipe, is suspended and resumed, and reads the pipe
@@ -92,3 +91,11 @@ snapshot invalid.
 #### Scenario: Parked record round trip
 - **WHEN** socket records, a parked one among them, are encoded and decoded
 - **THEN** the records are equal, and a truncated or out-of-range record is refused
+
+### Requirement: Invalid socket records
+A socket record whose fields are out of range SHALL make the snapshot
+invalid.
+
+#### Scenario: Out-of-range record
+- **WHEN** a snapshot holds a socket record with a field out of range
+- **THEN** decoding refuses it and no cell is created
