@@ -8,8 +8,8 @@
 //! - `distro-files`: where the cells' architecture is the host's, the
 //!   distribution's own `ls`, `sort` and `python3`, embedded in test
 //!   kernels only (the benchmark kernel keeps its memory for cells);
-//! - `node-files`: where the cells' architecture is the host's and
-//!   `RHIZO_NODE` is set, the official Node.js build (`tools::node`) with
+//! - `node-files`: when `RHIZO_NODE` is set, the official Node.js build
+//!   for the cells' architecture (`tools::node`) with
 //!   `cells/node/demo.js`, embedded only in the kernels built with the
 //!   `node` feature (change `add-node-workload`).
 //!
@@ -72,9 +72,11 @@ pub fn build(out: &Path) -> Result {
     compile_hello(&hello.join("usr/bin/hello"))?;
     pack(&hello, native, &out.join("dynamic-files"))?;
     let node_files = out.join("node-files");
-    if native && std::env::var_os("RHIZO_NODE").is_some() {
-        fresh(&node, "app")?;
-        copy(&crate::tools::node()?, &node.join(NODE))?;
+    if std::env::var_os("RHIZO_NODE").is_some() {
+        // Linked, not copied, where it can be: it is over 100 MiB.
+        let (from, to) = (crate::tools::node()?, node.join(NODE));
+        fresh(&node, "usr/bin")?;
+        std::fs::hard_link(&from, &to).or_else(|_| copy(&from, &to))?;
         copy(
             &crate::workspace_root().join("cells/node/demo.js"),
             &node.join(NODE_SCRIPT),

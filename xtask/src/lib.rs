@@ -79,9 +79,9 @@ Commands:
       --no-icount            Skip the instruction counts under QEMU -icount
       --icount-only          Only those instruction counts (hosts without
                              KVM, such as GitHub's ARM64 runners)
-      --workload <laptop|server>
-                             Only this reference workload (both run by
-                             default, after the cell figures)
+      --workload <laptop|server|node>
+                             Only this workload (all run by default, after
+                             the cell figures; Node.js with RHIZO_NODE)
       --soak                 The long versions of the workloads (weekly)
       --cells <n>            Cells of the server workload (default 10000)
       --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
@@ -521,13 +521,11 @@ pub(crate) const NODE_MEMORY_MIB: u32 = 1024;
 const NODE_CPUS: u32 = 2;
 
 /// Why the Node.js kernels are not built, if they are not: Node.js is
-/// downloaded only with `RHIZO_NODE` set, and packed natively only (as the
-/// distribution's programs: its libraries are the host's).
+/// downloaded only with `RHIZO_NODE` set.
 pub(crate) fn node_unavailable_reason() -> Option<String> {
-    if env::var_os("RHIZO_NODE").is_none() {
-        return Some("RHIZO_NODE is not set".into());
-    }
-    differential::unavailable_reason().map(|why| format!("it is packed natively only ({why})"))
+    env::var_os("RHIZO_NODE")
+        .is_none()
+        .then(|| "RHIZO_NODE is not set".into())
 }
 
 /// Most in-kernel test VMs one step is split into.

@@ -195,11 +195,11 @@ pub const NODE_ARGV: [&str; 3] = ["/usr/bin/node", "--jitless", "/app/demo.js"];
 pub const NODE_STDOUT: &str = "warm\n\
      {\"tool\":\"summarize\",\"top_words\":[\"RESUME\",\"SNAPSHOT\",\"AGENT\"],\
      \"counts\":[74,69,65],\"contacts\":24,\"first_contact\":\"agent@team0\",\
-     \"dates_since\":25,\"last_date\":\"2026-12-15\",\"folded\":40791170}\n";
+     \"dates_since\":25,\"last_date\":\"2026-12-15\",\"folded\":1636986}\n";
 /// What it prints after [`NODE_STDOUT`] given the model's URL: the model's
 /// tool call, received with `node:http`.
 #[allow(dead_code)]
-pub const NODE_MODEL_LINE: &str = "model: 200 compute {\"n\": 967, \"seed\": 768}\n";
+pub const NODE_MODEL_LINE: &str = "model: 200 compute {\"n\": 705, \"seed\": 225}\n";
 
 /// The CPython agent (`cells/python/agent_loop.py`, change
 /// `add-agent-workload`) after [`AGENT_TURNS`] turns with the host's fake

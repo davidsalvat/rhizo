@@ -58,7 +58,7 @@ function pipeline(words) {
   };
   const length = compose(stages);
   let total = 0;
-  for (let round = 0; round < 20; round++) {
+  for (let round = 0; round < 4; round++) {
     for (const w of words) {
       total += length(w) * counter(w)();
     }

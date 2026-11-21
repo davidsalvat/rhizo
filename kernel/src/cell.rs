@@ -2730,6 +2730,17 @@ pub fn bench(console: &mut impl Console) {
     use core::fmt::Write;
     #[cfg(feature = "profile")]
     return profiled(console);
+    // The Node.js kernel measures Node.js only (its VM has the memory).
+    if cfg!(feature = "node") {
+        let _ = match node() {
+            Some((cold, warm)) => writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-node cold_ns={cold} warm_ns={warm}"
+            ),
+            None => writeln!(rhizo_hal::ConsoleWriter(console), "rhizo-node not packed"),
+        };
+        return;
+    }
     if let Some(workload) = crate::wire::options().bench {
         crate::workloads::run(console, workload);
         return;
@@ -3182,6 +3193,57 @@ fn python() -> Option<(u64, u64)> {
     Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
 }
 
+/// Node.js answering one tool call (`cells/node/demo.js` with `--jitless`;
+/// change `add-node-workload`): spawned cold from its files (`ld.so`,
+/// Node's start-up, warm-up, answer, exit), and forked from a template
+/// frozen after its warm-up. Medians over 7 rounds, after a first spawn
+/// that fills the page cache; `None` when Node.js was not packed.
+#[cfg(feature = "bench-cell")]
+fn node() -> Option<(u64, u64)> {
+    const ROUNDS: usize = 7;
+    const ARGV: [&[u8]; 3] = [b"/usr/bin/node", b"--jitless", b"/app/demo.js"];
+    let files = node_files()?;
+    let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
+    let mut host = Host::new();
+    let spawn = |host: &mut Host| {
+        host.spawn_file(files.clone(), ARGV[0], &ARGV, &[], true, false)
+            .expect("spawn")
+    };
+    let (mut cold, mut warm) = (Vec::new(), Vec::new());
+    for round in 0..=ROUNDS {
+        host.finished.clear();
+        let t0 = bench_clock();
+        let id = spawn(&mut host);
+        host.run(|h| h.finished(id).is_some());
+        if round > 0 {
+            cold.push(ns(t0, bench_clock()));
+        }
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    let template = spawn(&mut host);
+    while host.output(template) != Some(b"warm\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    // The script's pause after `warm` (50 ms) ends before the first fork:
+    // forks wake at once, as from a template made long before.
+    let end = now_ns() + 50_000_000;
+    while now_ns() < end {}
+    for _ in 0..ROUNDS {
+        host.finished.clear();
+        let t0 = bench_clock();
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        host.run(|h| h.finished(id).is_some());
+        warm.push(ns(t0, bench_clock()));
+        assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+    }
+    cold.sort_unstable();
+    warm.sort_unstable();
+    Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
+}
+
 /// The files a CPython cell starts with (`cpython-files`, packed by `xtask`:
 /// the standard library under `/usr/lib/python3.13` and `/app/agent_demo.py`;
 /// design D2 of `add-cpython`), decoded once and then shared copy-on-write
@@ -3233,7 +3295,7 @@ pub fn distro_files() -> Option<Fs> {
 /// and libraries, `/app/demo.js`; change `add-node-workload`), as
 /// [`dynamic_files`]; embedded in the `node` kernels only.
 #[cfg_attr(
-    not(feature = "node"),
+    not(any(feature = "node", feature = "bench-cell")),
     allow(dead_code, reason = "used by the Node.js tests and benchmark")
 )]
 pub fn node_files() -> Option<Fs> {

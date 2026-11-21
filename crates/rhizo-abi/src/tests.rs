@@ -402,6 +402,70 @@ fn sysinfo_affinity_and_advice() {
     assert_eq!(w.call(223, &[99, 0, 0, 2]).0, -EBADF);
 }
 
+/// The calls Node.js makes at start-up and under load (spec `linux-abi`,
+/// change `add-node-workload`), with the AArch64 numbers and the x86_64
+/// ones.
+#[test]
+fn node_start_up_calls() {
+    for (arch, n) in [
+        (Arch::Aarch64, [169, 114, 90, 167, 121, 120, 425]),
+        (Arch::X86_64, [96, 229, 125, 157, 143, 145, 425]),
+    ] {
+        let [
+            gettimeofday,
+            getres,
+            capget,
+            prctl,
+            getparam,
+            getscheduler,
+            io_uring,
+        ] = n;
+        let mut w = World::new(arch);
+        w.services.clock = 2_500_000_000;
+        // gettimeofday: seconds and microseconds of the realtime clock; an
+        // empty time zone.
+        w.poke(DATA + 16, &[0xff; 8]);
+        assert_eq!(w.call(gettimeofday, &[DATA, DATA + 16]).0, 0);
+        let tv = w.peek(DATA, 16);
+        assert_eq!(tv[..8], 1_700_000_002u64.to_le_bytes());
+        assert_eq!(tv[8..], 500_000u64.to_le_bytes());
+        assert_eq!(w.peek(DATA + 16, 8), [0; 8]);
+        assert_eq!(w.call(gettimeofday, &[0, 0]).0, 0);
+        assert_eq!(w.call(gettimeofday, &[RO, 0]).0, -EFAULT);
+        // clock_getres: one nanosecond on every clock clock_gettime reads.
+        assert_eq!(w.call(getres, &[1, DATA]).0, 0);
+        assert_eq!(
+            w.peek(DATA, 16),
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(w.call(getres, &[0, 0]).0, 0);
+        assert_eq!(w.call(getres, &[3, DATA]).0, -EINVAL);
+        // capget: no capabilities; an unknown version is answered with 3.
+        w.poke(DATA, &0x2008_0522u32.to_le_bytes());
+        w.poke(DATA + 16, &[0xff; 24]);
+        assert_eq!(w.call(capget, &[DATA, DATA + 16]).0, 0);
+        assert_eq!(w.peek(DATA + 16, 24), [0; 24]);
+        w.poke(DATA, &7u32.to_le_bytes());
+        assert_eq!(w.call(capget, &[DATA, DATA + 16]).0, -EINVAL);
+        assert_eq!(w.peek(DATA, 4), 0x2008_0522u32.to_le_bytes());
+        assert_eq!(w.call(capget, &[RO + 4096 * 64, 0]).0, -EFAULT);
+        // prctl: naming a thread is accepted, other options are not known.
+        assert_eq!(w.call(prctl, &[15, DATA]).0, 0);
+        assert_eq!(w.call(prctl, &[16, DATA]).0, 0);
+        assert_eq!(w.call(prctl, &[0x5961_6d61, 0]).0, -EINVAL);
+        // The normal policy, priority 0, for the caller or a thread of it.
+        w.poke(DATA, &[0xff; 4]);
+        assert_eq!(w.call(getparam, &[0, DATA]).0, 0);
+        assert_eq!(w.peek(DATA, 4), [0; 4]);
+        assert_eq!(w.call(getscheduler, &[5]).0, 0);
+        assert_eq!(w.call(getscheduler, &[77]).0, -ESRCH);
+        assert_eq!(w.call(getparam, &[-1i64 as u64, DATA]).0, -EINVAL);
+        // io_uring is declined on purpose (libuv falls back), unreported.
+        assert_eq!(w.call(io_uring, &[256, DATA]).0, -ENOSYS);
+        assert_eq!(w.services.log, "", "{arch:?}");
+    }
+}
+
 #[test]
 fn unknown_calls_return_enosys_and_are_reported_once() {
     let mut w = World::new(Arch::Aarch64);
