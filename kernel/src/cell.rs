@@ -910,19 +910,21 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
             other = cover(s);
             return Take::Join(gang);
         }
-        let wake = next_wake(s);
-        // Under the lock: a CPU giving a cell back sees this bit and wakes
-        // this one, so no wake-up is lost between here and the wait.
-        if s.running == 0 && wake.is_none() {
-            // Only parked cells are left: nothing will wake them (but the
-            // network card, or the end of the run).
-            s.idle |= 1 << cpu;
-            return Take::Done;
-        }
+        // The boot CPU looks at ended cells before it waits: with nothing
+        // to run its wait may last until the network card wants polling,
+        // hours away, and the host would not see the cell end.
         if cpu == 0 && !s.ended.is_empty() {
             return Take::Look;
         }
+        let wake = next_wake(s);
+        // Under the lock: a CPU giving a cell back sees this bit and wakes
+        // this one, so no wake-up is lost between here and the wait.
         s.idle |= 1 << cpu;
+        if s.running == 0 && wake.is_none() {
+            // Only parked cells are left: nothing will wake them (but the
+            // network card, or the end of the run).
+            return Take::Done;
+        }
         // Its timer only if no other idle CPU's covers the deadline.
         Take::Wait(s.timer.idle(cpu, wake))
     });

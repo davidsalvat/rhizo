@@ -34,6 +34,12 @@ A CPU with nothing to run and no deadline anywhere (`Take::Done`) now also
 counts as idle, so a CPU giving back a cell wakes it for work as it wakes
 the others; before, only the slice-long poll brought it back.
 
+The boot CPU looks at ended cells (`Take::Look`) before it decides to wait,
+not after: with only cells waiting on sockets left, its wait lasts until the
+network card wants polling, hours away when no packet is due, and a cell
+that ended just before would go unseen. The slice-long poll used to hide
+this (`a_waiting_cell_uses_no_cpu` hung on 4 vCPUs without it).
+
 Alternatives: every idle CPU programs its timer for the earliest deadline
 (every idle CPU wakes at every deadline, and all but one find nothing);
 per-CPU sleep lists, each CPU responsible for the deadlines of the cells it
