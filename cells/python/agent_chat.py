@@ -18,8 +18,9 @@
 #
 # It ends at the end of its input. A connection the model closed, or one a
 # fork or a resume reset, is opened again once per request. Without
-# arguments it runs its tools once offline (how its standard library is
-# packed, cells/python/pack_stdlib.py: what they import is packed with it).
+# arguments it checks its tools' limits and runs each tool once offline
+# (how its standard library is packed, cells/python/pack_stdlib.py: what
+# they import is packed with it).
 import contextlib
 import io
 import json
@@ -109,11 +110,15 @@ class TimeUp(Exception):
 
 
 def run_python(code):
+    return snippet(code, SNIPPET_SECONDS)
+
+
+def snippet(code, seconds):
     """Runs `code` in a namespace of its own, its output captured and
-    capped, stopped at the first line it runs after `SNIPPET_SECONDS` (a
+    capped, stopped at the first line it runs after `seconds` (a
     line-by-line trace: one long call into C is not interrupted)."""
     out = Capped()
-    deadline = time.monotonic() + SNIPPET_SECONDS
+    deadline = time.monotonic() + seconds
 
     def trace(frame, event, arg):
         if time.monotonic() > deadline:
@@ -129,7 +134,7 @@ def run_python(code):
             finally:
                 sys.settrace(None)
     except TimeUp:
-        out.write("%s[stopped after %d seconds]" % ("\n" if out.size else "", SNIPPET_SECONDS))
+        out.write("%s[stopped after %g seconds]" % ("\n" if out.size else "", seconds))
     except BaseException:
         out.write(traceback.format_exc(limit=-3))
     return out.text() or "(no output)"
@@ -246,6 +251,11 @@ def chat(model):
 
 def main():
     if len(sys.argv) < 3:
+        # The tools' limits hold (this runs whenever the cell's files are
+        # packed, so a broken limit fails the build).
+        assert snippet("print(1)\nwhile True: pass", 0.05) == "1\n\n[stopped after 0.05 seconds]"
+        assert snippet("print('x' * 5000)", 1).endswith("x\n[1001 more characters dropped]")
+        assert "ZeroDivisionError" in snippet("1 / 0", 1)
         for call in (
             {"function": {"name": "run_python", "arguments": '{"code": "print(6 * 7)"}'}},
             {"function": {"name": "write_file", "arguments": '{"path": "chat-check.txt", "content": "x"}'}},
