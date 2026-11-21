@@ -160,6 +160,9 @@ come back, or the benchmark fails.
 | `density.wake_p50_us`, `density.wake_p99_us`, `_p999_us` | timing | Wake-up latency: its event (deadline, or a socket change by another cell's system call) until it runs; counted from the same moment |
 | `density.syscall_p50_ns`, `_p99_ns`, `_p999_ns` | timing | Time in the system-call handler, locks included |
 | `density.wasted_wakeups_pct/rhizo/<vmm>` | rate | Of the cells a socket change woke from waiting on descriptors, the share whose next system call waited again: a wake-up that found nothing (each socket wakes only the cells waiting on it, change `add-socket-wait-queues`) |
+| `density.suspend_us/rhizo/<vmm>` | timing | Median, over the load, of the host suspending a worker with every worker live: each finds its cell by identifier among the others (sleepers through their hints, change `heap-caches-cell-index`) |
+| `density.fork_us/rhizo/<vmm>` | timing | The same for forking a computing worker |
+| `density.kill_us/rhizo/<vmm>` | timing | The same for killing the previous fork |
 | `density.oom_cells/rhizo/<vmm>` | count, higher is better | Idle cells memory held before the kernel refused one |
 | `density.oom_heap_kept_bytes/rhizo/<vmm>` | size | Once every cell of the out-of-memory push ended: what the kernel heap still holds beyond what it held before, in free blocks of pages it has not given back (change `add-heap-trim`) |
 
