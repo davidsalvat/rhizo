@@ -105,6 +105,7 @@ macro_rules! suite {
             ktest_case!(fresh_memory_never_holds_another_cells_data),
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
+            ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
             ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
             ktest_case!(hardware_entropy_works_where_present),
@@ -1531,6 +1532,39 @@ fn shared_read_only_pages_stay_shared_after_mprotect() {
         assert_eq!(ending, Ending::Exit(0), "{out}");
         assert!(out.ends_with("own ok\n"), "{out}");
     }
+}
+
+/// Hostile threads on several CPUs (spec `isolation`, `multi-core`):
+/// `racer` cells unmap memory other threads are copying through the
+/// kernel, unmap a word a thread waits on, end while their threads are in
+/// system calls, and flip a page read-only under a writer. Each ends as its
+/// race allows, a cell next to them finishes, the kernel keeps running and
+/// every frame comes back.
+fn threads_racing_on_several_cpus_cannot_hurt_the_kernel() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let races = ["io", "futex", "exit", "protect"].map(|race| {
+        let id = spawn(&mut host, "racer", &[race.as_bytes()]);
+        (race, id)
+    });
+    let other = spawn(&mut host, "hello", &[]);
+    host.run(|_| false);
+    for (race, id) in races {
+        let (ending, out) = ended(&host, id);
+        match race {
+            "exit" => assert_eq!(ending, Ending::Exit(3), "{race}: {out}"),
+            // The writer may hit the page while it is read-only.
+            "protect" if ending == Ending::Fault => {}
+            _ => assert_eq!(
+                (ending, out.as_str()),
+                (Ending::Exit(0), alloc::format!("{race} ok\n").as_str()),
+                "{race}"
+            ),
+        }
+    }
+    assert_eq!(ended(&host, other).0, Ending::Exit(0));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
 }
 
 /// A cell that spins with the direction and alignment-check flags set

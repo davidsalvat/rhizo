@@ -435,7 +435,11 @@ struct Scatter {
 
 impl Scatter {
     fn total(&self) -> u64 {
-        self.iov.iter().map(|&(_, len)| len).sum()
+        // Each length is at most `SSIZE_MAX`; their sum may pass 2^64
+        // (finding S16).
+        self.iov
+            .iter()
+            .fold(0, |total: u64, &(_, len)| total.saturating_add(len))
     }
 
     /// Copies `piece` into the buffers; `false` (nothing counted) on a
@@ -595,7 +599,11 @@ pub(crate) fn sendmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
             },
             _ => None,
         };
-        let total: u64 = iov.iter().map(|&(_, len)| len).sum();
+        // Each length is at most `SSIZE_MAX`; their sum may pass 2^64
+        // (finding S16).
+        let total = iov
+            .iter()
+            .fold(0, |total: u64, &(_, len)| total.saturating_add(len));
         let cap = match ty {
             Type::Dgram if total > rhizo_net::DGRAM_MAX as u64 => return Err(-EMSGSIZE),
             Type::Dgram => total,
