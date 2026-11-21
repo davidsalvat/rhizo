@@ -562,6 +562,7 @@ pub(crate) fn now_ns() -> u64 {
 /// the same time on every CPU). A secondary CPU stops its tick again
 /// afterwards, as it idles between runs. Runs on any CPU through
 /// `smp::post`.
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub fn timed_wait(ns: u64) -> u64 {
     let t0 = Counter.cycles();
     irq::wait_ns(ns);
