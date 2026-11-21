@@ -813,3 +813,24 @@ impl Tlb for CpuTlb {
         unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
     }
 }
+
+/// Drops every translation and every paging-structure cache entry of this
+/// CPU, for every PCID, global ones included: a write to CR4 that changes
+/// CR4.PGE does, so it is toggled and set back.
+#[cfg(feature = "cells")]
+pub fn flush_all() {
+    const PGE: u64 = 1 << 7;
+    // SAFETY: only CR4.PGE changes, and back; both writes only flush.
+    unsafe {
+        asm!(
+            "mov {t}, cr4",
+            "xor {t}, {pge}",
+            "mov cr4, {t}",
+            "xor {t}, {pge}",
+            "mov cr4, {t}",
+            t = out(reg) _,
+            pge = in(reg) PGE,
+            options(nostack, preserves_flags)
+        );
+    }
+}

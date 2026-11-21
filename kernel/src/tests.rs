@@ -54,6 +54,7 @@ macro_rules! suite {
             ktest_case!(heap_alignment_is_honored),
             ktest_case!(heap_memory_is_reused),
             ktest_case!(large_heap_allocations_survive_fragmentation),
+            ktest_case!(every_cpu_flushes_between_runs),
             ktest_case!(cell_says_hello),
             ktest_case!(cell_exit_status_and_frames_return),
             ktest_case!(cell_system_calls),
@@ -461,6 +462,23 @@ fn large_heap_allocations_survive_fragmentation() {
     // those its setup left are freed too, the first time.
     let free = memory::free_bytes();
     assert!(free >= before, "{} bytes not returned", before - free);
+}
+
+/// Between host runs, every CPU can be made to flush its translations and
+/// paging-structure caches (what freeing the window's tables waits for,
+/// change `add-heap-trim`); while another CPU runs a job, it cannot.
+fn every_cpu_flushes_between_runs() {
+    assert!(crate::smp::flush_everywhere());
+    if crate::smp::count() > 1 && !crate::arch::user::TLB_FLUSH_IS_BROADCAST {
+        fn spin(rounds: u64) -> u64 {
+            (0..rounds).fold(0, |a, i| core::hint::black_box(a ^ i))
+        }
+        crate::smp::post(1, spin, 1 << 24);
+        let busy = crate::smp::flush_everywhere();
+        crate::smp::join(1);
+        assert!(!busy, "a busy CPU is not asked");
+        assert!(crate::smp::flush_everywhere());
+    }
 }
 
 // --- Self-checks ------------------------------------------------------------

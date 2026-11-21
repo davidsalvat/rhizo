@@ -2427,6 +2427,7 @@ impl Host {
             for cpu in 1..cpus {
                 crate::smp::join(cpu);
             }
+            crate::heap::reclaim_tables(); // the other CPUs can flush now
             let state = self.state();
             state.stopping = false;
             state.idle = 0;
