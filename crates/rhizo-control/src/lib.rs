@@ -336,7 +336,10 @@ impl<'a> Reader<'a> {
     }
     /// A list: its count is bounded by the bytes left (every item takes at
     /// least one), so a forged count allocates nothing.
-    fn list<T>(&mut self, mut each: impl FnMut(&mut Self) -> Result<T, Error>) -> Result<Vec<T>, Error> {
+    fn list<T>(
+        &mut self,
+        mut each: impl FnMut(&mut Self) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
         let n = self.u32()? as usize;
         if n > self.0.len() {
             return Err(Error::Malformed);
@@ -491,7 +494,9 @@ impl Request {
 pub enum State {
     Running,
     /// In a snapshot of this many bytes.
-    Suspended { bytes: u64 },
+    Suspended {
+        bytes: u64,
+    },
     /// It exited with this status.
     Exited(i32),
     /// It raised an exception and was ended.

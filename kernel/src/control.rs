@@ -218,14 +218,14 @@ impl Server {
             }
             Request::Resume(target) => {
                 let entry = self.entry(target)?;
-                let snapshot = match core::mem::replace(&mut entry.place, Place::Ended(State::Killed))
-                {
-                    Place::Suspended(snapshot) => snapshot,
-                    other => {
-                        entry.place = other;
-                        return refuse(Error::NotSuspended);
-                    }
-                };
+                let snapshot =
+                    match core::mem::replace(&mut entry.place, Place::Ended(State::Killed)) {
+                        Place::Suspended(snapshot) => snapshot,
+                        other => {
+                            entry.place = other;
+                            return refuse(Error::NotSuspended);
+                        }
+                    };
                 match self.host.resume(snapshot, Resume::Lazy, true, false) {
                     Ok(cell) => {
                         let entry = self.entry(target)?;

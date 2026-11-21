@@ -31,7 +31,11 @@ fn run() -> Request {
     Request::Run(Run {
         image: b"cpython".to_vec(),
         files_from: b"cpython-files".to_vec(),
-        argv: vec![b"/usr/bin/python3".to_vec(), b"-c".to_vec(), b"print(1)".to_vec()],
+        argv: vec![
+            b"/usr/bin/python3".to_vec(),
+            b"-c".to_vec(),
+            b"print(1)".to_vec(),
+        ],
         envp: vec![b"HOME=/".to_vec()],
         files: vec![(b"/branch".to_vec(), b"1".to_vec())],
     })
@@ -238,10 +242,7 @@ fn malformed_payloads_are_refused() {
         Request::decode(&frame(0x03, &[1, 0])),
         Err(Error::Malformed)
     );
-    assert_eq!(
-        Request::decode(&frame(0x02, &[0])),
-        Err(Error::Malformed)
-    );
+    assert_eq!(Request::decode(&frame(0x02, &[0])), Err(Error::Malformed));
     assert_eq!(Request::decode(&frame(0x7f, &[])), Err(Error::UnknownKind));
     assert_eq!(Message::decode(&frame(0x01, &[])), Err(Error::UnknownKind));
     let mut done = 0u64.to_le_bytes().to_vec();
@@ -256,10 +257,7 @@ fn malformed_payloads_are_refused() {
     let mut write = 1u32.to_le_bytes().to_vec();
     write.extend(1000u32.to_le_bytes());
     write.extend(b"short");
-    assert_eq!(
-        Request::decode(&frame(0x08, &write)),
-        Err(Error::Malformed)
-    );
+    assert_eq!(Request::decode(&frame(0x08, &write)), Err(Error::Malformed));
 }
 
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
@@ -289,8 +287,11 @@ fn request() -> impl Strategy<Value = Request> {
         (any::<u32>(), any::<u32>()).prop_map(|(cell, n)| Request::Fork { cell, n }),
         any::<u32>().prop_map(Request::Kill),
         any::<u32>().prop_map(Request::Output),
-        (any::<u32>(), bytes(), bytes())
-            .prop_map(|(cell, path, data)| Request::WriteFile { cell, path, data }),
+        (any::<u32>(), bytes(), bytes()).prop_map(|(cell, path, data)| Request::WriteFile {
+            cell,
+            path,
+            data
+        }),
         Just(Request::Stats),
         Just(Request::Shutdown),
     ]
@@ -345,7 +346,10 @@ fn message() -> impl Strategy<Value = Message> {
 
 /// Text as the kernel's console prints it: never the start byte.
 fn console_text() -> impl Strategy<Value = Vec<u8>> {
-    proptest::collection::vec(any::<u8>().prop_filter("not a frame start", |&b| b != 1), 0..16)
+    proptest::collection::vec(
+        any::<u8>().prop_filter("not a frame start", |&b| b != 1),
+        0..16,
+    )
 }
 
 proptest! {
