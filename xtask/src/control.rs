@@ -21,6 +21,39 @@ use std::time::{Duration, Instant};
 /// How long a control kernel may take to boot and say hello.
 pub const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The line the chat agent (`cells/python/agent_chat.py`, change
+/// `add-interactive-chat`) prints once it reads its input.
+pub const CHAT_READY: &str = "\x1eready";
+
+/// The line the chat agent prints after each answer: the time it waited
+/// for the model, and the whole turn in the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatTurn {
+    pub model_ns: u64,
+    pub agent_ns: u64,
+}
+
+impl ChatTurn {
+    /// The turn `line` (`\x1eturn model_ns=M agent_ns=A`) reports, if it is
+    /// one.
+    pub fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.strip_prefix("\x1eturn ")?.split(' ');
+        let mut field = |name: &str| {
+            fields
+                .next()?
+                .strip_prefix(name)?
+                .strip_prefix('=')?
+                .parse()
+                .ok()
+        };
+        let turn = ChatTurn {
+            model_ns: field("model_ns")?,
+            agent_ns: field("agent_ns")?,
+        };
+        fields.next().is_none().then_some(turn)
+    }
+}
+
 /// What the VM sent.
 #[derive(Debug)]
 pub enum Event {

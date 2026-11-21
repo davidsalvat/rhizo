@@ -119,6 +119,65 @@ impl Tables {
         Ok((read, write))
     }
 
+    /// Gives the cell standard input from the host (design D1 of
+    /// `add-interactive-chat`): descriptor 0 becomes the read end of a new
+    /// pipe whose one write end the host holds, outside the descriptors
+    /// ([`push_input`](Self::push_input), [`close_input`](Self::close_input)).
+    /// What descriptor 0 was is closed. `Exists` if the host has one already.
+    pub fn host_input(&mut self) -> Result<()> {
+        if self.input.is_some() {
+            return Err(Error::Exists);
+        }
+        if self.fds.first().copied().flatten().is_some() {
+            self.close(0)?;
+        }
+        let pipe = self.alloc_object(Object::Pipe {
+            data: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        });
+        let desc = self.new_desc(Target::Pipe(pipe, false), Self::status(false, 0));
+        self.fds.resize(self.fds.len().max(1), None);
+        self.fds[0] = Some((desc, false));
+        self.input = Some(pipe);
+        Ok(())
+    }
+
+    /// Whether the host holds the write end of the cell's standard input.
+    pub fn has_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Writes `bytes` from the host into the cell's standard input, whole
+    /// or not at all: `BadFd` without host input (or once the host closed
+    /// it), `Pipe` once the cell closed every read end, `Again` when the
+    /// unread bytes leave less room than `bytes` ([`PIPE_CAP`] in all).
+    pub fn push_input(&mut self, bytes: &[u8]) -> Result<()> {
+        let i = self.input.ok_or(Error::BadFd)?;
+        let Object::Pipe { data, readers, .. } = self.object(i) else {
+            unreachable!("the host's input is a pipe")
+        };
+        if *readers == 0 {
+            return Err(Error::Pipe);
+        }
+        if PIPE_CAP - data.len() < bytes.len() {
+            return Err(Error::Again);
+        }
+        if let Object::Pipe { data, .. } = self.object_mut(i) {
+            data.extend(bytes);
+        }
+        Ok(())
+    }
+
+    /// Closes the host's end of the cell's standard input: once the unread
+    /// bytes are read, reads return 0 (end of file). `BadFd` without host
+    /// input.
+    pub fn close_input(&mut self) -> Result<()> {
+        let i = self.input.take().ok_or(Error::BadFd)?;
+        self.drop_end(Target::Pipe(i, true));
+        Ok(())
+    }
+
     /// `eventfd2`.
     pub fn eventfd(
         &mut self,

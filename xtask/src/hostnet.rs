@@ -215,6 +215,9 @@ fn model_answer(request: &[u8], served: u32) -> String {
         .fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
             (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
         });
+    if contains(&request[head..], b"\"run_python\"") {
+        return chat_answer(&request[head..], hash, served);
+    }
     let (n, seed, id) = (500 + hash % 500, (hash >> 20) % 1000, hash as u32);
     format!(
         "{{\"object\": \"chat.completion\", \"model\": \"rhizo-fake\", \"choices\": [{{\
@@ -224,6 +227,57 @@ fn model_answer(request: &[u8], served: u32) -> String {
          \"arguments\": \"{{\\\"n\\\": {n}, \\\"seed\\\": {seed}}}\"}}}}]}}}}], \
          \"x_requests_on_connection\": {served}}}"
     )
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The fake model as the chat agent sees it (`cells/python/agent_chat.py`,
+/// change `add-interactive-chat`): after a user's message, a call to its
+/// `run_python` tool with a snippet derived from the conversation's hash;
+/// after the tool's result, an answer quoting what the snippet printed.
+/// Only the last message's role and content are looked for, as Python's
+/// `json` writes them.
+fn chat_answer(body: &[u8], hash: u64, served: u32) -> String {
+    let text = String::from_utf8_lossy(body);
+    let last = text
+        .rfind(r#""role": ""#)
+        .map(|at| &text[at + r#""role": ""#.len()..]);
+    let message = match last {
+        Some(rest) if rest.starts_with(r#"tool""#) => {
+            // The tool's output, still escaped as a JSON string, which it
+            // stays inside the answer.
+            let printed = rest
+                .split_once(r#""content": ""#)
+                .map_or("", |(_, c)| json_string(c))
+                .trim_end_matches(r"\n");
+            format!(r#""content": "The snippet printed {printed}.""#)
+        }
+        _ => format!(
+            r#""content": null, "tool_calls": [{{"id": "call_{:08x}", "type": "function", "function": {{"name": "run_python", "arguments": "{{\"code\": \"print(sum(i * i for i in range({})))\"}}"}}}}]"#,
+            hash as u32,
+            100 + hash % 900
+        ),
+    };
+    format!(
+        r#"{{"object": "chat.completion", "model": "rhizo-fake", "choices": [{{"index": 0, "message": {{"role": "assistant", {message}}}}}], "x_requests_on_connection": {served}}}"#
+    )
+}
+
+/// The body of the JSON string literal `rest` starts inside, escapes kept:
+/// up to its closing quote.
+fn json_string(rest: &str) -> &str {
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return &rest[..i],
+            _ => {}
+        }
+    }
+    rest
 }
 
 fn echo(mut stream: TcpStream) {
@@ -359,6 +413,35 @@ mod tests {
         let mut rest = Vec::new();
         s.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "closed after `Connection: close`");
+    }
+
+    #[test]
+    fn the_chat_model_calls_the_snippet_tool_then_quotes_it() {
+        let port = llm_server("127.0.0.1", 0).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let tools = r#""tools": [{"function": {"name": "run_python"}}]"#;
+        let asked = format!(r#"{{"messages": [{{"role": "user", "content": "hi"}}], {tools}}}"#);
+        let a = chat(&mut s, &asked, false);
+        let call = &a["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "run_python");
+        let args: serde_json::Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        let code = args["code"].as_str().unwrap();
+        assert!(
+            code.starts_with("print(sum(i * i for i in range("),
+            "{code}"
+        );
+        let again = chat(&mut s, &asked, false);
+        assert_eq!(again["choices"], a["choices"], "deterministic");
+        let answered = format!(
+            r#"{{"messages": [{{"role": "user", "content": "hi"}}, {{"role": "tool", "tool_call_id": "c", "content": "a \"quoted\" 42\n"}}], {tools}}}"#
+        );
+        let b = chat(&mut s, &answered, true);
+        assert_eq!(
+            b["choices"][0]["message"]["content"],
+            r#"The snippet printed a "quoted" 42."#
+        );
+        assert!(b["choices"][0]["message"]["tool_calls"].is_null());
     }
 
     #[test]

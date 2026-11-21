@@ -310,6 +310,9 @@ pub struct Tables {
     /// Socket handles whose last description closed, for the kernel to
     /// release ([`Tables::take_released`]); empty between system calls.
     released: Vec<u32>,
+    /// The pipe whose write end the host holds, outside the descriptors:
+    /// standard input from the host ([`Tables::host_input`]).
+    input: Option<u32>,
 }
 
 impl Tables {
@@ -336,6 +339,7 @@ impl Tables {
             used: 0,
             objects: Vec::new(),
             released: Vec::new(),
+            input: None,
         }
     }
 
