@@ -16,6 +16,12 @@ Terms used throughout:
 - **Budget**: a cell's limits (the quotas of `add-cell-quotas`, plus a
   limit on descendants) minus what it uses itself and what it reserved for
   its children (D4).
+- **Public object**: an immutable object the host publishes, holding no
+  secret (executables and libraries of its file sets, read-only template
+  and index files, published templates). The only memory shared by
+  content across domains (D21).
+- **Copy generation**: a per-cell counter that changes in every copy of
+  the cell, so user space knows to reseed (D22).
 
 ## Decisions taken by the user
 
@@ -35,6 +41,16 @@ Production requirements added with them:
 - an audit log on the host, append-only (D18);
 - explicit limits and failure modes (D19);
 - an upgrade path for snapshot and protocol versions (D20).
+
+Later, the user approved these decisions from a review of the state of
+the art:
+
+| # | Decision | Where |
+|---|---|---|
+| S1 | Content sharing only inside a domain, with the domain in every content key; across domains only public objects, shared when loaded, never by scanning memory | D21 |
+| S2 | A copy generation per cell (`/run/rhizo/generation`), `MADV_WIPEONFORK` across every copy, a copy's `getpid` unlike its source's; shipped templates reseed; templates hold no secrets | D22 |
+| C2 | Accounting charged to the using cell only; CPU weights (exact between domains) and CPU caps per subtree | D23 |
+| A | Devices and their partitions are handles with budgets and exposure checks; their architecture is `add-accelerators` | D24 |
 
 Module signing keys are in `add-cell-modules`.
 
@@ -163,9 +179,10 @@ handle derived from one of those. The kernel then checks:
 subtree, policy and reservation. If a cell (not the host) asked for it, the
 reservation leaves the old parent's budget for good: the parent's limits
 shrink by that amount, so the total reserved at the root level is
-unchanged and promotion creates no resources. The new domain still shares
-frames it mapped before the move with its old domain. This is a residual
-timing coupling (D12), and it is documented.
+unchanged and promotion creates no resources. Before the move, the cell
+takes private copies of the pages it shares with its old domain, public
+objects' pages excepted, so the two domains share no private frame (D21).
+The promotion is refused with `ENOMEM` if its budget cannot hold them.
 
 Alternative: the child requests and the parent approves. Rejected: the
 parent can already do it directly, and a second protocol adds code and a
@@ -256,6 +273,9 @@ cells stay charged to their reservations.
 Alternative: charge each child to every ancestor at allocation time,
 without reservations (cgroup v2's model). Rejected: one sibling's use then
 decides another's failures, which is a storage channel.
+
+What accounting costs, and how CPUs are shared between subtrees while
+they run (weights and caps), are in D23. Device budgets are in D24.
 
 ## D5. Loopback networks
 
@@ -509,6 +529,7 @@ Kernel objects and their rights:
 | View (phase 3) | read, write |
 | Kernel endpoint (phase 4, D10) | spawn, channel, derive, revoke, narrow |
 | Template (as a cell handle) | control (make copies of it), observe |
+| Device or partition (D24) | use, derive, observe |
 
 **The grant table.** Every handle is a grant entry in `rhizo-cap`:
 `{object, rights, holder, grantor, parent grant}`. The entries form a
@@ -717,10 +738,10 @@ not collude belong in two domains.
 | 6 | Frame allocator, free memory | `sysinfo` reports global free memory; `ENOMEM` on global exhaustion | High bandwidth: allocate and free versus read `sysinfo` | Allocation time | **Eliminate**: `sysinfo` reports the cell's own limit and what is left; reserved roots never fail because of others (D4), phase 1. Unlimited roots: accepted and documented |
 | 7 | Kernel heap | Cell records, file data and queues taken from one heap; `can_store` checks global free memory | `ENOSPC` and `ENOMEM` | Fragmentation | **Eliminate** storage by charging every kernel allocation to the cell (D4), phase 1; timing accepted |
 | 8 | File data | Bounded per cell (`DATA_MAX`), outside the memory quota | `ENOSPC` when the kernel runs low | — | **Eliminate**: charged to memory (D4), phase 1 |
-| 9 | Page cache of file pages (`add-dynamic-linking` D1) | Shared by block identity among cells whose blocks share an origin (the host's file sets, forks), 65,536 pages; a page past the limit **empties the whole cache** | — | Map latency shows hit or miss, and any cell can flush everyone's cache by mapping 65,536 pages: a classic dedup and eviction channel | **Partition**: key (domain, block), limit and eviction per domain, charged to the domain root (D4), phase 1. Cost: a library mapped in two domains takes two copies; within a domain nothing changes |
+| 9 | Page cache of file pages (`add-dynamic-linking` D1) | Shared by block identity among cells whose blocks share an origin (the host's file sets, forks), 65,536 pages; a page past the limit **empties the whole cache** | — | Map latency shows hit or miss, and any cell can flush everyone's cache by mapping 65,536 pages: a classic dedup and eviction channel | **Partition**: key (domain, block), limit and eviction per domain, charged to the domain root (D4), phase 1. Public objects' pages (key with scope 0) are shared across domains, loaded at publication and never evicted, so they always hit (D21). Cost: a private file mapped in two domains takes two copies; within a domain nothing changes |
 | 10 | File blocks shared by `Arc` | A write copies a shared block and writes in place when sole owner | — | When one sharer drops a block, another's write becomes faster | Across domains, the only shared blocks come from the host's file sets, which the kernel holds, so a block is never sole-owned: **no channel**. Within a domain: accepted |
 | 11 | Image cache (4 images, LRU) | Spawns from executables the kernel holds | — | Spawn latency shows hit or miss, and a spawner can evict | Only the host spawns from images. Cells create children only by fork, by template copy, or from their own files (phase 4), which never touch this cache: **no cell-driven state** |
-| 12 | Template and snapshot frames (`add-shared-snapshots`) | Copies share frames copy-on-write; a sole owner's write takes the frame without copying | — | Dropping a template, or the exit of the other sharers, changes a cell's write cost | **Eliminate**: a template whose copies live in more than one domain keeps its references after `kill` until its last copy ends (a dropped template whose memory is held until then), so no cell is ever the sole owner of a cross-domain frame, phase 1 |
+| 12 | Template and snapshot frames (`add-shared-snapshots`) | Copies share frames copy-on-write; a sole owner's write takes the frame without copying | — | Dropping a template, or the exit of the other sharers, changes a cell's write cost | **Eliminate**: only a published template (a public object, D21, D22) has copies in more than one domain, and it keeps its references after `kill` until its last copy ends (a dropped template whose memory is held until then), so no cell is ever the sole owner of a cross-domain frame, phase 1 |
 | 13 | Frames shared by host forks | Siblings in one domain | — | Same as 12 | Within a domain: accepted |
 | 14 | Free 2 MiB blocks | Large-page versus small-page fallback | — | TLB and fault cost | **Accept**, documented |
 | 15 | CPUs and scheduler | Per-CPU run queues, stealing | — | **High.** Contention and wake latency; the literature reports hundreds to thousands of bits per second for contention channels | **Accept, measure** (`covert.cpu_bps`, informational) and document by default. **Exclusive CPU sets per domain** (D17), a supported production option, take the scheduler and core-private caches out of the channel. Fixed time partitions per domain (as seL4's domain scheduler) are not designed |
@@ -738,7 +759,7 @@ not collude belong in two domains.
 | 27 | Socket wait queues, the change counter | Per socket; the counter is never shown to cells | — | — | No channel |
 | 28 | Kernel locks (`frames`, `refs`, `sharing`, `net`, `sched`) | Shared | — | Lock wait time | **Accept**, documented |
 | 29 | Kernel cell table | Global capacity | Refusal when full | — | **Partition**: descendant budgets admitted against it (D4), phases 1 and 4 |
-| 30 | Random generators | One per cell, fast key erasure | — | — | No channel |
+| 30 | Random generators | One per cell, fast key erasure; generators in user space are copied with memory | — | — | No channel. Copies learn they must reseed from their copy generation, which only their own copies change (D22) |
 | 31 | Parked socket keys | Derived from a kernel secret | — | — | Unguessable (finding S15) |
 | 32 | Handle grant table (phase 2) | Global table | Indices are private per cell; a cell never sees grant numbers | — | No channel. Per-cell bound and charge (D9) |
 | 33 | Channel queues | Room reserved at creation | Full is decided only by the two ends | — | Authorized flow only |
@@ -749,6 +770,8 @@ not collude belong in two domains.
 | 38 | **File names** | `rhizo-fs` keeps one tree per cell: names, inode numbers, directories, sizes and times are per cell, and blocks are shared only immutably | None: `rename` changes only the caller's own tree, and no other cell can list it | — | **Confirmed: there is no shared namespace through which renaming files could signal.** Live views (D11) share a namespace on purpose, and only by grant inside the ceilings |
 | 39 | `/run/rhizo/` | Per cell, read-only, built by the kernel | — | — | No channel (D9) |
 | 40 | Snapshots on disk (save/load) | The host chooses what to load | Host mediated | — | Loaded snapshots carry no authority (D13) |
+| 41 | Devices and accelerators (`add-accelerators`) | None yet | Device memory and queues | Device caches and contention | Handles with budgets (D24): a partition the hardware does not isolate is never shared across domains, and device caches keyed by content carry the domain (D21) |
+| 42 | CPU weights and caps (D23) | Round robin per cell | — | A domain's share depends on others' load | Same as 15: **accept**; caps bound how much a domain can take |
 
 **What remains is timing.** Items 14 to 17, 25 and 28 cannot be closed on
 shared hardware. Phase 1 measures one of them end to end: a sender in one
@@ -764,7 +787,12 @@ handles or quota by it.
 **Fork by the host or an ancestor.**
 
 - Placement: each copy is a sibling of its source, under the same parent
-  or wherever the host names. All copies are made or none.
+  or wherever the host names. All copies are made or none. Copies placed
+  in another domain share no private frame with the source: they are full
+  copies, unless the source is a published template (D21).
+- Every copy gets a new copy generation, its `MADV_WIPEONFORK` ranges
+  read as zero, and its `getpid` differs from the source's (D22).
+- Device handles are not inherited (D24).
 - Budget: the source's limits are carved again for each copy from that
   parent's budget.
 - Copied unchanged: egress policy, ceiling and `on_parent_end`.
@@ -788,8 +816,9 @@ together with a channel if asked.
 **Snapshots.**
 
 - Format version 11 (phase 1) adds the tree section: limits and budget
-  mode, `on_parent_end`, egress policy and ceiling, CPU set, identifier in
-  the domain and label.
+  mode, CPU weight and cap (D23), `on_parent_end`, egress policy and
+  ceiling, CPU set, identifier in the domain, label, copy generation,
+  `MADV_WIPEONFORK` ranges and the sticky bit of D22.
 - Version 12 (phase 2) adds handle records: kind, rights, label, a key
   derived from the kernel's secret (as parked sockets have, finding S15)
   and the boot identity. It also adds the messages queued on the cell's
@@ -842,7 +871,8 @@ Changes to existing requests:
   - `limits` and the reservation mode;
   - `egress` and `ceiling`;
   - `on_parent_end`;
-  - `cpus` (an exclusive CPU set, roots only, D17).
+  - `cpus` (an exclusive CPU set, roots only, D17);
+  - `cpu_weight` and `cpu_max` (D23).
 - `list` rows gain the parent, the domain root and the label.
 
 New requests:
@@ -856,7 +886,11 @@ New requests:
 - `revoke {grant}`;
 - `grants {cell}`;
 - `scoped {root, request}`;
-- `floor {rules}`: the deny floor, sent once after the hello (D7).
+- `floor {rules}`: the deny floor, sent once after the hello (D7);
+- `publish {template, attest}` and `withdraw {template}`: make a template
+  a public object, or end that, so that later copies in other domains are
+  full copies (D21, D22). The host's file sets, and the templates `rhizo
+  up` makes from them, are published at start.
 
 `kill`, `suspend` and `resume` gain a `tree` flag for subtree operations.
 New message kinds from the kernel: `audit` (D18) and `approval`
@@ -932,15 +966,18 @@ that does not exist.
 | Path | Phase 1 cost | Watched by |
 |---|---|---|
 | System call entry and exit | None (nothing on the common path reads the tree) | `cell.syscall_ns`, `_insns` |
-| Switch between cells | None | `cell.switch_ns` |
-| Fork, template copy | Budget arithmetic and a push to the parent's children list | `cell.fork_us`, `cell.spawn_from_template_us`, `control.fork_us` |
+| Switch between cells | None with one runnable domain per CPU; otherwise a pick among domains by virtual time (D23), measured and justified | `cell.switch_ns`, new `sched.domain_share_pct` |
+| End of a slice | Ticks charged to the cell, and to its capped ancestors only (none without caps, D23) | `cell.switch_ns` |
+| Fork, template copy | Budget arithmetic, a push to the parent's children list, the copy generation incremented and `MADV_WIPEONFORK` ranges left unmapped in the copy (D22) | `cell.fork_us`, `cell.spawn_from_template_us`, `control.fork_us` |
+| Move across domains | A private copy of each shared, non-public page (D21); rare | Tests only |
 | Loopback | One network comparison per socket looked at; the two-cell figures become two threads of one cell (D5), a redefinition justified in the pull request | `cell.loopback_rtt_us`, `cell.tcp_resume_us` |
 | Audit records | One record copied into a per-kernel ring for each tree change and denial (none on system calls that change nothing) | `cell.fork_us`, `cell.grant_us` |
 | Outside connect, UDP send | Rule scan | `net.tcp_rtt_us`, new `net.egress_check_insns` |
-| File-page fault | One more word in the page-cache key | `workload.dynamic_*`, `workload.node_*` |
+| File-page fault | One more word in the page-cache key (the domain, or 0 for a public page, D21) | `workload.dynamic_*`, `workload.node_*` |
 | File writes | A meter charge per new block | `cell.file_write_read_us`, `cell.fork_with_files_us` |
-| Idle memory | At most 48 bytes per cell | `cell.idle_bytes`: grows, justified in the pull request |
-| Snapshot size | Tree section, about 60 bytes | `cell.suspended_bytes`: grows, justified |
+| Idle memory | At most 48 bytes per cell for the node, plus 16 for the copy generation, CPU weight and cap | `cell.idle_bytes`: grows, justified in the pull request |
+| Published file sets | A frame per page of their mapped files while published (D21) | No cell metric; the `publish` reply reports the frames |
+| Snapshot size | Tree section, about 90 bytes, plus 16 per `MADV_WIPEONFORK` range | `cell.suspended_bytes`: grows, justified |
 
 Phases 2 to 4 add paths of their own (channels, views, cells creating
 cells) with their own metrics. They change none of the paths above.
@@ -1098,6 +1135,8 @@ the tree as it was.
 | Deny-floor rules | 64 | Refused by `rhizo up` |
 | Label | 64 bytes, `[A-Za-z0-9._-]` | `EINVAL` |
 | Pending module approvals per cell | 1 (`add-cell-modules`) | `EBUSY` |
+| `MADV_WIPEONFORK` ranges per cell | 64 (D22) | `ENOMEM`, as Linux when a mapping cannot be split |
+| CPU weight; CPU cap | 1 to 10,000; at most the parent's (D23) | `EINVAL`; `EACCES` for a cap above the parent's |
 | Audit ring | 64 KiB | Records dropped and counted, never blocking |
 
 The values are constants in `rhizo-cap`, checked against one another at
@@ -1191,3 +1230,383 @@ Every version bump from now on adds:
 - a test that loads the old file in the new kernel.
 
 The tasks of each phase carry these.
+
+## D21. Content sharing stays inside a domain
+
+D21 to D24 come from a review of the state of the art that the user
+approved.
+
+**The rule.** A frame is shared by content (the same bytes, reached from
+two places, mapped from one frame) only between cells of one domain. The
+domain's identifier is part of every content key, as vLLM's `cache_salt`
+is part of its prefix-cache key. This covers:
+
+- the page cache of mapped file pages, executables and interpreters
+  included;
+- the frames a suspended cell's snapshot refers to instead of copying
+  (`add-shared-snapshots`);
+- any later cache keyed by content: a KV or prompt cache of an inference
+  service, or a device's cache (`add-accelerators`).
+
+Across domains, only **public objects** are shared: immutable, holding no
+secret, and published by the host. They are:
+
+- the executables and libraries of the host's file sets;
+- read-only template files and read-only index files;
+- published templates (D22), signed module templates among them
+  (`add-cell-modules`).
+
+They are shared only when they are loaded, by their identity. **Nothing
+is ever shared by scanning memory** for equal pages (no merging like
+Linux's KSM), inside a domain or across domains.
+
+**Why.** Each of these attacks used content sharing across a trust
+boundary:
+
+- KSM page merging combined with Rowhammer gave Flip Feng Shui (USENIX
+  Security 2016, https://vusec.net/projects/flip-feng-shui): the
+  attacker writes a page equal to the victim's, the merge puts the
+  victim's data in a frame the attacker chose, and a bit flipped there
+  changes the victim.
+- Deduplication timing breaks ASLR in neighbouring VMs
+  (https://www.nebelwelt.net/files/15WOOT.pdf): a write to a merged page
+  is slower, which tells whether a guessed page exists elsewhere.
+- Prompt-cache timing leaked prompts between users at 8 of 17 API
+  providers (ICML 2025, https://arxiv.org/abs/2502.07776). OpenAI and
+  Anthropic now isolate their caches per organization.
+
+The domain is the unit the host isolates (D12), so it is the unit of
+sharing. Public objects are the same for everyone and hold no secret:
+sharing them tells a cell only which public object it uses, and an
+attacker cannot choose what lands in a public frame.
+
+**Residency tells nothing either.** A hit or a miss on a public page
+would still say whether another domain mapped it first. So the kernel
+loads every page of a public object's mapped files when the host
+publishes it, and keeps them until the host withdraws it and no mapping
+is left. A cell's map of a public page always hits, and no cell can
+evict one. A public frame is never sole-owned by a cell, since the
+publication holds a reference (item 12 of D12).
+
+**Moves across domains.** A cell that leaves its domain (promotion, or a
+move by the host) first takes private copies of the pages it shares with
+its old domain, public pages excepted. The move is refused with `ENOMEM`
+if its budget cannot hold them. A host fork whose copies go into another
+domain makes full copies, unless the source is a published template.
+This replaces the residual coupling that D2 used to accept.
+
+**What the implementation will change** (nothing is done here). Today
+`rhizo-abi`'s `PageCache` keys pages by `Page::key()`, the address of
+the file block's shared allocation and the length, in one cache for the
+whole kernel (`PAGES` in `kernel/src/cell.rs`). Copy-on-write frames
+(`rhizo-mm`'s `cow`) and the frames a snapshot refers to
+(`rhizo-snapshot`'s `Data::Frame`) are shared by lineage: fork, template
+copy, suspend. No code merges frames by comparing contents. The changes:
+
+- `rhizo-fs`: `Page::key()` stays the block's identity. A file gets a
+  `public` flag, set on every file of a published set or template and
+  cleared by any write or truncation (a write already gives the file a
+  new block); `Page` carries it.
+- `rhizo-abi` (`pages.rs`): `PageCache` keys pages by
+  `(scope, block, length)`, where `scope` is the caller's domain
+  identifier, or 0 for a public page; `share` takes the scope. The limit
+  and the search for dead pages are counted per scope, and a domain's
+  pages are charged to its root (D4). A new `publish` call fills and
+  pins a public object's pages; they are never filled on demand.
+- `kernel/src/cell.rs`: the calls into `PAGES` pass the cell's domain
+  identifier, a 64-bit number held in its tree node and never reused
+  within a boot.
+- `rhizo-mm` (`cow`): fork and write resolution do not change: they share
+  by lineage only. For a move across domains, the kernel walks the
+  cell's tables and resolves every shared page that is not public as a
+  write would, without writing.
+- `rhizo-snapshot`: a frame record may refer only to a frame of the
+  cell's own domain or of a public object. Moving a suspended cell across
+  domains turns its other frame records into private frames, as `export`
+  writes contents in their place. Delta records of module files ("same as
+  base page N", `add-cell-modules`) are honoured only against a public
+  base.
+
+**Cost.**
+
+- **Memory.** Sharing of private data across domains is lost: two
+  domains that map the same private file each keep a copy, a host fork
+  into another domain copies, and a cell that leaves its domain copies
+  what it shared. Libraries, executables and published templates stay
+  shared, so a library mapped in two domains still takes one copy (item
+  9 of D12 had accepted two).
+- **Published sets keep a frame for every page of their mapped files**
+  (their ELF files, and the files the host marks as mapped) while
+  published, not only for the pages someone touched. Their bytes are
+  already in memory as file blocks; the frames are the second copy that
+  mapping needs. They are charged to the kernel's reserve and admitted
+  like a reserved root.
+- **Time.** One more word in the page-cache key (`workload.dynamic_*`,
+  `workload.node_*`), and a copy proportional to the shared pages on the
+  rare moves across domains.
+
+Alternatives:
+
+- Share by content everywhere and add noise to the timing. Rejected:
+  noise lowers a channel's bandwidth without closing it, and does nothing
+  against Rowhammer.
+- No sharing across domains at all. Rejected: every domain would hold its
+  own CPython and libc, and density is the project's point.
+
+## D22. Randomness after fork, resume and template spawn
+
+The kernel already gives each cell its own generator, split off the
+kernel's on first use and never copied (D2 of `add-crypto-random`), so a
+copy's `getrandom` never repeats its source's. But generators in user
+space live in the cell's memory, and a fork, a template copy or a second
+load of one snapshot copies them:
+
+- CPython's `random` module, seeded once at import, and its string hash
+  seed;
+- Node.js's `Math.random` (V8 seeds it once per isolate) and the OpenSSL
+  generator behind `crypto`;
+- glibc's stack-protector value and pointer guard, taken from
+  `AT_RANDOM` at start, and the address layout.
+
+Two copies of one template then draw the same `random.random()`
+sequence. Firecracker's guidance says the same of VM clones
+(https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/random-for-clones.md):
+the guest kernel reseeds through VMGenID, and user space has to be told.
+Linux tells it in two ways: pages marked `MADV_WIPEONFORK` read as zero
+in a child (BoringSSL relies on this), and `vgetrandom` in the vDSO
+checks a generation counter the kernel bumps when the VM is cloned.
+
+**A copy generation per cell.** Each cell has a 64-bit counter, 0 at
+spawn, incremented in each new copy: every copy of a host fork or of a
+template, every load of a snapshot file and every resume. The source of
+a fork keeps its value, as a parent does on Linux. Only these events
+write it, so it tells nothing of other cells. User space learns of a
+copy in three ways, one per kind of program:
+
+1. **`/run/rhizo/generation`**: a read-only file of 8 bytes (little
+   endian) in the cell's own tree, for interpreters and scripts. It is a
+   cell's VMGenID. Reading it is one system call, and runtimes check it
+   once per request, not per random number.
+2. **`MADV_WIPEONFORK`**, honoured as on Linux, with "fork" meaning any
+   copy above: in the copy, a wiped range maps nothing and reads as zero
+   on first touch. No copy is made, and cells that never ask pay nothing.
+   Unmodified libraries that use it (BoringSSL) reseed. `MADV_KEEPONFORK`
+   undoes it, and the ranges are cell state.
+3. **A copy's `getpid` differs from its source's**: numbering inside the
+   domain skips the source's identifier. OpenSSL 3 and CPython's
+   `tempfile` detect a fork by a change of `getpid`, so they reseed.
+
+No vDSO is added: cells have none, and a system call per request costs
+far less than an agent's turn.
+
+**What the shipped templates do.**
+
+- **CPython** (`cells/python/agent_demo.py`, `rhizo_demo.py`, the
+  `python-agent` template and module servers): after the warm-up pause
+  in which the host freezes them, they compare `/run/rhizo/generation`
+  with the value read during warm-up, and on a change call
+  `random.seed()`, which draws from the copy's own `getrandom`. The
+  string hash seed cannot change in a running interpreter, so every copy
+  of a template shares it. Each copy can read it in its own memory
+  anyway: this is documented, not fixed, and a server that hashes
+  untrusted keys from another domain starts from its own program rather
+  than from a template.
+- **Node.js** (`cells/node/demo.js`): V8 cannot reseed `Math.random`.
+  After a copy, the template replaces it with xorshift128+ (V8's own
+  algorithm) seeded from `crypto.getRandomValues`. `crypto` itself
+  reseeds through OpenSSL's `getpid` check (way 3).
+- **C programs**: glibc's `arc4random` calls `getrandom` and keeps no
+  state, so they need nothing. The stack-protector value, the pointer
+  guard and the address layout stay the template's, as for every fork
+  server (Android's zygote has the same weakness). `docs/security.md`
+  says so.
+
+**Templates hold no secrets.** A template's memory and files are copied
+into every child, and a published template's into other domains.
+CodeSandbox refuses memory snapshots of VMs that hold secrets for the
+same reason. Rules:
+
+- The host passes a secret (a model key, a token) to a copy after the
+  copy, through its input or a channel, never to a cell before it is
+  frozen. `rhizo` warns when a template is made of a cell that received
+  host input after its start.
+- The kernel keeps a sticky bit per cell, set when the cell connects
+  through the network card or receives a message, a handle or a view.
+  Publishing a template whose bit is set is refused, unless the host
+  attests that it holds no secret (signed modules, after the operator's
+  review). The attestation goes into the audit log (D18).
+- A builder's per-build token (`add-cell-modules`) is revoked by the
+  package proxy before the builder freezes itself, so its template holds
+  only a dead token.
+
+**Tests** (behavior, both architectures):
+
+- `copies_draw_different_random`: two copies of a CPython template frozen
+  after `import random` print `random.random()` and `os.urandom(16)`;
+  the copies print different values. The same for two loads of one
+  snapshot file, and for a Node.js template's `Math.random()` and
+  `crypto.randomUUID()`.
+- `wipeonfork_reads_zero_in_copies`: a C cell marks a page
+  `MADV_WIPEONFORK` and writes 1 in it; its fork, a copy of its template
+  and a resume of its snapshot read 0, and the source still reads 1.
+- `generation_changes_only_in_copies`: a fork leaves the source's
+  `/run/rhizo/generation` unchanged, and each copy reads another value.
+- `copy_pid_differs`: a copy's `getpid` is never its source's, in the
+  same domain or as a new root.
+- `tainted_template_not_published`: a template of a cell that connected
+  to the host's echo server is refused publication without attestation.
+
+**Cost.** 8 bytes per cell and in the snapshot's tree section; the wipe
+ranges in snapshots, like the write-or-execute ranges. Nothing on system
+calls, switches or forks of cells that never use `MADV_WIPEONFORK`.
+Templates pay one file read per request.
+
+Alternatives:
+
+- The kernel reseeds user-space generators by writing into them.
+  Rejected: it would have to know every runtime's memory layout.
+- A page holding the generation, mapped into every cell. Rejected: 4 KiB
+  per cell on `cell.idle_bytes` for what the file and `MADV_WIPEONFORK`
+  already give.
+
+## D23. Hierarchical CPU and memory quotas: accounting and fairness
+
+D4 gives every subtree reserved limits on memory, CPU time, sockets and
+descendants. This decision states what accounting them costs, and how
+CPUs are shared between subtrees while they run.
+
+**Accounting never walks the tree.** Because children are reserved, a
+use is charged only to the cell that makes it: one addition and one
+comparison in its meter. cgroup v2 charges every level of the hierarchy
+on every page; Rhizo pays that walk once, when a child is made or ends
+(D4).
+
+- Pages, page tables and file blocks: one charge per frame or block, at
+  allocation.
+- Socket queues and `smoltcp` buffers: charged at their full size when
+  the socket is made, never per packet.
+- CPU time: ticks charged to the cell at the end of each slice, as today.
+  A subtree's total is bounded by its carving, so no running sum is kept;
+  `rhizo ps --tree` adds a subtree's figures when asked.
+
+**CPU shares between domains.** Today each CPU's run queue is round robin
+over cells, so a domain with 100 runnable cells gets 100 times the CPU of
+a domain with one: a denial of service between domains. After this
+change:
+
+- Each node has a **CPU weight** (1 to 10,000, default 100). Domains
+  share the CPUs by their roots' weights; inside a domain, siblings share
+  their parent's part by theirs.
+- **Two levels exact, deeper levels flattened.** Each CPU's queue picks
+  the domain with the least virtual time (CPU time used divided by its
+  weight), then that domain's cell with the least virtual time scaled by
+  its flattened weight: the product of its shares at each level, computed
+  when the tree changes, never when a cell runs. When part of a domain is
+  idle, its share goes to the rest of the domain in proportion to their
+  flattened weights. Fairness between domains is exact; inside a deep
+  domain it is approximate.
+- **One domain costs nothing more.** When a CPU has one runnable domain,
+  the first level is skipped. `cell.switch_ns` stays gated, and the pull
+  request justifies the domain level with its measured cost.
+- Balancing between CPUs moves cells as today. Fairness holds per CPU and
+  over balancing periods, as with Linux's CFS.
+
+**CPU rate caps.** A node may have a **CPU cap** (`--cpu-max 1.5`: at
+most 150 ms of CPU per 100 ms period, for its whole subtree). A child's
+cap is at most its parent's, and caps only narrow, as egress does. A
+subtree that used its cap leaves the run queues until the next period.
+Each cell keeps the list of its capped ancestors, computed when the tree
+changes, so the end of a slice charges only those, and a tree without
+caps pays nothing.
+
+**Memory needs no fairness rule.** Memory is reserved, there is no swap
+and no reclaim between cells, and the kernel's caches take only memory no
+reservation holds (D4).
+
+**Not offered: a guaranteed CPU share.** Another domain's load changes
+how much CPU a cell gets at a given moment: that is the timing channel of
+item 15 of D12, accepted. A domain that needs CPUs no one else touches
+gets an exclusive CPU set (D17).
+
+**Tests.**
+
+- `cargo test -p rhizo-sched fair_shares`, with properties: with weights
+  `w_i` and every domain runnable, each domain's share over 1,000 slices
+  is within one slice of `w_i / sum(w)`; an idle domain's share goes to
+  the others; a capped subtree never exceeds its cap by more than one
+  slice per period.
+- In-kernel `domains_share_by_weight`: on one CPU, a domain of 16
+  spinning cells and a domain of one, with equal weights, each get half
+  the CPU within 5 % over 2 s.
+- In-kernel `cpu_cap_holds`: a subtree capped at 0.25 CPU gets at most
+  25 % plus one slice per period.
+
+**Benchmarks.** `sched.domain_share_pct` (the one-cell domain's share in
+the test above, reported), and no regression of `cell.switch_ns`,
+`cell.parallel_us` or `cell.scaling_pct` with one domain.
+
+**Snapshots and protocol.** Weight and cap are limits: they go into the
+tree section (format version 11) and into `run`, `load`, `limits` and
+template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
+
+Alternatives:
+
+- One scheduling entity per tree level, as Linux's group scheduling.
+  Rejected: its cost on every switch grows with the depth.
+- Fairness per cell, as today. Rejected: cells would buy CPU.
+
+## D24. Devices and accelerators as capabilities
+
+Rhizo must not be CPU-only. The architecture of accelerators (drivers,
+DMA isolation, device memory, scheduling of their work, their state in
+snapshots) is designed in a separate change, `add-accelerators`. This
+design only makes room for them in the capability model, so that a GPU,
+an NPU or another device is held like any other resource.
+
+**A device is a handle.** A device, or a partition of one (a slice the
+hardware isolates, a virtual function, a group of cores, a share of its
+time), is a kernel object that a cell reaches only through a handle:
+
+| Object | Rights |
+|---|---|
+| Device or partition | use (submit work, map its buffers), derive (split off a smaller partition), observe (its counters) |
+
+- The host registers devices and their partitions. `add-accelerators`
+  says which partitions the hardware isolates.
+- No cell holds a device by default (no ambient authority).
+- A device handle is derived into a smaller partition or fewer rights,
+  never more; it moves only over channels with the carry right; its
+  grantor can revoke it. A revoked handle refuses new work, and work in
+  flight ends as `add-accelerators` specifies.
+- A child gets a device handle only by derivation from its creator's
+  own, through a grant or a `spawn` request.
+
+**Budgets.** Device resources are limits, like memory and CPU time (D4):
+device memory in bytes, device time, and contexts or queues. A child's
+are carved from its parent's and come back when it ends, and a root's
+are admitted against what the device has. They are charged to the cell
+that asks, where `add-accelerators` allocates them.
+
+**Exposure ceilings.** A device is a path for information:
+
+- A partition used by several cells is a flow edge between them, both
+  ways (D8). A partition the hardware does not isolate is never shared
+  across domains: its memory, caches and timing would be a channel.
+- A device that reaches a network by itself (RDMA, a smart NIC) counts
+  as egress: the grant is refused unless that reach is within the
+  holder's ceiling.
+- A device must reach only its holder's memory (DMA behind an IOMMU, in
+  `add-accelerators`). The kernel refuses to grant one that cannot.
+- A device's caches keyed by content (a KV cache) follow D21: the domain
+  identifier is in the key.
+
+**Fork and snapshots.** A copy does not inherit device handles: its
+device state would need a copy the device may not support. A snapshot
+records a device handle by label, as D13 records other handles, and the
+host binds it again at load. Capturing and restoring device state is
+`add-accelerators`' part, under rule 6.
+
+**Phase.** The handle kind, its rights, its budgets and the exposure
+check come with phase 2 (handles), as plain data in `rhizo-cap`, tested
+on the host with a fake device. Real devices come with
+`add-accelerators`.

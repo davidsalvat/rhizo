@@ -49,7 +49,20 @@ containment, implemented in four phases (design D16). It holds no code.
   reserved in full from the parent's, so fork bombs are impossible. There
   are no pools, but a mode field leaves room for them. Reserved roots are
   admitted against what the kernel can give. File data and kernel records
-  are charged to memory.
+  are charged to memory, only to the cell that takes it (no walk up the
+  tree).
+- **CPU weights and caps per subtree** (D23): domains share CPUs by
+  weight, not by their number of cells; a cap bounds a subtree's CPU
+  rate.
+- **Content sharing bounded by the domain** (D21): the domain is part of
+  every content key (page cache, file pages, snapshot frames, any later
+  KV or prompt cache). Across domains only public objects the host
+  publishes are shared, loaded at publication, never found by scanning
+  memory. Cells leaving their domain copy what they shared.
+- **Copies told to reseed** (D22): a copy generation per cell in
+  `/run/rhizo/generation`, `MADV_WIPEONFORK` across every kind of copy, a
+  copy's `getpid` unlike its source's; the CPython and Node.js templates
+  reseed; templates must hold no secrets to be published.
 - **A loopback network per cell, never shared.** Siblings and copies talk
   only through channels. The two-cell loopback tests and benchmarks become
   two threads of one cell.
@@ -102,6 +115,11 @@ containment, implemented in four phases (design D16). It holds no code.
   cell's information could reach egress beyond its ceiling, so no
   proxying past a policy.
 - Snapshot format version 12 (handles) and subtree snapshots.
+- **Devices as handles** (D24): a device or a partition of it (GPU, NPU,
+  other accelerators) is a handle with rights (use, derive, observe),
+  budgets carved like memory, and the exposure check. Only the
+  capability model is here; the accelerator architecture is the separate
+  change `add-accelerators`.
 
 **Phase 3: shared file views.** Snapshot views (copy-on-write, read-only)
 and live views (volumes, read-only or read-write), granted by handle,
@@ -150,17 +168,35 @@ The production requirements that came with them are the audit log, the
 limits and failure modes, and the upgrade path. Module key management is
 in `add-cell-modules`.
 
+Later, the user approved four decisions from a review of the state of the
+art (design D21 to D24):
+
+- **S1. Content sharing bounded by trust domain.** Only inside a domain,
+  whose identifier is in every content key; across domains only
+  immutable public objects, shared when loaded, never by scanning memory.
+  Cost: cross-domain sharing of private data is lost; libraries stay
+  shared.
+- **S2. Randomness after fork, resume and template spawn.** A copy
+  generation per cell, `MADV_WIPEONFORK` and a distinct `getpid` in
+  copies; the shipped templates reseed; templates hold no secrets.
+- **C2. Hierarchical CPU and memory quotas.** Charged to the using cell
+  only; CPU weights between domains and caps per subtree.
+- **Accelerators.** Devices and their partitions are capabilities with
+  budgets and exposure checks; their architecture is `add-accelerators`.
+
 ## Capabilities
 
 ### New Capabilities
 
-- `cell-hierarchy`: the ownership tree, authority, budgets, handles,
-  channels, exposure ceilings and cells creating cells.
+- `cell-hierarchy`: the ownership tree, authority, budgets, CPU weights
+  and caps, handles (devices among them), channels, exposure ceilings,
+  public objects, copy generations and cells creating cells.
 
 ### Modified Capabilities
 
 - `isolation`: hierarchical quotas, everything charged, no storage channel
-  between domains, pinned cross-domain frames, file pages per domain.
+  between domains, frames shared across domains only from published
+  templates, file pages per domain except public ones.
 - `networking`: loopback per cell, egress policy, kernel-chosen card
   ports, sockets that stay with their cell, forks across networks.
 - `snapshots`: format versions 11 to 13, tree state, handles, loaded
@@ -169,8 +205,10 @@ in `add-cell-modules`.
   access.
 - `fork`: where copies go and what they hold.
 - `files`: views.
-- `linux-abi`: identifiers per domain, `sysinfo` per cell.
-- `benchmarks`: containment, channel, view and child-cell metrics.
+- `linux-abi`: identifiers per domain, `sysinfo` per cell,
+  `MADV_WIPEONFORK` and a copy's identifier.
+- `benchmarks`: containment, fairness, channel, view and child-cell
+  metrics.
 
 ## Impact
 
@@ -179,20 +217,26 @@ in `add-cell-modules`.
   is added to `xtask/src/deps.rs` and to the code map in `AGENTS.md`.
 - `crates/rhizo-net`: networks, policy checks, address translation.
 - `crates/rhizo-cell`: quota to budget.
-- `crates/rhizo-fs`: metering, `/run/rhizo`, mounts and volumes.
+- `crates/rhizo-fs`: metering, `/run/rhizo` (with `generation`), mounts
+  and volumes, the `public` flag of files.
 - `crates/rhizo-abi`: SEQPACKET endpoints, `SCM_RIGHTS`, `sysinfo`,
-  `getpid`.
+  `getpid`, `MADV_WIPEONFORK`, the page cache keyed by scope.
 - `crates/rhizo-snapshot`: versions 11 to 13, reading the previous
-  version, upgrade steps.
+  version, upgrade steps, frame records limited to the domain and public
+  objects.
 - `crates/rhizo-control`: version 4, the previous version on the host
-  side, `audit` frames.
-- `crates/rhizo-sched`: exclusive CPU sets.
+  side, `audit` frames, `publish`.
+- `crates/rhizo-sched`: exclusive CPU sets, CPU weights and caps.
 - `kernel/src/cell.rs`, `kernel/src/control.rs`, `kernel/src/tests.rs`,
   `cells/src/bin` (hostile colluders, the `loopback` cell's thread pair),
+  `cells/python`, `cells/node` (reseeding after a copy),
   `cli/` (audit log, `snapshot upgrade`, floor, `--cpus`),
   `xtask/src/bench.rs`,
   `docs/security.md`, `docs/audit-scope.md` (B2 changes, a new boundary
   for the kernel endpoint).
 - No new third-party dependency.
-- No cost on system calls, switches or copy-on-write. Small, measured
-  costs on fork, loopback, outside connects and file-page faults (D16).
+- No cost on system calls or copy-on-write, and none on switches with one
+  domain per CPU. Small, measured costs on fork, loopback, outside
+  connects, file-page faults and switches between domains (D16, D23).
+- Memory: private data is no longer shared across domains, and published
+  file sets keep a frame for every page of their mapped files (D21).

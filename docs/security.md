@@ -262,6 +262,16 @@ handed out.
   buffered bytes, its stack-protector value from `AT_RANDOM`) is copied
   like the rest of its memory: a program that forks itself into templates
   should draw fresh bytes after the fork, as on Linux.
+- **Planned: copies told to reseed** (`add-cell-hierarchy`, design D22).
+  Generators in user space (CPython's `random`, Node.js's `Math.random`,
+  OpenSSL's pool) are copied with memory, so two copies of one template
+  draw the same sequence today. The design gives each cell a copy
+  generation (`/run/rhizo/generation`), honours `MADV_WIPEONFORK` across
+  every kind of copy, gives a copy a `getpid` unlike its source's, makes
+  the shipped templates reseed, and refuses to publish a template that
+  may hold secrets. Copies of a template keep sharing its string hash
+  seed, stack-protector value, pointer guard and address layout, as any
+  fork server's children do.
 
 ## System calls
 
@@ -731,7 +741,7 @@ network segment, and are listed below.
 ## Cross-cell leaks
 
 Change `close-cross-cell-leaks`, from the covert-channel inventory of
-`add-cell-hierarchy` (design D12 there: 40 kernel resources more than one
+`add-cell-hierarchy` (design D12 there: 42 kernel resources more than one
 cell can touch). Goal 6 of the threat model: two hostile cells holding no
 handle to each other, one changing kernel state, the other reading it
 (storage channel) or timing it (timing channel). The hierarchy closes most
@@ -800,7 +810,7 @@ Open, for the phases of `add-cell-hierarchy` (its D12 numbers):
 | Item | What a cell can still observe |
 |---|---|
 | 1, 2, 3 Ports as one namespace | That a port is held by someone: `EADDRINUSE` on an explicit bind, or a skipped port in its own sequence when another cell holds the very port it would take next. Closed by loopback networks per tree and kernel-chosen card ports. |
-| 9 Deduplication | Whether a page of a file another cell also holds (a host file set, a fork's files) is in the cache: a hit costs less than a miss. A cell able to exhaust memory still drops the pages no cell maps right now. Closed by a cache per domain with reserved budgets. |
+| 9 Deduplication | Whether a page of a file another cell also holds (a host file set, a fork's files) is in the cache: a hit costs less than a miss. A cell able to exhaust memory still drops the pages no cell maps right now. Closed by a cache keyed by domain with reserved budgets; across domains only public objects are shared, loaded when published and never evicted, and nothing is merged by scanning memory (design D21 there). |
 | 19, 20 Identifiers | `getpid` and thread identifiers count the cells the host created (O6). Only the host creates cells, so no cell writes this counter. |
 | 5, 7, 8, 24, 29 Shared pools | `ENFILE`, `ENOMEM`, `ENOSPC` when the kernel's socket pool, memory or heap is exhausted by others. Closed by budgets per domain. |
 | 14 to 17, 25, 28 Timing | Contention for CPUs, caches, locks and the network card (O3). Accepted and measured (`covert.cpu_bps`) by the hierarchy. |

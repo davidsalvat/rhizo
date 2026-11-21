@@ -10,6 +10,7 @@ questions (proposal, "Decisions taken by the user").
 - [x] 0.2 The user's decisions recorded (operator approval for roots, Rhizo's own package proxy, static chat as default) with key management (D2, D4a, D5a, D6); verify with `openspec validate add-cell-modules --strict`
 
 - [x] 0.3 The default for module children (empty policy, no `spawn`, ask the agent) and opt-in delegation recorded (D3a); verify with `openspec validate add-cell-modules --strict`
+- [x] 0.4 The state-of-the-art review applied to modules: module templates as public objects, module children reseeding, the build token dead before the freeze, devices only by derivation (D1, D5, D5a, D7; H-D21, H-D22, H-D24); verify with `openspec validate add-cell-modules --strict`
 
 ## 1. Modules and requests
 
@@ -18,6 +19,7 @@ questions (proposal, "Decisions taken by the user").
 - [ ] 1.3 Approvals: the parent's `approvals` channel, host events, deadline, one pending request per cell, the operator always for roots, audit records (D2); verify the in-kernel `module_approvals` and `root_adds_need_the_operator` and the `control` test step (`rhizo approve`, `deny`)
 - [ ] 1.3a Module children: empty policy and no `spawn` by default; the `delegate` section of `add` with its entry, budget, egress, approver and depth checks, audit records and `rhizo ps --tree` (D3a); verify `cargo test -p rhizo-cap delegation` (property: a delegated policy never exceeds its delegator's), the in-kernel `module_child_asks_its_agent` and `delegated_grandchildren`, and the `control` test step (`ps --tree`)
 - [ ] 1.4 `exec` and `repl:python` interfaces, `rhizo_module.py` and `rhizo-mod` (D1); verify the in-kernel `numpy_as_a_capability` with CPython built
+- [ ] 1.4a Module servers reseed after the copy, and loaded modules are published (D1, H-D21, H-D22); verify the in-kernel `module_children_reseed` (two agents in two domains add `python`; their `random.random()` answers differ) with CPython built
 - [ ] 1.5 File-only modules as snapshot views (D1); verify the in-kernel `file_only_module`
 - [ ] 1.6 Snapshot format version 14: module policy, with its upgrade step from 13 and a recorded version-13 file (D7, H-D20); verify `cargo test -p rhizo-snapshot module_policy` and `version_13_file_upgrades`
 - [ ] 1.7 Hostile tests: `requests_grants_no_internet`, `module_refusals`, `child_policy_is_a_subset`, `module_requests_fuzzed` (hostile frames on the endpoint); verify on both architectures
@@ -31,7 +33,7 @@ questions (proposal, "Decisions taken by the user").
 
 ## 3. Builder
 
-- [ ] 3.0 `rhizo proxy`: lockfile allowlist, upstream over verified TLS, hash check before serving, per-build tokens, limits, listening only where the guest reaches the host, JSON-lines log and build summary in the audit log, `--offline` from the cache; justify `ureq`, `rustls` and `sha2` in `deny.toml` (D5a); verify `cargo test -p rhizo-cli proxy` against a fake upstream (off-list project and version, wrong hash, foreign redirect, missing token, oversized file)
+- [ ] 3.0 `rhizo proxy`: lockfile allowlist, upstream over verified TLS, hash check before serving, per-build tokens, limits, listening only where the guest reaches the host, JSON-lines log and build summary in the audit log, `--offline` from the cache; justify `ureq`, `rustls` and `sha2` in `deny.toml` (D5a); verify `cargo test -p rhizo-cli proxy` against a fake upstream (off-list project and version, wrong hash, foreign redirect, missing token, token after the install ended, oversized file)
 - [ ] 3.1 Builder template, `index` egress rule set (the proxy, carved out of the floor for builders only), lockfile install with hashes, tree digest, freeze (D5); verify the `control` step `builder_is_confined`, `builder_refuses_a_bad_hash` and `agents_cannot_reach_the_proxy`
 - [ ] 3.2 `rhizo module build --twice`, `review`, `approve` (signing through minisign), `request`; verify the `control` test step (lockfile to signed catalogue file, digests equal)
 - [ ] 3.3 Private `pip install` in an agent; verify the in-kernel `pip_inside_an_agent_stays_private`

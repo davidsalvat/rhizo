@@ -91,6 +91,25 @@ from its parent's budget when it is created, and come back when it ends.
   what it can really give, so one domain's use never shows in another's
   errors.
 - File data and kernel records now count against the memory limit too.
+- **Accounting is cheap.** A use is charged only to the cell that makes
+  it, one addition in its meter. Unlike cgroup v2, nothing walks up the
+  tree per page: the walk happens once, when a child is carved out.
+
+## CPU shares and caps
+
+- **Domains share CPUs by weight, not by number of cells.** Each cell has
+  a CPU weight (default 100). A domain of 16 busy cells and a domain of
+  one busy cell, with equal weights, get half the CPU each. Inside a
+  domain, weights are flattened along the tree; an idle part's share goes
+  to the busy ones.
+- **A CPU cap** (`--cpu-max 1.5`) bounds a whole subtree's rate. A child's
+  cap is at most its parent's.
+- **Cost:** none with one domain per CPU; a pick among domains otherwise,
+  measured (`cell.switch_ns`, `sched.domain_share_pct`). A tree without
+  caps pays nothing for them.
+- **Not a guarantee.** How much CPU a domain gets right now still depends
+  on the others' load (a timing channel). For CPUs nobody else touches,
+  use an exclusive CPU set.
 
 ## Networks and egress
 
@@ -158,6 +177,24 @@ agent unless its parent deliberately raises its ceiling. This is the
 "talk to each other to reach the internet" case, closed by the kernel
 rather than by advice.
 
+## Devices and accelerators
+
+Rhizo is not CPU-only. A GPU, an NPU or another device, or a partition of
+one, is a handle like any other:
+
+- rights `use`, `derive` (split off a smaller partition) and `observe`;
+- no cell holds one unless it was granted;
+- device memory, device time and queues are budgets carved from the
+  parent, like memory;
+- the exposure check applies: a partition the hardware does not isolate
+  stays in one domain, and a device that reaches a network by itself
+  counts as egress;
+- copies do not inherit device handles.
+
+Only this capability model is part of the hierarchy. Drivers, DMA
+isolation and device state in snapshots are designed in the separate
+change `add-accelerators`.
+
 ## Shared files
 
 - A **snapshot view** gives another cell a read-only, copy-on-write copy
@@ -170,14 +207,55 @@ rather than by advice.
 **Renaming files cannot signal.** Each cell has its own file tree. There
 is no shared namespace except the views someone granted on purpose.
 
+## Sharing memory between domains
+
+Memory is shared by content (one frame for the same bytes) **only inside
+a domain**: the domain is part of every content key, as vLLM's
+`cache_salt` is part of its cache key. That covers the page cache, file
+pages, frames of snapshots, and any later KV or prompt cache.
+
+- **Across domains, only public objects** are shared: executables and
+  libraries the host publishes, read-only template and index files, and
+  published templates (signed modules among them). They are loaded when
+  published and never evicted, so a map of one always hits.
+- **Nothing is ever merged by scanning memory.**
+- **Why:** page merging plus Rowhammer gave Flip Feng Shui; deduplication
+  timing breaks ASLR between VMs; prompt-cache timing leaked prompts
+  between users at 8 of 17 API providers, and OpenAI and Anthropic now
+  isolate their caches per organization.
+- **Cost:** private data is no longer shared across domains (a promoted
+  cell or a fork into another domain copies what it shared). Libraries
+  stay shared, one copy for every domain.
+
+## Randomness in copies
+
+The kernel gives each copy its own `getrandom`. But generators in user
+space (Python's `random`, Node's `Math.random`, OpenSSL's pool) are
+memory, so a fork, a template copy or a second load of a snapshot copies
+them. Copies are told, in three ways:
+
+- `/run/rhizo/generation`, a counter that changes in every copy (the
+  cell's VMGenID);
+- `MADV_WIPEONFORK` pages read as zero in every kind of copy, as on Linux;
+- a copy's `getpid` differs from its source's, which OpenSSL checks.
+
+The shipped CPython and Node.js templates reseed when the counter
+changed: two children of one template draw different numbers.
+**Templates hold no secrets**: the host gives a secret to each copy after
+the copy, and the kernel refuses to publish a template of a cell that
+reached the network or received a message, unless the host attests it
+(audited). What copies still share with their template: Python's string
+hash seed, the stack-protector value and the address layout, as with any
+fork server.
+
 ## The covert-channel inventory
 
-The design lists 40 shared resources, each with what it can leak and what
+The design lists 42 shared resources, each with what it can leak and what
 is done about it. In short:
 
 | Closed (no longer shared, or partitioned) | Accepted and measured (timing) |
 |---|---|
-| Loopback network and ports, card ports, socket pool, free memory (`sysinfo`), kernel heap and file data, page cache (partitioned per domain), template frames (held while shared), cell identifiers, the cell table, error codes | CPU contention and scheduling, hardware caches and TLB, 2 MiB block availability, the card's queues and neighbour cache, kernel locks |
+| Loopback network and ports, card ports, socket pool, free memory (`sysinfo`), kernel heap and file data, page cache (partitioned per domain, public objects always resident), template frames (only published templates, held while shared), cell identifiers, the cell table, error codes, device partitions | CPU contention and scheduling (with weights and caps), hardware caches and TLB, 2 MiB block availability, the card's queues and neighbour cache, kernel locks |
 
 The phase 1 benchmarks measure a CPU-contention channel between two
 domains (`covert.cpu_bps`), and `docs/security.md` will publish the
@@ -292,6 +370,8 @@ agent ◄── /run/rhizo/chan/np ── child cell (copy of python+numpy templ
 
 - **Templates form a tree** (`python` → `python+numpy` → `+pandas`) that
   shares memory copy-on-write, in memory and on disk (delta files).
+  Loaded modules are public objects, shared by every domain, and each
+  module child reseeds after its copy.
 - **File-only modules** are read-only views.
 - **The agent adds modules itself**, within a whitelist and a budget set
   when it was created. Sensitive modules, and anything that would give
@@ -356,8 +436,8 @@ agent ◄── /run/rhizo/chan/np ── child cell (copy of python+numpy templ
 
 | Phase | What | Key tests | Key benchmarks |
 |---|---|---|---|
-| 1 | Tree, reserved budgets, private loopback, address translation on the card, egress with the floor, storage channels closed, scoped host access, CPU sets, audit log, limits, upgrades | Differential colluders in two domains, egress per level, fork bomb, forged snapshot authority | No regression on system calls, switches, forks, loopback, network; `net.egress_check_insns`, `covert.cpu_bps` |
-| 2 | Handles, channels, exposure ceilings, subtree snapshots | Forged handle numbers, rights cannot grow, sockets cannot be passed, proxy past the ceiling, revocation everywhere | `cell.channel_rtt_us` (not above loopback), `cell.handle_pass_us`, `cell.revoke_us`, `cell.grant_us` |
+| 1 | Tree, reserved budgets, CPU weights and caps, private loopback, address translation on the card, egress with the floor, storage channels closed, sharing bounded by the domain, copies told to reseed, scoped host access, CPU sets, audit log, limits, upgrades | Differential colluders in two domains, egress per level, fork bomb, forged snapshot authority, copies draw different random numbers, domains share by weight | No regression on system calls, switches, forks, loopback, network; `net.egress_check_insns`, `covert.cpu_bps`, `sched.domain_share_pct` |
+| 2 | Handles (devices among them), channels, exposure ceilings, subtree snapshots | Forged handle numbers, rights cannot grow, sockets cannot be passed, proxy past the ceiling, revocation everywhere | `cell.channel_rtt_us` (not above loopback), `cell.handle_pass_us`, `cell.revoke_us`, `cell.grant_us` |
 | 3 | Snapshot and live views | Renames do not signal, climbing out of a view, writing through read-only | `cell.view_grant_us`, `cell.view_read_us` |
 | 4 | Cells creating cells | Fork bomb from inside, a child cannot escape | `cell.child_spawn_us` |
 | Modules | Module policy, approvals, signed catalogue with key management, package proxy, builder, static chat | `requests` grants no internet, signatures, confined builder, private pip | `module.add_us`, `module.extra_bytes`, `chat.static_bytes` |
@@ -384,6 +464,21 @@ production, not just the proof of concept**:
 9. **What a module child gets:** an empty module policy and no `spawn`
    right; it asks its agent, which adds a sibling. Delegation of a
    subset of the agent's whitelist and budget is opt-in.
+
+From a later review of the state of the art:
+
+10. **Content sharing bounded by the domain:** only inside a domain;
+    across domains only public objects, loaded when published, never by
+    scanning memory. Private data is no longer shared across domains;
+    libraries stay shared.
+11. **Randomness after copies:** a copy generation, `MADV_WIPEONFORK` in
+    every copy, a distinct `getpid`; templates reseed and hold no
+    secrets.
+12. **CPU and memory quotas per tree:** charged to the using cell only;
+    CPU weights between domains and caps per subtree.
+13. **Accelerators:** devices and their partitions are capabilities with
+    budgets and exposure checks; their architecture is
+    `add-accelerators`.
 
 The production requirements that came with these decisions are:
 

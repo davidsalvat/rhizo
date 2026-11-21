@@ -68,6 +68,21 @@ with its base every page it did not write, copy-on-write
 from the deepest template that provides it. It does not get three
 children.
 
+**Module templates are public objects** (H-D21). A loaded module is
+published: immutable, holding no secret (D5), and the only kind of
+template whose frames copies in many domains share. Its mapped files'
+pages are loaded at publication, so adding a module in one domain never
+shows in another's page faults. Everything a module child writes is
+private to its domain.
+
+**A module child reseeds after the copy** (H-D22). Every add is a copy of
+a template, so the module's server (`rhizo_module.py`, `rhizo-mod`)
+reads `/run/rhizo/generation` before each request and, when it changed
+since the warm-up, reseeds what the interpreter keeps in memory
+(`random.seed()` for `repl:python`) before running anything. Two module
+children of one template never draw the same numbers. The string hash
+seed stays the template's (H-D22).
+
 **File-only modules** (pure Python packages, datasets, prompts, models'
 tokenizer files) are not cells. They are read-only snapshot views
 (H-D11), mounted at `/opt/modules/<name>` in the agent, or in its
@@ -370,7 +385,8 @@ repeating it. A page record "same as base page N" (a new record kind,
 snapshot format version 14) is honoured only when the base named by
 digest is loaded. The loaded sub-template then maps the base's frames
 copy-on-write: one copy of CPython for every Python module in memory and
-on disk. A file with such records loaded without its base is refused.
+on disk. A file with such records loaded without its base is refused,
+and the records are honoured only against a published base (H-D21).
 
 Module templates are held by the host's table and pinned. Copies in many
 domains therefore never become sole owners of a shared frame (H-D12,
@@ -488,6 +504,12 @@ a **builder cell**:
     and `AT_RANDOM` differ by design, spec `isolation`), so what is
     reproduced and attested is the file tree. The warm-up that produces
     the memory is a script named in the manifest and run from that tree.
+- **No secret in the template.** The build token is the only secret a
+  builder holds, and the proxy kills it when the install ends, before the
+  warm-up and the freeze, so the template holds only a dead token. The
+  builder connected through the network card, so its template can be
+  published only with an attestation (H-D22): signing after the
+  operator's review is that attestation, recorded in the audit log.
 - **Freeze, review, sign.** Once it has installed and warmed up, the
   builder freezes itself as a template (`rhizo freeze`) and the host saves
   it (`rhizo save`, which needs no egress). `rhizo module review` then
@@ -547,7 +569,8 @@ exactly the hashes it names, from exactly the configured index.
     and registers the build with a random token. The builder's index URL
     is `http://<proxy>/<token>/simple/`.
   - Requests without a live build's token get `403`.
-  - A build's token dies when the build ends.
+  - A build's token dies when the install ends (the builder says so, or
+    the host does at `freeze`), before the builder is frozen (D5).
 - **Limits.**
   - Files: at most 1 GiB each (configurable).
   - Connections: at most 8 at once per build.
@@ -649,6 +672,12 @@ the same way already.
   and budget are the agent's.
 - A pending approval is not snapshotted. A suspended agent's pending
   request is refused, and the agent asks again after its resume.
+- **Devices.** A module that needs an accelerator names a device class
+  and its limits in its manifest. Its child gets a device handle only by
+  derivation from one the agent holds, within the agent's device budget
+  and its exposure ceiling (H-D24); an agent without one gets the module
+  without the device, or a refusal if the manifest requires it. The
+  device itself is `add-accelerators`' design.
 
 ## D8. Tests and benchmarks
 
@@ -657,6 +686,9 @@ authority:
 
 - **Add a module.** An agent adds `numpy`, sends a computation over the
   `repl:python` channel, and reads the answer.
+- **Module children reseed.** Two agents in two domains each add
+  `python` and evaluate `random.random()`; the answers differ. The
+  builder's token is refused by the proxy once the builder is frozen.
 - **Refusals.** A module not in the whitelist, one over the budget's
   children or memory, an unsigned module, and one whose request asks for
   egress beyond the agent's are each refused with their reason.
