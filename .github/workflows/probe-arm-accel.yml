@@ -1,0 +1,81 @@
+name: probe-arm-accel
+
+# Temporary (change add-aarch64-bench): which GitHub-hosted ARM runners can
+# accelerate an AArch64 guest. Removed before the change is merged.
+on:
+  push:
+    branches: [change/add-aarch64-bench]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Probe KVM
+        run: |
+          uname -a
+          lscpu | head -20 || true
+          ls -l /dev/kvm || true
+          sudo dmesg | grep -i -E 'kvm|hyp|el2' | head -20 || true
+          grep -o -w -E 'cpuid|asimd' /proc/cpuinfo | sort | uniq -c || true
+          echo "::notice title=probe-${{ matrix.os }}::$(uname -r); $(lscpu | grep -E 'Model name|Vendor' | tr -s ' ' | tr '\n' ';'); kvm: $(ls -l /dev/kvm 2>&1); dmesg: $(sudo dmesg | grep -i -E 'kvm' | head -3 | tr '\n' ';')"
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - name: Build the AArch64 kernel
+        run: |
+          path=$(cargo xtask --arch aarch64 build --release | tail -1)
+          cp "$path" kernel.img
+          ls -l kernel.img
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: kernel.img
+  macos:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+      - name: Probe Hypervisor.framework
+        run: |
+          sw_vers
+          sysctl machdep.cpu.brand_string hw.model kern.hv_support kern.hv_vmm_present || true
+          brew install qemu >/dev/null 2>&1 || true
+          qemu-system-aarch64 --version | head -1
+          set +e
+          out=$(timeout 60 qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu host -m 512M \
+            -nodefaults -no-user-config -display none -no-reboot -serial stdio \
+            -kernel kernel.img -append "console=serial exit=psci" 2>&1)
+          code=$?
+          echo "$out" | tail -20
+          echo "::notice title=probe-${{ matrix.os }}::$(sw_vers -productVersion); $(sysctl -n machdep.cpu.brand_string); hv_support=$(sysctl -n kern.hv_support 2>&1); vmm_present=$(sysctl -n kern.hv_vmm_present 2>&1); hvf exit=$code: $(echo "$out" | grep -E 'rhizo-ready|hvf|HV_|rror' | head -3 | tr '\n' ';')"
+  windows:
+    runs-on: windows-11-arm
+    timeout-minutes: 10
+    steps:
+      - name: Probe hypervisor
+        shell: pwsh
+        run: |
+          $p = Get-CimInstance Win32_Processor | Select-Object Name, VirtualizationFirmwareEnabled, VMMonitorModeExtensions
+          $c = Get-CimInstance Win32_ComputerSystem | Select-Object HypervisorPresent, Model
+          $p | Format-List; $c | Format-List
+          $h = (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue).State
+          $w = (Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction SilentlyContinue).State
+          echo "::notice title=probe-windows-11-arm::$($p.Name); VirtFirmware=$($p.VirtualizationFirmwareEnabled); VMMonitor=$($p.VMMonitorModeExtensions); HypervisorPresent=$($c.HypervisorPresent); Model=$($c.Model); Hyper-V=$h; WHP=$w"
