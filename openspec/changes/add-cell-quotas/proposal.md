@@ -15,12 +15,13 @@ host has no way to say how much one cell may use.
   `Quota::NONE` is today's behavior. It lives in the `Cell`, with the CPU
   time used so far, so forks, templates and snapshots carry it.
 - `Host::set_quota(id, quota)` sets a live cell's quotas.
-- Memory: every frame taken for the cell (pages, page tables, private
-  copies of shared pages, lazily restored pages, stack growth) is counted
-  through `quota::Metered`; past the quota the allocation fails as when
+- Memory: every frame taken for the cell (pages, page tables, lazily
+  restored pages, stack growth) is counted through `quota::Metered`
+  (private copies of shared pages replace a shared frame, net zero); past the quota the allocation fails as when
   memory runs out: `mmap` and `brk` answer `ENOMEM`, a fault that needs a
   frame kills the cell, as today when memory runs out.
-- CPU time: counted per slice, system calls included; a cell past its
+- CPU time: counted per slice while the cell has a CPU quota, system
+  calls included; a cell past its
   quota is ended (`Ending::OutOfCpu`, reported in its output) at the end
   of the slice that used it up.
 - Descriptors: past the quota, `EMFILE` (as past 1024 today; `dup2` to a

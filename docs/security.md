@@ -142,16 +142,17 @@ and at most 256 sockets (S21).
 
 - **Memory** (bytes of pages and page tables): every frame the kernel takes
   for the cell goes through `rhizo_cell::quota::Metered`: system calls,
-  copy-on-write copies, lazy pages, stack growth, holes and pages past the
-  end of mapped files (S20), spawn and resume. Past
+  lazy pages, stack growth, holes and pages past the end of mapped files
+  (S20), spawn and resume. Copy-on-write copies are not metered: each
+  replaces a shared frame the cell gives back, net zero. Past
   the quota, `mmap` and `brk` answer `ENOMEM`; a fault that needs a frame
   kills the cell, as when memory runs out. Frames given back are credited
   (never below zero), so a forked cell holds at most its quota plus what it
   inherited (counted to its parent). File data (`rhizo_fs::DATA_MAX`) and
   names (4096) keep their own bounds per cell, outside the memory quota: a
   cell may hold that much file data above its quota.
-- **CPU time**, over the cell's life and its system calls included:
-  counted per slice; past the quota the cell ends (`Ending::OutOfCpu`,
+- **CPU time**, its system calls included, counted per slice from when
+  the quota is set (a cell without one is not timed); past the quota the cell ends (`Ending::OutOfCpu`,
   `cell N killed: CPU time quota used up`) at the end of that slice, at
   most 10 ms and one call late.
 - **Descriptors** (at most 1024): `EMFILE` past the quota. **Sockets**:

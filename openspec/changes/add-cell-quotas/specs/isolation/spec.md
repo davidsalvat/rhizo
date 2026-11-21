@@ -17,8 +17,9 @@ cells or the kernel.
 - **THEN** the pages past the file's end count in its quota: it is refused with `-ENOMEM` having taken at most 8 MiB, and the other gets all it asked for
 
 ### Requirement: CPU time quota per cell
-The host SHALL be able to set how much CPU time a cell may use over its
-life, its system calls included. A cell past it SHALL be ended at the end
+The host SHALL be able to set how much CPU time a cell may use, its
+system calls included, counted from when the quota is set and across
+suspend and resume. A cell past it SHALL be ended at the end
 of the time slice that used it up, with a report in its output.
 
 #### Scenario: Spinning past its quota

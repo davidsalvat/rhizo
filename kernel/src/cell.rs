@@ -16,14 +16,13 @@ use crate::sync::Global;
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
-use core::cell::Cell as Tally;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use rhizo_abi::{Abi, Context, ExecError, FilePages, Outcome, PageCache, Services};
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::images::{self, Images};
 use rhizo_cell::memory::Pager;
-use rhizo_cell::quota::{Metered, Quota};
+use rhizo_cell::quota::{Meter, Metered, Quota};
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
 use rhizo_cell::{Cell, FpState, Registers};
@@ -475,13 +474,12 @@ impl Frames for KernelFrames {
     }
 }
 
-/// The frames of a cell, counted in `used` against `limit` frames (its
-/// memory quota; design D1 of `add-cell-quotas`).
-fn cell_frames(used: &Tally<u64>, limit: u64) -> Metered<'_, KernelFrames> {
+/// The frames of a cell, counted by its meter against its memory quota
+/// (design D1 of `add-cell-quotas`).
+fn cell_frames(meter: &Meter) -> Metered<'_, KernelFrames> {
     Metered {
         frames: KernelFrames,
-        used,
-        limit,
+        meter,
     }
 }
 
@@ -691,11 +689,10 @@ struct Live {
     /// Pages still to restore, for a lazily resumed cell.
     lazy: Option<Lazy>,
     /// Frames counted against its memory quota.
-    frames: Tally<u64>,
-    /// CPU time it used not yet counted in `cell.cpu_ns`, in counter ticks
-    /// (design D2 of `add-cell-quotas`): converted at the end of each slice
-    /// only for a cell with a CPU quota, else when it is suspended or given
-    /// a quota.
+    frames: Meter,
+    /// The counter at the start of the running slice, negated, then the
+    /// slice's ticks until they are counted into `cell.cpu_ns` at its end
+    /// (only for a cell with a CPU quota; design D2 of `add-cell-quotas`).
     cpu_ticks: u64,
     /// Its files and open descriptors (spec `files`).
     fs: Fs,
@@ -799,15 +796,18 @@ impl Lazy {
         }
     }
 
-    /// Restores every page still pending, counting them in `used` (beyond
+    /// Restores every page still pending, counting them in `meter` (beyond
     /// the quota if need be: they were the cell's already).
-    fn finish(&mut self, pt: &PageTable<Format>, used: &Tally<u64>) {
+    fn finish(&mut self, pt: &PageTable<Format>, meter: &Meter) {
+        let limit = meter.limit();
+        meter.set_limit(u64::MAX);
         for i in 0..self.pending.len() {
             if self.pending[i] {
                 let virt = self.snapshot.page(i).virt;
-                self.page_in(pt, &mut cell_frames(used, u64::MAX), virt);
+                self.page_in(pt, &mut cell_frames(meter), virt);
             }
         }
+        meter.set_limit(limit);
     }
 }
 
@@ -842,11 +842,7 @@ impl Tlb for CellTlb<'_> {
 
 /// The pager of system calls: a lazily resumed cell's pending pages, and
 /// copy-on-write pages shared after a fork (resolved through the TLB given).
-struct CellPager<'a, 'g>(
-    &'a mut Option<Lazy>,
-    &'a mut CellTlb<'g>,
-    Metered<'a, KernelFrames>,
-);
+struct CellPager<'a, 'g>(&'a mut Option<Lazy>, &'a mut CellTlb<'g>, &'a Meter);
 
 impl Pager<Format, DirectMap> for CellPager<'_, '_> {
     fn page_in(
@@ -859,11 +855,11 @@ impl Pager<Format, DirectMap> for CellPager<'_, '_> {
         if self
             .0
             .as_mut()
-            .is_some_and(|lazy| lazy.page_in(pt, &mut self.2, addr))
+            .is_some_and(|lazy| lazy.page_in(pt, &mut cell_frames(self.2), addr))
         {
             return true;
         }
-        (write && resolve_write(pt, self.1, &mut self.2, addr)) || grow_stack(pt, &mut self.2, addr)
+        (write && resolve_write(pt, self.1, addr)) || grow_stack(pt, &mut cell_frames(self.2), addr)
     }
 
     fn discard(&mut self, addr: u64, len: u64) {
@@ -881,14 +877,13 @@ fn grow_stack(pt: &PageTable<Format>, frames: &mut impl Frames, addr: u64) -> bo
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
-fn resolve_write(
-    pt: &PageTable<Format>,
-    tlb: &mut CellTlb<'_>,
-    frames: &mut impl Frames,
-    addr: u64,
-) -> bool {
+///
+/// Not metered (design D1 of `add-cell-quotas`): a copy replaces the cell's
+/// reference to a shared frame or table by its own, so the meter would
+/// charge one frame and credit one back.
+fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bool {
     let _p = cost::scope(Part::Cow);
-    let resolved = pt.resolve_write(&mut DirectMap, frames, tlb, addr) == Ok(true);
+    let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, tlb, addr) == Ok(true);
     if resolved {
         tlb.flush_page(addr);
     }
@@ -1330,7 +1325,6 @@ fn syscall(
         fp_in_cpu,
     };
     let (mut tlb, mut pager_tlb) = (CellTlb::new(gang), CellTlb::new(gang));
-    let limit = live.cell.quota.frames();
     let t0 = prof::syscall_start();
     // Lock order: the cell's (when shared), `SHARING`, then the sockets.
     let (outcome, deadline) = sharing(live.shares, || {
@@ -1340,16 +1334,12 @@ fn syscall(
             pt,
             mem: &mut DirectMap,
             tlb: &mut tlb,
-            frames: &mut cell_frames(&live.frames, limit),
+            frames: &mut cell_frames(&live.frames),
             services: &mut services,
             fs: &mut live.fs,
             net: &mut sockets,
             deadline,
-            pager: &mut CellPager(
-                &mut live.lazy,
-                &mut pager_tlb,
-                cell_frames(&live.frames, limit),
-            ),
+            pager: &mut CellPager(&mut live.lazy, &mut pager_tlb, &live.frames),
             pages: &mut KernelPages,
         };
         let outcome = live.abi.handle(&mut live.cell, &mut cx);
@@ -1406,7 +1396,6 @@ impl Live {
 /// (several CPUs, not stepping), a cell with several threads runs as a
 /// [`Gang`] instead, which other CPUs may join.
 fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64, share: bool) {
-    let t0 = Counter.cycles();
     if share && live.cell.threads.len() > 1 {
         start_gang(shared, cpu, live, false);
         return;
@@ -1416,8 +1405,13 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
         return;
     }
     live.cpus |= 1 << cpu;
+    // The slice's CPU time, for a cell with a CPU quota: its start now, its
+    // end added in `check_cpu_quota`, so nothing stays in a register across
+    // the slice (design D2 of `add-cell-quotas`).
+    if live.cell.quota.cpu_ns != u64::MAX {
+        live.cpu_ticks = live.cpu_ticks.wrapping_sub(Counter.cycles());
+    }
     let pt = PageTable::<Format>::from_root(live.cell.root);
-    let limit = live.cell.quota.frames();
     // Ticks seen in this slice: the first may have been pending since
     // before the cell was picked, so a cell is preempted at the second,
     // and always makes progress (design D4).
@@ -1482,7 +1476,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     if fault.missing_page().is_some_and(|addr| {
                         live.lazy.as_mut().is_some_and(|l| {
                             let _p = cost::scope(Part::Fault);
-                            l.page_in(&pt, &mut cell_frames(&live.frames, limit), addr)
+                            l.page_in(&pt, &mut cell_frames(&live.frames), addr)
                         })
                     }) =>
                 {
@@ -1494,7 +1488,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                 }
                 Trap::Fault(fault)
                     if fault.missing_page().is_some_and(|addr| {
-                        grow_stack(&pt, &mut cell_frames(&live.frames, limit), addr)
+                        grow_stack(&pt, &mut cell_frames(&live.frames), addr)
                     }) =>
                 {
                     continue;
@@ -1502,12 +1496,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                 Trap::Fault(fault)
                     if fault.write_denied().is_some_and(|addr| {
                         sharing(live.shares, || {
-                            resolve_write(
-                                &pt,
-                                &mut CellTlb::new(None),
-                                &mut cell_frames(&live.frames, limit),
-                                addr,
-                            )
+                            resolve_write(&pt, &mut CellTlb::new(None), addr)
                         })
                     }) =>
                 {
@@ -1531,12 +1520,11 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
     // CPU time counts for the whole slice, its calls included; a cell past
     // its quota ends at the end of the slice that used it up (design D2 of
     // `add-cell-quotas`). Without a quota, the ticks are only added up.
-    let mut back = back;
-    live.cpu_ticks += Counter.cycles().wrapping_sub(t0);
-    if live.cell.quota.cpu_ns != u64::MAX && !live.count_cpu() && !matches!(back, Back::End(_)) {
-        out_of_cpu(&mut live);
-        back = Back::End(Ending::OutOfCpu);
-    }
+    let back = if live.cell.quota.cpu_ns == u64::MAX {
+        back
+    } else {
+        check_cpu_quota(&mut live, back)
+    };
     if let Back::Share = back {
         // Every thread's FP/SIMD state goes to memory: another CPU may run
         // it next.
@@ -1556,6 +1544,19 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
 }
 
 /// Reports in `live`'s output that it used up its CPU time quota.
+/// Counts the CPU time of a cell with a CPU quota at the end of its slice
+/// and ends it past its quota (design D2 of `add-cell-quotas`).
+#[cold]
+#[inline(never)]
+fn check_cpu_quota(live: &mut Live, back: Back) -> Back {
+    live.cpu_ticks = live.cpu_ticks.wrapping_add(Counter.cycles());
+    if !live.count_cpu() && !matches!(back, Back::End(_)) {
+        out_of_cpu(live);
+        return Back::End(Ending::OutOfCpu);
+    }
+    back
+}
+
 fn out_of_cpu(live: &mut Live) {
     use core::fmt::Write;
     let mut services = KernelServices {
@@ -1808,18 +1809,17 @@ impl GangCell {
         }
         let live = &mut *self.live;
         let pt = PageTable::<Format>::from_root(gang.root);
-        let limit = live.cell.quota.frames();
         if let Some(addr) = fault.missing_page() {
             if live.lazy.as_mut().is_some_and(|l| {
                 let _p = cost::scope(Part::Fault);
-                l.page_in(&pt, &mut cell_frames(&live.frames, limit), addr)
+                l.page_in(&pt, &mut cell_frames(&live.frames), addr)
             }) {
                 if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
                     live.lazy = None;
                 }
                 return true;
             }
-            if grow_stack(&pt, &mut cell_frames(&live.frames, limit), addr) {
+            if grow_stack(&pt, &mut cell_frames(&live.frames), addr) {
                 return true;
             }
             if pt.translate(&DirectMap, addr).is_some() {
@@ -1829,12 +1829,7 @@ impl GangCell {
         }
         if let Some(addr) = fault.write_denied()
             && sharing(live.shares, || {
-                resolve_write(
-                    &pt,
-                    &mut CellTlb::new(Some((gang, cpu))),
-                    &mut cell_frames(&live.frames, limit),
-                    addr,
-                )
+                resolve_write(&pt, &mut CellTlb::new(Some((gang, cpu))), addr)
             })
         {
             return true;
@@ -1853,6 +1848,9 @@ impl GangCell {
     /// Counts `ns` of CPU time this CPU ran the cell's threads; ends the
     /// cell if that used up its quota (design D2 of `add-cell-quotas`).
     fn charge_cpu(&mut self, gang: &Gang, cpu: usize, ns: u64) {
+        if self.live.cell.quota.cpu_ns == u64::MAX {
+            return; // counted only against a quota
+        }
         if !self.live.cell.charge_cpu(ns) && self.ending.is_none() {
             out_of_cpu(&mut self.live);
             self.end(gang, cpu, Ending::OutOfCpu);
@@ -2153,6 +2151,7 @@ impl Host {
         if tag.is_none() {
             prof::add(Count::Untagged, 1);
         }
+        let frames = Meter::new(0, cell.quota.frames());
         Box::new(Live {
             cell,
             tag: tag.unwrap_or(0),
@@ -2164,7 +2163,7 @@ impl Host {
             echo,
             random: None,
             lazy: None,
-            frames: Tally::new(0),
+            frames,
             cpu_ticks: 0,
             fs,
             deadlines: Vec::new(),
@@ -2221,7 +2220,7 @@ impl Host {
         let kernel = memory::kernel_tables();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
         let parsed = Image::parse(image, user::MACHINE)?;
-        let used = Tally::new(0);
+        let used = Meter::new(0, u64::MAX);
         let cell = rhizo_cell::start::<Format>(
             id,
             &parsed,
@@ -2229,13 +2228,13 @@ impl Host {
             image_space(image, &parsed)?,
             kernel_half,
             &mut DirectMap,
-            &mut cell_frames(&used, u64::MAX),
+            &mut cell_frames(&used),
             argv,
             envp,
             random,
         )?;
         let live = self.new_live(cell, capture, echo, files);
-        live.frames.set(used.get());
+        live.frames.set_used(used.used());
         self.state().sched.place(live);
         Ok(id)
     }
@@ -2305,7 +2304,6 @@ impl Host {
             lazy.finish(&pt, &live.frames);
         }
         sync_fp(&mut live, true);
-        live.count_cpu(); // the CPU time used goes into the snapshot
         let (files, sockets) = export_sockets(&live.fs);
         let snapshot = Snapshot::capture::<Format>(
             user::MACHINE,
@@ -2349,12 +2347,12 @@ impl Host {
         let mut fs = files_of(&snapshot);
         import_sockets(&mut fs, &snapshot.sockets());
         let mut lazy = Lazy::new(snapshot);
-        let used = Tally::new(1); // the root
+        let used = Meter::new(1, u64::MAX); // the root
         if mode == Resume::Eager {
             lazy.finish(&pt, &used);
         }
         let mut live = self.new_live(cell, capture, echo, fs);
-        live.frames.set(used.get());
+        live.frames.set_used(used.used());
         live.lazy = (lazy.left > 0).then_some(lazy);
         file(self.state(), None, live);
         Ok(id)
@@ -2655,7 +2653,7 @@ impl Host {
             ..cell.clone()
         };
         let mut live = self.new_live(cell, capture, echo, fork_files(fs));
-        live.frames.set(1); // its root
+        live.frames.set_used(1); // its root
         live.shares = true;
         Some(live)
     }
@@ -2815,8 +2813,8 @@ impl Host {
         let Some(live) = self.state().sched.find_mut(|l| l.cell.id == id) else {
             return false;
         };
-        live.count_cpu(); // the time used so far counts against the new quota
         live.cell.quota = quota;
+        live.frames.set_limit(quota.frames());
         live.fs
             .set_limits(quota.files() as usize, quota.sockets as usize);
         true
@@ -2829,7 +2827,7 @@ impl Host {
     )]
     pub fn charged_frames(&mut self, id: u32) -> Option<u64> {
         let live = self.state().sched.find(|l| l.cell.id == id)?;
-        Some(live.frames.get())
+        Some(live.frames.used())
     }
 
     /// Ends live cell `id` if it exists; returns whether it did.

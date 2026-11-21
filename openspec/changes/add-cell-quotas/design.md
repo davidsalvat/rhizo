@@ -4,12 +4,23 @@
 
 Every place the kernel takes frames for a cell goes through one adapter,
 `rhizo_cell::quota::Metered`, around the kernel's allocator: system calls
-(`mmap`, `brk`, `munmap`, `mprotect`), the pager (lazy pages,
-copy-on-write copies, stack growth), the fault path, spawn and resume.
+(`mmap`, `brk`, `munmap`, `mprotect`), the pager (lazy pages, stack
+growth), the fault path, spawn and resume.
 `Metered` refuses an allocation that would take the cell's count past its
 quota (a 2 MiB page counts 512 frames), and credits every frame the cell
-gives back, saturating at zero. The count lives in the kernel's record of
-the live cell (`Live::frames`), shared by the meters of one call.
+gives back, saturating at zero. The count and the limit live in the
+kernel's record of the live cell (`Live::frames`, a `quota::Meter`), so a
+meter is one pointer: a system call builds it with one store, and the
+limit is set when the quota is.
+
+Copy-on-write copies are not metered: a copy replaces the cell's reference
+to a shared frame (or table) by a frame of its own, so the meter would
+charge one frame and credit one back, whichever cell writes. Leaving them
+out changes no count; it only drops the refusal of a copy by a cell
+exactly at its limit, which would have been credited at once. (Splitting
+a shared 2 MiB page whose copy cannot be had takes one page table more
+than it gives back: one frame per such fault, bounded by what the cell
+inherited.) Metering them cost 28 instructions per copy-on-write fault.
 
 Frames shared after a fork stay counted to the cell that took them. A
 child is credited when it gives back a page it inherited (saturating at
@@ -46,16 +57,21 @@ frames and is counted (finding S20).
 
 ## D2. CPU time: per slice, checked at its end
 
-`run_slice` knows when it picked the cell; when the cell comes back
-(yield, block, preemption) the time since then is added to
-`Cell::cpu_ns`, system calls included. A cell past its quota ends there
-with `Ending::OutOfCpu`, and `cell N killed: CPU time quota used up` goes
-to its output. A cell overruns its quota by at most one slice (10 ms) plus
-one system call. The cost is two counter reads and an addition per slice
-(none on the system-call path): the ticks are added up in the live cell
-and converted to nanoseconds at the end of each slice only for a cell
-with a CPU quota, else when it is suspended or given a quota. Converting
-every slice cost about 40 instructions per switch between cells.
+For a cell with a CPU quota, `run_slice` subtracts the counter from
+`Live::cpu_ticks` as the slice starts and adds it back when the cell
+comes back (yield, block, preemption), so nothing stays in a register
+across the slice; the ticks are then added to `Cell::cpu_ns`, system calls
+included. A cell past its quota ends there with `Ending::OutOfCpu`, and
+`cell N killed: CPU time quota used up` goes to its output. A cell
+overruns its quota by at most one slice (10 ms) plus one system call.
+
+A cell without a CPU quota is not timed: the cost is one test of its quota
+at each end of the slice (none on the system-call path), where counting
+every cell cost 16 instructions per switch between cells, and converting
+every slice to nanoseconds about 40. So CPU time counts while the cell has
+a quota: a quota the host sets later counts from then, and a snapshot of
+a cell without one records the time counted before (none, or what it used
+under an earlier quota).
 
 Alternative: a timer at the exact deadline. Rejected: the preemption tick
 already bounds the overrun, and a second timer per CPU is more code.

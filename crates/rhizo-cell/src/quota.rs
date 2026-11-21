@@ -24,8 +24,9 @@ pub struct Quota {
     /// Bytes of memory the cell's pages and page tables may take (counted
     /// in whole frames).
     pub memory: u64,
-    /// CPU time over the cell's whole life, in nanoseconds, its system
-    /// calls included and across suspend and resume.
+    /// CPU time in nanoseconds, its system calls included and across
+    /// suspend and resume, counted while the cell has this quota (a quota
+    /// set later counts from then).
     pub cpu_ns: u64,
     /// Open descriptors (at most [`FILES_MAX`]).
     pub files: u32,
@@ -70,53 +71,99 @@ impl Default for Quota {
     }
 }
 
-/// Frames taken for one cell, counted against its memory quota: an
-/// allocation that would take the count past `limit` frames fails, as when
-/// memory runs out. Every frame the cell gives back is credited, whoever
-/// took it first, so a cell holds at most its quota plus what it inherited
-/// from its parent or template (counted against them).
+/// One cell's memory meter: the frames counted against it and its limit
+/// in frames (its memory quota). It lives with the cell, so taking frames
+/// for it costs one pointer to the meter.
+#[derive(Debug)]
+pub struct Meter {
+    used: Counter<u64>,
+    limit: Counter<u64>,
+}
+
+impl Meter {
+    /// A meter with `used` frames counted and a limit of `limit` frames.
+    pub const fn new(used: u64, limit: u64) -> Self {
+        Self {
+            used: Counter::new(used),
+            limit: Counter::new(limit),
+        }
+    }
+
+    /// Frames counted.
+    #[inline]
+    pub fn used(&self) -> u64 {
+        self.used.get()
+    }
+
+    /// Sets the frames counted.
+    #[inline]
+    pub fn set_used(&self, used: u64) {
+        self.used.set(used);
+    }
+
+    /// The limit in frames.
+    #[inline]
+    pub fn limit(&self) -> u64 {
+        self.limit.get()
+    }
+
+    /// Sets the limit in frames.
+    #[inline]
+    pub fn set_limit(&self, limit: u64) {
+        self.limit.set(limit);
+    }
+}
+
+/// Frames taken for one cell, counted against its [`Meter`]: an allocation
+/// that would take the count past the limit fails, as when memory runs
+/// out. Every frame the cell gives back is credited, whoever took it first,
+/// so a cell holds at most its quota plus what it inherited from its parent
+/// or template (counted against them).
 #[derive(Debug)]
 pub struct Metered<'a, A> {
     /// Where frames come from.
     pub frames: A,
-    /// Frames counted against the cell (shared with other meters of the
-    /// same cell).
-    pub used: &'a Counter<u64>,
-    /// The cell's limit in frames.
-    pub limit: u64,
+    /// The cell's meter (shared by every `Metered` of the cell).
+    pub meter: &'a Meter,
 }
 
 impl<A: Frames> Metered<'_, A> {
+    #[inline(always)]
     fn take(&mut self, count: u64, alloc: impl FnOnce(&mut A) -> Option<u64>) -> Option<u64> {
-        let used = self.used.get().checked_add(count)?;
-        if used > self.limit {
+        let used = self.meter.used().checked_add(count)?;
+        if used > self.meter.limit() {
             return None;
         }
         let phys = alloc(&mut self.frames)?;
-        self.used.set(used);
+        self.meter.set_used(used);
         Some(phys)
     }
 }
 
 impl<A: Frames> Frames for Metered<'_, A> {
+    #[inline(always)]
     fn alloc(&mut self) -> Option<u64> {
         self.take(1, A::alloc)
     }
 
+    #[inline(always)]
     fn alloc_large(&mut self) -> Option<u64> {
         self.take(PageSize::Large.bytes() / FRAME_SIZE, A::alloc_large)
     }
 
+    #[inline(always)]
     fn free(&mut self, phys: u64, size: PageSize) {
         self.frames.free(phys, size);
         let count = size.bytes() / FRAME_SIZE;
-        self.used.set(self.used.get().saturating_sub(count));
+        self.meter.set_used(self.meter.used().saturating_sub(count));
     }
 
+    #[inline(always)]
     fn share(&mut self, phys: u64) {
         self.frames.share(phys);
     }
 
+    #[inline(always)]
     fn is_shared(&self, phys: u64) -> bool {
         self.frames.is_shared(phys)
     }
@@ -130,17 +177,16 @@ mod tests {
     #[test]
     fn allocations_stop_at_the_limit_and_frees_make_room() {
         let frames = CountingFrames::new(64);
-        let used = Counter::new(0);
+        let used = Meter::new(0, 3);
         let mut m = Metered {
             frames,
-            used: &used,
-            limit: 3,
+            meter: &used,
         };
         let a: Vec<u64> = (0..3).map(|_| m.alloc().expect("within quota")).collect();
         assert_eq!(m.alloc(), None, "past the quota");
         assert_eq!(m.alloc_large(), None, "a large page does not fit either");
         m.free(a[0], PageSize::Small);
-        assert_eq!(used.get(), 2);
+        assert_eq!(used.used(), 2);
         assert!(m.alloc().is_some(), "a freed frame makes room");
         assert_eq!(
             m.frames.outstanding(),
@@ -152,17 +198,16 @@ mod tests {
     #[test]
     fn large_pages_count_512_frames() {
         let frames = CountingFrames::new(64);
-        let used = Counter::new(0);
+        let used = Meter::new(0, 600);
         let mut m = Metered {
             frames,
-            used: &used,
-            limit: 600,
+            meter: &used,
         };
         let large = m.alloc_large().expect("fits");
-        assert_eq!(used.get(), 512);
+        assert_eq!(used.used(), 512);
         assert_eq!(m.alloc_large(), None);
         m.free(large, PageSize::Large);
-        assert_eq!(used.get(), 0);
+        assert_eq!(used.used(), 0);
     }
 
     #[test]
@@ -170,14 +215,13 @@ mod tests {
         // A child giving back a page it inherited was never charged for it.
         let mut frames = CountingFrames::new(64);
         let inherited = frames.alloc().unwrap();
-        let used = Counter::new(0);
+        let used = Meter::new(0, 1);
         let mut m = Metered {
             frames,
-            used: &used,
-            limit: 1,
+            meter: &used,
         };
         m.free(inherited, PageSize::Small);
-        assert_eq!(used.get(), 0);
+        assert_eq!(used.used(), 0);
         assert!(m.alloc().is_some());
         assert_eq!(m.alloc(), None);
     }
