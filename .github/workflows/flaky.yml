@@ -1,0 +1,55 @@
+name: flaky
+
+# Flaky-test detection (change `faster-ci`, rule 9): when a CI or bench run
+# succeeds on a re-run of the same commit, every job that failed in an
+# earlier attempt failed on the same code, so it is flaky. This records it
+# in a "flaky: <failure>" issue (opened, or commented on when it is already
+# open) with links to both attempts. Nothing is retried or skipped
+# automatically. Runs from the default branch's copy of this file.
+on:
+  workflow_run:
+    workflows: [CI, bench]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    name: Record jobs that passed only on a re-run
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Open or update a flaky issue per failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          # shellcheck disable=SC2016 # backticks in printf formats are Markdown
+          for ((a = 1; a < ATTEMPT; a++)); do
+            gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$a/jobs?per_page=100" \
+              --jq '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)\t\(.html_url)\t\([.steps[] | select(.conclusion == "failure") | .name] | join(", "))"' |
+            while IFS=$'\t' read -r job name link steps; do
+              # The first xtask failure line names the test; else the step.
+              failed=$(gh api "repos/$REPO/actions/jobs/$job/logs" 2>/dev/null | grep -m1 -oE 'FAILED [^:]+: .*' | sed 's/^FAILED //' | cut -c1-120 || true)
+              title="flaky: ${failed:-$name / $steps}"
+              body=$(printf 'Failed, then passed on attempt %s of the same commit `%s` (%s).\n\n- Job: %s (step: %s)\n- Failed attempt %s: %s\n- Passing run: %s/attempts/%s\n' \
+                "$ATTEMPT" "${SHA:0:7}" "$WORKFLOW" "$name" "${steps:-unknown}" "$a" "$link" "$URL" "$ATTEMPT")
+              open=$(gh api "repos/$REPO/issues?state=open&per_page=100" --jq '.[] | select(.pull_request == null) | "\(.number)\t\(.title)"')
+              number=$(awk -F'\t' -v t="$title" '$2 == t { print $1; exit }' <<< "$open")
+              if [ -n "$number" ]; then
+                gh api "repos/$REPO/issues/$number/comments" -f body="$body" --jq .html_url
+              else
+                gh api "repos/$REPO/issues" -f title="$title" -f body="$body" --jq .html_url
+              fi
+            done
+          done
