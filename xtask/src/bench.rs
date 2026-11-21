@@ -375,6 +375,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    crate::control::measure(&opts.vmms, opts.accel, &mut metrics, &mut skipped)?;
     crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
     measure_comparisons(opts, &mut metrics, &mut skipped)?;
@@ -451,6 +452,7 @@ fn measure_cells(
         memory_mib: CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        control: false,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -1043,6 +1045,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         memory_mib: vmm::DEFAULT_MEMORY_MIB,
         bench: None,
         shard: None,
+        control: false,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),

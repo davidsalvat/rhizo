@@ -25,6 +25,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("fault_null", "", Ending::Fault),
     ("fault_kernel", "", Ending::Fault),
     ("chatter", "x\nx\nx\n", Ending::Exit(0)),
+    ("flags", "flags ok\n", Ending::Exit(0)),
     ("sleeper", "slept ok\n", Ending::Exit(0)),
     ("same_addr", "own value ok\n", Ending::Exit(0)),
     ("peek", "", Ending::Fault),
@@ -148,6 +149,7 @@ pub const KERNEL_ONLY: &[(&str, &str, Ending)] = &[
     ("fuzz", "fuzz ok\n", Ending::Exit(0)),
     ("hog", "exhausted\n", Ending::Exit(0)),
     ("namer", "names full\n", Ending::Exit(0)),
+    ("sharer", "shares ok\n", Ending::Exit(0)),
 ];
 
 /// Test cells that never end on their own (they are killed by the tests):

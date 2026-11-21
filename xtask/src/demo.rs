@@ -1,11 +1,14 @@
-//! `cargo xtask demo agent` (design D7 of `add-agent-workload`): the
-//! CPython agent in a Rhizo cell against a real model on the host (Ollama,
-//! `llama-server`) or any OpenAI-compatible endpoint, its steps shown live.
-//! Not run in CI: it needs a model.
+//! `cargo xtask demo agent` (design D6 of `add-control-plane`): a thin
+//! wrapper around the `rhizo` tool, which runs the CPython agent of
+//! `add-agent-workload` against a real model on the host (Ollama,
+//! `llama-server`) or any OpenAI-compatible endpoint through the control
+//! plane. It builds the control kernel and `rhizo`, then runs `rhizo up`,
+//! `rhizo run python-agent` and `rhizo down` with a state of its own. Not
+//! run in CI: it needs a model.
 
-use crate::vmm::{self, Accel, Bench, Guest, RunOptions, Vmm};
-use crate::{Profile, Result, arch, build_kernel, hostnet};
-use std::time::Duration;
+use crate::vmm::{Accel, Vmm};
+use crate::{Profile, Result, arch, build_kernel, target_dir};
+use std::process::Command;
 
 /// The options of `demo agent`.
 #[derive(Debug, PartialEq)]
@@ -54,28 +57,7 @@ fn parse(args: &[String]) -> Result<Options> {
     Ok(opts)
 }
 
-/// `IP:PORT` of the model as a guest on `vmm` reaches it: the host's own
-/// address there for a model on the host's loopback (or listening on every
-/// address), any other IPv4 address as it is.
-fn guest_endpoint(url: &str, vmm: Vmm) -> Result<String> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let hostport = rest.split('/').next().unwrap_or_default();
-    let (host, port) = hostport
-        .rsplit_once(':')
-        .ok_or_else(|| format!("`{url}` names no port (http://HOST:PORT)"))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("`{port}` is not a port"))?;
-    let host = match host {
-        "localhost" | "127.0.0.1" | "0.0.0.0" => hostnet::host_address(vmm),
-        ip if ip.parse::<std::net::Ipv4Addr>().is_ok() => ip,
-        other => return Err(format!("`{other}`: give the model's IPv4 address")),
-    };
-    Ok(format!("{host}:{port}"))
-}
-
-/// Boots a benchmark kernel that runs the agent demo against `--llm`,
-/// console on the terminal.
+/// Runs the agent demo through `rhizo`, console on the terminal.
 pub fn cmd(args: &[String]) -> Result {
     let opts = parse(args)?;
     if std::env::var_os("RHIZO_CPYTHON_SRC").is_none() {
@@ -85,71 +67,56 @@ pub fn cmd(args: &[String]) -> Result {
             crate::cpython::VERSION
         ));
     }
-    let llm = guest_endpoint(&opts.llm, opts.vmm)?;
-    let kernel = build_kernel(Profile::Release, &["bench-cell"])?;
+    let kernel = build_kernel(Profile::Release, &["control"])?;
     if !crate::cpython::root().join("usr/bin/python3").exists() {
         return Err("CPython was not built (see the build output above)".into());
     }
-    println!(
-        "[xtask] agent demo on {} ({}): model `{}` at {llm} as the guest sees it",
-        opts.vmm.id(),
-        arch::current().id(),
-        opts.model
-    );
-    let run = RunOptions {
-        stop_at_ready: false,
-        // A real model on a CPU, or the kernel under emulation, can be
-        // silent for long.
-        timeout: Duration::from_secs(1800),
-        echo: true,
-        accel: opts.accel,
-        gdb: false,
-        network: true,
-        pci_card: false,
-        cpus: 1,
-        memory_mib: vmm::DEFAULT_MEMORY_MIB,
-        bench: Some(Bench::AgentDemo {
-            llm: Box::leak(llm.into_boxed_str()),
-            model: Box::leak(opts.model.into_boxed_str()),
-        }),
-        shard: None,
+    let rhizo = crate::control::build_rhizo()?;
+    let state = target_dir().join("demo");
+    let rhizo_cmd = |words: &[&str]| {
+        let mut cmd = Command::new(&rhizo);
+        cmd.arg("--state").arg(&state).args(words);
+        cmd
     };
-    let out = vmm::run(opts.vmm, &Guest::Rhizo(kernel), run)?;
-    outcome(&out.output)
-}
-
-/// The demo's result: its `rhizo-demo done` or `rhizo-demo failed` line
-/// (the kernel also prints a `rhizo-demo agent, model …` header first).
-fn outcome(output: &str) -> Result {
-    let result = output
-        .lines()
-        .find(|l| l.starts_with("rhizo-demo done") || l.starts_with("rhizo-demo failed"));
-    match result {
-        Some(line) if line.starts_with("rhizo-demo done") => Ok(()),
-        Some(line) => Err(line.to_string()),
-        None => Err("the kernel printed no demo result".into()),
+    let kernel_path = kernel.to_string_lossy().into_owned();
+    let up = [
+        "up",
+        "--vmm",
+        opts.vmm.id(),
+        "--arch",
+        arch::current().id(),
+        "--accel",
+        opts.accel.id(),
+        "--kernel",
+        &kernel_path,
+    ];
+    let run = [
+        "run",
+        "python-agent",
+        "--llm",
+        &opts.llm,
+        "--model",
+        &opts.model,
+    ];
+    let status = |mut cmd: Command| {
+        cmd.status()
+            .map_err(|e| format!("cannot run {}: {e}", rhizo.display()))
+            .map(|s| s.success())
+    };
+    if !status(rhizo_cmd(&up))? {
+        return Err("`rhizo up` failed".into());
+    }
+    let ran = status(rhizo_cmd(&run));
+    let _ = status(rhizo_cmd(&["down"]));
+    match ran? {
+        true => Ok(()),
+        false => Err("the demo failed (see above)".into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_result_line_decides_not_the_header() {
-        let header = "rhizo-demo agent, model `qwen2.5:1.5b`\n";
-        assert!(
-            outcome(&format!(
-                "{header}turn 1\nrhizo-demo done in 19600 ms: 3 suspend\n"
-            ))
-            .is_ok()
-        );
-        assert_eq!(
-            outcome(&format!("{header}rhizo-demo failed after 5 ms: no model\n")),
-            Err("rhizo-demo failed after 5 ms: no model".to_string())
-        );
-        assert!(outcome(header).is_err(), "no result line is a failure");
-    }
 
     #[test]
     fn options_need_a_model_and_its_address() {
@@ -172,28 +139,5 @@ mod tests {
         assert!(parse(&args(&["agent", "--llm", "http://h:1"])).is_err());
         assert!(parse(&args(&["other"])).is_err());
         assert!(parse(&args(&["agent", "--llm", "x", "--model", "a b"])).is_err());
-    }
-
-    #[test]
-    fn the_guest_reaches_a_model_on_the_host() {
-        let url = "http://localhost:8080";
-        assert_eq!(
-            guest_endpoint(url, Vmm::QemuMicrovm).unwrap(),
-            "10.0.2.2:8080"
-        );
-        assert_eq!(
-            guest_endpoint(url, Vmm::Firecracker).unwrap(),
-            "172.16.0.1:8080"
-        );
-        assert_eq!(
-            guest_endpoint("http://127.0.0.1:11434/v1", Vmm::CloudHypervisor).unwrap(),
-            "172.16.1.1:11434"
-        );
-        assert_eq!(
-            guest_endpoint("http://192.168.1.20:8080", Vmm::QemuVirt).unwrap(),
-            "192.168.1.20:8080"
-        );
-        assert!(guest_endpoint("http://model.lan:8080", Vmm::QemuVirt).is_err());
-        assert!(guest_endpoint("http://127.0.0.1", Vmm::QemuVirt).is_err());
     }
 }
