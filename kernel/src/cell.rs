@@ -158,6 +158,16 @@ pub fn wire_busy() -> bool {
     with_net(|net| net.wire_busy())
 }
 
+/// Sets how long connections through the network card wait for an answer
+/// before they give up, from now on (`rhizo_net::Net::set_wire_timeout`).
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn set_wire_timeout(ns: u64) {
+    with_net(|net| net.set_wire_timeout(ns));
+}
+
 /// Closes the connections parked for `snapshot`, which the host drops
 /// without resuming it (spec `networking`, design D3 of
 /// `keep-tcp-across-suspend`); resumed later, it finds them reset.

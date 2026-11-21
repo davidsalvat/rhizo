@@ -23,6 +23,23 @@ struct Peer {
     udp: SocketHandle,
     /// Whether it closes its side once the client closed its own.
     closes: bool,
+    /// How long it thinks before echoing (nanoseconds), and what it holds
+    /// meanwhile with the time it arrived.
+    delay: u64,
+    held: Option<(u64, Vec<u8>)>,
+    /// Whether it closes the connection after each echo (a server ending
+    /// a kept-alive connection between requests).
+    hangs_up: bool,
+}
+
+/// A socket listening on port 80, for the peer's next client.
+fn listener() -> tcp::Socket<'static> {
+    let mut tcp = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 4096]),
+        tcp::SocketBuffer::new(vec![0; 4096]),
+    );
+    tcp.listen(80).unwrap();
+    tcp
 }
 
 impl Peer {
@@ -38,23 +55,21 @@ impl Peer {
             a.push(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24)).unwrap();
         });
         let mut sockets = SocketSet::new(Vec::new());
-        let mut tcp = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; 4096]),
-            tcp::SocketBuffer::new(vec![0; 4096]),
-        );
-        tcp.listen(80).unwrap();
         let mut udp = udp::Socket::new(
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
         );
         udp.bind(53).unwrap();
         Self {
-            tcp: sockets.add(tcp),
+            tcp: sockets.add(listener()),
             udp: sockets.add(udp),
             iface,
             sockets,
             link,
             closes: true,
+            delay: 0,
+            held: None,
+            hangs_up: false,
         }
     }
 
@@ -69,10 +84,30 @@ impl Peer {
         if t.can_recv() {
             let mut buf = [0u8; 512];
             let n = t.recv_slice(&mut buf).unwrap();
-            t.send_slice(&buf[..n]).unwrap();
+            let (_, held) = self.held.get_or_insert((now, Vec::new()));
+            held.extend_from_slice(&buf[..n]);
+        }
+        if let Some((since, _)) = self.held
+            && now >= since + self.delay
+            && let Some((_, data)) = self.held.take()
+        {
+            t.send_slice(&data).unwrap();
+            if self.hangs_up {
+                // It finishes closing on its own while a new socket
+                // listens for the next client, as a server's would.
+                t.close();
+                self.tcp = self.sockets.add(listener());
+                return;
+            }
         }
         if self.closes && t.state() == tcp::State::CloseWait {
             t.close(); // the client is done: so is the echo
+        }
+        if matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait) {
+            // Ready for the next client at once.
+            self.held = None;
+            self.sockets.remove(self.tcp);
+            self.tcp = self.sockets.add(listener());
         }
         let u = self.sockets.get_mut::<udp::Socket>(self.udp);
         if let Ok((data, meta)) = u.recv() {
@@ -380,4 +415,88 @@ fn frames_from_the_wire_wake_the_waiters_of_its_sockets() {
     let woken = woken(&mut w.net);
     assert!(woken.contains(&1), "the echo arrived");
     assert!(!woken.contains(&2), "nothing for a loopback socket");
+}
+
+/// A model that thinks for 45 s before it answers: its request is
+/// acknowledged at once, then nothing crosses the wire for longer than the
+/// card's timeout (20 s), and the answer still arrives.
+#[test]
+fn a_connection_silent_for_long_still_gets_its_reply() {
+    let mut w = World::new();
+    let s = w.connect(80);
+    w.peer.delay = 45_000 * MS;
+    assert_eq!(w.net.send(s, b"question", None), Ok(8));
+    w.run(45_000);
+    assert_eq!(drain(&mut w.net, s), Err(Error::Again), "still thinking");
+    assert_eq!(w.net.poll(s) & (ERR | HUP), 0, "and still connected");
+    w.run(20);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"question");
+    // Idle for ten minutes, then used again.
+    w.peer.delay = 0;
+    w.run(600_000);
+    assert_eq!(w.net.send(s, b"again", None), Ok(5));
+    w.run(20);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"again");
+}
+
+/// Bytes a peer never acknowledges are still given up after the timeout.
+#[test]
+fn bytes_a_peer_never_acknowledges_are_given_up() {
+    let mut w = World::new();
+    let s = w.connect(80);
+    assert_eq!(w.net.send(s, b"lost", None), Ok(4));
+    // The peer is gone: nothing reaches it any more.
+    for _ in 0..19_000 {
+        w.now += MS;
+        w.net.poll_wire(&mut w.link, w.now);
+        w.link.sent.clear();
+    }
+    assert_eq!(w.net.poll(s) & ERR, 0, "retransmitting");
+    for _ in 0..2_000 {
+        w.now += MS;
+        w.net.poll_wire(&mut w.link, w.now);
+        w.link.sent.clear();
+    }
+    assert_eq!(drain(&mut w.net, s), Err(Error::ConnReset));
+}
+
+/// A new connection to the peer, open within `ms` milliseconds.
+fn reconnect(w: &mut World, ms: u64) -> Handle {
+    let s = w.net.socket(Family::Inet, Type::Stream).unwrap();
+    let to = Addr::Inet { ip: PEER, port: 80 };
+    assert_eq!(w.net.connect(s, &to), Err(Error::InProgress));
+    w.run(ms);
+    assert_eq!(w.net.connect(s, &to), Ok(()), "open within {ms} ms");
+    s
+}
+
+#[test]
+fn a_connection_reset_by_the_peer_is_replaced_at_once() {
+    let mut w = World::new();
+    let s = w.connect(80);
+    let peer = w.peer.tcp;
+    w.peer.sockets.get_mut::<tcp::Socket>(peer).abort();
+    w.run(5);
+    assert_eq!(drain(&mut w.net, s), Err(Error::ConnReset));
+    w.net.release(s);
+    let s = reconnect(&mut w, 5);
+    assert_eq!(w.net.send(s, b"after the reset", None), Ok(15));
+    w.run(5);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"after the reset");
+}
+
+#[test]
+fn a_connection_the_peer_ends_between_requests_is_replaced_at_once() {
+    let mut w = World::new();
+    w.peer.hangs_up = true;
+    let s = w.connect(80);
+    assert_eq!(w.net.send(s, b"turn 1", None), Ok(6));
+    w.run(20);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"turn 1");
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"", "then the peer's end");
+    w.net.release(s);
+    let s = reconnect(&mut w, 5);
+    assert_eq!(w.net.send(s, b"turn 2", None), Ok(6));
+    w.run(5);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"turn 2");
 }
