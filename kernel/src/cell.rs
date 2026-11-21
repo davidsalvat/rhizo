@@ -670,11 +670,81 @@ pub fn timed_wait(ns: u64) -> u64 {
     took
 }
 
-/// Who owns the CPU's FP/SIMD registers: thread `tid` of cell `cell` (0:
-/// nobody; cell identifiers start at 1, and neither they nor thread
-/// identifiers are reused, so a key never names another thread).
+/// Who owns the CPU's FP/SIMD registers: thread `tid` of cell `cell`
+/// (cell identifiers start at 1, and neither they nor thread identifiers
+/// are reused, so a key never names another thread). Besides keys, the
+/// owner can be [`FP_STALE`] or [`FP_CLEAN`].
 fn fp_key(cell: u32, tid: u32) -> u64 {
     ((cell as u64) << 32) | tid as u64
+}
+
+/// No thread owns the registers, and they may still hold the values of one
+/// that ran (saved already, or moot): they are loaded or cleared before any
+/// cell code runs.
+const FP_STALE: u64 = 0;
+/// No thread owns the registers, and they hold the initial state
+/// ([`CLEAN_FP`]): nothing of any thread or cell.
+const FP_CLEAN: u64 = u64::MAX;
+/// What the registers hold while a thread runs that has not used FP/SIMD
+/// yet: a thread starts with it, and it comes from no thread or cell.
+static CLEAN_FP: FpState = FpState::initial(user::MACHINE);
+
+/// Gets this CPU's FP/SIMD registers ready for the thread `key`, whose
+/// registers are `regs`, about to run (design D1 of `lazy-fp-switch`):
+/// they hold its own state, or the initial state; never another thread's,
+/// not even for cell code that runs speculatively before an FP/SIMD
+/// trap is taken (LazyFP, CVE-2018-3665). A thread that has used FP/SIMD
+/// gets its state at once; one that has not runs with FP/SIMD trapping.
+/// The thread that owned the registers before has been saved already.
+/// Returns whether the registers now hold the thread's state.
+///
+/// Whether FP/SIMD traps follows the owner: never while a thread owns the
+/// registers, always while they are [`FP_CLEAN`] (either way while they
+/// are [`FP_STALE`]), so the cases that need no change cost no write.
+#[inline(always)]
+fn fp_enter(key: u64, regs: &Registers) -> bool {
+    // Only a thread that has used FP/SIMD can own the registers.
+    let owner = fp_owner();
+    match regs.fp_used != 0 {
+        true if owner == key => true,
+        false if owner == FP_CLEAN => false,
+        _ => fp_switch(key, regs),
+    }
+}
+
+/// [`fp_enter`] when the registers must change: loads the thread's state
+/// (it has used FP/SIMD), or clears them for it, with FP/SIMD trapping.
+#[inline(never)]
+fn fp_switch(key: u64, regs: &Registers) -> bool {
+    if regs.fp_used != 0 {
+        user::fp_load(&regs.fp);
+        user::fp_trap(false);
+        set_fp_owner(key);
+    } else {
+        user::fp_load(&CLEAN_FP);
+        user::fp_trap(true);
+        set_fp_owner(FP_CLEAN);
+    }
+    regs.fp_used != 0
+}
+
+/// Saves the FP/SIMD registers, which thread `key` of `live` owns, into
+/// that thread (if it has not exited meanwhile).
+fn fp_save_thread(live: &mut Live, key: u64) {
+    if let Some(thread) = live.cell.threads.get_mut(key as u32) {
+        user::fp_save(&mut thread.regs.fp);
+    }
+}
+
+/// The first FP/SIMD instruction of the thread `key`, whose registers are
+/// `regs`: the registers hold the initial state ([`fp_enter`]), so its own
+/// state is loaded, and from now on it is switched eagerly.
+fn fp_first_use(key: u64, regs: &mut Registers) {
+    debug_assert_eq!(fp_owner(), FP_CLEAN, "FP/SIMD trap with registers in use");
+    regs.fp_used = 1;
+    user::fp_load(&regs.fp);
+    user::fp_trap(false);
+    set_fp_owner(key);
 }
 
 /// Held while page tables and frames that cells may share change: a fork's
@@ -1541,7 +1611,7 @@ fn end(live: Box<Live>, ending: Ending) -> (Finished, u16) {
     let ended = {
         let live = *live;
         if fp_owner() >> 32 == live.cell.id as u64 {
-            set_fp_owner(0);
+            set_fp_owner(FP_STALE);
         }
         user::release_user(live.cell.root, live.tag);
         sharing(live.shares, || {
@@ -1730,12 +1800,13 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
     // before the cell was picked, so a cell is preempted at the second,
     // and always makes progress (design D4).
     let mut ticks = 0;
+    // The thread running, and whether this CPU's FP/SIMD registers hold its
+    // state (design D1 of `lazy-fp-switch`).
+    let (mut key, mut fp_mine);
     // Each thread that runs in the slice (design D2 of `add-threads`).
     let back = 'thread: loop {
-        let key = fp_key(live.cell.id, live.cell.threads.current().tid);
-        // FP/SIMD state moves only if this thread actually uses it
-        // (design D1).
-        user::fp_trap(fp_owner() != key);
+        key = fp_key(live.cell.id, live.cell.threads.current().tid);
+        fp_mine = fp_enter(key, live.cell.regs());
         loop {
             let flush = live.clean & (1 << cpu) == 0;
             let trap = {
@@ -1745,7 +1816,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
             live.clean |= flushed_on(cpu);
             match trap {
                 Trap::Syscall => {
-                    let (outcome, shrank) = syscall(&mut live, pt, fp_owner() == key, None);
+                    let (outcome, shrank) = syscall(&mut live, pt, fp_mine, None);
                     if shrank {
                         live.clean = flushed_by_kernel_on(cpu);
                     }
@@ -1757,18 +1828,27 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                         }
                         Outcome::Resume => continue,
                         Outcome::Yield => break 'thread Back::Requeue,
-                        // Another thread of the cell runs at once, in this
-                        // slice, without changing address space.
-                        Outcome::Block if live.cell.threads.next(now_ns()) => continue 'thread,
-                        Outcome::Block => break 'thread Back::File,
+                        Outcome::Block => {
+                            // Its FP/SIMD state goes to memory (the
+                            // registers stay its until another thread
+                            // needs them).
+                            if fp_mine {
+                                fp_save_thread(&mut live, key);
+                                fp_mine = false;
+                            }
+                            // Another thread of the cell runs at once, in
+                            // this slice, without changing address space.
+                            if live.cell.threads.next(now_ns()) {
+                                continue 'thread;
+                            }
+                            break 'thread Back::File;
+                        }
                         Outcome::Exit(status) => break 'thread Back::End(Ending::Exit(status)),
                     }
                 }
                 Trap::FpUnavailable => {
-                    save_fp_owner(shared, &mut live);
-                    user::fp_load(&live.cell.regs().fp);
-                    user::fp_trap(false);
-                    set_fp_owner(key);
+                    fp_first_use(key, live.cell.regs_mut());
+                    fp_mine = true;
                     continue;
                 }
                 Trap::Interrupt => {
@@ -1855,13 +1935,18 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
         start_gang(shared, cpu, live, true);
         return;
     }
-    if crate::smp::count() > 1 && !matches!(back, Back::End(_)) {
+    // An ended cell's state is moot: `end` lets go of it.
+    let ended = matches!(back, Back::End(_));
+    if !ended && crate::smp::count() > 1 {
         // Another CPU may take the cell next: its FP/SIMD state goes to
-        // memory, and this CPU lets go of its tables (design D4).
-        if fp_owner() >> 32 == live.cell.id as u64 {
-            sync_fp(&mut live, true);
-        }
+        // memory, and this CPU lets go of it and of its tables (design D4).
+        sync_fp(&mut live, true);
         user::leave_user();
+    } else if !ended && fp_mine {
+        // Its FP/SIMD state goes to memory, so the next cell to run here
+        // can have the registers (design D1 of `lazy-fp-switch`); they stay
+        // its until then, and it needs no load if it runs next.
+        fp_save_thread(&mut live, key);
     }
     give_back(shared, cpu, live, back);
 }
@@ -2075,7 +2160,7 @@ impl GangCell {
             }
         }
         if fp_owner() == key {
-            set_fp_owner(0);
+            set_fp_owner(FP_STALE);
         }
     }
 
@@ -2321,7 +2406,7 @@ fn run_gang(
     let mut next = first;
     while let Some(tid) = next.take() {
         let key = fp_key(gang.id, tid);
-        user::fp_trap(fp_owner() != key);
+        fp_enter(key, &regs);
         next = loop {
             if claimed(gang.id) {
                 // The host waits for the cell: this CPU leaves it.
@@ -2339,11 +2424,7 @@ fn run_gang(
                         After::Leave => break None,
                     }
                 }
-                Trap::FpUnavailable => {
-                    user::fp_load(&regs.fp);
-                    user::fp_trap(false);
-                    set_fp_owner(key);
-                }
+                Trap::FpUnavailable => fp_first_use(key, &mut regs),
                 Trap::Sample => cost::sample(gang.id, regs.pc),
                 Trap::Interrupt => {
                     if cost::timer_sampling() {
@@ -2383,7 +2464,7 @@ fn leave_gang(shared: &Global<Shared>, cpu: usize, ptr: GangPtr) {
     // SAFETY: as in `run_gang`, `cpu` has not left yet.
     let id = unsafe { ptr.0.as_ref() }.id;
     if fp_owner() >> 32 == id as u64 {
-        set_fp_owner(0); // the cell ended: its FP/SIMD state is moot
+        set_fp_owner(FP_STALE); // the cell ended: its FP/SIMD state is moot
     }
     user::leave_user();
     // The last CPU to leave still runs the cell until it gives it back.
@@ -2409,29 +2490,6 @@ fn leave_gang(shared: &Global<Shared>, cpu: usize, ptr: GangPtr) {
     give_back(shared, cpu, live, ending.map_or(Back::File, Back::End));
 }
 
-/// Saves the CPU's FP/SIMD registers into the thread that owns them,
-/// which may be a thread of `running` or, with one CPU, of a cell waiting
-/// its turn (with several, a cell's state leaves the CPU with the cell).
-fn save_fp_owner(shared: &Global<Shared>, running: &mut Live) {
-    let owner = fp_owner();
-    let (cell, tid) = ((owner >> 32) as u32, owner as u32);
-    if cell == running.cell.id {
-        if let Some(thread) = running.cell.threads.get_mut(tid) {
-            user::fp_save(&mut thread.regs.fp);
-        }
-    } else if cell != 0 {
-        shared.with(|s| {
-            if let Some(thread) = s
-                .sched
-                .find_mut(cell)
-                .and_then(|l| l.cell.threads.get_mut(tid))
-            {
-                user::fp_save(&mut thread.regs.fp);
-            }
-        });
-    }
-}
-
 /// Brings the FP/SIMD state of `live`'s threads up to date in their
 /// registers, if one of them has it in this CPU; with `leaving`, the
 /// CPU's copy stops belonging to it.
@@ -2442,7 +2500,7 @@ fn sync_fp(live: &mut Live, leaving: bool) {
             user::fp_save(&mut thread.regs.fp);
         }
         if leaving {
-            set_fp_owner(0);
+            set_fp_owner(FP_STALE);
         }
     }
 }
@@ -3883,6 +3941,11 @@ fn benchmarks(console: &mut impl Console) {
         "rhizo-cell spawn_ns={spawn_ns} run_ns={run_ns} pt_frames={tables} switch_ns={tagged} \
          switch_untagged_ns={untagged}"
     );
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-fp switch_fp_ns={}",
+        switch_fp_ns()
+    );
     // KPTI's cost (design D5 of `add-kpti`): the same figures with it
     // forced on (`cell.syscall_ns` itself is on the `rhizo-ops` line).
     let default = user::kpti();
@@ -5258,6 +5321,40 @@ fn switch_ns(mut host: Host) -> u64 {
     }
     rounds.sort_unstable();
     rounds[2]
+}
+
+/// Median over 5 rounds of the time per switch between two `fp_regs`
+/// cells that yield to each other 2000 times each with values in every
+/// FP/SIMD register (change `lazy-fp-switch`): the run of both to their
+/// exit, minus the same run with no yields, over the 4000 switches.
+#[cfg(feature = "bench-cell")]
+fn switch_fp_ns() -> u64 {
+    const YIELDS: u64 = 2000;
+    let image = test_image("fp_regs");
+    let mut host = Host::new();
+    let mut pair = |rounds: &[u8]| {
+        let a = host
+            .spawn(image, &[b"fp_regs", b"1", rounds], true, false)
+            .expect("spawn fp_regs");
+        let b = host
+            .spawn(image, &[b"fp_regs", b"2", rounds], true, false)
+            .expect("spawn fp_regs");
+        let t0 = bench_clock();
+        host.run(|h| h.finished(a).is_some() && h.finished(b).is_some());
+        let t1 = bench_clock();
+        for id in [a, b] {
+            let done = host.finished(id).expect("fp_regs ended");
+            assert_eq!(done.output, b"fp regs ok\n", "fp_regs keeps its values");
+        }
+        t1 - t0
+    };
+    let mut rounds = [0u64; 5];
+    for round in &mut rounds {
+        let empty = pair(b"0");
+        *round = pair(b"2000").saturating_sub(empty);
+    }
+    rounds.sort_unstable();
+    bench_ns(rounds[2]).unwrap_or(0) / (2 * YIELDS)
 }
 
 /// Counter ticks of one `getpid` round trip (cell to kernel and back):

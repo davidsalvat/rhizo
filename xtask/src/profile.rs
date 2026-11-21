@@ -16,6 +16,7 @@ pub const COUNTED: &[(&str, &str, &str)] = &[
     ("rhizo-cell", "run_ns", "cell.run"),
     ("rhizo-cell", "switch_ns", "cell.switch"),
     ("rhizo-cell", "switch_untagged_ns", "cell.switch_untagged"),
+    ("rhizo-fp", "switch_fp_ns", "cell.switch_fp"),
     ("rhizo-fork", "fork_ns", "cell.fork"),
     ("rhizo-fork", "fork_touch_ns", "cell.fork_touch"),
     (

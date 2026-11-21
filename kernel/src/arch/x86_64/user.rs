@@ -37,8 +37,8 @@ pub enum Trap {
     /// The sampling interrupt of the performance counters (spec
     /// `profiling`): `pc` of the saved registers is the sample; resume.
     Sample,
-    /// A first FP/SIMD instruction while the registers belong to another
-    /// cell (`#NM`, see [`fp_trap`]): swap the state and resume.
+    /// The first FP/SIMD instruction of a thread that had not used them
+    /// (`#NM`, see [`fp_trap`]): load its state and resume.
     FpUnavailable,
     /// An exception: the cell cannot continue.
     Fault(UserFault),
@@ -131,12 +131,20 @@ pub fn fp_trap(enable: bool) {
 }
 
 /// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
-/// state of the cell that last ran).
+/// state of the cell that last ran), leaving FP/SIMD trapping as it was:
+/// the kernel ties it to who owns the registers (design D1 of
+/// `lazy-fp-switch`).
 pub fn fp_save(state: &mut FpState) {
-    fp_trap(false);
+    let trapping = FP_TRAPS[index()].load(Ordering::Relaxed);
+    if trapping {
+        fp_trap(false);
+    }
     // SAFETY: `state` is 16-byte aligned and at least 512 bytes; SSE is
     // enabled by `init_tags`.
     unsafe { asm!("fxsave64 [{}]", in(reg) state, options(nostack)) };
+    if trapping {
+        fp_trap(true);
+    }
 }
 
 /// Loads the FP/SIMD registers for the cell about to run.

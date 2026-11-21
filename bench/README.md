@@ -59,6 +59,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.node_jit_warm_us/rhizo/<vmm>` | timing | `workload.node_warm_us` with V8's JIT, from a template frozen after a warm-up with its JIT |
 | `workload.node_jit_flips/rhizo/<vmm>` | rate | Write-or-execute pages made running by an instruction fetch in one cold run of Node.js with its JIT (each made writing by a write before: about twice as many faults in all), counted in a run of its own after the timed ones: what W^X costs the JIT, in faults |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
+| `cell.switch_fp_ns/rhizo/<vmm>` | timing | The same between two `fp_regs` cells (`cells/c/fp_regs.c`, glibc) that hold values in every FP/SIMD register across each yield and check them: both run to their exit with 2000 yields each, minus the same run with none, over the 4000 switches. What switching FP/SIMD state costs a cell that uses it (change `lazy-fp-switch`) |
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
 | `cell.pipe_rtt_ns/rhizo/<vmm>` | timing | The `piper` cell writing one byte into a pipe and reading it back (two system calls), per round trip over 2000 |
