@@ -936,8 +936,7 @@ enum Back {
 fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
     let _p = cost::scope(Part::Sched);
     let _timed = prof::Timed::new(Count::SchedCycles);
-    let mut other = None;
-    let take = shared.with(|s| {
+    shared.with(|s| {
         if s.stopping {
             s.idle &= !(1 << cpu);
             return Take::Stop;
@@ -961,12 +960,16 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
             live.ready = Ready::default();
             s.running += 1;
             s.idle &= !(1 << cpu);
-            other = cover(s, cpu);
+            if s.idle != 0 || s.timer.armed().is_some() {
+                cover(s, cpu);
+            }
             return Take::Run(live, now);
         }
         if !oldest && let Some(gang) = s.gangs.join(cpu, now) {
             s.idle &= !(1 << cpu);
-            other = cover(s, cpu);
+            if s.idle != 0 || s.timer.armed().is_some() {
+                cover(s, cpu);
+            }
             return Take::Join(gang);
         }
         // The boot CPU looks at ended cells before it waits: with nothing
@@ -988,11 +991,7 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
         }
         // Its timer only if no other idle CPU's covers the deadline.
         Take::Wait(s.timer.idle(cpu, wake))
-    });
-    if let Some(other) = other {
-        crate::smp::wake(other);
-    }
-    take
+    })
 }
 
 /// The earliest deadline of the cells that are not running.
@@ -1004,18 +1003,24 @@ fn next_wake(s: &Shared) -> Option<u64> {
     .filter(|&t| t != u64::MAX)
 }
 
-/// `cpu` took work: the idle CPU to wake so that its timer covers the
+/// `cpu` took work: wakes an idle CPU so that its timer covers the
 /// earliest deadline, if none does (design D1 of `add-tickless-idle`).
-fn cover(s: &mut Shared, cpu: usize) -> Option<usize> {
+/// Under the host's lock: rare, only when a deadline loses its timer. Out
+/// of line, so that taking a cell with no CPU idle costs a test.
+#[cold]
+#[inline(never)]
+fn cover(s: &mut Shared, cpu: usize) {
     if s.idle == 0 {
         // No CPU idles: busy CPUs look at every slice's end. Only an idle
         // CPU holds the timer, so it was this one, if any.
         s.timer = IdleTimer::new();
-        return None;
+        return;
     }
     s.timer.leave(cpu);
     let next = next_wake(s);
-    s.timer.cover(next, s.idle)
+    if let Some(other) = s.timer.cover(next, s.idle) {
+        crate::smp::wake(other);
+    }
 }
 
 /// Wakes the cells whose sockets changed since the last call (design D2 of
