@@ -84,3 +84,32 @@ until the process that answered has exited.
 #### Scenario: Not available
 - **WHEN** CPython is not built or Firecracker cannot run on the host
 - **THEN** the comparison is listed as skipped with the reason, and no number is reported
+
+### Requirement: The agent as a Linux process in the same VM
+`cargo xtask bench` SHALL run the CPython agent as a Linux process inside
+the Firecracker guest of the CPython comparison, reaching the host's fake
+model through the guest's network card and forking its branches with
+`fork`, and report its turn and its fork until every branch runs; where it
+cannot, it SHALL list them as skipped with the reason.
+
+#### Scenario: Measured in the guest
+- **WHEN** `cargo xtask bench` runs on a host with KVM, password-less `sudo` and CPython built
+- **THEN** the results contain `workload.agent_cpython_turn_us` and `workload.agent_fork_us` for guest `linux-process` on `firecracker`
+
+#### Scenario: No tap device
+- **WHEN** the tap device cannot be made
+- **THEN** the agent comparison is listed as skipped with the reason, and the CPython figures are still reported
+
+### Requirement: Node.js as a Linux process in the same VM
+`cargo xtask bench` SHALL measure, where Node.js is packed and Firecracker
+can run, the same Node.js files and request as a Linux process inside a
+Firecracker guest: started cold with `fork` and `execve` until it exits.
+Node.js cannot fork itself, so no warm figure is reported for Linux.
+
+#### Scenario: Measured in the guest
+- **WHEN** `cargo xtask bench` runs on a host with KVM for the target architecture and `RHIZO_NODE` set
+- **THEN** the results contain `workload.node_cold_us` for guest `linux-process` on `firecracker`
+
+#### Scenario: Not available
+- **WHEN** Node.js is not packed or Firecracker cannot run on the host
+- **THEN** the comparison is listed as skipped with the reason, and no number is reported
