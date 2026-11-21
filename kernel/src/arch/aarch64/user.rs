@@ -35,8 +35,8 @@ pub enum Trap {
     /// The sampling interrupt of the performance counters (spec
     /// `profiling`): `pc` of the saved registers is the sample; resume.
     Sample,
-    /// A first FP/SIMD instruction while the registers belong to another
-    /// cell (see [`fp_trap`]): swap the state and resume.
+    /// The first FP/SIMD instruction of a thread that had not used them
+    /// (see [`fp_trap`]): load its state and resume.
     FpUnavailable,
     /// Any other exception: the cell cannot continue.
     Fault(UserFault),

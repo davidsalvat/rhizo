@@ -37,8 +37,8 @@ pub enum Trap {
     /// The sampling interrupt of the performance counters (spec
     /// `profiling`): `pc` of the saved registers is the sample; resume.
     Sample,
-    /// A first FP/SIMD instruction while the registers belong to another
-    /// cell (`#NM`, see [`fp_trap`]): swap the state and resume.
+    /// The first FP/SIMD instruction of a thread that had not used them
+    /// (`#NM`, see [`fp_trap`]): load its state and resume.
     FpUnavailable,
     /// An exception: the cell cannot continue.
     Fault(UserFault),
@@ -130,13 +130,27 @@ pub fn fp_trap(enable: bool) {
     }
 }
 
+/// Whether FP/SIMD use traps on this CPU now ([`fp_trap`]).
+#[cfg(feature = "ktest")]
+pub fn fp_trapping() -> bool {
+    FP_TRAPS[index()].load(Ordering::Relaxed)
+}
+
 /// Saves the FP/SIMD registers (the kernel never uses them, so they hold the
-/// state of the cell that last ran).
+/// state of the cell that last ran), leaving FP/SIMD trapping as it was:
+/// the kernel ties it to who owns the registers (design D1 of
+/// `lazy-fp-switch`).
 pub fn fp_save(state: &mut FpState) {
-    fp_trap(false);
+    let trapping = FP_TRAPS[index()].load(Ordering::Relaxed);
+    if trapping {
+        fp_trap(false);
+    }
     // SAFETY: `state` is 16-byte aligned and at least 512 bytes; SSE is
     // enabled by `init_tags`.
     unsafe { asm!("fxsave64 [{}]", in(reg) state, options(nostack)) };
+    if trapping {
+        fp_trap(true);
+    }
 }
 
 /// Whether `FXRSTOR` keeps the x87 `FOP`, `FIP` and `FDP` of whatever ran
@@ -178,11 +192,17 @@ pub fn fp_scrubs() -> bool {
     FXSAVE_LEAK.load(Ordering::Relaxed)
 }
 
-/// Loads the FP/SIMD registers for the cell about to run. Where `FXRSTOR`
-/// would keep the previous owner's x87 pointers, an x87 load of a kernel
-/// value first replaces them (design D2 of `scrub-x87-pointers`).
+/// Loads the FP/SIMD registers for the cell about to run, leaving FP/SIMD
+/// trapping as it was, like [`fp_save`] (enable it first to load for a
+/// thread that runs with FP/SIMD: no `CR0` write is then undone; design D1
+/// of `lazy-fp-switch`). Where `FXRSTOR` would keep the previous owner's
+/// x87 pointers, an x87 load of a kernel value first replaces them (design
+/// D2 of `scrub-x87-pointers`).
 pub fn fp_load(state: &FpState) {
-    fp_trap(false);
+    let trapping = FP_TRAPS[index()].load(Ordering::Relaxed);
+    if trapping {
+        fp_trap(false);
+    }
     if FXSAVE_LEAK.load(Ordering::Relaxed) {
         // SAFETY: CR0.TS is clear and x87 enabled; `fnclex` drops pending
         // exceptions so `fild` cannot raise one, `emms` empties the x87
@@ -203,6 +223,9 @@ pub fn fp_load(state: &FpState) {
     // MXCSR bits are cleared by the kernel's initial image and cannot be set
     // by a cell without faulting in `LDMXCSR` first).
     unsafe { asm!("fxrstor64 [{}]", in(reg) state, options(nostack)) };
+    if trapping {
+        fp_trap(true);
+    }
 }
 
 /// Enables SSE for cells (and for the save and load above), SMEP and SMAP,

@@ -44,9 +44,11 @@ pub struct FpState(pub [u64; 66]);
 impl FpState {
     /// The state a program starts with on `machine`: all zero, except the
     /// x87 control word (`0x37f`) and `MXCSR` (`0x1f80`) on x86_64, as Linux.
-    pub fn initial(machine: elf::Machine) -> Self {
+    /// Nothing in it comes from another thread or cell, so the kernel also
+    /// loads it to clear the registers (change `lazy-fp-switch`).
+    pub const fn initial(machine: elf::Machine) -> Self {
         let mut words = [0u64; 66];
-        if machine == elf::Machine::X86_64 {
+        if matches!(machine, elf::Machine::X86_64) {
             words[0] = 0x37f; // FCW, bytes 0-1
             words[3] = 0x1f80; // MXCSR, bytes 24-27
         }
@@ -63,7 +65,7 @@ impl Default for FpState {
 /// Everything needed to resume a cell's execution, as plain data on both
 /// architectures (design decision D2). The AArch64 entry code saves and
 /// restores it in place, so its layout is fixed: `pc` at 0, `sp` at 8, `gpr`
-/// at 16, `tls` at 264, `flags` at 272, `fp` at 288.
+/// at 16, `tls` at 264, `flags` at 272, `fp_used` at 280, `fp` at 288.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C, align(16))]
 pub struct Registers {
@@ -78,6 +80,15 @@ pub struct Registers {
     pub tls: u64,
     /// Processor flags (`SPSR_EL1` or `RFLAGS`).
     pub flags: u64,
+    /// Not 0 once the thread has used FP/SIMD since it started or was
+    /// restored: the kernel then loads `fp` as it switches to the thread
+    /// instead of waiting for its first FP/SIMD instruction to trap
+    /// (design D1 of `lazy-fp-switch`). A hint, not state: snapshots leave
+    /// it out, and a restored thread traps once, then is switched eagerly.
+    /// A whole word, not a `bool`, so that `Registers` stays words without
+    /// a niche, and the values that hold it keep their layout and copies
+    /// (design D3).
+    pub fp_used: u64,
     /// Floating-point and SIMD state.
     pub fp: FpState,
 }
@@ -364,6 +375,8 @@ pub mod testing {
         /// Most references one page may have (sharing past it panics, as
         /// the kernel's counts would).
         pub max_refs: u32,
+        /// What [`Frames::metered`] answers.
+        pub metered: Option<(u64, u64)>,
     }
 
     /// Builds an ELF file of `kind` (2: executable, 3: shared object) with
@@ -425,6 +438,7 @@ pub mod testing {
                 live: BTreeMap::new(),
                 limit: usize::MAX,
                 max_refs: u32::MAX,
+                metered: None,
             }
         }
 
@@ -499,6 +513,10 @@ pub mod testing {
             }
             !full
         }
+
+        fn metered(&self) -> Option<(u64, u64)> {
+            self.metered
+        }
     }
 }
 
@@ -512,6 +530,7 @@ mod tests {
         assert_eq!(core::ptr::addr_of!(r.gpr) as usize - base, 16);
         assert_eq!(core::ptr::addr_of!(r.tls) as usize - base, 264);
         assert_eq!(core::ptr::addr_of!(r.flags) as usize - base, 272);
+        assert_eq!(core::ptr::addr_of!(r.fp_used) as usize - base, 280);
         assert_eq!(core::ptr::addr_of!(r.fp) as usize - base, 288);
         assert_eq!(core::mem::align_of::<super::Registers>(), 16);
     }

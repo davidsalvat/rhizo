@@ -49,7 +49,7 @@ fn the_x87_scrub_follows_the_cpu() {
 fn x87_env() -> [u32; 7] {
     let mut env = [0u32; 7];
     // SAFETY: `env` is 28 writable bytes; the caller cleared CR0.TS (through
-    // `fp_save`). `FNSTENV` only masks x87 exceptions, which the caller's
+    // `fp_trap`). `FNSTENV` only masks x87 exceptions, which the caller's
     // `fp_load` puts back.
     unsafe { core::arch::asm!("fnstenv [{}]", in(reg) &mut env, options(nostack)) };
     env
@@ -70,8 +70,13 @@ fn x87_pointers_never_survive_a_load() {
     static MARK: u32 = 7;
     let mut saved = FpState::default();
     super::user::fp_save(&mut saved);
+    // `fp_save` and `fp_load` leave FP/SIMD trapping as they found it
+    // (change `lazy-fp-switch`): the x87 instructions below need it off,
+    // and it goes back as it was at the end.
+    let trapping = super::user::fp_trapping();
+    super::user::fp_trap(false);
     let ip: u64;
-    // SAFETY: CR0.TS is clear (`fp_save`) and the x87 stack holds what
+    // SAFETY: CR0.TS is clear (`fp_trap`) and the x87 stack holds what
     // `saved` keeps; `MARK` is a kernel static. `fninit` leaves no pending
     // exception and an empty stack, so the load cannot fault.
     unsafe {
@@ -90,6 +95,7 @@ fn x87_pointers_never_survive_a_load() {
     super::user::fp_load(&FpState::initial(Machine::X86_64));
     let after = x87_env();
     super::user::fp_load(&saved);
+    super::user::fp_trap(trapping);
     if !fip && !fdp {
         super::console::BootConsole.write_bytes(b"(x87 pointers not recorded) ");
         return;

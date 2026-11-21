@@ -16,6 +16,8 @@ pub(crate) struct FakeServices {
     room: Option<u64>,
     /// Word 0 of the FP/SIMD state "in the CPU" (`save_fp`), if any.
     cpu_fp: Option<u64>,
+    /// The memory cells share (`memory`).
+    memory: u64,
 }
 
 impl Console for FakeServices {
@@ -46,6 +48,9 @@ impl Services for FakeServices {
             }
             Some(_) => false,
         }
+    }
+    fn memory(&mut self) -> u64 {
+        self.memory
     }
     fn save_fp(&mut self, fp: &mut rhizo_cell::FpState) {
         if let Some(word) = self.cpu_fp {
@@ -446,7 +451,7 @@ fn files_map_privately_and_share_their_pages() {
 
     // Unmapped and dropped from the cache: every frame is back.
     assert_eq!(w.call(MUNMAP, &[base, 5 * 4096]).0, 0);
-    assert!(w.pages.clear(&mut w.frames));
+    assert!(w.pages.trim(&mut w.frames));
     assert_eq!(held(&w), before);
 }
 
@@ -465,6 +470,39 @@ fn sysinfo_affinity_and_advice() {
     assert_eq!(w.call(123, &[0, 4, DATA]).0, -EINVAL);
     assert_eq!(w.call(223, &[1, 0, 0, 2]).0, 0);
     assert_eq!(w.call(223, &[99, 0, 0, 2]).0, -EBADF);
+}
+
+/// Hostile (finding S24): `sysinfo` shows the cell only itself. Its memory
+/// is its own limit and use as the kernel reports them (whatever other
+/// cells hold), and its processes are its own threads.
+#[test]
+fn sysinfo_shows_only_the_cell_itself() {
+    let mut w = World::new(Arch::Aarch64);
+    w.services.memory = 1 << 30;
+    // 10 MiB used of a 64 MiB quota.
+    w.frames.metered = Some((10 << 8, 64 << 8));
+    for _ in 0..2 {
+        w.cell
+            .threads
+            .spawn(rhizo_cell::Registers::default(), 0)
+            .unwrap();
+    }
+    assert_eq!(w.call(179, &[DATA]).0, 0);
+    let info = w.peek(DATA, 112);
+    let word = |at: usize| u64::from_le_bytes(info[at..at + 8].try_into().unwrap());
+    assert_eq!(word(32), 64 << 20, "totalram: the cell's limit");
+    assert_eq!(word(40), 54 << 20, "freeram: what it leaves of it");
+    assert_eq!(info[80..82], 3u16.to_le_bytes(), "procs: its threads");
+    assert_eq!(info[8..32], [0; 24], "no load");
+    // Past its limit (memory it inherited from a fork), nothing is free.
+    w.frames.metered = Some((9 << 8, 8 << 8));
+    assert_eq!(w.call(179, &[DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 32, 8), (8u64 << 20).to_le_bytes());
+    assert_eq!(w.peek(DATA + 40, 8), [0; 8]);
+    // Without a quota: all the memory cells share, less its own use.
+    w.frames.metered = None;
+    assert_eq!(w.call(179, &[DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 32, 8), (1u64 << 30).to_le_bytes());
 }
 
 /// The calls Node.js makes at start-up and under load (spec `linux-abi`,

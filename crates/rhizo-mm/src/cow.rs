@@ -34,6 +34,11 @@ pub trait Frames {
         self.share(phys);
         true
     }
+    /// The frames counted against a quota and the quota's limit, in
+    /// frames, when these frames are metered; `None` otherwise.
+    fn metered(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 const ENTRIES: u64 = 512;

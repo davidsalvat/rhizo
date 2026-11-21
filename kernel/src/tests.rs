@@ -90,6 +90,9 @@ macro_rules! suite {
             ktest_case!(cells_learn_the_cpu_as_on_linux),
             ktest_case!(fp_state_is_private_to_each_cell),
             ktest_case!(fp_state_survives_suspend_and_resume),
+            ktest_case!(fp_registers_hold_nothing_of_another_cell),
+            ktest_case!(fp_state_is_private_to_every_thread_and_cell),
+            ktest_case!(fp_state_survives_suspends_resumes_and_forks),
             ktest_case!(warm_template_of_a_real_program),
             ktest_case!(files_behave_as_on_linux_and_return_memory),
             ktest_case!(files_are_private_to_each_cell),
@@ -119,6 +122,9 @@ macro_rules! suite {
             ktest_case!(cpu_quota_ends_the_cell),
             ktest_case!(file_and_socket_quotas_travel_with_the_cell),
             ktest_case!(a_cell_holds_a_bounded_share_of_sockets),
+            ktest_case!(sysinfo_shows_a_cell_only_itself),
+            ktest_case!(ephemeral_ports_do_not_show_other_cells_binds),
+            ktest_case!(memory_pressure_keeps_the_pages_other_cells_map),
             ktest_case!(cells_run_alike_with_and_without_kpti),
             ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
@@ -1299,6 +1305,144 @@ fn fp_state_survives_suspend_and_resume() {
     }
 }
 
+/// Whether `fp` holds the state a program starts with, and so nothing of
+/// any thread or cell: on x86_64 the x87 control word and `MXCSR` as
+/// Linux sets them, the x87 and XMM registers zero (the rest of the
+/// `FXSAVE` image describes the CPU, not a thread); on AArch64 all zero.
+fn fp_is_initial(fp: &rhizo_cell::FpState) -> bool {
+    let w = &fp.0;
+    if cfg!(target_arch = "x86_64") {
+        w[0] & 0xffff == 0x37f && w[3] & 0xffff_ffff == 0x1f80 && w[4..52].iter().all(|&x| x == 0)
+    } else {
+        w.iter().all(|&x| x == 0)
+    }
+}
+
+/// While a cell runs that has not used FP/SIMD, the CPU's FP/SIMD
+/// registers hold the initial state, not the values of the cell that ran
+/// before (change `lazy-fp-switch`): FP/SIMD trapping alone would leave
+/// them there for code that runs speculatively before the trap (LazyFP,
+/// CVE-2018-3665). Read from the CPU after each scheduling step in which
+/// such a cell ran, right after `fp_regs` filled every register.
+fn fp_registers_hold_nothing_of_another_cell() {
+    let mut host = Host::new();
+    let secret = spawn(&mut host, "fp_regs", &[b"5", b"100"]);
+    let mut checked = 0;
+    for tag in [&b"a"[..], b"b", b"c"] {
+        let quiet = spawn(&mut host, "chatter", &[tag]);
+        let mut seen = 0;
+        while host.finished(quiet).is_none() {
+            host.step();
+            let printed = host.output(quiet).map_or(0, <[u8]>::len);
+            if printed > seen {
+                seen = printed;
+                let mut fp = rhizo_cell::FpState::default();
+                arch::user::fp_save(&mut fp);
+                assert!(
+                    fp_is_initial(&fp),
+                    "another cell's FP/SIMD values while `chatter` ran: {:x?}",
+                    &fp.0[16..24]
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(ended(&host, quiet).0, Ending::Exit(0));
+    }
+    assert!(
+        checked >= 6,
+        "`chatter` ran after `fp_regs` {checked} times"
+    );
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, secret),
+        (Ending::Exit(0), "fp regs ok\n".into())
+    );
+}
+
+/// Cells and threads holding distinct values in every FP/SIMD register
+/// (and the FP control and status registers) across yields and sleeps, many
+/// times over, next to hostile cells that only read their registers: no
+/// value leaks to another thread or cell, none is lost, on every CPU
+/// (`ktest-smp`: threads of one cell at once on several CPUs).
+fn fp_state_is_private_to_every_thread_and_cell() {
+    let mut host = Host::new();
+    let cells = [
+        spawn(&mut host, "fp_regs", &[b"1", b"300", b"3", b"3"]),
+        spawn(&mut host, "fp_regs", &[b"2", b"300", b"3", b"2"]),
+        spawn(&mut host, "fp_regs", &[b"3", b"300"]),
+        spawn(&mut host, "fp_regs", &[b"4", b"300", b"2"]),
+    ];
+    let peekers = [
+        spawn(&mut host, "fp_peek", &[b"300"]),
+        spawn(&mut host, "fp_peek", &[b"300"]),
+    ];
+    let quiet = spawn(&mut host, "yielder", &[]);
+    host.run(|_| false);
+    for id in cells {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "fp regs ok\n".into()));
+    }
+    for id in peekers {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "fp clean\n".into()));
+    }
+    assert_eq!(ended(&host, quiet).0, Ending::Exit(0));
+}
+
+/// A cell whose threads hold values in their FP/SIMD registers, suspended
+/// and resumed (eagerly and lazily, sometimes twice before it runs again,
+/// so a thread that has not touched FP/SIMD since its restore is captured
+/// again) and forked mid-run, next to another such cell and a hostile
+/// reader: it, its forks and the others all find their own values.
+fn fp_state_survives_suspends_resumes_and_forks() {
+    let mut host = Host::new();
+    let other = spawn(&mut host, "fp_regs", &[b"8", b"200"]);
+    let peeker = spawn(&mut host, "fp_peek", &[b"200"]);
+    let mut id = spawn(&mut host, "fp_regs", &[b"6", b"120", b"2", b"4"]);
+    let mut forks = Vec::new();
+    let mut output = Vec::new();
+    for step in 1.. {
+        host.step();
+        if let Some(done) = host.finished(id) {
+            assert_eq!(done.ending, Ending::Exit(0));
+            output.extend_from_slice(&done.output);
+            break;
+        }
+        if step % 7 == 0 {
+            // Every third time twice in a row, before it runs again.
+            let times = if step % 21 == 0 { 2 } else { 1 };
+            for _ in 0..times {
+                let mode = if step % 14 == 0 {
+                    Resume::Eager
+                } else {
+                    Resume::Lazy
+                };
+                let snapshot = host.suspend(id).expect("live");
+                output.extend_from_slice(&host.finished(id).expect("suspended").output);
+                id = host.resume(snapshot, mode, true, true).expect("resume");
+            }
+        }
+        if step % 25 == 0 && forks.len() < 4 {
+            forks.extend(host.fork(id, 1).expect("fork"));
+        }
+    }
+    assert_eq!(
+        alloc::string::String::from_utf8_lossy(&output),
+        "fp regs ok\n"
+    );
+    host.run(|_| false);
+    assert!(!forks.is_empty(), "no fork was made mid-run");
+    for child in forks {
+        assert_eq!(
+            ended(&host, child),
+            (Ending::Exit(0), "fp regs ok\n".into())
+        );
+    }
+    assert_eq!(
+        ended(&host, other),
+        (Ending::Exit(0), "fp regs ok\n".into())
+    );
+    assert_eq!(ended(&host, peeker), (Ending::Exit(0), "fp clean\n".into()));
+}
+
 /// A real program frozen after its warm-up: every cell forked from it
 /// answers without repeating the warm-up.
 fn warm_template_of_a_real_program() {
@@ -2079,6 +2223,92 @@ fn a_cell_holds_a_bounded_share_of_sockets() {
             "{out}"
         );
     }
+}
+
+// --- Cross-cell leaks (change `close-cross-cell-leaks`) ---------------------
+
+/// Hostile (finding S24): `sysinfo` shows a cell its own memory limit and
+/// use, and its own threads; a neighbour taking 32 MiB changes nothing in
+/// it (it showed the kernel's free memory before).
+fn sysinfo_shows_a_cell_only_itself() {
+    use rhizo_cell::quota::Quota;
+    let mut host = Host::new();
+    let observer = spawn(&mut host, "observer", &[b"memory", b"7401"]);
+    let quota = Quota {
+        memory: 64 << 20,
+        ..Quota::NONE
+    };
+    assert!(host.set_quota(observer, quota));
+    while host.output(observer) != Some(b"ready\n") {
+        host.step();
+    }
+    let neighbour = spawn(&mut host, "observer", &[b"neighbour", b"7401", b"32", b"0"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, neighbour), (Ending::Exit(0), "".into()));
+    assert_eq!(
+        ended(&host, observer),
+        (
+            Ending::Exit(0),
+            "ready\nmemory total=64 change=0 procs=1\n".into()
+        )
+    );
+}
+
+/// Hostile (finding S25): the ephemeral ports a cell gets do not show how
+/// many other cells took. A neighbour binds 100 between the observer's
+/// two binds; the observer's ports are one apart (102 with the one counter
+/// all cells shared before).
+fn ephemeral_ports_do_not_show_other_cells_binds() {
+    let mut host = Host::new();
+    let observer = spawn(&mut host, "observer", &[b"ports", b"7400"]);
+    while host.output(observer) != Some(b"ready\n") {
+        host.step();
+    }
+    let neighbour = spawn(
+        &mut host,
+        "observer",
+        &[b"neighbour", b"7400", b"0", b"100"],
+    );
+    host.run(|_| false);
+    assert_eq!(ended(&host, neighbour), (Ending::Exit(0), "".into()));
+    assert_eq!(
+        ended(&host, observer),
+        (Ending::Exit(0), "ready\nports +1\n".into())
+    );
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// Hostile (finding S26): a cell that takes memory until refused makes the
+/// kernel drop the kept file pages no cell maps, but not the page another
+/// cell maps (it emptied the whole page cache before: a flush any cell
+/// could make). Every frame comes back.
+fn memory_pressure_keeps_the_pages_other_cells_map() {
+    let before = memory_balance();
+    assert_eq!(crate::cell::kept_pages(), 0);
+    let mut host = Host::new();
+    let user = spawn(&mut host, "observer", &[b"page"]);
+    while host.output(user) != Some(b"mapped\n") {
+        host.step();
+    }
+    assert_eq!(crate::cell::kept_pages(), 1);
+    let hog = spawn(&mut host, "hog", &[]);
+    while host.output(hog) != Some(b"exhausted\n") {
+        host.step();
+    }
+    assert_eq!(
+        crate::cell::kept_pages(),
+        1,
+        "the page another cell maps stays kept"
+    );
+    assert!(host.wake(user));
+    host.run(|_| false);
+    assert_eq!(ended(&host, hog), (Ending::Exit(0), "exhausted\n".into()));
+    assert_eq!(
+        ended(&host, user),
+        (Ending::Exit(0), "mapped\npage ok\n".into())
+    );
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
 }
 
 /// Hostile threads on several CPUs (spec `isolation`, `multi-core`):

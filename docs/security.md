@@ -17,7 +17,10 @@ agent workload's host calls, and snapshots as untrusted input (findings
 S14 to S21, section [Second review](#second-review-d2)), then by a review
 of frames from the network (boundary B5 of the audit scope, change
 `fuzz-wire-packets`: findings S22 and S23, section
-[Frames from the network](#frames-from-the-network-b5)).
+[Frames from the network](#frames-from-the-network-b5)), then by the
+first pass over the shared state through which cells could observe each
+other (change `close-cross-cell-leaks`: findings S24 to S26, section
+[Cross-cell leaks](#cross-cell-leaks)).
 
 The scope we would hand an external auditor (trust boundaries, components
 ranked by risk with their size, open questions and an effort estimate) is
@@ -40,6 +43,10 @@ secrecy is assumed: there is no KASLR).
    in the kernel, kernel heap, console).
 5. Learn another cell's data through recycled frames, a fork, a snapshot
    or a resume.
+6. Learn what another cell does, or signal to it, through kernel state
+   both can reach without a handle (storage channels), from
+   `close-cross-cell-leaks` on; the full inventory and what is left are in
+   [Cross-cell leaks](#cross-cell-leaks).
 
 **Second attacker: a hostile snapshot** (from the second review on).
 Templates are downloaded as snapshot files (`docs/vision.md`; `rhizo load`
@@ -123,12 +130,14 @@ What makes the boundary hold:
 - **Copy-on-write.** Shared tables and pages are read-only for every
   sharer, even after `mprotect` asks for writes (finding S12); a write
   fault copies only what is shared, and only in the lower half (S2).
-- **Per-cell state.** Registers, FP/SIMD state (switched lazily, trapped on
-  first use), files and descriptors (`rhizo_fs::Fs`, private copy-on-write)
-  and the system-call handler (`Abi`) belong to one cell. On x86_64 CPUs
-  whose `FXRSTOR` keeps the previous x87 instruction and data pointers
-  (AMD and Hygon without `XSAVEERPTR`, and QEMU's emulation), an x87 load
-  of a kernel variable overwrites them before each FP/SIMD load
+- **Per-cell state.** Registers, FP/SIMD state (loaded as a thread that
+  uses it is switched in, trapped on first use otherwise, never left in
+  the registers for another thread: see *Speculation*), files and
+  descriptors (`rhizo_fs::Fs`, private copy-on-write) and the system-call
+  handler (`Abi`) belong to one cell. On x86_64 CPUs whose `FXRSTOR`
+  keeps the previous x87 instruction and data pointers (AMD and Hygon
+  without `XSAVEERPTR`, and QEMU's emulation), an x87 load of a kernel
+  variable overwrites them before each FP/SIMD load
   (`scrub-x87-pointers`).
 - **Per-CPU kernel data** (`add-smp-boot`). The entry code finds the
   kernel stack and the running cell's registers through per-CPU data that
@@ -188,9 +197,9 @@ and at most 256 sockets (S21).
   them; nothing in a cell can raise them, and a snapshot file cannot
   either: a loaded one gets at most a new cell's (`snapshots-on-disk`).
 
-## Speculation (Meltdown)
+## Speculation (Meltdown, LazyFP)
 
-`add-kpti` closed the Meltdown part of O3.
+`add-kpti` closed the Meltdown part of O3, `lazy-fp-switch` LazyFP.
 
 - **x86_64: KPTI.** On CPUs open to rogue data cache load (Intel CPUs
   without `IA32_ARCH_CAPABILITIES.RDCL_NO`, unknown vendors; not AMD or
@@ -215,6 +224,17 @@ and at most 256 sockets (S21).
   runners whose CPUs do not need it. On CI's KVM runners (nested
   virtualization, PCIDs): a system call 70 → 187 ns, a switch between
   cells 234 → 281 ns (+20 %), spawn to exit of `hello` 7.0 → 7.2 µs.
+- **FP/SIMD state (LazyFP, CVE-2018-3665)** (`lazy-fp-switch`). Trapping
+  FP/SIMD while another thread's values stay in the registers would let
+  an FP/SIMD instruction that runs speculatively before the trap read
+  them. The registers never hold another thread's or cell's values while
+  cell code runs: a thread's state is saved when it stops running on a
+  CPU, and the next thread either has its own loaded (it has used
+  FP/SIMD) or finds the registers cleared to the initial state, with
+  FP/SIMD trapping until its first use. Both architectures do the same,
+  whether or not the CPU is affected. The in-kernel test
+  `fp_registers_hold_nothing_of_another_cell` reads the registers after
+  a cell that never used FP/SIMD ran right after one that filled them.
 - **Left open.** Spectre v1/v2, L1TF, MDS and their mitigations; the entry
   pages themselves are readable by speculation (they hold per-CPU stack
   pointers and the cell's own saved RDI, no other cell's data).
@@ -354,6 +374,9 @@ the threat model above.
 | S21 | Medium | both | Sockets are bounded kernel-wide (4096): one cell can hold about half, two all, and every other cell gets `ENFILE` | Fixed (`add-cell-quotas`) |
 | S22 | Medium | both | A flood of frames from the network kept the CPU that polls the card in `smoltcp` for as long as it lasted | Fixed (`fuzz-wire-packets`) |
 | S23 | Low | both | A connection to the outside on which nothing arrived for 20 s was reset (`smoltcp` 0.14 applies its timeout to idle connections) | Worked around (`fix-tcp-long-wait`) |
+| S24 | Medium | both | `sysinfo` reported the kernel's free memory: every cell saw every other cell's allocations, a storage channel between cells | Fixed (`close-cross-cell-leaks`) |
+| S25 | Medium | both | Ephemeral ports came from one counter for all cells: the distance between a cell's ports counted every other cell's binds | Fixed (`close-cross-cell-leaks`) |
+| S26 | Medium | both | Any cell could empty the whole page cache (65,536 pages of its own files, or memory pressure from a cell without a quota): the flush half of a flush-and-probe timing channel; the frames of mapped pages then left the cache uncounted in their mappers' quotas | Fixed (`close-cross-cell-leaks`) |
 
 **S1. `mprotect` reached the kernel half (Critical, x86_64).** On x86_64 a
 cell's root table shares the kernel's upper-half entries, and those
@@ -489,7 +512,7 @@ kernel; every finding reproduced before its fix and kept fixed by a test.
 | Area | What a hostile cell (or snapshot) can try | What holds it |
 |---|---|---|
 | **Several CPUs** (`add-smp-boot`, `add-smp-scheduling`, `add-parallel-threads`) | Threads of one cell on several CPUs racing a system call against `munmap`, `mprotect`, `exit_group` or a futex on memory that goes away; a stale translation on another CPU after a frame is freed | A cell's calls and the faults that change its tables take its lock, one at a time; on x86_64 a shrinking change interrupts the cell's other CPUs and keeps them out until it is done (the clean-CPU set makes others drop the PCID); AArch64 invalidations are broadcast and a copy-on-write replacement is break-before-make (`resolve_write` clears the entry and flushes before writing the new one); the cell is freed by the last CPU to leave it. Per-CPU data is `TPIDR_EL1` / the kernel GS base, out of a cell's reach. Exercised by `racer` (below); no finding. |
-| **Sockets** (`rhizo-net`, loopback, Unix, UDP, `smoltcp` on the card) | Exhausting sockets, ports, backlogs and buffers shared by every cell; long or malformed addresses, `msghdr` and `iovec`; `ioctl` | Buffers are bounded (256 KiB per stream, `DGRAM_MAX`) and asked from memory before they grow; paths ≤ 107 bytes; `iovec` counts ≤ 1024 and lengths ≤ `SSIZE_MAX`, their sum saturates (S16); `ioctl` takes `FIONBIO`, `FIOCLEX`, `FIONCLEX` only, on the caller's own descriptor. Ephemeral ports and sockets are a kernel-wide pool (S21). A Unix name is a number in the cell's own tree: a cell reaches another's Unix socket only if its files hold the name. |
+| **Sockets** (`rhizo-net`, loopback, Unix, UDP, `smoltcp` on the card) | Exhausting sockets, ports, backlogs and buffers shared by every cell; long or malformed addresses, `msghdr` and `iovec`; `ioctl` | Buffers are bounded (256 KiB per stream, `DGRAM_MAX`) and asked from memory before they grow; paths ≤ 107 bytes; `iovec` counts ≤ 1024 and lengths ≤ `SSIZE_MAX`, their sum saturates (S16); `ioctl` takes `FIONBIO`, `FIOCLEX`, `FIONCLEX` only, on the caller's own descriptor. Ephemeral ports and sockets are a kernel-wide pool (S21); each cell walks the ports from its own start (S25). A Unix name is a number in the cell's own tree: a cell reaches another's Unix socket only if its files hold the name. |
 | **Parked connections** (`keep-tcp-across-suspend`, snapshot v6) | A forged snapshot naming another suspended cell's parked connection | Since S15, keys are SipHash-2-4 of a counter under a boot secret no snapshot holds; a key that matches nothing comes back reset or bound again; each key re-attaches once. |
 | **virtio** (mmio, pci) | — (the device is trusted, above) | Robustness only: configuration-space parsing bounded (48 capabilities, offsets inside the 4 KiB function), BARs naturally aligned powers of two below the top of memory (S17), structures inside their BAR. Fuzzed (`any_configuration_space_is_set_up_or_refused`). |
 | **Dynamic linking** (`PT_INTERP`, file `mmap`, `MAP_FIXED`, the page cache) | Mapping file pages without end; writing through a private mapping of a page other cells share; `MAP_FIXED` over its own or the kernel's memory; a planted interpreter with hostile headers | The cache holds each page it keeps, so a block's bytes cannot change while a frame shows them (a write gives the file a new block, hence a new key); file frames are mapped read-only, writable mappings copy-on-write (S12 rule); a count that cannot grow gives a private copy (S14); `MAP_FIXED` ends at or below `USER_END` and not on page 0; interpreters must be position independent with no interpreter of their own, and every entry point is checked (S18). Mapped holes and pages past the end are not asked for first (S20). |
@@ -705,6 +728,83 @@ neighbour-cache entries and delay connections by about a second, and a
 rogue DHCP server can change the card's address: both come with sharing a
 network segment, and are listed below.
 
+## Cross-cell leaks
+
+Change `close-cross-cell-leaks`, from the covert-channel inventory of
+`add-cell-hierarchy` (design D12 there: 40 kernel resources more than one
+cell can touch). Goal 6 of the threat model: two hostile cells holding no
+handle to each other, one changing kernel state, the other reading it
+(storage channel) or timing it (timing channel). The hierarchy closes most
+of the inventory in phases; this change closes the three items that leaked
+today at little cost. Method: reading every call that reports kernel
+state, and a hostile in-kernel test per finding with two cells
+(`observer`, `hog`), each failing before its fix.
+
+### Findings
+
+**S24. `sysinfo` showed the machine (Medium, both).** `totalram` was the
+memory cells share and `freeram` the frames free in the allocator: a cell
+reading it in a loop saw every other cell allocate and free, and two cells
+could signal through it at many bits per second. *Fix:* `sysinfo` reports
+the calling cell only: its memory quota (at most the memory cells share)
+as `totalram`, what its own metered use leaves of it as `freeram`, its
+threads as `procs`; no load, no swap. Nothing else reports global state:
+there is no `/proc`, `getrusage` and `times` answer `ENOSYS`, `getrlimit`
+and `prlimit64` report the cell's own quota, `uname` and
+`sched_getaffinity` are constant, the clocks are boot-relative.
+*Tests:* `sysinfo_shows_a_cell_only_itself` (in the kernel: a neighbour
+holding 32 MiB changes nothing in an observer's `sysinfo`; it read
+`change=32` before), `sysinfo_shows_only_the_cell_itself` (`rhizo-abi`).
+
+**S25. One counter for all ephemeral ports (Medium, both).** `bind` to
+port 0 and implicit binds took the next port of one counter: the distance
+between two ports one cell took was one plus every port other cells took
+in between, connections to the outside included. *Fix:* each cell walks
+the range in order from a start of its own, SipHash-2-4 of its
+identifier under the kernel's secret (with the boot, as
+`fix-ephemeral-ports` wanted); the cell's system-call handler keeps its
+cursor and hands it to the sockets for the five calls that can bind. A resumed or forked
+cell has a new identifier, so a new start. *Tests:*
+`ephemeral_ports_do_not_show_other_cells_binds` (in the kernel: a
+neighbour binds 100 ports between an observer's two binds; the observer's
+ports are 1 apart, 102 before), `a_cells_ephemeral_ports_do_not_show_other_cells_binds`
+and `a_cells_ephemeral_ports_skip_ports_in_use` (`rhizo-net`),
+`another_cells_binds_do_not_show_in_my_ports` (`rhizo-abi`).
+
+**S26. Any cell could empty the page cache (Medium, both).** The cache of
+file pages (`add-dynamic-linking`) emptied itself when a page came past
+its 65,536 pages, which a cell reaches by writing 256 MiB of its own
+files and mapping them, and `drop_images` emptied it under memory
+pressure, which a cell without a memory quota reaches by allocating.
+Another cell's next map of a library page then missed: the flush of a
+flush-and-probe channel. The frames of pages still mapped also left the
+cache for their mappers without being counted against their quotas, so a
+cell could map file pages past its quota by flushing and mapping again.
+*Fix:* a full cache drops only pages whose block no file holds any more
+(nobody can map them again), at most once every 4,096 refusals while it
+stays full, and a page it has no room for is the caller's own copy from
+its own frames, counted in its quota (as is now the copy S14 gives).
+Memory pressure drops only kept pages whose dropping frees memory: those
+no mapping uses and those no file holds. *Tests:*
+`memory_pressure_keeps_the_pages_other_cells_map` (in the kernel: `hog`
+exhausts memory while `observer page` maps a page of its own file; the
+page stays kept, where the cache was empty before the fix),
+`a_full_cache_keeps_what_others_map` and
+`a_full_cache_drops_pages_nobody_can_map` (`rhizo-abi`),
+`a_page_knows_whether_its_block_is_held_elsewhere` (`rhizo-fs`).
+
+### What is left
+
+Open, for the phases of `add-cell-hierarchy` (its D12 numbers):
+
+| Item | What a cell can still observe |
+|---|---|
+| 1, 2, 3 Ports as one namespace | That a port is held by someone: `EADDRINUSE` on an explicit bind, or a skipped port in its own sequence when another cell holds the very port it would take next. Closed by loopback networks per tree and kernel-chosen card ports. |
+| 9 Deduplication | Whether a page of a file another cell also holds (a host file set, a fork's files) is in the cache: a hit costs less than a miss. A cell able to exhaust memory still drops the pages no cell maps right now. Closed by a cache per domain with reserved budgets. |
+| 19, 20 Identifiers | `getpid` and thread identifiers count the cells the host created (O6). Only the host creates cells, so no cell writes this counter. |
+| 5, 7, 8, 24, 29 Shared pools | `ENFILE`, `ENOMEM`, `ENOSPC` when the kernel's socket pool, memory or heap is exhausted by others. Closed by budgets per domain. |
+| 14 to 17, 25, 28 Timing | Contention for CPUs, caches, locks and the network card (O3). Accepted and measured (`covert.cpu_bps`) by the hierarchy. |
+
 ## Known limitations and open findings
 
 These are not fixed by this change; each needs its own design.
@@ -716,7 +816,7 @@ These are not fixed by this change; each needs its own design.
 | O3 | Medium | **Side channels other than Meltdown are out of scope.** Meltdown is closed by `add-kpti` (KPTI on x86_64 where needed, E0PD on AArch64; see *Speculation*). Caches, branch predictors, other speculation attacks (Spectre, L1TF, MDS) and timing are not reviewed. An AArch64 CPU with neither E0PD nor CSV3 is reported, not protected. Cells see a nanosecond clock. |
 | O4 | — | **Closed by `add-crypto-random`** (see *Randomness*). What remains: a CPU without a hardware random source (an AArch64 host without FEAT_RNG under KVM) falls back to the cycle counter, and the boot says `getrandom is predictable`; there is no virtio-rng driver yet. |
 | O5 | Low | **SMEP, SMAP and PAN closed by `add-user-access-guards`.** Left: SMAP and PAN cannot see accesses through the direct map (software checks guard it); on x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
-| O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. |
+| O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. Only the host creates cells, so no cell can signal through it; see [Cross-cell leaks](#cross-cell-leaks) for this and the other channels still open. |
 | O7 | Low | **Host paths may panic.** Forking one cell, or spawning one kept image, more than 65535 times while every copy lives panics (frame reference counts are 16 bits; a cell's own path, mapping file pages, gives copies instead since S14); a frame lost when loading an executable fails half way. Only the host can do either. |
 | — | Low | **Hosts on the VM's network segment** (B5, above) can evict the card's neighbour-cache entries, delaying a connection's frames by about a second, and a rogue DHCP server can change or take away the card's address. Both come with sharing a segment; give the VM a network of its own. |
 | — | — | **Concurrency between CPUs** was reviewed by reading and by hostile cells (second review), not by a model checker or a proof. |
@@ -776,5 +876,10 @@ review:
   - `no_two_cells_draw_the_same_random_bytes`: `dice`, forked, copied from
     a template and resumed twice from one snapshot; and
     `hardware_entropy_works_where_present`.
+- Cross-cell leaks (S24 to S26), in the kernel with `observer` and `hog`:
+  `sysinfo_shows_a_cell_only_itself`,
+  `ephemeral_ports_do_not_show_other_cells_binds`,
+  `memory_pressure_keeps_the_pages_other_cells_map`; on the host the tests
+  named under each finding.
 - Host, `rhizo-core`: `block_function_matches_rfc_8439`,
   `the_key_is_erased_after_every_request`, `split_generators_share_no_output`.
