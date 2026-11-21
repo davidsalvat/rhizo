@@ -141,6 +141,7 @@ come back, or the benchmark fails.
 | `density.sched_p50_us`, `_p99_us`, `_p999_us` | timing | Scheduling latency: a cell joined a run queue (preempted, yielded, new, or its deadline passed) until it runs |
 | `density.wake_p50_us`, `density.wake_p99_us`, `_p999_us` | timing | Wake-up latency: its event (deadline, or a socket change by another cell's system call) until it runs |
 | `density.syscall_p50_ns`, `_p99_ns`, `_p999_ns` | timing | Time in the system-call handler, locks included |
+| `density.wasted_wakeups_pct/rhizo/<vmm>` | rate | Of the cells a socket change woke from waiting on descriptors, the share whose next system call waited again: a wake-up that found nothing (each socket wakes only the cells waiting on it, change `add-socket-wait-queues`) |
 | `density.oom_cells/rhizo/<vmm>` | count, higher is better | Idle cells memory held before the kernel refused one |
 
 In the `ci` environment (from two CI runs that agreed within the

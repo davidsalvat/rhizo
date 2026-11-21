@@ -19,6 +19,7 @@ rhizo-net = { path = "../rhizo-net" }
 [dev-dependencies]
 rhizo-hal = { path = "../rhizo-hal", features = ["testing"] }
 rhizo-cell = { path = "../rhizo-cell", features = ["testing"] }
+proptest = "1"
 
 [lints]
 workspace = true

@@ -43,6 +43,10 @@ pub enum ElfError {
     /// The program's interpreter (`PT_INTERP`) is not in the cell's files,
     /// or is not an interpreter that can be loaded.
     BadInterpreter,
+    /// The first instruction (the executable's or its interpreter's entry
+    /// point) is past the cell's addresses: entering the cell there would
+    /// fault in the kernel on x86_64 (finding S18).
+    BadEntry(u64),
 }
 
 const MAX_SEGMENTS: usize = 8;

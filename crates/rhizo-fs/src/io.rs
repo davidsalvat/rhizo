@@ -174,6 +174,14 @@ impl Tables {
         }
     }
 
+    /// Counts changes to pipes, event counters and `epoll` instances: data
+    /// in or out, an end closed, an interest changed. Only the cell's own
+    /// threads make them, so a thread waiting on one of these waits for
+    /// another thread of its cell (design D3 of `add-socket-wait-queues`).
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
     /// Whether socket handles wait to be released.
     pub fn has_released(&self) -> bool {
         !self.released.is_empty()
@@ -187,6 +195,7 @@ impl Tables {
 
     /// One description of `target` (not a file or socket) is gone.
     pub(crate) fn drop_end(&mut self, target: Target) {
+        self.changes += 1;
         let i = match target {
             Target::Pipe(i, write) => {
                 let Object::Pipe {
@@ -255,6 +264,7 @@ impl Tables {
             && let Object::Pipe { data, .. } = self.object_mut(i)
         {
             data.drain(..done);
+            self.changes += 1;
         }
         Ok(done)
     }
@@ -281,6 +291,7 @@ impl Tables {
         if let Object::Pipe { data, .. } = self.object_mut(i) {
             data.extend(&bytes[..n]);
         }
+        self.changes += 1;
         Ok(n)
     }
 
@@ -305,6 +316,7 @@ impl Tables {
         if let Object::Event { count, .. } = self.object_mut(i) {
             *count -= take;
         }
+        self.changes += 1;
         Ok(take)
     }
 
@@ -324,6 +336,7 @@ impl Tables {
         if let Object::Event { count, .. } = self.object_mut(i) {
             *count += value;
         }
+        self.changes += 1;
         Ok(())
     }
 
@@ -410,6 +423,7 @@ impl Tables {
         if let Target::Inode(_) = target {
             return Err(Error::Perm); // regular files and directories
         }
+        self.changes += 1;
         let Object::Epoll(list) = self.object_mut(i) else {
             unreachable!("epoll descriptions refer to epoll instances")
         };

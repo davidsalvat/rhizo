@@ -41,6 +41,15 @@ jobs:
           seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
           echo "PROPTEST_RNG_SEED=$seed (rerun a failure with this value)"
           PROPTEST_RNG_SEED=$seed PROPTEST_CASES=4096 cargo test -p rhizo-mm
+      - name: Run the hostile fuzzers with a random seed (docs/security.md)
+        run: |
+          seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+          echo "PROPTEST_RNG_SEED=$seed (rerun a failure with this value)"
+          export PROPTEST_RNG_SEED=$seed PROPTEST_CASES=4096
+          cargo test -p rhizo-abi -- hostile:: exec::
+          cargo test -p rhizo-snapshot -- hostile::
+          cargo test -p rhizo-virtio -- hostile::
+          cargo test -p rhizo-cell -- hostile
 
   soak:
     name: Long reference workloads (server and laptop)
