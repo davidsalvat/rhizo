@@ -483,15 +483,15 @@ impl Tree {
         self.node(id).limits.left(self.reserved_by(id)).left(used)
     }
 
-    /// Adds root `id` of a new domain `domain` (a fresh identifier, never
-    /// 0) and returns its number: 1, or 2 when `skip` is 1 (`skip` is the
-    /// source's number for a copy, so a copy's `getpid` differs, design
-    /// D22; 0 for none).
-    pub fn add_root(&mut self, id: u32, domain: u32, spec: Spec, skip: u32) -> Result<u32, Error> {
-        if id == HOST || domain == 0 {
+    /// Adds root `id` of a new domain, whose identifier is `id` (the
+    /// kernel's identifiers are fresh: never one a domain had), and returns
+    /// its number: 1, or 2 when `skip` is 1 (`skip` is the source's number
+    /// for a copy, so a copy's `getpid` differs, design D22; 0 for none).
+    pub fn add_root(&mut self, id: u32, spec: Spec, skip: u32) -> Result<u32, Error> {
+        if id == HOST {
             return Err(Error::Invalid);
         }
-        let mut node = self.made(id, HOST, domain, spec)?;
+        let mut node = self.made(id, HOST, id, spec)?;
         let i = self.insert_at(id)?;
         (node.pid, node.next_pid) = first_numbers(skip);
         self.nodes.insert(i, node);
@@ -684,7 +684,8 @@ impl Tree {
 
     /// Adds the cells `ids` as copies of `source` (design D13): siblings of
     /// it, all or none. Copies of a root are roots, each of a new domain
-    /// from `fresh`, numbered from 1 but never with the source's number;
+    /// (its identifier the copy's), numbered from 1 but never with the
+    /// source's number;
     /// copies of any other cell are carved from its parent's budget again.
     /// A copy has the source's limits and policies, and no children.
     /// `placed(k, pid, domain)` learns the number and domain of copy `k`.
@@ -693,51 +694,55 @@ impl Tree {
         source: u32,
         ids: &[u32],
         usage: Usage,
-        fresh: Fresh,
         placed: &mut dyn FnMut(usize, u32, u32),
     ) -> Result<(), Error> {
-        let s = self.get(source).ok_or(Error::NotFound)?;
+        let si = self.index(source).ok_or(Error::NotFound)?;
+        let s = &self.nodes[si];
         let (parent, pid) = (s.parent, s.pid);
         let count = u32::try_from(ids.len()).map_err(|_| Error::Invalid)?;
         if parent != HOST {
             self.room_for(parent, s.limits.charge(), count, usage)?;
         }
+        // Where a single copy goes, found once.
+        let mut place = None;
         for (k, &id) in ids.iter().enumerate() {
-            if id == HOST || ids[..k].contains(&id) || self.get(id).is_some() {
+            let at = self.nodes.binary_search_by_key(&id, |n| n.id);
+            if id == HOST || ids[..k].contains(&id) || at.is_ok() {
                 return Err(Error::Exists);
             }
+            place = at.err().filter(|_| ids.len() == 1);
         }
         reserve(&mut self.nodes, ids.len())?;
-        // Nothing fails from here. An exclusive CPU set stays with one
-        // domain.
-        let mut copy = Some(self.node(source).clone());
-        if let Some(c) = copy.as_mut() {
-            (c.first_child, c.next_sibling, c.children, c.next_pid) = (HOST, HOST, 0, 1);
-            if c.policy.cpus != 0 {
-                c.policy = self.shared(Policy {
-                    cpus: 0,
-                    ..Policy::clone(&c.policy)
-                })?;
-            }
-        }
+        // An exclusive CPU set stays with one domain.
+        let set = self.nodes[si].policy.cpus != 0;
+        let policy = match set {
+            true => Some(self.shared(Policy {
+                cpus: 0,
+                ..Policy::clone(&self.nodes[si].policy)
+            })?),
+            false => None,
+        };
+        // Nothing fails from here. Each copy is made in its place.
+        let mut si = si;
         for (k, &id) in ids.iter().enumerate() {
-            // The last copy takes the record itself.
-            let mut node = if k + 1 == ids.len() {
-                copy.take()
-            } else {
-                copy.clone()
+            let i = place.unwrap_or_else(|| {
+                let at = self.nodes.binary_search_by_key(&id, |n| n.id);
+                at.unwrap_err()
+            });
+            let node = self.nodes[si].clone();
+            self.nodes.insert(i, node);
+            si += usize::from(i <= si);
+            let n = &mut self.nodes[i];
+            (n.id, n.first_child, n.next_sibling, n.children) = (id, HOST, HOST, 0);
+            if let Some(p) = &policy {
+                n.policy = p.clone();
             }
-            .expect("a record for each copy");
-            node.id = id;
-            let i = self.nodes.binary_search_by_key(&id, |n| n.id).unwrap_err();
             if parent == HOST {
-                node.domain = fresh();
-                (node.pid, node.next_pid) = first_numbers(pid);
-                placed(k, node.pid, node.domain);
-                self.nodes.insert(i, node);
+                n.domain = id;
+                (n.pid, n.next_pid) = first_numbers(pid);
+                placed(k, n.pid, id);
             } else {
-                let domain = node.domain;
-                self.nodes.insert(i, node);
+                let domain = n.domain;
                 self.link(id, parent);
                 let p = self.number(id, 0);
                 self.node_mut(id).pid = p;
@@ -748,17 +753,15 @@ impl Tree {
     }
 
     /// Gives cell `old` the identifier `new` (a resume gives the cell a new
-    /// kernel identifier); its place, domain and number stay. Returns
-    /// whether `old` was in the tree and `new` was not.
-    pub fn rekey(&mut self, old: u32, new: u32) -> bool {
-        if new == HOST || self.get(new).is_some() {
-            return false;
+    /// kernel identifier); its place, domain and number stay. Returns its
+    /// node, or `None` if `old` was not in the tree or `new` was.
+    pub fn rekey(&mut self, old: u32, new: u32) -> Option<&Node> {
+        let at = self.nodes.binary_search_by_key(&new, |n| n.id).err()?;
+        if new == HOST {
+            return None;
         }
-        let Some(i) = self.index(old) else {
-            return false;
-        };
+        let i = self.index(old)?;
         // Moves the node to its new place in one rotation.
-        let at = self.nodes.binary_search_by_key(&new, |n| n.id).unwrap_err();
         let at = if at > i {
             self.nodes[i..at].rotate_left(1);
             at - 1
@@ -787,7 +790,7 @@ impl Tree {
             n.parent = new;
             c = n.next_sibling;
         }
-        true
+        Some(&self.nodes[at])
     }
 
     /// Moves cell `id` under `to` ([`HOST`]: makes it a root), at `by`'s

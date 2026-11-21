@@ -45,16 +45,15 @@ impl Host {
     /// number 1 (`getpid`, spec `linux-abi`); `false` if the tree has no
     /// room.
     pub(super) fn enter_root(&mut self, cell: &mut Cell) -> bool {
-        let domain = fresh_domain();
         let spec = Spec {
             limits: root_limits(&cell.quota),
             ..Spec::default()
         };
-        let Ok(pid) = self.tree.add_root(cell.id, domain, spec, 0) else {
+        let Ok(pid) = self.tree.add_root(cell.id, spec, 0) else {
             return false;
         };
         cell.renumber(pid);
-        cell.domain = domain;
+        cell.domain = cell.id;
         true
     }
 
@@ -82,7 +81,7 @@ impl Host {
             }
         };
         self.tree
-            .add_copies(source, ids, &|_| used, &mut fresh_domain, &mut placed)
+            .add_copies(source, ids, &|_| used, &mut placed)
             .is_ok()
     }
 
@@ -92,31 +91,22 @@ impl Host {
     /// `snapshots`, loaded snapshots hold no authority). Its threads keep
     /// their identifiers. `false` if the tree has no room.
     pub(super) fn enter_restored(&mut self, cell: &mut Cell, origin: u32) -> bool {
-        let at = self.suspended.iter().position(|&s| s == origin);
-        if let Some(at) = at.filter(|_| self.tree.rekey(origin, cell.id)) {
-            self.suspended.swap_remove(at);
-        } else {
-            let spec = Spec {
-                limits: root_limits(&cell.quota),
-                ..Spec::default()
-            };
-            if self
-                .tree
-                .add_root(cell.id, fresh_domain(), spec, 0)
-                .is_err()
-            {
-                return false;
-            }
-        }
-        self.place(cell);
-        true
-    }
-
-    /// Sets `cell`'s number and domain from its node.
-    fn place(&self, cell: &mut Cell) {
-        if let Some(n) = self.tree.get(cell.id) {
+        if let Some(at) = self.suspended.iter().position(|&s| s == origin)
+            && let Some(n) = self.tree.rekey(origin, cell.id)
+        {
             (cell.pid, cell.domain) = (n.pid(), n.domain());
+            self.suspended.swap_remove(at);
+            return true;
         }
+        let spec = Spec {
+            limits: root_limits(&cell.quota),
+            ..Spec::default()
+        };
+        let Ok(pid) = self.tree.add_root(cell.id, spec, 0) else {
+            return false;
+        };
+        (cell.pid, cell.domain) = (pid, cell.id);
+        true
     }
 
     /// What cell `id` uses itself, as limits: its frames, CPU time and
