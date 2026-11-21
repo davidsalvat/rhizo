@@ -47,7 +47,8 @@ impl PageSource for FramePages {
 /// freed allocation.
 #[cfg(feature = "cells")]
 pub mod window {
-    use crate::memory::{self, with_frames};
+    use crate::arch::cpu::CpuTlb;
+    use crate::memory::{self, DirectMap, with_frames};
     use core::ptr::NonNull;
     use core::sync::atomic::{AtomicU64, Ordering};
     use rhizo_mm::FRAME_SIZE;
@@ -107,13 +108,24 @@ pub mod window {
         unmap(ptr.as_ptr() as u64, count);
     }
 
-    /// Unmaps `count` pages from `start` and frees their frames.
+    /// Unmaps `count` pages from `start` and frees their frames, and the
+    /// tables left empty (design D3 of `add-heap-trim`): addresses are
+    /// never reused, so they would never map anything again.
     fn unmap(start: u64, count: usize) {
         for i in 0..count as u64 {
             if let Ok(phys) = memory::unmap_page(start + i * FRAME_SIZE) {
                 with_frames(|f| f.free(phys));
             }
         }
+        let end = start + count as u64 * FRAME_SIZE;
+        memory::kernel_tables().free_empty_tables(
+            &mut DirectMap,
+            &mut CpuTlb,
+            start..end,
+            &mut |table| {
+                with_frames(|f| f.free(table));
+            },
+        );
     }
 }
 
@@ -143,6 +155,14 @@ static ALLOCATOR: KernelAllocator = KernelAllocator {
 #[cfg(all(feature = "bench-cell", feature = "profile"))]
 pub fn contention() -> rhizo_core::sync::Contention {
     ALLOCATOR.heap.contention()
+}
+
+/// Gives the heap's wholly free pages back to the frame allocator if it is
+/// due (`Heap::trim_if_due`): called where many allocations may just have
+/// gone, as when a cell ends.
+#[cfg(feature = "cells")]
+pub fn trim_if_due() {
+    ALLOCATOR.heap.with(|heap| heap.trim_if_due());
 }
 
 /// Pages the kernel heap holds and its live allocations.

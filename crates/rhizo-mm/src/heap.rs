@@ -7,10 +7,10 @@
 //! Larger requests take contiguous pages from the [`PageSource`] and return
 //! them on free. Every operation is O(1) except page refills and trims.
 //!
-//! Free blocks are given back by page (design D1 of `add-heap-trim`): once
-//! the free blocks of the classes reach [`TRIM_AT`] bytes, and twice what
-//! was left after the last trim, a trim sorts each free list by address and
-//! returns to the page source every page whose blocks are all free.
+//! Free blocks are given back by page (design D1 of `add-heap-trim`): a
+//! trim sorts each free list by address and returns to the page source
+//! every page whose blocks are all free. The owner asks for one at quiet
+//! moments ([`Heap::trim_if_due`]); allocating and freeing pay nothing.
 
 use core::alloc::Layout;
 use core::ptr::{self, NonNull};
@@ -24,7 +24,7 @@ pub const MAX_CLASS_SIZE: usize = 2048;
 
 const CLASSES: usize = 8; // 16, 32, 64, 128, 256, 512, 1024, 2048
 
-/// Free bytes in the classes below which no trim runs.
+/// Bytes of class pages below which [`Heap::trim_if_due`] never trims.
 pub const TRIM_AT: usize = 1 << 20;
 
 /// Supplier of page-aligned, writable memory.
@@ -82,10 +82,11 @@ pub struct Heap<S: PageSource> {
     source: S,
     free: [Option<NonNull<u8>>; CLASSES],
     stats: HeapStats,
-    /// Bytes of the blocks on the free lists.
-    free_bytes: usize,
-    /// The next trim runs when `free_bytes` reaches this.
-    trim_at: usize,
+    /// Pages carved into blocks.
+    class_pages: usize,
+    /// Most live allocations [`trim_if_due`](Self::trim_if_due) saw since
+    /// the last trim.
+    peak_live: usize,
 }
 
 // SAFETY: the heap owns every block it hands out through raw pointers; moving
@@ -99,8 +100,8 @@ impl<S: PageSource> Heap<S> {
             source,
             free: [None; CLASSES],
             stats: HeapStats { pages: 0, live: 0 },
-            free_bytes: 0,
-            trim_at: TRIM_AT,
+            class_pages: 0,
+            peak_live: 0,
         }
     }
 
@@ -150,10 +151,6 @@ impl<S: PageSource> Heap<S> {
                     })
                 };
                 self.free[class] = Some(block);
-                self.free_bytes += MIN_CLASS_SIZE << class;
-                if self.free_bytes >= self.trim_at {
-                    self.trim();
-                }
             }
             Some(Plan::Pages(count)) => {
                 // SAFETY: the caller guarantees these pages came from
@@ -173,18 +170,26 @@ impl<S: PageSource> Heap<S> {
         // SAFETY: blocks on the free list are unused and hold a `FreeBlock`.
         let next = unsafe { block.cast::<FreeBlock>().as_ref().next };
         self.free[class] = next.map(NonNull::cast);
-        self.free_bytes -= MIN_CLASS_SIZE << class;
         block.as_ptr()
     }
 
-    /// Gives back every page whose blocks are all free, and sets the next
-    /// trim at twice what is left (at least [`TRIM_AT`]): each trim follows
-    /// at least as many bytes freed as it sorts, half of them (design D1).
+    /// Trims ([`trim`](Self::trim)) if the class pages hold at least
+    /// [`TRIM_AT`] bytes and the live allocations fell to half the most it
+    /// saw since the last trim: what was freed since is worth sorting
+    /// (design D2). Cheap otherwise: two comparisons.
+    pub fn trim_if_due(&mut self) {
+        self.peak_live = self.peak_live.max(self.stats.live);
+        if self.class_pages * PAGE_SIZE >= TRIM_AT && 2 * self.stats.live <= self.peak_live {
+            self.trim();
+        }
+    }
+
+    /// Gives back every page whose blocks are all free.
     pub fn trim(&mut self) {
         for class in 0..CLASSES {
             self.trim_class(class);
         }
-        self.trim_at = (2 * self.free_bytes).max(TRIM_AT);
+        self.peak_live = self.stats.live;
     }
 
     /// Sorts the free list of `class` by address, so the free blocks of one
@@ -210,7 +215,7 @@ impl<S: PageSource> Heap<S> {
                 // it; it came from `alloc_pages(1)` in `refill`.
                 unsafe { self.source.free_pages(page, 1) };
                 self.stats.pages -= 1;
-                self.free_bytes -= PAGE_SIZE;
+                self.class_pages -= 1;
                 continue;
             }
             match tail {
@@ -232,7 +237,7 @@ impl<S: PageSource> Heap<S> {
             return false;
         };
         self.stats.pages += 1;
-        self.free_bytes += PAGE_SIZE;
+        self.class_pages += 1;
         let size = MIN_CLASS_SIZE << class;
         // Push in reverse so blocks are handed out in address order.
         for i in (0..PAGE_SIZE / size).rev() {
@@ -461,25 +466,37 @@ mod tests {
     }
 
     #[test]
-    fn whole_free_pages_go_back() {
+    fn whole_free_pages_go_back_when_due() {
         let mut heap = Heap::new(HostPages::default());
         let l = layout(MAX_CLASS_SIZE, 8);
-        let blocks: Vec<_> = (0..4 * TRIM_AT / MAX_CLASS_SIZE)
-            .map(|_| heap.alloc(l))
-            .collect();
+        let n = 4 * TRIM_AT / MAX_CLASS_SIZE;
+        let blocks: Vec<_> = (0..n).map(|_| heap.alloc(l)).collect();
+        heap.trim_if_due(); // sees the peak: nothing freed, no trim
         let peak = heap.stats().pages;
         assert_eq!(peak, 4 * TRIM_AT / PAGE_SIZE);
-        for &p in &blocks {
+        // Fewer than half freed: not due.
+        for &p in &blocks[..n / 2 - 1] {
             free(&mut heap, p, l);
         }
-        let kept = heap.stats().pages;
-        assert!(
-            kept * PAGE_SIZE <= TRIM_AT,
-            "{kept} pages kept without an explicit trim"
-        );
-        heap.trim();
+        heap.trim_if_due();
+        assert_eq!(heap.stats().pages, peak, "not due yet");
+        for &p in &blocks[n / 2 - 1..] {
+            free(&mut heap, p, l);
+        }
+        heap.trim_if_due();
         assert_eq!(heap.stats(), HeapStats { pages: 0, live: 0 });
         assert_eq!(heap.source.outstanding, 0, "every page back to its source");
+    }
+
+    #[test]
+    fn a_small_heap_is_never_trimmed_when_due() {
+        let mut heap = Heap::new(HostPages::default());
+        let l = layout(64, 8);
+        let p = heap.alloc(l);
+        heap.trim_if_due();
+        free(&mut heap, p, l);
+        heap.trim_if_due();
+        assert_eq!(heap.stats().pages, 1, "kept below TRIM_AT");
     }
 
     #[test]

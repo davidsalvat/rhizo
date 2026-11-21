@@ -427,9 +427,10 @@ fn large_heap_allocations_survive_fragmentation() {
     for phys in kept {
         memory::with_frames(|f| f.free(phys));
     }
-    // Back, but for the window's page tables (made once).
-    let lost = before - memory::free_bytes();
-    assert!(lost <= 2 * FRAME_SIZE, "{lost} bytes not returned");
+    // All back, the window's tables included (change `add-heap-trim`):
+    // those its setup left are freed too, the first time.
+    let free = memory::free_bytes();
+    assert!(free >= before, "{} bytes not returned", before - free);
 }
 
 // --- Self-checks ------------------------------------------------------------
