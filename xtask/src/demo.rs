@@ -115,7 +115,16 @@ pub fn cmd(args: &[String]) -> Result {
         shard: None,
     };
     let out = vmm::run(opts.vmm, &Guest::Rhizo(kernel), run)?;
-    match out.output.lines().find(|l| l.starts_with("rhizo-demo ")) {
+    outcome(&out.output)
+}
+
+/// The demo's result: its `rhizo-demo done` or `rhizo-demo failed` line
+/// (the kernel also prints a `rhizo-demo agent, model …` header first).
+fn outcome(output: &str) -> Result {
+    let result = output
+        .lines()
+        .find(|l| l.starts_with("rhizo-demo done") || l.starts_with("rhizo-demo failed"));
+    match result {
         Some(line) if line.starts_with("rhizo-demo done") => Ok(()),
         Some(line) => Err(line.to_string()),
         None => Err("the kernel printed no demo result".into()),
@@ -125,6 +134,22 @@ pub fn cmd(args: &[String]) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_result_line_decides_not_the_header() {
+        let header = "rhizo-demo agent, model `qwen2.5:1.5b`\n";
+        assert!(
+            outcome(&format!(
+                "{header}turn 1\nrhizo-demo done in 19600 ms: 3 suspend\n"
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            outcome(&format!("{header}rhizo-demo failed after 5 ms: no model\n")),
+            Err("rhizo-demo failed after 5 ms: no model".to_string())
+        );
+        assert!(outcome(header).is_err(), "no result line is a failure");
+    }
 
     #[test]
     fn options_need_a_model_and_its_address() {
