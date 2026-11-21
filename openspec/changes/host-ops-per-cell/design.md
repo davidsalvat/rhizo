@@ -108,6 +108,13 @@ freeing a cell) runs outside it and scales with that cell only. A claimed
 cell's CPUs stop for the interrupt round trip and the end of their kernel
 section; no other CPU stops at all. The host's wait is bounded by the same.
 
+Between runs no other CPU reaches the shared state, so operations use it
+without the lock (`Host::locked`), as before this change: forks, spawns
+and templates cost what they did (`cell.fork_insns`,
+`cell.spawn_from_template_insns`, `cell.spawn_insns`). A CPU giving a cell
+back files it and updates its own bookkeeping in one critical section, so
+claims add no lock round trip to a switch (`cell.switch_insns`).
+
 ## D6. Measuring the stall
 
 `progress` counts in a loop without system calls and keeps, in a word next
