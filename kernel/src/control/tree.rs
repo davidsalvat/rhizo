@@ -5,6 +5,7 @@
 //! identifiers; the tree knows the kernel's.
 
 use super::{Body, Entry, Error, Outcome, Place, Server, State};
+use crate::audit::{self, Kind};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -345,9 +346,50 @@ impl Server {
     /// (spec `control-plane`, scoped host access): refused unless every
     /// cell it names is in the subtree, it moves nothing out of it, and it
     /// widens no policy or limit. The kernel checks it, not only the
-    /// host's server (design D14).
+    /// host's server (design D14). The request is audited with its scope,
+    /// let through or refused (design D18).
     pub(super) fn scoped(&mut self, id: u32, root: u32, request: Request) -> Outcome {
         let top = self.node_of(root)?;
+        let (name, target) = super::about(&request);
+        match self.within(top, root, &request) {
+            Ok(None) => {
+                audit::record(
+                    Kind::Scoped,
+                    top,
+                    0,
+                    format!("{name} cell {target}, scoped to cell {root}").as_bytes(),
+                );
+                self.execute(id, request)
+            }
+            Ok(Some(body)) => Ok(body),
+            Err((error, why)) => {
+                let kind = match error {
+                    Error::Denied => Some(Kind::Scope),
+                    Error::Invalid => Some(Kind::Tree),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    audit::deny(
+                        kind,
+                        top,
+                        0,
+                        format!("{name} cell {target}, scoped to cell {root}: {why}").as_bytes(),
+                    );
+                }
+                Err((error, why))
+            }
+        }
+    }
+
+    /// Whether `request` stays inside the subtree of `top`, host cell
+    /// `root`: `None` if it does and is to be executed, the reply of a
+    /// list (only the subtree's rows).
+    fn within(
+        &self,
+        top: u32,
+        root: u32,
+        request: &Request,
+    ) -> Result<Option<Body>, (Error, String)> {
         let out = |what: &str| {
             Err((
                 Error::Denied,
@@ -356,7 +398,7 @@ impl Server {
         };
         let inside = |s: &Self, cell: u32| s.inside(top, cell);
         let placed = |s: &Self, p: &Placement| p.parent != 0 && inside(s, p.parent);
-        match &request {
+        match request {
             Request::List => {
                 let rows = self
                     .cells
@@ -364,7 +406,7 @@ impl Server {
                     .filter(|e| self.inside(top, e.id))
                     .map(|e| self.row(e))
                     .collect();
-                return Ok(Body::List(rows));
+                return Ok(Some(Body::List(rows)));
             }
             Request::Run(run) if !placed(self, &run.placement) => {
                 return out("the new cell's parent");
@@ -456,6 +498,6 @@ impl Server {
             }
             _ => {}
         }
-        self.execute(id, request)
+        Ok(None)
     }
 }

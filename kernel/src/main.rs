@@ -11,6 +11,8 @@ extern crate alloc;
 
 mod arch;
 #[cfg(feature = "cells")]
+mod audit;
+#[cfg(feature = "cells")]
 mod cell;
 #[cfg(feature = "control")]
 mod control;

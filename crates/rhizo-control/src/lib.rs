@@ -24,10 +24,16 @@
 //! (design D20 of `add-cell-hierarchy`), so a newer `rhizo` still drives a
 //! VM booted before an upgrade: [`Request::encode_as`] writes a request in
 //! either, and decoding follows the version of the frame.
+//!
+//! The kernel also sends the host audit records, unasked, with identifier
+//! 0 ([`Message::Audit`], design D18 of `add-cell-hierarchy`); [`audit`]
+//! has the records and the ring that keeps them until they leave.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+pub mod audit;
 
 use alloc::vec::Vec;
 
@@ -88,6 +94,7 @@ mod kind {
     pub const FAILED: u8 = 0x82;
     pub const OUTPUT_DATA: u8 = 0x83;
     pub const ENDED: u8 = 0x84;
+    pub const AUDIT: u8 = 0x85;
 }
 
 /// Why a frame or a request was refused.
@@ -1239,6 +1246,8 @@ pub enum Message {
     Output { cell: u32, data: Vec<u8> },
     /// The cell of an `output` request ended.
     Ended { cell: u32, state: State },
+    /// An audit record (version 4, identifier 0), sent unasked.
+    Audit(audit::Record),
 }
 
 impl Message {
@@ -1317,6 +1326,10 @@ impl Message {
                 state.write(&mut w);
                 kind::ENDED
             }
+            Message::Audit(record) => {
+                record.write(&mut w);
+                kind::AUDIT
+            }
         };
         encode_frame_as(version, kind, id, &w.0)
     }
@@ -1387,6 +1400,7 @@ impl Message {
                 cell: r.u32()?,
                 state: State::read(&mut r)?,
             },
+            kind::AUDIT if v4 => Message::Audit(audit::Record::read(&mut r)?),
             _ => return Err(Error::UnknownKind),
         };
         r.end()?;

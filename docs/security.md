@@ -957,7 +957,9 @@ other user. Found by reading the host ends while documenting
   have come (no byte-by-byte answer). Until then it is not greeted, none
   of its bytes is decoded, and nothing is written to it. A wrong secret,
   no secret within 2 s, or another peer's request resets it; the kernel
-  keeps listening, counts the refusal and prints it. Every new
+  keeps listening, counts the refusal, prints it and audits it (an
+  `auth-refused` record, folded per second; see
+  [The audit log](#the-audit-log-design-d18-of-add-cell-hierarchy)). Every new
   connection, after a drop too, presents the secret again.
 - `xtask`'s `Vm`, and so `rhizo up`'s relay, takes the secret line out of
   the console text (it reaches neither `console.log` nor an error
@@ -981,7 +983,8 @@ packets) and `hostile_packets_are_never_admitted`; in `xtask`,
 socket device, connects three strangers (frames, a wrong secret followed
 by a power off, half the secret then silence), checks that each is reset
 without a byte back and that the VM still answers the host, and that the
-kernel reported three refusals.
+kernel reported three refusals and sent `auth-refused` audit records
+counting three.
 
 *What is left:* a local user can still keep the host out, by claiming
 the guest's CID before QEMU starts or by sending requests that keep
@@ -1032,6 +1035,35 @@ Not covered:
 - **Transport resets** are never received: the event queue is set up with
   no buffer. A VMM sends one after it restores a VM snapshot, and VMM
   snapshots of a control kernel are not supported.
+
+## The audit log (design D18 of `add-cell-hierarchy`)
+
+The kernel records what it refused and what the host administered in a
+ring of 64 KiB that no cell can read; `rhizo` appends the records to
+`<state>/audit/` as JSON lines, each carrying the SHA-256 of the line
+before, and `audit/head` names the last line's hash.
+
+**What `rhizo audit verify` proves.** That the log is the one the server
+wrote, unless someone rewrote it from some line to its end: an edited,
+removed or reordered line in the middle, a removed file, or a cut end
+breaks the chain or disagrees with `head`, and `verify` names where.
+Within one boot it also reports records that never reached the log (a gap
+in the kernel's sequence numbers) apart from those the kernel dropped
+when its ring was full (the drop count the next record carries).
+
+**What it does not prove.** The chain has no key. Anyone who can write the
+state directory (root, or the user who runs `rhizo`) can rewrite the log
+from an edited line on, recompute every hash and `head`, and `verify`
+passes; deleting the whole directory removes the log. The kernel's
+sequence numbers and drop counts make records missing from a live
+session visible only if the rest of that session was not rewritten to
+match.
+
+**Mitigation, not built.** Forward the files as they are written
+(journald, syslog, a SIEM), and export `head` to an append-only sink
+outside the host's reach, or sign it with a key kept outside the state
+directory. Then a rewrite of the chain no longer matches the exported
+hash.
 
 ## Known limitations and open findings
 

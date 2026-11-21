@@ -236,10 +236,23 @@ fn tainted_template_not_published() {
         host.step();
     }
     let child = host.fork(id, 1).expect("fork")[0];
+    // Records of earlier tests out of the way: nothing empties the ring
+    // in a test build.
+    while crate::audit::take().is_some() {}
     for template in [id, child] {
         assert!(host.freeze(template));
         assert_eq!(host.may_publish(template, false), Some(false), "refused");
         assert_eq!(host.may_publish(template, true), Some(true), "attested");
+        // Both audited (design D18), naming the template and its domain.
+        let domain = host.tree().root_of(template).expect("in the tree");
+        for kind in [crate::audit::Kind::Publish, crate::audit::Kind::Attested] {
+            let r = crate::audit::take().expect("an audit record");
+            assert_eq!(
+                (r.kind, r.cell, r.domain),
+                (kind, template, domain),
+                "{r:?}"
+            );
+        }
     }
 }
 
