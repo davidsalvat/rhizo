@@ -1,9 +1,13 @@
-//! Kernel heap: power-of-two size classes for small blocks, whole pages for
-//! large ones (design decision D6).
+//! Kernel heap: size classes for small blocks, whole pages for large ones
+//! (design decision D6).
 //!
 //! Small requests (up to [`MAX_CLASS_SIZE`] bytes after rounding) are served
-//! from per-class free lists. Each class carves 4 KiB pages into equal blocks;
-//! a block of size `2^k` inside a page-aligned page is aligned to `2^k`.
+//! from per-class free lists. Each class carves 4 KiB pages into equal blocks.
+//! The power-of-two classes (16 to 2048 bytes) serve every alignment up to
+//! their size: a block of size `2^k` inside a page-aligned page is aligned to
+//! `2^k`. Between them, classes of 48 to 1360 bytes, each a whole fraction of
+//! a page, serve requests aligned to 16 bytes or less, so a request wastes
+//! less than its size (design D1 of `heap-caches-cell-index`).
 //! Larger requests take contiguous pages from the [`PageSource`] and return
 //! them on free. Every operation is O(1) except page refills and trims.
 //!
@@ -22,7 +26,37 @@ pub const MIN_CLASS_SIZE: usize = 16;
 /// Largest block size served from size classes.
 pub const MAX_CLASS_SIZE: usize = 2048;
 
-const CLASSES: usize = 8; // 16, 32, 64, 128, 256, 512, 1024, 2048
+/// Block size of each class: the powers of two first (their index is their
+/// order above 16 bytes), then the classes between them, each the largest
+/// multiple of 16 bytes of which a page holds 85, 42, 21, 12, 9, 6, 5 or 3.
+const SIZES: [usize; CLASSES] = [
+    16, 32, 64, 128, 256, 512, 1024, 2048, 48, 96, 192, 336, 448, 672, 816, 1360,
+];
+const CLASSES: usize = 16;
+
+/// The smallest class holding `16 * i` bytes, for requests aligned to 16
+/// bytes or less.
+const CLASS_OF: [u8; MAX_CLASS_SIZE / MIN_CLASS_SIZE + 1] = {
+    let mut table = [0u8; MAX_CLASS_SIZE / MIN_CLASS_SIZE + 1];
+    let mut i = 0;
+    while i < table.len() {
+        let size = if i == 0 {
+            MIN_CLASS_SIZE
+        } else {
+            i * MIN_CLASS_SIZE
+        };
+        let (mut best, mut c) = (0, 0);
+        while c < CLASSES {
+            if SIZES[c] >= size && (SIZES[best] < size || SIZES[c] < SIZES[best]) {
+                best = c;
+            }
+            c += 1;
+        }
+        table[i] = best as u8;
+        i += 1;
+    }
+    table
+};
 
 /// Bytes of class pages below which [`Heap::trim_if_due`] never trims.
 pub const TRIM_AT: usize = 1 << 20;
@@ -60,6 +94,12 @@ fn plan(layout: Layout) -> Option<Plan> {
     if layout.align() > PAGE_SIZE {
         return None;
     }
+    if layout.align() <= MIN_CLASS_SIZE && layout.size() <= MAX_CLASS_SIZE {
+        // Every block is aligned to 16 bytes.
+        let i = layout.size().div_ceil(MIN_CLASS_SIZE);
+        return Some(Plan::Class(CLASS_OF[i] as usize));
+    }
+    // Only the power-of-two classes are aligned beyond 16 bytes.
     let size = layout.size().max(layout.align()).max(MIN_CLASS_SIZE);
     if size <= MAX_CLASS_SIZE {
         let rounded = size.next_power_of_two();
@@ -195,7 +235,7 @@ impl<S: PageSource> Heap<S> {
     /// Sorts the free list of `class` by address, so the free blocks of one
     /// page are next to each other, and gives back the pages it holds whole.
     fn trim_class(&mut self, class: usize) {
-        let size = MIN_CLASS_SIZE << class;
+        let size = SIZES[class];
         let page_of = |b: NonNull<u8>| b.as_ptr() as usize & !(PAGE_SIZE - 1);
         let mut rest = sort(self.free[class]);
         self.free[class] = None;
@@ -238,14 +278,16 @@ impl<S: PageSource> Heap<S> {
         };
         self.stats.pages += 1;
         self.class_pages += 1;
-        let size = MIN_CLASS_SIZE << class;
+        let size = SIZES[class];
         // Push in reverse so blocks are handed out in address order.
         for i in (0..PAGE_SIZE / size).rev() {
-            // SAFETY: `i * size` is inside the fresh page.
+            // SAFETY: `i * size` is inside the fresh page, and so is the
+            // block: the page holds `PAGE_SIZE / size` whole blocks.
             let block = unsafe { page.add(i * size) };
             let node = block.cast::<FreeBlock>();
-            // SAFETY: the block is unused, aligned to `size` (>= 16) and large
-            // enough for a `FreeBlock`.
+            // SAFETY: the block is unused, aligned to 16 bytes (`size` is a
+            // multiple of 16, the page is page-aligned) and large enough for
+            // a `FreeBlock`.
             unsafe {
                 node.as_ptr().write(FreeBlock {
                     next: self.free[class].map(NonNull::cast),
@@ -417,6 +459,41 @@ mod tests {
     }
 
     #[test]
+    fn classes_between_the_powers_of_two_hold_whole_blocks() {
+        for (c, &size) in SIZES.iter().enumerate() {
+            assert_eq!(size % MIN_CLASS_SIZE, 0, "class {c}");
+            if c >= 8 {
+                // The largest multiple of 16 for its number of blocks.
+                let blocks = PAGE_SIZE / size;
+                assert!(PAGE_SIZE / blocks - size < MIN_CLASS_SIZE, "class {c}");
+            }
+        }
+        assert_eq!(plan(layout(33, 8)), Some(Plan::Class(8)), "48 bytes");
+        assert_eq!(plan(layout(48, 16)), Some(Plan::Class(8)));
+        assert_eq!(plan(layout(48, 32)), Some(Plan::Class(2)), "aligned: 64");
+        assert_eq!(plan(layout(1350, 8)), Some(Plan::Class(15)), "1360 bytes");
+        assert_eq!(plan(layout(1361, 8)), Some(Plan::Class(7)), "2048 bytes");
+        assert_eq!(plan(layout(0, 1)), Some(Plan::Class(0)));
+    }
+
+    #[test]
+    fn three_blocks_of_a_third_of_a_page_share_one() {
+        let mut heap = Heap::new(HostPages::default());
+        let l = layout(1350, 8);
+        let blocks: Vec<_> = (0..3).map(|_| heap.alloc(l)).collect();
+        assert_eq!(heap.stats().pages, 1, "a power-of-two class would take two");
+        for (i, &p) in blocks.iter().enumerate() {
+            fill(p, i as u8 + 1, l.size());
+        }
+        for (i, &p) in blocks.iter().enumerate() {
+            assert!((0..l.size()).all(|k| byte(p, k) == i as u8 + 1));
+            free(&mut heap, p, l);
+        }
+        heap.trim();
+        assert_eq!(heap.stats(), HeapStats { pages: 0, live: 0 });
+    }
+
+    #[test]
     fn alignment_is_honored() {
         let mut heap = Heap::new(HostPages::default());
         for align in [1, 8, 64, 4096] {
@@ -527,6 +604,23 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn a_request_gets_the_smallest_class_that_fits(size in 0usize..3000, align_pow in 0u32..13) {
+            let l = layout(size, 1 << align_pow);
+            let fits = |c: usize| {
+                SIZES[c] >= size.max(l.align())
+                    && (l.align() <= MIN_CLASS_SIZE || SIZES[c].is_power_of_two())
+            };
+            let best = (0..CLASSES).filter(|&c| fits(c)).min_by_key(|&c| SIZES[c]);
+            match (plan(l), best) {
+                (Some(Plan::Class(c)), Some(b)) => prop_assert_eq!(SIZES[c], SIZES[b]),
+                (Some(Plan::Pages(n)), None) => {
+                    prop_assert_eq!(n, size.max(l.align()).div_ceil(PAGE_SIZE));
+                }
+                (got, best) => prop_assert!(false, "{:?} for {:?}, best {:?}", got, l, best),
+            }
+        }
+
         #[test]
         fn sort_orders_a_free_list(order in Just((0..300usize).collect::<Vec<_>>()).prop_shuffle()) {
             let mut buf = vec![0u128; 300];
