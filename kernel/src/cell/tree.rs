@@ -3,7 +3,7 @@
 //! its domain and its number there, and what its end does to its subtree.
 
 use super::*;
-use rhizo_cap::{Limits, Spec, Tree};
+use rhizo_cap::{Actor, Error as TreeError, HOST, Limits, Spec, Tree};
 
 /// A fresh domain identifier: from the cells' own counter, so never 0 and
 /// never one another domain had in this boot.
@@ -164,6 +164,7 @@ impl Host {
         }
         self.settling = true;
         while let Some(id) = self.ends.pop() {
+            let parent = self.tree.get(id).map_or(HOST, |n| n.parent());
             let Ok(ended) = self.tree.end(id, &mut fresh_domain) else {
                 continue;
             };
@@ -185,19 +186,218 @@ impl Host {
             }
             for &root in &ended.promoted {
                 for cell in self.tree.subtree(root).unwrap_or_default() {
-                    let Some(n) = self.tree.get(cell) else {
-                        continue;
-                    };
-                    let (pid, domain) = (n.pid(), n.domain());
-                    self.with_live(cell, |live| {
-                        (live.cell.pid, live.cell.domain) = (pid, domain)
-                    });
-                    if let Some((c, ..)) = self.templates.iter_mut().find(|(c, ..)| c.id == cell) {
-                        (c.pid, c.domain) = (pid, domain);
-                    }
+                    self.sync(cell);
                 }
             }
+            // Its parent got its reservation back, less promoted ones.
+            self.sync_up(parent);
         }
         self.settling = false;
+    }
+
+    /// Gives cell `id` (live or a template) what its node says: its number,
+    /// domain, and as its quotas what it may use itself (its limits less its
+    /// children's reservations).
+    fn sync(&mut self, id: u32) {
+        let (Some(n), Some(own)) = (self.tree.get(id), self.tree.own(id)) else {
+            return;
+        };
+        let (pid, domain) = (n.pid(), n.domain());
+        let apply = |cell: &mut Cell| {
+            (cell.pid, cell.domain) = (pid, domain);
+            let q = &mut cell.quota;
+            (q.memory, q.cpu_ns, q.sockets) = (own.memory, own.cpu_ns, own.sockets);
+        };
+        if let Some((cell, ..)) = self.templates.iter_mut().find(|(c, ..)| c.id == id) {
+            apply(cell);
+            return;
+        }
+        self.with_live(id, |live| {
+            apply(&mut live.cell);
+            let q = live.cell.quota;
+            live.frames.set_limit(q.frames());
+            live.fs.set_limits(q.files() as usize, q.sockets as usize);
+        });
+    }
+
+    /// [`sync`](Self::sync) for cell `id` and each of its ancestors.
+    fn sync_up(&mut self, mut id: u32) {
+        while id != HOST {
+            self.sync(id);
+            id = self.tree.get(id).map_or(HOST, |n| n.parent());
+        }
+    }
+
+    /// [`sync`](Self::sync) for every cell of `id`'s subtree.
+    fn sync_down(&mut self, id: u32) {
+        for cell in self.tree.subtree(id).unwrap_or_default() {
+            self.sync(cell);
+        }
+    }
+
+    /// Sets the limits of cell `id` from the host, for its memory, CPU time
+    /// and sockets from `quota` and its descendants from `cells`; the cell
+    /// may then use them less its children's reservations. `false` if they
+    /// do not fit its parent's budget or its children's reservations.
+    pub(super) fn set_limits_from(&mut self, id: u32, quota: &Quota, cells: Option<u32>) -> bool {
+        let Some(n) = self.tree.get(id) else {
+            return false;
+        };
+        let limits = Limits {
+            cells: cells.unwrap_or(n.limits().cells),
+            ..root_limits(quota)
+        };
+        // What it holds already stays (spec `isolation`): only its children
+        // count against the new limits.
+        let used = self.usage(n.parent());
+        let usage = |c: u32| if c == id { Limits::ZERO } else { used };
+        if self
+            .tree
+            .set_limits(id, limits, Actor::Host, &usage)
+            .is_err()
+        {
+            return false;
+        }
+        self.sync(id);
+        true
+    }
+
+    /// Makes root `id`, which has no children, a child of `parent` with
+    /// `spec` (the host's placement of a cell it made, spec
+    /// `cell-hierarchy`): its limits are carved from the parent's free
+    /// budget, its egress must be within the parent's, and it takes a
+    /// number in the parent's domain. Refused, changing nothing, unless the
+    /// host asks: a root is no cell's to move.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn adopt(&mut self, id: u32, parent: u32, spec: Spec, by: Actor) -> Result<(), TreeError> {
+        let n = self.tree.get(id).ok_or(TreeError::NotFound)?;
+        if by != Actor::Host {
+            return Err(TreeError::Denied);
+        }
+        if !n.is_root() || n.children() > 0 || self.tree.get(parent).is_none() {
+            return Err(if self.tree.get(parent).is_none() {
+                TreeError::NotFound
+            } else {
+                TreeError::Invalid
+            });
+        }
+        let p = n.policy();
+        let saved = Spec {
+            limits: n.limits(),
+            on_parent_end: n.on_parent_end(),
+            egress: p.egress.clone(),
+            ceiling: Some(p.ceiling.clone()),
+            label: p.label.clone(),
+            weight: p.weight,
+            cpu_max: p.cpu_max,
+            cpus: p.cpus,
+        };
+        let used = self.usage(parent);
+        self.tree.end(id, &mut fresh_domain)?; // a leaf: allocates nothing
+        if let Err(e) = self.tree.add_child(id, parent, spec, by, &|_| used) {
+            let _ = self.tree.add_root(id, saved, 0); // back where it was
+            return Err(e);
+        }
+        self.sync(id);
+        self.sync_up(parent);
+        // A cell placed before it ran: its thread takes its new number.
+        let pid = self.tree.get(id).map_or(0, |n| n.pid());
+        self.with_live(id, |live| {
+            let t = &live.cell.threads;
+            if t.len() == 1 && t.current().tid == 1 {
+                live.cell.renumber(pid);
+            }
+        });
+        Ok(())
+    }
+
+    /// Moves cell `id` under `to` (`HOST`: makes it a root) at `by`'s
+    /// request (spec `cell-hierarchy`, re-parenting and promotion): see
+    /// `rhizo_cap::Tree::reparent`. The cells whose budget, policy, domain
+    /// or number changed get them.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn reparent(&mut self, id: u32, to: u32, by: Actor) -> Result<(), TreeError> {
+        let old = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
+        let used = self.usage(to);
+        self.tree
+            .reparent(id, to, by, &|_| used, &mut fresh_domain)?;
+        self.sync_down(id);
+        self.sync_up(old);
+        self.sync_up(to);
+        Ok(())
+    }
+
+    /// Ends cell `id` and its whole subtree at `by`'s request, whatever
+    /// their policy for when a parent ends (spec `control-plane`, subtree
+    /// kill): live cells are killed, templates dropped and suspended ones
+    /// reported killed in [`finished`](Self::finished).
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn kill_tree(&mut self, id: u32, by: Actor) -> Result<(), TreeError> {
+        if !self.tree.controls(by, id) {
+            return Err(self.refusal(id));
+        }
+        let sub = self.tree.subtree(id)?;
+        for &cell in sub.iter().rev() {
+            self.end_node(cell);
+        }
+        Ok(())
+    }
+
+    /// Suspends every live cell of `id`'s subtree at `by`'s request (spec
+    /// `cell-hierarchy`: ownership is not scheduling, so only on request);
+    /// returns each suspended cell's identifier and snapshot. A cell whose
+    /// snapshot does not fit keeps running.
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn suspend_tree(&mut self, id: u32, by: Actor) -> Result<Vec<(u32, Snapshot)>, TreeError> {
+        if !self.tree.controls(by, id) {
+            return Err(self.refusal(id));
+        }
+        let sub = self.tree.subtree(id)?;
+        let mut out = Vec::new();
+        for cell in sub {
+            if let Some(snapshot) = self.suspend(cell) {
+                out.push((cell, snapshot));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Why `by` was refused an operation on cell `id`.
+    fn refusal(&self, id: u32) -> TreeError {
+        match self.tree.get(id) {
+            Some(_) => TreeError::Denied,
+            None => TreeError::NotFound,
+        }
+    }
+
+    /// Ends cell `id` alone, wherever it is (its children are ended first
+    /// by [`kill_tree`](Self::kill_tree)).
+    fn end_node(&mut self, id: u32) {
+        if let Some(at) = self.suspended.iter().position(|&s| s == id) {
+            self.suspended.swap_remove(at);
+            self.finished.push(Finished {
+                id,
+                ending: Ending::Killed,
+                output: Vec::new(),
+                cpus: 0,
+                peak: 0,
+            });
+            self.ends.push(id);
+            self.settle();
+        } else if !self.drop_template(id) {
+            self.kill(id);
+        }
     }
 }
