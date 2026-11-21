@@ -8,7 +8,10 @@
 //!   retrying while nobody listens), send N 64-byte messages and check each
 //!   echo, print `pinged`;
 //! - `twice PORT`: as `ping PORT 2`, but print `once` and yield after the
-//!   first echo (where a host suspends it), then `twice` after the second.
+//!   first echo (where a host suspends it), then `twice` after the second;
+//! - `pause PORT MS ADDR`: connect to ADDR:PORT, check one echo, stay
+//!   silent for MS milliseconds and check another; then close, connect
+//!   again and check an echo, all within a second; print `paused`.
 //!
 //! Two cells, one serving and one pinging, measure `cell.loopback_rtt_us`;
 //! one pinging the host's echo server through the network card measures
@@ -18,8 +21,8 @@
 #![no_main]
 
 use rhizo_cells::{
-    arg, check, local_port, loopback, nr, number, print, read_full, sleep_ns, syscall, tcp_connect,
-    tcp_listen, tcp_socket, write_all, yield_now,
+    arg, check, local_port, loopback, now_ns, nr, number, print, read_full, sleep_ns, syscall,
+    tcp_connect, tcp_listen, tcp_socket, write_all, yield_now,
 };
 
 const ECONNREFUSED: isize = -111;
@@ -103,6 +106,20 @@ fn twice(port: u16) -> i32 {
     0
 }
 
+fn pause(port: u16, ms: usize, ip: [u8; 4]) -> i32 {
+    let c = connect(port, ip);
+    round_trip(c, 1);
+    sleep_ns(ms as u64 * 1_000_000);
+    round_trip(c, 2);
+    check(syscall(nr::CLOSE, [c, 0, 0, 0, 0, 0]) == 0, "close");
+    let t0 = now_ns();
+    let c = connect(port, ip);
+    round_trip(c, 3);
+    check(now_ns() - t0 < 1_000_000_000, "reconnect within a second");
+    print(b"paused\n");
+    0
+}
+
 /// Both ends in one program, one message at a time.
 fn alone() -> i32 {
     let l = tcp_socket(0);
@@ -136,6 +153,7 @@ fn main() -> i32 {
         Some(b"serve") => serve(port, n),
         Some(b"ping") => ping(port, n, arg(4).map_or([127, 0, 0, 1], ipv4)),
         Some(b"twice") => twice(port),
+        Some(b"pause") => pause(port, n, arg(4).map_or([127, 0, 0, 1], ipv4)),
         _ => alone(),
     }
 }
