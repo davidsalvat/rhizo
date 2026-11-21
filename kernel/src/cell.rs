@@ -938,7 +938,6 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
     let _timed = prof::Timed::new(Count::SchedCycles);
     let mut other = None;
     let take = shared.with(|s| {
-        s.timer.leave(cpu);
         if s.stopping {
             s.idle &= !(1 << cpu);
             return Take::Stop;
@@ -962,12 +961,12 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
             live.ready = Ready::default();
             s.running += 1;
             s.idle &= !(1 << cpu);
-            other = cover(s);
+            other = cover(s, cpu);
             return Take::Run(live, now);
         }
         if !oldest && let Some(gang) = s.gangs.join(cpu, now) {
             s.idle &= !(1 << cpu);
-            other = cover(s);
+            other = cover(s, cpu);
             return Take::Join(gang);
         }
         // The boot CPU looks at ended cells before it waits: with nothing
@@ -980,6 +979,8 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
         // Under the lock: a CPU giving a cell back sees this bit and wakes
         // this one, so no wake-up is lost between here and the wait.
         s.idle |= 1 << cpu;
+        // A timer it held covers nothing any more: it looks again.
+        s.timer.leave(cpu);
         if s.running == 0 && wake.is_none() {
             // Only parked cells are left: nothing will wake them (but the
             // network card, or the end of the run).
@@ -1003,12 +1004,16 @@ fn next_wake(s: &Shared) -> Option<u64> {
     .filter(|&t| t != u64::MAX)
 }
 
-/// A CPU took work: the idle CPU to wake so that its timer covers the
+/// `cpu` took work: the idle CPU to wake so that its timer covers the
 /// earliest deadline, if none does (design D1 of `add-tickless-idle`).
-fn cover(s: &mut Shared) -> Option<usize> {
+fn cover(s: &mut Shared, cpu: usize) -> Option<usize> {
     if s.idle == 0 {
-        return None; // no CPU idles: busy CPUs look at every slice's end
+        // No CPU idles: busy CPUs look at every slice's end. Only an idle
+        // CPU holds the timer, so it was this one, if any.
+        s.timer = IdleTimer::new();
+        return None;
     }
+    s.timer.leave(cpu);
     let next = next_wake(s);
     s.timer.cover(next, s.idle)
 }
