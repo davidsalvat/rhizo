@@ -75,6 +75,7 @@ macro_rules! suite {
             ktest_case!(suspend_returns_all_memory),
             ktest_case!(lazy_resume_restores_only_touched_pages),
             ktest_case!(suspended_cells_hold_no_kernel_resources),
+            ktest_case!(a_suspended_fork_refers_to_its_template),
             ktest_case!(snapshot_of_another_architecture_is_rejected),
             ktest_case!(forked_cells_see_only_their_own_writes),
             ktest_case!(children_outlive_their_parent_and_frames_return),
@@ -904,6 +905,37 @@ fn lazy_resume_restores_only_touched_pages() {
     );
     host.run(|_| false);
     assert_eq!(ended(&host, id), (Ending::Exit(0), "checked\n".into()));
+}
+
+/// A cell forked from a template and suspended before it writes refers to
+/// the template's pages instead of copying them (spec `snapshots`, change
+/// `add-shared-snapshots`); resumed, it writes its own copies, and the
+/// template's pages stay as they were.
+fn a_suspended_fork_refers_to_its_template() {
+    let mut host = Host::new();
+    let template = spawn(&mut host, "ballast", &[b"write", b"2"]);
+    while host.output(template) != Some(b"filled\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let checked = (Ending::Exit(0), "checked\n".into());
+    for mode in [Resume::Lazy, Resume::Eager] {
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        let snapshot = host.suspend(id).expect("live");
+        let (heap, shared) = (snapshot.heap_bytes(), snapshot.shared_bytes());
+        assert!(shared >= 2 << 20, "{shared} bytes shared");
+        assert!(heap < 64 << 10, "{heap} bytes in the heap");
+        let id = host.resume(snapshot, mode, true, false).expect("resume");
+        host.run(|h| h.finished(id).is_some());
+        assert_eq!(ended(&host, id), checked, "{mode:?}");
+    }
+    let id = host
+        .spawn_from_template(template, true, false)
+        .expect("fork");
+    host.run(|h| h.finished(id).is_some());
+    assert_eq!(ended(&host, id), checked, "the template is unchanged");
 }
 
 fn suspended_cells_hold_no_kernel_resources() {

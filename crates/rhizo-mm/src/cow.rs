@@ -286,7 +286,10 @@ impl<F: EntryFormat> PageTable<F> {
             if F::is_leaf(entry, level) {
                 return Ok(Some((slot, level)));
             }
-            table = private_table::<F>(mem, frames, slot, entry, level)?;
+            table = match F::table_writable(entry) {
+                true => F::address(entry),
+                false => private_table::<F>(mem, frames, slot, entry, level)?,
+            };
         }
         Ok(None)
     }

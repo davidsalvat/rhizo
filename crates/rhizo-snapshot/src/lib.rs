@@ -243,8 +243,11 @@ impl Snapshot {
         let own = pt.unshare_tables(mem, frames).is_ok();
         let mem = &*mem;
         let (mut refers, mut data_len) = (Vec::new(), 0usize);
-        pt.for_each_lower_leaf(mem, &mut |_, phys, size, _| {
-            let refer = own && frames.is_shared(phys) && frames.try_share(phys);
+        pt.for_each_lower_leaf(mem, &mut |_, phys, size, flags| {
+            // With every table its own and writable, a writable entry is
+            // the frame's only one (copy-on-write invariant): not shared.
+            let refer =
+                own && !flags.is_writable() && frames.is_shared(phys) && frames.try_share(phys);
             if !refer {
                 data_len += size.bytes() as usize;
             }
@@ -274,29 +277,25 @@ impl Snapshot {
         for v in state.into_iter().chain(words) {
             b.extend_from_slice(&v.to_le_bytes());
         }
+        // Records and data in one walk: both places are known now.
+        let mut rec = b.len();
+        b.resize(data_start + data_len, 0);
         let (mut offset, mut i) = (0u64, 0);
         pt.for_each_lower_leaf(mem, &mut |virt, phys, size, flags| {
-            b.extend_from_slice(&virt.to_le_bytes());
+            let r = &mut b[rec..rec + RECORD];
+            r[..8].copy_from_slice(&virt.to_le_bytes());
             if refers[i] {
-                b.extend_from_slice(&phys.to_le_bytes());
+                r[8..16].copy_from_slice(&phys.to_le_bytes());
+                r[REFERS] = 1;
             } else {
-                b.extend_from_slice(&offset.to_le_bytes());
+                r[8..16].copy_from_slice(&offset.to_le_bytes());
+                let (at, n) = (data_start + offset as usize, size.bytes() as usize);
+                mem.read_bytes(phys, &mut b[at..at + n]);
                 offset += size.bytes();
             }
-            b.push((size == PageSize::Large) as u8);
-            b.push(encode_flags(flags));
-            b.push(refers[i] as u8);
-            b.extend_from_slice(&[0; 5]);
-            i += 1;
-        });
-        b.resize(data_start + data_len, 0);
-        let (mut at, mut i) = (data_start, 0);
-        pt.for_each_lower_leaf(mem, &mut |_, phys, size, _| {
-            if !refers[i] {
-                let n = size.bytes() as usize;
-                mem.read_bytes(phys, &mut b[at..at + n]);
-                at += n;
-            }
+            b[rec + 16] = (size == PageSize::Large) as u8;
+            b[rec + 17] = encode_flags(flags);
+            rec += RECORD;
             i += 1;
         });
         b.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
@@ -566,12 +565,18 @@ impl Snapshot {
         let pages = self.page_count();
         let data_start = self.records() + pages * RECORD;
         // Pages are stored in record order: the data ends after the last
-        // one stored.
-        let data_len = (0..pages).rev().find_map(|i| match self.page(i).data {
-            Data::Bytes(data) => {
-                Some(u64_at(&self.bytes, self.records() + i * RECORD + 8) as usize + data.len())
-            }
-            Data::Frame(_) => None,
+        // one stored (the last one, unless some refer to frames).
+        let rec = |i: usize| self.records() + i * RECORD;
+        let last = match self.frames {
+            0 => pages.checked_sub(1),
+            _ => (0..pages).rev().find(|&i| self.bytes[rec(i) + REFERS] == 0),
+        };
+        let data_len = last.map(|i| {
+            let size = match self.bytes[rec(i) + 16] {
+                1 => PageSize::Large,
+                _ => PageSize::Small,
+            };
+            u64_at(&self.bytes, rec(i) + 8) as usize + size.bytes() as usize
         });
         data_start + data_len.unwrap_or(0)
     }
