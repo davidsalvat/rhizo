@@ -24,6 +24,13 @@ Page size needs no field: every page record says whether it is 4 KiB or
 page size, or any other change to what a snapshot means, is a new format
 version, which older kernels refuse by its number.
 
+The CRC is computed eight bytes at a time (slicing by 8, 8 KiB of tables
+built at compile time), and `rhizo-snapshot` is optimized in test builds
+too, as `rhizo-core` is for ChaCha20: in-kernel tests export and decode
+snapshots of tens of MiB at every step under emulation, and the first CI
+round on AArch64 (TCG) timed out in them with a byte-at-a-time CRC in an
+unoptimized build.
+
 `export` now takes `&self`: a suspended cell, or the snapshot of a
 template, stays as it was after a save. The references to shared frames
 are dropped with the snapshot, no longer by the export.

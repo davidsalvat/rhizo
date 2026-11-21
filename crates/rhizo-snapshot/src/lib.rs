@@ -890,10 +890,12 @@ impl Snapshot {
     }
 }
 
-/// CRC-32C (Castagnoli, reflected, as iSCSI and ext4 use it) of `bytes`.
+/// CRC-32C (Castagnoli, reflected, as iSCSI and ext4 use it) of `bytes`,
+/// eight bytes at a time ("slicing by 8"): a file of tens of MiB is checked
+/// twice per round trip, and test builds run under emulation.
 fn crc32c(bytes: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = {
-        let mut table = [0; 256];
+    const TABLES: [[u32; 256]; 8] = {
+        let mut t = [[0u32; 256]; 8];
         let mut i = 0;
         while i < 256 {
             let mut c = i as u32;
@@ -906,14 +908,33 @@ fn crc32c(bytes: &[u8]) -> u32 {
                 };
                 bit += 1;
             }
-            table[i] = c;
+            t[0][i] = c;
             i += 1;
         }
-        table
+        let mut k = 1;
+        while k < 8 {
+            let mut i = 0;
+            while i < 256 {
+                let c = t[k - 1][i];
+                t[k][i] = c >> 8 ^ t[0][(c & 0xff) as usize];
+                i += 1;
+            }
+            k += 1;
+        }
+        t
     };
-    !bytes.iter().fold(!0u32, |c, &b| {
-        TABLE[((c ^ b as u32) & 0xff) as usize] ^ c >> 8
-    })
+    let byte = |c: u32, b: u8| TABLES[0][((c ^ b as u32) & 0xff) as usize] ^ c >> 8;
+    let mut words = bytes.chunks_exact(8);
+    let mut c = !0u32;
+    for w in &mut words {
+        let mut word = [0; 8];
+        word.copy_from_slice(w);
+        let v = u64::from_le_bytes(word) ^ c as u64;
+        c = (0..8).fold(0, |acc, k| {
+            acc ^ TABLES[7 - k][(v >> (8 * k) & 0xff) as usize]
+        });
+    }
+    !words.remainder().iter().fold(c, |c, &b| byte(c, b))
 }
 
 #[cfg(test)]

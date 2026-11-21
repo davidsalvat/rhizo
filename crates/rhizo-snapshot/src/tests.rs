@@ -1064,6 +1064,12 @@ fn the_checksum_is_crc32c() {
     // The check value of CRC-32C (RFC 3720, appendix B.4).
     assert_eq!(crc32c(b"123456789"), 0xe306_9283);
     assert_eq!(crc32c(b""), 0);
+    // Eight bytes at a time, the same as one at a time (RFC 3720, B.4: 32
+    // bytes of zeros, of ones, and counting up).
+    assert_eq!(crc32c(&[0; 32]), 0x8a91_36aa);
+    assert_eq!(crc32c(&[0xff; 32]), 0x62a8_ab43);
+    let up: Vec<u8> = (0..32).collect();
+    assert_eq!(crc32c(&up), 0x46dd_794e);
 }
 
 #[test]
