@@ -347,7 +347,7 @@ impl Snapshot {
             } else {
                 r[8..16].copy_from_slice(&offset.to_le_bytes());
                 let (at, n) = (data_start + offset as usize, size.bytes() as usize);
-                mem.read_bytes(phys, &mut b[at..at + n]);
+                mem.read_pages(phys, &mut b[at..at + n]);
                 offset += size.bytes();
             }
             b[rec + 16] = (size == PageSize::Large) as u8;
@@ -372,10 +372,11 @@ impl Snapshot {
     /// The snapshot as bytes that stand alone, to leave the kernel: the
     /// contents of the frames it refers to are written in their place
     /// (design D2 of `add-shared-snapshots`), then the checksum (D1 of
-    /// `snapshots-on-disk`). The snapshot keeps its references.
-    pub fn export(&self, mem: &impl PhysicalMemory) -> Vec<u8> {
+    /// `snapshots-on-disk`), computed by `crc` (a [`Crc32c`]). The snapshot
+    /// keeps its references.
+    pub fn export(&self, mem: &impl PhysicalMemory, crc: Crc32c) -> Vec<u8> {
         let mut b = self.standalone(mem);
-        let sum = crc32c(&b);
+        let sum = crc(&b);
         b.extend_from_slice(&sum.to_le_bytes());
         b
     }
@@ -409,7 +410,7 @@ impl Snapshot {
                 Data::Frame(phys) => {
                     let at = b.len();
                     b.resize(at + self.page(i).size.bytes() as usize, 0);
-                    mem.read_bytes(phys, &mut b[at..]);
+                    mem.read_pages(phys, &mut b[at..]);
                 }
             }
         }
@@ -432,8 +433,13 @@ impl Snapshot {
     }
 
     /// Validates `bytes`, the exported form of a snapshot, for `machine`:
-    /// its header, then its checksum, then everything it holds.
-    pub fn from_bytes(mut bytes: Vec<u8>, machine: Machine) -> Result<Self, FormatError> {
+    /// its header, then its checksum (computed by `crc`, a [`Crc32c`]), then
+    /// everything it holds.
+    pub fn from_bytes(
+        mut bytes: Vec<u8>,
+        machine: Machine,
+        crc: Crc32c,
+    ) -> Result<Self, FormatError> {
         if bytes.len() < HEADER + STATE + CHECKSUM {
             return Err(FormatError::Truncated);
         }
@@ -454,7 +460,7 @@ impl Snapshot {
         let end = bytes.len() - CHECKSUM;
         let mut sum = [0; CHECKSUM];
         sum.copy_from_slice(&bytes[end..]);
-        if crc32c(&bytes[..end]) != u32::from_le_bytes(sum) {
+        if crc(&bytes[..end]) != u32::from_le_bytes(sum) {
             return Err(FormatError::Checksum);
         }
         bytes.truncate(end);
@@ -861,7 +867,7 @@ impl Snapshot {
             };
             let n = size.bytes();
             match page.data {
-                Data::Bytes(data) => mem.write_bytes(phys, &data[at as usize..(at + n) as usize]),
+                Data::Bytes(data) => mem.write_pages(phys, &data[at as usize..(at + n) as usize]),
                 Data::Frame(from) => mem.copy(from + at, phys, n),
             }
             let virt = page.virt + at;
@@ -890,10 +896,15 @@ impl Snapshot {
     }
 }
 
+/// A function computing the CRC-32C of exported snapshots: [`crc32c`], or
+/// one with the same results that uses the CPU's CRC instructions, which
+/// the kernel passes in (change `fast-mem-primitives`).
+pub type Crc32c = fn(&[u8]) -> u32;
+
 /// CRC-32C (Castagnoli, reflected, as iSCSI and ext4 use it) of `bytes`,
-/// eight bytes at a time ("slicing by 8"): a file of tens of MiB is checked
-/// twice per round trip, and test builds run under emulation.
-fn crc32c(bytes: &[u8]) -> u32 {
+/// eight bytes at a time ("slicing by 8"): the portable form, and the
+/// reference the kernel's accelerated one is tested against.
+pub fn crc32c(bytes: &[u8]) -> u32 {
     const TABLES: [[u32; 256]; 8] = {
         let mut t = [[0u32; 256]; 8];
         let mut i = 0;

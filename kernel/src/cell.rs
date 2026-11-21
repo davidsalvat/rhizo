@@ -3982,12 +3982,15 @@ fn benchmarks(console: &mut impl Console) {
     let s = suspend_resume();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
-        "rhizo-snapshot suspend_ns={} resume_ns={} resume_eager_ns={} resume_touch_ns={} bytes={}",
+        "rhizo-snapshot suspend_ns={} resume_ns={} resume_eager_ns={} resume_touch_ns={} bytes={} \
+         export_ns={} import_ns={}",
         s[0],
         s[1],
         s[2],
         s[3],
-        s[4]
+        s[4],
+        s[5],
+        s[6]
     );
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
@@ -5163,13 +5166,16 @@ fn wire_rtt() -> Result<u64, alloc::string::String> {
 
 /// Medians over 7 rounds, for the `ballast` cell (8 MiB written): suspend,
 /// lazy resume until runnable, eager resume, lazy resume plus touching every
-/// page to the cell's exit; and the snapshot size.
+/// page to the cell's exit; and the snapshot size; then the snapshot
+/// exported to bytes with its checksum, and those bytes checked and decoded
+/// (what saving and loading a snapshot file cost in the kernel, change
+/// `fast-mem-primitives`).
 #[cfg(feature = "bench-cell")]
-fn suspend_resume() -> [u64; 5] {
+fn suspend_resume() -> [u64; 7] {
     const ROUNDS: usize = 7;
     let image = test_image("ballast");
     let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
-    let mut samples: [Vec<u64>; 4] = Default::default();
+    let mut samples: [Vec<u64>; 6] = Default::default();
     let mut bytes = 0;
     let mut host = Host::new();
     for _ in 0..ROUNDS {
@@ -5184,6 +5190,17 @@ fn suspend_resume() -> [u64; 5] {
             let snapshot = host.suspend(id).expect("live");
             let t1 = bench_clock();
             bytes = snapshot.heap_bytes();
+            if eager {
+                let crc = crate::arch::mem::crc32c;
+                let t0 = bench_clock();
+                let exported = snapshot.export(&DirectMap, crc);
+                let t1 = bench_clock();
+                let decoded = Snapshot::from_bytes(exported, user::MACHINE, crc).expect("valid");
+                let t2 = bench_clock();
+                drop(decoded);
+                samples[4].push(ns(t0, t1));
+                samples[5].push(ns(t1, t2));
+            }
             let mode = if eager { Resume::Eager } else { Resume::Lazy };
             let t2 = bench_clock();
             let id = host.resume(snapshot, mode, true, false).expect("resume");
@@ -5198,11 +5215,12 @@ fn suspend_resume() -> [u64; 5] {
             }
         }
     }
-    let mut out = [0u64; 5];
+    let mut out = [0u64; 7];
     for (o, s) in out.iter_mut().zip(&mut samples) {
         s.sort_unstable();
         *o = s[s.len() / 2];
     }
+    out.copy_within(4..6, 5);
     out[4] = bytes as u64;
     out
 }

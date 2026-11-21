@@ -535,6 +535,7 @@ fn measure_cells(
         let (mut suspend, mut resume, mut eager, mut touch) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut fork, mut fork_touch, mut template) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut export, mut import) = (Vec::new(), Vec::new());
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
         let (mut pipe_rtt, mut loopback_rtt, mut tcp_resume) = (Vec::new(), Vec::new(), Vec::new());
@@ -645,6 +646,8 @@ fn measure_cells(
                         resume.push(snap.resume_ns as f64 / 1000.0);
                         eager.push(snap.resume_eager_ns as f64 / 1000.0);
                         touch.push(snap.resume_touch_ns as f64 / 1000.0);
+                        export.push(snap.export_ns as f64 / 1000.0);
+                        import.push(snap.import_ns as f64 / 1000.0);
                         snapshot_bytes = Some(snap.bytes);
                     }
                     pt_frames = Some(c.pt_frames);
@@ -714,6 +717,8 @@ fn measure_cells(
             ("cell.resume_us", "us", &mut resume),
             ("cell.resume_eager_us", "us", &mut eager),
             ("cell.resume_touch_us", "us", &mut touch),
+            ("cell.snapshot_export_us", "us", &mut export),
+            ("cell.snapshot_import_us", "us", &mut import),
             ("cell.fork_us", "us", &mut fork),
             ("cell.fork_touch_us", "us", &mut fork_touch),
             ("cell.spawn_from_template_us", "us", &mut template),
@@ -1227,6 +1232,8 @@ struct SnapshotLine {
     resume_eager_ns: u64,
     resume_touch_ns: u64,
     bytes: u64,
+    export_ns: u64,
+    import_ns: u64,
 }
 
 fn parse_snapshot_line(output: &str) -> Option<SnapshotLine> {
@@ -1243,6 +1250,8 @@ fn parse_snapshot_line(output: &str) -> Option<SnapshotLine> {
         resume_eager_ns: field("resume_eager_ns")?,
         resume_touch_ns: field("resume_touch_ns")?,
         bytes: field("bytes")?,
+        export_ns: field("export_ns")?,
+        import_ns: field("import_ns")?,
     })
 }
 
@@ -2877,8 +2886,8 @@ mod tests {
 
     #[test]
     fn snapshot_line_is_parsed() {
-        let out =
-            "rhizo-snapshot suspend_ns=1 resume_ns=2 resume_eager_ns=3 resume_touch_ns=4 bytes=5";
+        let out = "rhizo-snapshot suspend_ns=1 resume_ns=2 resume_eager_ns=3 resume_touch_ns=4 \
+                   bytes=5 export_ns=6 import_ns=7";
         assert_eq!(
             parse_snapshot_line(out),
             Some(SnapshotLine {
@@ -2887,6 +2896,8 @@ mod tests {
                 resume_eager_ns: 3,
                 resume_touch_ns: 4,
                 bytes: 5,
+                export_ns: 6,
+                import_ns: 7,
             })
         );
     }

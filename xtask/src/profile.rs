@@ -38,6 +38,8 @@ pub const COUNTED: &[(&str, &str, &str)] = &[
     ("rhizo-snapshot", "resume_ns", "cell.resume"),
     ("rhizo-snapshot", "resume_eager_ns", "cell.resume_eager"),
     ("rhizo-snapshot", "resume_touch_ns", "cell.resume_touch"),
+    ("rhizo-snapshot", "export_ns", "cell.snapshot_export"),
+    ("rhizo-snapshot", "import_ns", "cell.snapshot_import"),
     ("rhizo-ops", "syscall_ns", "cell.syscall"),
     ("rhizo-ops", "cow_fault_ns", "cell.cow_fault"),
 ];
