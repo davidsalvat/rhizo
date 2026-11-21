@@ -626,7 +626,7 @@ impl Abi {
             Some(Sys::Fsync) => files::fsync(cx, a[0]),
             Some(Sys::Dup) => files::dup(cx, a[0], 0, false, false),
             Some(Sys::Dup2) => match cx.fs.kind(a[0] as u32) {
-                Ok(_) if a[0] == a[1] => a[1] as i64,
+                Ok(_) if a[0] as u32 == a[1] as u32 => (a[1] as u32).into(),
                 _ => files::dup(cx, a[0], a[1], true, false),
             },
             Some(Sys::Dup3) => files::dup3(cx, a[0], a[1], a[2]),

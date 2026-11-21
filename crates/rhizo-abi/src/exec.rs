@@ -202,4 +202,52 @@ mod tests {
         m.cache.clear(&mut m.frames);
         assert_eq!(m.frames.outstanding(), 0);
     }
+
+    proptest::proptest! {
+        /// A program and an interpreter with any bytes changed (the cell
+        /// may have written both): `exec` refuses them leaving nothing
+        /// behind, or starts a cell whose pages are its own, in the lower
+        /// half, never writable and executable at once, and all given back
+        /// when it ends.
+        #[test]
+        fn tampered_programs_start_safely_or_not_at_all(
+            prog_edits in proptest::collection::vec((0usize..0x900, proptest::prelude::any::<u8>()), 0..4),
+            ld_edits in proptest::collection::vec((0usize..0x900, proptest::prelude::any::<u8>()), 0..4),
+        ) {
+            let ld_path = b"/lib/ld.so";
+            let mut prog = elf_with(
+                183,
+                3,
+                &[(0x1000, 5, b"MAIN", 4), (0x2000, 6, b"D", 0x2000)],
+                Some(ld_path),
+            );
+            let mut ld = elf_with(183, 3, &[(0, 5, b"LDSO", 4), (0x1000, 6, b"L", 0x1000)], None);
+            for (bytes, edits) in [(&mut prog, &prog_edits), (&mut ld, &ld_edits)] {
+                for &(at, b) in edits {
+                    bytes[at] = b;
+                }
+            }
+            let mut fs = Fs::new();
+            fs.put_file(b"/prog", &prog).unwrap();
+            fs.put_file(ld_path, &ld).unwrap();
+            let mut m = Machine {
+                fs,
+                mem: FakePhysicalMemory::new(),
+                frames: CountingFrames::new(1 << 16),
+                cache: PageCache::new(64),
+            };
+            m.frames.limit = 256;
+            if let Ok(cell) = m.exec(b"/prog") {
+                let pt = PageTable::<Aarch64>::from_root(cell.root);
+                pt.for_each_lower_leaf(&m.mem, &mut |virt, _, size, flags| {
+                    assert!(virt + size.bytes() <= rhizo_cell::USER_END, "{virt:#x}");
+                    assert!(!(flags.is_writable() && flags.is_executable()), "W^X at {virt:#x}");
+                });
+                proptest::prop_assert!(cell.regs().pc < rhizo_cell::USER_END);
+                space::destroy(pt, &mut m.mem, &mut m.frames);
+            }
+            m.cache.clear(&mut m.frames);
+            proptest::prop_assert_eq!(m.frames.outstanding(), 0, "every frame back");
+        }
+    }
 }

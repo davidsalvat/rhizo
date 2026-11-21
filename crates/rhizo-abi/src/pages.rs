@@ -64,7 +64,8 @@ impl PageCache {
     /// A frame for `page` with one reference for the caller, and whether it
     /// was written now: the kept frame of the same contents, or a new one
     /// (kept, unless the page has no file data: then it is the caller's
-    /// alone, zeroed).
+    /// alone, zeroed). When the kept frame cannot count one more reference,
+    /// the caller gets a copy of its own.
     pub fn get(
         &mut self,
         page: &Page,
@@ -77,8 +78,15 @@ impl PageCache {
             return Some((phys, true));
         };
         if let Some(&(_, phys)) = self.pages.get(&key) {
-            frames.share(phys);
-            return Some((phys, false));
+            if frames.try_share(phys) {
+                return Some((phys, false));
+            }
+            // Its count is full (a cell can map one page without end,
+            // finding S14): a copy of the caller's own.
+            let copy = frames.alloc()?;
+            mem.zero_frame(copy);
+            write_bytes(mem, copy, page.bytes());
+            return Some((copy, true));
         }
         if self.pages.len() >= self.limit {
             self.clear(frames);
@@ -153,6 +161,34 @@ mod tests {
         }
         assert!(cache.clear(&mut frames));
         assert!(cache.is_empty() && !cache.clear(&mut frames));
+        assert_eq!(frames.outstanding(), 0);
+    }
+
+    /// Finding S14: a page mapped more times than a frame counts gets
+    /// copies of its own past the count; nothing panics or leaks.
+    #[test]
+    fn a_page_shared_without_end_gets_copies() {
+        let mut fs = rhizo_fs::Fs::new();
+        fs.put_file(b"/f", b"!").unwrap();
+        let (ino, _) = fs.file_at(b"/f").unwrap();
+        let mut mem = FakePhysicalMemory::new();
+        let mut frames = CountingFrames::new(1024);
+        frames.max_refs = 3;
+        let mut cache = PageCache::new(8);
+        let page = fs.page(ino, 0).unwrap();
+        let got: Vec<(u64, bool)> = (0..4)
+            .map(|_| cache.get(&page, &mut mem, &mut frames).unwrap())
+            .collect();
+        let kept = got[0].0;
+        assert_eq!(got[..2], [(kept, true), (kept, false)], "shared while it counts");
+        for &(copy, fresh) in &got[2..] {
+            assert!(copy != kept && fresh && !frames.is_shared(copy));
+            assert_eq!(mem.read_u64(copy), u64::from(b'!'), "the page's bytes");
+        }
+        for (phys, _) in got {
+            frames.free(phys, PageSize::Small);
+        }
+        cache.clear(&mut frames);
         assert_eq!(frames.outstanding(), 0);
     }
 
