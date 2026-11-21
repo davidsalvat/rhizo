@@ -88,22 +88,41 @@ and Cloud Hypervisor where KVM is available.
 
 ### Requirement: A share of the in-kernel tests
 An in-kernel test build booted with `shard=I/N` (`0 <= I < N`) SHALL run
-only the tests whose position across all test suites is `I` modulo `N`,
-reporting how many it runs, and SHALL ignore a malformed value.
+only the tests dealt to share `I`, reporting how many it runs, and SHALL
+ignore a malformed value. The tests SHALL be ranked by their estimated
+cost, most expensive first (1 unless given, ties by position across all
+test suites), and dealt by rank to shares `0` to `N-1`, then `N-1` to
+`0`, and again; each share SHALL run its tests in suite order. The deal
+SHALL depend only on the suites and `N`.
 
 #### Scenario: Shares cover every test once
 - **WHEN** the test build boots `N` times with `shard=0/N` to `shard=N-1/N`
 - **THEN** every test runs in exactly one of the boots
 
+#### Scenario: Expensive tests apart
+- **WHEN** the two most expensive tests sit at positions of the same parity and the build boots with `shard=0/2` and `shard=1/2`
+- **THEN** they run in different boots, each boot in suite order
+
 ### Requirement: Tests do not depend on their order
 An in-kernel test SHALL pass whether or not the tests before it ran: work
 done once per boot (such as bringing up the network card) SHALL happen at
 boot, and a test that compares free memory SHALL warm the kernel heap
-first.
+first. A test that compares memory before and after itself SHALL take
+both measures with no connection through the network card still closing,
+waiting a bounded time for those an earlier test closed, and SHALL fail
+when one never finishes closing.
 
 #### Scenario: Memory check first in its VM
 - **WHEN** a test that checks every frame is returned runs first after boot
 - **THEN** it passes as it does after the other tests
+
+#### Scenario: A connection still closing from an earlier test
+- **WHEN** a test that checks every heap allocation is returned runs right after a test whose connection through the card is still closing
+- **THEN** the connection finishes closing before the first measure, and the check counts only the test's own allocations
+
+#### Scenario: Any split of the suite
+- **WHEN** `ktest` or `ktest-smp` runs with `RHIZO_SHARDS` from 1 to 4
+- **THEN** every VM passes
 
 ### Requirement: Node.js tests in their own VM
 Where Node.js is packed (`RHIZO_NODE`), `cargo xtask test` SHALL run the
@@ -136,3 +155,34 @@ not run. CI SHALL run it on both architectures.
 #### Scenario: Not built
 - **WHEN** a developer runs `cargo xtask test` without `RHIZO_CPYTHON_SRC`
 - **THEN** the step prints that the package tests did not run and why, and the run passes
+
+### Requirement: Harness self-checks chosen at boot
+The in-kernel test build SHALL contain every harness self-check (a case
+that must end the run in one precise way). Booted with `selfcheck=NAME`
+it SHALL run one passing case and then self-check `NAME` instead of its
+suite, and SHALL fail the run when `NAME` is unknown. `cargo xtask test`
+SHALL run each self-check (step `ktest-<NAME>`) on the test kernel that
+runs the in-kernel tests.
+
+#### Scenario: A self-check without a build of its own
+- **WHEN** `cargo xtask test --only ktest-page-fault` runs after `cargo xtask test --only ktest`, with no source changed
+- **THEN** no kernel is compiled, the test kernel boots with `selfcheck=page-fault`, the null write is reported as a page fault, and the step passes
+
+#### Scenario: Unknown self-check
+- **WHEN** the test kernel boots with `selfcheck=bogus`
+- **THEN** it panics with `unknown self-check` and the run fails
+
+#### Scenario: No self-check named
+- **WHEN** the test kernel boots without `selfcheck=`
+- **THEN** it runs every in-kernel test and no self-check
+
+### Requirement: Test code only in the test build
+In-kernel tests and harness self-checks SHALL be compiled only into kernels
+built with the test feature (`ktest`), chosen once per build, not per test
+or self-check. Kernels built without it (the plain kernel, the control
+kernel, the benchmark kernels) SHALL contain no test or self-check code,
+and choosing tests at boot SHALL NOT change their images.
+
+#### Scenario: A release kernel holds no self-check
+- **WHEN** the control kernel `rhizo up` runs is built
+- **THEN** it contains no self-check case, and `selfcheck=` on its command line has no effect
