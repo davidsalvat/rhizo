@@ -79,9 +79,9 @@ Commands:
       --no-icount            Skip the instruction counts under QEMU -icount
       --icount-only          Only those instruction counts (hosts without
                              KVM, such as GitHub's ARM64 runners)
-      --workload <laptop|server>
-                             Only this reference workload (both run by
-                             default, after the cell figures)
+      --workload <laptop|server|node>
+                             Only this workload (all run by default, after
+                             the cell figures; Node.js with RHIZO_NODE)
       --soak                 The long versions of the workloads (weekly)
       --cells <n>            Cells of the server workload (default 10000)
       --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
@@ -359,6 +359,7 @@ fn test_steps() -> Vec<&'static str> {
         "boot",
         "ktest",
         "ktest-smp",
+        "ktest-node",
         "control",
     ];
     steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
@@ -457,6 +458,26 @@ fn cmd_test(args: &RunArgs) -> Result {
             ));
         }
     }
+    if args.wants("ktest-node") {
+        match node_unavailable_reason() {
+            Some(why) => report::text(&format!("[xtask] Node.js tests not run: {why}")),
+            None => jobs.push(Job::vm(
+                format!("Node.js in cells on {} CPUs", NODE_CPUS),
+                keep_kernel(
+                    "ktest-node",
+                    &build_kernel(Profile::Debug, &["ktest", "node"])?,
+                )?,
+                RunOptions {
+                    network: true,
+                    cpus: NODE_CPUS,
+                    memory_mib: NODE_MEMORY_MIB,
+                    ..opts
+                },
+                Check::Ktest { cpus: NODE_CPUS },
+                args.reproduce("ktest-node"),
+            )),
+        }
+    }
     if args.wants("control") {
         let kernel = keep_kernel("control", &build_kernel(Profile::Debug, &["control"])?)?;
         check_kernel_reused(Profile::Debug, &["control"])?;
@@ -491,6 +512,21 @@ fn cmd_test(args: &RunArgs) -> Result {
         ));
     }
     run_jobs(args.vmm, &jobs, parallel)
+}
+
+/// Memory of the VMs that run Node.js (change `add-node-workload`): its
+/// files embedded in the kernel and decoded into a cell file system (over
+/// 100 MiB each), the file pages it maps, and its heap.
+pub(crate) const NODE_MEMORY_MIB: u32 = 1024;
+/// CPUs of the Node.js test VM: its threads run on several at once.
+const NODE_CPUS: u32 = 2;
+
+/// Why the Node.js kernels are not built, if they are not: Node.js is
+/// downloaded only with `RHIZO_NODE` set.
+pub(crate) fn node_unavailable_reason() -> Option<String> {
+    env::var_os("RHIZO_NODE")
+        .is_none()
+        .then(|| "RHIZO_NODE is not set".into())
 }
 
 /// Most in-kernel test VMs one step is split into.

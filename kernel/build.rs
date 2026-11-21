@@ -1,12 +1,13 @@
 use std::path::Path;
 
 /// Cells built only when their source is given, or by `xtask` only.
-const OPTIONAL: [&str; 5] = [
+const OPTIONAL: [&str; 6] = [
     "micropython",
     "cpython",
     "cpython-files",
     "dynamic-files",
     "distro-files",
+    "node-files",
 ];
 /// Cells embedded in test kernels only (`ktest`): elsewhere they read as
 /// not built, and take no memory from the cells a benchmark runs (its guest
@@ -84,10 +85,14 @@ fn embed_cells() {
          /// The embedded cell named `name`, if any (empty: not built).\n\
          pub fn find_image(name: &[u8]) -> Option<&'static [u8]> {\n    Some(match name {\n",
     );
+    let ktest = std::env::var_os("CARGO_FEATURE_KTEST").is_some();
+    // Node.js (over 100 MiB) only in the kernels built to run it, whose VMs
+    // get the memory it needs (change `add-node-workload`).
+    let node = std::env::var_os("CARGO_FEATURE_NODE").is_some();
     for name in &names {
-        let ktest = std::env::var_os("CARGO_FEATURE_KTEST").is_some();
         let data = match &from {
             Some(_) if TEST_ONLY.contains(&name.as_str()) && !ktest => Vec::new(),
+            Some(_) if name == "node-files" && !node => Vec::new(),
             Some(dir) => {
                 let path = Path::new(dir).join(name);
                 match std::fs::read(&path) {

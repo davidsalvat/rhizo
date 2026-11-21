@@ -26,6 +26,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ("fault_kernel", "", Ending::Fault),
     ("chatter", "x\nx\nx\n", Ending::Exit(0)),
     ("flags", "flags ok\n", Ending::Exit(0)),
+    ("ticks", "ticks ok\n", Ending::Exit(0)),
     ("sleeper", "slept ok\n", Ending::Exit(0)),
     ("same_addr", "own value ok\n", Ending::Exit(0)),
     ("peek", "", Ending::Fault),
@@ -183,6 +184,23 @@ pub const CPYTHON_STDOUT: &str = "warm\n\
      \"gap_spread\": 7.62, \"last_date\": \"22 Dec 2026\", \"mean_gap_days\": 8.6087, \
      \"tool\": \"summarize\", \"top_words\": [\"KERNEL\", \"FORK\", \"PAGE\"]}\n\
      cpython ok\n";
+
+/// Node.js (`cells/node/demo.js`, packed only with `RHIZO_NODE`; change
+/// `add-node-workload`): its command line, in a cell holding the files
+/// `xtask` packs and on Linux in a directory laid out the same way, without
+/// and with the URL of the host's fake model, and what it prints. The
+/// script pauses after `warm`, where a host may freeze it as a template.
+#[allow(dead_code)]
+pub const NODE_ARGV: [&str; 3] = ["/usr/bin/node", "--jitless", "/app/demo.js"];
+#[allow(dead_code)]
+pub const NODE_STDOUT: &str = "warm\n\
+     {\"tool\":\"summarize\",\"top_words\":[\"RESUME\",\"SNAPSHOT\",\"AGENT\"],\
+     \"counts\":[74,69,65],\"contacts\":24,\"first_contact\":\"agent@team0\",\
+     \"dates_since\":25,\"last_date\":\"2026-12-15\",\"folded\":1636986}\n";
+/// What it prints after [`NODE_STDOUT`] given the model's URL: the model's
+/// tool call, received with `node:http`.
+#[allow(dead_code)]
+pub const NODE_MODEL_LINE: &str = "model: 200 compute {\"n\": 705, \"seed\": 225}\n";
 
 /// The CPython agent (`cells/python/agent_loop.py`, change
 /// `add-agent-workload`) after [`AGENT_TURNS`] turns with the host's fake
