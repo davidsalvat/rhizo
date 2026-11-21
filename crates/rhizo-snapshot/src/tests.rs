@@ -9,6 +9,11 @@ const RW: PageFlags = PageFlags::USER
     .union(PageFlags::NO_EXECUTE);
 const RX: PageFlags = PageFlags::USER;
 
+/// The release of snapshots of cells that share no page.
+fn unshared(phys: u64, _: PageSize) {
+    unreachable!("{phys:#x} was never shared");
+}
+
 /// A cell with a code page, a written data page and a 2 MiB region.
 fn cell<F: EntryFormat>(mem: &mut FakePhysicalMemory, frames: &mut CountingFrames) -> Cell {
     let mut tlb = RecordingTlb::default();
@@ -60,13 +65,31 @@ fn threaded<F: EntryFormat>(mem: &mut FakePhysicalMemory, frames: &mut CountingF
 fn round_trip<F: EntryFormat>() {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let original = threaded::<F>(&mut mem, &mut frames);
-    let snap = Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), &[], 1000, &mem);
+    let snap = Snapshot::capture::<F>(
+        Machine::Aarch64,
+        &original,
+        &Fs::new(),
+        &[],
+        1000,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
     assert_eq!(
         snap,
-        Snapshot::capture::<F>(Machine::Aarch64, &original, &Fs::new(), &[], 1000, &mem),
+        Snapshot::capture::<F>(
+            Machine::Aarch64,
+            &original,
+            &Fs::new(),
+            &[],
+            1000,
+            &mut mem,
+            &mut frames,
+            unshared
+        ),
         "deterministic"
     );
-    let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
     assert_eq!(snap.pages(), 3);
     assert_eq!(snap.page(2).size, PageSize::Large);
     assert_eq!(snap.find(0x60_0fff), Some(1));
@@ -113,9 +136,11 @@ fn round_trip<F: EntryFormat>() {
         &Fs::new(),
         &[],
         1000,
-        &mem,
+        &mut mem,
+        &mut frames,
+        unshared,
     );
-    assert_eq!(again.as_bytes(), snap.as_bytes());
+    assert_eq!(again, snap);
 }
 
 #[test]
@@ -135,14 +160,23 @@ fn files_travel_with_the_snapshot() {
     let mut fs = Fs::new();
     fs.put_file(b"/in/data.txt", b"input").unwrap();
     fs.chdir(b"/in").unwrap();
-    let snap = Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &fs, &[], 0, &mem);
-    let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
+    let snap = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &fs,
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
+    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
     let back = snap.files();
     assert_eq!(back.getcwd(), b"/in");
     assert_eq!(back.stat(None, b"data.txt").unwrap().size, 5);
     // A files section that does not decode is refused (its last byte is
     // just before the sockets section: a length and an empty list).
-    let mut bytes = snap.into_bytes();
+    let mut bytes = snap.export(&mem);
     let last = bytes.len() - 13;
     bytes[last] ^= 0xff;
     assert_eq!(
@@ -175,14 +209,25 @@ fn socket_records_travel_one_per_descriptor() {
         &fs,
         std::slice::from_ref(&listener),
         0,
-        &mem,
+        &mut mem,
+        &mut frames,
+        unshared,
     );
-    let snap = Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64).unwrap();
+    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
     assert_eq!(snap.sockets(), std::slice::from_ref(&listener));
     assert_eq!(snap.files().socket(fd), Ok(0));
-    let refused = |fs: &Fs, records: &[Record]| {
-        let snap = Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, fs, records, 0, &mem);
-        Snapshot::from_bytes(snap.into_bytes(), Machine::Aarch64)
+    let mut refused = |fs: &Fs, records: &[Record]| {
+        let snap = Snapshot::capture::<Aarch64>(
+            Machine::Aarch64,
+            &c,
+            fs,
+            records,
+            0,
+            &mut mem,
+            &mut frames,
+            unshared,
+        );
+        Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64)
     };
     assert_eq!(
         refused(&fs, &[]),
@@ -230,9 +275,11 @@ fn parked_connections_travel_as_their_key() {
         &fs,
         std::slice::from_ref(&parked),
         0,
-        &mem,
+        &mut mem,
+        &mut frames,
+        unshared,
     );
-    let mut bytes = snap.into_bytes();
+    let mut bytes = snap.export(&mem);
     let back = Snapshot::from_bytes(bytes.clone(), Machine::Aarch64).unwrap();
     assert_eq!(back.sockets(), std::slice::from_ref(&parked));
     assert_eq!(back.files().socket(fd), Ok(0));
@@ -244,7 +291,17 @@ fn parked_connections_travel_as_their_key() {
 fn sample() -> Vec<u8> {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let c = cell::<Aarch64>(&mut mem, &mut frames);
-    Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &Fs::new(), &[], 0, &mem).into_bytes()
+    Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    )
+    .export(&mem)
 }
 
 #[test]
@@ -298,8 +355,17 @@ fn rejects_what_it_cannot_resume() {
 fn x86_64_state_that_would_fault_in_the_kernel_is_refused() {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let c = cell::<X86_64>(&mut mem, &mut frames);
-    let good =
-        Snapshot::capture::<X86_64>(Machine::X86_64, &c, &Fs::new(), &[], 0, &mem).into_bytes();
+    let good = Snapshot::capture::<X86_64>(
+        Machine::X86_64,
+        &c,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    )
+    .export(&mem);
     assert!(Snapshot::from_bytes(good.clone(), Machine::X86_64).is_ok());
     // The first thread's words: tls is word 39, the FP image from word 41.
     let tls = HEADER + STATE + 39 * 8;
@@ -347,7 +413,16 @@ impl Frames for Fragmented {
 fn a_large_page_comes_back_in_small_pages_without_a_large_frame() {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(4096));
     let original = cell::<X86_64>(&mut mem, &mut frames);
-    let snap = Snapshot::capture::<X86_64>(Machine::Aarch64, &original, &Fs::new(), &[], 0, &mem);
+    let snap = Snapshot::capture::<X86_64>(
+        Machine::Aarch64,
+        &original,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
     assert_eq!(snap.page(2).size, PageSize::Large);
     let mut frames = Fragmented(frames);
     let pt = PageTable::<X86_64>::new(&mut mem, &mut || frames.alloc()).unwrap();
@@ -380,8 +455,17 @@ fn restore_failure_returns_the_frame() {
 fn rejects_malformed_threads() {
     let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
     let c = threaded::<Aarch64>(&mut mem, &mut frames);
-    let good =
-        Snapshot::capture::<Aarch64>(Machine::Aarch64, &c, &Fs::new(), &[], 0, &mem).into_bytes();
+    let good = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    )
+    .export(&mem);
     assert!(Snapshot::from_bytes(good.clone(), Machine::Aarch64).is_ok());
     let word = |index: usize, i: usize| HEADER + STATE + index * THREAD + i * 8;
     let with = |at: usize, v: u64| {
@@ -488,7 +572,17 @@ mod hostile {
                 parked: None,
             },
         ];
-        Snapshot::capture::<X86_64>(Machine::X86_64, &c, &fs, &records, 0, &mem).into_bytes()
+        Snapshot::capture::<X86_64>(
+            Machine::X86_64,
+            &c,
+            &fs,
+            &records,
+            0,
+            &mut mem,
+            &mut frames,
+            unshared,
+        )
+        .export(&mem)
     }
 
     /// Restores everything `snap` holds as the kernel does on resume, then
@@ -606,4 +700,120 @@ mod hostile {
             }
         }
     }
+}
+
+thread_local! {
+    /// Frames the snapshots of [`shared`] gave back.
+    static RELEASED: std::cell::RefCell<Vec<(u64, PageSize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn release(phys: u64, size: PageSize) {
+    RELEASED.with(|r| r.borrow_mut().push((phys, size)));
+}
+
+/// A fork of a template that wrote one page: its snapshot refers to the
+/// two pages it still shares, copies the third, keeps them as they were
+/// when the template writes them, and exports them in full.
+fn shared<F: EntryFormat>() {
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let template = cell::<F>(&mut mem, &mut frames);
+    let tpt = PageTable::<F>::from_root(template.root);
+    let fork = tpt.fork_lower_half(&mut mem, &mut frames).unwrap();
+    /// Writes like a cell, resolving copy-on-write first.
+    fn write<F: EntryFormat>(
+        mem: &mut FakePhysicalMemory,
+        frames: &mut CountingFrames,
+        pt: &PageTable<F>,
+        at: u64,
+        data: &[u8],
+    ) {
+        let resolved = pt.resolve_write(mem, frames, &mut RecordingTlb::default(), at);
+        assert_eq!(resolved, Ok(true));
+        rhizo_cell::memory::copy_to(pt, mem, at, data).unwrap();
+    }
+    write(&mut mem, &mut frames, &fork, 0x60_0ffc, b"kid!");
+    let child = Cell {
+        root: fork.root(),
+        ..template
+    };
+    let snap = Snapshot::capture::<F>(
+        Machine::Aarch64,
+        &child,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        release,
+    );
+    let kinds: Vec<bool> = (0..3)
+        .map(|i| matches!(snap.page(i).data, Data::Frame(_)))
+        .collect();
+    assert_eq!(kinds, [true, false, true], "code and 2 MiB page shared");
+    assert_eq!(snap.shared_bytes(), 0x1000 + (2 << 20));
+    assert!(
+        snap.heap_bytes() < 3 * 0x1000,
+        "{} bytes",
+        snap.heap_bytes()
+    );
+    space::destroy(fork, &mut mem, &mut frames);
+    // The template writes a page the snapshot refers to: it gets a copy.
+    write(&mut mem, &mut frames, &tpt, 0x4000_001f_fff8, b"template");
+
+    let check = |snap: &Snapshot, mem: &mut FakePhysicalMemory, frames: &mut CountingFrames| {
+        let pt = PageTable::<F>::new(mem, &mut || frames.alloc()).unwrap();
+        for i in 0..snap.pages() {
+            snap.restore_page(i, &pt, mem, frames).unwrap();
+        }
+        let mut buf = [0u8; 8];
+        rhizo_cell::memory::copy_from(&pt, mem, 0x4000_001f_fff8, &mut buf).unwrap();
+        assert_eq!(&buf, b"big page");
+        rhizo_cell::memory::copy_from(&pt, mem, 0x60_0ffc, &mut buf[..4]).unwrap();
+        assert_eq!(&buf[..4], b"kid!");
+        assert_eq!(pt.translate(mem, 0x40_0000).unwrap().flags, RX);
+        pt
+    };
+    let resumed = check(&snap, &mut mem, &mut frames);
+    let big = resumed.translate(&mem, 0x4000_0000_0000).unwrap();
+    assert_eq!(snap.page(2).data, Data::Frame(big.phys), "shared again");
+    assert!(!big.flags.is_writable(), "copy-on-write");
+    write(
+        &mut mem,
+        &mut frames,
+        &resumed,
+        0x4000_0000_0000,
+        b"resumed!",
+    );
+    let back = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
+    assert_eq!(back.shared_bytes(), 0, "an export stands alone");
+    let imported = check(&back, &mut mem, &mut frames);
+    let released = RELEASED.with(|r| r.take());
+    assert_eq!(released.len(), 2, "the export dropped both references");
+    for (phys, size) in released {
+        frames.free(phys, size);
+    }
+    for pt in [resumed, imported, tpt] {
+        space::destroy(pt, &mut mem, &mut frames);
+    }
+    assert_eq!(frames.outstanding(), 0, "every frame back");
+}
+
+#[test]
+fn shared_pages_are_referred_to_aarch64() {
+    shared::<Aarch64>();
+}
+
+#[test]
+fn shared_pages_are_referred_to_x86_64() {
+    shared::<X86_64>();
+}
+
+#[test]
+fn records_that_refer_to_frames_are_refused() {
+    let mut b = sample();
+    b[HEADER + STATE + THREAD + REFERS] = 1;
+    assert_eq!(
+        Snapshot::from_bytes(b, Machine::Aarch64),
+        Err(FormatError::BadPage { index: 0 })
+    );
 }

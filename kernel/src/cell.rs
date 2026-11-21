@@ -34,7 +34,7 @@ use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_net::Net;
 use rhizo_prof::Part;
 use rhizo_sched::{Gangs, IdleTimer, SLICE_NS, Scheduler, TagPool};
-use rhizo_snapshot::Snapshot;
+use rhizo_snapshot::{Data, Snapshot};
 
 /// How a cell ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,11 +752,14 @@ impl Lazy {
         true
     }
 
-    /// Bytes of the pages still pending.
+    /// Bytes of the pages still pending that need frames of their own (not
+    /// those it shares).
     fn pending_bytes(&self) -> u64 {
         (0..self.pending.len())
             .filter(|&i| self.pending[i])
-            .map(|i| self.snapshot.page(i).size.bytes())
+            .map(|i| self.snapshot.page(i))
+            .filter(|p| matches!(p.data, Data::Bytes(_)))
+            .map(|p| p.size.bytes())
             .sum()
     }
 
@@ -849,6 +852,13 @@ fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
     let _p = cost::scope(Part::Fault);
     cells_may_take(FRAME_SIZE)
         && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, &mut KernelFrames, addr)
+}
+
+/// Drops a snapshot's reference to a frame it shares (design D1 of
+/// `add-shared-snapshots`). Only a count goes down, so no lock of shared
+/// tables is needed: a cell that sees the frame no longer shared owns it.
+fn release_frame(phys: u64, size: PageSize) {
+    KernelFrames.free(phys, size);
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
@@ -2218,14 +2228,21 @@ impl Host {
         }
         sync_fp(&mut live, true);
         let (files, sockets) = export_sockets(&live.fs);
-        let snapshot = Snapshot::capture::<Format>(
-            user::MACHINE,
-            &live.cell,
-            &files,
-            &sockets,
-            now_ns(),
-            &DirectMap,
-        );
+        // Refers to the pages it shares instead of copying them (design D1
+        // of `add-shared-snapshots`); its tables become its own first, under
+        // the lock of shared tables when it has some.
+        let snapshot = sharing(live.shares, || {
+            Snapshot::capture::<Format>(
+                user::MACHINE,
+                &live.cell,
+                &files,
+                &sockets,
+                now_ns(),
+                &mut DirectMap,
+                &mut KernelFrames,
+                release_frame,
+            )
+        });
         self.end(live, Ending::Suspended);
         Some(snapshot)
     }
@@ -2243,7 +2260,9 @@ impl Host {
         let _p = cost::scope(Part::Spawn);
         if mode == Resume::Eager {
             let bytes = (0..snapshot.pages())
-                .map(|i| snapshot.page(i).size.bytes())
+                .map(|i| snapshot.page(i))
+                .filter(|p| matches!(p.data, Data::Bytes(_)))
+                .map(|p| p.size.bytes())
                 .sum();
             if !cells_may_take(bytes) {
                 return Err(snapshot);
@@ -3823,7 +3842,7 @@ fn density() -> (u64, u64) {
     while host.output(id) != Some(b"idle\n") {
         host.step();
     }
-    let suspended = host.suspend(id).map_or(0, |s| s.as_bytes().len() as u64);
+    let suspended = host.suspend(id).map_or(0, |s| s.heap_bytes() as u64);
     (idle, suspended)
 }
 
@@ -4173,7 +4192,7 @@ fn suspend_resume() -> [u64; 5] {
             let t0 = bench_clock();
             let snapshot = host.suspend(id).expect("live");
             let t1 = bench_clock();
-            bytes = snapshot.as_bytes().len();
+            bytes = snapshot.heap_bytes();
             let mode = if eager { Resume::Eager } else { Resume::Lazy };
             let t2 = bench_clock();
             let id = host.resume(snapshot, mode, true, false).expect("resume");

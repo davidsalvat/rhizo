@@ -168,6 +168,40 @@ impl<F: EntryFormat> PageTable<F> {
         self.walk_private(mem, frames, virt).map(|_| ())
     }
 
+    /// Makes every table of the user half private to this hierarchy and
+    /// writable, as writes everywhere would, without copying a page (design
+    /// D1 of `add-shared-snapshots`): afterwards a page another hierarchy
+    /// can reach counts that reference itself, and is copy-on-write (or
+    /// read-only) everywhere, so it can be shared once more safely.
+    pub fn unshare_tables(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        frames: &mut impl Frames,
+    ) -> Result<(), MapError> {
+        fn walk<F: EntryFormat>(
+            mem: &mut impl PhysicalMemory,
+            frames: &mut impl Frames,
+            table: u64,
+            level: u32,
+            entries: u64,
+        ) -> Result<(), MapError> {
+            for i in 0..entries {
+                let slot = table + i * 8;
+                let entry = mem.read_u64(slot);
+                if !F::is_valid(entry) || F::is_leaf(entry, level) {
+                    continue;
+                }
+                let next = private_table::<F>(mem, frames, slot, entry, level)?;
+                // A table of the last level holds only pages.
+                if level > 1 {
+                    walk::<F>(mem, frames, next, level - 1, ENTRIES)?;
+                }
+            }
+            Ok(())
+        }
+        walk::<F>(mem, frames, self.root(), 3, ENTRIES / 2)
+    }
+
     /// Resolves a write to `virt` refused only because of sharing: copies the
     /// shared tables on the path and the page if it still has other
     /// references, or makes it writable again if not. Returns `false` if the
@@ -252,44 +286,9 @@ impl<F: EntryFormat> PageTable<F> {
             if F::is_leaf(entry, level) {
                 return Ok(Some((slot, level)));
             }
-            let next = F::address(entry);
-            if F::table_writable(entry) {
-                table = next;
-                continue;
-            }
-            table = if frames.is_shared(next) {
-                let copy = frames.alloc().ok_or(MapError::OutOfFrames)?;
-                mem.copy(next, copy, FRAME_SIZE);
-                // Both copies now point at everything below: one more
-                // reference each, and no writes through either (invariant).
-                for i in 0..ENTRIES {
-                    let e = mem.read_u64(next + i * 8);
-                    if !F::is_valid(e) {
-                        continue;
-                    }
-                    frames.share(F::address(e) & !(leaf_bytes::<F>(e, level - 1) - 1));
-                    let shared = if F::is_leaf(e, level - 1) {
-                        let f = F::flags(e);
-                        if f.is_writable() {
-                            F::with_cow(F::with_leaf_writable(e, false), true)
-                        } else {
-                            e
-                        }
-                    } else {
-                        F::with_table_writable(e, false)
-                    };
-                    mem.write_u64(next + i * 8, shared);
-                    mem.write_u64(copy + i * 8, shared);
-                }
-                mem.write_u64(
-                    slot,
-                    F::with_table_writable(F::with_address(entry, copy), true),
-                );
-                frames.free(next, PageSize::Small);
-                copy
-            } else {
-                mem.write_u64(slot, F::with_table_writable(entry, true));
-                next
+            table = match F::table_writable(entry) {
+                true => F::address(entry),
+                false => private_table::<F>(mem, frames, slot, entry, level)?,
             };
         }
         Ok(None)
@@ -330,6 +329,55 @@ impl<F: EntryFormat> PageTable<F> {
         walk::<F>(mem, frames, self.root(), 3, ENTRIES / 2);
         frames.free(self.root(), PageSize::Small);
     }
+}
+
+/// Makes the table that `entry` (in `slot`, at `level`) points to private to
+/// the hierarchy holding `slot`, and writable through it; returns the table.
+/// A shared table is copied: both copies then point at everything below,
+/// with one more reference each, and no writes through either (invariant).
+#[inline]
+fn private_table<F: EntryFormat>(
+    mem: &mut impl PhysicalMemory,
+    frames: &mut impl Frames,
+    slot: u64,
+    entry: u64,
+    level: u32,
+) -> Result<u64, MapError> {
+    let next = F::address(entry);
+    if F::table_writable(entry) {
+        return Ok(next);
+    }
+    if !frames.is_shared(next) {
+        mem.write_u64(slot, F::with_table_writable(entry, true));
+        return Ok(next);
+    }
+    let copy = frames.alloc().ok_or(MapError::OutOfFrames)?;
+    mem.copy(next, copy, FRAME_SIZE);
+    for i in 0..ENTRIES {
+        let e = mem.read_u64(next + i * 8);
+        if !F::is_valid(e) {
+            continue;
+        }
+        frames.share(F::address(e) & !(leaf_bytes::<F>(e, level - 1) - 1));
+        let shared = if F::is_leaf(e, level - 1) {
+            let f = F::flags(e);
+            if f.is_writable() {
+                F::with_cow(F::with_leaf_writable(e, false), true)
+            } else {
+                e
+            }
+        } else {
+            F::with_table_writable(e, false)
+        };
+        mem.write_u64(next + i * 8, shared);
+        mem.write_u64(copy + i * 8, shared);
+    }
+    mem.write_u64(
+        slot,
+        F::with_table_writable(F::with_address(entry, copy), true),
+    );
+    frames.free(next, PageSize::Small);
+    Ok(copy)
 }
 
 /// Bytes mapped by entry `e` at `level` if it is a leaf, else one frame.
