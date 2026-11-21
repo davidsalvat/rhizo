@@ -157,6 +157,7 @@ pub fn measure(
         memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        control: false,
     };
     for &vmm in &opts.vmms {
         if vmm.unavailable_reason(opts.accel).is_some() {
@@ -222,6 +223,7 @@ fn icount(
         memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        control: false,
     };
     let mut samples = Samples::default();
     for guest in [&plain, profiled] {
@@ -510,6 +512,7 @@ pub fn cmd(args: &ProfileArgs) -> Result {
         memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        control: false,
     };
     let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
     if run.result == VmResult::Failed {

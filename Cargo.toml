@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "cells", "crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "crates/rhizo-cell", "crates/rhizo-abi", "crates/rhizo-sched", "crates/rhizo-snapshot", "crates/rhizo-fs", "crates/rhizo-net", "crates/rhizo-virtio", "crates/rhizo-prof", "xtask"]
+members = ["kernel", "cells", "crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "crates/rhizo-cell", "crates/rhizo-abi", "crates/rhizo-sched", "crates/rhizo-snapshot", "crates/rhizo-fs", "crates/rhizo-net", "crates/rhizo-virtio", "crates/rhizo-prof", "crates/rhizo-control", "xtask", "cli"]
 # The kernel only builds for the bare-metal target; plain `cargo` commands
 # (test, clippy, build) operate on the host-buildable crates. Use
 # `cargo xtask` for anything involving the kernel.
-default-members = ["crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "crates/rhizo-cell", "crates/rhizo-abi", "crates/rhizo-sched", "crates/rhizo-snapshot", "crates/rhizo-fs", "crates/rhizo-net", "crates/rhizo-virtio", "crates/rhizo-prof", "xtask"]
+default-members = ["crates/rhizo-hal", "crates/rhizo-core", "crates/rhizo-mm", "crates/rhizo-cell", "crates/rhizo-abi", "crates/rhizo-sched", "crates/rhizo-snapshot", "crates/rhizo-fs", "crates/rhizo-net", "crates/rhizo-virtio", "crates/rhizo-prof", "crates/rhizo-control", "xtask", "cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,3 +38,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+# The ChaCha20 generator runs on every getrandom: optimized in test builds
+# too, which run under emulation (design D1 of add-crypto-random).
+[profile.dev.package.rhizo-core]
+opt-level = 3

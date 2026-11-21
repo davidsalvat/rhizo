@@ -23,6 +23,8 @@ use rhizo_mm::paging::PageFlags;
     feature = "ktest-stack-overflow",
     feature = "ktest-invalid-opcode",
     feature = "ktest-oom",
+    feature = "ktest-user-read",
+    feature = "ktest-user-exec",
 ))]
 macro_rules! self_check {
     ($extra:path) => {
@@ -103,6 +105,10 @@ macro_rules! suite {
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
             ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
+            ktest_case!(flags_a_cell_sets_stay_in_the_cell),
+            ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
+            ktest_case!(hardware_entropy_works_where_present),
+            ktest_case!(no_two_cells_draw_the_same_random_bytes),
             ktest_case!(micropython_in_a_cell),
             ktest_case!(sockets_and_pipes_behave_as_on_linux),
             ktest_case!(cells_talk_over_loopback),
@@ -151,6 +157,8 @@ macro_rules! suite {
     feature = "ktest-stack-overflow",
     feature = "ktest-invalid-opcode",
     feature = "ktest-oom",
+    feature = "ktest-user-read",
+    feature = "ktest-user-exec",
 )))]
 /// Every in-kernel test case, in execution order.
 pub static ALL: &[TestCase] = suite!();
@@ -164,6 +172,8 @@ pub static ALL: &[TestCase] = suite!();
     feature = "ktest-stack-overflow",
     feature = "ktest-invalid-opcode",
     feature = "ktest-oom",
+    feature = "ktest-user-read",
+    feature = "ktest-user-exec",
 ))]
 #[allow(dead_code, reason = "the suite runs in the regular `ktest` build")]
 static SUITE: &[TestCase] = suite!();
@@ -191,6 +201,14 @@ pub static ALL: &[TestCase] = self_check!(execute_invalid_opcode);
 /// Self-check: an impossible allocation must panic with its size.
 #[cfg(feature = "ktest-oom")]
 pub static ALL: &[TestCase] = self_check!(allocate_too_much);
+
+/// Self-check: the kernel reading a user page must fault (SMAP, PAN).
+#[cfg(feature = "ktest-user-read")]
+pub static ALL: &[TestCase] = self_check!(kernel_reads_a_user_page);
+
+/// Self-check: the kernel executing a user page must fault (SMEP, PXN).
+#[cfg(feature = "ktest-user-exec")]
+pub static ALL: &[TestCase] = self_check!(kernel_executes_a_user_page);
 
 // --- H0 tests ---------------------------------------------------------------
 
@@ -422,6 +440,58 @@ fn hang_forever() {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Maps a page as a cell's (user, readable, executable, holding a `ret`)
+/// at `0x40_0000` in a fresh lower half, loads that half, and returns the
+/// page's address: what a stray kernel pointer into a cell would reach.
+#[cfg(any(feature = "ktest-user-read", feature = "ktest-user-exec"))]
+fn load_a_user_page() -> u64 {
+    use crate::arch::platform::Format;
+    use rhizo_mm::paging::{PageSize, PageTable};
+    const PAGE: u64 = 0x40_0000;
+    #[cfg(target_arch = "x86_64")]
+    const RET: u64 = 0xc3;
+    #[cfg(target_arch = "aarch64")]
+    const RET: u64 = 0xd65f_03c0;
+    let mut alloc = || memory::with_frames(|f| f.alloc()).flatten();
+    let pt = PageTable::<Format>::new(&mut DirectMap, &mut alloc).expect("a root");
+    if arch::user::CELL_ROOT_HAS_KERNEL_HALF {
+        pt.share_upper_half(&mut DirectMap, &memory::kernel_tables());
+    }
+    let frame = alloc().expect("a frame");
+    DirectMap.zero_frame(frame);
+    DirectMap.write_u64(frame, RET);
+    pt.map(
+        &mut DirectMap,
+        &mut alloc,
+        PAGE,
+        frame,
+        PageSize::Small,
+        PageFlags::USER,
+    )
+    .expect("map the page");
+    arch::user::load_tables(pt.root());
+    PAGE
+}
+
+#[cfg(feature = "ktest-user-read")]
+fn kernel_reads_a_user_page() {
+    let page = load_a_user_page() as *const u64;
+    // SAFETY: deliberately outside the user-access helpers; the guard must
+    // turn it into a fault that ends the run.
+    let value = unsafe { page.read_volatile() };
+    panic!("the kernel read a user page: {value:#x}");
+}
+
+#[cfg(feature = "ktest-user-exec")]
+fn kernel_executes_a_user_page() {
+    let page = load_a_user_page();
+    // SAFETY: deliberately invalid: the page holds a `ret`, which the guard
+    // must refuse to fetch, ending the run.
+    let f: extern "C" fn() = unsafe { core::mem::transmute(page as usize) };
+    f();
+    panic!("the kernel executed a user page");
 }
 
 #[cfg(feature = "ktest-page-fault")]
@@ -1471,6 +1541,106 @@ fn threads_racing_on_several_cpus_cannot_hurt_the_kernel() {
     assert_eq!(ended(&host, other).0, Ending::Exit(0));
     drop(host);
     assert_eq!(memory_balance(), before, "every frame back");
+}
+
+/// A cell that spins with the direction and alignment-check flags set
+/// (x86_64) is interrupted many times: the kernel's own code runs with
+/// them clear, so its copies go forwards and SMAP stays on, and the cells
+/// around it, which the kernel copies data for, are unharmed.
+fn flags_a_cell_sets_stay_in_the_cell() {
+    let mut host = Host::new();
+    let flags = spawn(&mut host, "flags", &[]);
+    let others: Vec<u32> = (0..3).map(|_| spawn(&mut host, "abi", &[])).collect();
+    let before = memory::free_bytes();
+    host.run(|_| false);
+    assert_eq!(ended(&host, flags), (Ending::Exit(0), "flags ok\n".into()));
+    for id in others {
+        let (ending, out) = ended(&host, id);
+        assert_eq!(
+            (ending, out.as_str()),
+            (Ending::Exit(0), expected_output("abi"))
+        );
+    }
+    assert!(memory::free_bytes() >= before);
+}
+
+/// Finding S14 (spec `isolation`): a cell maps one page of a file of its
+/// own 70000 times, more references to the page cache's frame than 16 bits
+/// count. The kernel keeps running (it panicked), every mapping reads the
+/// file, a cell next to it finishes, and every frame comes back.
+fn one_page_mapped_without_end_cannot_stop_the_kernel() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let sharer = spawn(&mut host, "sharer", &[]);
+    let other = spawn(&mut host, "hello", &[]);
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, sharer),
+        (Ending::Exit(0), "shares ok\n".into())
+    );
+    assert_eq!(ended(&host, other).0, Ending::Exit(0));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
+}
+
+/// The CPU's random-number instruction, where it has one, gives bytes that
+/// differ from one read to the next (QEMU's `max` CPU has it on both
+/// architectures; without it the boot says `getrandom` is predictable).
+fn hardware_entropy_works_where_present() {
+    use rhizo_hal::Entropy;
+    let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+    if !arch::random::HardwareEntropy.fill(&mut a) {
+        arch::console::BootConsole.write_bytes(b"(no hardware random source on this CPU) ");
+        return;
+    }
+    assert!(arch::random::HardwareEntropy.fill(&mut b));
+    assert_ne!(a, b, "two reads gave the same bytes");
+    assert_ne!(a, [0; 32]);
+}
+
+/// `getrandom` is a private stream per cell (spec `isolation`): independent
+/// cells, forks, copies of a template and two resumes of one snapshot all
+/// draw different bytes after the point they share.
+fn no_two_cells_draw_the_same_random_bytes() {
+    fn ready(host: &mut Host) -> u32 {
+        let id = spawn(host, "dice", &[]);
+        while host.output(id) != Some(b"ready\n") {
+            host.step();
+        }
+        id
+    }
+    let mut host = Host::new();
+    // Each is used as soon as it is ready (stepping may end the others).
+    let mut ids = alloc::vec![ready(&mut host)];
+    ids.extend(host.fork(ids[0], 2).expect("fork"));
+    ids.push(ready(&mut host));
+    let template = ready(&mut host);
+    assert!(host.freeze(template));
+    for _ in 0..2 {
+        ids.push(
+            host.spawn_from_template(template, true, false)
+                .expect("copy"),
+        );
+    }
+    let suspended = ready(&mut host);
+    let bytes = host.suspend(suspended).expect("suspend").into_bytes();
+    for mode in [Resume::Eager, Resume::Lazy] {
+        let snapshot = Snapshot::from_bytes(bytes.clone(), arch::user::MACHINE).expect("valid");
+        ids.push(host.resume(snapshot, mode, true, false).expect("resume"));
+    }
+    host.run(|_| false);
+    let mut draws: Vec<alloc::string::String> = ids
+        .iter()
+        .map(|&id| {
+            let (ending, out) = ended(&host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            out.trim_start_matches("ready\n").trim_end().into()
+        })
+        .collect();
+    assert!(draws.iter().all(|d| d.len() == 32), "{draws:?}");
+    draws.sort();
+    draws.dedup();
+    assert_eq!(draws.len(), ids.len(), "two cells drew the same bytes");
 }
 
 /// Cells make directories until refused. Next to a cell that takes all the

@@ -349,6 +349,9 @@ pub mod testing {
         live: BTreeMap<u64, (PageSize, u32)>,
         /// Allocations fail once this many are outstanding.
         pub limit: usize,
+        /// Most references one page may have (sharing past it panics, as
+        /// the kernel's counts would).
+        pub max_refs: u32,
     }
 
     /// Builds an ELF file of `kind` (2: executable, 3: shared object) with
@@ -409,6 +412,7 @@ pub mod testing {
                 free_large: Vec::new(),
                 live: BTreeMap::new(),
                 limit: usize::MAX,
+                max_refs: u32::MAX,
             }
         }
 
@@ -463,14 +467,25 @@ pub mod testing {
         }
 
         fn share(&mut self, phys: u64) {
-            self.live
+            let refs = &mut self
+                .live
                 .get_mut(&phys)
                 .unwrap_or_else(|| panic!("share of free {phys:#x}"))
-                .1 += 1;
+                .1;
+            assert!(*refs < self.max_refs, "too many references to {phys:#x}");
+            *refs += 1;
         }
 
         fn is_shared(&self, phys: u64) -> bool {
             self.live.get(&phys).is_some_and(|e| e.1 > 1)
+        }
+
+        fn try_share(&mut self, phys: u64) -> bool {
+            let full = self.live.get(&phys).is_some_and(|e| e.1 >= self.max_refs);
+            if !full {
+                self.share(phys);
+            }
+            !full
         }
     }
 }

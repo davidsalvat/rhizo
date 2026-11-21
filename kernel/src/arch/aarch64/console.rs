@@ -24,6 +24,54 @@ pub fn init(_kind: ConsoleKind) {
     };
     BASE.store(MMIO_BASE + region.base, Ordering::Relaxed);
     KIND.store(kind, Ordering::Relaxed);
+    #[cfg(feature = "control")]
+    if kind == PL011 {
+        const CR_UARTEN_TXE_RXE: u32 = (1 << 0) | (1 << 8) | (1 << 9);
+        let cr = (MMIO_BASE + region.base + 0x30) as *mut u32;
+        // SAFETY: CR (offset 0x30) of the PL011 the device tree describes,
+        // mapped as device memory: enabling the UART and its receiver only
+        // lets it take bytes from the host.
+        unsafe { cr.write_volatile(CR_UARTEN_TXE_RXE) };
+    }
+}
+
+/// The control channel (change `add-control-plane`): the UART, both ways,
+/// shared with the console's text.
+#[cfg(feature = "control")]
+pub mod control {
+    use super::{BASE, KIND, NS16550, Ordering, PL011, write_byte};
+
+    /// The next byte the host sent, if one is waiting.
+    pub fn read_byte() -> Option<u8> {
+        let base = BASE.load(Ordering::Relaxed);
+        match KIND.load(Ordering::Relaxed) {
+            PL011 => {
+                const FR_RXFE: u32 = 1 << 4;
+                let dr = base as *const u32;
+                let fr = (base + 0x18) as *const u32;
+                // SAFETY: DR and FR of the PL011 found at boot, mapped as
+                // device memory; reading DR only takes the received byte.
+                unsafe { (fr.read_volatile() & FR_RXFE == 0).then(|| dr.read_volatile() as u8) }
+            }
+            NS16550 => {
+                const LSR_DR: u8 = 1 << 0;
+                let rbr = base as *const u8;
+                let lsr = (base + 5) as *const u8;
+                // SAFETY: as above, for the 16550's RBR and LSR.
+                unsafe { (lsr.read_volatile() & LSR_DR != 0).then(|| rbr.read_volatile()) }
+            }
+            _ => None,
+        }
+    }
+
+    /// Sends `bytes` (a frame) to the host as they are.
+    pub fn write(bytes: &[u8]) {
+        let kind = KIND.load(Ordering::Relaxed);
+        let base = BASE.load(Ordering::Relaxed);
+        for &byte in bytes {
+            write_byte(kind, base, byte);
+        }
+    }
 }
 
 /// Handle to the boot console (stateless).
