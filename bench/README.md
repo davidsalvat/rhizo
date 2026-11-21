@@ -11,8 +11,9 @@ way. Firecracker and Cloud Hypervisor need KVM.
   which is the UART of QEMU `virt` and Cloud Hypervisor, so on AArch64 the
   reference Linux guest is measured on Firecracker only. A reference kernel
   with both drivers would fix this.
-- GitHub's ARM64 runners do not expose KVM, so AArch64 CI runs are emulated
-  and AArch64 benchmarks need the `dedicated` environment below.
+- No GitHub-hosted ARM runner accelerates a guest (see "AArch64 in CI"
+  below), so AArch64 CI runs are emulated: CI gates AArch64 on instruction
+  counts only, and AArch64 timings need the `dedicated` environment.
 - The reference Linux guest is not measured on QEMU `microvm`: it resets right
   after KASLR setup, before `/init`, both with and without KVM. It is measured
   on QEMU `q35`, Firecracker and Cloud Hypervisor.
@@ -81,6 +82,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `control.resume_us/rhizo/<vmm>` | timing | `resume` of it (lazy: pages come back on first touch) |
 | `control.fork_us/rhizo/<vmm>` | timing | `fork` of it into one cell |
 | `control.kill_us/rhizo/<vmm>` | timing | `kill` of it. Each of these five over 20 rounds; each reply also carries the kernel's own time for the operation, which `rhizo` prints next to the round trip |
+| `chat.turn_us/rhizo/<vmm>` | timing | The Rhizo side of one interactive turn (change `add-interactive-chat`): on the same boot, when CPython is built, the chat agent (`cells/python/agent_chat.py`) against the host's fake model with no delay; each turn timed by the host from writing the `input` request (one line) to the VMM's standard input until it reads the agent's end-of-turn line back, less the time the agent waited for the model (its requests sent until their answers were read). What is left: the request on the serial line, waking the agent's read, CPython's work (JSON, one `run_python` snippet, printing), the answer's output and the serial line back. Median of 20 turns; `rhizo chat` prints the same split after every turn |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded
@@ -146,16 +148,17 @@ come back, or the benchmark fails.
 
 In the `ci` environment (from two CI runs that agreed within the
 threshold) every workload metric is gated except these, recorded but
-listed under `ungated.ci`: `workload.agent_turn_us` and
-`laptop.resume_turn_us` (bimodal: about 0.3 ms, or 1 s when the answer
-arrives after the guest stopped polling its card and only smoltcp's
-retransmission timer wakes it), `laptop.idle_host_cpu_pct` (the host's
+listed under `ungated.ci`: `laptop.idle_host_cpu_pct` (the host's
 own load on a shared runner), the p99.9 latencies (`*_p999_*`: a
 handful of samples per run), and `density.sched_p99_us` and
 `density.wake_p99_us`: the server load runs close to saturation (every
 socket change wakes every cell waiting on a socket), so its tails moved
 up to 5x between runners of the same code. They are gated once that is
-fixed.
+fixed. The agent turns are gated since `fix-ephemeral-ports`: they took
+1 s in most runs on Firecracker and Cloud Hypervisor, because each boot
+started its ephemeral ports at 32768, so its first connections reused
+4-tuples the host still kept in `TIME_WAIT` from the previous run, and
+smoltcp retried the refused SYN after 1 s.
 
 The `rhizo-server-breakdown` line printed with the results says where the
 load's time went (idle, system calls, scheduling decisions, host
@@ -253,7 +256,11 @@ one nanosecond per instruction, so every figure the kernel times is a count
 of retired instructions, the same on every run and every host (without the
 network card, the only input from outside). These are the
 `<metric>_insns/rhizo/<vmm>-icount` metrics, gated at +2 %
-(`thresholds_pct.instructions`). `--no-icount` skips them.
+(`thresholds_pct.instructions`). `--no-icount` skips them; `--icount-only`
+measures nothing else (the AArch64 CI job, below). Where the guest has a
+PMU that counts instructions (QEMU's AArch64 CPU), its passes give the
+figures they cover, exactly, and the clock the rest (the fork benchmarks;
+AArch64's generic timer ticks every 16 instructions under `-icount`).
 
 | VMM | Performance counters in the guest |
 |---|---|
@@ -308,6 +315,7 @@ baseline by more than its threshold:
 | Environment | Where | Timing threshold | Deterministic threshold |
 |---|---|---|---|
 | `ci` | GitHub-hosted runners (shared, noisy) | +100 % on time to ready; TSC cycles recorded but not gated | +1 %; instructions under `-icount` +2 % |
+| `ci-arm` | The AArch64 CI job (`ubuntu-24.04-arm`, no KVM): `--icount-only`, instructions on `qemu-virt-icount` | — (no timings) | instructions under `-icount` +2 % |
 | `dedicated` | A self-hosted runner labelled `rhizo-bench`: bare metal or a pinned VM with KVM, fixed CPU frequency, nothing else running | +5 % | +1 %; instructions under `-icount` +2 % |
 
 Breakdowns (`breakdown.`) and lock waits (`lock.`) are recorded but not gated
@@ -319,6 +327,41 @@ machines whose TSC frequencies differ, so cycle counts are not comparable
 between runs there. The `ci` gate therefore only catches gross regressions
 (for example, a boot that doubles); the `dedicated` run is the precise one. It runs from the `bench-dedicated` workflow, started manually
 (Actions → bench-dedicated → Run workflow) once such a runner is registered.
+
+## AArch64 in CI: instruction counts, no timings
+
+No GitHub-hosted ARM runner a public repository can use accelerates an
+AArch64 guest. A probe on every free ARM label (2026-11-21, runs
+44855293209 and 44855941291 of this repository; design D1 of
+`add-aarch64-bench`):
+
+| Runner | Machine | Result |
+|---|---|---|
+| `ubuntu-22.04-arm`, `ubuntu-24.04-arm`, `ubuntu-26.04-arm` | Azure VM, Neoverse-N2 (Cobalt 100) | no `/dev/kvm`; the kernel logs `kvm [1]: HYP mode not available` (it starts at EL1) |
+| `macos-15`, `macos-26` | Apple M1 (Virtual) | `kern.hv_support: 0`; QEMU `-accel hvf` fails with `HV_UNSUPPORTED` |
+| `windows-11-arm` | Azure VM, Cobalt 100 | no virtualization extensions in the guest; and Rhizo's VMMs need KVM |
+
+GitHub's documentation says the same for macOS ("Nested-virtualization is
+not supported due to the limitation of Apple's Virtualization Framework",
+[GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
+also for the M2 larger runner); larger ARM runners are billed for public
+repositories ([Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions))
+and run on the same Azure Cobalt 100 sizes, which do not support nested
+virtualization ([Dpsv6 series](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/dpsv6-series)).
+The AArch64 job's step "Report whether this runner offers KVM" keeps
+watching for a change.
+
+Timings under emulation would measure QEMU's translator, so the AArch64
+job (`ci-arm64` in `.github/workflows/ci.yml`) runs, after its checks:
+
+```bash
+cargo xtask --arch aarch64 bench --icount-only --env ci-arm --check --output bench-results-aarch64.json
+```
+
+the same instruction counts as x86_64's, on `qemu-virt-icount`, gated at
++2 % against the `ci-arm` baseline (breakdowns and lock waits ungated). It
+publishes them as `bench-aarch64-medians` and `bench-aarch64-results-N`
+annotations, apart from the x86_64 job's `bench-results-N`.
 
 ## Measuring on real ARM64 hardware (`dedicated`)
 
@@ -369,6 +412,13 @@ and run:
 cargo xtask bench --from results.json --env ci --update-baseline
 ```
 
+The AArch64 job's `bench-aarch64-results-N` annotations, joined in order,
+are the `ci-arm` results:
+
+```bash
+cargo xtask bench --from results-aarch64.json --env ci-arm --update-baseline
+```
+
 ## README chart
 
 ```bash
@@ -377,3 +427,7 @@ cargo xtask bench --readme
 
 regenerates the chart in the README from a fresh measurement (or from stored
 results with `--from`). Prefer numbers from the `dedicated` environment.
+A second `--from` with the AArch64 job's results adds a table of
+instructions per operation on both architectures (a metric in both files
+is an error); `python3 docs/img/gen.py bench-results.json
+bench-results-aarch64.json` draws the same as `docs/img/arches.svg`.

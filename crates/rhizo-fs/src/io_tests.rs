@@ -251,6 +251,82 @@ fn objects_round_trip_and_corruption_is_refused() {
 }
 
 #[test]
+fn the_host_writes_standard_input() {
+    let mut fs = Fs::new();
+    assert!(!fs.has_input());
+    assert_eq!(fs.push_input(b"x"), Err(Error::BadFd), "no host input yet");
+    fs.host_input().unwrap();
+    assert_eq!(fs.host_input(), Err(Error::Exists));
+    assert_eq!(fs.kind(0), Ok(Kind::Pipe));
+    assert_eq!(fs.kind(1), Ok(Kind::Console), "output stays on the console");
+    assert_eq!(fs.read_pipe(0, 10, &mut |_| true), Err(Error::Again));
+    assert_eq!(fs.poll(0, &no_socket), Ok(0));
+    fs.push_input(b"hello\n").unwrap();
+    assert_eq!(fs.poll(0, &no_socket), Ok(IN));
+    assert_eq!(read_pipe_all(&mut fs, 0).unwrap(), b"hello\n");
+    // Whole or not at all, within the pipe's capacity.
+    fs.push_input(&vec![1; PIPE_CAP - 1]).unwrap();
+    assert_eq!(fs.push_input(b"ab"), Err(Error::Again));
+    fs.push_input(b"a").unwrap();
+    assert_eq!(read_pipe_all(&mut fs, 0).unwrap().len(), PIPE_CAP);
+    // A duplicate reads the same pipe; closing the host's end is the end
+    // of file once the unread bytes are read.
+    let dup = fs.dup(0, 0, false, false).unwrap();
+    fs.push_input(b"last").unwrap();
+    fs.close_input().unwrap();
+    assert_eq!(fs.close_input(), Err(Error::BadFd));
+    assert_eq!(fs.push_input(b"more"), Err(Error::BadFd));
+    assert_eq!(fs.poll(dup, &no_socket), Ok(IN | HUP));
+    assert_eq!(read_pipe_all(&mut fs, dup).unwrap(), b"last");
+    assert_eq!(read_pipe_all(&mut fs, 0).unwrap(), b"", "end of file");
+    fs.close(0).unwrap();
+    fs.close(dup).unwrap();
+    assert!(fs.objects.iter().all(Option::is_none), "the pipe is freed");
+}
+
+#[test]
+fn input_to_a_cell_that_closed_it_is_refused() {
+    let mut fs = Fs::new();
+    fs.host_input().unwrap();
+    fs.close(0).unwrap();
+    assert_eq!(fs.push_input(b"x"), Err(Error::Pipe));
+    fs.close_input().unwrap();
+    assert!(fs.objects.iter().all(Option::is_none), "the pipe is freed");
+}
+
+#[test]
+fn forks_and_snapshots_keep_their_own_input() {
+    let mut parent = Fs::new();
+    parent.host_input().unwrap();
+    parent.push_input(b"before ").unwrap();
+    let mut child = parent.clone();
+    child.push_input(b"child").unwrap();
+    parent.push_input(b"parent").unwrap();
+    assert_eq!(read_pipe_all(&mut parent, 0).unwrap(), b"before parent");
+    assert_eq!(read_pipe_all(&mut child, 0).unwrap(), b"before child");
+    child.push_input(b"unread").unwrap();
+    let mut bytes = Vec::new();
+    child.encode(&mut bytes);
+    let mut back = Fs::decode(&bytes).unwrap();
+    assert!(back.has_input());
+    back.push_input(b" and more").unwrap();
+    assert_eq!(read_pipe_all(&mut back, 0).unwrap(), b"unread and more");
+    back.close_input().unwrap();
+    let mut closed = Vec::new();
+    back.encode(&mut closed);
+    let mut back = Fs::decode(&closed).unwrap();
+    assert!(!back.has_input());
+    assert_eq!(read_pipe_all(&mut back, 0).unwrap(), b"", "still closed");
+    // The host's end must name a pipe it holds: anything else is refused.
+    let at = bytes.len() - 4;
+    for bad in [1u32, 7, 1 << 20, u32::MAX] {
+        let mut corrupt = bytes.clone();
+        corrupt[at..].copy_from_slice(&bad.to_le_bytes());
+        assert!(Fs::decode(&corrupt).is_err(), "input {bad}");
+    }
+}
+
+#[test]
 fn what_a_waiting_thread_may_wait_for_is_counted() {
     let mut fs = Fs::new();
     let (r, w) = fs.pipe(false, false).unwrap();

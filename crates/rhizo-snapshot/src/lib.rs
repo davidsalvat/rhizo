@@ -19,7 +19,8 @@
 //! data     page contents, in record order
 //! files    length u64, then the cell's file system as `rhizo_fs` encodes
 //!          it (tree, open descriptions and descriptors, pipes, event
-//!          counters, `epoll` instances, working directory)
+//!          counters, `epoll` instances, working directory; version 7:
+//!          the pipe of the host's standard input)
 //! sockets  length u64, then one record per socket as `rhizo_net` encodes
 //!          them (version 6: a connection may be parked in the kernel);
 //!          a socket descriptor's index is its record's
@@ -43,7 +44,7 @@ use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 const HEADER: usize = 24;
 const STATE: usize = 4 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.

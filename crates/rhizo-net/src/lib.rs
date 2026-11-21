@@ -323,6 +323,14 @@ fn reset_pending(state: &mut State) -> Option<bool> {
     }
 }
 
+/// Spreads the bits of `x` over the whole word (the SplitMix64 finalizer):
+/// nearby boot identities pick far-apart ports.
+fn mix(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 fn is_loopback(ip: [u8; 4]) -> bool {
     ip[0] == 127
 }
@@ -347,9 +355,16 @@ impl Net {
     }
 
     /// Sets the identity of this boot (the caller's randomness, never read
-    /// here): sockets parked in another boot do not re-attach.
+    /// here): sockets parked in another boot do not re-attach, and ephemeral
+    /// ports start at a place it chooses. A peer keeps the addresses and
+    /// ports of a connection it closed for a while (`TIME_WAIT`); starting
+    /// every boot at the first port would make the first connections of a
+    /// new boot look like old ones to it (RFC 6056; design D1 of
+    /// `fix-ephemeral-ports`).
     pub fn set_boot(&mut self, boot: u64) {
         self.boot = boot;
+        let span = u64::from(EPHEMERAL.end() - EPHEMERAL.start()) + 1;
+        self.next_port = EPHEMERAL.start() + (mix(boot) % span) as u16;
     }
 
     /// Sets the secret parked records' keys are derived from (the caller's
