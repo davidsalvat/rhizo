@@ -21,4 +21,4 @@
 
 - [x] 4.1 Snapshot file metrics on QEMU (D6); verify the control-plane benchmark (`control::measure_on`) on `qemu-microvm` with CPython built reports the five metrics (figures in the design)
 - [x] 4.2 `docs/audit-scope.md` (B3, area 6) and `docs/security.md` (snapshots from files); verify by reading
-- [ ] 4.3 Everything CI runs; verify `cargo xtask check`, `cargo xtask test` on both architectures with `RHIZO_CPYTHON_SRC`, and CI
+- [x] 4.3 Everything CI runs; verify `cargo xtask check`, `cargo xtask test` on both architectures with `RHIZO_CPYTHON_SRC`, and CI
