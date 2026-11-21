@@ -48,14 +48,11 @@ imported numpy once saves.
   import numpy, compute, exit) and `workload.numpy_warm_us` (the same
   forked from a template that imported numpy); the same two for CPython as
   a Linux process in the comparison's Firecracker guest.
-- **Memory**: a cell may hold 128 MiB of file data instead of 64 MiB (the
-  packed tree is 65 MiB: OpenBLAS alone is 24 MiB); the test VMs grow from
-  128 MiB to 1 GiB and the cell benchmark VM from 256 to 512 MiB: numpy's
-  files are embedded in the kernel image, decoded into the heap and kept in
-  the page cache once mapped, and a snapshot of a cell that imported numpy
-  copies them. The two tests that fill memory hold the frames beyond
-  96 MiB while they run, so they ask for as much and take as long as on
-  the small VM they were written for.
+- **Kernels of their own**: as for Node.js (`add-node-workload`), only
+  kernels built with the `packages` feature embed the 65 MiB tree; with
+  `ktest` they run the package tests only (step `ktest-packages`, 1 GiB, 2
+  vCPUs), with `bench-cell` they measure numpy only (1 GiB). Every other
+  kernel and VM is unchanged.
 
 ### Out of scope
 
@@ -75,18 +72,18 @@ None.
 - `workloads`: packages from PyPI in a cell.
 - `benchmarks`: numpy metrics.
 - `comparisons`: numpy as a Linux process in the same VM.
-- `files`: the bound on a cell's file data.
+- `kernel-testing`: the package tests in their own VM.
 - `linux-abi`: CPU features as Linux tells them (AArch64 `AT_HWCAP`, ID
   registers read at EL0).
 
 ## Impact
 
-`crates/rhizo-fs` (`DATA_MAX`), `crates/rhizo-cell` (`AT_HWCAP`),
+`crates/rhizo-cell` (`AT_HWCAP`),
 `crates/rhizo-core` (`IdRegisterRead`), `kernel/src/arch/*/user.rs`
 (`UserFault::emulate`), `xtask/src/packages.rs` (new),
 `xtask/src/{cpython,dynamic,differential,bench,compare,lib}.rs`,
 `cells/python/{numpy_demo,requests_demo,pack_stdlib}.py`,
-`cells/c/libc_hwcap.c`, `cells/expected.rs`, `kernel/build.rs`,
+`cells/c/libc_hwcap.c`, `cells/expected.rs`, `kernel/{build.rs,Cargo.toml}`,
 `kernel/src/{cell,tests}.rs`,
 `bench/host/linux_numpy.c`, `bench/host/numpy_forkserver.py`,
 `bench/README.md`, `.github/workflows/ci.yml` (the CPython cache key

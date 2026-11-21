@@ -103,20 +103,14 @@ In a cell the interpreter is `/usr/bin/python3`, started as
 command from the top of the tree finds the tree's own files, never the
 host's.
 
-## D4. Memory: file data and VMs
+## D4. Memory: kernels of their own
 
 numpy's files are large: OpenBLAS is 24 MiB on x86_64 and 26 MiB on
 aarch64, numpy's core module 6 to 11 MiB; the packed tree is about
 65 MiB (CPython, its libraries and the standard library's extension
-modules, stripped of their debug information, are 20 MiB of it).
-
-That is more than a cell could hold: its file data was bounded at
-64 MiB (spec `files`). The bound becomes 128 MiB (`rhizo_fs::DATA_MAX`):
-room for the interpreter, numpy and a package or two more, and still a
-bound on the kernel memory a cell's files take. Files given to many
-cells are shared copy-on-write, so the bound is per cell, not per copy;
-memory pressure is handled as before (a cell is refused memory, the
-kernel keeps running).
+modules, stripped of their debug information, are 20 MiB of it). A cell
+may hold it: `add-node-workload` raised the bound on a cell's file data
+to 256 MiB.
 
 The tree is embedded in the kernel image, decoded into the kernel heap
 when first used (`rhizo_fs`, copy-on-write blocks shared by every cell
@@ -125,24 +119,24 @@ given the files), and the mapped pages are kept in the page cache
 cell runs. A snapshot of a cell that imported numpy is self-contained
 (`add-dynamic-linking` D7): it holds the cell's files and every page it
 mapped, well over 100 MiB, and the test that resumes one from its bytes
-holds both at once. The test VMs (`ktest`, `ktest-smp`, and `ktest` on
-q35) grow from 128 MiB to 1 GiB, and the cell benchmark VM from 256 MiB
-to 512 MiB; the boot check, the self-checks and the boot benchmarks keep
-128 MiB. A larger guest does not change what the cell benchmarks measure
-(no metric depends on free memory; the 50 MiB fork benchmark is the one
-that needed the room). Two tests fill memory: the memory pressure test
-(twenty cells of 16 MiB, more than a 128 MiB VM holds) and the one that
-forks idle cells until memory runs out, whose time grows with free
-memory (eight times as long in 1 GiB: too long for emulated AArch64 on 4
-CPUs). Both now hold the frames beyond 96 MiB while they run, as on the
-small VM they were written for, and give them back.
-Mapping the embedded bytes directly (no decoded copy), and snapshots that
-refer to file pages by content instead of copying them, would save most
-of this; both are left for later.
+holds both at once. That does not fit the 128 MiB test VMs nor the
+256 MiB cell benchmark VM, and growing them would change what the tests
+that fill memory take (forking idle cells until memory runs out takes
+eight times as long in 1 GiB, too long for emulated AArch64).
+
+So the packages follow Node.js (`add-node-workload`): a kernel feature,
+`packages`, is the only one that embeds `packages-files`. With `ktest`
+the kernel runs the package tests only (step `ktest-packages`, a 1 GiB
+VM with 2 vCPUs: OpenBLAS starts threads, which then run as a gang);
+with `bench-cell` it measures numpy only (a 1 GiB VM). Every other
+kernel and VM is as it was. Mapping the embedded bytes directly (no
+decoded copy), and snapshots that refer to file pages by content instead
+of copying them, would save most of this memory; both are left for
+later.
 
 ## D5. Tests and metrics
 
-In-kernel tests (`kernel/src/tests.rs`):
+In-kernel tests (`kernel/src/tests.rs`, in the `packages` kernel, D4):
 
 - `numpy_from_a_wheel_computes_as_on_linux`: `numpy_demo.py` (integer
   array operations, `linalg.solve` and `det`, `np.hypot`, a 64x64 matrix
@@ -162,7 +156,9 @@ The differential check runs both scripts natively from the top of the
 tree with an empty environment (requests against the host's fake model)
 and compares with `cells/expected.rs`.
 
-`bench-cell` prints `rhizo-numpy cold_ns=... warm_ns=...`:
+The `bench-cell` kernel with `packages` prints `rhizo-numpy cold_ns=...
+warm_ns=...` (`xtask` measures it as it measures Node.js, one `Runtime`
+for both in `bench.rs`):
 
 - `workload.numpy_cold_us`: spawn the packages' CPython from its files,
   `import numpy`, compute, exit; robust figure over 10 runs after a first
@@ -177,7 +173,8 @@ Both are new: no baseline until a CI run records one.
 
 As CPython (`add-cpython` D4): a Linux guest in Firecracker whose
 initramfs holds the packages cell's tree and `bench/host/linux_numpy.c`
-as `/init`. Cold: fork and exec `python3 /app/numpy_demo.py` until it
+as `/init`, with 1 GiB as the packages cells' VM. Cold: fork and exec
+`python3 /app/numpy_demo.py` until it
 exits, median of 7; warm: `bench/host/numpy_forkserver.py`, a CPython
 process that imported numpy and forks one child per request, which runs
 the script's computation and exits. They report `workload.numpy_cold_us`

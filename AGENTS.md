@@ -100,7 +100,7 @@ The feedback loop, fastest first:
 |---|---|---|
 | `cargo test -p <crate> <name>` | < 1 s | One host test |
 | `cargo xtask check` | seconds | fmt, clippy (all crates), host tests, crate dependency rules. **Run after every edit.** |
-| `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, `ktest-smp` (4 vCPUs), `ktest-node` (Node.js, with `RHIZO_NODE`), or a self-check such as `ktest-page-fault` |
+| `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, `ktest-smp` (4 vCPUs), `ktest-node` (Node.js, with `RHIZO_NODE`), `ktest-packages` (numpy and requests, with `RHIZO_CPYTHON_SRC`), or a self-check such as `ktest-page-fault` |
 | `cargo xtask test` | ~1 min | Host tests, boot check, in-kernel tests, all self-checks |
 | `cargo xtask ci` | minutes | Everything CI runs. **Run before pushing.** |
 | `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates) |

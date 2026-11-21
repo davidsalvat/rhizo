@@ -7,11 +7,11 @@
 
 ## 2. Kernel tests
 
-- [x] 2.1 In-kernel tests `numpy_from_a_wheel_computes_as_on_linux`, `requests_gets_from_the_host_as_on_linux` and `a_cell_that_imported_numpy_suspends_resumes_and_forks` (D5); test VMs with 1 GiB, the tests that fill memory run with 96 MiB free (D4); verify `cargo xtask test --only ktest` and `cargo xtask test --only ktest-smp` on both architectures
+- [ ] 2.1 In-kernel tests `numpy_from_a_wheel_computes_as_on_linux`, `requests_gets_from_the_host_as_on_linux` and `a_cell_that_imported_numpy_suspends_resumes_and_forks` (D5), alone in the `packages` kernel (feature `packages`, `packages-files` embedded there only), step `ktest-packages` with 1 GiB and 2 vCPUs (D4); verify `cargo xtask test --only ktest-packages` on both architectures (CI)
 - [x] 2.2 AArch64 CPU features (D8): `Machine::hwcap` and `AT_HWCAP` in the initial stack, `IdRegisterRead` decoding both exception classes, `UserFault::emulate` (both architectures) in the single-CPU and gang paths, `cells/c/libc_hwcap.c` and the in-kernel test `cells_learn_the_cpu_as_on_linux`; verify `cargo test -p rhizo-core id_register`, `cargo test -p rhizo-cell stack_tells`, `cargo xtask --arch aarch64 test --only ktest` and the numpy tests on AArch64 in CI
 
 ## 3. Benchmarks and documentation
 
-- [x] 3.1 `rhizo-numpy` line of the `bench-cell` kernel and `workload.numpy_cold_us`, `workload.numpy_warm_us` in `xtask/src/bench.rs` with a parser test; the cell benchmark VM with 512 MiB (D4); verify `cargo test -p xtask numpy`
+- [ ] 3.1 `rhizo-numpy` line of the `bench-cell` kernel built with `packages` and `workload.numpy_cold_us`, `workload.numpy_warm_us` measured by `xtask/src/bench.rs` as Node.js is (one `Runtime` for both), with a parser test (D4, D5); verify `cargo test -p xtask numpy`
 - [x] 3.2 numpy as a Linux process in the comparison's Firecracker guest (`bench/host/linux_numpy.c`, `bench/host/numpy_forkserver.py`, `compare::numpy_in_vm`) with a parser test (D6); verify `cargo test -p xtask numpy_line` and the CI benchmark gate passes with the new metrics present and no metric worse
 - [x] 3.3 `bench/README.md` describes the metrics; `AGENTS.md` code map names `packages.rs`; verify `openspec validate add-pip-packages --strict`
