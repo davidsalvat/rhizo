@@ -57,7 +57,8 @@ impl<T> SpinLock<T> {
     /// # Panics
     /// If `cpu` already holds it (reentrance).
     pub fn with<R>(&self, cpu: usize, f: impl FnOnce(&mut T) -> R) -> R {
-        f(&mut self.lock(cpu))
+        self.acquire(cpu);
+        self.run(f)
     }
 
     /// Exclusive access to the value, on behalf of CPU `cpu`, until the
@@ -67,7 +68,20 @@ impl<T> SpinLock<T> {
     /// # Panics
     /// If `cpu` already holds it (reentrance).
     pub fn lock(&self, cpu: usize) -> Guard<'_, T> {
-        self.lock_waiting(cpu, || (), drop)
+        self.acquire(cpu);
+        Guard(self)
+    }
+
+    /// Takes the lock for CPU `cpu`, waiting while another CPU holds it.
+    #[inline(always)]
+    fn acquire(&self, cpu: usize) {
+        let me = cpu as u32 + 1;
+        while let Err(held) =
+            self.holder
+                .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
+        {
+            self.wait_while_held(held, me);
+        }
     }
 
     /// [`with`](Self::with), calling `wait` when the lock is found held by
@@ -84,7 +98,8 @@ impl<T> SpinLock<T> {
         done: impl FnOnce(W),
         f: impl FnOnce(&mut T) -> R,
     ) -> R {
-        f(&mut self.lock_waiting(cpu, wait, done))
+        self.acquire_waiting(cpu, wait, done);
+        self.run(f)
     }
 
     /// [`lock`](Self::lock), with the hooks of
@@ -98,6 +113,14 @@ impl<T> SpinLock<T> {
         wait: impl FnOnce() -> W,
         done: impl FnOnce(W),
     ) -> Guard<'_, T> {
+        self.acquire_waiting(cpu, wait, done);
+        Guard(self)
+    }
+
+    /// [`acquire`](Self::acquire), with the hooks of
+    /// [`with_waiting`](Self::with_waiting).
+    #[inline(always)]
+    fn acquire_waiting<W>(&self, cpu: usize, wait: impl FnOnce() -> W, done: impl FnOnce(W)) {
         let me = cpu as u32 + 1;
         if self
             .holder
@@ -113,7 +136,6 @@ impl<T> SpinLock<T> {
             }
             done(waiting);
         }
-        Guard(self)
     }
 
     /// The lock was found held by `held` (a CPU number plus one, 0 for a
@@ -135,6 +157,14 @@ impl<T> SpinLock<T> {
         }
         self.contended.fetch_add(1, Ordering::Relaxed);
         self.spins.fetch_add(spins, Ordering::Relaxed);
+    }
+
+    /// Runs `f` on the value, then releases the lock (which `self` holds).
+    fn run<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        // SAFETY: `holder` is ours, so no other reference to the value exists.
+        let result = f(unsafe { &mut *self.value.get() });
+        self.holder.store(0, Ordering::Release);
+        result
     }
 
     /// How often CPUs waited for this lock, and spun meanwhile.
