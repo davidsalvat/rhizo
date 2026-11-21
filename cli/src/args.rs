@@ -1,5 +1,6 @@
 //! The command line of `rhizo`.
 
+use crate::tree::Place;
 use std::path::PathBuf;
 use xtask::arch::Arch;
 use xtask::vmm::Accel;
@@ -28,6 +29,22 @@ Commands:
                              (CPython with its standard library; args go to
                              python3), or any program the kernel holds
                              (hello, idle, ...)
+                             Placement (protocol 4):
+      --parent <id>          Place it under this cell (default: a root)
+      --label <name>         Its label ([A-Za-z0-9._-], at most 64 bytes)
+      --egress <policy>      none (default), model, full, or rules
+                             PROTO:CIDR:PORTS (tcp:140.82.112.0/20:443),
+                             several joined by commas
+      --ceiling <policy>     Its exposure ceiling (default: its egress)
+      --mem <size>           Memory limit (256M, 2G)
+      --cpu-time <time>      CPU time limit (90s, 500ms)
+      --sockets <n>          Socket limit
+      --cells <n>            Descendant limit (its children need one)
+      --on-parent-end <p>    cascade (default) or promote
+      --cpus <set>           An exclusive CPU set, roots only (2-3,5)
+      --cpu-weight <n>       CPU weight among its siblings (1 to 10000)
+      --cpu-max <cpus>       CPU cap of its subtree (1.5)
+      --llm <url>            The model endpoint `--egress model` names
   run python-agent --llm <url> --model <name> [--turns <n>] [--transcript]
                              The CPython agent against an OpenAI-compatible
                              model: suspended and resumed after every turn,
@@ -36,18 +53,28 @@ Commands:
                              Talk to a new agent in a cell (CPython with
                              tools that run in the cell); /help inside
   chat <id>                  Talk to it again, resuming it if suspended
-  ps                         List the cells
+  ps [--tree]                List the cells (--tree: under their parents,
+                             with labels, egress and limits)
   stats                      Memory and cells of the VM
-  fork <id> [n]              Fork a running cell into n (default 1)
-  suspend <id>               Suspend a running cell into a snapshot
-  resume <id>                Resume a suspended cell
+  fork <id> [n] [options]    Fork a running cell into n (default 1), or
+                             make n cells of a template, placed as `run`'s
+  suspend <id> [--tree]      Suspend a running cell (--tree: its subtree)
+  resume <id> [--tree]       Resume a suspended cell (--tree: its subtree)
   freeze <id>                Freeze a running cell into a template, which
                              `fork` makes cells from
   save <id> <file>           Save a suspended cell or a template to a file
-  load <file> [--template]   Load a saved file as a suspended cell, or as a
-                             template, into this VM
+  load <file> [--template] [options]
+                             Load a saved file as a suspended cell, or as a
+                             template, into this VM, placed as `run`'s
   attach <id>                Show a cell's output until it ends
-  kill <id>                  End a cell, or forget one that ended
+  kill <id> [--tree]         End a cell, or forget one that ended (--tree:
+                             its whole subtree)
+  reparent <id> --to <id|root>
+                             Move a cell under another, or make it a root
+  policy <id> [--egress <p>] [--ceiling <p>] [--mem ...]
+                             Narrow or set a cell's egress and limits
+  scope <id> --socket <path> Serve on <path> requests limited to the cell's
+                             subtree, until interrupted
   down                       Power the VM off
   snapshot upgrade <in> <out>
                              Convert a file saved by an older kernel (one
@@ -98,6 +125,8 @@ pub struct Run {
     pub model: Option<String>,
     pub turns: u32,
     pub transcript: bool,
+    /// Where the cell goes in the tree (protocol 4).
+    pub place: Place,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,13 +137,18 @@ pub enum Command {
     Run(Run),
     Chat(Chat),
     Ps,
+    /// `ps --tree`.
+    PsTree,
     Stats,
     Fork {
         id: u32,
         n: u32,
+        place: Place,
     },
     Suspend(u32),
+    SuspendTree(u32),
     Resume(u32),
+    ResumeTree(u32),
     Freeze(u32),
     Save {
         id: u32,
@@ -123,9 +157,26 @@ pub enum Command {
     Load {
         file: PathBuf,
         template: bool,
+        place: Place,
     },
     Attach(u32),
     Kill(u32),
+    KillTree(u32),
+    /// Moves a cell under `to` (0: makes it a root).
+    Reparent {
+        id: u32,
+        to: u32,
+    },
+    /// Sets a cell's egress, ceiling and limits (those given).
+    Policy {
+        id: u32,
+        place: Place,
+    },
+    /// Serves requests limited to a cell's subtree on a socket.
+    Scope {
+        id: u32,
+        socket: PathBuf,
+    },
     Down,
     /// `snapshot upgrade IN OUT`: converts a saved file to the current
     /// format version (no VM needed).
@@ -166,6 +217,40 @@ fn id(args: &[String], command: &str) -> Result<u32, String> {
     }
 }
 
+/// A cell, with or without `--tree`.
+fn id_tree(args: &[String], command: &str) -> Result<(u32, bool), String> {
+    match args {
+        [id] => Ok((number("cell", id)?, false)),
+        [id, flag] | [flag, id] if flag == "--tree" => Ok((number("cell", id)?, true)),
+        _ => Err(format!("usage: rhizo {command} <id> [--tree]")),
+    }
+}
+
+/// The words of `args` that are not options, its placement options, and
+/// whether each of `switches` (options without a value) was given.
+fn split(
+    args: &[String],
+    switches: &[&str],
+    command: &str,
+) -> Result<(Vec<String>, Place, Vec<bool>), String> {
+    let (mut words, mut place) = (Vec::new(), Place::default());
+    let mut on = vec![false; switches.len()];
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if let Some(k) = switches.iter().position(|s| s == arg) {
+            on[k] = true;
+        } else if arg.starts_with("--") {
+            let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
+            if !place.option(arg, value)? {
+                return Err(format!("unknown option `{arg}` for `{command}`"));
+            }
+        } else {
+            words.push(arg.clone());
+        }
+    }
+    Ok((words, place, on))
+}
+
 /// Parses the arguments after the program's name.
 pub fn parse(args: &[String]) -> Result<Args, String> {
     let mut state = None;
@@ -188,21 +273,36 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         "__serve" => Command::Serve(parse_up(args)?),
         "run" => Command::Run(parse_run(args)?),
         "chat" => Command::Chat(parse_chat(args)?),
-        "ps" | "list" => Command::Ps,
-        "stats" => Command::Stats,
-        "fork" => match args {
-            [id] => Command::Fork {
-                id: number("cell", id)?,
-                n: 1,
-            },
-            [id, n] => Command::Fork {
-                id: number("cell", id)?,
-                n: number("count", n)?,
-            },
-            _ => return Err("usage: rhizo fork <id> [n]".into()),
+        "ps" | "list" => match args {
+            [] => Command::Ps,
+            [flag] if flag == "--tree" => Command::PsTree,
+            _ => return Err("usage: rhizo ps [--tree]".into()),
         },
-        "suspend" => Command::Suspend(id(args, "suspend")?),
-        "resume" => Command::Resume(id(args, "resume")?),
+        "stats" => Command::Stats,
+        "fork" => {
+            let (words, place, _) = split(args, &[], "fork")?;
+            match words.as_slice() {
+                [id] => Command::Fork {
+                    id: number("cell", id)?,
+                    n: 1,
+                    place,
+                },
+                [id, n] => Command::Fork {
+                    id: number("cell", id)?,
+                    n: number("count", n)?,
+                    place,
+                },
+                _ => return Err("usage: rhizo fork <id> [n] [options]".into()),
+            }
+        }
+        "suspend" => match id_tree(args, "suspend")? {
+            (id, false) => Command::Suspend(id),
+            (id, true) => Command::SuspendTree(id),
+        },
+        "resume" => match id_tree(args, "resume")? {
+            (id, false) => Command::Resume(id),
+            (id, true) => Command::ResumeTree(id),
+        },
         "freeze" => Command::Freeze(id(args, "freeze")?),
         "save" => match args {
             [id, file] => Command::Save {
@@ -211,19 +311,68 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             },
             _ => return Err("usage: rhizo save <id> <file>".into()),
         },
-        "load" => match args {
-            [file] => Command::Load {
-                file: PathBuf::from(file),
-                template: false,
-            },
-            [file, flag] | [flag, file] if flag == "--template" => Command::Load {
-                file: PathBuf::from(file),
-                template: true,
-            },
-            _ => return Err("usage: rhizo load <file> [--template]".into()),
-        },
+        "load" => {
+            let (words, place, on) = split(args, &["--template"], "load")?;
+            match words.as_slice() {
+                [file] => Command::Load {
+                    file: PathBuf::from(file),
+                    template: on[0],
+                    place,
+                },
+                _ => return Err("usage: rhizo load <file> [--template] [options]".into()),
+            }
+        }
         "attach" => Command::Attach(id(args, "attach")?),
-        "kill" => Command::Kill(id(args, "kill")?),
+        "kill" => match id_tree(args, "kill")? {
+            (id, false) => Command::Kill(id),
+            (id, true) => Command::KillTree(id),
+        },
+        "reparent" => match args {
+            [id, flag, to] if flag == "--to" => Command::Reparent {
+                id: number("cell", id)?,
+                to: match to.as_str() {
+                    "root" => 0,
+                    to => number("cell", to)?,
+                },
+            },
+            _ => return Err("usage: rhizo reparent <id> --to <id|root>".into()),
+        },
+        "policy" => {
+            let (words, place, _) = split(args, &[], "policy")?;
+            let only = Place {
+                egress: place.egress.clone(),
+                ceiling: place.ceiling.clone(),
+                memory: place.memory,
+                cpu_ns: place.cpu_ns,
+                sockets: place.sockets,
+                cells: place.cells,
+                llm: place.llm.clone(),
+                ..Place::default()
+            };
+            match words.as_slice() {
+                [id] if only == place && (place.egress.is_some() || place.has_limits()) => {
+                    if place.ceiling.is_some() && place.egress.is_none() {
+                        return Err("--ceiling goes with --egress".into());
+                    }
+                    Command::Policy {
+                        id: number("cell", id)?,
+                        place,
+                    }
+                }
+                _ => {
+                    return Err("usage: rhizo policy <id> [--egress <p>] [--ceiling <p>] \
+                                [--mem <size>] [--cpu-time <t>] [--sockets <n>] [--cells <n>]"
+                        .into());
+                }
+            }
+        }
+        "scope" => match args {
+            [id, flag, path] if flag == "--socket" => Command::Scope {
+                id: number("cell", id)?,
+                socket: PathBuf::from(path),
+            },
+            _ => return Err("usage: rhizo scope <id> --socket <path>".into()),
+        },
         "down" => Command::Down,
         "snapshot" => match args {
             [sub, input, output] if sub == "upgrade" => Command::SnapshotUpgrade {
@@ -336,7 +485,10 @@ fn parse_run(args: &[String]) -> Result<Run, String> {
                 run.files.push((path.into(), contents));
             }
             flag if flag.starts_with("--") => {
-                return Err(format!("unknown option `{flag}` for `run`"));
+                let value = value(flag)?;
+                if !run.place.option(flag, &value)? {
+                    return Err(format!("unknown option `{flag}` for `run`"));
+                }
             }
             word if run.template.is_empty() => run.template = word.into(),
             word => run.args.push(word.into()),
@@ -356,8 +508,10 @@ fn parse_run(args: &[String]) -> Result<Run, String> {
         if run.turns == 0 {
             return Err("--turns must be at least 1".into());
         }
-    } else if run.llm.is_some() || run.model.is_some() || run.transcript {
-        return Err("--llm, --model and --transcript are for python-agent".into());
+    } else if run.model.is_some() || run.transcript {
+        return Err("--model and --transcript are for python-agent".into());
+    } else if run.llm.is_some() && !run.place.egress.as_ref().is_some_and(|e| e.model) {
+        return Err("--llm is for python-agent, or names the endpoint of --egress model".into());
     }
     Ok(run)
 }
@@ -408,8 +562,13 @@ mod tests {
 
     #[test]
     fn cell_commands_take_identifiers() {
-        assert_eq!(command("fork 3"), Command::Fork { id: 3, n: 1 });
-        assert_eq!(command("fork 3 4"), Command::Fork { id: 3, n: 4 });
+        let fork = |id, n| Command::Fork {
+            id,
+            n,
+            place: Place::default(),
+        };
+        assert_eq!(command("fork 3"), fork(3, 1));
+        assert_eq!(command("fork 3 4"), fork(3, 4));
         assert_eq!(command("suspend 7"), Command::Suspend(7));
         assert_eq!(command("resume 7"), Command::Resume(7));
         assert_eq!(command("attach 7"), Command::Attach(7));
@@ -426,7 +585,8 @@ mod tests {
                 command(words),
                 Command::Load {
                     file: "agent.rhz".into(),
-                    template: true
+                    template: true,
+                    place: Place::default(),
                 }
             );
         }
@@ -434,7 +594,8 @@ mod tests {
             command("load agent.rhz"),
             Command::Load {
                 file: "agent.rhz".into(),
-                template: false
+                template: false,
+                place: Place::default(),
             }
         );
         assert!(parse_words("save 7").is_err());
@@ -524,5 +685,77 @@ mod tests {
         assert!(parse_words("run python-agent --llm http://h:1").is_err());
         assert!(parse_words("run python-agent --llm http://h:1 --model m --turns 0").is_err());
         assert!(parse_words("run hello --llm http://h:1").is_err());
+    }
+
+    /// The tree commands of protocol 4 (spec `control-plane`, tree under
+    /// control and tree operations from the host).
+    #[test]
+    fn tree_commands_parse() {
+        assert_eq!(command("ps --tree"), Command::PsTree);
+        assert!(parse_words("ps --forest").is_err());
+        assert_eq!(command("kill 3 --tree"), Command::KillTree(3));
+        assert_eq!(command("suspend --tree 3"), Command::SuspendTree(3));
+        assert_eq!(command("resume 3 --tree"), Command::ResumeTree(3));
+        assert!(parse_words("kill 3 --all").is_err());
+        assert_eq!(
+            command("reparent 7 --to 3"),
+            Command::Reparent { id: 7, to: 3 }
+        );
+        assert_eq!(
+            command("reparent 7 --to root"),
+            Command::Reparent { id: 7, to: 0 }
+        );
+        assert!(parse_words("reparent 7 3").is_err());
+        assert_eq!(
+            command("scope 3 --socket ./agent3.sock"),
+            Command::Scope {
+                id: 3,
+                socket: "./agent3.sock".into()
+            }
+        );
+        assert!(parse_words("scope 3").is_err());
+        let Command::Policy { id: 7, place } =
+            command("policy 7 --egress allow:tcp:140.82.112.0/20:443 --mem 128M")
+        else {
+            panic!("not a policy");
+        };
+        assert_eq!(place.memory, Some(128 << 20));
+        assert_eq!(place.egress.map(|e| e.rules.len()), Some(1));
+        // Nothing to set, a placement option, or a ceiling alone.
+        assert!(parse_words("policy 7").is_err());
+        assert!(parse_words("policy 7 --parent 3").is_err());
+        assert!(parse_words("policy 7 --ceiling none").is_err());
+    }
+
+    #[test]
+    fn placement_options_go_with_run_fork_and_load() {
+        let Command::Run(run) = command(
+            "run python --parent 3 --label tools --egress model --llm http://127.0.0.1:8080 \
+             --mem 256M --cells 4 --on-parent-end cascade -- -c pass",
+        ) else {
+            panic!("not a run");
+        };
+        assert_eq!(run.place.parent, Some(3));
+        assert_eq!(run.place.label.as_deref(), Some("tools"));
+        assert_eq!(run.place.cells, Some(4));
+        assert_eq!(run.args, ["-c", "pass"]);
+        // `--llm` names the endpoint of `--egress model`, else it is the
+        // agent's.
+        assert!(parse_words("run python --llm http://h:1").is_err());
+        let Command::Fork { id: 5, n: 2, place } = command("fork 5 2 --parent 3 --mem 64M") else {
+            panic!("not a fork");
+        };
+        assert_eq!((place.parent, place.memory), (Some(3), Some(64 << 20)));
+        let Command::Load {
+            template: true,
+            place,
+            ..
+        } = command("load agent.rhz --template --egress none --cpu-weight 50")
+        else {
+            panic!("not a load");
+        };
+        assert_eq!(place.cpu_weight, Some(50));
+        assert!(parse_words("run idle --cpus 64").is_err());
+        assert!(parse_words("fork 5 --mem").is_err());
     }
 }

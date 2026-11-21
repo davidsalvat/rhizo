@@ -78,14 +78,22 @@ pub struct Info {
     pub cpus: u32,
     /// Milliseconds from launching the VMM to the kernel's hello.
     pub boot_ms: u64,
+    /// The control protocol the kernel's hello named; `None` in the state
+    /// of a server older than version 4, whose kernel speaks version 3 at
+    /// most.
+    pub protocol: Option<u8>,
 }
 
 impl Info {
     pub fn encode(&self) -> String {
-        format!(
+        let mut text = format!(
             "pid={}\nvmm_pid={}\nvmm={}\narch={}\nmemory_mib={}\ncpus={}\nboot_ms={}\n",
             self.pid, self.vmm_pid, self.vmm, self.arch, self.memory_mib, self.cpus, self.boot_ms
-        )
+        );
+        if let Some(p) = self.protocol {
+            text += &format!("protocol={p}\n");
+        }
+        text
     }
 
     pub fn decode(text: &str) -> Option<Self> {
@@ -101,6 +109,10 @@ impl Info {
             memory_mib: field("memory_mib")?.parse().ok()?,
             cpus: field("cpus")?.parse().ok()?,
             boot_ms: field("boot_ms")?.parse().ok()?,
+            protocol: match field("protocol") {
+                Some(p) => Some(p.parse().ok()?),
+                None => None,
+            },
         })
     }
 
@@ -138,8 +150,16 @@ mod tests {
             memory_mib: 256,
             cpus: 2,
             boot_ms: 40,
+            protocol: Some(4),
         };
-        assert_eq!(Info::decode(&info.encode()), Some(info));
+        assert_eq!(Info::decode(&info.encode()), Some(info.clone()));
+        // A version-3 server wrote no protocol.
+        let old = Info {
+            protocol: None,
+            ..info
+        };
+        assert_eq!(old.encode().lines().count(), 7);
+        assert_eq!(Info::decode(&old.encode()), Some(old));
         assert_eq!(Info::decode("pid=1\n"), None);
         assert_eq!(Info::decode("garbage"), None);
     }

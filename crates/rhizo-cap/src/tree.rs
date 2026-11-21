@@ -526,6 +526,21 @@ impl Tree {
         by: Actor,
         usage: Usage,
     ) -> Result<(), Error> {
+        self.add_child_unlike(id, parent, spec, by, usage, 0)
+    }
+
+    /// [`add_child`](Self::add_child), never numbering the cell `skip` in
+    /// the parent's domain: a copy placed there keeps a number unlike its
+    /// source's (design D22; 0 for none).
+    pub fn add_child_unlike(
+        &mut self,
+        id: u32,
+        parent: u32,
+        spec: Spec,
+        by: Actor,
+        usage: Usage,
+        skip: u32,
+    ) -> Result<(), Error> {
         let p = self.get(parent).ok_or(Error::NotFound)?;
         if by != Actor::Host && by != Actor::Cell(parent) && !self.controls(by, parent) {
             return Err(Error::Denied);
@@ -548,7 +563,7 @@ impl Tree {
         let i = self.insert_at(id)?;
         self.nodes.insert(i, node);
         self.link(id, parent);
-        let pid = self.number(id, 0);
+        let pid = self.number(id, skip);
         self.node_mut(id).pid = pid;
         Ok(())
     }

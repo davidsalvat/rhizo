@@ -44,6 +44,18 @@ the tree. `rhizo chat` and agent templates SHALL pass `--egress model`.
 - **WHEN** the host runs an agent, two helpers under it with egress `none`, and lists the cells
 - **THEN** `rhizo ps --tree` shows both helpers indented under the agent with their egress and limits
 
+### Requirement: Output with the start
+`run` and `fork` SHALL take a `watch` flag: with it, the output of the
+cells they make SHALL stream to the same request right after its reply,
+then their ends, as an `output` request would, so that a new cell's first
+output costs one round trip (recommendation 1 of design D8 of
+`control-over-vsock`). `rhizo run` without `--detach` SHALL use it with a
+kernel of protocol 4.
+
+#### Scenario: Run and watch
+- **WHEN** the host runs `hello` with the flag and sends no `output` request
+- **THEN** it receives the reply, then `hello`'s output and its end, all under the identifier of the `run`
+
 ### Requirement: Tree operations from the host
 The host SHALL be able to re-parent a cell or make it a root, narrow or
 set its egress and limits, kill, suspend or resume a whole subtree, and

@@ -10,7 +10,9 @@ use crate::bench::{Metric, summarize};
 use crate::report::Failure;
 use crate::vmm::{self, Accel, Guest, RunOptions, Vmm};
 use crate::{Profile, Result, arch, build_kernel, report, target_dir, workspace_root};
-use rhizo_control::{Body, Decoder, Frame, Item, Message, Request, Run, State, VSOCK_PORT};
+use rhizo_control::{
+    Body, Decoder, Frame, Item, Message, Placement, Request, Run, State, VSOCK_PORT,
+};
 use std::io::{self as stdio, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -111,12 +113,15 @@ pub struct Vm {
     /// Where the frames go, for people: `vsock`, or the serial line and
     /// why.
     pub channel: String,
+    /// The control protocol the kernel's hello named.
+    pub protocol: u8,
 }
 
 /// Decodes what `from` carries into `tx` until it ends; then, if
 /// `vmm_output`, tells that the VMM ended.
 fn read_frames(mut from: impl Read, tx: &Sender<Event>, vmm_output: bool) {
-    let mut decoder = Decoder::new();
+    // Every version: the hello of a kernel `rhizo` does not speak names it.
+    let mut decoder = Decoder::any_version();
     let mut buf = [0u8; 4096];
     while let Ok(n) = from.read(&mut buf) {
         if n == 0 {
@@ -282,6 +287,7 @@ impl Vm {
             next_id: 1,
             vsock,
             channel,
+            protocol: 0,
         };
         vm.hello(vmm, BOOT_TIMEOUT, "on its serial line")?;
         if let Some(v) = vsock {
@@ -308,8 +314,9 @@ impl Vm {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.next(left) {
                 Some(Event::Frame(f))
-                    if matches!(Message::decode(&f), Ok(Message::Hello { .. })) =>
+                    if let Ok(Message::Hello { version }) = Message::decode(&f) =>
                 {
+                    self.protocol = version;
                     return Ok(());
                 }
                 Some(Event::Text(t)) => self.console.extend(t),
@@ -481,7 +488,7 @@ fn measure_on(vmm: Vmm, kernel: &Path, accel: Accel) -> Result<Vec<Metric>> {
         samples[3]
             .1
             .push(us(done(&mut vm, &Request::Resume(cell))?.1));
-        let (Body::Cells(children), took) = done(&mut vm, &Request::Fork { cell, n: 1 })? else {
+        let (Body::Cells(children), took) = done(&mut vm, &Request::fork(cell, 1))? else {
             return Err("`fork` returned no cells".into());
         };
         samples[4].1.push(us(took));
@@ -549,56 +556,56 @@ struct FirstOutput {
     reply: Duration,
     /// The kernel's own time for that request.
     kernel: Duration,
-    /// From sending the `output` request to the first output read.
+    /// From the start request's reply to the first output read.
     watch: Duration,
 }
 
-/// Starts one cell with `start` (`run`, or `fork` into one), streams its
-/// output until the first bytes come, waits for its end and forgets it.
+/// Starts one cell with `start` (`run`, or `fork` into one), which streams
+/// its output after the reply (protocol version 4: no `output` request,
+/// so no second round trip), waits for its end and forgets it.
 fn first_output(vm: &mut Vm, start: &Request) -> Result<FirstOutput> {
     let t0 = Instant::now();
-    let (body, ns, reply) = match vm.call(start)? {
-        (Message::Done { body, ns }, took) => (body, ns, took),
-        (other, _) => return Err(format!("{start:?} failed: {other:?}")),
-    };
-    let cell = match body {
-        Body::Cell(cell) => cell,
-        Body::Cells(cells) if cells.len() == 1 => cells[0],
-        other => return Err(format!("{start:?} returned {other:?}")),
-    };
-    let t1 = Instant::now();
-    let watch = vm.submit(&Request::Output(cell))?;
+    let id = vm.submit(start)?;
+    let mut reply = None;
     let mut first = None;
     loop {
         match vm.next(Duration::from_secs(60)) {
-            Some(Event::Frame(f)) if f.id == watch => match Message::decode(&f) {
+            Some(Event::Frame(f)) if f.id == id => match Message::decode(&f) {
+                Ok(Message::Done { body, ns }) => {
+                    let cell = match body {
+                        Body::Cell(cell) => cell,
+                        Body::Cells(cells) if cells.len() == 1 => cells[0],
+                        other => return Err(format!("{start:?} returned {other:?}")),
+                    };
+                    reply = Some((cell, ns, Instant::now()));
+                }
                 Ok(Message::Output { .. }) => {
                     first.get_or_insert_with(Instant::now);
                 }
-                Ok(Message::Ended { state, .. }) => match first {
+                Ok(Message::Ended { state, cell }) => match first {
                     Some(_) if state == State::Exited(0) => break,
                     _ => return Err(format!("cell {cell} ended: {state:?}")),
                 },
-                Ok(Message::Done { .. }) => {}
-                other => return Err(format!("watching cell {cell}: {other:?}")),
+                other => return Err(format!("{start:?}: {other:?}")),
             },
             Some(Event::Text(t)) => vm.console.extend(t),
             Some(Event::Exited) | None => {
                 return Err(format!(
-                    "cell {cell} printed nothing; console:\n{}",
+                    "{start:?}: no output; console:\n{}",
                     String::from_utf8_lossy(&vm.console)
                 ));
             }
             Some(_) => {}
         }
     }
+    let (cell, ns, replied) = reply.ok_or("output before the reply")?;
     done(vm, &Request::Kill(cell))?; // it ended: forget it
     let first = first.expect("output came before the end");
     Ok(FirstOutput {
         total: first - t0,
-        reply,
+        reply: replied - t0,
         kernel: Duration::from_nanos(ns),
-        watch: first - t1,
+        watch: first.saturating_duration_since(replied),
     })
 }
 
@@ -611,6 +618,7 @@ fn first_outputs(vm: &mut Vm) -> Result<Vec<(&'static str, Vec<f64>)>> {
     let hello = Request::Run(Run {
         image: b"hello".to_vec(),
         argv: vec![b"hello".to_vec()],
+        watch: true,
         ..Run::default()
     });
     let (Body::Cell(template), _) = done(
@@ -647,6 +655,8 @@ fn first_outputs(vm: &mut Vm) -> Result<Vec<(&'static str, Vec<f64>)>> {
     let fork = Request::Fork {
         cell: template,
         n: 1,
+        placement: Placement::root(),
+        watch: true,
     };
     let names = [
         "control.spawn_to_first_output_us",
@@ -922,6 +932,7 @@ fn load(vm: &mut Vm, vmm: Vmm, bytes: Vec<u8>, template: bool) -> Result<(u32, D
             size,
             template,
             host,
+            placement: Placement::root(),
         },
     )?
     else {
@@ -954,14 +965,7 @@ fn snapshot_files(
     let size = file.len();
     let (template, loaded) = load(&mut vm, vmm, file, true)?;
     let t0 = Instant::now();
-    let (Body::Cells(cells), _) = done(
-        &mut vm,
-        &Request::Fork {
-            cell: template,
-            n: 1,
-        },
-    )?
-    else {
+    let (Body::Cells(cells), _) = done(&mut vm, &Request::fork(template, 1))? else {
         return Err("`fork` returned no cells".into());
     };
     done(&mut vm, &Request::Output(cells[0]))?;
@@ -1143,6 +1147,28 @@ impl Drop for Chat<'_> {
     }
 }
 
+/// Reads frames from `stream` until the reply to request `id`.
+fn read_reply(stream: &mut UnixStream, id: u32) -> Result<Message> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let mut decoder = Decoder::any_version();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .map_err(|e| format!("no reply to {id}: {e}"))?;
+        if n == 0 {
+            return Err(format!("no reply to {id}: the socket closed"));
+        }
+        for &byte in &buf[..n] {
+            if let Some(Item::Frame(f)) = decoder.push(byte)
+                && f.id == id
+            {
+                return Message::decode(&f).map_err(|e| e.as_str().to_string());
+            }
+        }
+    }
+}
+
 /// Builds the `rhizo` tool (debug) and returns its path.
 pub fn build_rhizo() -> Result<PathBuf> {
     crate::cargo(&["build", "-p", "rhizo-cli", "--bin", "rhizo"])?;
@@ -1152,8 +1178,9 @@ pub fn build_rhizo() -> Result<PathBuf> {
 /// The `control` test step (spec `control-plane`): boots `kernel` with
 /// `rhizo up` on `vmm` and drives it with `rhizo` as a user would: a
 /// program run to its end, an idle cell suspended, resumed, forked, killed
-/// and listed, and the CPython agent against the host's fake model, its
-/// transcript checked.
+/// and listed, a small cell tree placed, moved, narrowed, suspended,
+/// resumed, reached through a scoped socket and killed as one, and the
+/// CPython agent against the host's fake model, its transcript checked.
 pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &str) -> Result {
     let state = target_dir()
         .join("xtask-test")
@@ -1329,6 +1356,228 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             .to_string();
         refused(&["resume", &idle])?;
         ok(&["kill", &idle])?;
+        // The cell tree (protocol version 4, spec `control-plane`): an
+        // agent, two helpers under it with egress `none`, and a cell of
+        // another domain.
+        let started = |out: String| {
+            out.split("cell ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let detached = |more: &[&str]| -> Result<String> {
+            let mut words = vec!["run", "idle", "--detach"];
+            words.extend_from_slice(more);
+            ok(&words).map(started)
+        };
+        let agent = detached(&[
+            "--label",
+            "agent",
+            "--mem",
+            "64M",
+            "--sockets",
+            "8",
+            "--cells",
+            "4",
+        ])?;
+        let helper = |label: &'static str| {
+            detached(&[
+                "--parent",
+                &agent,
+                "--label",
+                label,
+                "--egress",
+                "none",
+                "--mem",
+                "8M",
+                "--sockets",
+                "2",
+                "--cells",
+                "0",
+            ])
+        };
+        let (tools, search) = (helper("tools")?, helper("search")?);
+        let other = detached(&[])?;
+        // A row of `ps --tree`: the cell, `indent` deep, with `what` in it.
+        let row = |out: &str, id: &str, indent: usize, what: &[&str]| {
+            out.lines().any(|l| {
+                l.len() > indent
+                    && l[..indent].trim().is_empty()
+                    && l[indent..].split_whitespace().next() == Some(id)
+                    && what.iter().all(|w| l.contains(w))
+            })
+        };
+        let out = ok(&["ps", "--tree"])?;
+        must(
+            row(&out, &agent, 0, &["agent", "mem 64M, 8 sockets, 4 cells"])
+                && row(
+                    &out,
+                    &tools,
+                    2,
+                    &["tools", "none", "mem 8M, 2 sockets, 0 cells"],
+                )
+                && row(&out, &search, 2, &["search", "none", "mem 8M"])
+                && row(&out, &other, 0, &["idle"]),
+            "`rhizo ps --tree` shows both helpers indented under the agent with their egress \
+             and limits",
+            "the agent's row, then `tools` and `search` two spaces in",
+        )?;
+        let refused_with = |words: &[&str], why: &str| -> Result {
+            let (succeeded, out) = rhizo_run(words)?;
+            must(
+                !succeeded && out.contains(why),
+                &format!("`rhizo {}` is refused with the reason", words.join(" ")),
+                why,
+            )
+        };
+        refused_with(&["run", "idle", "--parent", "99999"], "no such cell")?;
+        refused_with(
+            &[
+                "run",
+                "idle",
+                "--parent",
+                &agent,
+                "--mem",
+                "1G",
+                "--sockets",
+                "1",
+                "--cells",
+                "0",
+            ],
+            "free budget",
+        )?;
+        // Moves and policies.
+        ok(&["reparent", &search, "--to", "root"])?;
+        let out = ok(&["ps", "--tree"])?;
+        must(
+            row(&out, &search, 0, &["search"]),
+            "`rhizo reparent --to root` makes the helper a root",
+            "its row not indented",
+        )?;
+        ok(&["reparent", &search, "--to", &agent])?;
+        ok(&["policy", &agent, "--egress", "tcp:10.0.2.2:9"])?;
+        ok(&[
+            "policy",
+            &tools,
+            "--egress",
+            "tcp:10.0.2.2:9",
+            "--mem",
+            "4M",
+        ])?;
+        refused_with(&["policy", &tools, "--egress", "full"], "not allowed")?;
+        let out = ok(&["ps", "--tree"])?;
+        must(
+            row(&out, &tools, 2, &["tcp:10.0.2.2/32:9", "mem 4M"]),
+            "`rhizo policy` narrows the helper's egress and limits",
+            "`tcp:10.0.2.2/32:9` and `mem 4M` in its row",
+        )?;
+        // The subtree as one.
+        let out = ok(&["suspend", &agent, "--tree"])?;
+        must(
+            [&agent, &tools, &search]
+                .iter()
+                .all(|c| out.contains(c.as_str())),
+            "`rhizo suspend --tree` suspends the agent and both helpers",
+            "the three cells",
+        )?;
+        let out = ok(&["ps"])?;
+        must(
+            [&agent, &tools, &search]
+                .iter()
+                .all(|c| line_of(&out, c, "suspended"))
+                && line_of(&out, &other, "running"),
+            "the subtree is suspended, the other domain runs on",
+            "`suspended` for the three, `running` for the other",
+        )?;
+        ok(&["resume", &agent, "--tree"])?;
+        let out = ok(&["ps", "--tree"])?;
+        must(
+            row(&out, &tools, 2, &["running", "tools"]) && row(&out, &agent, 0, &["running"]),
+            "`rhizo resume --tree` resumes them where they were",
+            "the helpers running under the agent",
+        )?;
+        // Scoped access: a client of a socket scoped to the agent kills
+        // the agent's child, and is refused the cell of another domain,
+        // and a rule with a prefix over 32 (spec `control-plane`).
+        let socket = std::env::temp_dir().join(format!("rhizo-scope-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let mut scope = Command::new(rhizo)
+            .arg("--state")
+            .arg(&state)
+            .args(["scope", &agent, "--socket"])
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot run {}: {e}", rhizo.display()))?;
+        let scoped = (|| -> Result<Vec<Message>> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match UnixStream::connect(&socket) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                    Err(e) => return Err(format!("cannot reach {}: {e}", socket.display())),
+                }
+            };
+            let id = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let wide = Request::Run(Run {
+                image: b"idle".to_vec(),
+                placement: Placement {
+                    parent: id(&agent),
+                    egress: rhizo_control::Egress::Rules(vec![rhizo_control::Rule {
+                        proto: rhizo_control::Proto::Tcp,
+                        addr: [10, 0, 2, 2],
+                        prefix: 33,
+                        lo: 9,
+                        hi: 9,
+                    }]),
+                    ..Placement::root()
+                },
+                ..Run::default()
+            });
+            let requests = [Request::Kill(id(&tools)), Request::Kill(id(&other)), wide];
+            let mut replies = Vec::new();
+            for (k, request) in requests.iter().enumerate() {
+                stream
+                    .write_all(&request.encode(k as u32 + 1))
+                    .map_err(|e| e.to_string())?;
+                replies.push(read_reply(&mut stream, k as u32 + 1)?);
+            }
+            Ok(replies)
+        })();
+        let _ = scope.kill();
+        let _ = scope.wait();
+        let _ = std::fs::remove_file(&socket);
+        let replies = scoped.map_err(|e| fail(&e, "replies on the scoped socket"))?;
+        let refused_because = |m: &Message, error: rhizo_control::Error, why: &str| {
+            matches!(m, Message::Failed { error: e, message, .. }
+                if *e == error && String::from_utf8_lossy(message).contains(why))
+        };
+        must(
+            matches!(replies[0], Message::Done { .. })
+                && refused_because(&replies[1], rhizo_control::Error::Denied, "outside")
+                && refused_because(&replies[2], rhizo_control::Error::Invalid, "prefix 33"),
+            &format!("scoped to {agent}: kill {tools}, kill {other}, a rule /33: {replies:?}"),
+            "the first done, the second refused as outside, the third with `prefix 33`",
+        )?;
+        let out = ok(&["ps"])?;
+        must(
+            line_of(&out, &tools, "killed") && line_of(&out, &other, "running"),
+            "the scoped kill ended the child, and the other domain's cell runs on",
+            "`killed` for the helper, `running` for the other",
+        )?;
+        // The whole subtree ends.
+        ok(&["kill", &agent, "--tree"])?;
+        let out = ok(&["ps"])?;
+        must(
+            line_of(&out, &agent, "killed") && line_of(&out, &search, "killed"),
+            "`rhizo kill --tree` ends the agent and its helper",
+            "`killed` for both",
+        )?;
+        for c in [&agent, &tools, &search] {
+            ok(&["kill", c])?; // forget it
+        }
+        ok(&["kill", &other])?;
         // The agent, against the host's fake model.
         if crate::cpython::root().join("usr/bin/python3").exists() {
             let bind = match vmm {

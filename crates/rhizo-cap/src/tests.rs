@@ -670,3 +670,33 @@ proptest! {
         }
     }
 }
+
+/// A child placed while avoiding a number never takes it, whatever the
+/// domain's counter says (a copy placed under another parent, design D22).
+#[test]
+fn a_child_avoids_the_number_it_is_told() {
+    let mut t = Tree::new();
+    t.add_root(1, spec(limits(MIB, 4)), 0).unwrap();
+    let next = 2; // the root is 1
+    t.add_child_unlike(
+        5,
+        1,
+        spec(limits(MIB / 4, 0)),
+        Actor::Host,
+        &|_| Limits::ZERO,
+        next,
+    )
+    .unwrap();
+    assert_ne!(t.get(5).unwrap().pid(), next);
+    t.add_child_unlike(
+        6,
+        1,
+        spec(limits(MIB / 4, 0)),
+        Actor::Host,
+        &|_| Limits::ZERO,
+        0,
+    )
+    .unwrap();
+    assert_ne!(t.get(6).unwrap().pid(), t.get(5).unwrap().pid());
+    t.check().unwrap();
+}

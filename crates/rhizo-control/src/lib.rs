@@ -1,9 +1,10 @@
 //! The control protocol between the host and a control kernel (spec
 //! `control-plane`, design D2 of `add-control-plane`): the host asks the
 //! kernel to run, list, suspend, resume, fork and kill cells, to freeze
-//! them into templates, and to save and load snapshots as bytes (change
-//! `snapshots-on-disk`), and the kernel answers each request with its
-//! outcome and the time it took.
+//! them into templates, to save and load snapshots as bytes (change
+//! `snapshots-on-disk`), and to place and move cells in the cell tree
+//! (version 4, design D14 of `add-cell-hierarchy`); the kernel answers each
+//! request with its outcome and the time it took.
 //!
 //! Both directions carry the same frames on one byte stream, which may also
 //! carry plain text (the kernel's console, on a serial line it shares):
@@ -18,6 +19,11 @@
 //! the output events of an `output` request. Everything read is checked:
 //! decoding never panics and never allocates more than the bytes it was
 //! given (design D3 of `add-control-plane`: this is an attack surface).
+//!
+//! The kernel speaks [`VERSION`] only. The host speaks it and [`PREVIOUS`]
+//! (design D20 of `add-cell-hierarchy`), so a newer `rhizo` still drives a
+//! VM booted before an upgrade: [`Request::encode_as`] writes a request in
+//! either, and decoding follows the version of the frame.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -27,8 +33,12 @@ use alloc::vec::Vec;
 
 /// The protocol's version, in every frame (2: standard input, design D2 of
 /// `add-interactive-chat`; 3: templates, save and load, design D2 of
-/// `snapshots-on-disk`).
-pub const VERSION: u8 = 3;
+/// `snapshots-on-disk`; 4: the cell tree, design D14 of
+/// `add-cell-hierarchy`).
+pub const VERSION: u8 = 4;
+/// The version before, which the host still speaks (design D20 of
+/// `add-cell-hierarchy`).
+pub const PREVIOUS: u8 = 3;
 /// The bytes every frame starts with.
 pub const MAGIC: [u8; 2] = [0x01, b'Z'];
 /// Bytes of a frame before its payload.
@@ -61,6 +71,10 @@ mod kind {
     pub const FREEZE: u8 = 0x0d;
     pub const SAVE: u8 = 0x0e;
     pub const LOAD: u8 = 0x0f;
+    pub const REPARENT: u8 = 0x10;
+    pub const POLICY: u8 = 0x11;
+    pub const LIMITS: u8 = 0x12;
+    pub const SCOPED: u8 = 0x13;
     // Kernel to host.
     pub const HELLO: u8 = 0x80;
     pub const DONE: u8 = 0x81;
@@ -95,6 +109,12 @@ pub enum Error {
     NoMemory,
     /// The kernel could not do it (the message says why).
     Failed,
+    /// The requester has no authority over the cell, or a scoped request
+    /// reaches outside its subtree or widens (version 4).
+    Denied,
+    /// A tree request the kernel cannot apply: a bad label, rule, limit or
+    /// placement (version 4; the message says why).
+    Invalid,
 }
 
 impl Error {
@@ -111,6 +131,8 @@ impl Error {
             Error::NoMemory => 9,
             Error::Failed => 10,
             Error::BadSnapshot => 11,
+            Error::Denied => 12,
+            Error::Invalid => 13,
         }
     }
 
@@ -127,6 +149,8 @@ impl Error {
             9 => Error::NoMemory,
             10 => Error::Failed,
             11 => Error::BadSnapshot,
+            12 => Error::Denied,
+            13 => Error::Invalid,
             _ => return None,
         })
     }
@@ -145,23 +169,31 @@ impl Error {
             Error::NoMemory => "not enough memory",
             Error::Failed => "failed",
             Error::BadSnapshot => "not a snapshot this kernel can load",
+            Error::Denied => "not allowed",
+            Error::Invalid => "invalid tree request",
         }
     }
 }
 
-/// One frame: its kind, its request identifier and its payload.
+/// One frame: its protocol version, kind, request identifier and payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
+    pub version: u8,
     pub kind: u8,
     pub id: u32,
     pub payload: Vec<u8>,
 }
 
-/// The bytes of a frame.
+/// The bytes of a frame of the current version.
 pub fn encode_frame(kind: u8, id: u32, payload: &[u8]) -> Vec<u8> {
+    encode_frame_as(VERSION, kind, id, payload)
+}
+
+/// The bytes of a frame of `version` (a relay keeps the version it read).
+pub fn encode_frame_as(version: u8, kind: u8, id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
-    out.push(VERSION);
+    out.push(version);
     out.push(kind);
     out.extend_from_slice(&id.to_le_bytes());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -185,13 +217,25 @@ pub enum Item {
 enum Phase {
     Text,
     Header,
-    Payload { kind: u8, id: u32, len: usize },
-    Skip { left: usize },
+    Payload {
+        version: u8,
+        kind: u8,
+        id: u32,
+        len: usize,
+    },
+    Skip {
+        left: usize,
+    },
 }
 
-/// Splits a byte stream into text and frames, one byte at a time.
+/// Splits a byte stream into text and frames, one byte at a time. The
+/// kernel's takes frames of [`VERSION`] only; the host's
+/// ([`Decoder::any_version`]) takes every version, so that it reads the
+/// hello and refusals of any kernel, and leaves the rest to
+/// [`Message::decode`].
 #[derive(Debug)]
 pub struct Decoder {
+    any_version: bool,
     state: Phase,
     header: [u8; HEADER_LEN],
     have: usize,
@@ -207,6 +251,18 @@ impl Default for Decoder {
 impl Decoder {
     pub const fn new() -> Self {
         Self {
+            any_version: false,
+            state: Phase::Text,
+            header: [0; HEADER_LEN],
+            have: 0,
+            payload: Vec::new(),
+        }
+    }
+
+    /// A decoder that takes frames of every version (the host's).
+    pub const fn any_version() -> Self {
+        Self {
+            any_version: true,
             state: Phase::Text,
             header: [0; HEADER_LEN],
             have: 0,
@@ -252,15 +308,20 @@ impl Decoder {
                         error: Error::TooLarge,
                     });
                 }
-                let error = if version != VERSION {
+                let error = if version != VERSION && !self.any_version {
                     Error::Version
                 } else {
                     self.payload = Vec::new();
                     if self.payload.try_reserve_exact(len).is_ok() {
                         if len == 0 {
-                            return Some(self.frame(kind, id));
+                            return Some(self.frame(version, kind, id));
                         }
-                        self.state = Phase::Payload { kind, id, len };
+                        self.state = Phase::Payload {
+                            version,
+                            kind,
+                            id,
+                            len,
+                        };
                         return None;
                     }
                     Error::TooLarge
@@ -270,13 +331,18 @@ impl Decoder {
                 }
                 Some(Item::Bad { id, error })
             }
-            Phase::Payload { kind, id, len } => {
+            Phase::Payload {
+                version,
+                kind,
+                id,
+                len,
+            } => {
                 self.payload.push(byte);
                 if self.payload.len() < len {
                     return None;
                 }
                 self.state = Phase::Text;
-                Some(self.frame(kind, id))
+                Some(self.frame(version, kind, id))
             }
             Phase::Skip { left } => {
                 self.state = if left > 1 {
@@ -289,8 +355,9 @@ impl Decoder {
         }
     }
 
-    fn frame(&mut self, kind: u8, id: u32) -> Item {
+    fn frame(&mut self, version: u8, kind: u8, id: u32) -> Item {
         Item::Frame(Frame {
+            version,
             kind,
             id,
             payload: core::mem::take(&mut self.payload),
@@ -332,6 +399,46 @@ impl Writer {
         }
         self
     }
+    fn u16(&mut self, v: u16) -> &mut Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    fn limits(&mut self, l: &Limits) -> &mut Self {
+        self.u64(l.memory).u64(l.cpu_ns).u32(l.sockets).u32(l.cells)
+    }
+    fn egress(&mut self, e: &Egress) -> &mut Self {
+        match e {
+            Egress::None => self.u8(0),
+            Egress::Rules(rules) => self.u8(1).list(rules, |w, r| {
+                w.u8(r.proto as u8);
+                w.0.extend_from_slice(&r.addr);
+                w.u8(r.prefix).u16(r.lo).u16(r.hi);
+            }),
+            Egress::Full => self.u8(2),
+        }
+    }
+    fn ceiling(&mut self, c: &Option<Egress>) -> &mut Self {
+        match c {
+            None => self.u8(0),
+            Some(e) => self.u8(1).egress(e),
+        }
+    }
+    /// A placement: one byte 0 for the default (most cells, so that a
+    /// `run` costs two bytes more than in version 3, where bytes are slow:
+    /// the serial line), else 1 and its fields.
+    fn placement(&mut self, p: &Placement) -> &mut Self {
+        if p.is_root() {
+            return self.u8(0);
+        }
+        self.u8(1).u32(p.parent).bytes(&p.label).u8(0); // mode: reserved
+        self.limits(&p.limits)
+            .egress(&p.egress)
+            .ceiling(&p.ceiling)
+            .u8(p.on_parent_end as u8)
+            .u64(p.cpus)
+            .u16(p.cpu_weight)
+            .u32(p.cpu_max)
+    }
 }
 
 /// Reads the fields of a payload, every read checked.
@@ -371,6 +478,74 @@ impl<'a> Reader<'a> {
             token: self.u64()?,
         })
     }
+    fn u16(&mut self) -> Result<u16, Error> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn limits(&mut self) -> Result<Limits, Error> {
+        Ok(Limits {
+            memory: self.u64()?,
+            cpu_ns: self.u64()?,
+            sockets: self.u32()?,
+            cells: self.u32()?,
+        })
+    }
+    fn egress(&mut self) -> Result<Egress, Error> {
+        Ok(match self.u8()? {
+            0 => Egress::None,
+            1 => Egress::Rules(self.list(|r| {
+                let proto = match r.u8()? {
+                    0 => Proto::Tcp,
+                    1 => Proto::Udp,
+                    2 => Proto::Any,
+                    _ => return Err(Error::Malformed),
+                };
+                let mut addr = [0; 4];
+                addr.copy_from_slice(r.take(4)?);
+                Ok(Rule {
+                    proto,
+                    addr,
+                    prefix: r.u8()?,
+                    lo: r.u16()?,
+                    hi: r.u16()?,
+                })
+            })?),
+            2 => Egress::Full,
+            _ => return Err(Error::Malformed),
+        })
+    }
+    fn ceiling(&mut self) -> Result<Option<Egress>, Error> {
+        Ok(if self.flag()? {
+            Some(self.egress()?)
+        } else {
+            None
+        })
+    }
+    fn placement(&mut self) -> Result<Placement, Error> {
+        if !self.flag()? {
+            return Ok(Placement::root());
+        }
+        let parent = self.u32()?;
+        let label = self.bytes()?;
+        if self.u8()? != 0 {
+            return Err(Error::Malformed); // only `reserved` exists
+        }
+        Ok(Placement {
+            parent,
+            label,
+            limits: self.limits()?,
+            egress: self.egress()?,
+            ceiling: self.ceiling()?,
+            on_parent_end: match self.u8()? {
+                0 => OnParentEnd::Cascade,
+                1 => OnParentEnd::Promote,
+                _ => return Err(Error::Malformed),
+            },
+            cpus: self.u64()?,
+            cpu_weight: self.u16()?,
+            cpu_max: self.u32()?,
+        })
+    }
     fn flag(&mut self) -> Result<bool, Error> {
         match self.u8()? {
             0 => Ok(false),
@@ -403,8 +578,114 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// What `run` starts (spec `control-plane`, commands).
+/// What a cell may use (version 4): memory in bytes, CPU time in
+/// nanoseconds, sockets, and descendants; `u64::MAX` or `u32::MAX` is no
+/// limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub memory: u64,
+    pub cpu_ns: u64,
+    pub sockets: u32,
+    pub cells: u32,
+}
+
+impl Limits {
+    /// No limit on anything: for a root, what the kernel's quotas allow.
+    pub const NONE: Self = Self {
+        memory: u64::MAX,
+        cpu_ns: u64::MAX,
+        sockets: u32::MAX,
+        cells: u32::MAX,
+    };
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+/// The protocol an egress rule allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    Tcp = 0,
+    Udp = 1,
+    Any = 2,
+}
+
+/// One egress rule (design D7 of `add-cell-hierarchy`): a protocol, an
+/// IPv4 network and an inclusive range of ports. Decoding checks only its
+/// shape; the kernel refuses, with the reason, a prefix over 32 or an
+/// empty range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rule {
+    pub proto: Proto,
+    pub addr: [u8; 4],
+    pub prefix: u8,
+    pub lo: u16,
+    pub hi: u16,
+}
+
+/// An egress policy: nothing outside the cell, some rules, or everything
+/// the deny floor leaves. `model` is a name `rhizo` gives rules: the model
+/// endpoint as the guest reaches it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Egress {
+    #[default]
+    None,
+    Rules(Vec<Rule>),
+    Full,
+}
+
+/// What happens to a cell when its parent ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnParentEnd {
+    #[default]
+    Cascade = 0,
+    Promote = 1,
+}
+
+/// Where a cell the host makes goes in the tree, and what it may do
+/// (version 4, design D14 of `add-cell-hierarchy`), for `run`, `load` and
+/// the fork of a template. The default is a root with egress `none`,
+/// limited by the kernel's quotas only, as version 3 made every cell.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Placement {
+    /// Its parent (0: a root, the host's).
+    pub parent: u32,
+    /// Its label, `[A-Za-z0-9._-]`, empty for none.
+    pub label: Vec<u8>,
+    /// Its limits, reserved in full from its parent's budget.
+    pub limits: Limits,
+    pub egress: Egress,
+    /// Its exposure ceiling; `None` takes the egress policy.
+    pub ceiling: Option<Egress>,
+    pub on_parent_end: OnParentEnd,
+    /// An exclusive set of CPUs, one bit each (roots only; 0: none).
+    pub cpus: u64,
+    /// CPU weight among its siblings (0: the default, 100).
+    pub cpu_weight: u16,
+    /// CPU cap of its subtree in thousandths of a CPU (`u32::MAX`: none).
+    pub cpu_max: u32,
+}
+
+impl Placement {
+    /// The default placement: a root as version 3 made them.
+    pub fn root() -> Self {
+        Self {
+            cpu_max: u32::MAX,
+            ..Self::default()
+        }
+    }
+
+    /// Whether version 3 can say it (it is [`Placement::root`]).
+    pub fn is_root(&self) -> bool {
+        *self == Self::root()
+    }
+}
+
+/// What `run` starts (spec `control-plane`, commands).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     /// The executable: the name of one the kernel holds.
     pub image: Vec<u8>,
@@ -420,6 +701,26 @@ pub struct Run {
     /// Whether its standard input comes from the host ([`Request::Input`]);
     /// without it, reading descriptor 0 gives end of file.
     pub input: bool,
+    /// Where it goes in the tree (version 4).
+    pub placement: Placement,
+    /// Whether its output streams to this request, right after the reply,
+    /// as an `output` request would (version 4): no second round trip.
+    pub watch: bool,
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Self {
+            image: Vec::new(),
+            files_from: Vec::new(),
+            argv: Vec::new(),
+            envp: Vec::new(),
+            files: Vec::new(),
+            input: false,
+            placement: Placement::root(),
+            watch: false,
+        }
+    }
 }
 
 /// A request, host to kernel.
@@ -434,10 +735,45 @@ pub enum Request {
     Suspend(u32),
     /// Resume a suspended cell, same identifier.
     Resume(u32),
-    /// Fork a running cell into `n` new ones; replies [`Body::Cells`].
-    Fork { cell: u32, n: u32 },
+    /// Fork a running cell into `n` new ones, its siblings, or make `n`
+    /// cells of a template, placed by `placement` (version 4: a running
+    /// cell's copies take only the default); replies [`Body::Cells`]. With
+    /// `watch`, their output streams to this request (version 4).
+    Fork {
+        cell: u32,
+        n: u32,
+        placement: Placement,
+        watch: bool,
+    },
     /// End a cell, or forget one that ended.
     Kill(u32),
+    /// End a cell and its whole subtree, whatever their policy for when a
+    /// parent ends (version 4).
+    KillTree(u32),
+    /// Suspend every running cell of a subtree (version 4); replies
+    /// [`Body::Cells`], those suspended.
+    SuspendTree(u32),
+    /// Resume every suspended cell of a subtree (version 4); replies
+    /// [`Body::Cells`], those resumed.
+    ResumeTree(u32),
+    /// Move a cell under `to`, or make it a root (`to` 0) (version 4).
+    Reparent { cell: u32, to: u32 },
+    /// Set a cell's egress policy and ceiling: narrowing for a non-root,
+    /// any for a root (version 4).
+    Policy {
+        cell: u32,
+        egress: Egress,
+        ceiling: Option<Egress>,
+    },
+    /// Set a cell's limits, within its parent's free budget (version 4).
+    Limits { cell: u32, limits: Limits },
+    /// `request` from a client limited to `root`'s subtree (version 4,
+    /// `rhizo scope`): the kernel refuses any target outside it, a move
+    /// out of it, and widening. Never nested.
+    Scoped {
+        root: u32,
+        request: alloc::boxed::Box<Request>,
+    },
     /// Stream the cell's output: what it printed so far, then as it prints,
     /// as [`Message::Output`], then [`Message::Ended`] when it ends.
     Output(u32),
@@ -471,6 +807,9 @@ pub enum Request {
         size: u64,
         template: bool,
         host: Host,
+        /// Where the cell goes (version 4): a template at once, a
+        /// suspended cell when it is resumed.
+        placement: Placement,
     },
 }
 
@@ -486,8 +825,31 @@ pub struct Host {
 }
 
 impl Request {
-    /// The frame of this request.
+    /// The `n` copies of `cell`, placed as the defaults say.
+    pub fn fork(cell: u32, n: u32) -> Self {
+        Request::Fork {
+            cell,
+            n,
+            placement: Placement::root(),
+            watch: false,
+        }
+    }
+
+    /// The frame of this request, in the current version.
     pub fn encode(&self, id: u32) -> Vec<u8> {
+        // Every request has a frame in the current version.
+        self.encode_as(VERSION, id).unwrap_or_default()
+    }
+
+    /// The frame of this request in `version` ([`VERSION`] or
+    /// [`PREVIOUS`]); [`Error::Version`] if that version cannot say it
+    /// (a tree request, a placement, a watch).
+    pub fn encode_as(&self, version: u8, id: u32) -> Result<Vec<u8>, Error> {
+        let v4 = match version {
+            VERSION => true,
+            PREVIOUS => false,
+            _ => return Err(Error::Version),
+        };
         let mut w = Writer::default();
         let kind = match self {
             Request::Run(run) => {
@@ -502,23 +864,41 @@ impl Request {
                     w.bytes(path).bytes(data);
                 });
                 w.u8(run.input as u8);
+                if v4 {
+                    w.placement(&run.placement).u8(run.watch as u8);
+                } else if !run.placement.is_root() || run.watch {
+                    return Err(Error::Version);
+                }
                 kind::RUN
             }
             Request::List => kind::LIST,
-            Request::Suspend(cell) => {
+            Request::Suspend(cell) | Request::SuspendTree(cell) => {
                 w.u32(*cell);
+                tree_flag(&mut w, v4, matches!(self, Request::SuspendTree(_)))?;
                 kind::SUSPEND
             }
-            Request::Resume(cell) => {
+            Request::Resume(cell) | Request::ResumeTree(cell) => {
                 w.u32(*cell);
+                tree_flag(&mut w, v4, matches!(self, Request::ResumeTree(_)))?;
                 kind::RESUME
             }
-            Request::Fork { cell, n } => {
+            Request::Fork {
+                cell,
+                n,
+                placement,
+                watch,
+            } => {
                 w.u32(*cell).u32(*n);
+                if v4 {
+                    w.placement(placement).u8(*watch as u8);
+                } else if !placement.is_root() || *watch {
+                    return Err(Error::Version);
+                }
                 kind::FORK
             }
-            Request::Kill(cell) => {
+            Request::Kill(cell) | Request::KillTree(cell) => {
                 w.u32(*cell);
+                tree_flag(&mut w, v4, matches!(self, Request::KillTree(_)))?;
                 kind::KILL
             }
             Request::Output(cell) => {
@@ -551,18 +931,61 @@ impl Request {
                 size,
                 template,
                 host,
+                placement,
             } => {
                 w.u64(*size).u8(*template as u8).host(host);
+                if v4 {
+                    w.placement(placement);
+                } else if !placement.is_root() {
+                    return Err(Error::Version);
+                }
                 kind::LOAD
             }
+            _ if !v4 => return Err(Error::Version),
+            Request::Reparent { cell, to } => {
+                w.u32(*cell).u32(*to);
+                kind::REPARENT
+            }
+            Request::Policy {
+                cell,
+                egress,
+                ceiling,
+            } => {
+                w.u32(*cell).egress(egress).ceiling(ceiling);
+                kind::POLICY
+            }
+            Request::Limits { cell, limits } => {
+                w.u32(*cell).limits(limits);
+                kind::LIMITS
+            }
+            Request::Scoped { root, request } => {
+                // A nested one is written, and refused when read.
+                let inner = request.encode_as(VERSION, 0)?;
+                w.u32(*root).u8(inner[3]).bytes(&inner[HEADER_LEN..]);
+                kind::SCOPED
+            }
         };
-        encode_frame(kind, id, &w.0)
+        Ok(encode_frame_as(version, kind, id, &w.0))
     }
 
-    /// The request a frame carries.
+    /// The request a frame carries, in its version ([`VERSION`] or
+    /// [`PREVIOUS`]).
     pub fn decode(frame: &Frame) -> Result<Self, Error> {
+        let v4 = match frame.version {
+            VERSION => true,
+            PREVIOUS => false,
+            _ => return Err(Error::Version),
+        };
         let mut r = Reader(&frame.payload);
-        let request = match frame.kind {
+        let request = Self::read(frame.kind, &mut r, v4, true)?;
+        r.end()?;
+        Ok(request)
+    }
+
+    /// The request of `kind` in `r`; `outer`: it may be a scoped one.
+    fn read(kind: u8, r: &mut Reader<'_>, v4: bool, outer: bool) -> Result<Self, Error> {
+        let tree = |r: &mut Reader<'_>| if v4 { r.flag() } else { Ok(false) };
+        let request = match kind {
             kind::RUN => Request::Run(Run {
                 image: r.bytes()?,
                 files_from: r.bytes()?,
@@ -570,15 +993,48 @@ impl Request {
                 envp: r.list(Reader::bytes)?,
                 files: r.list(|r| Ok((r.bytes()?, r.bytes()?)))?,
                 input: r.flag()?,
+                placement: if v4 {
+                    r.placement()?
+                } else {
+                    Placement::root()
+                },
+                watch: v4 && r.flag()?,
             }),
             kind::LIST => Request::List,
-            kind::SUSPEND => Request::Suspend(r.u32()?),
-            kind::RESUME => Request::Resume(r.u32()?),
+            kind::SUSPEND => {
+                let cell = r.u32()?;
+                if tree(r)? {
+                    Request::SuspendTree(cell)
+                } else {
+                    Request::Suspend(cell)
+                }
+            }
+            kind::RESUME => {
+                let cell = r.u32()?;
+                if tree(r)? {
+                    Request::ResumeTree(cell)
+                } else {
+                    Request::Resume(cell)
+                }
+            }
             kind::FORK => Request::Fork {
                 cell: r.u32()?,
                 n: r.u32()?,
+                placement: if v4 {
+                    r.placement()?
+                } else {
+                    Placement::root()
+                },
+                watch: v4 && r.flag()?,
             },
-            kind::KILL => Request::Kill(r.u32()?),
+            kind::KILL => {
+                let cell = r.u32()?;
+                if tree(r)? {
+                    Request::KillTree(cell)
+                } else {
+                    Request::Kill(cell)
+                }
+            }
             kind::OUTPUT => Request::Output(r.u32()?),
             kind::WRITE_FILE => Request::WriteFile {
                 cell: r.u32()?,
@@ -605,12 +1061,53 @@ impl Request {
                 size: r.u64()?,
                 template: r.flag()?,
                 host: r.host()?,
+                placement: if v4 {
+                    r.placement()?
+                } else {
+                    Placement::root()
+                },
             },
+            _ if !v4 => return Err(Error::UnknownKind),
+            kind::REPARENT => Request::Reparent {
+                cell: r.u32()?,
+                to: r.u32()?,
+            },
+            kind::POLICY => Request::Policy {
+                cell: r.u32()?,
+                egress: r.egress()?,
+                ceiling: r.ceiling()?,
+            },
+            kind::LIMITS => Request::Limits {
+                cell: r.u32()?,
+                limits: r.limits()?,
+            },
+            kind::SCOPED if outer => {
+                let root = r.u32()?;
+                let kind = r.u8()?;
+                let payload = r.bytes()?;
+                let mut inner = Reader(&payload);
+                let request = Self::read(kind, &mut inner, true, false)?;
+                inner.end()?;
+                Request::Scoped {
+                    root,
+                    request: alloc::boxed::Box::new(request),
+                }
+            }
+            kind::SCOPED => return Err(Error::Malformed), // nested
             _ => return Err(Error::UnknownKind),
         };
-        r.end()?;
         Ok(request)
     }
+}
+
+/// The `tree` flag of `kill`, `suspend` and `resume`: in version 4 only.
+fn tree_flag(w: &mut Writer, v4: bool, tree: bool) -> Result<(), Error> {
+    if v4 {
+        w.u8(tree as u8);
+    } else if tree {
+        return Err(Error::Version);
+    }
+    Ok(())
 }
 
 /// Where a cell is.
@@ -675,6 +1172,23 @@ pub struct CellInfo {
     /// The executable it was started from.
     pub image: Vec<u8>,
     pub state: State,
+    /// Its place in the tree (version 4); `None` for a cell that ended, a
+    /// loaded one not yet resumed, or from a version-3 kernel.
+    pub tree: Option<TreeInfo>,
+}
+
+/// A cell's place in the tree and its policies, in a [`Body::List`]
+/// (version 4).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TreeInfo {
+    /// Its parent (0: it is a root).
+    pub parent: u32,
+    /// The root of its domain (itself for a root; 0 if the host knows no
+    /// such cell).
+    pub root: u32,
+    pub label: Vec<u8>,
+    pub limits: Limits,
+    pub egress: Egress,
 }
 
 /// The kernel's memory and cells.
@@ -721,8 +1235,15 @@ pub enum Message {
 }
 
 impl Message {
-    /// The frame of this message.
+    /// The frame of this message, in the current version.
     pub fn encode(&self, id: u32) -> Vec<u8> {
+        self.encode_as(VERSION, id)
+    }
+
+    /// The frame of this message in `version` ([`PREVIOUS`] leaves out
+    /// what version 4 added; any other is written as the current one).
+    pub fn encode_as(&self, version: u8, id: u32) -> Vec<u8> {
+        let v4 = version != PREVIOUS;
         let mut w = Writer::default();
         let kind = match self {
             Message::Hello { version } => {
@@ -750,6 +1271,17 @@ impl Message {
                         w.u8(4).list(cells, |w, c| {
                             w.u32(c.id).bytes(&c.image);
                             c.state.write(w);
+                            if v4 {
+                                match &c.tree {
+                                    None => {
+                                        w.u8(0);
+                                    }
+                                    Some(t) => {
+                                        w.u8(1).u32(t.parent).u32(t.root).bytes(&t.label);
+                                        w.limits(&t.limits).egress(&t.egress);
+                                    }
+                                }
+                            }
                         });
                     }
                     Body::Stats(s) => {
@@ -779,11 +1311,21 @@ impl Message {
                 kind::ENDED
             }
         };
-        encode_frame(kind, id, &w.0)
+        encode_frame_as(version, kind, id, &w.0)
     }
 
-    /// The message a frame carries.
+    /// The message a frame carries, in its version: a hello or a refusal
+    /// of any version (so that the host can name a kernel it does not
+    /// speak), anything else in [`VERSION`] or [`PREVIOUS`].
     pub fn decode(frame: &Frame) -> Result<Self, Error> {
+        let v4 = frame.version == VERSION;
+        if !v4
+            && frame.version != PREVIOUS
+            && frame.kind != kind::HELLO
+            && frame.kind != kind::FAILED
+        {
+            return Err(Error::Version);
+        }
         let mut r = Reader(&frame.payload);
         let message = match frame.kind {
             kind::HELLO => Message::Hello { version: r.u8()? },
@@ -799,6 +1341,17 @@ impl Message {
                             id: r.u32()?,
                             image: r.bytes()?,
                             state: State::read(r)?,
+                            tree: if v4 && r.flag()? {
+                                Some(TreeInfo {
+                                    parent: r.u32()?,
+                                    root: r.u32()?,
+                                    label: r.bytes()?,
+                                    limits: r.limits()?,
+                                    egress: r.egress()?,
+                                })
+                            } else {
+                                None
+                            },
                         })
                     })?),
                     5 => Body::Stats(Stats {
