@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod acpi;
+pub mod agent;
 pub mod boot;
 pub mod exception;
 pub mod fdt;
