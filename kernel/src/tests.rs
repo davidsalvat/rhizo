@@ -11,6 +11,7 @@ use rhizo_core::ktest_case;
 use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
 
 use rhizo_mm::FRAME_SIZE;
+use rhizo_mm::heap::TRIM_AT;
 use rhizo_mm::paging::PageFlags;
 
 /// Builds a harness self-check: one passing case, then the case the harness
@@ -53,6 +54,7 @@ macro_rules! suite {
             ktest_case!(heap_alignment_is_honored),
             ktest_case!(heap_memory_is_reused),
             ktest_case!(large_heap_allocations_survive_fragmentation),
+            ktest_case!(every_cpu_flushes_between_runs),
             ktest_case!(cell_says_hello),
             ktest_case!(cell_exit_status_and_frames_return),
             ktest_case!(cell_system_calls),
@@ -99,6 +101,7 @@ macro_rules! suite {
             ktest_case!(memory_full_of_cells_is_refused_cleanly),
             ktest_case!(a_woken_cell_runs_at_once),
             ktest_case!(a_wake_before_the_sleep_is_kept),
+            ktest_case!(a_wait_on_descriptors_keeps_no_time),
             ktest_case!(hostile_pointers_get_efault),
             ktest_case!(cell_cannot_write_kernel_memory),
             ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
@@ -460,9 +463,27 @@ fn large_heap_allocations_survive_fragmentation() {
     for phys in kept {
         memory::with_frames(|f| f.free(phys));
     }
-    // Back, but for the window's page tables (made once).
-    let lost = before - memory::free_bytes();
-    assert!(lost <= 2 * FRAME_SIZE, "{lost} bytes not returned");
+    // All back, the window's tables included (change `add-heap-trim`):
+    // those its setup left are freed too, the first time.
+    let free = memory::free_bytes();
+    assert!(free >= before, "{} bytes not returned", before - free);
+}
+
+/// Between host runs, every CPU can be made to flush its translations and
+/// paging-structure caches (what freeing the window's tables waits for,
+/// change `add-heap-trim`); while another CPU runs a job, it cannot.
+fn every_cpu_flushes_between_runs() {
+    assert!(crate::smp::flush_everywhere());
+    if crate::smp::count() > 1 && !crate::arch::user::TLB_FLUSH_IS_BROADCAST {
+        fn spin(rounds: u64) -> u64 {
+            (0..rounds).fold(0, |a, i| core::hint::black_box(a ^ i))
+        }
+        crate::smp::post(1, spin, 1 << 24);
+        let busy = crate::smp::flush_everywhere();
+        crate::smp::join(1);
+        assert!(!busy, "a busy CPU is not asked");
+        assert!(crate::smp::flush_everywhere());
+    }
 }
 
 // --- Self-checks ------------------------------------------------------------
@@ -774,11 +795,11 @@ fn many_cells_in_sequence_stay_isolated() {
         }
     }
     pair();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     for _ in 0..150 {
         pair();
     }
-    assert_eq!(memory::free_bytes(), before);
+    assert_eq!(free_or_in_heap(), before);
 }
 
 // --- Executables kept loaded (change `add-image-cache`) ---------------------
@@ -902,12 +923,12 @@ fn suspend_returns_all_memory() {
         snapshot
     }
     drop(cycle()); // warm the heap up for the host's small allocations
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     let snapshot = cycle();
     assert!(snapshot.heap_bytes() > 8 << 20, "8 MiB of pages captured");
     drop(snapshot);
     assert_eq!(
-        memory::free_bytes(),
+        free_or_in_heap(),
         before,
         "the suspended cell held nothing but its snapshot"
     );
@@ -1047,10 +1068,10 @@ fn children_outlive_their_parent_and_frames_return() {
         }
     }
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
     assert_eq!(
-        memory::free_bytes(),
+        free_or_in_heap(),
         before,
         "every shared frame and table returned"
     );
@@ -1333,16 +1354,19 @@ fn file_data_takes_its_own_size() {
 // --- H9: memory accounting and density -------------------------------------
 
 /// Memory that is not leaked: frames free in the allocator plus frames the
-/// kernel heap holds (it keeps small-object pages for reuse, by design), and
+/// kernel heap holds (it keeps some small-object pages for reuse), and
 /// the heap's live allocations; measured with no image kept loaded (spec
 /// `cells`, image cache: those frames are the kernel's until dropped).
 fn memory_balance() -> (u64, usize) {
     crate::cell::drop_images();
-    let heap = crate::heap::stats();
-    (
-        memory::free_bytes() + heap.pages as u64 * FRAME_SIZE,
-        heap.live,
-    )
+    (free_or_in_heap(), crate::heap::stats().live)
+}
+
+/// Frames free in the allocator plus the frames the kernel heap holds: the
+/// same whenever the heap gives its free pages back (change
+/// `add-heap-trim`), which depends on what ran before.
+fn free_or_in_heap() -> u64 {
+    memory::free_bytes() + crate::heap::stats().pages as u64 * FRAME_SIZE
 }
 
 /// Twenty cells each wanting 8 MiB of memory, or 16 MiB of files, at once:
@@ -1430,6 +1454,14 @@ fn memory_full_of_cells_is_refused_cleanly() {
         "{o:?}"
     );
     assert_eq!(o.leaked_bytes, 0, "{o:?}");
+    // The heap gave back the pages of the cells' kernel records (change
+    // `add-heap-trim`): it keeps at most what its next trim waits for.
+    let spike = o.heap_peak_bytes;
+    assert!(
+        spike > 2 * TRIM_AT as u64,
+        "a spike of {spike} bytes: {o:?}"
+    );
+    assert!(o.heap_kept_bytes <= 2 * TRIM_AT as u64, "{o:?}");
 }
 
 /// A sleeping cell woken by the host (the stand-in for a user's message)
@@ -1469,6 +1501,42 @@ fn a_wake_before_the_sleep_is_kept() {
         }
     }
     assert_eq!(ended(&host, id), (Ending::Exit(0), "ready\nwoken\n".into()));
+}
+
+/// A wait on descriptors with a timeout (an hour in `epoll_pwait`, as
+/// libuv waits for its next timer) is timed out in a cell spawned from a
+/// template frozen during it, and by a wake from the host: the call, made
+/// again, returns at once instead of waiting its whole timeout again
+/// (design D1 of `fast-node-template`; every fork of the Node.js template
+/// waited its 50 ms pause again).
+fn a_wait_on_descriptors_keeps_no_time() {
+    let mut host = Host::new();
+    let waiting = |host: &mut Host| {
+        let id = spawn(host, "sleeper", &[b"3600000", b"epoll"]);
+        while !(host.output(id) == Some(b"ready\n") && host.waits(id)) {
+            host.step();
+        }
+        id
+    };
+    let template = waiting(&mut host);
+    assert!(host.freeze(template));
+    let child = host
+        .spawn_from_template(template, true, false)
+        .expect("fork");
+    let woken = waiting(&mut host);
+    assert!(host.wake(woken));
+    // A slice each: the call made again, `timed out`, the exit.
+    for _ in 0..4 {
+        if host.finished(child).is_none() || host.finished(woken).is_none() {
+            host.step();
+        }
+    }
+    // The fork's output starts after the template's `ready`.
+    assert_eq!(ended(&host, child), (Ending::Exit(0), "timed out\n".into()));
+    assert_eq!(
+        ended(&host, woken),
+        (Ending::Exit(0), "ready\ntimed out\n".into())
+    );
 }
 
 // --- H13: isolation under attack (spec `isolation`) -------------------------
@@ -2483,9 +2551,9 @@ fn spinning_thread_does_not_starve_its_siblings() {
         assert_eq!(host.live(), 0);
     }
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
-    assert_eq!(memory::free_bytes(), before, "every frame returned");
+    assert_eq!(free_or_in_heap(), before, "every frame returned");
 }
 
 /// Scheduling steps until a `chatter` cell ends next to a cell of `n`
@@ -3114,9 +3182,9 @@ fn cells_in_parallel_stay_isolated() {
     // into (as `assert_no_leak` does), so the check does not depend on which
     // tests ran before this one.
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
-    assert_eq!(memory::free_bytes(), before);
+    assert_eq!(free_or_in_heap(), before);
 }
 
 /// `counter` next to spinning cells, run on every CPU twenty slices (of
@@ -3198,11 +3266,11 @@ fn threads_of_a_cell_run_on_several_cpus_at_once() {
 /// every frame comes back.
 fn unmapped_page_is_gone_on_every_cpu() {
     run_expected("shootdown");
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     for _ in 0..4 {
         run_expected("shootdown");
     }
-    assert_eq!(memory::free_bytes(), before, "every frame returned");
+    assert_eq!(free_or_in_heap(), before, "every frame returned");
 }
 
 /// `parsum` computing with 4 threads on every CPU, stopped after each slice

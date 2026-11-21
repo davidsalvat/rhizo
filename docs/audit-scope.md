@@ -52,17 +52,19 @@ to the cell. There is no KASLR and no secrecy about the kernel's layout.
 | B2 | **Cell to cell**: shared frames after fork and template copies, shared page cache, loopback and Unix sockets, the kernel-wide socket and port pools | Another hostile cell | **Untrusted.** |
 | B3 | **Snapshot bytes to kernel**: `Snapshot::from_bytes`, `Fs::decode`, socket records | Whoever wrote the snapshot | **Untrusted by design**, for downloadable templates ([`vision.md`](vision.md)). On `main` no production path reads snapshot bytes from outside the kernel yet: the control kernel keeps snapshots in memory, and only in-kernel tests round-trip bytes. The decoder is built and fuzzed for that future input. |
 | B4 | **Cell files to program loader**: `Host::spawn_file` and `rhizo_abi::exec` start an executable and its `PT_INTERP` interpreter from the cell's own files | A cell that wrote those files | **Untrusted** (ELF headers are hostile). |
-| B5 | **Network packets to `smoltcp` and `rhizo-net`**: TCP, UDP, DHCPv4, Ethernet frames from the virtio-net card | Any host on the network the VM is attached to | **Untrusted.** See note below. |
+| B5 | **Network packets to `smoltcp` and `rhizo-net`**: TCP, UDP, DHCPv4, Ethernet frames from the virtio-net card | Any host on the network the VM is attached to | **Untrusted.** Reviewed and fuzzed (`fuzz-wire-packets`, S22, S23). See note below. |
 | B6 | **virtio device to driver**: virtio-mmio and virtio-pci configuration, BARs, virtqueue rings | The VMM's device model | **Trusted**, reviewed for robustness only (a broken device must not crash the kernel). |
 | B7 | **Host control protocol to control kernel**: frames on the serial line (run, suspend, resume, fork, kill, write file, input, stats, shutdown) | The host's `rhizo` server, and anyone who can write to the VM's serial line or the server's Unix socket | **Trusted host**, but the decoder is treated as an attack surface (never panics, never allocates more than it receives). |
 | B8 | **Kernel to host on the serial line**: replies, cell output in frames, console text | The kernel; cell output travels inside it | Cells are untrusted: their output must never be able to forge a frame the host would act on. |
 | B9 | **VMM, firmware, hardware** | The hypervisor and CPU | **Trusted.** Out of scope. |
 
 Note on B5: [`security.md`](security.md) treats the network *device* as
-trusted and reviewed the sockets against hostile *cells*. The packets that
-the device delivers come from the network, which is not trusted. Remote
-input to `smoltcp` and to `crates/rhizo-net/src/wire.rs` has not been
-reviewed or fuzzed as such; we ask the audit to cover it (section 6).
+trusted, but the frames it delivers come from the network, which is not.
+Since `fuzz-wire-packets` they are a third attacker there, reviewed in
+[Frames from the network](security.md#frames-from-the-network-b5) and
+fuzzed through `Net::poll_wire` with `smoltcp` as the kernel configures
+it (findings S22 and S23). We still ask the audit to look at it (Q11):
+the fuzzer is not coverage-guided and runs on the host.
 
 ## 2. Threat model
 
@@ -137,7 +139,7 @@ only), see section 4.
 | 4 | **Page tables, copy-on-write, frames** (`rhizo-mm`) | B1, B2 | `crates/rhizo-mm/src/{paging,cow,frames,heap,memmap,lib}.rs` | 690 + 374 + 263 + 185 + 135 + 40 = 1,687 | 1,604 | Two entry formats (x86_64, AArch64), shared page tables between forks, 16-bit frame reference counts (S14), 2 MiB pages. Critical findings S1, S2, S12 were here. Mutation-tested weekly. |
 | 5 | **Cell host, SMP, gangs, TLB shootdown** | B1, B2 | `kernel/src/cell.rs` (host part, lines 1 to 2791 of 4,335), `kernel/src/smp.rs`, `kernel/src/arch/{x86_64,aarch64}/smp.rs`, `kernel/src/memory.rs`, `kernel/src/sync.rs`, `crates/rhizo-sched/src/{lib,gangs,idle}.rs`, `crates/rhizo-core/src/sync.rs` | 2,791 + 193 + 346 + 206 + 308 + 79 + 530 + 216 = 4,669 | 668 (sched) + 109 (sync) + in-kernel | Threads of one cell on several CPUs, the cell lock, the x86_64 clean-CPU set and shootdown interrupts, break-before-make on AArch64, freeing a cell from the last CPU to leave it. Races are tested by running them (`racer`), not by a model checker. |
 | 6 | **Snapshot decode and restore** | B3 | `crates/rhizo-snapshot/src/lib.rs`, `crates/rhizo-fs/src/codec.rs`, `crates/rhizo-net/src/record.rs`; restore and lazy resume in `kernel/src/cell.rs` (`Lazy`, `Host::resume`) | 574 + 535 + 239 = 1,348 | 609 (snapshot) | Fully attacker-controlled bytes once templates are downloaded; validates page records, threads, registers, the file tree and socket records. Fuzzed, no finding in D.2. Format version 7 on `main`. |
-| 7 | **Sockets and the TCP/IP stack** (`rhizo-net`, `smoltcp`) | B2, B5 | `crates/rhizo-net/src/{lib,wire}.rs`, `kernel/src/wire.rs`, plus `smoltcp` 0.14 (features `medium-ethernet`, `proto-ipv4`, `socket-tcp`, `socket-udp`, `socket-dhcpv4`) | 1,383 + 525 + 159 = 2,067 (Rhizo) | 1,297 | Shared by all cells: ports, backlogs, buffers, parked connections (S15, S21). Remote packets have not been in a review's threat model (B5). |
+| 7 | **Sockets and the TCP/IP stack** (`rhizo-net`, `smoltcp`) | B2, B5 | `crates/rhizo-net/src/{lib,wire}.rs`, `kernel/src/wire.rs`, plus `smoltcp` 0.14 (features `medium-ethernet`, `proto-ipv4`, `socket-tcp`, `socket-udp`, `socket-dhcpv4`) | 1,389 + 548 + 159 = 2,096 (Rhizo) | 2,378 (with the fuzzer) | Shared by all cells: ports, backlogs, buffers, parked connections (S15, S21). Remote packets reviewed and fuzzed since `fuzz-wire-packets` (B5, S22, S23). |
 | 8 | **In-memory file system** (`rhizo-fs`, outside the codec) | B1, B2 | `crates/rhizo-fs/src/{lib,io}.rs` | 1,222 + 601 = 1,823 | 962 | Per-cell tree, descriptors, pipes, `epoll`, file blocks shared copy-on-write between forks; limits from S5. |
 | 9 | **Control protocol and control kernel** | B7, B8 | `crates/rhizo-control/src/lib.rs`, `kernel/src/control.rs`, UART receive in `kernel/src/arch/{x86_64,aarch64}/console.rs`; host side `cli/src/{serve,client,state}.rs` | 742 + 485 = 1,227 (kernel side); `cli` 1,698 in all | 494 (control) + 274 (cli) | Host is trusted, so the risk is in decoding robustness and in output framing (can a cell make kernel console text contain a frame?). Fuzzed by property tests; reviewed by neither D.1 nor D.2. |
 | 10 | **virtio drivers** | B6 | `crates/rhizo-virtio/src/{lib,pci}.rs` | 481 + 311 = 792 | 839 | Trusted device; robustness only. S17 found by the configuration-space fuzzer. |
@@ -179,8 +181,11 @@ attacker code by definition and out of scope.
   and the network card (against hostile cells), virtio-pci, dynamic linking
   and file mappings, the image cache and 2 MiB pages, the agent workload's
   host calls, snapshots as untrusted input. Findings S14 to S21.
+- **Frames from the network (B5, `fuzz-wire-packets`).** A host on the
+  network against `smoltcp` and the wire glue, with a fuzzer. Findings
+  S22 and S23.
 
-Both are written up in [`security.md`](security.md), with the threat
+All are written up in [`security.md`](security.md), with the threat
 model, a per-call table of checks, each finding's reproduction and fix,
 and the tests that keep it fixed. Its per-call table covers every call
 the kernel decodes, those added since the first review (threads,
@@ -191,7 +196,7 @@ review's area table says how each area was reviewed.
 
 | Status | Findings |
 |---|---|
-| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18 (Medium); S9, S10, S11, S17, S19 (Low). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2). |
+| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S22 (Medium); S9, S10, S11, S17, S19 (Low); S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5). |
 | Accepted until quotas | S20 (Low, file holes mapped without asking memory first), S21 (Medium, kernel-wide pool of 4096 sockets), O1 (no per-cell quota), O2 (call time proportional to what a cell holds). Fix proposed in [PR #61](https://github.com/davidsalvat/rhizo/pull/61), open. |
 | Open | O3 (side channels; no KPTI on x86_64: [PR #63](https://github.com/davidsalvat/rhizo/pull/63), open), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies). See [Known limitations](security.md#known-limitations-and-open-findings). |
 
@@ -212,6 +217,7 @@ kernel binary, and they are not coverage-guided.
 | `any_configuration_space_is_set_up_or_refused` | `rhizo-virtio` | virtio-pci configuration space and BAR sizes |
 | `hostile_headers_never_panic`, `ranges_outside_the_user_half_are_refused` | `rhizo-cell` | ELF headers; user ranges |
 | `any_bytes_never_panic`, `any_payload_never_panics`, `any_input_payload_is_bounded` | `rhizo-control` | Bytes on the control stream, payloads of every kind |
+| `frames_from_the_wire_cannot_hurt_the_kernel`, `dhcp_replies_cannot_hurt_the_kernel` | `rhizo-net` (`src/hostile.rs`) | Valid, changed, cut, replayed and random Ethernet frames and floods next to two cells' sockets; DHCP replies to a card asking for a lease |
 
 Run them:
 
@@ -221,6 +227,7 @@ cargo test -p rhizo-snapshot -- hostile::
 cargo test -p rhizo-virtio -- hostile::
 cargo test -p rhizo-cell -- hostile
 cargo test -p rhizo-control
+cargo test -p rhizo-net -- hostile::
 # More cases and a new seed, as the weekly job does:
 PROPTEST_RNG_SEED=$RANDOM PROPTEST_CASES=4096 cargo test -p rhizo-snapshot -- hostile::
 ```
@@ -257,8 +264,8 @@ on a kernel access to a cell page.
 - Races are found only when an interleaving happens; CI runs QEMU, with
   software emulation where the runner has no KVM, whose memory ordering is stronger than some
   hardware's.
-- Remote network input (B5) and the control protocol (B7, B8) have not had
-  a dedicated review.
+- The control protocol (B7, B8) has not had a dedicated review. Remote
+  network input (B5) has, with a host fuzzer, but no coverage-guided one.
 
 ## 6. Suggested priorities and questions
 
@@ -312,7 +319,10 @@ Ordered by what we most want answered.
   `smoltcp` or `rhizo-net`'s wire glue (`crates/rhizo-net/src/wire.rs`,
   `kernel/src/wire.rs`), for example with SYN floods, out-of-window
   segments, DHCP replies or oversized frames? Is the `smoltcp` 0.14
-  feature set in use free of known issues?
+  feature set in use free of known issues? (Covered internally since
+  `fuzz-wire-packets`: floods were bounded (S22); idle connections (S23)
+  were fixed by `fix-tcp-long-wait`; see [Frames from the network](security.md#frames-from-the-network-b5).
+  An independent look is still wanted.)
 - Q12. Can a cell make the kernel's console text, which shares the serial
   line with the protocol's frames, contain the byte `0x01` and so forge a
   reply or output frame for the host? (Cell output is sent only in frames
@@ -397,7 +407,7 @@ reviewing both architectures. Sizes are from section 3.
 | User memory, address spaces, ELF (rank 3) | 3 | About 1,900 lines; `memory.rs` is short and central, the ELF loader takes hostile input. |
 | Page tables, COW, frames (rank 4) | 3 | About 1,700 lines with subtle invariants in two entry formats; past Critical findings were here, but it is the best tested crate. |
 | Snapshot decode and restore (rank 6) | 3 | About 1,350 lines of decoders plus the restore and lazy-resume paths; fully attacker-controlled input. |
-| Sockets and remote packets (rank 7) | 4 | About 2,100 lines of Rhizo code plus the parts of `smoltcp` in use; remote input was never in a review's threat model. |
+| Sockets and remote packets (rank 7) | 4 | About 2,100 lines of Rhizo code plus the parts of `smoltcp` in use; remote input has had one internal review and a host fuzzer (`fuzz-wire-packets`). |
 | File system (rank 8) | 1.5 | About 1,800 lines, no `unsafe`, fuzzed through decoded file systems. |
 | Control protocol and host framing (rank 9) | 1.5 | About 1,200 lines on the kernel side; trusted peer, so mostly decoder robustness and Q12. |
 | virtio and boot-time parsing (ranks 10, 11) | 1 | Trusted inputs; robustness only. |

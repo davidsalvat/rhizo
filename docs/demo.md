@@ -119,7 +119,11 @@ rhizo down
 CPython with `cells/python/agent_chat.py`, which keeps the whole
 conversation in the cell and gives the model four tools that run inside
 it: a Python snippet (its output capped at 4000 characters, stopped after
-10 s), read a file, write a file, list a directory. Type a message, read
+10 s; as in the Python REPL, a last line that is an expression shows its
+value), read a file, write a file, list a directory. A call the model
+writes into its text instead of making it (`{"name": "run_python",
+"arguments": {...}}`, as small Qwen models sometimes do) runs as a call.
+Type a message, read
 the answer, type the next; after each answer `rhizo` prints the turn's
 time, the model's apart from Rhizo's.
 
@@ -169,7 +173,7 @@ Inside a chat:
 
 | Type | What happens |
 |---|---|
-| a message | It goes to the agent's standard input; its answer, and each tool call with its result, is shown whole, then the time split |
+| a message | It goes to the agent's standard input; its answer, and each tool call with its result, is shown whole, then the time split. A message typed while a turn runs waits for it (`[rhizo] queued for the next turn`) |
 | `/fork K` | Forks the conversation into `K` new cells sharing its memory and history copy-on-write; you stay on the current one |
 | `/branches` | The branches this session knows (the first cell and those it forked or switched to), with their states |
 | `/switch N` | Talk to cell `N` from now on (resumed first if suspended) |

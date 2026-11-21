@@ -261,6 +261,12 @@ fn parse_server(
         ),
         ("density.wasted_wakeups_pct", "%", wasted),
         ("density.oom_cells", "cells", oom["cells"] as f64),
+        (
+            "density.oom_heap_kept_bytes",
+            "bytes",
+            *oom.get("heap_kept_bytes")
+                .ok_or("no `heap_kept_bytes` in the out-of-memory line")? as f64,
+        ),
     ])
 }
 
@@ -393,7 +399,8 @@ mod tests {
         let out = run(
             &format!(
                 "{SERVER}rhizo-oom cells=25000 spawn_refused=1 fork_refused=1 \
-                 resume_refused=1 hog_enomem=1 leaked_bytes=0\n"
+                 resume_refused=1 hog_enomem=1 leaked_bytes=0 heap_peak_bytes=9000000 \
+                 heap_kept_bytes=8192\n"
             ),
             vec![],
         );
@@ -405,6 +412,7 @@ mod tests {
         assert_eq!(get("density.sched_p999_us"), Some(400.0));
         assert_eq!(get("density.syscall_p99_ns"), Some(5000.0));
         assert_eq!(get("density.oom_cells"), Some(25000.0));
+        assert_eq!(get("density.oom_heap_kept_bytes"), Some(8192.0));
         assert_eq!(get("density.wasted_wakeups_pct"), Some(25.0));
     }
 

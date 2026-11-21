@@ -183,6 +183,36 @@ pub fn post(cpu: usize, f: fn(u64) -> u64, arg: u64) {
     wake(cpu);
 }
 
+/// Flushes every CPU's translations and paging-structure caches
+/// (`cpu::flush_all`) and returns `true`, or returns `false` without doing
+/// anything when a secondary CPU is busy (a host run is going on) or this
+/// is not the boot CPU, which alone posts work. Where invalidations are
+/// broadcast, this CPU's flush is enough.
+pub fn flush_everywhere() -> bool {
+    fn flush(_: u64) -> u64 {
+        arch::cpu::flush_all();
+        0
+    }
+    let others = 1..count();
+    if !arch::user::TLB_FLUSH_IS_BROADCAST && !others.is_empty() {
+        if arch::cpu::index() != 0
+            || others
+                .clone()
+                .any(|c| MAIL[c].job.load(Ordering::Acquire) != 0)
+        {
+            return false;
+        }
+        for cpu in others.clone() {
+            post(cpu, flush, 0);
+        }
+        for cpu in others {
+            join(cpu);
+        }
+    }
+    arch::cpu::flush_all();
+    true
+}
+
 /// Waits until CPU `cpu` has run what [`post`] gave it; returns the result.
 pub fn join(cpu: usize) -> u64 {
     let mail = &MAIL[cpu];
