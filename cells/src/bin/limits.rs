@@ -2,7 +2,8 @@
 //! suspends it there. Then makes Unix sockets until refused, closes them,
 //! opens `.` until refused, and prints what it got and why it stopped:
 //! `nofile L sockets N errno E files M errno F` (spec `isolation`,
-//! quotas). Run only with quotas (without, it would open 1021 of each).
+//! quotas). Without a quota set by the host: 256 sockets (the default), and
+//! 1021 files.
 #![no_std]
 #![no_main]
 

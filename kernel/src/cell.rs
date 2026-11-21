@@ -212,6 +212,12 @@ const KEPT_IMAGES: usize = 4;
 /// reserve) and given back before any cell is refused memory (D4).
 static IMAGES: Global<Images<KEPT_IMAGES>> = Global::new(Images::new());
 
+// A new cell's file tables start with its default socket quota (so making
+// a live cell copies no tables), and with the server ends of its own
+// connections it holds at most an eighth of the kernel's sockets (S21).
+const _: () = assert!(rhizo_cell::quota::SOCKETS_DEFAULT as usize == rhizo_fs::SOCKETS_DEFAULT);
+const _: () = assert!(2 * rhizo_fs::SOCKETS_DEFAULT <= rhizo_net::SOCKETS_MAX / 8);
+
 /// Most file pages kept (design D1 of `add-dynamic-linking`): 64 MiB.
 const KEPT_PAGES: usize = 16384;
 
@@ -226,7 +232,15 @@ static PAGES: Global<PageCache> = Global::new(PageCache::new(KEPT_PAGES));
 struct KernelPages;
 
 impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
-    fn frame(&mut self, page: &rhizo_fs::Page, _: &mut DirectMap, _: &mut A) -> Option<u64> {
+    fn frame(&mut self, page: &rhizo_fs::Page, mem: &mut DirectMap, frames: &mut A) -> Option<u64> {
+        if page.key().is_none() {
+            // A hole or a page past the end is the cell's alone, never kept:
+            // it comes from the cell's frames, counted in its memory quota
+            // like anonymous memory (finding S20).
+            let phys = frames.alloc()?;
+            rhizo_hal::PhysicalMemory::zero_frame(mem, phys);
+            return Some(phys);
+        }
         // Short of frames, what is kept goes first (outside the lock).
         let get = || PAGES.with(|pages| pages.get(page, &mut DirectMap, &mut ImageFrames));
         let (phys, fresh) = get().or_else(|| drop_images().then(get).flatten())?;

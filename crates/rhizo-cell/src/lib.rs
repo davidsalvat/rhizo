@@ -123,7 +123,7 @@ impl Cell {
             brk: brk_start,
             mmap_next: MMAP_BASE,
             exit_status: None,
-            quota: Quota::NONE,
+            quota: Quota::DEFAULT,
             cpu_ns: 0,
         }
     }

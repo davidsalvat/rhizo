@@ -107,6 +107,7 @@ macro_rules! suite {
             ktest_case!(memory_quota_refuses_the_cell_not_the_others),
             ktest_case!(cpu_quota_ends_the_cell),
             ktest_case!(file_and_socket_quotas_travel_with_the_cell),
+            ktest_case!(a_cell_holds_a_bounded_share_of_sockets),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
             ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
             ktest_case!(hardware_entropy_works_where_present),
@@ -1518,11 +1519,18 @@ fn shared_read_only_pages_stay_shared_after_mprotect() {
 /// it, and keeps running; a cell without one, next to it, still gets the
 /// memory it asks for; every frame comes back.
 fn memory_quota_refuses_the_cell_not_the_others() {
+    // Anonymous memory, then pages of a file past its end (finding S20).
+    for args in [&[][..], &[&b"file"[..]]] {
+        quota_refuses_the_hog(args);
+    }
+}
+
+fn quota_refuses_the_hog(args: &[&[u8]]) {
     use rhizo_cell::quota::Quota;
     const QUOTA: u64 = 8 << 20;
     let before = memory_balance();
     let mut host = Host::new();
-    let hog = spawn(&mut host, "hog", &[]);
+    let hog = spawn(&mut host, "hog", args);
     let quota = Quota {
         memory: QUOTA,
         ..Quota::NONE
@@ -1616,6 +1624,28 @@ fn file_and_socket_quotas_travel_with_the_cell() {
         assert_eq!(ending, Ending::Exit(0), "{out}");
         assert!(
             out.ends_with("nofile 16 sockets 3 errno 23 files 13 errno 24\n"),
+            "{out}"
+        );
+    }
+}
+
+/// Finding S21: without a quota from the host, a cell and its fork stop at
+/// the default socket quota (256, `ENFILE`), far below the kernel's 4096;
+/// descriptors are not limited beyond the kernel's own.
+fn a_cell_holds_a_bounded_share_of_sockets() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "limits", &[]);
+    while host.output(id) != Some(b"ready\n") {
+        host.step();
+    }
+    let mut ids = alloc::vec![id];
+    ids.extend(host.fork(id, 1).expect("fork"));
+    host.run(|_| false);
+    for id in ids {
+        let (ending, out) = ended(&host, id);
+        assert_eq!(ending, Ending::Exit(0), "{out}");
+        assert!(
+            out.ends_with("nofile 1024 sockets 256 errno 23 files 1021 errno 24\n"),
             "{out}"
         );
     }

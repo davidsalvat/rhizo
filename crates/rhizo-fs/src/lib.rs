@@ -37,6 +37,9 @@ pub const BLOCK: usize = 4096;
 pub const NAME_MAX: usize = 255;
 /// Most descriptors a cell may have open.
 pub const FD_MAX: usize = 1024;
+/// Sockets a cell may hold until the kernel sets its quota
+/// (`rhizo_cell::quota::SOCKETS_DEFAULT`, finding S21).
+pub const SOCKETS_DEFAULT: usize = 256;
 /// Most file data a cell may hold, and the largest file size (bytes).
 pub const DATA_MAX: u64 = 64 << 20;
 /// Most files and directories a cell may have (the root included): bounds
@@ -344,7 +347,7 @@ impl Tables {
             objects: Vec::new(),
             released: Vec::new(),
             fd_limit: FD_MAX,
-            socket_limit: u32::MAX as usize,
+            socket_limit: SOCKETS_DEFAULT,
         }
     }
 
@@ -357,7 +360,7 @@ impl Tables {
     }
 
     /// The limits [`set_limits`](Self::set_limits) set: descriptors and
-    /// sockets ([`FD_MAX`] and `u32::MAX` until set).
+    /// sockets ([`FD_MAX`] and [`SOCKETS_DEFAULT`] until set).
     pub fn limits(&self) -> (usize, usize) {
         (self.fd_limit, self.socket_limit)
     }

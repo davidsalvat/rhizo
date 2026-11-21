@@ -11,6 +11,12 @@ use rhizo_mm::paging::PageSize;
 /// Most descriptors any cell may have open (`rhizo_fs::FD_MAX`).
 pub const FILES_MAX: u32 = 1024;
 
+/// Sockets a cell may hold unless the host sets another quota
+/// (`rhizo_fs::SOCKETS_DEFAULT`, finding S21): with the server ends of its
+/// own connections, which the kernel makes at `connect`, a cell holds at
+/// most 512 of the kernel's 4096 sockets.
+pub const SOCKETS_DEFAULT: u32 = 256;
+
 /// What a cell may use. Hitting a limit fails the call that needed more
 /// (`ENOMEM`, `EMFILE`, `ENFILE`), except CPU time, which ends the cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +54,19 @@ impl Quota {
     }
 }
 
+impl Quota {
+    /// What a new cell may use: [`NONE`](Self::NONE), but at most
+    /// [`SOCKETS_DEFAULT`] sockets, so no cell holds a large share of the
+    /// kernel's.
+    pub const DEFAULT: Self = Self {
+        sockets: SOCKETS_DEFAULT,
+        ..Self::NONE
+    };
+}
+
 impl Default for Quota {
     fn default() -> Self {
-        Self::NONE
+        Self::DEFAULT
     }
 }
 
@@ -179,10 +195,22 @@ mod tests {
 
     #[test]
     fn no_quota_is_the_kernels_limits() {
-        let q = Quota::default();
-        assert_eq!(q, Quota::NONE);
+        let q = Quota::NONE;
         assert_eq!(q.files(), FILES_MAX);
         assert_eq!(Quota { files: 5000, ..q }.files(), FILES_MAX);
         assert_eq!(Quota { memory: 8191, ..q }.frames(), 1);
+    }
+
+    #[test]
+    fn a_new_cell_holds_a_bounded_share_of_sockets() {
+        let cell = crate::Cell::new(1, 0, 0, 0, 0);
+        assert_eq!(cell.quota, Quota::default());
+        assert_eq!(
+            cell.quota,
+            Quota {
+                sockets: SOCKETS_DEFAULT,
+                ..Quota::NONE
+            }
+        );
     }
 }
