@@ -1276,12 +1276,36 @@ fn memory_balance() -> (u64, usize) {
     )
 }
 
-/// Twenty cells each wanting an eighth of free memory, as memory or as
-/// files, at once: more than memory holds, whatever the VM's size. Some are
-/// refused (`FAIL` from their own checks, or a fault), the rest finish, the
-/// kernel keeps running, and nothing leaks: every frame is back in the
-/// allocator or in the heap, and every heap allocation is freed.
+/// Free memory the tests that fill memory leave themselves: what a small
+/// VM has. Their work grows with free memory; the test VMs are large for
+/// the packages cell (design D4 of `add-pip-packages`).
+const SMALL_VM_FREE: u64 = 96 << 20;
+
+/// Runs `test` with only `bytes` of memory free, the frames beyond held
+/// meanwhile, then gives them back.
+fn with_free_memory(bytes: u64, test: impl FnOnce()) {
+    crate::cell::drop_images();
+    let mut held = Vec::new();
+    while memory::free_bytes() > bytes {
+        let frame = memory::with_frames(|f| f.alloc()).flatten();
+        held.push(frame.expect("a free frame"));
+    }
+    test();
+    for frame in held {
+        memory::with_frames(|f| f.free(frame));
+    }
+}
+
+/// Twenty cells each wanting 16 MiB of memory, or 16 MiB of files, at once,
+/// with [`SMALL_VM_FREE`] free: more than memory holds. Some are refused
+/// (`FAIL` from their own checks, or a fault), the rest finish, the kernel
+/// keeps running, and nothing leaks: every frame is back in the allocator
+/// or in the heap, and every heap allocation is freed.
 fn memory_pressure_fails_cells_not_the_kernel() {
+    with_free_memory(SMALL_VM_FREE, memory_pressure);
+}
+
+fn memory_pressure() {
     fn flood(name: &str, args: &[&[u8]]) -> (usize, usize) {
         let mut host = Host::new();
         let ids: Vec<u32> = (0..20).map(|_| spawn(&mut host, name, args)).collect();
@@ -1297,11 +1321,12 @@ fn memory_pressure_fails_cells_not_the_kernel() {
         }
         (done, refused)
     }
-    // 2.5 times what memory holds: more even when, on several CPUs, some
-    // cells end before others start.
-    let mib = alloc::format!("{}", (memory::free_bytes() >> 20) / 8 + 1);
-    let mib = mib.as_bytes();
-    for (name, args) in [("ballast", &[&b"all"[..], mib][..]), ("filer", &[mib][..])] {
+    for (name, args) in [
+        // 16 MiB each: more than memory holds even when, on several
+        // CPUs, some cells end before others start.
+        ("ballast", &[&b"all"[..], b"16"][..]),
+        ("filer", &[&b"16"[..]][..]),
+    ] {
         let before = memory_balance();
         let (done, refused) = flood(name, args);
         assert!(
@@ -1349,11 +1374,13 @@ fn a_thousand_idle_cells() {
 }
 
 /// Idle cells forked until memory runs out (spec `benchmarks`, server
-/// workload): the kernel refuses the next spawn, fork and eager resume, a
-/// cell asking for memory gets `ENOMEM`, nothing panics, and every byte
-/// comes back.
+/// workload), from [`SMALL_VM_FREE`] free: the kernel refuses the next
+/// spawn, fork and eager resume, a cell asking for memory gets `ENOMEM`,
+/// nothing panics, and every byte comes back.
 fn memory_full_of_cells_is_refused_cleanly() {
-    let o = crate::workloads::fill_memory();
+    let mut o = None;
+    with_free_memory(SMALL_VM_FREE, || o = Some(crate::workloads::fill_memory()));
+    let o = o.expect("filled");
     assert!(o.cells > 1000, "{o:?}");
     assert!(
         o.spawn_refused && o.fork_refused && o.resume_refused && o.hog_enomem,

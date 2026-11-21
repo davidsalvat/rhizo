@@ -129,9 +129,12 @@ q35) grow from 128 MiB to 1 GiB, and the cell benchmark VM from 256 MiB
 to 512 MiB; the boot check, the self-checks and the boot benchmarks keep
 128 MiB. A larger guest does not change what the cell benchmarks measure
 (no metric depends on free memory; the 50 MiB fork benchmark is the one
-that needed the room). The memory pressure test asked twenty cells for
-16 MiB each, more than a 128 MiB VM holds; it now asks each for an
-eighth of the free memory, so that twenty want more than any VM holds.
+that needed the room). Two tests fill memory: the memory pressure test
+(twenty cells of 16 MiB, more than a 128 MiB VM holds) and the one that
+forks idle cells until memory runs out, whose time grows with free
+memory (eight times as long in 1 GiB: too long for emulated AArch64 on 4
+CPUs). Both now hold the frames beyond 96 MiB while they run, as on the
+small VM they were written for, and give them back.
 Mapping the embedded bytes directly (no decoded copy), and snapshots that
 refer to file pages by content instead of copying them, would save most
 of this; both are left for later.
