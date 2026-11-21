@@ -30,6 +30,7 @@ mod density;
 mod dynamic;
 mod files;
 mod fork;
+mod hierarchy;
 mod images;
 mod isolation;
 mod jit;
@@ -69,6 +70,7 @@ const AREAS: &[&[TestCase]] = &[
     isolation::ALL,
     quotas::ALL,
     leaks::ALL,
+    hierarchy::ALL,
     micropython::ALL,
     net::ALL,
     cpython::ALL,

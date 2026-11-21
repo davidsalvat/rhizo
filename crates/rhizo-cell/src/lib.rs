@@ -98,6 +98,13 @@ pub struct Registers {
 pub struct Cell {
     /// Identifier, unique while the cell exists.
     pub id: u32,
+    /// Its number in its domain, what `getpid` returns (spec `linux-abi`,
+    /// identifiers per domain): never another domain's business.
+    pub pid: u32,
+    /// Its domain (`rhizo_cap::Node::domain`): what kernel state shared
+    /// between cells is keyed by, never 0 for a cell of the kernel's tree
+    /// (0: no domain, as for cells outside one in host tests).
+    pub domain: u32,
     /// Physical address of the cell's root page table.
     pub root: u64,
     /// Its threads (spec `threads`).
@@ -139,6 +146,8 @@ impl Cell {
         };
         Self {
             id,
+            pid: id,
+            domain: 0,
             root,
             threads: Threads::new(Thread::new(id, regs)),
             brk_start,
@@ -150,6 +159,15 @@ impl Cell {
             generation: 0,
             exposed: false,
         }
+    }
+
+    /// Gives a cell that has not run its number in its domain, and its only
+    /// thread the same identifier, as thread identifiers derive from the
+    /// cell's. A cell that ran keeps its threads' identifiers, which its
+    /// program may have kept: set [`pid`](Self::pid) alone.
+    pub fn renumber(&mut self, pid: u32) {
+        self.threads.renumber(pid);
+        self.pid = pid;
     }
 
     /// Counts `ns` more CPU time; returns whether the cell is still within

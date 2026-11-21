@@ -44,6 +44,9 @@ const OUTPUT_EVERY_NS: u64 = 10_000_000;
 const FRAME_GAP_NS: u64 = 1_000_000_000;
 /// Most output kept for a cell nobody watches (as a cell's own capture).
 const KEPT_OUTPUT: usize = 1 << 20;
+/// Longest the kernel waits, before the power off, for its last frames
+/// to leave (`link::finish`).
+const FINISH_NS: u64 = 1_000_000_000;
 /// Most cells one fork makes.
 const MAX_FORK: u32 = 1024;
 
@@ -107,6 +110,13 @@ mod link {
             serial::write(bytes);
         }
     }
+
+    /// Sends what is still queued for the host before the power off,
+    /// waiting at most [`FINISH_NS`](super::FINISH_NS): a frame queued on
+    /// the vsock connection, or in the device, would be lost with the VM.
+    pub fn finish() {
+        vsock::finish(crate::cell::now_ns() + super::FINISH_NS);
+    }
 }
 
 /// A request's outcome.
@@ -140,6 +150,8 @@ pub fn serve() {
         let busy = !server.items.is_empty();
         for item in core::mem::take(&mut server.items) {
             if server.handle(item) {
+                // The reply to the power off goes out before the VM does.
+                link::finish();
                 return;
             }
         }
@@ -331,7 +343,10 @@ impl Server {
                         self.host.kill(cell);
                         self.reap();
                     }
-                    Place::Suspended(snapshot) => cell::close_parked(&snapshot),
+                    Place::Suspended(snapshot) => {
+                        cell::close_parked(&snapshot);
+                        self.host.drop_snapshot(&snapshot);
+                    }
                     Place::Template(template) => {
                         self.host.drop_template(template);
                     }
@@ -572,6 +587,10 @@ impl Server {
             };
             keep(&mut entry.out, &finished.output);
             if finished.ending != Ending::Suspended {
+                // A suspended cell ends when its parent's end cascades.
+                if let Place::Suspended(snapshot) = &entry.place {
+                    cell::close_parked(snapshot);
+                }
                 entry.place = Place::Ended(match finished.ending {
                     Ending::Exit(code) => State::Exited(code),
                     Ending::Fault => State::Fault,

@@ -99,6 +99,14 @@ impl Threads {
         }
     }
 
+    /// Gives the only thread of a table (a cell that has not run) the
+    /// identifier `tid`; the next thread gets the one after it.
+    pub fn renumber(&mut self, tid: u32) {
+        debug_assert!(self.others.is_empty(), "a cell that has not run");
+        self.current.tid = tid;
+        self.next_tid = tid.saturating_add(1);
+    }
+
     /// Rebuilds a table from its parts, the current thread first (a
     /// snapshot); `None` if `threads` is empty.
     pub fn from_parts(threads: Vec<Thread>, next_tid: u32) -> Option<Self> {

@@ -790,6 +790,14 @@ handles or quota by it.
   or wherever the host names. All copies are made or none. Copies placed
   in another domain share no private frame with the source: they are full
   copies, unless the source is a published template (D21).
+- A sibling of a root is a root, so **every copy of a root is the root of
+  a new domain**: a host fork of a root, or a copy of a root template,
+  shares no private frame with its source unless the source is published.
+  Today's copy-on-write forks of roots (the `cell.fork_us` path, the
+  density loads) keep sharing only within one domain: the content-sharing
+  work (tasks 1.8 and 1.8a) either places such copies under a common root,
+  publishes their source, or pays for the full copy, and says which in
+  its benchmarks.
 - Every copy gets a new copy generation, its `MADV_WIPEONFORK` ranges
   read as zero, and its `getpid` differs from the source's (D22).
 - Accelerator handles are not inherited; open sessions are forked by the

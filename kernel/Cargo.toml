@@ -61,6 +61,7 @@ rhizo-net = { path = "../crates/rhizo-net" }
 rhizo-virtio = { path = "../crates/rhizo-virtio" }
 rhizo-control = { path = "../crates/rhizo-control" }
 rhizo-prof = { path = "../crates/rhizo-prof" }
+rhizo-cap = { path = "../crates/rhizo-cap" }
 
 [lints]
 workspace = true

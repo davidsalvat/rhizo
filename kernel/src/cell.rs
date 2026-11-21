@@ -59,6 +59,7 @@ mod slice;
 mod snapshot;
 mod sockets;
 mod transfer;
+mod tree;
 
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub use agent::*;

@@ -505,6 +505,52 @@ fn sysinfo_shows_only_the_cell_itself() {
     assert_eq!(w.peek(DATA + 32, 8), (1u64 << 30).to_le_bytes());
 }
 
+/// Spec `linux-abi`, "Memory of a limited cell" (task 1.7 of
+/// `add-cell-hierarchy`): a cell with a 64 MiB limit that took 10 MiB reads
+/// 64 MiB total and 54 MiB free, while another domain takes frames from the
+/// same allocator and gives them back.
+#[test]
+fn sysinfo_per_cell() {
+    use rhizo_mm::cow::Frames;
+    let mut w = World::new(Arch::X86_64);
+    w.services.memory = 1 << 30;
+    w.frames.metered = Some((10 << 8, 64 << 8));
+    let read = |w: &mut World| {
+        assert_eq!(w.call(99, &[DATA]).0, 0);
+        let info = w.peek(DATA, 112);
+        let word = |at: usize| u64::from_le_bytes(info[at..at + 8].try_into().unwrap());
+        (word(32), word(40))
+    };
+    assert_eq!(read(&mut w), (64 << 20, 54 << 20));
+    let taken: Vec<u64> = (0..4096).map(|_| w.frames.alloc().unwrap()).collect();
+    assert_eq!(
+        read(&mut w),
+        (64 << 20, 54 << 20),
+        "while another domain holds 16 MiB"
+    );
+    for phys in taken {
+        w.frames.free(phys, rhizo_mm::paging::PageSize::Small);
+    }
+    assert_eq!(read(&mut w), (64 << 20, 54 << 20), "once it gave them back");
+}
+
+/// Spec `linux-abi`, "Identifiers per domain": `getpid` is the cell's
+/// number in its domain, not the kernel's identifier, and calls naming a
+/// process take that number.
+#[test]
+fn identifiers_come_from_the_domain() {
+    let mut w = World::new(Arch::Aarch64);
+    w.cell.id = 4711;
+    w.cell.pid = 3;
+    assert_eq!(w.call(172, &[]).0, 3, "getpid");
+    assert_eq!(w.call(121, &[3, DATA]).0, 0, "sched_getparam of itself");
+    assert_eq!(
+        w.call(121, &[4711, DATA]).0,
+        -ESRCH,
+        "the kernel's identifier names nothing"
+    );
+}
+
 /// The calls Node.js makes at start-up and under load (spec `linux-abi`,
 /// change `add-node-workload`), with the AArch64 numbers and the x86_64
 /// ones.

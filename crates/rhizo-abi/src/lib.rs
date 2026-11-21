@@ -600,7 +600,7 @@ impl Abi {
             Some(Sys::Brk) => brk(cell, cx, a[0]),
             Some(Sys::Mmap) => mmap(cell, cx, a),
             Some(Sys::Munmap) => munmap(cx, a[0], a[1]),
-            Some(Sys::Getpid) => cell.id as i64,
+            Some(Sys::Getpid) => cell.pid as i64,
             Some(Sys::Gettid) => cell.threads.current().tid as i64,
             Some(Sys::SetTidAddress) => {
                 let thread = cell.threads.current_mut();
@@ -1309,7 +1309,7 @@ fn sched_policy<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     param: Option<u64>,
 ) -> i64 {
     let known =
-        |id: u64| id == u64::from(cell.id) || cell.threads.iter().any(|t| u64::from(t.tid) == id);
+        |id: u64| id == u64::from(cell.pid) || cell.threads.iter().any(|t| u64::from(t.tid) == id);
     match param {
         _ if (pid as i64) < 0 => -EINVAL,
         _ if pid != 0 && !known(pid) => -ESRCH,
