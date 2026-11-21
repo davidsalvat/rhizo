@@ -22,13 +22,13 @@ const TRAP_STACK_SIZE: usize = 16 * 1024;
 /// Page alignment around the entry code in builds that run cells, where
 /// KPTI maps those pages for cells (design D2 of `add-kpti`); nothing in
 /// the boot-only build, whose image stays as small as it was.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 macro_rules! entry_page {
     () => {
         ".balign 4096"
     };
 }
-#[cfg(not(any(feature = "ktest", feature = "bench-cell")))]
+#[cfg(not(feature = "cells"))]
 macro_rules! entry_page {
     () => {
         ""
@@ -53,11 +53,8 @@ struct TaskStateSegment {
 
 /// Page-aligned, whole pages: with KPTI the cells' tables map it (the CPU
 /// pushes there on an exception from a cell) and nothing else beside it.
-#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(C, align(4096)))]
-#[cfg_attr(
-    not(any(feature = "ktest", feature = "bench-cell")),
-    repr(C, align(16))
-)]
+#[cfg_attr(feature = "cells", repr(C, align(4096)))]
+#[cfg_attr(not(feature = "cells"), repr(C, align(16)))]
 struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
 /// The boot CPU's stacks (the other CPUs' are mapped by `smp`).
@@ -89,7 +86,7 @@ struct Tables {
 /// tables map them (the CPU reads them on an exception from a cell, and
 /// `IRETQ` reads the GDT).
 #[repr(C)]
-#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(align(4096)))]
+#[cfg_attr(feature = "cells", repr(align(4096)))]
 struct AllTables([Global<Tables>; MAX_CPUS]);
 
 static TABLES: AllTables = AllTables(
@@ -142,7 +139,7 @@ pub struct PerCpu {
 /// Every CPU's per-CPU data, alone on its pages: with KPTI the cells'
 /// tables map them (the entry code reads them before switching tables).
 #[repr(C)]
-#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(align(4096)))]
+#[cfg_attr(feature = "cells", repr(align(4096)))]
 pub(super) struct AllPerCpu(pub(super) [PerCpu; MAX_CPUS]);
 
 /// Per-CPU data of every CPU, by number.
@@ -165,14 +162,14 @@ pub(super) static PERCPU: AllPerCpu = AllPerCpu(
 
 impl PerCpu {
     /// Sets the CR3 the entry code loads on entry from a cell (0: none).
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     pub(super) fn set_kernel_cr3(&self, cr3: u64) {
         self.kernel_cr3
             .store(cr3, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Sets the CR3 loaded just before returning to a cell (0: none).
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     pub(super) fn set_user_cr3(&self, cr3: u64) {
         self.user_cr3
             .store(cr3, core::sync::atomic::Ordering::Relaxed);
@@ -310,7 +307,7 @@ impl IdtEntry {
 
 /// The IDT, alone on its pages (with KPTI the cells' tables map it).
 #[repr(C)]
-#[cfg_attr(any(feature = "ktest", feature = "bench-cell"), repr(align(4096)))]
+#[cfg_attr(feature = "cells", repr(align(4096)))]
 struct Idt(Global<[IdtEntry; 256]>);
 
 static IDT: Idt = Idt(Global::new([IdtEntry::MISSING; 256]));
@@ -462,7 +459,7 @@ pub fn init() {
 /// What cells' tables map of the kernel with KPTI, besides the other CPUs'
 /// stacks: `(start, end, code)` virtual ranges, each on whole pages of its
 /// own (design D2 of `add-kpti`).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub(super) fn entry_ranges() -> [(u64, u64, bool); 7] {
     unsafe extern "C" {
         static rhizo_entry_a_start: u8;
@@ -671,6 +668,10 @@ rhizo_syscall_entry:
     // RIP, CS, RFLAGS, RSP, SS (pushed by the stub and the CPU).
 rhizo_user_trap:
     swapgs
+    push 2                          // RFLAGS: only the reserved bit. The
+    popfq                           // cell's DF and AC (set by POPF in ring
+                                    // 3; an interrupt gate keeps them) must
+                                    // not reach Rust code or lift SMAP
     push rax
     mov rax, gs:[40]                // KPTI: the kernel's CR3
     test rax, rax

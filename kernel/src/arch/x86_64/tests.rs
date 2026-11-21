@@ -7,6 +7,7 @@ use rhizo_core::ktest_case;
 pub static ALL: &[TestCase] = &[
     ktest_case!(pvh_start_info_is_valid),
     ktest_case!(kpti_leaves_cells_only_the_entry_pages),
+    ktest_case!(user_guards_are_on),
 ];
 
 /// With KPTI (on for every in-kernel test), the kernel half of a cell's
@@ -46,6 +47,18 @@ fn kpti_leaves_cells_only_the_entry_pages() {
         ("kernel data", &PROBE as *const AtomicU64 as u64),
     ] {
         assert!(!mapped(virt), "{what} ({virt:#x}) is mapped for cells");
+    }
+}
+
+/// SMEP and SMAP are on wherever the CPU has them (QEMU's `max` CPU has
+/// both); the self-checks `ktest-user-read` and `ktest-user-exec` show them
+/// at work.
+fn user_guards_are_on() {
+    let guards = super::user::user_guards();
+    assert_eq!(super::user::user_guards_on(), guards);
+    if guards != 0b11 << 20 {
+        use rhizo_hal::Console;
+        super::console::BootConsole.write_bytes(b"(SMEP or SMAP missing on this CPU) ");
     }
 }
 
