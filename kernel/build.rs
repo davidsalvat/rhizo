@@ -1,24 +1,26 @@
 use std::path::Path;
 
 /// Cells built only when their source is given, or by `xtask` only.
-const OPTIONAL: [&str; 6] = [
+const OPTIONAL: [&str; 7] = [
     "micropython",
     "cpython",
     "cpython-files",
     "dynamic-files",
     "distro-files",
+    "packages-files",
     "node-files",
 ];
 /// Cells embedded in test kernels only (`ktest`): elsewhere they read as
 /// not built, and take no memory from the cells a benchmark runs (its guest
 /// has 128 MiB, and the 50 MiB fork benchmark needs most of it). The C
 /// cells here are those no benchmark runs.
-const TEST_ONLY: [&str; 8] = [
+const TEST_ONLY: [&str; 9] = [
     "distro-files",
     "libc_alloc",
     "libc_deep_stack",
     "libc_files",
     "libc_float",
+    "libc_hwcap",
     "libc_hello",
     "libc_net",
     "libc_threads",
@@ -89,10 +91,13 @@ fn embed_cells() {
     // Node.js (over 100 MiB) only in the kernels built to run it, whose VMs
     // get the memory it needs (change `add-node-workload`).
     let node = std::env::var_os("CARGO_FEATURE_NODE").is_some();
+    // The packages' CPython (65 MiB) likewise (change `add-pip-packages`).
+    let packages = std::env::var_os("CARGO_FEATURE_PACKAGES").is_some();
     for name in &names {
         let data = match &from {
             Some(_) if TEST_ONLY.contains(&name.as_str()) && !ktest => Vec::new(),
             Some(_) if name == "node-files" && !node => Vec::new(),
+            Some(_) if name == "packages-files" && !packages => Vec::new(),
             Some(dir) => {
                 let path = Path::new(dir).join(name);
                 match std::fs::read(&path) {
