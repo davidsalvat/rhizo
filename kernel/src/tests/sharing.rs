@@ -37,7 +37,12 @@ fn mapper(host: &mut Host, files: &rhizo_fs::Fs, path: &str, pages: &str) -> u32
 fn line(host: &mut Host, id: u32, n: usize) -> alloc::string::String {
     loop {
         let out = alloc::string::String::from_utf8_lossy(host.output(id).unwrap_or_default());
-        if let Some(line) = out.lines().nth(n - 1) {
+        // Only whole lines: the cell prints one in several writes.
+        if let Some(line) = out
+            .split_inclusive('\n')
+            .nth(n - 1)
+            .and_then(|l| l.strip_suffix('\n'))
+        {
             return line.into();
         }
         assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
