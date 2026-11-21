@@ -163,13 +163,20 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn set_quota(&mut self, id: u32, quota: Quota) -> bool {
-        self.with_live(id, |live| {
-            live.cell.quota = quota;
-            live.frames.set_limit(quota.frames());
-            live.fs
-                .set_limits(quota.files() as usize, quota.sockets as usize);
-        })
-        .is_some()
+        let live = self
+            .with_live(id, |live| live.cell.quota.files = quota.files)
+            .is_some();
+        live && self.set_limits_from(id, &quota, None)
+    }
+
+    /// [`set_quota`](Self::set_quota), and at most `cells` descendants
+    /// (spec `cell-hierarchy`, budgets).
+    #[cfg_attr(
+        not(feature = "ktest"),
+        allow(dead_code, reason = "used by in-kernel tests")
+    )]
+    pub fn set_limits(&mut self, id: u32, quota: Quota, cells: u32) -> bool {
+        self.set_quota(id, quota) && self.set_limits_from(id, &quota, Some(cells))
     }
 
     /// Frames counted against the memory quota of live cell `id`.

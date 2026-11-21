@@ -150,9 +150,8 @@ fn latencies_count_from_the_first_idle_moment() {
 /// Runs `netstate` to its `ready` line.
 fn netstate_ready(host: &mut Host) -> u32 {
     let id = spawn(host, "netstate", &[]);
-    while host.output(id) != Some(b"ready\n") {
-        host.step();
-    }
+    host.run_to_pause(id, b"ready", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     id
 }
 

@@ -269,6 +269,22 @@ impl Node {
     pub fn on_parent_end(&self) -> OnParentEnd {
         self.on_parent_end
     }
+    /// What a creator would give a cell to make it as this one: its
+    /// limits, its policy for when its parent ends and its policies (a
+    /// snapshot keeps them, and a refused move puts them back).
+    pub fn spec(&self) -> Spec {
+        let p = &self.policy;
+        Spec {
+            limits: self.limits,
+            on_parent_end: self.on_parent_end,
+            egress: p.egress.clone(),
+            ceiling: Some(p.ceiling.clone()),
+            label: p.label.clone(),
+            weight: p.weight,
+            cpu_max: p.cpu_max,
+            cpus: p.cpus,
+        }
+    }
     /// Its policies, shared and immutable.
     pub fn policy(&self) -> &Arc<Policy> {
         &self.policy
@@ -310,12 +326,36 @@ pub struct Ended {
 
 /// The ownership tree of a kernel's cells (design D1), ordered by
 /// identifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A cell that leaves the tree leaves a gone node in its place (depth
+/// [`GONE`]), dropped with the others once they outnumber the cells: the
+/// kernel ends and resumes cells among thousands, and closing the gap at
+/// once moved every node after it (change `fix-tree-removal`).
+#[derive(Debug, Clone)]
 pub struct Tree {
     nodes: Vec<Node>,
+    /// Gone nodes among `nodes`.
+    gone: usize,
     /// The default policies, shared by every cell that has them.
     default: Arc<Policy>,
 }
+
+/// The depth of a gone node, which no cell has.
+const GONE: u8 = u8::MAX;
+/// Nodes moved at once rather than leaving a gone node: as cheap (1 KiB)
+/// and the tree stays without gaps where few cells follow.
+const NEAR: usize = 16;
+const _: () = assert!(DEPTH_MAX < GONE);
+
+/// Trees are equal when they hold the same cells, wherever their gone
+/// nodes are.
+impl PartialEq for Tree {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter()) && self.default == other.default
+    }
+}
+
+impl Eq for Tree {}
 
 impl Default for Tree {
     fn default() -> Self {
@@ -332,21 +372,66 @@ impl Tree {
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
+            gone: 0,
             default: Arc::new(Policy::DEFAULT),
         }
     }
 
     /// Number of cells in the tree.
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.len() - self.gone
     }
 
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.len() == 0
     }
 
     fn index(&self, id: u32) -> Option<usize> {
-        self.nodes.binary_search_by_key(&id, |n| n.id).ok()
+        let i = self.nodes.binary_search_by_key(&id, |n| n.id).ok()?;
+        (self.nodes[i].depth != GONE).then_some(i)
+    }
+
+    /// Leaves a gone node in place of the cell at `i`, which keeps its
+    /// identifier for the order and holds nothing; returns the cell's.
+    fn bury(&mut self, i: usize) -> Node {
+        let gone = Node {
+            id: self.nodes[i].id,
+            parent: HOST,
+            first_child: HOST,
+            next_sibling: HOST,
+            domain: 0,
+            pid: 0,
+            next_pid: 0,
+            children: 0,
+            depth: GONE,
+            on_parent_end: OnParentEnd::Cascade,
+            limits: Limits::ZERO,
+            policy: self.default.clone(),
+        };
+        self.gone += 1;
+        core::mem::replace(&mut self.nodes[i], gone)
+    }
+
+    /// Drops the gone nodes once they outnumber the cells, so each costs
+    /// its share of one pass over the tree.
+    fn tidy(&mut self) {
+        if self.gone > self.len() {
+            self.nodes.retain(|n| n.depth != GONE);
+            self.gone = 0;
+        }
+    }
+
+    /// Where identifier `id` is in the nodes (`Ok`), or would go; a gone
+    /// node of that identifier (a cell that left comes back: never in the
+    /// kernel, whose identifiers are fresh) first drops the gone nodes.
+    fn find(&mut self, id: u32) -> Result<usize, usize> {
+        let at = self.nodes.binary_search_by_key(&id, |n| n.id);
+        if !at.is_ok_and(|i| self.nodes[i].depth == GONE) {
+            return at;
+        }
+        self.nodes.retain(|n| n.depth != GONE);
+        self.gone = 0;
+        self.nodes.binary_search_by_key(&id, |n| n.id)
     }
 
     /// Cell `id`'s node.
@@ -381,12 +466,12 @@ impl Tree {
 
     /// Every node, by identifier.
     pub fn iter(&self) -> impl Iterator<Item = &Node> {
-        self.nodes.iter()
+        self.nodes.iter().filter(|n| n.depth != GONE)
     }
 
     /// The children of cell `id`, newest first ([`HOST`]: the roots).
     pub fn children(&self, id: u32) -> impl Iterator<Item = u32> + '_ {
-        let host = (id == HOST).then(|| self.nodes.iter().filter(|n| n.is_root()).map(|n| n.id));
+        let host = (id == HOST).then(|| self.iter().filter(|n| n.is_root()).map(|n| n.id));
         let mut next = if id == HOST {
             HOST
         } else {
@@ -510,6 +595,21 @@ impl Tree {
         by: Actor,
         usage: Usage,
     ) -> Result<(), Error> {
+        self.add_child_unlike(id, parent, spec, by, usage, 0)
+    }
+
+    /// [`add_child`](Self::add_child), never numbering the cell `skip` in
+    /// the parent's domain: a copy placed there keeps a number unlike its
+    /// source's (design D22; 0 for none).
+    pub fn add_child_unlike(
+        &mut self,
+        id: u32,
+        parent: u32,
+        spec: Spec,
+        by: Actor,
+        usage: Usage,
+        skip: u32,
+    ) -> Result<(), Error> {
         let p = self.get(parent).ok_or(Error::NotFound)?;
         if by != Actor::Host && by != Actor::Cell(parent) && !self.controls(by, parent) {
             return Err(Error::Denied);
@@ -532,7 +632,7 @@ impl Tree {
         let i = self.insert_at(id)?;
         self.nodes.insert(i, node);
         self.link(id, parent);
-        let pid = self.number(id, 0);
+        let pid = self.number(id, skip);
         self.node_mut(id).pid = pid;
         Ok(())
     }
@@ -627,11 +727,7 @@ impl Tree {
 
     /// Where `id` goes in the nodes, with room for it.
     fn insert_at(&mut self, id: u32) -> Result<usize, Error> {
-        let at = self
-            .nodes
-            .binary_search_by_key(&id, |n| n.id)
-            .err()
-            .ok_or(Error::Exists)?;
+        let at = self.find(id).err().ok_or(Error::Exists)?;
         reserve(&mut self.nodes, 1)?;
         Ok(at)
     }
@@ -704,14 +800,19 @@ impl Tree {
             self.room_for(parent, s.limits.charge(), count, usage)?;
         }
         // Where a single copy goes, found once.
-        let mut place = None;
+        let (mut place, len) = (None, self.nodes.len());
         for (k, &id) in ids.iter().enumerate() {
-            let at = self.nodes.binary_search_by_key(&id, |n| n.id);
+            let at = self.find(id);
             if id == HOST || ids[..k].contains(&id) || at.is_ok() {
                 return Err(Error::Exists);
             }
             place = at.err().filter(|_| ids.len() == 1);
         }
+        // Gone nodes dropped on the way moved the source.
+        let si = match self.nodes.len() == len {
+            true => si,
+            false => self.index(source).expect("the source"),
+        };
         reserve(&mut self.nodes, ids.len())?;
         // An exclusive CPU set stays with one domain.
         let set = self.nodes[si].policy.cpus != 0;
@@ -758,22 +859,28 @@ impl Tree {
     /// old one. Returns its node, or `None` if `old` was not in the tree or
     /// `new` was.
     pub fn rekey(&mut self, old: u32, new: u32) -> Option<&Node> {
-        let at = self.nodes.binary_search_by_key(&new, |n| n.id).err()?;
         if new == HOST {
             return None;
         }
+        let mut at = self.find(new).err()?;
         let i = self.index(old)?;
-        // Moves the node to its new place in one rotation.
-        let at = if at > i {
-            self.nodes[i..at].rotate_left(1);
-            at - 1
+        if at.abs_diff(i) > NEAR && reserve(&mut self.nodes, 1).is_ok() {
+            // The node in its new place (the end, for a fresh identifier),
+            // a gone one in the old.
+            let mut node = self.bury(i);
+            node.id = new;
+            self.nodes.insert(at, node);
         } else {
-            self.nodes[at..=i].rotate_right(1);
-            at
-        };
-        let node = &mut self.nodes[at];
-        node.id = new;
-        let (parent, first) = (node.parent, node.first_child);
+            // Near, or no room: moves the node in one rotation.
+            if at > i {
+                self.nodes[i..at].rotate_left(1);
+                at -= 1;
+            } else {
+                self.nodes[at..=i].rotate_right(1);
+            }
+            self.nodes[at].id = new;
+        }
+        let (parent, first) = (self.nodes[at].parent, self.nodes[at].first_child);
         if parent != HOST {
             let p = self.node_mut(parent);
             if p.first_child == old {
@@ -794,6 +901,10 @@ impl Tree {
         }
         let pid = self.number(new, 0);
         self.nodes[at].pid = pid;
+        if self.gone > self.len() {
+            self.tidy();
+            return self.get(new);
+        }
         Some(&self.nodes[at])
     }
 
@@ -940,7 +1051,12 @@ impl Tree {
         if n.children == 0 {
             self.unlink(id);
             let i = self.index(id).expect("a cell of the tree");
-            self.nodes.remove(i);
+            if self.nodes.len() - i > NEAR {
+                self.bury(i);
+                self.tidy();
+            } else {
+                self.nodes.remove(i);
+            }
             return Ok(Ended::default());
         }
         // Who ends and who is promoted, before anything changes.
@@ -1100,7 +1216,10 @@ impl Tree {
                 return Err("identifiers out of order");
             }
         }
-        for n in &self.nodes {
+        if self.nodes.iter().filter(|n| n.depth == GONE).count() != self.gone {
+            return Err("gone nodes miscounted");
+        }
+        for n in self.iter() {
             if n.id == HOST || n.domain == 0 || n.pid == 0 {
                 return Err("identifier, domain or number 0");
             }
@@ -1110,7 +1229,6 @@ impl Tree {
                 return Err("domain or number unlike its root's");
             }
             if self
-                .nodes
                 .iter()
                 .any(|m| m.id != n.id && m.domain == n.domain && m.pid == n.pid)
             {
@@ -1149,7 +1267,6 @@ impl Tree {
                     return Err("a cell missing from its parent's children");
                 }
             } else if self
-                .nodes
                 .iter()
                 .any(|m| m.is_root() && m.id != n.id && m.domain == n.domain)
             {

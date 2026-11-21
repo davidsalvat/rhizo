@@ -41,7 +41,7 @@ impl Host {
         // Refers to the pages it shares instead of copying them (design D1
         // of `add-shared-snapshots`); its tables become its own first, under
         // the lock of shared tables when it has some.
-        let snapshot = sharing(live.shares, || {
+        let mut snapshot = sharing(live.shares, || {
             Snapshot::capture::<Format>(
                 user::MACHINE,
                 &live.cell,
@@ -55,6 +55,7 @@ impl Host {
                 release_frame,
             )
         });
+        self.record_tree(&mut snapshot, id);
         self.end(live, Ending::Suspended);
         Some(snapshot)
     }
@@ -128,13 +129,14 @@ impl Host {
         let now = now_ns();
         let mut cell = snapshot.cell(id, pt.root(), now);
         // A resume or a load is a copy (design D22 of `add-cell-hierarchy`);
-        // the snapshot holds its wipe ranges as zeros.
-        cell.generation = if cell.generation == UNKNOWN_GENERATION {
-            loaded_generation()
+        // the snapshot holds its wipe ranges as zeros. Each load of bytes,
+        // which may be loaded many times, draws its own generation.
+        cell.generation = if snapshot.origin() == 0 || cell.generation == UNKNOWN_GENERATION {
+            loaded_generation(cell.generation)
         } else {
             cell.generation + 1
         };
-        if !self.enter_restored(&mut cell, snapshot.origin()) {
+        if !self.enter_restored(&mut cell, &snapshot) {
             space::destroy(pt, &mut DirectMap, &mut KernelFrames);
             return Err(snapshot);
         }
@@ -317,7 +319,7 @@ impl Host {
             return None;
         }
         let (files, sockets) = export_sockets(fs);
-        let snapshot = sharing(true, || {
+        let mut snapshot = sharing(true, || {
             Snapshot::capture::<Format>(
                 user::MACHINE,
                 cell,
@@ -331,6 +333,7 @@ impl Host {
                 release_frame,
             )
         });
+        self.record_tree(&mut snapshot, id);
         close_parked(&snapshot);
         Some(snapshot)
     }
@@ -421,13 +424,19 @@ fn wipe_copy(live: &Live) -> bool {
     .is_ok()
 }
 
-/// The copy generation of a cell loaded from bytes that do not hold its
-/// own (until format version 11, task 1.10): drawn from the kernel's
-/// generator, so it equals no value the cell saw before it was saved but
-/// with chance 2^-62. Never 0, and below 2^62, so later copies counting up
-/// from it stay far from [`UNKNOWN_GENERATION`].
-fn loaded_generation() -> u64 {
-    let mut word = [0u8; 8];
-    RANDOM.with(|g| g.fill(&mut word));
-    (u64::from_le_bytes(word) >> 2) | 1
+/// The copy generation of a cell loaded from bytes, which can be loaded
+/// any number of times: drawn from the kernel's generator, never `saved`
+/// (the generation the bytes hold, [`UNKNOWN_GENERATION`] for a version-10
+/// file), so two loads of one file differ but with chance 2^-62. Never 0,
+/// and below 2^62, so later copies counting up from it stay far from
+/// [`UNKNOWN_GENERATION`].
+fn loaded_generation(saved: u64) -> u64 {
+    loop {
+        let mut word = [0u8; 8];
+        RANDOM.with(|g| g.fill(&mut word));
+        let generation = (u64::from_le_bytes(word) >> 2) | 1;
+        if generation != saved {
+            return generation;
+        }
+    }
 }

@@ -317,9 +317,9 @@ fn files_travel_with_the_snapshot() {
     assert_eq!(back.stat(None, b"data.txt").unwrap().size, 5);
     // A files section that does not decode is refused (its last byte is
     // just before the sockets section: a length and an empty list, then
-    // the checksum).
+    // the tree section with the defaults, then the checksum).
     let mut bytes = snap.export(&mem, crc32c);
-    let last = bytes.len() - 13 - CHECKSUM;
+    let last = bytes.len() - 13 - (8 + tree::FIXED) - CHECKSUM;
     bytes[last] ^= 0xff;
     assert_eq!(
         Snapshot::from_bytes(sealed(bytes), Machine::Aarch64, crc32c),
@@ -868,7 +868,51 @@ mod hostile {
             })
     }
 
+    /// `rich()` with every kind of tree state: rules, a label, a CPU set
+    /// and cap, a wipe range.
+    fn rich_tree() -> Vec<u8> {
+        let crc = crc32c;
+        let mut snap = Snapshot::from_bytes(rich(), Machine::X86_64, crc).unwrap();
+        snap.set_tree(&super::busy_spec());
+        let mut b = snap.export(&FakePhysicalMemory::new(), crc);
+        // A wipe range too: rewrite the section with one.
+        let mut t = snap.tree();
+        t.wiped = vec![(0x60_0000, 0x60_1000)];
+        b.truncate(snap.tree_at());
+        tree::encode(&t, &mut b);
+        b.extend_from_slice(&[0; CHECKSUM]);
+        sealed(b)
+    }
+
     proptest! {
+        /// Edits in the tree section, sealed: refused, or a tree state
+        /// that decodes to valid values, which placing under a parent
+        /// without egress narrows (spec `snapshots`, loaded snapshots hold
+        /// no authority).
+        #[test]
+        fn tampered_tree_sections_are_refused_or_contained(
+            edits in prop::collection::vec((0usize..400, any::<u8>()), 1..4),
+        ) {
+            let mut bytes = rich_tree();
+            let tail = bytes.len() - CHECKSUM;
+            for (at, b) in edits {
+                let at = tail - 1 - at % (tail.min(400));
+                bytes[at] = b;
+            }
+            if let Ok(snap) = Snapshot::from_bytes(sealed(bytes), Machine::X86_64, crc32c) {
+                let t = snap.tree();
+                prop_assert!(tree::decode(&snap.bytes[snap.tree_at() + 8..]).is_some());
+                prop_assert!((1..=10_000).contains(&t.spec.weight));
+                let most = rhizo_cap::Limits { memory: 1 << 20, cpu_ns: 5, sockets: 2, cells: 1 };
+                let placed = snap.placed(&rhizo_cap::Egress::None, &rhizo_cap::Egress::None, most).unwrap();
+                prop_assert_eq!(&placed.egress, &rhizo_cap::Egress::None);
+                prop_assert_eq!(placed.ceiling, Some(rhizo_cap::Egress::None));
+                prop_assert!(placed.limits.memory <= 1 << 20 && placed.limits.cells <= 1);
+                prop_assert_eq!(placed.cpus, 0);
+                restore_safely(&snap);
+            }
+        }
+
         #[test]
         fn tampered_snapshots_are_refused_or_contained(bytes in tampered()) {
             if let Ok(snap) = Snapshot::from_bytes(bytes, Machine::X86_64, crc32c) {
@@ -881,11 +925,13 @@ mod hostile {
             mut bytes in prop::collection::vec(any::<u8>(), 0..2048),
             pages in 0u32..4,
             threads in 1u32..3,
+            version in prop_oneof![Just(VERSION), Just(PREVIOUS)],
         ) {
-            // A valid header and checksum, so the rest is what gets tested.
+            // A valid header and checksum, so the rest is what gets tested
+            // (a version-10 one through the upgrade).
             if bytes.len() >= HEADER {
                 bytes[..8].copy_from_slice(MAGIC);
-                bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+                bytes[8..12].copy_from_slice(&version.to_le_bytes());
                 bytes[12..14].copy_from_slice(&(Machine::X86_64 as u16).to_le_bytes());
                 bytes[16..20].copy_from_slice(&pages.to_le_bytes());
                 bytes[20..24].copy_from_slice(&threads.to_le_bytes());
@@ -1127,13 +1173,11 @@ fn quotas_from_outside_are_capped() {
     assert_eq!(snap.state().cpu_ns, 1234, "the time used stays");
 }
 
-/// A snapshot in the kernel keeps the cell's copy generation, whether it
-/// may hold a secret, and its wipe ranges (design D22 of
-/// `add-cell-hierarchy`); its exported bytes do not hold them yet (format
-/// version 11 will), so one made from bytes has none and an unknown
-/// generation.
+/// A snapshot keeps the cell's copy generation, whether it may hold a
+/// secret, and its wipe ranges (design D22 of `add-cell-hierarchy`), in
+/// the kernel and in its exported bytes (format version 11).
 #[test]
-fn copy_state_kept_in_the_kernel() {
+fn copy_state_travels_with_the_snapshot() {
     let mut mem = FakePhysicalMemory::new();
     let mut frames = CountingFrames::new(4096);
     let mut c = cell::<Aarch64>(&mut mem, &mut frames);
@@ -1167,13 +1211,222 @@ fn copy_state_kept_in_the_kernel() {
     assert_eq!(buf, [0; 4], "wiped");
     rhizo_cell::memory::copy_from(&pt, &mem, 0x4000_001f_fff8, &mut buf).unwrap();
     assert_eq!(&buf, b"big ");
+    // Format version 11 holds them (task 1.10 of `add-cell-hierarchy`): a
+    // snapshot read from bytes has them too.
     let loaded = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
     assert_eq!(loaded, snap, "the same bytes");
-    assert_eq!(loaded.wx().ranges(), wx.ranges());
-    assert!(loaded.wx().wiped().is_empty());
+    assert_eq!(loaded.wx(), wx);
     let restored = loaded.cell(9, 0, 0);
-    assert_eq!(
-        (restored.generation, restored.exposed),
-        (UNKNOWN_GENERATION, false)
+    assert_eq!((restored.generation, restored.exposed), (4, true));
+}
+
+/// A tree state with something in every field: limits, `promote`, egress
+/// rules, a ceiling of `full`, a label, CPU weight, cap and set.
+fn busy_spec() -> rhizo_cap::Spec {
+    use rhizo_cap::{Egress, Label, Limits, OnParentEnd, Proto, Rule, Spec};
+    let rules = [
+        Rule::new(Proto::Tcp, [140, 82, 112, 0], 20, 443, 443).unwrap(),
+        Rule::new(Proto::Any, [10, 0, 2, 2], 32, 11434, 11434).unwrap(),
+    ];
+    Spec {
+        limits: Limits {
+            memory: 16 << 20,
+            cpu_ns: 9_000_000,
+            sockets: 12,
+            cells: 3,
+        },
+        on_parent_end: OnParentEnd::Promote,
+        egress: Egress::rules(&rules).unwrap(),
+        ceiling: Some(Egress::Full),
+        label: Label::new(b"tools.v1").unwrap(),
+        weight: 250,
+        cpu_max: 1500,
+        cpus: 0b1100,
+    }
+}
+
+/// Spec `snapshots`, "Tree state in snapshots": a snapshot holds the
+/// cell's limits, budget mode, policy for when its parent ends, egress and
+/// ceiling, label, CPU weight, cap and set, number in its domain, copy
+/// generation, sticky bit and wipe ranges, through export and from_bytes,
+/// with one encoding.
+#[test]
+fn tree_state_round_trip() {
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let mut c = cell::<Aarch64>(&mut mem, &mut frames);
+    (c.pid, c.generation, c.exposed) = (7, 3, true);
+    let mut wx = WxRanges::default();
+    wx.wipe(0x60_0000, 0x60_1000).unwrap();
+    let mut snap = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &[],
+        &wx,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
     );
+    let defaults = snap.tree();
+    assert_eq!(
+        defaults.spec.egress,
+        rhizo_cap::Egress::None,
+        "none until set"
+    );
+    assert_eq!(defaults.spec.limits.memory, 32 << 20, "the quota's");
+    let spec = busy_spec();
+    snap.set_tree(&spec);
+    let exported = snap.export(&mem, crc32c);
+    assert_eq!(exported, snap.export(&mem, crc32c), "deterministic");
+    let loaded = Snapshot::from_bytes(exported, Machine::Aarch64, crc32c).unwrap();
+    let t = loaded.tree();
+    assert_eq!(t.spec, spec);
+    assert_eq!((t.pid, t.generation, t.exposed), (7, 3, true));
+    assert_eq!(t.wiped, [(0x60_0000, 0x60_1000)]);
+    assert_eq!(loaded.wx(), wx);
+    let restored = loaded.cell(40, 0, 0);
+    assert_eq!((restored.pid, restored.generation), (7, 3));
+    // Setting the same state again changes no byte.
+    let mut again =
+        Snapshot::from_bytes(loaded.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
+    again.set_tree(&spec);
+    assert_eq!(again, loaded);
+}
+
+/// Spec `snapshots`, "Forged authority": a file changed to claim egress
+/// `full`, a 4 GiB limit and a CPU set, loaded under a parent with egress
+/// `none` and a 16 MiB budget, gets egress `none`, limits within the
+/// budget and no CPU set; a tree section that does not decode is refused.
+#[test]
+fn forged_tree_state_is_capped() {
+    use rhizo_cap::{Egress, Limits};
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let c = cell::<Aarch64>(&mut mem, &mut frames);
+    let mut snap = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &[],
+        &WxRanges::default(),
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
+    snap.set_tree(&rhizo_cap::Spec {
+        limits: Limits {
+            memory: 4 << 30,
+            cpu_ns: u64::MAX,
+            sockets: u32::MAX,
+            cells: u32::MAX,
+        },
+        egress: Egress::Full,
+        ceiling: Some(Egress::Full),
+        cpus: u64::MAX,
+        ..busy_spec()
+    });
+    let bytes = snap.export(&mem, crc32c);
+    let loaded = Snapshot::from_bytes(bytes, Machine::Aarch64, crc32c).unwrap();
+    let most = Limits {
+        memory: 16 << 20,
+        cpu_ns: 1_000_000,
+        sockets: 8,
+        cells: 0,
+    };
+    let placed = loaded.placed(&Egress::None, &Egress::None, most).unwrap();
+    assert_eq!(placed.egress, Egress::None);
+    assert_eq!(placed.ceiling, Some(Egress::None));
+    assert_eq!(placed.limits, most);
+    assert_eq!(placed.cpus, 0);
+    // Malformed sections: each edit, sealed again, is refused. The section
+    // of `busy_spec()` holds two rules and an 8-byte label.
+    snap.set_tree(&busy_spec());
+    let bytes = snap.export(&mem, crc32c);
+    assert!(Snapshot::from_bytes(bytes.clone(), Machine::Aarch64, crc32c).is_ok());
+    let tree_at = bytes.len() - CHECKSUM - (8 + tree::FIXED + 2 * 12 + 8);
+    let fixed = tree_at + 8;
+    for (at, value) in [
+        (fixed + 50, 1),     // a budget mode other than reserved
+        (fixed + 51, 2),     // on_parent_end
+        (fixed + 52, 2),     // the sticky bit
+        (fixed + 48, 0),     // CPU weight 0
+        (fixed + 56, 3),     // an egress kind
+        (fixed + 57, 0),     // rules, but none
+        (fixed + 60, 1),     // reserved bytes
+        (fixed + 64, 9),     // a rule's protocol
+        (fixed + 65, 33),    // a prefix over 32
+        (fixed + 64 + 9, 1), // a bit past the prefix (140.82.112.1/20)
+        (fixed + 88, b' '),  // a label byte
+        (tree_at, 1),        // the section's length
+    ] {
+        let mut b = bytes.clone();
+        b[at] = value;
+        let r = Snapshot::from_bytes(sealed(b), Machine::Aarch64, crc32c);
+        assert!(
+            matches!(r, Err(FormatError::BadTree | FormatError::Truncated)),
+            "byte {} = {value}: {:?}",
+            at - fixed,
+            r.map(|s| s.tree())
+        );
+    }
+}
+
+/// Spec `snapshots`, "A version-10 file" (design D20): a file a version-10
+/// kernel saved, recorded in `tests/data`, is read, and upgraded one step
+/// to the same bytes every time; its cell keeps its pages, files and
+/// quotas, and gets egress `none`, no CPU set, an unknown number and
+/// generation, and the sticky bit. Other versions are refused by name.
+#[test]
+fn version_10_file_upgrades() {
+    let v10 = include_bytes!("../tests/data/version-10.rhz").to_vec();
+    assert_eq!(u32::from_le_bytes(v10[8..12].try_into().unwrap()), PREVIOUS);
+    let upgraded = upgrade(v10.clone(), crc32c).unwrap();
+    assert_eq!(
+        upgraded,
+        upgrade(v10.clone(), crc32c).unwrap(),
+        "deterministic"
+    );
+    assert_eq!(
+        upgrade(upgraded.clone(), crc32c).unwrap(),
+        upgraded,
+        "current stays"
+    );
+    assert_eq!(
+        u32::from_le_bytes(upgraded[8..12].try_into().unwrap()),
+        VERSION
+    );
+    let direct = Snapshot::from_bytes(v10.clone(), Machine::Aarch64, crc32c).unwrap();
+    let via = Snapshot::from_bytes(upgraded, Machine::Aarch64, crc32c).unwrap();
+    assert_eq!(direct, via, "reading version 10 is its upgrade");
+    let t = via.tree();
+    assert_eq!(t.spec.egress, rhizo_cap::Egress::None);
+    assert_eq!(t.spec.ceiling, Some(rhizo_cap::Egress::None));
+    assert_eq!(
+        (t.spec.cpus, t.pid, t.generation, t.exposed),
+        (0, 0, UNKNOWN_GENERATION, true)
+    );
+    assert_eq!((t.spec.limits.memory, t.spec.limits.sockets), (32 << 20, 3));
+    assert_eq!(via.state().quota.files, 64);
+    assert_eq!(via.pages(), 2);
+    let size = via.files().stat(None, b"/note").unwrap().size;
+    assert_eq!(size, b"kept across versions".len() as u64);
+    // A damaged version-10 file is refused before conversion.
+    let mut bad = v10.clone();
+    bad[100] ^= 1;
+    assert_eq!(upgrade(bad, crc32c), Err(FormatError::Checksum));
+    for version in [PREVIOUS - 1, VERSION + 1] {
+        let mut b = v10.clone();
+        b[8..12].copy_from_slice(&version.to_le_bytes());
+        assert_eq!(
+            upgrade(b.clone(), crc32c),
+            Err(FormatError::Version(version))
+        );
+        assert_eq!(
+            Snapshot::from_bytes(sealed(b), Machine::Aarch64, crc32c),
+            Err(FormatError::Version(version))
+        );
+    }
 }

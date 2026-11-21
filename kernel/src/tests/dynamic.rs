@@ -60,9 +60,8 @@ fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
     let mut host = Host::new();
     let ready = |host: &mut Host| {
         let id = spawn_dynamic(host, &files, path, argv);
-        while host.output(id) != Some(b"ready\n") {
-            host.step();
-        }
+        host.run_to_pause(id, b"ready", Pause::Waits)
+            .unwrap_or_else(|why| panic!("{why}"));
         id
     };
     let id = ready(&mut host);

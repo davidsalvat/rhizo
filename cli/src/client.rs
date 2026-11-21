@@ -2,7 +2,7 @@
 //! control kernel.
 
 use crate::state::{Dir, Info};
-use rhizo_control::{Body, Decoder, Item, Message, Request};
+use rhizo_control::{Body, Decoder, Item, Message, PREVIOUS, Request, VERSION};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -16,11 +16,15 @@ pub struct Client {
     /// Messages read while waiting for another request's reply.
     pending: VecDeque<(u32, Message)>,
     pub info: Info,
+    /// The protocol the kernel speaks: [`VERSION`] or [`PREVIOUS`].
+    pub protocol: u8,
 }
 
-/// A successful reply: its body, the kernel's time and the round trip.
+/// A successful reply: the request's identifier, its body, the kernel's
+/// time and the round trip.
 #[derive(Debug)]
 pub struct Reply {
+    pub id: u32,
     pub body: Body,
     pub ns: u64,
     pub round_trip: Duration,
@@ -46,6 +50,28 @@ pub fn duration(ns: u64) -> String {
     }
 }
 
+/// How to move cells to a kernel of the current protocol (design D20 of
+/// `add-cell-hierarchy`).
+pub const UPGRADE: &str = "To upgrade: suspend each cell (`rhizo suspend`) and `rhizo save` \
+     it, `rhizo down`, `rhizo up` with the new kernel, `rhizo snapshot upgrade` the files two \
+     format versions old, then `rhizo load` them.";
+
+/// The refusal of a kernel of protocol `found`, which this `rhizo` does
+/// not speak.
+pub fn upgrade(found: u8) -> String {
+    if found > VERSION {
+        format!(
+            "the VM's kernel speaks control protocol {found}, newer than this rhizo \
+             ({PREVIOUS} and {VERSION}): use the rhizo built with that kernel"
+        )
+    } else {
+        format!(
+            "the VM's kernel speaks control protocol {found}; this rhizo speaks {PREVIOUS} and \
+             {VERSION}. {UPGRADE}"
+        )
+    }
+}
+
 impl Client {
     /// Connects to the VM `rhizo up` started.
     pub fn connect(dir: &Dir) -> Result<Self, String> {
@@ -55,23 +81,40 @@ impl Client {
                 dir.0.display()
             )
         })?;
+        let protocol = info.protocol.unwrap_or(PREVIOUS);
+        if protocol != VERSION && protocol != PREVIOUS {
+            return Err(upgrade(protocol));
+        }
         let stream = UnixStream::connect(dir.socket())
             .map_err(|e| format!("cannot reach the VM at {}: {e}", dir.socket().display()))?;
         Ok(Client {
             stream,
-            decoder: Decoder::new(),
+            decoder: Decoder::any_version(),
             next_id: 1,
             pending: VecDeque::new(),
             info,
+            protocol,
         })
+    }
+
+    /// Whether the kernel speaks the current protocol (the cell tree).
+    pub fn current(&self) -> bool {
+        self.protocol == VERSION
     }
 
     /// Sends `request`; returns its identifier.
     pub fn send(&mut self, request: &Request) -> Result<u32, String> {
         let id = self.next_id;
         self.next_id += 1;
+        let frame = request.encode_as(self.protocol, id).map_err(|_| {
+            format!(
+                "this needs control protocol {VERSION} (the cell tree); the VM's kernel speaks \
+                 {}. {UPGRADE}",
+                self.protocol
+            )
+        })?;
         self.stream
-            .write_all(&request.encode(id))
+            .write_all(&frame)
             .map_err(|e| format!("the VM's server is gone: {e}"))?;
         Ok(id)
     }
@@ -93,6 +136,9 @@ impl Client {
             }
             for &byte in &buf[..n] {
                 match self.decoder.push(byte) {
+                    Some(Item::Frame(frame)) if frame.version != self.protocol => {
+                        return Err(upgrade(frame.version));
+                    }
                     Some(Item::Frame(frame)) => match Message::decode(&frame) {
                         Ok(m) => self.pending.push_back((frame.id, m)),
                         Err(e) => return Err(format!("unreadable reply: {}", e.as_str())),
@@ -126,6 +172,7 @@ impl Client {
         self.pending = other;
         match reply {
             Message::Done { ns, body } => Ok(Reply {
+                id,
                 body,
                 ns,
                 round_trip,
