@@ -16,6 +16,9 @@ rhizo-control = { path = "../crates/rhizo-control" }
 # Building the control kernel, launching VMMs and the host's side of their
 # network: the same code as `cargo xtask` (design D5 of `add-control-plane`).
 xtask = { path = "../xtask" }
+# `rhizo snapshot upgrade`: the same format code as the kernel's (design D20
+# of `add-cell-hierarchy`).
+rhizo-snapshot = { path = "../crates/rhizo-snapshot" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
