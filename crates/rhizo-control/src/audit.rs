@@ -37,6 +37,9 @@ pub enum Kind {
     Narrowed = 4,
     /// A template refused publication (it may hold a secret).
     Publish = 5,
+    /// A connection to the control channel refused: it did not present
+    /// the secret (change `authenticate-control-channel`).
+    Auth = 6,
     /// Cells made by the host.
     Created = 16,
     /// A cell ended.
@@ -55,12 +58,13 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 12] = [
+    pub const ALL: [Kind; 13] = [
         Kind::Egress,
         Kind::Scope,
         Kind::Tree,
         Kind::Narrowed,
         Kind::Publish,
+        Kind::Auth,
         Kind::Created,
         Kind::Ended,
         Kind::Moved,
@@ -87,6 +91,7 @@ impl Kind {
             Kind::Tree => "tree-denied",
             Kind::Narrowed => "load-narrowed",
             Kind::Publish => "publish-refused",
+            Kind::Auth => "auth-refused",
             Kind::Created => "created",
             Kind::Ended => "ended",
             Kind::Moved => "moved",

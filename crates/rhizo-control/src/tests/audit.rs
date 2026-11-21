@@ -45,7 +45,8 @@ fn audit_kinds_have_names_and_codes() {
         assert_eq!(Kind::parse(kind.as_str()), Some(kind));
         assert_eq!(Kind::from_code(kind as u8), Some(kind));
     }
-    assert!(Kind::Egress.is_denial() && Kind::Publish.is_denial());
+    assert!(Kind::Egress.is_denial() && Kind::Publish.is_denial() && Kind::Auth.is_denial());
+    assert_eq!(Kind::parse("auth-refused"), Some(Kind::Auth));
     assert!(!Kind::Attested.is_denial() && !Kind::Created.is_denial());
     assert_eq!(Kind::parse("nothing"), None);
 }

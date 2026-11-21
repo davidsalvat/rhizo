@@ -1147,7 +1147,9 @@ recommended for production.
   their placement) and their ends; moves, policies and limits; requests of
   scoped clients, let through or refused, with the scope; tree refusals
   (`Denied`, `Invalid`); a load whose quota was cut; a publication refused
-  or made on the host's attestation (`Host::may_publish`). Egress denials
+  or made on the host's attestation (`Host::may_publish`); a vsock
+  connection to the control channel refused for want of the secret
+  (`auth-refused`, change `authenticate-control-channel`). Egress denials
   come with task 1.6 through `audit::deny(Kind::Egress, cell, domain,
   detail)`; grants with phase 2.
 - On the host the files are `audit/audit-<n>.jsonl` (`n` counting up from

@@ -21,6 +21,19 @@ impl Dir {
         Dir(dir)
     }
 
+    /// Creates the directory if it is missing, and makes it reachable by
+    /// its user alone (mode `0700`), as it holds the control socket, which
+    /// controls every cell (change `authenticate-control-channel`).
+    pub fn create(&self) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.0)
+            .and_then(|()| fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)))
+            .map_err(|e| format!("cannot create {}: {e}", self.0.display()))
+    }
+
     pub fn state(&self) -> PathBuf {
         self.0.join("state")
     }
@@ -194,6 +207,25 @@ mod tests {
         assert!(dir.console().exists());
         assert!(audit.join("audit-000000.jsonl").exists());
         fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    /// A new state directory, and one that already existed open to
+    /// everyone, are both left to their user alone.
+    #[test]
+    fn the_state_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = std::env::temp_dir().join(format!("rhizo-private-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let new = Dir(root.join("a").join("state"));
+        new.create().unwrap();
+        assert_eq!(mode(&new.0), 0o700);
+        let old = Dir(root.join("old"));
+        fs::create_dir_all(&old.0).unwrap();
+        fs::set_permissions(&old.0, fs::Permissions::from_mode(0o777)).unwrap();
+        old.create().unwrap();
+        assert_eq!(mode(&old.0), 0o700);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

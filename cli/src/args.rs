@@ -79,8 +79,9 @@ Commands:
                              Show the audit log: what the kernel refused and
                              what was administered (kinds: egress-denied,
                              scope-denied, tree-denied, load-narrowed,
-                             publish-refused, created, ended, moved, policy,
-                             limits, publish-attested, scoped)
+                             publish-refused, auth-refused, created, ended,
+                             moved, policy, limits, publish-attested,
+                             scoped)
   audit verify               Check the audit log's hash chain: edited,
                              removed, reordered and missing records
   down                       Power the VM off
