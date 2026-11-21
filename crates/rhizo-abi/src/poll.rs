@@ -206,9 +206,11 @@ pub(crate) fn write_event<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 
 /// The events of `fd`, as `poll` reports them (`POLLRDNORM` and
 /// `POLLWRNORM` with `POLLIN` and `POLLOUT`).
-fn events_of<F, M, T, A, S>(cx: &Context<'_, F, M, T, A, S>, fd: u32) -> Result<u32, Error> {
-    let net = &*cx.net;
-    let ev = cx.fs.poll(fd, &|h| net.poll(h))?;
+fn events_of<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, fd: u32) -> Result<u32, Error> {
+    // The sockets are locked only if `fd` is one, or an `epoll` instance
+    // holding one.
+    let net = core::cell::RefCell::new(&mut *cx.net);
+    let ev = cx.fs.poll(fd, &|h| net.borrow_mut().net().poll(h))?;
     Ok(ev
         | if ev & POLLIN != 0 { POLLRDNORM } else { 0 }
         | if ev & POLLOUT != 0 { POLLWRNORM } else { 0 })
