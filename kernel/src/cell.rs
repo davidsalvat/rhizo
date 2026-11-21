@@ -944,7 +944,10 @@ fn wait(wake: Option<u64>) {
                         "DBG stuck cpu={} runnable={} waiting={} running={} idle={:#x} net={} seen={} timer={:?} next={:?} ended={} stopping={} gangs={}\n",
                         crate::arch::cpu::index(), s.sched.runnable(), s.sched.waiting(), s.running, s.idle,
                         NET.with(|n| n.changes()), s.net_seen, s.timer.armed(), next_wake(s), s.ended.len(), s.stopping, s.gangs.len()));
-                    let _ = core::fmt::Write::write_str(&mut rhizo_hal::ConsoleWriter(&mut BootConsole), &line);
+                    let _ = core::fmt::Write::write_str(
+                        &mut rhizo_hal::ConsoleWriter(&mut BootConsole),
+                        &line,
+                    );
                 }
             }
         }
@@ -2079,7 +2082,10 @@ impl Host {
             return;
         }
         let cpus = crate::smp::count();
-        DBG_SHARED.store(&self.shared as *const Global<Shared> as u64, Ordering::Relaxed);
+        DBG_SHARED.store(
+            &self.shared as *const Global<Shared> as u64,
+            Ordering::Relaxed,
+        );
         if cpus > 1 {
             let shared = &self.shared as *const Global<Shared> as u64;
             for cpu in 1..cpus {
@@ -2150,7 +2156,14 @@ impl Host {
         match wake {
             Some(at) => {
                 if at > now + 1_000_000_000 {
-                    let _ = core::fmt::Write::write_fmt(&mut rhizo_hal::ConsoleWriter(&mut BootConsole), format_args!("DBG cpu0 long wait {} wire={:?}\n", at - now, self.wire_delay));
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut rhizo_hal::ConsoleWriter(&mut BootConsole),
+                        format_args!(
+                            "DBG cpu0 long wait {} wire={:?}\n",
+                            at - now,
+                            self.wire_delay
+                        ),
+                    );
                 }
                 wait(Some(at));
                 true
