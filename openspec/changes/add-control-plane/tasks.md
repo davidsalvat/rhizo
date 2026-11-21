@@ -9,7 +9,7 @@
 
 - [x] 2.1 Kernel feature `cells` (set by `ktest`, `bench-cell`, `control`) and `control`; UART receive side behind `arch::console::control` (16550 port and MMIO, PL011); verify clippy of the kernel with every feature on both architectures
 - [x] 2.2 `Host::look_every`, `take_output`, `spawn_with_env`, `has_finished`; `find_image`; `kernel/src/control.rs` (table, requests, output streaming); verify `cargo xtask --arch x86_64 test --only control`
-- [ ] 2.3 The same on AArch64; verify `cargo xtask --arch aarch64 test --only control` (CI's AArch64 job)
+- [x] 2.3 The same on AArch64; verify `cargo xtask --arch aarch64 test --only control` (CI's AArch64 job)
 
 ## 3. rhizo
 
