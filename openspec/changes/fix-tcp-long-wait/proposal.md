@@ -64,6 +64,6 @@ None.
 ## Impact
 
 `crates/rhizo-net/src/wire.rs` and its tests, `kernel/src/cell.rs`,
-`kernel/src/tests.rs`, `cells/src/bin/loopback.rs` (`pause` mode). No
+`kernel/src/tests.rs`, a `quiet` test cell (`cells/src/bin/quiet.rs`). No
 benchmarked path changes beyond one store per send and one check per
 wire socket when a frame arrives.

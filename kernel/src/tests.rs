@@ -2418,12 +2418,12 @@ fn a_silent_connection_outlasts_the_timeout_and_reconnects_at_once() {
     let port = alloc::format!("{port}");
     let id = spawn(
         &mut host,
-        "loopback",
-        &[b"pause", port.as_bytes(), b"1500", ip.as_bytes()],
+        "quiet",
+        &[port.as_bytes(), b"1500", ip.as_bytes()],
     );
     host.run(|_| false);
     crate::cell::set_wire_timeout(20_000_000_000);
-    assert_eq!(ended(&host, id), (Ending::Exit(0), "paused\n".into()));
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "quiet ok\n".into()));
 }
 
 fn forks_of_a_threaded_cell_run_all_threads() {

@@ -80,8 +80,12 @@ the in-kernel step. `Net::set_wire_timeout` sets the timeout given to
 connections opened or written to from then on; the in-kernel test sets
 500 ms, keeps a connection to the host's echo server silent for 1.5 s,
 checks an echo, closes it, and checks that a new connection is open and
-echoes within a second (the `pause` mode of the `loopback` cell), then
-restores 20 s. Without D1 that test fails on its second send (`EPIPE`,
+echoes within a second (the new `quiet` cell), then restores 20 s. It
+is a program of its own rather than a mode of `loopback`: a first version
+added to `loopback` grew the code `loopback twice` touches, and the lazy
+resume behind `cell.tcp_resume_insns` cost 1,903 more instructions on
+every run (+2.6 %, over the gate); as a separate program the count is
+main's again. Without D1 that test fails on its second send (`EPIPE`,
 the connection was reset). The host tests of `rhizo-net` run on simulated
 time and use the real 20 s.
 
@@ -89,11 +93,14 @@ time and use the real 20 s.
 
 One store per `send` on a wire connection, and one check of the send
 queue per wire socket when a frame changes the sockets (the loop already
-visits them). Measured on QEMU `microvm` x86_64 (TCG), before and after:
-all 50 instruction counts under `-icount` identical
-(`cell.loopback_rtt_insns` 8,938, `cell.tcp_resume_insns` 76,619); timed
-medians of 5 runs within TCG's noise (`net.tcp_rtt_us` 127.5 → 116.6,
-`cell.loopback_rtt_us` 31.7 → 34.5, `cell.tcp_resume_us` 353 → 400).
+visits them). Measured under `-icount` on QEMU `microvm` x86_64,
+`cargo xtask --arch x86_64 bench --vmm qemu-microvm --icount-only`, against
+`main` at the merge base: 48 of the 50 instruction counts identical
+(`cell.loopback_rtt_insns` 8,950, `cell.tcp_resume_insns` 74,731);
+`breakdown.fork_touch.frames_insns` and `breakdown.fork_touch.total_insns`
++13 (+0.008 % and +0.0002 %). Timed medians of 5 runs under TCG, before and after (an earlier
+base): `net.tcp_rtt_us` 127.5 and 116.6, `cell.loopback_rtt_us` 31.7 and
+34.5, `cell.tcp_resume_us` 353 and 400, within TCG's noise.
 
 ## Manual reproduction
 
