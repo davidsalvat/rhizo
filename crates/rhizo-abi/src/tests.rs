@@ -70,6 +70,18 @@ pub(crate) struct World {
     pub(crate) deadline: Option<u64>,
     /// The last call waits on descriptors: with this deadline.
     pub(crate) io: Option<Option<u64>>,
+    /// Whether a call reached the sockets.
+    pub(crate) used_net: bool,
+}
+
+/// The sockets, noting whether a call reached them.
+struct Noting<'a>(&'a mut rhizo_net::Net, &'a mut bool);
+
+impl Sockets for Noting<'_> {
+    fn net(&mut self) -> &mut rhizo_net::Net {
+        *self.1 = true;
+        self.0
+    }
 }
 
 pub(crate) const DATA: u64 = 0x10_0000;
@@ -98,6 +110,7 @@ impl World {
             pages: PageCache::new(64),
             deadline: None,
             io: None,
+            used_net: false,
         }
     }
 
@@ -127,7 +140,7 @@ impl World {
             frames: &mut self.frames,
             services: &mut self.services,
             fs: &mut self.fs,
-            net: &mut self.net,
+            net: &mut Noting(&mut self.net, &mut self.used_net),
             deadline: self.deadline.take(),
             pager: &mut NoPager,
             pages: &mut self.pages,

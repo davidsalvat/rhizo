@@ -554,3 +554,20 @@ fn receive_timeout_bounds_a_blocking_receive() {
     w.services.clock = 7 + 10 * MS;
     assert_eq!(w.call(READ, &[s, BUF, 1]).0, -EAGAIN, "timed out");
 }
+
+#[test]
+fn only_calls_on_sockets_reach_them() {
+    let mut w = World::new(Arch::Aarch64);
+    w.call(PIPE2, &[OUT, 0]);
+    let (r, wr) = w.fds_at(OUT);
+    w.send(wr, b"abc");
+    assert_eq!(w.call(READ, &[r, BUF, 3]).0, 3);
+    let e = w.call(EVENTFD2, &[1, 0]).0 as u64;
+    let ep = w.call(EPOLL_CREATE1, &[0]).0 as u64;
+    w.poke(BUF, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(w.call(EPOLL_CTL, &[ep, 1, e, BUF]).0, 0);
+    assert_eq!(w.call(EPOLL_PWAIT, &[ep, BUF, 4, 0, 0]).0, 1);
+    assert!(!w.used_net, "pipes, counters and epoll without sockets");
+    assert!(w.call(SOCKET, &[2, 1, 0]).0 >= 0);
+    assert!(w.used_net);
+}

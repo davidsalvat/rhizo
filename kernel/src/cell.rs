@@ -97,6 +97,26 @@ static NET: Global<Net> = Global::new(Net::new());
 /// `add-socket-wait-queues`).
 static WOKEN: AtomicBool = AtomicBool::new(false);
 
+/// The sockets as a system call reaches them (design D1 of
+/// `split-sockets-lock`): locked the first time the call uses them, until
+/// the call ends, with their change count then; a call that uses no socket
+/// never waits for another CPU's socket calls.
+#[derive(Default)]
+struct CallNet(Option<(rhizo_core::sync::Guard<'static, Net>, u64)>);
+
+impl rhizo_abi::Sockets for CallNet {
+    fn net(&mut self) -> &mut Net {
+        &mut self
+            .0
+            .get_or_insert_with(|| {
+                let net = NET.lock();
+                let changes = net.changes();
+                (net, changes)
+            })
+            .0
+    }
+}
+
 /// Runs `f` on the sockets, noting woken waiters for [`wake_woken`].
 fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
     NET.with(|net| {
@@ -1207,39 +1227,38 @@ fn syscall(
     let t0 = prof::syscall_start();
     // Lock order: the cell's (when shared), `SHARING`, then the sockets.
     let (outcome, deadline) = sharing(live.shares, || {
-        NET.with(|net| {
-            let _call = cost::syscall(&live.cell);
-            let changes = net.changes();
-            let mut cx = Context {
-                pt,
-                mem: &mut DirectMap,
-                tlb: &mut tlb,
-                frames: &mut KernelFrames,
-                services: &mut services,
-                fs: &mut live.fs,
-                net,
-                deadline,
-                pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
-                pages: &mut KernelPages,
-            };
-            let outcome = live.abi.handle(&mut live.cell, &mut cx);
-            let deadline = cx.deadline;
+        let _call = cost::syscall(&live.cell);
+        let mut sockets = CallNet::default();
+        let mut cx = Context {
+            pt,
+            mem: &mut DirectMap,
+            tlb: &mut tlb,
+            frames: &mut KernelFrames,
+            services: &mut services,
+            fs: &mut live.fs,
+            net: &mut sockets,
+            deadline,
+            pager: &mut CellPager(&mut live.lazy, &mut pager_tlb),
+            pages: &mut KernelPages,
+        };
+        let outcome = live.abi.handle(&mut live.cell, &mut cx);
+        let deadline = cx.deadline;
+        let waits = || matches!(live.cell.threads.current().wait, Wait::Io { .. });
+        if let Some((net, changes)) = sockets.0.as_mut() {
             // A call that waits on descriptors joins the wait queues of the
-            // sockets it looked at (design D1 of `add-socket-wait-queues`).
-            let waits = || matches!(live.cell.threads.current().wait, Wait::Io { .. });
+            // sockets it looked at (design D1 of `add-socket-wait-queues`),
+            // under the lock it looked at them with.
             if net.end_call(|| waits().then_some(live.cell.id)) {
                 WOKEN.store(true, Ordering::Release);
             }
-            if prof::on() {
-                if net.changes() != changes {
-                    prof::net_changed(now_ns());
-                }
-                if core::mem::take(&mut live.io_woken) && waits() {
-                    prof::add(Count::IoWasted, 1);
-                }
+            if prof::on() && net.changes() != *changes {
+                prof::net_changed(now_ns());
             }
-            (outcome, deadline)
-        })
+        }
+        if prof::on() && core::mem::take(&mut live.io_woken) && waits() {
+            prof::add(Count::IoWasted, 1);
+        }
+        (outcome, deadline)
     });
     prof::syscall_end(t0);
     // Only a call that blocked can have started the wait the wake-up is
@@ -2752,12 +2771,13 @@ pub fn bench(console: &mut impl Console) {
         return;
     }
     if crate::smp::count() > 1 {
-        let (serial, parallel, wake) = multi_core();
+        let (serial, parallel, wake, calls_serial, calls_parallel) = multi_core();
         let (one, four, shootdown) = parallel_threads();
         let _ = writeln!(
             rhizo_hal::ConsoleWriter(console),
             "rhizo-smp cpus={} serial_ns={serial} parallel_ns={parallel} ipi_wake_ns={wake} \
-             threads1_ns={one} threads4_ns={four} shootdown_ns={shootdown}",
+             threads1_ns={one} threads4_ns={four} shootdown_ns={shootdown} \
+             syscalls_serial_ns={calls_serial} syscalls_parallel_ns={calls_parallel}",
             crate::smp::count()
         );
         return; // the other metrics are measured with one CPU
@@ -3681,17 +3701,14 @@ fn threads() -> (u64, u64) {
 /// round trip to an idle CPU (wake it, run nothing, see it done), robust
 /// figure over 105.
 #[cfg(feature = "bench-cell")]
-fn multi_core() -> (u64, u64, u64) {
+fn multi_core() -> (u64, u64, u64, u64, u64) {
     const ROUNDS: usize = 3;
-    let image = test_image("spin");
     let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
-    let batch = |parallel: bool| {
+    let batch = |argv: &[&[u8]], parallel: bool| {
+        let image = test_image(core::str::from_utf8(argv[0]).unwrap_or("spin"));
         let mut host = Host::new();
         let ids: Vec<u32> = (0..4 * crate::smp::count())
-            .map(|_| {
-                host.spawn(image, &[b"spin", b"5"], false, false)
-                    .expect("spawn")
-            })
+            .map(|_| host.spawn(image, argv, false, false).expect("spawn"))
             .collect();
         let t0 = bench_clock();
         if parallel {
@@ -3705,10 +3722,17 @@ fn multi_core() -> (u64, u64, u64) {
         }
         ns(t0, t1)
     };
-    let mut serial: Vec<u64> = (0..ROUNDS).map(|_| batch(false)).collect();
-    let mut parallel: Vec<u64> = (0..ROUNDS).map(|_| batch(true)).collect();
-    serial.sort_unstable();
-    parallel.sort_unstable();
+    let median = |argv: &[&[u8]], parallel: bool| {
+        let mut t: Vec<u64> = (0..ROUNDS).map(|_| batch(argv, parallel)).collect();
+        t.sort_unstable();
+        t[ROUNDS / 2]
+    };
+    let spin: [&[u8]; 2] = [b"spin", b"5"];
+    let (serial, parallel) = (median(&spin, false), median(&spin, true));
+    // System calls of different cells (design D3 of `split-sockets-lock`):
+    // each `piper` writes and reads a byte through its pipe 20,000 times.
+    let piper: [&[u8]; 2] = [b"piper", b"20000"];
+    let (calls_serial, calls_parallel) = (median(&piper, false), median(&piper, true));
     fn nothing(x: u64) -> u64 {
         x
     }
@@ -3720,7 +3744,13 @@ fn multi_core() -> (u64, u64, u64) {
             ns(t0, bench_clock())
         })
         .collect();
-    (serial[ROUNDS / 2], parallel[ROUNDS / 2], robust(&mut wake))
+    (
+        serial,
+        parallel,
+        robust(&mut wake),
+        calls_serial,
+        calls_parallel,
+    )
 }
 
 /// With several CPUs (design D9 of `add-parallel-threads`): `parsum` with 1
