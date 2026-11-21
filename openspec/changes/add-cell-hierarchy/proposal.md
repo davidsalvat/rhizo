@@ -46,15 +46,32 @@ containment, implemented in four phases (design D16). It holds no code.
     or the host, never by the child.
   - `on_parent_end` is `cascade` (the default) or `promote`.
 - **Hierarchical budgets** (memory, CPU time, sockets, descendants):
-  carved from the parent's (reserved, or pooled on request), so fork bombs
-  are impossible. Reserved roots are admitted against what the kernel can
-  give. File data and kernel records are charged to memory.
-- **Loopback networks per cell**, shared only on request.
+  reserved in full from the parent's, so fork bombs are impossible. There
+  are no pools, but a mode field leaves room for them. Reserved roots are
+  admitted against what the kernel can give. File data and kernel records
+  are charged to memory.
+- **A loopback network per cell, never shared.** Siblings and copies talk
+  only through channels. The two-cell loopback tests and benchmarks become
+  two threads of one cell.
 - **The card behind kernel address translation**, with random card ports
   invisible to cells.
 - **Egress policy per cell** (`none`, `model`, an allowlist, `full`),
-  enforced in `rhizo-net`, inherited and only narrowed. Sockets never move
-  between cells.
+  enforced in `rhizo-net`, inherited and only narrowed. **The default is
+  `none`.** `rhizo chat` and agent templates pass `--egress model`.
+  Sockets never move between cells.
+- **A deny floor under every policy.** By default it holds the host's own
+  addresses as the guest sees them (QEMU's gateway to the host's
+  127.0.0.1, the tap's host address), except the model endpoint granted
+  explicitly.
+- **Exclusive CPU sets per domain**: a supported production option, not
+  the default, with its cost in density stated (D17).
+- **Audit log on the host**, append-only and hash-chained: grants,
+  revocations, re-parents, policy changes, egress denials (D18).
+- **Limits and failure modes** for every structure (tree depth 16, 256
+  handles per cell, and so on), with atomic tree operations (D19).
+- **Upgrade path:** the kernel reads the previous snapshot version,
+  `rhizo snapshot upgrade` converts older files, and `rhizo` speaks the
+  previous protocol version (D20).
 - **Storage channels between domains closed:**
   - `sysinfo` per cell;
   - `getpid` numbered within the domain;
@@ -69,7 +86,8 @@ containment, implemented in four phases (design D16). It holds no code.
   - `rhizo run --parent/--egress/--mem/...`;
   - `rhizo ps --tree`, `reparent`, `policy`;
   - subtree `kill`, `suspend` and `resume`;
-  - host access scoped to a subtree (`rhizo scope`).
+  - host access scoped to a subtree (`rhizo scope`);
+  - `rhizo audit`.
 
 **Phase 2: handles and channels.**
 
@@ -100,11 +118,11 @@ hot paths (design D16).
 
 ### Out of scope
 
-- **Modular or mutable cells** (adding a Python or Node.js capability to a
-  running cell, layered sub-templates). These are designed separately in
-  `add-cell-modules`, built on this design (D15).
-- **Closing timing channels.** They are reduced, listed and measured
-  (G4). Exclusive CPU sets and time partitions per domain are follow-ups.
+- **Modular cells.** Designed in `add-cell-modules`, in the same pull
+  request, built on this design (D15).
+- **Closing timing channels on shared CPUs.** They are reduced, listed and
+  measured (G4). Exclusive CPU sets remove the scheduler and core-private
+  caches from them. Fixed time partitions per domain are not designed.
 - **Name-based or content-based egress** (DNS, TLS SNI). The kernel
   filters addresses and ports. Names belong to a host-side egress proxy
   granted as an address.
@@ -112,23 +130,25 @@ hot paths (design D16).
 - **Signed snapshot files.**
 - **Host shared folders.** Views leave room for them.
 
-### Open questions for the user
+### Decisions taken by the user
 
-1. **Pooled children.** Should pooled children (dense forks of one agent,
-   sharing their parent's pool and a storage channel within the domain)
-   be offered at all, or only reserved ones?
-2. **Default egress.** Should the default for a root the host creates
-   without `--egress` be `none` (safe, but it breaks today's
-   `rhizo run python-agent` unless `--egress model` is given) or `model`?
-   The design assumes `none`, with `rhizo run python-agent` passing
-   `--egress model` itself.
-3. **The host gateway.** Should the deny floor contain the host's gateway
-   on QEMU's user network by default (it reaches the host's 127.0.0.1)?
-4. **CPU isolation.** Are exclusive CPU sets per domain (closing the
-   scheduler timing channel) wanted soon, given their cost in density?
-5. **Shared loopback within a domain.** Is shared loopback between
-   siblings acceptable as an explicit option, or should cells in one
-   domain talk only through channels?
+The user approved the recommendations, with the rule: **design for
+production, not just the proof of concept.**
+
+1. **Pooled children:** not offered; children are reserved only. The
+   budget record leaves room to add pools later.
+2. **Default egress of a root:** `none`. `rhizo chat` and agent templates
+   pass `--egress model` explicitly.
+3. **The host's 127.0.0.1 through the gateway:** denied by every policy by
+   default, except the model endpoint granted explicitly.
+4. **Exclusive CPU sets per domain:** a supported production option, not
+   the default, specified with its cost.
+5. **Siblings and loopback:** no shared loopback; siblings talk only
+   through channels.
+
+The production requirements that came with them are the audit log, the
+limits and failure modes, and the upgrade path. Module key management is
+in `add-cell-modules`.
 
 ## Capabilities
 
@@ -162,10 +182,15 @@ hot paths (design D16).
 - `crates/rhizo-fs`: metering, `/run/rhizo`, mounts and volumes.
 - `crates/rhizo-abi`: SEQPACKET endpoints, `SCM_RIGHTS`, `sysinfo`,
   `getpid`.
-- `crates/rhizo-snapshot`: versions 11 to 13.
-- `crates/rhizo-control`: version 4.
+- `crates/rhizo-snapshot`: versions 11 to 13, reading the previous
+  version, upgrade steps.
+- `crates/rhizo-control`: version 4, the previous version on the host
+  side, `audit` frames.
+- `crates/rhizo-sched`: exclusive CPU sets.
 - `kernel/src/cell.rs`, `kernel/src/control.rs`, `kernel/src/tests.rs`,
-  `cells/src/bin` (hostile colluders), `cli/`, `xtask/src/bench.rs`,
+  `cells/src/bin` (hostile colluders, the `loopback` cell's thread pair),
+  `cli/` (audit log, `snapshot upgrade`, floor, `--cpus`),
+  `xtask/src/bench.rs`,
   `docs/security.md`, `docs/audit-scope.md` (B2 changes, a new boundary
   for the kernel endpoint).
 - No new third-party dependency.

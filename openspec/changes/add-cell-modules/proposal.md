@@ -47,8 +47,16 @@ there. This change adds the module-specific parts:
   builds), and freezes. The host reviews, and signs after operator
   approval. Agents can request a module as a lockfile, never publish one.
   `pip install` inside an agent stays private to its tree.
-- **Static chat agent** (`cells/c/chat.c`) that adds `python` only on its
-  first snippet. `rhizo chat --agent static|python`.
+- **Package proxy** (`rhizo proxy`): it serves only the lockfile's files
+  with their pinned hashes from the configured index, takes a token per
+  build, listens only where the guest reaches the host, and logs as JSON
+  lines (D5a).
+- **Key management**: `rhizo keys generate`, `rotate` and `revoke`; a
+  trust directory with key validity; a signed, sequence-numbered
+  revocation list (D4a).
+- **Static chat agent** (`cells/c/chat.c`), the default of `rhizo chat`,
+  that adds `python` only on its first snippet.
+  `rhizo chat --agent static|python`.
 - **`rhizo module` commands:**
   - `load`, `build [--twice]`, `review`, `approve`, `request`, `list`;
   - `rhizo approvals`, `approve`, `deny`;
@@ -74,16 +82,25 @@ This change needs phases 1, 2 and 4 of `add-cell-hierarchy` (tree,
 budgets, egress, channels, the kernel endpoint) and phase 3 for file-only
 modules, plus `snapshots-on-disk`. Its tasks start after those.
 
-### Open questions for the user
+### Decisions taken by the user
 
-1. **Who approves a root agent's adds.** Should the approver of a root
-   agent's `ask` modules default to the host (an operator prompt), with
-   no way to approve automatically by policy?
-2. **The package proxy.** Should Rhizo ship the host-side package proxy
-   for the builder, or document using an existing one (a pip-compatible
-   mirror)?
-3. **Defaults for `rhizo chat`.** Is the static chat agent the intended
-   default for `rhizo chat` once it passes the transcript?
+The rule is **design for production, not just the proof of concept**.
+
+1. **A root agent's sensitive modules** always need the operator's
+   approval. No policy can make them automatic (design D2).
+2. **The builder's package proxy** is production-grade. Rhizo ships its
+   own minimal proxy on the host (`rhizo proxy`), which enforces the
+   lockfile's allowlist and checks pinned hashes before serving, and logs
+   every request (D5a).
+3. **The static chat agent** becomes the default for `rhizo chat` once it
+   exists (D6).
+4. **Key management** for signing is specified (D4a):
+   - generation, with module keys and an offline revocation key;
+   - rotation with a grace period;
+   - a signed revocation list with a sequence number against rollback;
+   - where keys live on the host.
+
+   Module events go to the audit log of `add-cell-hierarchy`.
 
 ## Capabilities
 
@@ -107,7 +124,11 @@ modules, plus `snapshots-on-disk`. Its tasks start after those.
 - `crates/rhizo-control` (approval events, module load).
 - `kernel/src/cell.rs` and `kernel/src/control.rs` (module table, spawn,
   approvals).
-- `cli/` (`rhizo module`, verification; new dependencies `ed25519-dalek`,
-  BSD-3-Clause, and `blake2`, MIT or Apache-2.0).
+- `cli/` (`rhizo module`, `rhizo keys`, `rhizo proxy`, verification).
+  New host-only dependencies:
+  - `ed25519-dalek` (BSD-3-Clause);
+  - `blake2` and `sha2` (MIT or Apache-2.0);
+  - `ureq` (MIT or Apache-2.0);
+  - `rustls` (Apache-2.0, ISC or MIT).
 - `cells/c/chat.c`, `cells/python/rhizo_module.py`, `rhizo-mod`.
 - `xtask/src/bench.rs`, `docs/security.md`.

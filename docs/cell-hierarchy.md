@@ -9,7 +9,9 @@ This is a readable summary of two proposed changes:
 
 The decisions and the alternatives that lost are in each change's
 `design.md`, and the requirements in its `specs/`. Nothing here is
-implemented yet.
+implemented yet. The user approved the design with one rule: **design
+for production, not just the proof of concept** (see
+[Decisions](#decisions)).
 
 ## The problem
 
@@ -81,8 +83,10 @@ A child's memory, CPU time, sockets and number of descendants are carved
 from its parent's budget when it is created, and come back when it ends.
 
 - A subtree can never hold more than its root was given.
-- Reserved siblings never compete, so one cannot tell what the other
-  uses. Pooled children, for density, share their parent's pool.
+- Children are reserved, only: siblings never compete, so one cannot
+  tell what the other uses. There are no shared pools. The budget record
+  keeps a mode field so pools could be added later, with their own
+  analysis.
 - A root with a memory limit is reserved. The kernel admits roots against
   what it can really give, so one domain's use never shows in another's
   errors.
@@ -90,9 +94,11 @@ from its parent's budget when it is created, and come back when it ends.
 
 ## Networks and egress
 
-- **Loopback becomes private per cell.** 127.0.0.1 in one cell is not
-  127.0.0.1 in another. A creator can share its network with a child on
-  purpose.
+- **Loopback becomes private per cell, and is never shared.** 127.0.0.1 in
+  one cell is not 127.0.0.1 in another. That includes siblings and fork
+  copies: cells talk to each other only through channels. A TCP tool
+  server in another cell is reached through a small relay that carries
+  TCP over a channel.
 - **The network card is behind address translation in the kernel.** The
   card ports are random and no cell sees them, so ports cannot signal.
 - **Egress policy per cell:**
@@ -102,8 +108,16 @@ from its parent's budget when it is created, and come back when it ends.
   - `full`.
 
   The policy is enforced in the kernel's sockets, inherited down the tree
-  and only narrowed. Denied connections get `EACCES`. Inbound datagrams
-  from outside the policy are dropped.
+  and only narrowed. **The default is `none`**: `rhizo chat` and agent
+  templates pass `--egress model` explicitly. Denied connections get
+  `EACCES` and are recorded in the audit log. Inbound datagrams from
+  outside the policy are dropped.
+- **A deny floor under every policy**, `full` included. By default it
+  holds the host's own addresses as the guest sees them. On QEMU's user
+  network the gateway leads to the host's 127.0.0.1, so no cell can
+  reach a database or development server on the host. The only
+  exceptions are the model endpoint the host grants, and the package
+  proxy for builder cells.
 - **The kernel knows addresses, not names.**
   - Allowing a DNS resolver allows exfiltration through DNS names.
   - An address shared by a CDN reaches every site behind it.
@@ -169,6 +183,67 @@ The phase 1 benchmarks measure a CPU-contention channel between two
 domains (`covert.cpu_bps`), and `docs/security.md` will publish the
 inventory with that number.
 
+## Exclusive CPU sets (production option)
+
+The host can give a domain CPUs of its own (`rhizo run --cpus 2-3`). Its
+cells run only there and no other cell does. That takes the scheduler and
+the core-private caches out of the timing channels.
+
+- **Not the default.** It costs density: the CPUs stay idle when their
+  domain is idle, and work is never stolen across the set's edge.
+- **Rules.** The boot CPU and at least one other CPU stay shared.
+- **What it leaves shared:** the last-level cache, memory bandwidth, the
+  kernel's locks and the card.
+- **Host side.** For it to mean anything, the VMM must pin each vCPU to
+  its own physical core (`rhizo up --pin`).
+- **Measured.** `covert.cpu_bps` is measured with and without sets.
+
+## Audit log
+
+The kernel reports every grant, revocation, re-parent, promotion, policy
+or limit change, cell creation and end, refused tree request and egress
+denial to the host.
+
+- **On the host.** `rhizo` appends the records to
+  `~/.rhizo/audit/` (or `/var/log/rhizo/`) as JSON lines, each carrying
+  the hash of the one before, so `rhizo audit verify` detects edited,
+  removed or missing records.
+- **Never blocking.** Cells never wait for the log. A full kernel buffer
+  (64 KiB) drops records, counts them and reports the count. Repeated
+  egress denials are folded to one record per cell and second.
+- **Forwarding.** Production deployments forward the files to an
+  append-only store.
+
+## Limits and failure modes
+
+Every structure has a bound, for example:
+
+- tree depth 16;
+- 1024 children per cell;
+- 256 handles and 128 channels per cell;
+- grant chains of 16;
+- 64 rules per policy;
+- 64-byte labels.
+
+Exceeding one gives a clear error (`EMLINK`, `EMFILE`, `EINVAL`, `EDQUOT`)
+and changes nothing. Tree operations are atomic: a fork into four that
+fails after two undoes the two. If the host's link is lost, cells keep
+running, and requests that wait for the host are refused at their
+deadline.
+
+## Upgrades
+
+- **Snapshots.** The kernel reads the current snapshot format and the one
+  before it. `rhizo snapshot upgrade` converts older files one version at
+  a time, filling new fields with their safest values (egress `none`, no
+  handles).
+- **Protocol.** `rhizo` speaks the current protocol version and the one
+  before it, and refuses older kernels with the upgrade steps:
+  1. suspend and save;
+  2. `rhizo down`, `rhizo up` with the new kernel;
+  3. upgrade the files;
+  4. load.
+
 ## Snapshots, forks and other machines
 
 - The tree position, budget, egress, ceiling and handles are cell state
@@ -194,6 +269,9 @@ rhizo grant view 3:/data 7:/mnt/data --snapshot
 rhizo revoke G
 rhizo scope 3 --socket ./agent3.sock   # a host socket limited to 3's subtree
 rhizo kill 3 --tree
+rhizo run agent --egress model --cpus 2-3 # an exclusive CPU set
+rhizo audit tail --cell 7                # who granted what, what was denied
+rhizo snapshot upgrade old.snap new.snap
 ```
 
 A cell creates children (phase 4) through `/run/rhizo/kernel`, a channel
@@ -220,40 +298,70 @@ agent ◄── /run/rhizo/chan/np ── child cell (copy of python+numpy templ
   the child egress, wait for the parent's or the operator's approval.
   A module never gets more egress than the agent: **adding `requests`
   grants no internet access.**
+- **A root agent's sensitive modules always wait for the operator.** No
+  policy can make them automatic.
 - **The catalogue holds only signed modules.** They are snapshot files
-  plus a manifest, signed with minisign (Ed25519). The keys stay on the
-  host. Cells and the kernel never hold them.
+  plus a manifest, signed with minisign (Ed25519).
+- **Key management.**
+  - Secret keys stay with the operator: an encrypted key file, or an
+    HSM or KMS behind a signing command. Cells, the kernel and builders
+    never see them.
+  - Trusted public keys carry a purpose and a validity.
+  - `rhizo keys rotate` re-signs the catalogue and gives the old key a
+    grace period.
+  - Revocations go into a list signed by an offline revocation key, whose
+    sequence number prevents rollback.
 - **A builder cell is the only way into the catalogue.** It runs in its
-  own domain, its only egress is the package index (through a host
-  proxy), and it installs from a lockfile with pinned hashes. Two builds
+  own domain. Its only egress is **Rhizo's own package proxy**
+  (`rhizo proxy`) on the host, which:
+  - serves only the files the build's lockfile names, from the
+    configured index over verified TLS;
+  - checks each file's pinned SHA-256 before serving a byte;
+  - takes a token per build;
+  - listens only where the guest reaches the host;
+  - logs every request.
+
+  The builder installs from that lockfile. Two builds
   must give the same file tree, and the result is signed after the
   operator reviews it. `pip install` inside an agent stays private to
   that agent's tree.
-- **A small static chat agent** talks to the model without CPython, and
-  adds the `python` module only when the model asks it to run a snippet.
+- **A small static chat agent**, the default of `rhizo chat` once it
+  exists, talks to the model without CPython, and adds the `python`
+  module only when the model asks it to run a snippet.
 
 ## Phases
 
 | Phase | What | Key tests | Key benchmarks |
 |---|---|---|---|
-| 1 | Tree, budgets, private loopback, address translation on the card, egress, storage channels closed, scoped host access | Differential colluders in two domains, egress per level, fork bomb, forged snapshot authority | No regression on system calls, switches, forks, loopback, network; `net.egress_check_insns`, `covert.cpu_bps` |
+| 1 | Tree, reserved budgets, private loopback, address translation on the card, egress with the floor, storage channels closed, scoped host access, CPU sets, audit log, limits, upgrades | Differential colluders in two domains, egress per level, fork bomb, forged snapshot authority | No regression on system calls, switches, forks, loopback, network; `net.egress_check_insns`, `covert.cpu_bps` |
 | 2 | Handles, channels, exposure ceilings, subtree snapshots | Forged handle numbers, rights cannot grow, sockets cannot be passed, proxy past the ceiling, revocation everywhere | `cell.channel_rtt_us` (not above loopback), `cell.handle_pass_us`, `cell.revoke_us`, `cell.grant_us` |
 | 3 | Snapshot and live views | Renames do not signal, climbing out of a view, writing through read-only | `cell.view_grant_us`, `cell.view_read_us` |
 | 4 | Cells creating cells | Fork bomb from inside, a child cannot escape | `cell.child_spawn_us` |
-| Modules | Module policy, approvals, signed catalogue, builder, static chat | `requests` grants no internet, signatures, confined builder, private pip | `module.add_us`, `module.extra_bytes`, `chat.static_bytes` |
+| Modules | Module policy, approvals, signed catalogue with key management, package proxy, builder, static chat | `requests` grants no internet, signatures, confined builder, private pip | `module.add_us`, `module.extra_bytes`, `chat.static_bytes` |
 
-## Open questions
+## Decisions
 
-The full list is in each change's proposal. The main ones:
+The user approved the recommendations, with the rule **design for
+production, not just the proof of concept**:
 
-1. Should pooled children (dense, but sharing a pool inside the domain)
-   be offered at all?
-2. Should a root created without `--egress` default to `none` or to
-   `model`?
-3. Should every policy deny the host's own gateway on QEMU's user network
-   by default?
-4. Are exclusive CPU sets per domain wanted soon, against density?
-5. Should siblings be allowed to share a loopback network, or talk only
-   through channels?
-6. Who approves a root agent's sensitive modules, and does Rhizo ship the
-   builder's package proxy?
+1. **Pooled children:** not offered; reserved only, with room to add pools
+   later.
+2. **Default egress of a root:** `none`. `rhizo chat` and agent templates
+   pass `--egress model`.
+3. **The host's 127.0.0.1 through the gateway:** denied by every policy by
+   default, except the model endpoint granted explicitly.
+4. **Exclusive CPU sets per domain:** a supported production option, not
+   the default, with its cost stated.
+5. **Siblings and loopback:** no shared loopback; siblings talk only
+   through channels.
+6. **A root agent's sensitive modules:** always the operator's approval.
+7. **The builder's package proxy:** Rhizo ships its own minimal proxy
+   that enforces the lockfile's allowlist and checks pinned hashes.
+8. **The static chat agent:** the default of `rhizo chat` once it exists.
+
+The production requirements that came with these decisions are:
+
+- key management for signing;
+- the audit log;
+- limits and failure modes;
+- the upgrade path for snapshots and the protocol.

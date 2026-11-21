@@ -87,3 +87,14 @@ emptied per domain, and charged to the domain's root.
 #### Scenario: Flushing another domain
 - **WHEN** a cell maps more file pages than its domain may keep, while a cell of another domain maps a library page again and again
 - **THEN** the second cell's mappings stay cache hits, and its page is never copied again
+
+### Requirement: Exclusive CPU sets per domain
+The host MAY give a root an exclusive set of CPUs: the cells of its domain
+SHALL then run only on those CPUs and no other cell SHALL run there, so
+CPU scheduling and core-private caches are not shared with other
+domains. The boot CPU SHALL never be exclusive, and the sets of all roots
+SHALL leave at least one CPU shared.
+
+#### Scenario: Contention channel closed
+- **WHEN** a sender and a receiver of the CPU-contention channel run in two domains with exclusive sets of one CPU each
+- **THEN** `covert.cpu_bps` with sets is reported next to the figure without, and the receiver's timings do not follow the sender's bits

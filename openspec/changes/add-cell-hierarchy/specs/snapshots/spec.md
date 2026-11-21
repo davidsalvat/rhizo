@@ -5,9 +5,10 @@
 ### Requirement: Snapshot format
 A snapshot SHALL encode to a versioned byte sequence (format version 13:
 11 adds the tree state, 12 handles, 13 views) tagged with its
-architecture, independent of in-memory layouts, and decoding SHALL reject
-a sequence that is truncated, corrupted, of another version or of another
-architecture with an error naming the reason.
+architecture, independent of in-memory layouts. Decoding SHALL accept the
+current version and the one before it, and SHALL reject a sequence that
+is truncated, corrupted, of an older or newer version, or of another
+architecture, with an error naming the reason and the versions read.
 
 #### Scenario: Wrong architecture
 - **WHEN** a snapshot taken on one architecture is decoded on the other
@@ -19,12 +20,23 @@ architecture with an error naming the reason.
 
 ## ADDED Requirements
 
+### Requirement: Snapshot upgrades
+A snapshot of the previous format version SHALL decode into the current
+state with the new fields at their safest defaults (egress `none`, no
+handles, no views, the host choosing its place), and `rhizo snapshot
+upgrade` SHALL rewrite a file of any older version, one version at a time,
+into the current one; encoding SHALL write only the current version.
+
+#### Scenario: A version-10 file
+- **WHEN** a snapshot file saved by a version-10 kernel is upgraded and loaded
+- **THEN** the cell resumes with egress `none`, no handles, and the limits its new parent allows
+
 ### Requirement: Tree state in snapshots
-A snapshot SHALL hold the cell's limits and reservation mode, its policy
-for when its parent ends, its egress policy and ceiling, whether it
-shares a loopback network, its identifier in its domain and its label.
-Resumed in the kernel that took it, the cell SHALL come back under its
-parent; if the parent ended, that policy SHALL already have applied.
+A snapshot SHALL hold the cell's limits and budget mode, its policy for
+when its parent ends, its egress policy and ceiling, its CPU set, its
+identifier in its domain and its label. Resumed in the kernel that took
+it, the cell SHALL come back under its parent; if the parent ended, that
+policy SHALL already have applied.
 
 #### Scenario: Policy across suspend
 - **WHEN** a child with egress `model` and a 16 MiB limit is suspended and resumed

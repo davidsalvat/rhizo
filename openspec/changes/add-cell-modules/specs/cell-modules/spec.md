@@ -70,11 +70,20 @@ An add SHALL wait for the approver when its entry asks for it or the
 child would get egress its entry does not grant. The approver SHALL be
 the parent, through an `approvals` channel the kernel gives it, or the
 host; a cell SHALL have at most one pending request, refused after its
-deadline or on a suspend.
+deadline or on a suspend. Each answer SHALL be an audit record.
 
 #### Scenario: Approve, deny, time out
 - **WHEN** three adds needing approval are answered by approve, by deny, and not at all
 - **THEN** the first makes the child, the second and third are refused, the third after its deadline
+
+### Requirement: The operator approves for roots
+For a root cell, every add that needs approval, or would give the child
+any egress, SHALL wait for the operator (the host), whatever its policy
+says: no entry and no approver setting SHALL make it automatic.
+
+#### Scenario: Root agent asks for requests
+- **WHEN** a root agent whose policy marks `requests` with `egress = "granted"` and names itself as approver adds `requests`
+- **THEN** the request waits until the operator runs `rhizo approve`, and the audit log records the operator's answer
 
 ### Requirement: Signed module files
 A module file SHALL be a snapshot file followed by a canonical manifest
@@ -126,3 +135,43 @@ table.
 #### Scenario: pip inside an agent
 - **WHEN** an agent whose egress allows the index runs `pip install` and its sibling and a cell of another domain look for the package
 - **THEN** neither finds it, and nothing of it remains after the agent's tree ends
+
+### Requirement: Signing keys
+Secret keys SHALL stay outside cells, the kernel and builders: in a
+passphrase-encrypted file of the operator or behind a signing command.
+Trusted public keys SHALL carry a purpose and a validity, and `rhizo`
+SHALL refuse a trust directory or file that others can write, and a
+signature made outside its key's validity.
+
+#### Scenario: Rotation
+- **WHEN** a module key is rotated with a grace period of 30 days
+- **THEN** modules re-signed by the new key load, and those signed only by the old key load until the grace period ends and not after
+
+### Requirement: Signed revocation list
+Revoked keys and module digests SHALL be listed in a file signed by a
+revocation key, with a sequence number; `rhizo` SHALL refuse a list with
+a bad signature or a lower sequence number than the last it saw, and
+SHALL report loaded modules the list revokes.
+
+#### Scenario: Rollback refused
+- **WHEN** an older revocation list replaces the current one
+- **THEN** `rhizo module load` refuses to run until the current list is back
+
+### Requirement: Package proxy
+`rhizo proxy` SHALL serve a builder only the projects, versions and files
+the build's lockfile names, fetched from the configured index over
+verified TLS, each checked against its pinned SHA-256 before any byte is
+served; requests without a live build token SHALL get `403`. It SHALL
+listen only where the guest reaches the host and log every request.
+
+#### Scenario: Off-list and tampered files
+- **WHEN** a builder asks the proxy for a project outside its lockfile, and upstream serves a pinned file with other bytes
+- **THEN** the first gets `404`, the second `502` with no byte served, the build fails, and both are in the proxy's log
+
+### Requirement: Only builders reach the proxy
+The proxy's address SHALL stay in every cell's deny floor except for
+builder cells, so no agent can reach it.
+
+#### Scenario: Agent tries the proxy
+- **WHEN** an agent with egress `full` connects to the proxy's address
+- **THEN** it receives `EACCES` and the denial is audited

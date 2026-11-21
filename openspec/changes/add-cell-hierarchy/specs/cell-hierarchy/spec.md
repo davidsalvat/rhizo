@@ -79,10 +79,12 @@ descendants are finite, so a subtree never holds more than its root got.
 - **WHEN** a cell with a limit of 8 descendants and 64 MiB makes children that each try to make children without end
 - **THEN** at most 8 cells are made in its subtree, the rest are refused, another domain runs undisturbed, and everything comes back when the subtree ends
 
-### Requirement: Pooled children
-A parent MAY create a child pooled instead of reserved: its limits are then
-caps, and what it takes SHALL come from the parent's free budget when it
-takes it. A reserved child's refusals SHALL depend only on its own use.
+### Requirement: Reserved children only
+Every child's limits SHALL be reserved in full from its parent's budget
+when it is made; no child SHALL draw from a pool shared with its
+siblings. A child's refusals SHALL depend only on its own use. The
+budget record SHALL carry a mode field, always `reserved`, so that other
+modes can be added by a later change.
 
 #### Scenario: Reserved siblings do not see each other
 - **WHEN** a reserved child takes memory until refused while its reserved sibling probes how much it can take, and again with the first idle
@@ -112,8 +114,8 @@ domain keeps.
 
 ### Requirement: No ambient authority
 A new cell SHALL hold no handle but those its creator gives it, and a
-loopback network of its own unless its creator names one to share: no
-channel, no cell handle, no view and no kernel endpoint.
+loopback network of its own that no other cell shares: no channel, no
+cell handle, no view, no kernel endpoint and, by default, egress `none`.
 
 #### Scenario: A new cell looks around
 - **WHEN** a cell created with no grants lists `/run/rhizo`, connects to every loopback port and opens every descriptor number up to 1023
@@ -175,8 +177,8 @@ a revoked view SHALL disappear.
 ### Requirement: Exposure ceilings
 Each cell SHALL have an exposure ceiling, an egress policy at least its
 own, set by its creator and only narrowed. The kernel SHALL refuse
-(`EACCES`) a grant, transfer, accepted channel, creation, move or shared
-loopback after which information could flow from a cell, through cells
+(`EACCES`) a grant, transfer, accepted channel, creation or move after
+which information could flow from a cell, through cells
 that are not its ancestors, to a cell whose egress exceeds that ceiling.
 
 #### Scenario: No proxy to the internet
@@ -229,10 +231,33 @@ refused without harm.
 ### Requirement: Children made by a cell
 A child made at a cell's request SHALL be its child: a fork of it, a copy
 of a template it holds a control handle on, or a program from its own
-files; with limits carved from its budget, egress within its own, its own
-loopback network unless shared within its ceiling, and only the handles
-the request passes. The creator SHALL receive a control handle on it.
+files; with limits carved from its budget, egress within its own, a
+loopback network of its own, and only the handles the request passes. The creator SHALL receive a control handle on it.
 
 #### Scenario: Child spawned from inside
 - **WHEN** a cell with the spawn right forks itself into a child with 16 MiB and egress `none`, passing one channel
 - **THEN** the child runs with those limits and that egress, holds only that channel, and the parent holds a control handle on it
+
+### Requirement: Limits of the hierarchy
+The kernel SHALL bound: tree depth to 16 below the host, children of one
+cell to 1024, handles per cell to 256, derivation chains of a grant to 16,
+channels a cell holds to 128, channels waiting in an inbox to 64, rules in
+an egress policy to 64, entries in the host's deny floor to 64, and labels
+to 64 bytes. A request past a bound SHALL fail with its reason (`EMLINK`
+for depth and chains, `EMFILE` for handles and channels, `EINVAL` for
+sizes) and change nothing.
+
+#### Scenario: Too deep
+- **WHEN** cells make children down to depth 16 and the deepest asks for one more
+- **THEN** it is refused with `EMLINK`, and every cell of the chain keeps running
+
+### Requirement: Failures leave a consistent tree
+A refused or failed tree operation SHALL change nothing: no cell made in
+part, no reservation taken, no handle granted. If the host's link is lost,
+cells SHALL keep running, requests waiting for the host SHALL be refused
+at their deadline, and audit records SHALL be kept up to the kernel's
+bound and the rest counted as dropped.
+
+#### Scenario: Fork that cannot finish
+- **WHEN** a fork into four copies runs out of memory after making two
+- **THEN** the two are undone, the parent's free budget is what it was, and the request reports the memory error

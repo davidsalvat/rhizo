@@ -21,3 +21,13 @@ approver is the host, and `rhizo approvals`, `rhizo approve ID` and
 #### Scenario: Operator approves
 - **WHEN** an agent asks for an `ask` module and the operator runs `rhizo approve` on its request
 - **THEN** the agent receives the module's channel
+
+### Requirement: Key and proxy commands
+`rhizo` SHALL offer `keys generate --purpose modules|revocation`, `keys
+rotate`, `keys revoke`, `module resign`, `module check` (loaded or
+catalogue modules that are revoked or about to expire), `module unload
+[--kill]` and `proxy` (the package proxy, also started by `module build`).
+
+#### Scenario: Revoking a loaded module
+- **WHEN** the operator revokes the digest of a module loaded in a running VM and runs `rhizo module check`, then `rhizo module unload --kill`
+- **THEN** the check names the module, no new add of it succeeds, and its running copies end
