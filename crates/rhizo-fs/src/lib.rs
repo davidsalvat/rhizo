@@ -37,6 +37,9 @@ pub const BLOCK: usize = 4096;
 pub const NAME_MAX: usize = 255;
 /// Most descriptors a cell may have open.
 pub const FD_MAX: usize = 1024;
+/// Sockets a cell may hold until the kernel sets its quota
+/// (`rhizo_cell::quota::SOCKETS_DEFAULT`, finding S21).
+pub const SOCKETS_DEFAULT: usize = 256;
 /// Most file data a cell may hold, and the largest file size (bytes).
 pub const DATA_MAX: u64 = 256 << 20;
 /// Most files and directories a cell may have (the root included): bounds
@@ -56,6 +59,8 @@ pub enum Error {
     Invalid,
     NameTooLong,
     TooManyFiles,
+    /// The cell holds as many sockets as its quota allows (`ENFILE`).
+    TooManySockets,
     Busy,
     /// The cell holds [`DATA_MAX`] bytes of file data, or [`INODES_MAX`]
     /// files and directories.
@@ -93,6 +98,7 @@ impl Error {
             Error::NotDir => 20,
             Error::IsDir => 21,
             Error::Invalid => 22,
+            Error::TooManySockets => 23,
             Error::TooManyFiles => 24,
             Error::TooBig => 27,
             Error::NoSpace => 28,
@@ -310,6 +316,10 @@ pub struct Tables {
     /// Socket handles whose last description closed, for the kernel to
     /// release ([`Tables::take_released`]); empty between system calls.
     released: Vec<u32>,
+    /// Descriptors the cell may have open (its quota, at most [`FD_MAX`]).
+    fd_limit: usize,
+    /// Sockets (open socket descriptions) the cell may hold.
+    socket_limit: usize,
     /// The pipe whose write end the host holds, outside the descriptors:
     /// standard input from the host ([`Tables::host_input`]).
     input: Option<u32>,
@@ -343,10 +353,26 @@ impl Tables {
             used: 0,
             objects: Vec::new(),
             released: Vec::new(),
+            fd_limit: FD_MAX,
+            socket_limit: SOCKETS_DEFAULT,
             input: None,
 
             changes: 0,
         }
+    }
+
+    /// Sets the cell's quotas on descriptors (`EMFILE` past it, capped at
+    /// [`FD_MAX`]) and sockets (`ENFILE` past it). Descriptors already open
+    /// stay open. Not encoded: the kernel sets them from the cell's quota.
+    pub fn set_limits(&mut self, files: usize, sockets: usize) {
+        self.fd_limit = files.min(FD_MAX);
+        self.socket_limit = sockets;
+    }
+
+    /// The limits [`set_limits`](Self::set_limits) set: descriptors and
+    /// sockets ([`FD_MAX`] and [`SOCKETS_DEFAULT`] until set).
+    pub fn limits(&self) -> (usize, usize) {
+        (self.fd_limit, self.socket_limit)
     }
 
     fn inode(&self, ino: Ino) -> &Inode {
@@ -506,7 +532,8 @@ impl Tables {
     }
 
     fn new_fd(&mut self, desc: u32, min: Fd, cloexec: bool) -> Result<Fd> {
-        let free = (min as usize..FD_MAX).find(|&i| self.fds.get(i).is_none_or(Option::is_none));
+        let free =
+            (min as usize..self.fd_limit).find(|&i| self.fds.get(i).is_none_or(Option::is_none));
         let fd = free.ok_or(Error::TooManyFiles)?;
         if self.fds.len() <= fd {
             self.fds.resize(fd + 1, None);
@@ -626,7 +653,7 @@ impl Tables {
             .flatten()
             .ok_or(Error::BadFd)?;
         if exact {
-            if min as usize >= FD_MAX {
+            if min as usize >= self.fd_limit {
                 return Err(Error::BadFd);
             }
             if min == fd {
