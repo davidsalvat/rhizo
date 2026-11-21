@@ -307,14 +307,21 @@ fn server(console: &mut impl Console) {
     let (mut host_cycles, mut host_ops) = (0u64, 0u64);
     let (mut suspend_ns, mut resume_ns, mut fork_ns) = (Vec::new(), Vec::new(), Vec::new());
     // From the run's stop condition: the other CPUs, if any, keep running
-    // their cells meanwhile (design D1 of `host-ops-per-cell`).
-    let mut done = false;
-    while !done {
+    // their cells meanwhile (design D1 of `host-ops-per-cell`). It is asked
+    // after every slice, so it does nothing more than read the clock until
+    // an operation is due: every slice's cost is a queued cell's latency.
+    loop {
         host.run(|host| {
             let now = now_ns();
-            peak = peak.max(start - memory::free_bytes());
-            if now >= next_op && now < stop_ops {
+            if now >= stop_ops {
+                if let Some(id) = child.take() {
+                    host.kill(id);
+                }
+                return now >= deadline;
+            }
+            if now >= next_op {
                 next_op = now + HOST_PERIOD_NS;
+                peak = peak.max(start - memory::free_bytes());
                 let c0 = Counter.cycles();
                 if let Some(id) = child.take() {
                     host.kill(id);
@@ -341,14 +348,13 @@ fn server(console: &mut impl Console) {
                 }
                 host_cycles += Counter.cycles() - c0;
             }
-            if now >= stop_ops
-                && let Some(id) = child.take()
-            {
-                host.kill(id);
-            }
-            done = host.live() == child.is_some() as usize || now >= deadline;
-            done
+            false
         });
+        // The run ended by itself (no cell can run again) or at the deadline.
+        peak = peak.max(start - memory::free_bytes());
+        if host.live() == child.is_some() as usize || now_ns() >= deadline {
+            break;
+        }
     }
     let elapsed = now_ns() - t0;
     // What each cell holds at the busiest point: its pages, tables, files,
