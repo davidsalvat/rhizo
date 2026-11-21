@@ -73,7 +73,7 @@ start it again.
   travel over TCP through the VM's network card, admitted with a one-time
   token, while requests stay on the serial line; a loaded file is checked
   (header, CRC-32C, every field), may not name a physical page, and its
-  quotas are capped. A cell of a loaded template answers about 3 to 4 times
+  quotas are capped. A cell of a loaded template answers about 3 times
   sooner than a cold agent.
 - **Threads.** `pthread_create`, mutexes, condition variables and futexes;
   snapshots, forks and templates carry every thread.
@@ -85,7 +85,7 @@ start it again.
   cell needs run more threads of a running cell at once (TLB shootdowns on
   x86_64); only system calls on sockets take turns. A host operation on one
   cell (suspend, resume, fork, freeze, kill) stops only the CPUs running that
-  cell: the others keep running, and stall about 7 times less than when every
+  cell: the others keep running, and stall about 6 to 7 times less than when every
   CPU stopped.
 - **CPython and packages from PyPI.** Unmodified CPython 3.13 runs as a cell,
   its standard library in the cell's own files; a template frozen after its
@@ -98,7 +98,7 @@ start it again.
   unmodified, runs as a cell with its JIT: V8 asks for memory both writable
   and executable, and the kernel gives it pages that are either, changed on
   faults, never both (change `node-jit`); with the JIT a cold start is about
-  16% faster than with `--jitless`. A cell forked from Node.js frozen after
+  16 to 23% faster than with `--jitless`. A cell forked from Node.js frozen after
   its warm-up answers in about 4 to 6 ms, against about 35 to 46 ms from a
   cold start, in a cell or as a Linux process (which cannot fork Node.js).
 - **Control plane.** `rhizo`, a command-line tool on the host, drives a
@@ -187,7 +187,7 @@ the same run:
   CPUs wake about once a second.
 - **Server**: 10,000 busy cells in a 1 GiB VM with one vCPU, about 35,000 to
   46,000 operations per second; the 99th percentile of the time a cell waits
-  to be woken (about 1.4 to 4 ms, Firecracker the slowest) is gated like the
+  to be woken (about 0.6 to 4 ms, Firecracker the slowest) is gated like the
   other figures. Pushed until memory runs out (about 46,000 to 48,000 idle
   cells), the kernel refuses new cells cleanly and gets every byte back, its
   heap included.
