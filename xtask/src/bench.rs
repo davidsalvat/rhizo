@@ -527,6 +527,7 @@ fn measure_cells(
         shard: None,
         selfcheck: None,
         control: false,
+        vsock: None,
     };
     let mut pt_frames = None;
     let mut snapshot_bytes = None;
@@ -925,6 +926,7 @@ fn measure_runtime(
         shard: None,
         selfcheck: None,
         control: false,
+        vsock: None,
     };
     for &vmm in &opts.vmms {
         if vmm.unavailable_reason(opts.accel).is_some() {
@@ -1358,6 +1360,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         shard: None,
         selfcheck: None,
         control: false,
+        vsock: None,
     };
     let mut samples = Samples {
         ready_ms: Vec::new(),

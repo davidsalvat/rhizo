@@ -297,6 +297,7 @@ impl RunArgs {
             shard: None,
             selfcheck: None,
             control: false,
+            vsock: None,
         }
     }
 }

@@ -39,6 +39,10 @@ pub const MAX_PAYLOAD: usize = 1 << 20;
 /// holds (a pipe of 64 KiB), so an accepted request always fits an empty
 /// one.
 pub const MAX_INPUT: usize = 64 << 10;
+/// The virtio-vsock port a control kernel listens on (change
+/// `control-over-vsock`): the host connects there, and the stream carries
+/// the same frames as the serial line, without console text.
+pub const VSOCK_PORT: u32 = 1024;
 
 /// Frame kinds of requests, host to kernel.
 mod kind {

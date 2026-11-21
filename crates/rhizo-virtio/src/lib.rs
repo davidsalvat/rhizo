@@ -1,13 +1,14 @@
-//! A virtio network device (spec `networking`, design D1 and D3 of
-//! `add-virtio-net`, D1 of `add-virtio-pci`).
+//! Virtio devices: a network card (spec `networking`, design D1 and D3 of
+//! `add-virtio-net`, D1 of `add-virtio-pci`) and a socket device
+//! ([`vsock`], change `control-over-vsock`).
 //!
 //! [`VirtioNet::probe`] brings up a virtio-mmio device (version 2, the
 //! modern interface) and [`VirtioNet::probe_pci`] a modern virtio-pci one
 //! (found and set up with [`pci`]), each with a receive and a transmit
 //! split virtqueue, and the result is a [`NetLink`]. Registers are reached
 //! through [`DeviceRegisters`] and the rings and buffers through
-//! [`PhysicalMemory`]: the driver runs on the host against a simulated
-//! device. It polls: the device is asked for no interrupts.
+//! [`PhysicalMemory`]: the drivers run on the host against simulated
+//! devices. They poll: devices are asked for no interrupts.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -18,6 +19,7 @@ use alloc::vec::Vec;
 use rhizo_hal::{DeviceRegisters, NetLink, PhysicalMemory};
 
 pub mod pci;
+pub mod vsock;
 
 /// virtio-mmio register offsets (virtio 1.2, section 4.2.2).
 pub mod reg {
@@ -47,6 +49,8 @@ pub mod reg {
 pub const MAGIC: u32 = 0x7472_6976;
 /// Device ID of a network card.
 pub const NET_DEVICE: u32 = 1;
+/// Device ID of a socket device (virtio-vsock).
+pub const VSOCK_DEVICE: u32 = 19;
 /// Bytes of registers a virtio-mmio device takes.
 pub const REGION: u64 = 0x200;
 
@@ -57,6 +61,7 @@ const FEATURES_OK: u32 = 8;
 const F_MAC: u32 = 1 << 5;
 /// `VIRTIO_F_VERSION_1`, bit 32: the second feature word's bit 0.
 const F_VERSION_1: u32 = 1;
+const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 const AVAIL_F_NO_INTERRUPT: u16 = 1;
 const USED_F_NO_NOTIFY: u16 = 1;
@@ -95,8 +100,8 @@ pub enum ProbeError {
     NotVirtio,
     /// A legacy (or unknown) virtio-mmio version.
     Version(u32),
-    /// Not a network card (0: no device behind the transport).
-    NotNet(u32),
+    /// Another kind of device (0: no device behind the transport).
+    Other(u32),
     /// The device does not offer `VIRTIO_F_VERSION_1`, or refused ours.
     Features,
     /// A queue is missing or already in use.
@@ -163,6 +168,14 @@ impl<R: DeviceRegisters> Transport<R> {
                 [a[0], a[1], a[2], a[3], b[0], b[1]]
             }
             Self::Pci(p) => core::array::from_fn(|i| p.device.read8(i)),
+        }
+    }
+
+    /// The 32-bit word at `offset` of the device configuration.
+    fn config32(&mut self, offset: usize) -> u32 {
+        match self {
+            Self::Mmio(r) => r.read32(reg::CONFIG + offset),
+            Self::Pci(p) => p.device.read32(offset),
         }
     }
 
@@ -257,12 +270,26 @@ impl Queue {
         u16::from_le_bytes(b)
     }
 
-    /// Sets descriptor `id` to its buffer, `len` bytes, `flags`.
-    fn describe(&self, mem: &mut impl PhysicalMemory, id: u16, len: u32, flags: u16) {
+    /// Sets descriptor `id` to its buffer, `len` bytes, `flags`, chained to
+    /// descriptor `id + 1` if `chained`.
+    fn describe(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        id: u16,
+        len: u32,
+        flags: u16,
+        chained: bool,
+    ) {
         let mut d = [0u8; 16];
         d[..8].copy_from_slice(&self.bufs[id as usize].to_le_bytes());
         d[8..12].copy_from_slice(&len.to_le_bytes());
+        let (flags, next) = if chained {
+            (flags | DESC_F_NEXT, id + 1)
+        } else {
+            (flags, 0)
+        };
         d[12..14].copy_from_slice(&flags.to_le_bytes());
+        d[14..16].copy_from_slice(&next.to_le_bytes());
         mem.write_bytes(self.frame + u64::from(id) * 16, &d);
     }
 
@@ -319,28 +346,15 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
     /// rings and buffers from `alloc` (never returned: the card lives as
     /// long as the kernel).
     pub fn probe(
-        mut regs: R,
+        regs: R,
         mem: M,
         alloc: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<Self, ProbeError> {
-        if regs.read32(reg::MAGIC) != MAGIC {
-            return Err(ProbeError::NotVirtio);
-        }
-        // An empty transport (device 0) is not an error, whatever its
-        // version.
-        match regs.read32(reg::DEVICE_ID) {
-            NET_DEVICE => {}
-            id => return Err(ProbeError::NotNet(id)),
-        }
-        match regs.read32(reg::VERSION) {
-            2 => {}
-            v => return Err(ProbeError::Version(v)),
-        }
-        Self::start(Transport::Mmio(regs), mem, alloc)
+        Self::start(mmio(regs, NET_DEVICE)?, mem, alloc)
     }
 
     /// Brings up the modern virtio-pci network card whose structures
-    /// `transport` reaches (see [`pci::net_regions`]), taking frames as
+    /// `transport` reaches (see [`pci::regions`]), taking frames as
     /// [`probe`](Self::probe) does.
     pub fn probe_pci(
         transport: pci::Transport<R>,
@@ -356,30 +370,14 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
         mut mem: M,
         alloc: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<Self, ProbeError> {
-        regs.set_status(0);
-        while regs.status() != 0 {
-            core::hint::spin_loop(); // the reset is not done yet
-        }
-        regs.set_status(ACKNOWLEDGE);
-        regs.set_status(ACKNOWLEDGE | DRIVER);
-        let low = regs.device_features(0);
-        let high = regs.device_features(1);
-        if high & F_VERSION_1 == 0 {
-            return Err(ProbeError::Features);
-        }
-        regs.set_driver_features(0, low & F_MAC);
-        regs.set_driver_features(1, F_VERSION_1);
-        regs.set_status(ACKNOWLEDGE | DRIVER | FEATURES_OK);
-        if regs.status() & FEATURES_OK == 0 {
-            return Err(ProbeError::Features);
-        }
+        let low = negotiate(&mut regs, F_MAC)?;
         let mac = if low & F_MAC != 0 {
             regs.mac()
         } else {
             [0x02, 0, 0, 0, 0, 1] // locally administered
         };
-        let rx = Self::queue(&mut regs, &mut mem, alloc, 0)?;
-        let tx = Self::queue(&mut regs, &mut mem, alloc, 1)?;
+        let rx = queue(&mut regs, &mut mem, alloc, 0, QUEUE_SIZE)?;
+        let tx = queue(&mut regs, &mut mem, alloc, 1, QUEUE_SIZE)?;
         let mut card = Self {
             regs,
             mem,
@@ -391,7 +389,7 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
         };
         for id in 0..QUEUE_SIZE {
             card.rx
-                .describe(&mut card.mem, id, BUF as u32, DESC_F_WRITE);
+                .describe(&mut card.mem, id, BUF as u32, DESC_F_WRITE, false);
             card.rx.offer(&mut card.mem, id);
         }
         card.regs
@@ -399,42 +397,83 @@ impl<R: DeviceRegisters, M: PhysicalMemory> VirtioNet<R, M> {
         card.rx.publish(&mut card.mem, &mut card.regs);
         Ok(card)
     }
+}
 
-    /// Sets up queue `index` in a new frame, with buffers in more frames.
-    fn queue(
-        regs: &mut Transport<R>,
-        mem: &mut M,
-        alloc: &mut dyn FnMut() -> Option<u64>,
-        index: u16,
-    ) -> Result<Queue, ProbeError> {
-        if regs
-            .queue_max(index)
-            .is_none_or(|max| max < u32::from(QUEUE_SIZE))
-        {
-            return Err(ProbeError::Queue(index));
-        }
-        let mut frame = || {
-            let f = alloc().ok_or(ProbeError::OutOfMemory)?;
-            mem.zero_frame(f);
-            Ok::<u64, ProbeError>(f)
-        };
-        let ring = frame()?;
-        let mut bufs = Vec::with_capacity(QUEUE_SIZE as usize);
-        while bufs.len() < QUEUE_SIZE as usize {
-            let f = frame()?;
-            bufs.extend((0..FRAME / BUF).map(|i| f + i * BUF));
-        }
-        // The driver polls: no interrupts, please.
-        mem.write_bytes(ring + AVAIL_AT, &AVAIL_F_NO_INTERRUPT.to_le_bytes());
-        regs.enable_queue(index, QUEUE_SIZE, [ring, ring + AVAIL_AT, ring + USED_AT]);
-        Ok(Queue {
-            index,
-            frame: ring,
-            avail: 0,
-            used: 0,
-            bufs,
-        })
+/// The virtio-mmio transport behind `regs`, if it is version 2 and holds a
+/// device of type `device`.
+fn mmio<R: DeviceRegisters>(mut regs: R, device: u32) -> Result<Transport<R>, ProbeError> {
+    if regs.read32(reg::MAGIC) != MAGIC {
+        return Err(ProbeError::NotVirtio);
     }
+    // An empty transport (device 0) is not an error, whatever its version.
+    match regs.read32(reg::DEVICE_ID) {
+        id if id == device => {}
+        id => return Err(ProbeError::Other(id)),
+    }
+    match regs.read32(reg::VERSION) {
+        2 => Ok(Transport::Mmio(regs)),
+        v => Err(ProbeError::Version(v)),
+    }
+}
+
+/// Resets the device and negotiates `VIRTIO_F_VERSION_1` and those bits of
+/// `wanted` (the first feature word) it offers; returns them.
+fn negotiate<R: DeviceRegisters>(regs: &mut Transport<R>, wanted: u32) -> Result<u32, ProbeError> {
+    regs.set_status(0);
+    while regs.status() != 0 {
+        core::hint::spin_loop(); // the reset is not done yet
+    }
+    regs.set_status(ACKNOWLEDGE);
+    regs.set_status(ACKNOWLEDGE | DRIVER);
+    let low = regs.device_features(0) & wanted;
+    if regs.device_features(1) & F_VERSION_1 == 0 {
+        return Err(ProbeError::Features);
+    }
+    regs.set_driver_features(0, low);
+    regs.set_driver_features(1, F_VERSION_1);
+    regs.set_status(ACKNOWLEDGE | DRIVER | FEATURES_OK);
+    if regs.status() & FEATURES_OK == 0 {
+        return Err(ProbeError::Features);
+    }
+    Ok(low)
+}
+
+/// Sets up queue `index` in a new frame, with `buffers` buffers of [`BUF`]
+/// bytes in more frames.
+fn queue<R: DeviceRegisters, M: PhysicalMemory>(
+    regs: &mut Transport<R>,
+    mem: &mut M,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+    index: u16,
+    buffers: u16,
+) -> Result<Queue, ProbeError> {
+    if regs
+        .queue_max(index)
+        .is_none_or(|max| max < u32::from(QUEUE_SIZE))
+    {
+        return Err(ProbeError::Queue(index));
+    }
+    let mut frame = || {
+        let f = alloc().ok_or(ProbeError::OutOfMemory)?;
+        mem.zero_frame(f);
+        Ok::<u64, ProbeError>(f)
+    };
+    let ring = frame()?;
+    let mut bufs = Vec::with_capacity(buffers as usize);
+    while bufs.len() < buffers as usize {
+        let f = frame()?;
+        bufs.extend((0..FRAME / BUF).map(|i| f + i * BUF));
+    }
+    // The driver polls: no interrupts, please.
+    mem.write_bytes(ring + AVAIL_AT, &AVAIL_F_NO_INTERRUPT.to_le_bytes());
+    regs.enable_queue(index, QUEUE_SIZE, [ring, ring + AVAIL_AT, ring + USED_AT]);
+    Ok(Queue {
+        index,
+        frame: ring,
+        avail: 0,
+        used: 0,
+        bufs,
+    })
 }
 
 impl<R: DeviceRegisters, M: PhysicalMemory> NetLink for VirtioNet<R, M> {
@@ -457,7 +496,7 @@ impl<R: DeviceRegisters, M: PhysicalMemory> NetLink for VirtioNet<R, M> {
         self.mem.write_bytes(buf, &[0; HDR]);
         self.mem.write_bytes(buf + HDR as u64, frame);
         self.tx
-            .describe(&mut self.mem, id, (HDR + frame.len()) as u32, 0);
+            .describe(&mut self.mem, id, (HDR + frame.len()) as u32, 0, false);
         self.tx.offer(&mut self.mem, id);
         self.tx.publish(&mut self.mem, &mut self.regs);
         true
