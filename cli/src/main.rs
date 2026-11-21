@@ -20,6 +20,7 @@ use state::{Dir, Info};
 use std::io::Write;
 use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
+use xtask::vmm::Vmm;
 
 fn main() -> ExitCode {
     let words: Vec<String> = std::env::args().skip(1).collect();
@@ -264,95 +265,64 @@ fn attach(client: &mut Client, id: u32) -> Result<(), String> {
     }
 }
 
-/// `rhizo save`: the kernel's chunks, written to `file` once all came.
+/// `rhizo save`: the snapshot comes over TCP through the VM's network card
+/// (design D2 of `snapshots-on-disk`), and is written once all came.
 fn save(client: &mut Client, id: u32, file: &std::path::Path) -> Result<(), String> {
-    let t0 = Instant::now();
-    let request = client.send(&Request::Save(id))?;
-    let mut bytes = Vec::new();
-    let ns = loop {
-        match client.next()? {
-            (r, Message::Data(data)) if r == request => bytes.extend(data),
-            (r, Message::Done { ns, body }) if r == request => {
-                if body != Body::Bytes(bytes.len() as u64) {
-                    return Err(format!(
-                        "the kernel sent {} bytes, then {body:?}",
-                        bytes.len()
-                    ));
-                }
-                break ns;
-            }
-            (r, Message::Failed { error, message, .. }) if r == request => {
-                return Err(refusal(error, &message));
-            }
-            _ => {}
-        }
-    };
-    let took = t0.elapsed();
+    let transfer = xtask::control::Transfer::new(Vmm::parse(&client.info.vmm)?)?;
+    let host = transfer.host;
+    let received = transfer.receive();
+    let reply = client.call(&Request::Save { cell: id, host })?;
+    let bytes = received.join().map_err(|_| "the transfer panicked")??;
+    if reply.body != Body::Bytes(bytes.len() as u64) {
+        return Err(format!(
+            "received {} bytes, the kernel sent {:?}",
+            bytes.len(),
+            reply.body
+        ));
+    }
     let tmp = file.with_extension("partial");
     std::fs::write(&tmp, &bytes)
         .and_then(|()| std::fs::rename(&tmp, file))
         .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
     println!(
-        "saved {id} to {} ({}) in {} (round trip {}, {})",
+        "saved {id} to {} ({}) in {}, {}",
         file.display(),
         size(bytes.len()),
-        duration(ns),
-        duration(took.as_nanos() as u64),
-        rate(bytes.len(), took)
+        reply.timing(),
+        rate(bytes.len(), reply.round_trip)
     );
     Ok(())
 }
 
-/// `rhizo load`: the file in chunks, all sent before the replies are read.
+/// `rhizo load`: the file goes over TCP through the VM's network card.
 fn load(client: &mut Client, file: &std::path::Path, template: bool) -> Result<(), String> {
     let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    let t0 = Instant::now();
-    let opened = client.call(&Request::Load {
-        size: bytes.len() as u64,
-        template,
-    })?;
-    let &Body::Cell(cell) = &opened.body else {
-        return Err(format!("unexpected reply {:?}", opened.body));
+    let n = bytes.len();
+    let transfer = xtask::control::Transfer::new(Vmm::parse(&client.info.vmm)?)?;
+    let host = transfer.host;
+    let sent = transfer.send(bytes);
+    let reply = client
+        .call(&Request::Load {
+            size: n as u64,
+            template,
+            host,
+        })
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    sent.join().map_err(|_| "the transfer panicked")??;
+    let &Body::Cell(cell) = &reply.body else {
+        return Err(format!("unexpected reply {:?}", reply.body));
     };
-    let mut sent = Vec::new();
-    for chunk in bytes.chunks(rhizo_control::CHUNK) {
-        sent.push(client.send(&Request::LoadData {
-            cell,
-            data: chunk.to_vec(),
-        })?);
-    }
-    let (mut ns, mut first_error) = (opened.ns, None);
-    for request in sent {
-        let reply = loop {
-            match client.next()? {
-                (r, message) if r == request => break message,
-                _ => {}
-            }
-        };
-        match reply {
-            Message::Done { ns: n, .. } => ns += n,
-            Message::Failed { error, message, .. } => {
-                first_error.get_or_insert_with(|| refusal(error, &message));
-            }
-            other => return Err(format!("unexpected reply {other:?}")),
-        }
-    }
-    if let Some(e) = first_error {
-        return Err(format!("{}: {e}", file.display()));
-    }
-    let took = t0.elapsed();
     println!(
-        "loaded {} as {} {cell} ({}) in {} (round trip {}, {})",
+        "loaded {} as {} {cell} ({}) in {}, {}",
         file.display(),
         if template {
             "template"
         } else {
             "suspended cell"
         },
-        size(bytes.len()),
-        duration(ns),
-        duration(took.as_nanos() as u64),
-        rate(bytes.len(), took)
+        size(n),
+        reply.timing(),
+        rate(n, reply.round_trip)
     );
     Ok(())
 }

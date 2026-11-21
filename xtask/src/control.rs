@@ -438,56 +438,115 @@ fn chat_turn(vm: &mut Vm, cell: u32, partial: &mut Vec<u8>, turn: usize) -> Resu
     }
 }
 
-/// The snapshot of suspended cell or template `cell`, and the round trip
-/// that brought it.
-fn save(vm: &mut Vm, cell: u32) -> Result<(Vec<u8>, Duration)> {
-    let id = vm.next_id;
-    vm.next_id += 1;
-    let t0 = Instant::now();
-    vm.send(&Request::Save(cell).encode(id))?;
-    let mut bytes = Vec::new();
-    loop {
-        match vm.next(Duration::from_secs(600)) {
-            Some(Event::Frame(f)) if f.id == id => match Message::decode(&f) {
-                Ok(Message::Data(data)) => bytes.extend(data),
-                Ok(Message::Done { .. }) => return Ok((bytes, t0.elapsed())),
-                other => return Err(format!("`save` failed: {other:?}")),
+/// How long the host's end of a snapshot transfer waits for the guest.
+const TRANSFER_WAIT: Duration = Duration::from_secs(60);
+
+/// The host's end of a snapshot transfer (design D2 of `snapshots-on-disk`):
+/// a TCP listener the guest on a VMM reaches through its network card.
+#[derive(Debug)]
+pub struct Transfer {
+    listener: std::net::TcpListener,
+    /// Where the guest reaches it.
+    pub host: rhizo_control::Host,
+}
+
+impl Transfer {
+    /// A listener for the guest on `vmm`, where it reaches the host.
+    pub fn new(vmm: Vmm) -> Result<Self> {
+        let guest_sees = crate::hostnet::host_address(vmm);
+        let bind = match vmm {
+            Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
+            _ => guest_sees,
+        };
+        let listener = std::net::TcpListener::bind((bind, 0))
+            .and_then(|l| l.set_nonblocking(true).map(|()| l))
+            .map_err(|e| format!("cannot listen on {bind} for the transfer: {e}"))?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let ip: std::net::Ipv4Addr = guest_sees.parse().map_err(|e| format!("{e}"))?;
+        Ok(Self {
+            listener,
+            host: rhizo_control::Host {
+                ip: ip.octets(),
+                port,
             },
-            Some(Event::Text(t)) => vm.console.extend(t),
-            Some(Event::Exited) | None => return Err("no end to `save`".into()),
-            Some(_) => {}
+        })
+    }
+
+    /// The guest's connection, within [`TRANSFER_WAIT`].
+    fn accept(&self) -> Result<std::net::TcpStream> {
+        let deadline = Instant::now() + TRANSFER_WAIT;
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+                    return Ok(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() > deadline {
+                        return Err("the guest did not connect for the transfer".into());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(format!("transfer: {e}")),
+            }
         }
+    }
+
+    /// Receives, in a thread, everything the guest sends until it closes.
+    pub fn receive(self) -> thread::JoinHandle<Result<Vec<u8>>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            self.accept()?
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("transfer: {e}"))?;
+            Ok(bytes)
+        })
+    }
+
+    /// Sends `bytes` to the guest, in a thread.
+    pub fn send(self, bytes: Vec<u8>) -> thread::JoinHandle<Result> {
+        thread::spawn(move || {
+            let mut stream = self.accept()?;
+            stream
+                .write_all(&bytes)
+                .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+                .map_err(|e| format!("transfer: {e}"))
+        })
     }
 }
 
-/// Loads `bytes` as a suspended cell or a template, every chunk sent before
-/// the replies are read; the cell, and the time from the first request to
-/// the last reply.
-fn load(vm: &mut Vm, bytes: &[u8], template: bool) -> Result<(u32, Duration)> {
+/// The snapshot of suspended cell or template `cell`, and the round trip
+/// that brought it.
+fn save(vm: &mut Vm, vmm: Vmm, cell: u32) -> Result<(Vec<u8>, Duration)> {
+    let transfer = Transfer::new(vmm)?;
+    let host = transfer.host;
+    let received = transfer.receive();
     let t0 = Instant::now();
-    let size = bytes.len() as u64;
-    let (Body::Cell(cell), _) = done(vm, &Request::Load { size, template })? else {
+    done(vm, &Request::Save { cell, host })?;
+    let took = t0.elapsed();
+    let bytes = received.join().map_err(|_| "the transfer panicked")??;
+    Ok((bytes, took))
+}
+
+/// Loads `bytes` as a suspended cell or a template; the cell, and the round
+/// trip.
+fn load(vm: &mut Vm, vmm: Vmm, bytes: Vec<u8>, template: bool) -> Result<(u32, Duration)> {
+    let transfer = Transfer::new(vmm)?;
+    let (host, size) = (transfer.host, bytes.len() as u64);
+    let sent = transfer.send(bytes);
+    let (Body::Cell(cell), took) = done(
+        vm,
+        &Request::Load {
+            size,
+            template,
+            host,
+        },
+    )?
+    else {
         return Err("`load` returned no cell".into());
     };
-    let first = vm.next_id;
-    for chunk in bytes.chunks(rhizo_control::CHUNK) {
-        let data = chunk.to_vec();
-        vm.send(&Request::LoadData { cell, data }.encode(vm.next_id))?;
-        vm.next_id += 1;
-    }
-    let last = vm.next_id - 1;
-    loop {
-        match vm.next(Duration::from_secs(600)) {
-            Some(Event::Frame(f)) if (first..=last).contains(&f.id) => match Message::decode(&f) {
-                Ok(Message::Done { .. }) if f.id == last => return Ok((cell, t0.elapsed())),
-                Ok(Message::Done { .. }) => {}
-                other => return Err(format!("`load-data` failed: {other:?}")),
-            },
-            Some(Event::Text(t)) => vm.console.extend(t),
-            Some(Event::Exited) | None => return Err("no end to `load`".into()),
-            Some(_) => {}
-        }
-    }
+    sent.join().map_err(|_| "the transfer panicked")??;
+    Ok((cell, took))
 }
 
 /// Snapshot files (spec `benchmarks`, design D6 of `snapshots-on-disk`):
@@ -507,10 +566,11 @@ fn snapshot_files(
     while chat_line(&mut vm, agent, &mut partial)? != CHAT_READY {}
     chat_turn(&mut vm, agent, &mut partial, 0)?;
     done(&mut vm, &Request::Freeze(agent))?;
-    let (file, saved) = save(&mut vm, agent)?;
+    let (file, saved) = save(&mut vm, vmm, agent)?;
     vm.shutdown();
     let mut vm = Vm::start(vmm, kernel, opts, Stdio::null())?;
-    let (template, loaded) = load(&mut vm, &file, true)?;
+    let size = file.len();
+    let (template, loaded) = load(&mut vm, vmm, file, true)?;
     let t0 = Instant::now();
     let (Body::Cells(cells), _) = done(
         &mut vm,
@@ -536,7 +596,7 @@ fn snapshot_files(
     Ok(vec![
         ("snapshot.save_us", "us", us(saved)),
         ("snapshot.load_us", "us", us(loaded)),
-        ("snapshot.file_bytes", "bytes", file.len() as f64),
+        ("snapshot.file_bytes", "bytes", size as f64),
         ("snapshot.loaded_answer_us", "us", us(loaded_answer)),
         ("snapshot.cold_answer_us", "us", us(cold_answer)),
     ])

@@ -101,14 +101,20 @@ fn every_request_round_trips() {
         },
         Request::CloseInput(10),
         Request::Freeze(11),
-        Request::Save(12),
+        Request::Save {
+            cell: 12,
+            host: Host {
+                ip: [10, 0, 2, 2],
+                port: 40123,
+            },
+        },
         Request::Load {
             size: 40 << 20,
             template: true,
-        },
-        Request::LoadData {
-            cell: 13,
-            data: vec![0x01; CHUNK],
+            host: Host {
+                ip: [172, 16, 0, 1],
+                port: 1,
+            },
         },
     ];
     for (id, request) in requests.iter().enumerate() {
@@ -204,7 +210,6 @@ fn every_message_round_trips() {
             error: Error::BadSnapshot,
             message: b"checksum".to_vec(),
         },
-        Message::Data(vec![0x01, b'Z', 0, 0xff]),
     ];
     for message in &messages {
         let found = frames(&message.encode(77));
@@ -323,23 +328,15 @@ fn input_is_bounded_and_its_flag_checked() {
     let last = run.len() - 1;
     run[last] = 2;
     assert_eq!(Request::decode(&frames(&run)[0]), Err(Error::Malformed));
-    // Snapshot bytes come in chunks of at most `CHUNK`, and `load`'s
-    // template flag is 0 or 1.
-    let big = Request::LoadData {
-        cell: 1,
-        data: vec![0; CHUNK + 1],
-    };
-    assert_eq!(
-        Request::decode(&frames(&big.encode(4))[0]),
-        Err(Error::TooLarge)
-    );
+    // `load`'s template flag is 0 or 1.
     let mut load = Request::Load {
         size: 1,
         template: false,
+        host: Host::default(),
     }
     .encode(5);
-    let last = load.len() - 1;
-    load[last] = 2;
+    let flag = load.len() - 7;
+    load[flag] = 2;
     assert_eq!(Request::decode(&frames(&load)[0]), Err(Error::Malformed));
 }
 
@@ -384,9 +381,17 @@ fn request() -> impl Strategy<Value = Request> {
         (any::<u32>(), bytes()).prop_map(|(cell, data)| Request::Input { cell, data }),
         any::<u32>().prop_map(Request::CloseInput),
         any::<u32>().prop_map(Request::Freeze),
-        any::<u32>().prop_map(Request::Save),
-        (any::<u64>(), any::<bool>()).prop_map(|(size, template)| Request::Load { size, template }),
-        (any::<u32>(), bytes()).prop_map(|(cell, data)| Request::LoadData { cell, data }),
+        (any::<u32>(), any::<[u8; 4]>(), any::<u16>()).prop_map(|(cell, ip, port)| Request::Save {
+            cell,
+            host: Host { ip, port }
+        }),
+        (any::<u64>(), any::<bool>(), any::<[u8; 4]>(), any::<u16>()).prop_map(
+            |(size, template, ip, port)| Request::Load {
+                size,
+                template,
+                host: Host { ip, port }
+            }
+        ),
     ]
 }
 
@@ -436,7 +441,6 @@ fn message() -> impl Strategy<Value = Message> {
         }),
         (any::<u32>(), bytes()).prop_map(|(cell, data)| Message::Output { cell, data }),
         (any::<u32>(), state()).prop_map(|(cell, state)| Message::Ended { cell, state }),
-        bytes().prop_map(Message::Data),
     ]
 }
 
@@ -523,21 +527,6 @@ proptest! {
         match Request::decode(&Frame { kind: 0x0b, id: 1, payload }) {
             Ok(Request::Input { data, .. }) => {
                 prop_assert!(data.len() <= MAX_INPUT && data.len() == len as usize);
-            }
-            Ok(other) => prop_assert!(false, "decoded as {:?}", other),
-            Err(e) => prop_assert!(e == Error::Malformed || e == Error::TooLarge),
-        }
-    }
-
-    /// Any `load-data` payload decodes within its bound or is refused.
-    #[test]
-    fn any_load_data_payload_is_bounded(cell in any::<u32>(), len in any::<u32>(), tail in proptest::collection::vec(any::<u8>(), 0..64)) {
-        let mut payload = cell.to_le_bytes().to_vec();
-        payload.extend(len.to_le_bytes());
-        payload.extend(&tail);
-        match Request::decode(&Frame { kind: 0x10, id: 1, payload }) {
-            Ok(Request::LoadData { data, .. }) => {
-                prop_assert!(data.len() <= CHUNK && data.len() == len as usize);
             }
             Ok(other) => prop_assert!(false, "decoded as {:?}", other),
             Err(e) => prop_assert!(e == Error::Malformed || e == Error::TooLarge),

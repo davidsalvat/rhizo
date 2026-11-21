@@ -10,9 +10,10 @@
 //! this table (change `fix-cli-nits`).
 //!
 //! Snapshots leave and enter as bytes (change `snapshots-on-disk`): a
-//! save streams a suspended cell's or a template's exported snapshot in
-//! chunks, and a load gathers the chunks the host sends, then validates
-//! them as the untrusted input they are (`Snapshot::from_bytes`).
+//! save sends a suspended cell's or a template's exported snapshot to the
+//! host over TCP through the network card, and a load fetches one the same
+//! way, then validates it as the untrusted input it is
+//! (`Snapshot::from_bytes`).
 
 use crate::arch::console::control as link;
 use crate::arch::timer::{self, Counter};
@@ -23,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rhizo_cell::quota::Quota;
 use rhizo_control::{
-    Body, CHUNK, CellInfo, Decoder, Error, Item, Message, Request, Run, State, Stats, VERSION,
+    Body, CellInfo, Decoder, Error, Item, Message, Request, Run, State, Stats, VERSION,
 };
 use rhizo_hal::CycleCounter;
 use rhizo_mm::FRAME_SIZE;
@@ -55,14 +56,6 @@ enum Place {
     Ended(State),
 }
 
-/// A snapshot the host is sending, to become cell `id`.
-struct Load {
-    id: u32,
-    bytes: Vec<u8>,
-    size: usize,
-    template: bool,
-}
-
 /// A cell the host started, and what it printed that the host has not had.
 struct Entry {
     id: u32,
@@ -83,8 +76,6 @@ struct Server {
     decoder: Decoder,
     /// Frames and refusals read, not yet handled.
     items: Vec<Item>,
-    /// Snapshots being loaded.
-    loads: Vec<Load>,
 }
 
 /// A request's outcome.
@@ -106,7 +97,6 @@ pub fn serve() {
         next: 1,
         decoder: Decoder::new(),
         items: Vec::new(),
-        loads: Vec::new(),
     };
     // Cells may talk to the host's network as soon as they start.
     server.host.wire_address(10_000_000_000);
@@ -290,10 +280,6 @@ impl Server {
                     .collect();
                 Ok(Body::Cells(ids))
             }
-            Request::Kill(target) if self.loads.iter().any(|l| l.id == target) => {
-                self.loads.retain(|l| l.id != target);
-                Ok(Body::None)
-            }
             Request::Kill(target) => {
                 let entry = self.entry(target)?;
                 match core::mem::replace(&mut entry.place, Place::Ended(State::Killed)) {
@@ -337,24 +323,12 @@ impl Server {
                 entry.place = Place::Template(cell);
                 Ok(Body::None)
             }
-            Request::Save(target) => self.save(id, target),
-            Request::Load { size, template } => {
-                let size = usize::try_from(size).unwrap_or(usize::MAX);
-                let mut bytes = Vec::new();
-                if !cell::cells_may_take(size as u64) || bytes.try_reserve_exact(size).is_err() {
-                    return Err((Error::NoMemory, format!("{size} bytes do not fit")));
-                }
-                let id = self.next;
-                self.next += 1;
-                self.loads.push(Load {
-                    id,
-                    bytes,
-                    size,
-                    template,
-                });
-                Ok(Body::Cell(id))
-            }
-            Request::LoadData { cell, data } => self.load_data(cell, &data),
+            Request::Save { cell, host } => self.save(cell, host),
+            Request::Load {
+                size,
+                template,
+                host,
+            } => self.load(size, template, host),
         }
     }
 
@@ -376,9 +350,9 @@ impl Server {
         Some(children)
     }
 
-    /// Streams the snapshot of suspended cell or template `target` to the
-    /// host as request `id`'s data (design D2 of `snapshots-on-disk`).
-    fn save(&mut self, id: u32, target: u32) -> Outcome {
+    /// Sends the snapshot of suspended cell or template `target` to the
+    /// host (design D2 of `snapshots-on-disk`).
+    fn save(&mut self, target: u32, to: rhizo_control::Host) -> Outcome {
         let bytes = match &self.entry(target)?.place {
             Place::Suspended(snapshot) => {
                 let size = snapshot.heap_bytes() as u64 + snapshot.shared_bytes();
@@ -399,39 +373,24 @@ impl Server {
                 ));
             }
         };
-        for chunk in bytes.chunks(CHUNK) {
-            send(id, &Message::Data(chunk.to_vec()));
-        }
+        self.host
+            .send_bytes(to.ip, to.port, &bytes)
+            .map_err(transfer)?;
         Ok(Body::Bytes(bytes.len() as u64))
     }
 
-    /// Adds `data` to the snapshot loading as `target`; with its last bytes,
-    /// validates it and makes it a suspended cell or a template (design D3
-    /// of `snapshots-on-disk`).
-    fn load_data(&mut self, target: u32, data: &[u8]) -> Outcome {
-        let i = self
-            .loads
-            .iter()
-            .position(|l| l.id == target)
-            .ok_or((Error::NoCell, String::new()))?;
-        let load = &mut self.loads[i];
-        if data.len() > load.size - load.bytes.len() {
-            self.loads.swap_remove(i);
-            return Err((
-                Error::BadSnapshot,
-                String::from("more bytes than the load announced"),
-            ));
+    /// Fetches a snapshot of `size` bytes from the host, validates it and
+    /// makes it a suspended cell or a template under the next identifier
+    /// (design D2 to D4 of `snapshots-on-disk`).
+    fn load(&mut self, size: u64, template: bool, from: rhizo_control::Host) -> Outcome {
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        let mut bytes = Vec::new();
+        if !cell::cells_may_take(size as u64) || bytes.try_reserve_exact(size).is_err() {
+            return Err((Error::NoMemory, format!("{size} bytes do not fit")));
         }
-        load.bytes.extend_from_slice(data);
-        if load.bytes.len() < load.size {
-            return Ok(Body::None);
-        }
-        let Load {
-            id,
-            bytes,
-            template,
-            ..
-        } = self.loads.swap_remove(i);
+        self.host
+            .fetch_bytes(from.ip, from.port, size, &mut bytes)
+            .map_err(transfer)?;
         let mut snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE)
             .map_err(|e| (Error::BadSnapshot, describe(e)))?;
         // It gets no more than a cell the host starts (design D4).
@@ -445,6 +404,8 @@ impl Server {
         } else {
             Place::Suspended(snapshot)
         };
+        let id = self.next;
+        self.next += 1;
         self.cells.push(Entry {
             id,
             image: b"loaded".to_vec(),
@@ -631,6 +592,19 @@ fn state_of(place: &Place) -> State {
         Place::Template(_) => State::Template,
         Place::Ended(state) => *state,
     }
+}
+
+/// A failed transfer of snapshot bytes, for people.
+fn transfer(e: cell::Transfer) -> (Error, String) {
+    let why = match e {
+        cell::Transfer::Net(rhizo_net::Error::NetUnreach) => {
+            String::from("the VM has no network card with an address: it carries snapshot files")
+        }
+        cell::Transfer::Net(e) => format!("the host's end of the transfer: {e:?}"),
+        cell::Transfer::Short => String::from("the host sent fewer bytes than it announced"),
+        cell::Transfer::Stalled => String::from("the transfer stalled"),
+    };
+    (Error::Failed, why)
 }
 
 /// Why bytes are not a snapshot this kernel loads, for people (spec

@@ -13,8 +13,8 @@
 
 ## 3. Control plane
 
-- [x] 3.1 Protocol version 3: `freeze`, `save`, `load`, `load-data`, `data`, the `template` state, `BadSnapshot` (D2); verify `cargo test -p rhizo-control`
-- [x] 3.2 The control kernel's templates, save and load, with the reasons of refusals (D2, D3, D4); verify the `control` test step on both architectures
+- [x] 3.1 Protocol version 3: `freeze`, `save`, `load` (with the host's address), the `template` state, `BadSnapshot` (D2); verify `cargo test -p rhizo-control`
+- [x] 3.2 The control kernel's templates, save and load over TCP through the card (`Host::send_bytes`, `fetch_bytes`), with the reasons of refusals (D2, D3, D4); verify the `control` test step on both architectures
 - [x] 3.3 `rhizo freeze`, `save`, `load`; verify `cargo test -p rhizo-cli` and the `control` test step: the agent's template and suspended cell across `rhizo down` and `rhizo up`, refused files
 
 ## 4. Benchmarks, documentation, CI

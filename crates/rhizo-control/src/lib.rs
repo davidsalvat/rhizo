@@ -39,9 +39,6 @@ pub const MAX_PAYLOAD: usize = 1 << 20;
 /// holds (a pipe of 64 KiB), so an accepted request always fits an empty
 /// one.
 pub const MAX_INPUT: usize = 64 << 10;
-/// Bytes of a snapshot one [`Message::Data`] or [`Request::LoadData`]
-/// carries at most.
-pub const CHUNK: usize = 64 << 10;
 
 /// Frame kinds of requests, host to kernel.
 mod kind {
@@ -60,14 +57,12 @@ mod kind {
     pub const FREEZE: u8 = 0x0d;
     pub const SAVE: u8 = 0x0e;
     pub const LOAD: u8 = 0x0f;
-    pub const LOAD_DATA: u8 = 0x10;
     // Kernel to host.
     pub const HELLO: u8 = 0x80;
     pub const DONE: u8 = 0x81;
     pub const FAILED: u8 = 0x82;
     pub const OUTPUT_DATA: u8 = 0x83;
     pub const ENDED: u8 = 0x84;
-    pub const DATA: u8 = 0x85;
 }
 
 /// Why a frame or a request was refused.
@@ -316,6 +311,11 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
     }
+    fn host(&mut self, h: &Host) -> &mut Self {
+        self.u32(u32::from_be_bytes(h.ip));
+        self.0.extend_from_slice(&h.port.to_le_bytes());
+        self
+    }
     fn bytes(&mut self, v: &[u8]) -> &mut Self {
         self.u32(v.len() as u32);
         self.0.extend_from_slice(v);
@@ -357,6 +357,14 @@ impl<'a> Reader<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, Error> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
+    }
+    fn host(&mut self) -> Result<Host, Error> {
+        let ip = self.u32()?.to_be_bytes();
+        let b = self.take(2)?;
+        Ok(Host {
+            ip,
+            port: u16::from_le_bytes([b[0], b[1]]),
+        })
     }
     fn flag(&mut self) -> Result<bool, Error> {
         match self.u8()? {
@@ -447,16 +455,25 @@ pub enum Request {
     /// Freeze a running cell into a template: it never runs again, and
     /// [`Request::Fork`] makes cells from it.
     Freeze(u32),
-    /// The snapshot of a suspended cell or a template, as bytes that stand
-    /// alone: [`Message::Data`] frames of at most [`CHUNK`] bytes, then
-    /// [`Body::Bytes`], their total.
-    Save(u32),
-    /// Start loading a snapshot of `size` bytes as a suspended cell, or as
-    /// a template; replies [`Body::Cell`], the cell it will be.
-    Load { size: u64, template: bool },
-    /// The next bytes of the snapshot loading as `cell`, at most
-    /// [`CHUNK`]; the last ones complete it, or refuse it with the reason.
-    LoadData { cell: u32, data: Vec<u8> },
+    /// Send the snapshot of a suspended cell or a template, as bytes that
+    /// stand alone, over TCP to `port` at `host` (the host as the guest
+    /// reaches it, through the network card); replies [`Body::Bytes`],
+    /// their total, once the host has them all.
+    Save { cell: u32, host: Host },
+    /// Fetch a snapshot of `size` bytes over TCP from `port` at `host`, and
+    /// make it a suspended cell, or a template; replies [`Body::Cell`].
+    Load {
+        size: u64,
+        template: bool,
+        host: Host,
+    },
+}
+
+/// Where the guest reaches the host's end of a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Host {
+    pub ip: [u8; 4],
+    pub port: u16,
 }
 
 impl Request {
@@ -517,17 +534,17 @@ impl Request {
                 w.u32(*cell);
                 kind::FREEZE
             }
-            Request::Save(cell) => {
-                w.u32(*cell);
+            Request::Save { cell, host } => {
+                w.u32(*cell).host(host);
                 kind::SAVE
             }
-            Request::Load { size, template } => {
-                w.u64(*size).u8(*template as u8);
+            Request::Load {
+                size,
+                template,
+                host,
+            } => {
+                w.u64(*size).u8(*template as u8).host(host);
                 kind::LOAD
-            }
-            Request::LoadData { cell, data } => {
-                w.u32(*cell).bytes(data);
-                kind::LOAD_DATA
             }
         };
         encode_frame(kind, id, &w.0)
@@ -571,19 +588,15 @@ impl Request {
             }
             kind::CLOSE_INPUT => Request::CloseInput(r.u32()?),
             kind::FREEZE => Request::Freeze(r.u32()?),
-            kind::SAVE => Request::Save(r.u32()?),
+            kind::SAVE => Request::Save {
+                cell: r.u32()?,
+                host: r.host()?,
+            },
             kind::LOAD => Request::Load {
                 size: r.u64()?,
                 template: r.flag()?,
+                host: r.host()?,
             },
-            kind::LOAD_DATA => {
-                let cell = r.u32()?;
-                let data = r.bytes()?;
-                if data.len() > CHUNK {
-                    return Err(Error::TooLarge);
-                }
-                Request::LoadData { cell, data }
-            }
             _ => return Err(Error::UnknownKind),
         };
         r.end()?;
@@ -696,8 +709,6 @@ pub enum Message {
     Output { cell: u32, data: Vec<u8> },
     /// The cell of an `output` request ended.
     Ended { cell: u32, state: State },
-    /// Bytes of a snapshot, for a `save` request.
-    Data(Vec<u8>),
 }
 
 impl Message {
@@ -758,10 +769,6 @@ impl Message {
                 state.write(&mut w);
                 kind::ENDED
             }
-            Message::Data(data) => {
-                w.bytes(data);
-                kind::DATA
-            }
         };
         encode_frame(kind, id, &w.0)
     }
@@ -811,7 +818,6 @@ impl Message {
                 cell: r.u32()?,
                 state: State::read(&mut r)?,
             },
-            kind::DATA => Message::Data(r.bytes()?),
             _ => return Err(Error::UnknownKind),
         };
         r.end()?;

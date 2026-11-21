@@ -41,27 +41,35 @@ Alternative: CRC-32 (IEEE). Equivalent; CRC-32C has the better error
 detection at these lengths and hardware support on both architectures if
 it is ever needed.
 
-## D2. Transport: the serial line, in chunks of 64 KiB
+## D2. Transport: TCP over the network card, requests on the serial line
 
-Requests and replies already travel in frames of at most 1 MiB on the
-serial line. Snapshot bytes travel in the same frames, in chunks of
-64 KiB (`rhizo_control::CHUNK`):
+Requests stay on the serial line; the bytes go over TCP through the VM's
+network card, which every control kernel already has (it is how agents
+reach their model):
 
-- `save <cell>`: the kernel exports the snapshot into its heap (refused
-  when the heap cannot hold it), sends it as `data` frames carrying the
-  request's identifier, then `done` with the total. The relay keeps a
-  `save`'s route open until then.
-- `load <size> <template>`: the kernel reserves `size` bytes of heap
-  (refused when cells may not take that much) and replies with the
-  identifier of the cell it will be. `load-data <cell> <bytes>` frames
-  then carry the file in order; the host sends them all before it reads
-  the replies, so the serial line never waits for a round trip. The one
-  that completes the file validates it (D4); bytes past the announced size
-  end the load, and so does `kill` of its identifier.
+- `save <cell> <host>`: the host opens a TCP listener where the guest
+  reaches it (`127.0.0.1` behind QEMU's user network, seen by the guest as
+  `10.0.2.2`; the tap's address on Firecracker and Cloud Hypervisor) and
+  names it in the request. The kernel exports the snapshot into its heap
+  (refused when the heap cannot hold it), connects, sends it, shuts its end
+  for writing and replies with the total once the host, having read
+  everything, has closed.
+- `load <size> <template> <host>`: the host offers the file on such a
+  listener. The kernel reserves `size` bytes of heap (refused when cells
+  may not take that much), connects, reads exactly that many bytes,
+  validates them (D4) and replies with the new cell. A host that closes
+  early, or a transfer that moves no byte for 10 s, fails the request;
+  nothing of it is kept.
 
-A chunk of 64 KiB keeps a frame's reassembly buffer small in the kernel and
-lets `rhizo` show progress later; frames of 1 MiB would save nothing
-measurable (12 bytes of header per 64 KiB).
+The kernel side is `Host::send_bytes` and `Host::fetch_bytes` in
+`kernel/src/cell.rs`: a kernel-owned socket of `rhizo-net`, polled with
+the card until the transfer is done. No new device, driver or dependency.
+While a transfer runs the control kernel serves nothing else, as during
+any request; cells do not run.
+
+A VM without a card with an address (Firecracker and Cloud Hypervisor
+when the host cannot make a tap) cannot save or load: the request is
+refused with that reason.
 
 ### Measured
 
@@ -69,56 +77,50 @@ On the development host (QEMU 8.2.2 with TCG, x86_64 guest on
 `qemu-microvm`, 4 CPUs shared with several other QEMU runs, so the
 figures move with the load):
 
-| What | Size | `save` (kernel to host) | `load` (host to kernel) |
+| What | Size | Serial (frames of 64 KiB) | TCP through the card |
 |---|---|---|---|
-| CPython sleeping, suspended (lightly loaded host) | 14.6 MiB | 18.3 s, 0.79 MiB/s | 86 s, 0.17 MiB/s |
-| Same, host busy with two in-kernel test runs | 14.6 MiB | 18.6 s, 0.78 MiB/s | 426 s, 0.03 MiB/s |
-| Chat agent template after one turn (the benchmark, busy host) | 17.1 MiB | 20.9 s, 0.82 MiB/s | 419 s, 0.04 MiB/s |
+| CPython sleeping, suspended: save | 14.6 MiB | 18.3 s (0.79 MiB/s) | 0.49 s (29.5 MiB/s) |
+| Same: load | 14.6 MiB | 86 s (0.17 MiB/s) lightly loaded host, 426 s (0.03 MiB/s) busy | 0.15 s (95 MiB/s) |
+| Chat agent template after one turn (the benchmark): save | 17.1 MiB | 20.9 s (0.82 MiB/s) | 0.61 s (28 MiB/s) |
+| Same: load into a fresh VM | 17.1 MiB | 419 s (0.04 MiB/s), busy host | 0.24 s (71 MiB/s) |
+
+The serial figures come from a first implementation that carried the
+bytes in `data` and `load-data` frames on the serial line. Sending cost
+the kernel two port accesses per byte; receiving was bounded by how QEMU
+feeds the 16550: at most the FIFO trigger level (14 bytes) per pass of its
+main loop. Under KVM each port access is a VM exit: on GitHub's runners
+the `control` test step's two loads alone ran past the job's 30 minutes.
+TCP through the card is 35 to over 500 times faster and needs nothing the
+VM does not have.
 
 The 14.6 MiB file holds 13.2 MiB of pages (6 MiB of them the interpreter
 image's three 2 MiB pages, which every CPython cell shares) and 1.4 MiB of
 files. On the fresh VM, a cell of the loaded agent template answers its
-first turn 0.18 s after the `fork`, against 0.94 s for a new agent from
-`run` (`snapshot.loaded_answer_us`, `snapshot.cold_answer_us`): once the
-file is in, a downloaded template starts five times faster than a cold
-agent.
+first turn 0.14 s after the `fork`, against 0.83 s for a new agent from
+`run` (`snapshot.loaded_answer_us`, `snapshot.cold_answer_us`): a
+downloaded template starts six times faster than a cold agent, and its
+load takes a quarter of a second.
 
-Sending costs the kernel two port accesses per byte (status, data) and
-holds steady. Receiving is bounded by how QEMU feeds the 16550: it hands
-the guest at most the FIFO trigger level (14 bytes) per pass of its main
-loop, and the next 14 wait for the main loop to wake again, which on a
-busy host takes long; waiting between polls in the kernel, so as not to
-contend for QEMU's lock, did not help and was dropped. Under KVM each port
-access is a VM exit; the order of magnitude stays tens of seconds or more
-per agent. That is enough to show the feature end to end and to measure
-it, not to start a downloaded agent "instantly".
+### Alternatives
 
-### Faster path (follow-up)
-
-A virtio-blk **exchange disk**: `rhizo up` creates a file as large as the
-VM's memory and attaches it as a virtio-blk device, which QEMU (`microvm`,
-`virt`: virtio-mmio; `q35`: virtio-pci), Firecracker (drives) and Cloud
-Hypervisor (`--disk`) all offer, on both architectures. `save` and `load`
-then name an offset and a length on that disk: the host reads or writes
-the file directly and the kernel moves the bytes with a few large DMA
-requests (hundreds of MiB/s even under TCG). The kernel side is a block
-driver beside `VirtioNet` in `rhizo-virtio` (one request queue: header,
-data, status), found like the network card; it is a change of its own:
-the driver, its probing on both transports and architectures, the
-VMM command lines, and its fuzzing as a new device surface.
-
-Rejected for that follow-up: virtio-vsock (Firecracker and Cloud
-Hypervisor expose it as a Unix socket on the host, QEMU needs
-`vhost-vsock` in the host kernel: three host sides, and a credit-based
-stream protocol in the kernel); TCP over the existing network card
-(Firecracker and Cloud Hypervisor have a card only on a tap device, which
-needs root; a kernel-side TCP client); a shared memory device
-(`ivshmem`, `virtio-pmem`: not offered by every VMM).
+- **The serial line** (measured above): no network needed, but tens of
+  seconds to minutes per agent.
+- **A virtio-blk exchange disk**: `rhizo up` attaches a file as a block
+  device (QEMU, Firecracker and Cloud Hypervisor all offer one), and the
+  kernel moves the bytes with large DMA requests. As fast or faster, and
+  it works without a network, but it needs a new driver, its probing on
+  both transports and architectures, VMM command lines and fuzzing as a
+  new device surface: a change of its own, worth it if save and load must
+  work on a VM without a card.
+- **virtio-vsock**: Firecracker and Cloud Hypervisor expose it as a Unix
+  socket on the host, QEMU needs `vhost-vsock` in the host kernel: three
+  host sides, and a new driver with a credit-based stream protocol.
+- **A shared memory device** (`ivshmem`, `virtio-pmem`): not offered by
+  every VMM.
 
 Independently, files can shrink: the interpreter's pages and the files of
 `cpython-files` are the same in every CPython agent, so a file could name
-them by content instead of carrying them, and a kernel that holds them
-would send and receive only what the agent made its own (a few MiB).
+them by content instead of carrying them (follow-up).
 
 ## D3. Templates in the control plane
 
@@ -197,16 +199,14 @@ Alternative: a separate deadline word per thread. Rejected: the futex
 words are unused for these kinds, and a word more per thread grows every
 snapshot.
 
-## D6. Benchmarks on QEMU only
+## D6. Benchmarks on QEMU, reported
 
 `snapshot.save_us`, `snapshot.load_us`, `snapshot.file_bytes`,
 `snapshot.loaded_answer_us` and `snapshot.cold_answer_us` are measured by
-the control-plane benchmark on the QEMU VMMs, once per run (a save and a
-load take tens of seconds over the serial line, D2). Firecracker and Cloud
-Hypervisor feed their serial line differently and would add minutes per
-VMM to every CI run for a figure the faster transport replaces. The
-figures are reported, not gated, until that transport lands: gating a
-serial line's rate would gate the VMM, not Rhizo.
+the control-plane benchmark on the QEMU VMMs, once per run: the chat agent
+starts twice and the VM boots twice, which on every VMM would add a
+minute to each CI run. They are reported, not gated, until a few CI runs
+give them a baseline (the bench README lists them).
 
 `snapshot.loaded_answer_us` (fork of the loaded template to the first
 answer read back) next to `snapshot.cold_answer_us` (run of a new agent to

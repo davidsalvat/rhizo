@@ -32,15 +32,14 @@ fixed here.
 - **Templates in the control plane.** `freeze` makes a running cell a
   template; `fork` of a template makes cells from it (they keep no time);
   `kill` drops it; `list` shows it.
-- **Save and load.** Protocol version 3: `save` streams the snapshot of a
-  suspended cell or a template in chunks of 64 KiB; `load` and `load-data`
-  send one in chunks, and the last chunk makes it a suspended cell or a
-  template, through `from_bytes`, with quotas no higher than a new cell's.
-  `rhizo freeze <id>`, `rhizo save <id> <file>` and
-  `rhizo load <file> [--template]`.
-- **Transport: the serial line, measured.** The control channel carries
-  the chunks; the design gives the measured rates and the faster path
-  (a virtio-blk exchange disk) as follow-up.
+- **Save and load.** Protocol version 3: `save` sends the snapshot of a
+  suspended cell or a template to the host, and `load` fetches one and
+  makes it a suspended cell or a template, through `from_bytes`, with
+  quotas no higher than a new cell's. `rhizo freeze <id>`,
+  `rhizo save <id> <file>` and `rhizo load <file> [--template]`.
+- **Transport: TCP through the VM's network card**, which every control
+  kernel has; requests stay on the serial line. Measured against the
+  serial line (design D2): 0.24 s instead of minutes to load the agent.
 - **Tests**: format v10 and the checksum on the host, the hostile-snapshot
   property tests on the sealed (import) form, two in-kernel tests (a wait
   on descriptors keeps its time left across suspend; a template travels as
@@ -55,7 +54,8 @@ fixed here.
 
 ### Out of scope
 
-A faster transport (follow-up, design D2), signed or authenticated files
+Save and load on a VM without a network card (a virtio-blk exchange
+disk, design D2), signed or authenticated files
 (the checksum catches damage, not forgery: forged bytes are contained by
 validation, spec `isolation`), files that refer to executables or file
 sets by content instead of carrying them, and loading a file across

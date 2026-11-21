@@ -37,6 +37,21 @@ use rhizo_prof::Part;
 use rhizo_sched::{Gangs, IdleTimer, SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::{Data, Snapshot};
 
+/// How long a snapshot transfer through the network card may go without
+/// moving a byte.
+const TRANSFER_STALL_NS: u64 = 10_000_000_000;
+
+/// Why a snapshot transfer through the network card failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    /// The sockets said so (no card or address: `NetUnreach`).
+    Net(rhizo_net::Error),
+    /// The host closed before sending every byte.
+    Short,
+    /// No byte moved for [`TRANSFER_STALL_NS`].
+    Stalled,
+}
+
 /// How a cell ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ending {
@@ -2864,6 +2879,117 @@ impl Host {
             }
             idle_until(now + WIRE_PERIOD_NS * 50);
         }
+    }
+
+    /// Sends `bytes` to `port` at `ip` over TCP through the network card,
+    /// and returns once the host has them all and closed its end (design
+    /// D2 of `snapshots-on-disk`: how a snapshot file leaves the kernel).
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn send_bytes(&mut self, ip: [u8; 4], port: u16, bytes: &[u8]) -> Result<(), Transfer> {
+        let mut sent = 0;
+        let mut shut = false;
+        self.stream(ip, port, |net, h| {
+            if sent < bytes.len() {
+                return match net.send(h, &bytes[sent..], None) {
+                    Ok(n) => {
+                        sent += n;
+                        Ok(Some(n > 0))
+                    }
+                    Err(rhizo_net::Error::Again) => Ok(Some(false)),
+                    Err(e) => Err(Transfer::Net(e)),
+                };
+            }
+            if !shut {
+                shut = true;
+                net.shutdown(h, rhizo_net::Shutdown::Write)
+                    .map_err(Transfer::Net)?;
+            }
+            // Done when the host, having read everything, closes.
+            match net.recv(h, 1, false, &mut |_| true) {
+                Ok(r) if r.len == 0 => Ok(None),
+                Ok(_) | Err(rhizo_net::Error::Again) => Ok(Some(false)),
+                Err(e) => Err(Transfer::Net(e)),
+            }
+        })
+    }
+
+    /// Receives `size` bytes from `port` at `ip` over TCP through the
+    /// network card (design D2 of `snapshots-on-disk`: how a snapshot file
+    /// enters the kernel), into `out`, which has room for them.
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn fetch_bytes(
+        &mut self,
+        ip: [u8; 4],
+        port: u16,
+        size: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Transfer> {
+        self.stream(ip, port, |net, h| {
+            if out.len() == size {
+                return Ok(None);
+            }
+            let left = size - out.len();
+            match net.recv(h, left, false, &mut |b| {
+                out.extend_from_slice(b);
+                true
+            }) {
+                Ok(r) if r.len == 0 => Err(Transfer::Short),
+                Ok(_) => Ok(Some(true)),
+                Err(rhizo_net::Error::Again) => Ok(Some(false)),
+                Err(e) => Err(Transfer::Net(e)),
+            }
+        })
+    }
+
+    /// Connects to `port` at `ip` and polls the card and `step` until
+    /// `step` says the transfer is done (`None`), fails, or makes no
+    /// progress for [`TRANSFER_STALL_NS`]; the socket is released either
+    /// way. `step` says whether it moved bytes.
+    fn stream(
+        &mut self,
+        ip: [u8; 4],
+        port: u16,
+        mut step: impl FnMut(&mut Net, rhizo_net::Handle) -> Result<Option<bool>, Transfer>,
+    ) -> Result<(), Transfer> {
+        use rhizo_net::{Addr, Error, Family, Type};
+        let h = with_net(|net| net.socket(Family::Inet, Type::Stream)).map_err(Transfer::Net)?;
+        let to = Addr::Inet { ip, port };
+        let (mut connected, mut last) = (false, now_ns());
+        let result = loop {
+            let now = now_ns();
+            if now - last > TRANSFER_STALL_NS {
+                break Err(Transfer::Stalled);
+            }
+            self.wire_due = 0;
+            self.poll_wire(now);
+            let moved = with_net(|net| {
+                if !connected {
+                    return match net.connect(h, &to) {
+                        Ok(()) => {
+                            connected = true;
+                            Ok(Some(true))
+                        }
+                        Err(Error::InProgress | Error::Again) => Ok(Some(false)),
+                        Err(e) => Err(Transfer::Net(e)),
+                    };
+                }
+                step(net, h)
+            });
+            match moved {
+                Ok(None) => break Ok(()),
+                Ok(Some(true)) => last = now,
+                Ok(Some(false)) => core::hint::spin_loop(),
+                Err(e) => break Err(e),
+            }
+        };
+        with_net(|net| net.release(h));
+        result
     }
 
     /// Forks live cell `id` into `n` children that share its memory

@@ -34,16 +34,15 @@ commands SHALL be able to talk to the same VM at once.
 
 ### Requirement: Bounded input requests
 The protocol's version SHALL be 3. An `input` request carrying more than
-64 KiB, or a `load-data` request carrying more than 64 KiB, SHALL be
-refused as too large, and its decoding, like that of every request, SHALL
-never panic nor allocate more than the frame's bytes.
+64 KiB SHALL be refused as too large, and its decoding, like that of every
+request, SHALL never panic nor allocate more than the frame's bytes.
 
 #### Scenario: Oversized or malformed input
 - **WHEN** the kernel receives an `input` request of 64 KiB plus one byte, or one whose length exceeds its payload
 - **THEN** it refuses it and keeps serving
 
-#### Scenario: Oversized snapshot chunk
-- **WHEN** a `load-data` request carries 64 KiB plus one byte, or a `load` request a template flag other than 0 or 1
+#### Scenario: Malformed load
+- **WHEN** a `load` request carries a template flag other than 0 or 1
 - **THEN** decoding refuses it
 
 ### Requirement: Sequential cell identifiers
@@ -69,21 +68,22 @@ it; its memory goes back once no cell made from it shares it.
 
 ### Requirement: Save
 `save` SHALL send the exported snapshot of a suspended cell or a template
-in chunks of at most 64 KiB, then their total, leaving the cell as it was.
-`rhizo save <id> <file>` SHALL write the file once all its bytes came, and
-print its size, the kernel's time, the round trip and the rate.
+over TCP to the host address and port it names, through the network card,
+then reply with its size, leaving the cell as it was. `rhizo save <id>
+<file>` SHALL write the file once all its bytes came, and print its size,
+the kernel's time, the round trip and the rate.
 
 #### Scenario: Save a template
 - **WHEN** the `control` test step saves a template
 - **THEN** `rhizo save` reports the file, its size and its rate, and refuses a cell that does not exist
 
 ### Requirement: Load
-`load` SHALL announce a snapshot's size and whether it becomes a template,
-and get the cell it will be, refused when memory cannot hold it.
-`load-data` requests SHALL carry its bytes in order; the one completing it
-SHALL validate it and make it a suspended cell or a template, or refuse it
-with the reason and keep nothing; bytes past the size SHALL refuse it.
-`rhizo load <file> [--template]` SHALL send a file and print as `save`.
+`load` SHALL fetch a snapshot of the size it names over TCP from the host
+address and port it names, refused when memory cannot hold it, validate it
+and make it a suspended cell or a template, or refuse it with the reason
+and keep nothing. A VM without a network card SHALL refuse both, saying
+so. `rhizo load <file> [--template]` SHALL send a file and print as
+`save`.
 
 #### Scenario: A template and a suspended cell across a reboot
 - **WHEN** the `control` test step freezes a chat agent into a template after one turn, leaves another suspended after one turn, saves both, runs `rhizo down` and `rhizo up`, loads the first as a template and forks it into two, and loads the second and talks to it
