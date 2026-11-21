@@ -169,11 +169,17 @@ input. The scripted agent SHALL be unchanged.
 The conversational agent SHALL run the tools the model calls inside the
 cell: a Python snippet (output capped at 4000 characters, stopped after a
 time limit), read a file, write a file, list a directory; a tool's error
-SHALL be a result the model reads.
+SHALL be a result the model reads. As in the Python REPL, when a snippet's
+last statement is an expression, its value's `repr` SHALL follow what the
+snippet printed, unless the value is None.
 
 #### Scenario: A snippet that does not end
 - **WHEN** a snippet prints and then loops forever
 - **THEN** it is stopped after its time limit, and the result holds what it printed and that it was stopped
+
+#### Scenario: A snippet ending in an expression
+- **WHEN** the fake model calls the snippet tool with `import math`, `result = 18 * 8`, `sqrt_result = math.sqrt(result)` and `sqrt_result` on four lines
+- **THEN** the tool's result is `12.0`, and the agent shows it, on x86_64 and AArch64
 
 ### Requirement: Scratch directory in the CPython cell
 The CPython cell's files SHALL include an empty, writable `/tmp` directory
@@ -217,3 +223,45 @@ a template, every copy answering without warming up again.
 #### Scenario: Warm Node.js template
 - **WHEN** cells are forked from Node.js frozen after it printed `warm`, or resumed from its snapshot taken there and forked
 - **THEN** each prints only the answer and exits with 0
+
+### Requirement: Packages from PyPI in a cell
+A dynamically linked build of the pinned CPython SHALL run as a cell with
+pinned, checksummed wheels from PyPI installed unmodified in its
+`site-packages` (numpy, whose extensions it opens with `dlopen`, and
+requests with what it needs), and print what it prints on Linux with the
+same files and an empty environment. Where it is not built, the checks
+SHALL report that they did not run.
+
+#### Scenario: numpy computes
+- **WHEN** the packages' CPython runs `app/numpy_demo.py` in a cell (array operations, a linear solve, a ufunc, a matrix product)
+- **THEN** it prints the output recorded from Linux and exits with 0, and once the kept file pages are dropped every frame and heap allocation is back
+
+#### Scenario: requests reaches the host
+- **WHEN** the packages' CPython runs `app/requests_demo.py` in a cell with the URL of the host's fake model, through the network card
+- **THEN** it prints the status, content type, detected encoding and tool call recorded from Linux and exits with 0
+
+#### Scenario: A template that imported numpy
+- **WHEN** a cell stopped after `import numpy` is suspended and resumed from the snapshot's bytes, forked, and frozen as a template that new cells are forked from
+- **THEN** every copy prints the computation and exits with 0
+
+#### Scenario: Same behavior on Linux
+- **WHEN** the differential check runs both scripts natively from the top of the packed tree with an empty environment, requests against the host's fake model
+- **THEN** each prints the recorded output and exits with 0
+
+#### Scenario: A wheel that is not the pinned one
+- **WHEN** a downloaded wheel's SHA-256 differs from its pin
+- **THEN** the build fails, naming the URL, the expected and the actual checksum
+
+### Requirement: Tool calls written as text
+When a reply of the model has no tool calls, the conversational agent SHALL
+run, as a tool call, the first JSON object in its text that parses, names
+one of its tools and has an object of arguments, and SHALL NOT show that
+text as an answer. Any other text SHALL be the answer.
+
+#### Scenario: A call in the message's text
+- **WHEN** the fake model answers `Sure {"name": "run_python", "arguments": {"code": "6 * 7"}}` with no tool calls
+- **THEN** the agent shows the call and its result `42`, then the model's next answer, and does not show the JSON as an answer
+
+#### Scenario: Text that is not a call
+- **WHEN** a reply's text holds no JSON object, or one naming no tool of the agent, or one whose arguments are not an object
+- **THEN** the agent shows the text as the answer and runs no tool

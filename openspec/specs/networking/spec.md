@@ -258,3 +258,52 @@ cell's snapshot: a resumed or forked cell makes its waiting calls again.
 #### Scenario: A frame from the wire
 - **WHEN** a waiter blocked on a connection through the network card and the answer arrives
 - **THEN** the waiter is woken, and a waiter on a loopback socket is not
+
+### Requirement: Connections to the outside wait for silent peers
+A TCP connection through the card SHALL give up on its peer (and report
+`ECONNRESET`) only while it is being opened or while bytes it sent wait
+for their acknowledgment, after 20 s without an answer. An open
+connection with nothing outstanding SHALL stay open however long its peer
+stays silent. A connection the cells closed SHALL be aborted only if its
+peer has not finished closing after 60 s.
+
+#### Scenario: A model that thinks for 45 s
+- **WHEN** a cell sends a request over a connection to the outside, the peer acknowledges it and answers 45 s later
+- **THEN** the cell receives the answer on the same connection
+
+#### Scenario: An idle kept-alive connection
+- **WHEN** a connection to the outside carries nothing for ten minutes and the cell then sends on it
+- **THEN** the peer's reply arrives on the same connection
+
+#### Scenario: A peer that vanishes
+- **WHEN** a cell sends bytes to a peer that no longer answers
+- **THEN** the connection reports `ECONNRESET` after the 20 s timeout
+
+#### Scenario: Reconnecting
+- **WHEN** a connection to the outside is reset by its peer, or its peer closes it between two requests, and the cell opens a new one
+- **THEN** the new connection is open and carries an echo within a second
+
+### Requirement: Frames from the network are hostile input
+The kernel SHALL treat every frame the card delivers as written by anyone
+on the network. No sequence of frames SHALL panic the kernel, open or close
+a socket, change another cell's sockets or connections (except one whose
+peer's addresses the frames carry, which TCP and ARP do not authenticate),
+send a cell's bytes to any host but its connection's peer, or keep kernel
+memory once the sockets it reached are closed.
+
+#### Scenario: Hostile frames next to another cell's connection
+- **WHEN** a host on the network sends valid, changed, cut, replayed or random frames (TCP to listening, closed and connected ports, UDP, IPv4 fragments and options, ICMP, ARP, DHCP replies) while a cell's connection exchanges data with another host
+- **THEN** the kernel does not panic, the number of open sockets does not change, that connection receives exactly the bytes its peer sent, its bytes leave only towards its peer, and once every socket is closed the kernel heap holds what it held before
+
+#### Scenario: Hostile DHCP server
+- **WHEN** a card asking for a lease receives changed, cut or random DHCP replies
+- **THEN** the kernel does not panic, and the card's address, if it has one, is a unicast address
+
+### Requirement: A flood cannot hold the kernel
+One poll of the card SHALL take at most one receive ring of frames (64)
+and then ask to be polled again at once, so that frames arriving faster
+than the kernel handles them cannot hold the CPU that polls the card.
+
+#### Scenario: Flood
+- **WHEN** frames keep arriving faster than the kernel handles them
+- **THEN** a poll of the card returns after 64 frames and asks to be polled again at once

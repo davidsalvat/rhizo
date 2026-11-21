@@ -101,6 +101,13 @@ CPY_COLD = median("workload.cpython_cold_us", required=False)
 CPY_WARM = median("workload.cpython_warm_us", required=False)
 LX_CPY_COLD = median("workload.cpython_cold_us", "linux-process", required=False)
 LX_CPY_WARM = median("workload.cpython_warm_us", "linux-process", required=False)
+NP_COLD = median("workload.numpy_cold_us", required=False)
+NP_WARM = median("workload.numpy_warm_us", required=False)
+LX_NP_COLD = median("workload.numpy_cold_us", "linux-process", required=False)
+LX_NP_WARM = median("workload.numpy_warm_us", "linux-process", required=False)
+NODE_COLD = median("workload.node_cold_us", required=False)
+NODE_WARM = median("workload.node_warm_us", required=False)
+LX_NODE_COLD = median("workload.node_cold_us", "linux-process", required=False)
 SECURITY = (OUT.parent / "security.md").exists()
 PY_COLD = median("workload.python_cold_us")
 PY_WARM = median("workload.python_warm_us")
@@ -301,7 +308,20 @@ def chart(t):
         ("CPython agent request, from a warm template", ratio(CPY_WARM, LX_CPY_WARM),
          [("Rhizo cell", CPY_WARM, us(CPY_WARM), True)]
          + linux("fork of warm", LX_CPY_WARM, "same VM")),
-    ] if CPY_COLD and CPY_WARM else []) + [
+    ] if CPY_COLD and CPY_WARM else []) + ([
+        ("numpy from PyPI wheels, cold start", ratio(NP_COLD, LX_NP_COLD),
+         [("Rhizo cell", NP_COLD, us(NP_COLD), True)]
+         + linux("process", LX_NP_COLD, "same VM")),
+        ("numpy from PyPI wheels, from a warm template", ratio(NP_WARM, LX_NP_WARM),
+         [("Rhizo cell", NP_WARM, us(NP_WARM), True)]
+         + linux("fork of warm", LX_NP_WARM, "same VM")),
+    ] if NP_COLD and NP_WARM else []) + ([
+        # Node.js cannot fork itself: a Linux process can only start cold.
+        ("Node.js agent request (Linux cannot fork Node.js)", ratio(NODE_WARM, LX_NODE_COLD),
+         [("Cell, warm template", NODE_WARM, us(NODE_WARM), True),
+          ("Cell, cold", NODE_COLD, us(NODE_COLD), False)]
+         + linux("process, cold", LX_NODE_COLD, "same VM")),
+    ] if NODE_COLD and NODE_WARM else []) + [
         ("Answer a Python request (MicroPython)", ratio(PY_WARM, PY_COLD),
          [("Warm template", PY_WARM, us(PY_WARM), True),
           ("Cold interpreter", PY_COLD, us(PY_COLD), False)]),
@@ -500,7 +520,8 @@ STAGES = [
      (us(AGENT_FORK), "to fork a live agent three ways") if AGENT_FORK else None),
     ("Scale and compatibility", "Thousands of busy agents and everyday software, safely shared",
      [has("cell.shootdown_us"), has("density.wake_p99_us"),
-      has("workload.dynamic_run_us"), has("workload.node_warm_us")], "now",
+      has("workload.dynamic_run_us"), has("workload.node_warm_us"),
+      has("workload.numpy_warm_us"), has("cell.syscall_kpti_ns")], "now",
      (f"{DENSITY:,.0f}", "busy cells in one VM") if DENSITY else None),
     ("The product", "Download a ready agent in two clicks, bring your own model",
      [False], "vision", None),

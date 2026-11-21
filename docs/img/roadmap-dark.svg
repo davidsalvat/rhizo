@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 612" width="800" height="612" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Where Rhizo stands</title>
-<desc>7 of 8 stages done. The foundations (done): boots in milliseconds on arm and x86, tested on every change, 8 ms to boot (Firecracker). The cell (done): runs ordinary linux programs, each sealed off from the rest, 21 KB per idle cell. Native operations (done): pause, resume or copy a running agent in microseconds, 1.14 µs to fork a 50 MiB agent. Real programs (done): threads, networking, python and every processor core, 3.83 ms a Python request, warm. Proven with numbers (done): compared fairly with linux, vms and sandboxes; reviewed, 84× faster to start a program. A real agent (done): calls a model, explores branches, pauses between turns, 1.50 ms to fork a live agent three ways. Scale and compatibility (done): thousands of busy agents and everyday software, safely shared, 10,000 busy cells in one VM. The product (vision): download a ready agent in two clicks, bring your own model.</desc>
+<desc>7 of 8 stages done. The foundations (done): boots in milliseconds on arm and x86, tested on every change, 6 ms to boot (Firecracker). The cell (done): runs ordinary linux programs, each sealed off from the rest, 22 KB per idle cell. Native operations (done): pause, resume or copy a running agent in microseconds, 1.91 µs to fork a 50 MiB agent. Real programs (done): threads, networking, python and every processor core, 3.65 ms a Python request, warm. Proven with numbers (done): compared fairly with linux, vms and sandboxes; reviewed, 50× faster to start a program. A real agent (done): calls a model, explores branches, pauses between turns, 1.29 ms to fork a live agent three ways. Scale and compatibility (done): thousands of busy agents and everyday software, safely shared, 10,000 busy cells in one VM. The product (vision): download a ready agent in two clicks, bring your own model.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="611" rx="12" fill="#0d1117" stroke="#30363d"/>
 <text x="24" y="40" font-size="20" fill="#e6edf3" font-weight="700">Proof of concept: 7 of 8 stages done</text>
@@ -20,37 +20,37 @@
 <path d="M47.5 131.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="80" y="127.0" font-size="16" fill="#e6edf3" font-weight="700">The foundations</text>
 <text x="80" y="148.0" font-size="14" fill="#9ba7b3">Boots in milliseconds on Arm and x86, tested on every change</text>
-<text x="776" y="127.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">8 ms</text>
+<text x="776" y="127.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">6 ms</text>
 <text x="776" y="148.0" font-size="13" fill="#9ba7b3" text-anchor="end">to boot (Firecracker)</text>
 <circle cx="52" cy="193.0" r="9" fill="#63d4a0"/>
 <path d="M47.5 193.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="80" y="189.0" font-size="16" fill="#e6edf3" font-weight="700">The cell</text>
 <text x="80" y="210.0" font-size="14" fill="#9ba7b3">Runs ordinary Linux programs, each sealed off from the rest</text>
-<text x="776" y="189.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">21 KB</text>
+<text x="776" y="189.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">22 KB</text>
 <text x="776" y="210.0" font-size="13" fill="#9ba7b3" text-anchor="end">per idle cell</text>
 <circle cx="52" cy="255.0" r="9" fill="#63d4a0"/>
 <path d="M47.5 255.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="80" y="251.0" font-size="16" fill="#e6edf3" font-weight="700">Native operations</text>
 <text x="80" y="272.0" font-size="14" fill="#9ba7b3">Pause, resume or copy a running agent in microseconds</text>
-<text x="776" y="251.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">1.14 µs</text>
+<text x="776" y="251.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">1.91 µs</text>
 <text x="776" y="272.0" font-size="13" fill="#9ba7b3" text-anchor="end">to fork a 50 MiB agent</text>
 <circle cx="52" cy="317.0" r="9" fill="#63d4a0"/>
 <path d="M47.5 317.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="80" y="313.0" font-size="16" fill="#e6edf3" font-weight="700">Real programs</text>
 <text x="80" y="334.0" font-size="14" fill="#9ba7b3">Threads, networking, Python and every processor core</text>
-<text x="776" y="313.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">3.83 ms</text>
+<text x="776" y="313.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">3.65 ms</text>
 <text x="776" y="334.0" font-size="13" fill="#9ba7b3" text-anchor="end">a Python request, warm</text>
 <circle cx="52" cy="379.0" r="9" fill="#63d4a0"/>
 <path d="M47.5 379.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="80" y="375.0" font-size="16" fill="#e6edf3" font-weight="700">Proven with numbers</text>
 <text x="80" y="396.0" font-size="14" fill="#9ba7b3">Compared fairly with Linux, VMs and sandboxes; reviewed</text>
-<text x="776" y="375.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">84× faster</text>
+<text x="776" y="375.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">50× faster</text>
 <text x="776" y="396.0" font-size="13" fill="#9ba7b3" text-anchor="end">to start a program</text>
 <circle cx="52" cy="441.0" r="9" fill="#63d4a0"/>
 <path d="M47.5 441.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="80" y="437.0" font-size="16" fill="#e6edf3" font-weight="700">A real agent</text>
 <text x="80" y="458.0" font-size="14" fill="#9ba7b3">Calls a model, explores branches, pauses between turns</text>
-<text x="776" y="437.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">1.50 ms</text>
+<text x="776" y="437.0" font-size="16" fill="#63d4a0" font-weight="700" text-anchor="end">1.29 ms</text>
 <text x="776" y="458.0" font-size="13" fill="#9ba7b3" text-anchor="end">to fork a live agent three ways</text>
 <circle cx="52" cy="503.0" r="9" fill="#63d4a0"/>
 <path d="M47.5 503.0l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
