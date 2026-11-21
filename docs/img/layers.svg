@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 488" width="800" height="488" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Simple on top, deep below</title>
-<desc>Layers of Rhizo. On top, what the user sees: a two-click app and a template catalog (both planned) and their agents. A line separates it from what the user does not see: agent cells that are created, suspended, resumed and forked in microseconds (fork 1.44 µs, resume 1.27 µs, measured), and below them the Rhizo kernel, which rebuilds the foundations: memory, scheduler, isolation, network and snapshots.</desc>
+<desc>Layers of Rhizo. On top, what the user sees: a two-click app and a template catalog (both planned) and their agents. A line separates it from what the user does not see: agent cells that are created, suspended, resumed and forked in microseconds (fork 1.91 µs, resume 0.88 µs, measured), and below them the Rhizo kernel, which rebuilds the foundations: memory, scheduler, isolation, network and snapshots.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="487" rx="12" fill="#ffffff" stroke="#d0d7de"/>
 <text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Simple on top, deep below</text>
@@ -23,7 +23,7 @@
 <rect x="24" y="224" width="752" height="84" rx="24" fill="#eafaf2" stroke="#1f9d6b" stroke-width="2"/>
 <text x="48" y="258" font-size="18" fill="#0e2a20" font-weight="700">Agent cells</text>
 <text x="48" y="284" font-size="14" fill="#4b5c55">create · suspend · resume · fork</text>
-<text x="752" y="258" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">fork 1.44 µs · resume 1.27 µs</text>
+<text x="752" y="258" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">fork 1.91 µs · resume 0.88 µs</text>
 <text x="752" y="284" font-size="12" fill="#146c4a" font-weight="700" text-anchor="end">measured</text>
 <line x1="400" y1="310" x2="400" y2="332" stroke="#57706a" stroke-width="1.8" marker-end="url(#a)"/>
 <rect x="24" y="334" width="752" height="116" rx="8" fill="#f3f5f4" stroke="#c3ccc8" stroke-width="1.5"/>

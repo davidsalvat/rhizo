@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 512" width="800" height="512" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Two clicks</title>
-<desc>The user's path: 1. Pick a template: a ready Python, data or Node agent (planned). 2. Download it: one compressed snapshot (planned). 3. Open an agent: the snapshot resumes (1.27 µs resume from memory, measured). 4. Open ten more: ten forks, no extra memory until they write (1.44 µs per fork, measured). 5. Suspend, come back later: the agent waits as a snapshot (22 KB per idle agent, measured).</desc>
+<desc>The user's path: 1. Pick a template: a ready Python, data or Node agent (planned). 2. Download it: one compressed snapshot (planned). 3. Open an agent: the snapshot resumes (0.88 µs resume from memory, measured). 4. Open ten more: ten forks, no extra memory until they write (1.91 µs per fork, measured). 5. Suspend, come back later: the agent waits as a snapshot (22 KB per idle agent, measured).</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="511" rx="12" fill="#ffffff" stroke="#d0d7de"/>
 <text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Two clicks</text>
@@ -23,14 +23,14 @@
 <text x="52" y="281" font-size="14" fill="#0e2a20" font-weight="700" text-anchor="middle">3</text>
 <text x="108" y="272" font-size="16" fill="#0e2a20" font-weight="700">Open an agent</text>
 <text x="108" y="294" font-size="14" fill="#4b5c55">the snapshot resumes</text>
-<text x="756" y="272" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">1.27 µs</text>
+<text x="756" y="272" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">0.88 µs</text>
 <text x="756" y="294" font-size="13" fill="#4b5c55" text-anchor="end">resume from memory</text>
 <rect x="88" y="320" width="688" height="64" rx="8" fill="#eafaf2" stroke="#1f9d6b" stroke-width="1.5"/>
 <circle cx="52" cy="352" r="15" fill="#ffffff" stroke="#1f9d6b" stroke-width="2"/>
 <text x="52" y="357" font-size="14" fill="#0e2a20" font-weight="700" text-anchor="middle">4</text>
 <text x="108" y="348" font-size="16" fill="#0e2a20" font-weight="700">Open ten more</text>
 <text x="108" y="370" font-size="14" fill="#4b5c55">ten forks, no extra memory until they write</text>
-<text x="756" y="348" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">1.44 µs</text>
+<text x="756" y="348" font-size="16" fill="#146c4a" font-weight="700" text-anchor="end">1.91 µs</text>
 <text x="756" y="370" font-size="13" fill="#4b5c55" text-anchor="end">per fork</text>
 <rect x="88" y="396" width="688" height="64" rx="8" fill="#eafaf2" stroke="#1f9d6b" stroke-width="1.5"/>
 <circle cx="52" cy="428" r="15" fill="#ffffff" stroke="#1f9d6b" stroke-width="2"/>
