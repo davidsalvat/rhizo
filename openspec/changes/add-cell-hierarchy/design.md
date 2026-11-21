@@ -1,0 +1,873 @@
+# Design
+
+Terms used throughout:
+
+- **Tree**: the ownership tree of cells. The host is its root; it is not a
+  cell.
+- **Root cell**: a child of the host.
+- **Domain**: a root cell and all its descendants. The domain is the
+  boundary for covert channels (D12). Explicit authority applies inside a
+  domain too (D9).
+- **Loopback network**: one instance of 127.0.0.0/8 with its own ports and
+  Unix socket names (D5). Today there is one per kernel; after this change
+  there is one per cell, unless the creator shares one.
+- **Handle**: a kernel object together with a set of rights, held by one
+  cell (D9).
+- **Budget**: a cell's limits (the quotas of `add-cell-quotas`, plus a
+  limit on descendants) minus what it uses itself and what it reserved for
+  its children (D4).
+
+## D0. Threat model
+
+The first attacker is two or more cooperating agents, each in its own
+cell. They know the kernel's source. Their goals:
+
+1. Communicate with each other when nobody gave them a channel. This covers
+   direct paths (a shared loopback port), storage channels (state one cell
+   changes and another reads: a port in use, free memory, an error code, a
+   file name) and timing channels.
+2. Make the network card send bytes to a destination that their egress
+   policy does not allow. They may do it directly, through another cell
+   that has more egress, or by taking a socket that cell opened.
+3. Gain authority nobody granted them: control over a cell that is not a
+   descendant, a handle they did not receive, wider egress or a larger
+   quota. They may try re-parenting, promotion, forking, snapshots or
+   forged numbers.
+4. Exhaust resources so that other domains fail (fork bombs, socket pool,
+   ports, kernel heap).
+
+The second attacker is a forged snapshot file (as in `snapshots-on-disk`).
+It must not bring authority into the kernel: no handle, no tree position,
+no wider policy.
+
+Trusted: the host (`rhizo` server and whoever drives it) and everything the
+existing review trusts (VMM, hardware, the device model).
+
+What the design promises, in order of strength:
+
+- **G1. No authority without a grant.** Every handle, every way to reach
+  another cell and every socket to the outside comes from the creator, the
+  host or a grant along an explicit path. Handles cannot be forged, and
+  sockets cannot be transferred.
+- **G2. Egress is enforced per socket, from the policy of the cell that
+  made the socket.** The card sends a cell's bytes only to destinations its
+  policy allows. Even with a perfect covert channel, a cell with policy
+  `none` can never put a packet on the wire itself. It can only pass
+  information to a cell that is allowed to.
+- **G3. No storage channel between domains** whose roots have memory
+  limits. Nothing a cell can observe, apart from elapsed time, depends on
+  what another domain does.
+- **G4. Timing channels between domains are reduced, listed and measured,
+  but not closed.** On shared CPUs and caches they cannot be closed (D12).
+  For that level of assurance, use separate VMs or exclusive CPUs.
+
+As a consequence of G2 and G4, the information two colluding domains can
+exchange is bounded by the bandwidth of the timing channels, and their
+network reach is the union of their own policies, never more. The incident
+the user described needs both a way to talk and a way out. G1 to G3 close
+both inside one kernel. G4 leaves a slow, noisy timing channel. That
+channel cannot widen any cell's reach; it can only leak information to a
+cell that already has egress.
+
+## D1. Ownership tree
+
+The kernel keeps the tree as plain data in a new library crate,
+`rhizo-cap`, which has no dependencies and can be tested on the host. A
+node holds:
+
+- its parent;
+- its children;
+- its limits, its reservation and the reservation mode (reserved or pooled);
+- its policy for when the parent ends;
+- its egress policy and exposure ceiling;
+- its loopback network;
+- its identifier inside its domain;
+- its label.
+
+A node exists for a running cell, a suspended cell and a template.
+Suspending a cell does not suspend its children: ownership is not
+scheduling. `suspend --tree` suspends the whole subtree.
+
+How cells enter the tree:
+
+- A cell the host creates (`run`, `load`, a fork of a template) is a child
+  of the host, which makes it a root, or of the cell the host names with
+  `--parent`.
+- A cell created at a cell's request (phase 4, D10) is a child of that
+  cell.
+- A copy made by the host or by an ancestor (fork, template copy) is a
+  sibling of its source (D13).
+
+Size: a node is at most 48 bytes, stored inside the kernel's record of the
+cell. `cell.idle_bytes` grows by at most that amount per cell, which the
+phase 1 pull request justifies under rule 8.
+
+Alternative: groups as explicit tree nodes that hold no program, like
+cgroups. Rejected: they add a kind of object nobody needs yet. A root cell
+already plays the part of a group, and the host can name any cell as
+parent.
+
+## D2. Authority over the tree flows down
+
+An ancestor of a cell, or the host, may do the following to it: suspend,
+resume, fork, freeze, kill, re-parent, narrow its policy or limits, and
+grant or revoke on its behalf. No operation exists that lets a cell act on
+itself (except ending), on an ancestor, or on a cell outside its subtree.
+The only way to do that is a handle granted to it.
+
+A handle with the control right is never held by the cell it names or by a
+descendant of that cell. The kernel refuses that delivery, whoever sends
+it. Without this rule, a parent could hand a child control over itself and
+the child could then promote itself. The rule keeps "never by the child" an
+invariant, not a convention.
+
+**Re-parenting.** The request has to come from someone who controls the
+cell: its current parent, an ancestor, the host, or the holder of a control
+handle derived from one of those. The kernel then checks:
+
+- The new parent is not in the cell's subtree (no cycles).
+- The new parent is in the same domain. Only the host moves a cell across
+  domains: the domain boundary is the host's to cross.
+- The new egress policy is the intersection of the cell's policy with the
+  new parent's. Connections the narrower policy denies are reset.
+- The cell's reservation fits in the new parent's free budget, otherwise
+  the move is refused. Nothing is shrunk silently.
+- When the move is to a non-root parent, the holder of the request must
+  also have control over the new parent. Moving a cell under someone means
+  giving it to them and charging their budget.
+
+**Promotion to root.** This is re-parenting to the host. The cell keeps its
+subtree, policy and reservation. If a cell (not the host) asked for it, the
+reservation leaves the old parent's budget for good: the parent's limits
+shrink by that amount, so the total reserved at the root level is
+unchanged and promotion creates no resources. The new domain still shares
+frames it mapped before the move with its old domain. This is a residual
+timing coupling (D12), and it is documented.
+
+Alternative: the child requests and the parent approves. Rejected: the
+parent can already do it directly, and a second protocol adds code and a
+waiting state that would go into snapshots.
+
+## D3. When a parent ends
+
+Each cell carries `on_parent_end`, set by whoever creates it and changeable
+by its ancestors and the host. It has two values:
+
+- **cascade** (the default): the cell and its descendants end, depth
+  first. Suspended snapshots are discarded and templates are dropped. An
+  agent that dies takes its helpers with it, and their reservations come
+  back.
+- **promote**: each direct child with this value becomes a root with its
+  subtree, as in D2. This is an authorization of promotion given in
+  advance, so it can be set by anyone who could promote the cell.
+
+No cell is ever left without a parent. When the kernel shuts down, every
+cell ends.
+
+Alternative: re-parent to the grandparent. Rejected: the grandparent never
+asked to own the cell and may not have the budget for it. Promotion is
+explicit about where the resources go.
+
+## D4. Hierarchical budgets
+
+These extend `add-cell-quotas` (`rhizo_cell::quota`). A cell has limits on
+memory, CPU time, sockets and descendants. Descriptors stay per cell
+(they are per-cell tables and share nothing). The free budget of a cell is:
+
+```text
+free = limit - own use - sum of reserved children's limits - sum of pooled children's use
+```
+
+**Reserved children** (the default). The child's limits are subtracted from
+the parent's free budget when the child is created, and the creation is
+refused if they do not fit. When the child ends, its limits come back. For
+CPU time, only the part the child did not use comes back: time used is
+spent for the whole subtree. Siblings with reserved budgets never compete,
+so a child's failures depend only on its own use. That is G3 inside a
+domain.
+
+**Pooled children.** The child's limits are only caps. What it takes comes
+from the parent's free budget at the moment it takes it. This is what
+density needs (1000 forks of one agent cannot each reserve 64 MiB on a
+laptop). The cost is a storage channel between pooled siblings, through
+their common pool. It stays inside the domain and is documented.
+
+**No fork bombs.** A cell can create children only while it has finite
+limits on memory, descendants and sockets. A child counts as one
+descendant plus its own descendant limit. Whatever a subtree does, it holds
+at most what its root was given.
+
+**Roots and admission.** A root with a memory limit is reserved. The kernel
+refuses to create or raise such a root if the sum of reserved roots'
+limits would exceed what cells can take: usable memory minus the kernel's
+reserve and fixed overhead. Allocations of unlimited roots, and of the
+kernel's caches, cannot eat into the unused reservations of reserved
+roots. The caches are already given back before a cell is refused memory
+(design D4 of `add-image-cache`). Sockets work the same way against half
+of `SOCKETS_MAX` (each connection costs two), and descendants against the
+capacity of the kernel's cell table. Unlimited roots share whatever is
+left, so they can observe each other's use. Containment requires reserved
+roots.
+
+**Everything a cell's actions take is charged to it.** In this design,
+memory covers:
+
+- pages and page tables (already metered);
+- file data and names (today bounded per cell by `DATA_MAX`, outside the
+  quota: that is O1's remainder in `docs/security.md`);
+- thread and socket records;
+- socket queues and `smoltcp` buffers;
+- channel queues;
+- the file pages kept for its domain (D12, item 9).
+
+Without these, a reserved root could still exhaust the kernel heap and be
+seen by others. File data is metered where `rhizo-fs` allocates and frees
+blocks, through the same `Meter` the pager uses. Snapshots of suspended
+cells stay charged to their reservations.
+
+Alternative: charge each child to every ancestor at allocation time,
+without reservations (cgroup v2's model). Rejected as the default: one
+sibling's use then decides another's failures, which is a storage channel.
+It is kept as the pooled mode.
+
+## D5. Loopback networks
+
+Every socket in `rhizo-net` gets a network number, and everything on the
+loopback is looked up per network:
+
+- bind conflicts;
+- the listener a `connect` reaches;
+- UDP delivery;
+- the ephemeral port counter, one per network, each starting at a place
+  drawn from the boot's randomness;
+- Unix socket listeners, keyed by (network, name) instead of name alone.
+  The (network, name) key also means a forged snapshot that puts a name
+  number into a socket file reaches nothing outside its own network.
+
+Which network a cell gets:
+
+| Cell | Network |
+|---|---|
+| Created by the host | A new one, unless the host passes `--net-of N` (join N's network) |
+| Created by a cell (phase 4) | A new one, unless the creator shares its own (subject to D8) |
+| Copy made by fork or template, into the source's network | Same network as the source. Listeners and bound datagram sockets are shared, as today (forked servers keep working). |
+| Template copy placed in another network | Its listeners and bound datagram sockets are bound again in the new network, as a resume does. They are never shared across networks. |
+
+A network lives as long as a member cell holds it, suspended cells
+included. In-kernel tests and benchmarks that run two cells over loopback
+(`cell.loopback_rtt_us`, the density loads) put the client into the
+server's network. That is one argument more when spawning, and one
+comparison more per socket looked at.
+
+Alternative: one loopback network per domain. Rejected as the default:
+every sibling in the domain could then reach every other, which is ambient
+authority inside the hierarchy. Sharing stays possible on request.
+
+Alternative: remove loopback between cells and use only channels.
+Rejected: unmodified servers and clients (HTTP tool servers, databases)
+talk TCP. A shared network is how a parent can wire them, explicitly.
+
+## D6. The network card: kernel-chosen ports
+
+All cells share one card, one address and one `smoltcp` interface. Today
+the ports of connections to the outside come from the same sequential
+counter as loopback ports, and a cell can bind the card's address to a
+chosen port. Both are storage channels: from the port sequence a cell can
+count what others opened, and `EADDRINUSE` tells it which ports others
+hold.
+
+The fix is network address translation inside the kernel. A socket that
+reaches the card keeps the port its cell sees in its own loopback network.
+`getsockname` answers the card's address with that port. The card port is
+picked by the kernel uniformly at random among free ports, and no cell
+ever sees it. The card has 28,232 ports and the kernel at most 4,096
+sockets, so a card port is always free and a collision is retried
+invisibly. Inbound datagrams are matched by card port to their socket. The
+kernel opens no listener on the card, so there is no inbound connection to
+route.
+
+What stays shared: the card's MAC and IP address (constant), its neighbour
+cache and DHCP lease (timing only, D12), and its bandwidth and queues
+(timing only).
+
+## D7. Egress policy
+
+The policy is part of a cell's state, defined in `rhizo-cap` and enforced
+in `rhizo-net`:
+
+```text
+Egress = None | Rules([Rule]) | Full
+Rule   = { proto: tcp | udp | any, net: a.b.c.d/len, ports: lo..=hi }
+model  = Rules(the host's model endpoints)   // a named rule set
+```
+
+The four levels the user asked for are `None`, `model`, `Rules(list)` and
+`Full`. `model` is a named rule set the host defines for the VM
+(`rhizo up --model HOST:PORT`) or for one root. A parent can therefore
+narrow a child to "the model only" without knowing the model's address.
+The vision's local model socket can later join this set without changing
+the policy model.
+
+**Order.** Policies are ordered by the set of (protocol, address, port)
+tuples they allow:
+
+- `None` is the smallest and `Full` the largest.
+- `Rules(a) ⊆ Rules(b)` when each rule of `a` lies inside one rule of `b`.
+  The check is conservative: a rule covered only by the union of several
+  rules is refused. Since narrowing is the only use of the check,
+  refusing in doubt is safe.
+
+**Inheritance.** A child's policy is at most its parent's. Re-parenting
+takes the intersection. A loaded snapshot takes the intersection with its
+new parent's policy. Nothing widens a policy except the host, and only on
+a root or within the parent's policy.
+
+**Enforcement points** in `rhizo-net`. Each socket records, when it is
+made, a reference to its cell's policy (immutable and shared, so narrowing
+replaces the reference):
+
+- `connect` to an outside address: refused with `EACCES` if no rule allows
+  it.
+- `sendto` and `send` on an unconnected UDP socket: checked per datagram.
+  A connected UDP socket is checked once, at `connect`.
+- Datagrams from the outside: dropped unless the receiving socket's policy
+  allows their source. A `model` cell cannot be reached by arbitrary
+  hosts, so no command-and-control by UDP.
+- Narrowing a live cell's policy resets its connections the new policy
+  denies. They report `ECONNRESET` at the next call.
+
+`EACCES` follows Landlock, so an agent can tell "denied" from "no route".
+`ENETUNREACH` keeps meaning "no card or no address".
+
+**Sockets never change cells.** The only way a socket reaches another cell
+is a fork of its own cell, and every copy has the same policy. Channels
+cannot carry sockets (D9). A cell without egress therefore cannot borrow a
+connection that a cell with egress opened.
+
+**A floor for every policy.** `rhizo up --deny CIDR` sets addresses no
+policy reaches, `Full` included. QEMU's user network maps `10.0.2.2` to
+the host's own loopback, so `Full` reaches every service listening on the
+host's 127.0.0.1. `rhizo` warns when `Full` is used there. Whether the
+floor should contain that gateway by default is an open question
+(proposal).
+
+**What the kernel cannot judge.**
+
+- The kernel knows addresses, not names. The host resolves names when it
+  sets a policy, and the cell gets `/etc/hosts`.
+- Allowing UDP or TCP port 53 to a recursive resolver allows exfiltration
+  through DNS names. `rhizo` warns about it.
+- An allowlist entry for an address shared by a CDN reaches every site
+  behind that CDN, through the TLS SNI or the HTTP Host header.
+- For name-level or content-level policy, grant only the address of a
+  host-side egress proxy that checks names. `model` is meant to point to
+  such a gateway.
+- The model endpoint is itself a way out: what a cell sends to its model
+  leaves the machine.
+
+Cost: one rule scan per outside `connect` and per unconnected UDP
+datagram, against typically fewer than 8 rules. Loopback calls pay
+nothing. `net.egress_check_insns` measures it, and `net.tcp_rtt_us` with a
+16-rule policy must not regress.
+
+Alternatives:
+
+- **Names in the kernel** (a DNS resolver, SNI inspection). Rejected:
+  parsing TLS in the kernel, a large new attack surface, and still not
+  sound behind CDNs.
+- **A filter in the VMM or on the host only** (iptables on the tap).
+  Rejected as the only layer: every cell has the VM's one address, so a
+  host filter cannot tell cells apart. It remains a good second layer.
+
+## D8. Exposure ceilings: no proxying past a policy
+
+Handles and shared networks let information flow between cells. If a cell
+with policy `None` can send messages to a cell with `Full`, its data
+reaches the internet: this is exactly "agents talking to each other to
+reach the internet". The kernel can see every such flow, because it
+creates them all, so it checks them.
+
+Each cell has an **exposure ceiling**, an egress policy at least as wide as
+its own (by default, equal to it), set by its creator and only narrowed.
+
+**Flow edges** are the paths information can take:
+
+- A channel: both ways if both ends can send, one way otherwise.
+- An observe handle: from the observed cell to the holder.
+- An input handle: from the holder to the target.
+- A control handle: both ways.
+- A read-only view: from the owner to the viewer. A read-write view: both
+  ways.
+- A shared loopback network: both ways between every pair of its members.
+- The tree edge: both ways between parent and child.
+
+**Invariant.** For every cell `c`, let the cells reachable from `c` be
+those reached along flow edges without passing through an ancestor of `c`.
+The union of their egress policies must be within `c`'s ceiling.
+Ancestors are excluded because they already have full authority over `c`
+(they can suspend it, give it its inputs, read its results), so they are
+part of its trusted base. What an ancestor does with `c`'s data is that
+ancestor's authority.
+
+The kernel checks the invariant before any change that adds an edge:
+
+- granting or transferring a handle;
+- accepting a channel;
+- creating or re-parenting a cell;
+- sharing a loopback network.
+
+It refuses the change with `EACCES` if the invariant would break. Grants
+are rare and domains are small (bounded by their descendant limits), so a
+traversal per grant is cheap. `cell.grant_us` measures it.
+
+Example: under a parent with `Full`, a sibling `B` with policy `None`
+cannot be given a channel to a sibling `A` with `Full` unless the parent
+raises `B`'s ceiling. Raising the ceiling is a visible, deliberate act.
+
+Alternative: no check, and document that capabilities do not prevent
+proxying. Rejected: that is the incident. The check costs a traversal per
+grant and turns "do not connect these cells" from advice into a kernel
+rule.
+
+Alternative: information-flow labels on every message (DIFC, as in
+HiStar or Flume). Rejected: tracking per message is a much larger design.
+Checking edges at grant time gives the property we need, because channels
+are the only flows we allow.
+
+## D9. Handles and rights (phase 2)
+
+Kernel objects and their rights:
+
+| Object | Rights |
+|---|---|
+| Cell | observe (its state changes and output), input (write its standard input), message (open a channel to it), control (D2 operations) |
+| Channel endpoint | send, receive, carry (move handles) |
+| View (phase 3) | read, write |
+| Kernel endpoint (phase 4, D10) | spawn, channel, derive, revoke, narrow |
+| Template (as a cell handle) | control (make copies of it), observe |
+
+**The grant table.** Every handle is a grant entry in `rhizo-cap`:
+`{object, rights, holder, grantor, parent grant}`. The entries form a
+derivation tree: a grant made from another grant is its child.
+
+**How a cell uses handles.** Only through descriptors, and through entries
+the kernel keeps in a read-only directory, `/run/rhizo/`, of the cell's own
+file tree:
+
+- `chan/<label>`: channel endpoints;
+- `cell/<label>`: cell handles;
+- `inbox`: where new channels from holders of the message right arrive;
+- `kernel`: the kernel endpoint.
+
+Views appear where they are mounted (phase 3). A cell can list, open and
+connect these entries. It drops a handle with `unlink`. Creating, renaming
+or writing an entry fails with `EROFS`. The directory is in the cell's own
+tree, so nothing about it is shared, and renaming cannot signal (D12,
+item 38).
+
+**No ambient authority.** A new cell's grant set is empty. Its
+`/run/rhizo/` holds what its creator granted at creation, and an `inbox`
+that stays empty until someone holds the message right on the cell. An
+empty inbox is not authority.
+
+**Unforgeable.** Descriptors and grant numbers are indices private to a
+cell. A number sent in a message or leaked covertly confers nothing. Only
+the kernel moves handles.
+
+**Attenuation.** The request `derive(fd, rights[, subdirectory])` returns a
+new descriptor with at most the source's rights. No request yields more
+rights than the cell holds.
+
+**Transfer.** Handles move as `SCM_RIGHTS` on a channel endpoint that has
+the carry right. The receiver gets a grant derived from the sender's, with
+the sender as grantor, so the sender can revoke it. Only handle
+descriptors can be sent. Descriptors of files, pipes, sockets, `epoll`
+instances and the kernel endpoint are refused with `EPERM`, a documented
+difference from Linux:
+
+- a socket to the outside would carry its creator's egress to another
+  cell (D7);
+- a pipe or a file description would be a shared kernel object outside
+  the handle model;
+- the kernel endpoint acts as its holder.
+
+**Revocation.** A cell revokes the grants it derived from one of its
+handles (`revoke(fd)`). An ancestor or the host can revoke any grant whose
+grantor is in its subtree. Revocation removes the derivation subtree at
+once, at a cost proportional to its size. What the holders of revoked
+handles see:
+
+- a channel endpoint behaves as a reset peer: reads return 0, writes fail
+  with `EPIPE`;
+- a cell handle refuses operations with `EACCES`, and its observe stream
+  ends;
+- a view disappears: its mount point reads empty, and descriptors opened
+  through it fail with `EIO`.
+
+**Bounds.** At most 256 handles per cell. Their records are charged to the
+cell's memory (D4).
+
+**Control flows down.** As stated in D2: a control handle on `X` is never
+delivered to `X` or to a descendant of `X`.
+
+Alternative: access control lists on cells (who may talk to whom).
+Rejected, as the user asked: ACLs need global names, which are themselves
+a channel, and they make delegation and revocation awkward.
+
+## D10. Channels, and how a program finds them
+
+A channel is two endpoints. Each endpoint has a receive queue bounded to
+64 messages and 256 KiB. A message holds at most 64 KiB and 16 handles.
+The kernel copies bytes in and out, and no memory is ever shared. The room
+for both queues (512 KiB) is reserved from the creator's memory budget
+when the channel is made. Sending into a full queue blocks or fails with
+`EAGAIN`, and never fails because of memory, so the queue reveals nothing
+of anyone's budget.
+
+**As a descriptor**, an endpoint is a connected `AF_UNIX` `SOCK_SEQPACKET`
+socket, with semantics Linux already defines:
+
+- one `write` is one message, and a message over 64 KiB fails with
+  `EMSGSIZE`;
+- one `read` takes one message, cut to the buffer with `MSG_TRUNC` as
+  SEQPACKET does;
+- `poll` and `epoll` report `IN`, `OUT` and `HUP`;
+- non-blocking mode, `sendmsg` and `recvmsg` (`SCM_RIGHTS`) work as on
+  Linux;
+- a closed peer gives end of file and `EPIPE`.
+
+Waiting uses the per-socket wait queues of `add-socket-wait-queues`, so a
+message wakes only the waiters of its endpoint.
+
+**Finding a channel.** `connect(AF_UNIX, SOCK_SEQPACKET,
+"/run/rhizo/chan/<label>")` or `open` of that path gives a descriptor of
+the endpoint. Several opens share one queue, as several opens of a FIFO
+do. `connect` needs no change in a Python, Node or C program. `open` makes
+`cat`, shell redirections and `os.read` work. Labels are chosen by the
+granter.
+
+**Opening a new channel to a cell** requires the message right on it.
+`connect` to `/run/rhizo/cell/<label>` makes a new channel. The other end
+waits on the target's `/run/rhizo/inbox`, a listening `SOCK_SEQPACKET`
+socket. The target accepts it, and `getpeername` names the label under
+which the target holds a handle to the opener, or `?`.
+
+**The kernel endpoint** (phase 4) is a channel whose peer is the kernel,
+acting for the cell. Requests and replies use `rhizo-control`'s frame
+encoding: its decoder already treats input as hostile (never panics,
+never allocates more than it receives). Handles travel as `SCM_RIGHTS`.
+The requests are `spawn`, `channel`, `derive`, `revoke`, `narrow`,
+`reparent` (of a descendant) and `promote` (of a descendant). Each needs
+the matching right of the endpoint, granted by the cell's creator.
+
+Alternatives:
+
+- **Inherited descriptors with `LISTEN_FDS` / `LISTEN_FDNAMES`** (systemd
+  socket activation). Deferred: many programs close descriptors above 2,
+  and the descriptors' numbers would have to survive `exec`. A path
+  survives everything. Adding the convention later is cheap.
+- **A new system call for kernel requests.** Rejected: it is ambient
+  (every cell could call it, so every call needs a check anyway), it
+  needs wrappers in every language, and it risks colliding with future
+  Linux numbers. The endpoint is a capability by construction, and it
+  reuses a hardened codec. Requests are not hot paths:
+  `cell.child_spawn_us` is measured against `control.fork_us`.
+- **Shared-memory rings.** Rejected: shared memory between cells is a
+  channel nobody can bound or revoke, and copies of messages up to 64 KiB
+  are cheap next to an agent's turn.
+
+## D11. Shared file views (phase 3)
+
+`rhizo-fs` keeps one tree per cell, with blocks shared copy-on-write. There
+are two kinds of views, both granted by handle and mounted at a path the
+grant names in the receiver's tree.
+
+**Snapshot view** (read-only, the default). Granting it clones the subtree
+into the receiver as a copy-on-write copy taken at that moment. File
+blocks are shared and not copied; directory and inode records are copied
+(proportional to the number of entries, not to the data). After the grant
+nothing flows: the receiver sees the subtree as it was. A new grant
+refreshes it. This is the safe default for "give the agent this dataset".
+
+**Live view** (read-only or read-write). The first live grant of a subtree
+moves it out of the owner's tree into a **volume**: an `Fs` of its own with
+its own lock, mounted back at the same path in the owner, which sees no
+difference. Receivers mount the same volume, with read access or with read
+and write. Volume data is charged to the owner's memory: a viewer's writes
+are refused with `ENOSPC` when the owner's budget is full. That flow is
+authorized, and it is part of the grant's flow edges (D8).
+
+Rules that keep a view inside its volume:
+
+- `..` at a mount root stays there;
+- `rename` and `link` across a mount boundary fail with `EXDEV`;
+- a volume holds only its subtree, so no path inside it can reach the
+  owner's other files.
+
+Revocation unmounts the view: the mount point reads as an empty directory,
+and descriptors opened through it fail with `EIO`.
+
+**Fork and snapshots.**
+
+- Snapshot views are part of the cell's files: forked copy-on-write and
+  serialized as they are.
+- Live mounts are shared by the fork's copies through derived grants, and
+  are not copied. This is a documented exception to "files are forked
+  copy-on-write".
+- A snapshot records live mounts by label. Its owner's snapshot holds the
+  volume's contents.
+- An exported snapshot of a viewer drops its live mounts, unless the host
+  binds them again or exports them as snapshot views
+  (`rhizo save --with-views`).
+
+There are no change notifications (`inotify` is not supported). Polling a
+live view is an explicit, authorized flow.
+
+Room for later: host shared folders (`docs/vision.md`: "shared folders
+with permissions") can be volumes backed by the host (virtio-fs), granted
+the same way.
+
+Alternative: a shared global namespace with permissions (`/shared/...`).
+Rejected: that is exactly the "communicating by renaming files" channel,
+and a single namespace for everyone.
+
+## D12. Covert channels: inventory
+
+The method: list every kernel resource more than one cell can touch. For
+each, decide whether a cell can modify it and another cell, holding no
+handle to the first, can observe it, either as a value (a storage channel)
+or as elapsed time (a timing channel). Then choose eliminate, partition,
+coarsen, or accept and document.
+
+"Within a domain" items are accepted: explicit authority still applies
+there, but the domain is the unit the host isolates. Two agents that must
+not collude belong in two domains.
+
+| # | Shared resource | Today | Storage | Timing | Decision |
+|---|---|---|---|---|---|
+| 1 | Loopback network 127.0.0.0/8 | One for all cells: any cell reaches any listener | Direct communication | — | **Partition** per cell (D5), phase 1 |
+| 2 | Loopback ports and their counter | Global, sequential | `EADDRINUSE`, and the sequence counts others' binds | — | **Partition**: ports and counter per network, phase 1 |
+| 3 | Card ports | Shared with loopback's counter; binds on the card address | Same as 2 | — | **Eliminate**: NAT with kernel-chosen random card ports, invisible to cells (D6), phase 1 |
+| 4 | Unix socket names | Global name numbers, private files | Not observable | — | **Partition**: key (network, name), against forged snapshots, phase 1 |
+| 5 | Socket pool (`SOCKETS_MAX` 4096) | Global | `ENFILE` when full | — | **Partition**: reserved socket budgets admitted against the pool (D4), phase 1 |
+| 6 | Frame allocator, free memory | `sysinfo` reports global free memory; `ENOMEM` on global exhaustion | High bandwidth: allocate and free versus read `sysinfo` | Allocation time | **Eliminate**: `sysinfo` reports the cell's own limit and what is left; reserved roots never fail because of others (D4), phase 1. Unlimited roots: accepted and documented |
+| 7 | Kernel heap | Cell records, file data and queues taken from one heap; `can_store` checks global free memory | `ENOSPC` and `ENOMEM` | Fragmentation | **Eliminate** storage by charging every kernel allocation to the cell (D4), phase 1; timing accepted |
+| 8 | File data | Bounded per cell (`DATA_MAX`), outside the memory quota | `ENOSPC` when the kernel runs low | — | **Eliminate**: charged to memory (D4), phase 1 |
+| 9 | Page cache of file pages (`add-dynamic-linking` D1) | Shared by block identity among cells whose blocks share an origin (the host's file sets, forks), 65,536 pages; a page past the limit **empties the whole cache** | — | Map latency shows hit or miss, and any cell can flush everyone's cache by mapping 65,536 pages: a classic dedup and eviction channel | **Partition**: key (domain, block), limit and eviction per domain, charged to the domain root (D4), phase 1. Cost: a library mapped in two domains takes two copies; within a domain nothing changes |
+| 10 | File blocks shared by `Arc` | A write copies a shared block and writes in place when sole owner | — | When one sharer drops a block, another's write becomes faster | Across domains, the only shared blocks come from the host's file sets, which the kernel holds, so a block is never sole-owned: **no channel**. Within a domain: accepted |
+| 11 | Image cache (4 images, LRU) | Spawns from executables the kernel holds | — | Spawn latency shows hit or miss, and a spawner can evict | Only the host spawns from images. Cells create children only by fork, by template copy, or from their own files (phase 4), which never touch this cache: **no cell-driven state** |
+| 12 | Template and snapshot frames (`add-shared-snapshots`) | Copies share frames copy-on-write; a sole owner's write takes the frame without copying | — | Dropping a template, or the exit of the other sharers, changes a cell's write cost | **Eliminate**: a template whose copies live in more than one domain keeps its references after `kill` until its last copy ends (a dropped template whose memory is held until then), so no cell is ever the sole owner of a cross-domain frame, phase 1 |
+| 13 | Frames shared by host forks | Siblings in one domain | — | Same as 12 | Within a domain: accepted |
+| 14 | Free 2 MiB blocks | Large-page versus small-page fallback | — | TLB and fault cost | **Accept**, documented |
+| 15 | CPUs and scheduler | Per-CPU run queues, stealing | — | **High.** Contention and wake latency; the literature reports hundreds to thousands of bits per second for contention channels | **Accept, measure** (`covert.cpu_bps`, informational) and document. Follow-up options: exclusive CPU sets per domain; fixed time partitions per domain (as seL4's domain scheduler) |
+| 16 | Caches, TLB, branch predictors, memory bus | Hardware | — | High | Out of scope (O3). CPU sets reduce private-cache sharing. Separate VMs or hosts for high assurance |
+| 17 | `CNTVCT_EL0`, `rdtsc` | Read directly by cells (spec `isolation`) | — | Not a channel by itself: the stopwatch for 14 to 16 | **Accept.** Coarsening rejected: trapping costs on every read, breaks the spec's direct counter, and any cell with two threads builds a fine clock from a shared counter anyway |
+| 18 | `CLOCK_MONOTONIC`, real time | Boot-relative, the same for all | — | — | No channel: no cell can change it |
+| 19 | Cell identifiers (`getpid`) | Global counter (O6) | Counts cells created anywhere; cells creating cells (phase 4) would make it writable by others | — | **Eliminate**: identifiers numbered within the domain from 1 (spec `linux-abi`), phase 1 |
+| 20 | Thread identifiers | Per cell, from the cell's identifier | Follow 19 | — | Fixed by 19 |
+| 21 | Control-plane identifiers | The host's table | Host only | — | No channel |
+| 22 | Output relay, serial line | Each cell's output goes to the host in its own frames, through one line | — | Line bandwidth, seen only by the host | No cell observes another's output. **Documented:** a host orchestrator that pipes one domain's output into another's input builds the channel itself; the host is trusted |
+| 23 | Kernel console reports | Bounded per cell, host only | — | — | No channel |
+| 24 | Error codes | `ENOMEM`, `ENOSPC`, `ENFILE`, `EADDRINUSE`, `ECONNREFUSED` reflect global state today | Yes | — | **Eliminate**: each now depends on the domain's own state (items 2 to 8); requirement "No storage channel between domains" |
+| 25 | Network card: MAC, IP, ARP and neighbour cache, DHCP, queues, bandwidth | Shared | Constant values only | Neighbour-cache hits and queue contention | **Accept**, documented. Cells with egress `None` never touch the card |
+| 26 | DNS | None in the kernel | — | — | Cells resolve through UDP or TCP to an address, which their policy decides. Allowing a recursive resolver allows exfiltration in DNS names, and `rhizo` warns |
+| 27 | Socket wait queues, the change counter | Per socket; the counter is never shown to cells | — | — | No channel |
+| 28 | Kernel locks (`frames`, `refs`, `sharing`, `net`, `sched`) | Shared | — | Lock wait time | **Accept**, documented |
+| 29 | Kernel cell table | Global capacity | Refusal when full | — | **Partition**: descendant budgets admitted against it (D4), phases 1 and 4 |
+| 30 | Random generators | One per cell, fast key erasure | — | — | No channel |
+| 31 | Parked socket keys | Derived from a kernel secret | — | — | Unguessable (finding S15) |
+| 32 | Handle grant table (phase 2) | Global table | Indices are private per cell; a cell never sees grant numbers | — | No channel. Per-cell bound and charge (D9) |
+| 33 | Channel queues | Room reserved at creation | Full is decided only by the two ends | — | Authorized flow only |
+| 34 | Futexes | Keyed per cell | — | — | No channel |
+| 35 | `sysinfo` uptime, `uname`, CPU count | Constant or boot-relative | — | — | No channel |
+| 36 | Templates and file sets from the host | Read-only contents | — | See 10 and 12 | Covered |
+| 37 | Exit status | Delivered to the parent (tree edge) and to observe handles | Authorized | — | Flow edges (D8) |
+| 38 | **File names** | `rhizo-fs` keeps one tree per cell: names, inode numbers, directories, sizes and times are per cell, and blocks are shared only immutably | None: `rename` changes only the caller's own tree, and no other cell can list it | — | **Confirmed: there is no shared namespace through which renaming files could signal.** Live views (D11) share a namespace on purpose, and only by grant inside the ceilings |
+| 39 | `/run/rhizo/` | Per cell, read-only, built by the kernel | — | — | No channel (D9) |
+| 40 | Snapshots on disk (save/load) | The host chooses what to load | Host mediated | — | Loaded snapshots carry no authority (D13) |
+
+**What remains is timing.** Items 14 to 17, 25 and 28 cannot be closed on
+shared hardware. Phase 1 measures one of them end to end: a sender in one
+domain spins or sleeps to send bits, and a receiver in another domain
+times its own loop. This gives `covert.cpu_bps`, reported and never gated.
+`docs/security.md` gets the table above with that number. The honest
+summary for the user: inside one VM, colluding agents in different domains
+can still signal each other slowly through timing. They cannot gain reach,
+handles or quota by it.
+
+## D13. Fork, snapshots and machines that lack the referenced cells
+
+**Fork by the host or an ancestor.**
+
+- Placement: each copy is a sibling of its source, under the same parent
+  or wherever the host names. All copies are made or none.
+- Budget: the source's limits are carved again for each copy from that
+  parent's budget.
+- Copied unchanged: egress policy, ceiling and `on_parent_end`.
+- Copies have no children, and they hold no control handle on the source's
+  descendants: a cell has one parent.
+- Other handles are inherited as grants derived from the source's, with
+  the same grantor, so they are revoked together.
+- A channel endpoint whose peer is outside the copy reads as reset in the
+  copy, as inherited connections do today: the peer agreed to talk to the
+  source, not to new cells. A channel with both ends in the source is
+  copied with its messages, as pipes are.
+- The kernel endpoint is inherited.
+- The exposure invariant holds after the fork, because the copies'
+  egress and edges are the source's.
+
+**Fork from inside** (phase 4, `spawn` of the cell itself). The copy is a
+child of the requester. It holds no handle except those the request
+passes, after attenuation, and the requester gets a control handle on it
+together with a channel if asked.
+
+**Snapshots.**
+
+- Format version 11 (phase 1) adds the tree section: limits and
+  reservation mode, `on_parent_end`, egress policy and ceiling, whether
+  the cell shares a network (and which: a member of this kernel), its
+  identifier in the domain and its label.
+- Version 12 (phase 2) adds handle records: kind, rights, label, a key
+  derived from the kernel's secret (as parked sockets have, finding S15)
+  and the boot identity. It also adds the messages queued on the cell's
+  endpoints.
+- Version 13 (phase 3) adds snapshot views (as files) and live mounts by
+  label.
+- While a cell is suspended its endpoints stay parked in the kernel, and
+  messages sent to it queue up to their bound, as parked connections do.
+
+**Resume in the boot that took the snapshot.**
+
+- The cell comes back under its parent if the parent lives. If the parent
+  ended, its `on_parent_end` was applied at that time to the suspended
+  cell too.
+- Each handle comes back if its key matches, its object lives and it was
+  not revoked meanwhile. Otherwise a channel endpoint reads as reset and
+  other handles are dropped.
+
+**Snapshot loaded from bytes** (another boot or another machine). The
+bytes are untrusted and carry no authority:
+
+- The host chooses placement (`--parent`, root by default).
+- Egress becomes the intersection with the new parent's policy, and the
+  ceiling likewise.
+- Limits must fit the new parent's free budget, as `cap_quota` does today.
+- Every handle record is dropped, unless the host binds its label to an
+  object of this kernel (`rhizo load file --bind tools=12`), which
+  re-derives a grant under the host's authority and passes the D8 check.
+- Handles that reference cells absent from this machine are therefore
+  dropped by default and re-bound by name only by the host.
+
+**Subtree snapshots** (phase 2): `suspend --tree` and `save --tree` capture
+a subtree with the channels between its members as one bundle, so that a
+multi-cell agent travels whole. Channels that leave the subtree follow the
+rules above.
+
+Alternative: global names for cells so that handles can be resolved on
+any machine. Rejected: a global namespace is a channel, and it would let a
+forged file name a victim.
+
+## D14. Control protocol and `rhizo`
+
+The protocol goes to version 4 (after `snapshots-on-disk`'s version 3).
+
+Changes to existing requests:
+
+- `run`, `load` and template `fork` gain:
+  - `parent` (0: the host);
+  - `label`;
+  - `limits` and the reservation mode;
+  - `egress` and `ceiling`;
+  - `on_parent_end`;
+  - `net` (new, or the network of a given cell).
+- `list` rows gain the parent, the domain root and the label.
+
+New requests:
+
+- `reparent {cell, to}`, where `to = 0` makes the cell a root;
+- `policy {cell, egress, ceiling}`: narrowing for non-roots; for a root,
+  any policy;
+- `limits {cell, ...}`: within the parent's free budget;
+- `grant {object, to, rights, label}`, where the object is a cell, a new
+  channel between two cells, or a view `cell:path`;
+- `revoke {grant}`;
+- `grants {cell}`;
+- `scoped {root, request}`.
+
+`kill`, `suspend` and `resume` gain a `tree` flag for subtree operations.
+
+**Scoped host access** ("host operations scoped to a subtree"). `rhizo
+scope N --socket PATH` opens a second Unix socket on the host. The server
+wraps every request arriving on it as `scoped {N, request}`, and the
+kernel refuses any target outside `N`'s subtree, as well as `reparent` out
+of it and widening. An orchestrator on the host, or an outside service,
+can then manage one agent's hierarchy without holding the whole VM. The
+kernel checks it, not only the server: defence in depth for the one place
+where the host hands out partial power.
+
+**`rhizo` commands.**
+
+```text
+rhizo up    --model HOST:PORT [--deny CIDR]...
+rhizo run   python --parent 3 --label tools --egress model --mem 256M \
+            --cells 4 --on-parent-end cascade --net new
+rhizo ps    --tree
+rhizo reparent 7 --to 3 | --to root
+rhizo policy 7 --egress allow:tcp:140.82.112.0/20:443
+rhizo grant channel 3 7 --label tools [--rights send,recv,carry]
+rhizo grant cell 7 --to 3 --rights observe,message
+rhizo grant view 3:/data 7:/mnt/data --snapshot | --ro | --rw
+rhizo revoke G
+rhizo grants [N]
+rhizo scope 3 --socket ./agent3.sock
+rhizo kill 3 --tree
+```
+
+**A cell asking for a child** (phase 4) sends `spawn` on its kernel
+endpoint. The request needs:
+
+- the endpoint's `spawn` right;
+- a free budget for the child's limits plus one descendant;
+- an egress policy within its own;
+- the D8 check to pass;
+- for a copy of a template, a cell handle with the control right on that
+  template.
+
+It is answered with a control handle on the child, and optionally a
+channel to it.
+
+## D15. Room for modular cells (out of scope)
+
+Modular cells ("add Python to a running agent") are designed separately
+(change `add-cell-modules`). This design leaves room for them without
+deciding them:
+
+- A capability can be a child cell forked from a warm template and reached
+  over a channel. Templates are handles (D9), budgets are carved (D4) and
+  egress only narrows (D7), so adding a capability can never add authority
+  the parent lacks.
+- File-only modules can be snapshot views (D11).
+- Nothing in the tree, budgets or handles assumes a cell's program or
+  files are fixed after creation.
+
+## D16. Phases, and what each costs on the hot paths
+
+Each phase is implemented in this change's tasks, in order. A phase that
+is to be archived on its own is first split into its own change carrying
+that phase's deltas, so that `openspec/specs` never describes behavior
+that does not exist.
+
+| Path | Phase 1 cost | Watched by |
+|---|---|---|
+| System call entry and exit | None (nothing on the common path reads the tree) | `cell.syscall_ns`, `_insns` |
+| Switch between cells | None | `cell.switch_ns` |
+| Fork, template copy | Budget arithmetic and a push to the parent's children list | `cell.fork_us`, `cell.spawn_from_template_us`, `control.fork_us` |
+| Loopback | One network comparison per socket looked at | `cell.loopback_rtt_us`, `cell.tcp_resume_us` |
+| Outside connect, UDP send | Rule scan | `net.tcp_rtt_us`, new `net.egress_check_insns` |
+| File-page fault | One more word in the page-cache key | `workload.dynamic_*`, `workload.node_*` |
+| File writes | A meter charge per new block | `cell.file_write_read_us`, `cell.fork_with_files_us` |
+| Idle memory | At most 48 bytes per cell | `cell.idle_bytes`: grows, justified in the pull request |
+| Snapshot size | Tree section, about 60 bytes | `cell.suspended_bytes`: grows, justified |
+
+Phases 2 to 4 add paths of their own (channels, views, cells creating
+cells) with their own metrics. They change none of the paths above.

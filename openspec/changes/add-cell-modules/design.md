@@ -1,0 +1,424 @@
+# Design
+
+This design builds on `add-cell-hierarchy`. It uses that change's
+ownership tree, carved budgets, egress policy, handles, channels, views
+and kernel endpoint, and adds no new isolation mechanism. Its decision
+numbers (D1 to D16) are cited as `H-Dn`.
+
+The user's decisions, which this design takes as given:
+
+1. Capabilities are connected child cells. The agent's memory is never
+   merged with a module's.
+2. The agent adds capabilities itself, within a whitelist and a budget
+   set when it is created. Sensitive modules need approval. A module
+   never gets more than its parent.
+3. The shared catalogue holds only signed modules. Promotion into it goes
+   through a builder cell, with operator approval. The host holds the
+   keys.
+4. A small static chat agent, with Python added only as a capability.
+
+## D1. A module is a template, used as a child cell
+
+A **module** is a frozen cell (a template) with a manifest. Adding it to an
+agent means:
+
+- the kernel copies the template as a child of the agent, with its limits
+  carved from the agent's module budget (H-D4);
+- the kernel creates a channel between the two (H-D10);
+- the agent holds the channel at `/run/rhizo/chan/<label>` and a control
+  handle on the child at `/run/rhizo/cell/<label>`;
+- the child runs the program its manifest names, already warm (it was
+  frozen after its warm-up), and serves requests on its end of the
+  channel, `/run/rhizo/chan/parent`.
+
+Nothing is merged into the agent: the agent's memory, files and egress are
+unchanged. Removing the module is killing the child, which gives its
+budget back. A module child has no module policy of its own unless its
+whitelist entry gives it one (D3), so modules do not add modules by
+default.
+
+**Sub-templates.** Modules form a tree: `python` → `python+numpy` →
+`python+numpy+pandas`. A sub-template is made by copying its base template,
+installing into the copy, warming up and freezing. It therefore shares
+with its base every page it did not write, copy-on-write
+(`add-shared-snapshots`). An agent that asks for `pandas` gets one child,
+from the deepest template that provides it. It does not get three
+children.
+
+**File-only modules** (pure Python packages, datasets, prompts, models'
+tokenizer files) are not cells. They are read-only snapshot views
+(H-D11), mounted at `/opt/modules/<name>` in the agent, or in its
+`python` child when the manifest says the files are for Python. Their
+blocks come from a file set the host holds, so they are shared across
+domains without creating a channel (H-D12, item 10).
+
+**What a module offers** is named by its manifest's `interface`. Two
+interfaces are defined. Both use JSON messages on the `SOCK_SEQPACKET`
+channel, so any language can drive them:
+
+- `exec`: run a command line in the module cell with given standard input
+  and files; reply with its output, errors and exit status.
+- `repl:<language>` (`repl:python`, `repl:node`): evaluate code in a
+  session that persists between requests. This is the contract that
+  `agent_chat.py`'s snippet tool implements today (output capped, time
+  limit, the value of the last expression).
+
+Each request carries an `id`, and its reply carries the same `id`. Files
+travel in messages up to 64 KiB. Larger files go through a snapshot view
+that the agent grants the child (`/in`, read-only), or one the child
+grants back (`/out`). A child granting its parent a view is allowed: the
+parent is an ancestor.
+
+Alternatives:
+
+- **Load the interpreter into the agent's own memory** (layered images,
+  `dlopen` of a runtime). Rejected by the user: a module's code would run
+  with the agent's memory, files, sockets and egress, and could not be
+  removed, metered or killed alone.
+- **One child per layer** (`python`, `numpy` and `pandas` as three
+  cooperating cells). Rejected: numpy must live in the same address space
+  as the interpreter that imports it.
+
+## D2. How an agent asks for a capability
+
+The agent asks the kernel through its kernel endpoint, which needs the
+`modules` right (a new right of the endpoint, H-D9). A cell given a module
+policy (D3) gets an endpoint with that right, even if it has no `spawn`
+right. A small client is provided (`rhizo_module.py`, and `rhizo-mod`, a
+static command for shells and other languages) so that agents send JSON
+lines and do not have to encode control-protocol frames.
+
+```text
+agent ──add{module:"numpy", label:"np"}──► kernel (its own endpoint)
+        kernel: whitelist? budget? egress? approval needed?
+            ├─ allowed, nothing sensitive ──────────────► spawn
+            └─ sensitive ──approval{cell, module, egress}──► approver
+                                (parent's /run/rhizo/approvals, or the host)
+                 approver ──approve | deny──► kernel ──► spawn | refuse
+agent ◄──added{label:"np", limits, egress} + /run/rhizo/chan/np, cell/np
+```
+
+The kernel decides everything that can be decided mechanically:
+
+- **Whitelist.** Is the module named in the agent's policy, with a
+  matching version? If not, the request is refused with `EACCES`.
+- **Catalogue.** Does the kernel's module table (D4) hold a module of that
+  name and version that is signed, or explicitly allowed as unsigned by
+  the host? If not, `ENOENT`.
+- **Budget.** Do the module's minimum limits fit in what is left of the
+  agent's module budget? If not, `EDQUOT`.
+- **Egress.** The child's egress is the intersection of three things: the
+  egress the manifest asks for, what the whitelist entry grants, and the
+  agent's own egress. If the manifest asks for more than the agent has,
+  the request is refused: no approval can widen a policy below the host
+  (H-D7).
+
+**Approval.** Approval is needed when the entry is marked `ask`, or when
+the child would get any egress at all and the entry does not say
+`egress = "granted"`. The kernel then sends an approval request to the
+approver named by the policy, and the agent's request waits until the
+answer comes. The approver is one of:
+
+- `parent`: an `approvals` channel in the parent's `/run/rhizo/`, created
+  by the kernel when the parent asked to approve for its children;
+- `host`: a control-protocol event, handled with `rhizo approvals`,
+  `rhizo approve ID` and `rhizo deny ID`.
+
+Pending requests are bounded: one per cell. A pending request is
+refused after a deadline, 10 minutes by default. The answer is delivered
+to the agent as `added` or `refused{reason}`.
+
+The agent's own requests go to the kernel, not to its parent, so the
+fast, common path involves no other cell. The parent or the host is
+involved only for approvals, as the user asked ("a channel to its parent
+or the host").
+
+Alternatives:
+
+- **The parent as broker for every request**, holding template handles
+  and spawning itself. Rejected as the default: every capability would
+  wake another cell, and an agent at the root has no parent to ask. It
+  remains possible, since a parent with the `spawn` right can do
+  exactly that with H-D10.
+- **A new system call.** Rejected for the reasons given in H-D10.
+
+## D3. Whitelist and budget format
+
+The module policy is part of the cell's state: it goes into snapshots and
+forks, and a child of the cell holds at most a subset of it. The host
+gives it as TOML (`rhizo run --modules agent.toml`), and a parent gives it
+in a `spawn` request in the same structure, encoded:
+
+```toml
+# Budget for all modules together, carved from the agent's own limits
+# when the agent is created (H-D4): reserved for modules, given back
+# when they end.
+[budget]
+children = 4          # modules alive at once
+memory   = "768M"
+cpu      = "10m"      # CPU time over the agent's life
+sockets  = 16
+
+approver = "parent"   # or "host": who answers "ask" entries
+
+[[allow]]
+module  = "python"
+version = "3.13"      # a prefix of the module's version
+[[allow]]
+module  = "numpy"
+version = "2"
+memory  = "256M"      # cap for this module, within the budget
+[[allow]]
+module  = "requests"
+ask     = true        # every add needs approval
+[[allow]]
+module  = "pip-tools"
+egress  = "granted"   # may get egress within the agent's, no approval
+modules = false       # the child gets no module policy (the default)
+```
+
+**Rules.**
+
+- `budget` is carved out of the agent's limits when the agent is created.
+  An agent with 1 GiB and a 768 MiB module budget has 256 MiB left for its
+  own pages and files.
+- An entry's limits are caps inside the budget. The manifest's minimum
+  limits must fit them, or the add is refused.
+- The child's egress is always at most the agent's. `egress = "granted"`
+  only waives the approval. It cannot widen anything.
+- **Adding `requests` grants no internet access.** The `requests` module
+  child gets egress only if the tree's egress policy allows it, and then
+  only after approval. An agent with egress `model` that adds `requests`
+  gets a child whose connections outside the model endpoint fail with
+  `EACCES`.
+- A child cell's policy (made by the agent with `spawn`, or by the host
+  under the agent) has at most the parent's entries and a budget carved
+  from the parent's module budget.
+- In a snapshot or a fork the policy travels with the cell. A snapshot
+  loaded from bytes gets its policy intersected with what its new parent
+  allows (H-D13).
+
+## D4. The catalogue, the kernel's module table and signing
+
+**Module files.** A module file is a snapshot file of `snapshots-on-disk`
+(a template's exported snapshot with its CRC-32C) followed by a manifest,
+with a detached signature next to it:
+
+```text
+numpy-2.1.3-py313-aarch64.rzmod       snapshot bytes || manifest || u32 manifest length
+numpy-2.1.3-py313-aarch64.rzmod.minisig
+```
+
+The manifest (TOML, stored canonically: keys sorted, no comments) holds:
+
+- `name`, `version` and `arch`;
+- `base`, the name, version and BLAKE2b-512 digest of the base module's
+  file;
+- `interface` and `entry` (the program the child runs);
+- `egress_request`, `min_limits` and `files_for` (for file-only modules);
+- `lockfile_digest` and `tree_digest` (D5);
+- `builder`, with the builder template's digest and the build's time.
+
+**Signatures** use the minisign format: Ed25519 over the BLAKE2b-512 of the
+whole file. Its trusted comment repeats `name@version` and the digest of
+the base. Operators can therefore sign and check modules with the
+`minisign` tool itself, and `rhizo` only has to verify.
+
+**Keys stay on the host. Cells never hold keys, and neither does the
+kernel.**
+
+- The operator's secret key lives where they keep it: a minisign key file
+  protected by a passphrase, or a hardware token through a signing
+  command `rhizo` runs.
+- `rhizo` holds only public keys: `~/.rhizo/trusted/*.pub`, plus a
+  revocation list of file digests and key identifiers,
+  `~/.rhizo/revoked`.
+- `rhizo module load FILE` verifies the signature against a trusted key,
+  checks the revocation list, checks that the base module (if any) is
+  already loaded with the digest the manifest names, and only then sends
+  the bytes to the kernel (`load` as a template, protocol version 4), with
+  the manifest's name, version and digest.
+- The kernel registers the template in its **module table**. It still
+  validates the bytes as untrusted (`Snapshot::from_bytes`): a signature
+  says who approved a module, not that it is harmless.
+- The kernel trusts the host's verification (the host is trusted, H-D0).
+  Doing Ed25519 in the kernel would add a dependency and a surface for no
+  gain against a trusted host.
+- `--unsigned` (for development) loads a module marked unsigned. Only
+  whitelist entries with `unsigned = true` match it, and `rhizo ps`
+  shows it.
+
+**Delta files.** A sub-template's file can refer to its base instead of
+repeating it. A page record "same as base page N" (a new record kind,
+snapshot format version 14) is honoured only when the base named by
+digest is loaded. The loaded sub-template then maps the base's frames
+copy-on-write: one copy of CPython for every Python module in memory and
+on disk. A file with such records loaded without its base is refused.
+
+Module templates are held by the host's table and pinned. Copies in many
+domains therefore never become sole owners of a shared frame (H-D12,
+item 12), and the time to add a module does not depend on other domains.
+
+Alternatives:
+
+- **Signatures checked in the kernel.** Rejected for now: the host is
+  trusted and already verifies.
+- **Sigstore or GPG.** Rejected: sigstore needs network access and an
+  identity provider, which offline laptops and air-gapped servers do not
+  have. GPG is a large tool and a complex format. Minisign is small,
+  Ed25519, and has an existing command-line tool.
+- **Our own signature format.** Rejected: there is no reason to invent
+  one when minisign fits.
+
+**New host dependencies** (in `cli` only, never in the kernel):
+
+- `ed25519-dalek` (BSD-3-Clause), to verify signatures;
+- `blake2` (MIT or Apache-2.0), for the prehash.
+
+Both are permissive and checked by `cargo deny`.
+
+## D5. The builder cell, the only way into the catalogue
+
+An agent may `pip install` inside its own cell if its egress allows the
+package index. What it installs is private: copy-on-write in its own
+files, gone when its tree ends, and never shared across domains or put in
+the catalogue. To become a module for everyone, a package set goes through
+a **builder cell**:
+
+- **What it is.** A root cell in a domain of its own, a copy of a builder
+  template (the base module plus pip and the build tools), made by the
+  host with `rhizo module build`. It has no handles, no channels and no
+  views from agents. Its only input is the build request (a lockfile and
+  the base module), which the host writes into its files.
+- **Egress: the package index only.** That is the host-defined rule set
+  `index`. It should point to a host-side package proxy (a pip-compatible
+  mirror or proxy that serves only the index). PyPI's real addresses are
+  CDN addresses shared with unrelated sites (H-D7), so they should not be
+  used directly. Its ceiling equals its egress.
+- **Input: a lockfile with pinned versions and hashes**
+  (`pip install --require-hashes --only-binary :all: --no-deps -r
+  lock.txt`), as `xtask` already pins numpy's wheel by SHA-256
+  (`add-pip-packages`). Source distributions are refused unless the
+  lockfile allows them per package, and then they are built with the
+  build dependencies the lockfile also pins.
+- **Reproducibility.** The build fixes `SOURCE_DATE_EPOCH`, sets
+  `PYTHONHASHSEED=0` and compiles with `compileall --invalidation-mode
+  unchecked-hash`. The **installed tree's digest** (`tree_digest`: the
+  BLAKE2b of the sorted paths, modes and contents) is recorded. `rhizo
+  module build --twice` runs two independent builders and refuses to go
+  on unless their tree digests are equal.
+  - The frozen memory is not byte-reproducible (random seeds, `getrandom`
+    and `AT_RANDOM` differ by design, spec `isolation`), so what is
+    reproduced and attested is the file tree. The warm-up that produces
+    the memory is a script named in the manifest and run from that tree.
+- **Freeze, review, sign.** Once it has installed and warmed up, the
+  builder freezes itself as a template (`rhizo freeze`) and the host saves
+  it (`rhizo save`, which needs no egress). `rhizo module review` then
+  shows the operator:
+  - the manifest;
+  - the packages and their versions and hashes, from the lockfile;
+  - the size;
+  - the egress the module requests;
+  - the difference from the base's file tree.
+
+  After `rhizo module approve`, the host signs (D4) and copies the file to
+  the catalogue directory. The builder's domain is killed. The builder
+  never sees a key, and nothing in the catalogue is signed without an
+  operator's approval.
+- **An agent asks for a new module** by writing a lockfile. It cannot
+  start a builder. Its request reaches the operator as data
+  (`rhizo module request` shows it). Only the operator turns it into a
+  build.
+
+Alternative: let agents publish what they installed. Rejected: that is
+exactly the path by which an agent's tree could put code in front of every
+other agent.
+
+## D6. A small static chat agent
+
+Today the chat template carries CPython: tens of MiB of interpreter for an
+agent that mostly sends HTTP requests and prints text (`snapshot.file_bytes`
+measures it). A new static chat agent, `cells/c/chat.c`, is linked
+statically with glibc like the other C cells:
+
+- it speaks the same OpenAI-compatible protocol;
+- it reads a line from its input, sends the conversation, prints the
+  answer and the timing line, exactly as `agent_chat.py` does in its
+  transcript;
+- it parses JSON with a small parser of its own (only the fields it
+  needs);
+- tools that need Python (the snippet tool) add the `python` module on
+  first use, through `rhizo-mod`'s C client, and send the snippet over the
+  `repl:python` interface;
+- file tools (read, write, list) run in the agent itself.
+
+`agent_chat.py` stays: it is the CPython workload and the existing
+transcript. `rhizo chat` gains `--agent static|python`. The default stays
+`python` until the static agent passes the same transcript.
+
+Expected effect (to be measured, not promised):
+
+- the chat template's memory and file size drop by roughly the size of
+  CPython for conversations that never call a Python tool;
+- the first snippet pays one `module.add_us`.
+
+Alternative: a `no_std` Rust agent. Rejected for now: HTTP, JSON and
+`getaddrinfo`-free sockets are simpler with glibc. The C cells are built
+the same way already.
+
+## D7. State, snapshots and fork
+
+- The module policy, with its budget and what is in use, is cell state:
+  snapshot format version 14 (with the delta page records of D4).
+- A module child is an ordinary child cell. It follows `on_parent_end`
+  (by default cascade: the agent's capabilities end with it).
+- A fork of the agent by the host follows H-D13. The channels to its
+  module children read as reset in the copy, and the copy has no
+  children, so it adds its own modules again when it needs them. Each add
+  is one warm template copy (`module.add_us`), and the copy's whitelist
+  and budget are the agent's.
+- A pending approval is not snapshotted. A suspended agent's pending
+  request is refused, and the agent asks again after its resume.
+
+## D8. Tests and benchmarks
+
+The hostile tests check every place where a capability could add
+authority:
+
+- **Add a module.** An agent adds `numpy`, sends a computation over the
+  `repl:python` channel, and reads the answer.
+- **Refusals.** A module not in the whitelist, one over the budget's
+  children or memory, an unsigned module, and one whose request asks for
+  egress beyond the agent's are each refused with their reason.
+- **`requests` grants nothing.** An agent with egress `model` adds
+  `requests` (approved). The child's connection to any host other than
+  the model fails with `EACCES`.
+- **Approvals.** A parent approver and a host approver both work: approve,
+  deny, deadline, one pending request per cell.
+- **Signatures.** A changed byte, an unknown key, a revoked digest, and a
+  delta file without its base are each refused by `rhizo module load`.
+- **Builder.** It reaches only the index proxy (anything else gives
+  `EACCES`). A hash mismatch in the lockfile fails the build. Two builds
+  give equal tree digests. Its domain gets no channel from agents.
+- **`pip install` stays private.** An agent installs into its own cell.
+  Its sibling and another domain do not see it, and nothing of it remains
+  after its tree ends.
+- **Static chat.** The static chat agent passes the recorded chat
+  transcript, adding `python` at the first snippet.
+
+Benchmarks:
+
+- `module.add_us`: from the `add` request to the first reply from the
+  module child, for `python` and for `numpy`, against
+  `workload.cpython_warm_us` and `workload.numpy_warm_us`.
+- `module.extra_bytes`: deterministic memory of each extra module child
+  that has added nothing yet. It should be close to `cell.idle_bytes`
+  plus the pages its warm-up left private, thanks to the sub-template
+  copy-on-write.
+- `module.file_bytes`: the size of `python+numpy` as a delta file against
+  a full file.
+- `chat.static_bytes`: the static chat template's memory, against the
+  CPython chat template's.
+- `chat.static_turn_us`, against `chat.turn_us`.
+- None of the gated metrics of `add-cell-hierarchy` may regress: modules
+  add no path to system calls, switches, forks or the network.
