@@ -344,6 +344,10 @@ impl Frames for ImageFrames {
     fn is_shared(&self, phys: u64) -> bool {
         KernelFrames.is_shared(phys)
     }
+
+    fn try_share(&mut self, phys: u64) -> bool {
+        KernelFrames.try_share(phys)
+    }
 }
 
 impl Frames for KernelFrames {
@@ -393,6 +397,17 @@ impl Frames for KernelFrames {
     fn is_shared(&self, phys: u64) -> bool {
         let _p = cost::scope(Part::Frames);
         SHARED.with(|s| s.get((phys / FRAME_SIZE) as usize).is_some_and(|&e| e > 0))
+    }
+
+    fn try_share(&mut self, phys: u64) -> bool {
+        let _p = cost::scope(Part::Frames);
+        let index = (phys / FRAME_SIZE) as usize;
+        SHARED.with(|s| {
+            if s.len() <= index {
+                s.resize(index + 1, 0);
+            }
+            s[index].checked_add(1).map(|n| s[index] = n).is_some()
+        })
     }
 }
 

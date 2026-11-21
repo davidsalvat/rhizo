@@ -102,6 +102,7 @@ macro_rules! suite {
             ktest_case!(fresh_memory_never_holds_another_cells_data),
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
+            ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
             ktest_case!(hardware_entropy_works_where_present),
             ktest_case!(no_two_cells_draw_the_same_random_bytes),
             ktest_case!(micropython_in_a_cell),
@@ -1439,6 +1440,25 @@ fn shared_read_only_pages_stay_shared_after_mprotect() {
         assert_eq!(ending, Ending::Exit(0), "{out}");
         assert!(out.ends_with("own ok\n"), "{out}");
     }
+}
+
+/// Finding S14 (spec `isolation`): a cell maps one page of a file of its
+/// own 70000 times, more references to the page cache's frame than 16 bits
+/// count. The kernel keeps running (it panicked), every mapping reads the
+/// file, a cell next to it finishes, and every frame comes back.
+fn one_page_mapped_without_end_cannot_stop_the_kernel() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let sharer = spawn(&mut host, "sharer", &[]);
+    let other = spawn(&mut host, "hello", &[]);
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, sharer),
+        (Ending::Exit(0), "shares ok\n".into())
+    );
+    assert_eq!(ended(&host, other).0, Ending::Exit(0));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
 }
 
 /// The CPU's random-number instruction, where it has one, gives bytes that
