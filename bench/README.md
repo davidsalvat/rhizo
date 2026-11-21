@@ -119,7 +119,7 @@ the VMM has no network card.
 | `workload.agent_turn_us/rhizo/<vmm>` | timing | One turn of a live agent: woken by its user, HTTP request to the model, answer, tool action (history appended, shared notes read and checked) |
 | `laptop.resume_turn_us/rhizo/<vmm>` | timing | The same turn right after a lazy resume (its pages come back as it touches them) |
 | `laptop.memory_bytes/rhizo/<vmm>` | size | Memory the template and the 50 agents take (45 snapshots in the kernel heap included) |
-| `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second |
+| `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second. Idle CPUs have no tick, and only one of them programs its timer, for the earliest deadline (change `add-tickless-idle`); what still wakes them is that deadline, work handed over by another CPU, and the boot CPU polling the network card while a cell waits on a descriptor |
 | `laptop.idle_host_cpu_pct/rhizo/<vmm>` | rate | Over the same window, read on the host: the VMM process's CPU time (all threads, `/proc/PID/task/*/schedstat`) over wall time, in percent of one CPU |
 
 **Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from four

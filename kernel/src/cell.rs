@@ -33,7 +33,7 @@ use rhizo_mm::paging::{PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_net::Net;
 use rhizo_prof::Part;
-use rhizo_sched::{Gangs, SLICE_NS, Scheduler, TagPool};
+use rhizo_sched::{Gangs, IdleTimer, SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::Snapshot;
 
 /// How a cell ended.
@@ -892,6 +892,9 @@ struct Shared {
     /// Cells taken out whose threads run on several CPUs (design D1 of
     /// `add-parallel-threads`).
     gangs: Gangs<GangPtr>,
+    /// The idle CPU whose timer covers the earliest deadline (design D1 of
+    /// `add-tickless-idle`).
+    timer: IdleTimer,
 }
 
 /// The cells of the machine: the live ones in the shared scheduler (or on
@@ -979,29 +982,67 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
             live.ready = Ready::default();
             s.running += 1;
             s.idle &= !(1 << cpu);
+            if s.idle != 0 || s.timer.armed().is_some() {
+                cover(s, cpu);
+            }
             return Take::Run(live, now);
         }
         if !oldest && let Some(gang) = s.gangs.join(cpu, now) {
             s.idle &= !(1 << cpu);
+            if s.idle != 0 || s.timer.armed().is_some() {
+                cover(s, cpu);
+            }
             return Take::Join(gang);
         }
-        let wake = match (s.sched.next_wake(), s.gangs.next_wake()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
-        .filter(|&t| t != u64::MAX);
-        if s.running == 0 && wake.is_none() {
-            // Only parked cells are left: nothing will wake them.
-            return Take::Done;
-        }
+        // The boot CPU looks at ended cells before it waits: with nothing
+        // to run its wait may last until the network card wants polling,
+        // hours away, and the host would not see the cell end.
         if cpu == 0 && !s.ended.is_empty() {
             return Take::Look;
         }
+        let wake = next_wake(s);
         // Under the lock: a CPU giving a cell back sees this bit and wakes
         // this one, so no wake-up is lost between here and the wait.
         s.idle |= 1 << cpu;
-        Take::Wait(wake)
+        // A timer it held covers nothing any more: it looks again.
+        s.timer.leave(cpu);
+        if s.running == 0 && wake.is_none() {
+            // Only parked cells are left: nothing will wake them (but the
+            // network card, or the end of the run).
+            return Take::Done;
+        }
+        // Its timer only if no other idle CPU's covers the deadline.
+        Take::Wait(s.timer.idle(cpu, wake))
     })
+}
+
+/// The earliest deadline of the cells that are not running.
+fn next_wake(s: &Shared) -> Option<u64> {
+    match (s.sched.next_wake(), s.gangs.next_wake()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+    .filter(|&t| t != u64::MAX)
+}
+
+/// `cpu` took work: wakes an idle CPU so that its timer covers the
+/// earliest deadline, if none does (design D1 of `add-tickless-idle`).
+/// Under the host's lock: rare, only when a deadline loses its timer. Out
+/// of line, so that taking a cell with no CPU idle costs a test.
+#[cold]
+#[inline(never)]
+fn cover(s: &mut Shared, cpu: usize) {
+    if s.idle == 0 {
+        // No CPU idles: busy CPUs look at every slice's end. Only an idle
+        // CPU holds the timer, so it was this one, if any.
+        s.timer = IdleTimer::new();
+        return;
+    }
+    s.timer.leave(cpu);
+    let next = next_wake(s);
+    if let Some(other) = s.timer.cover(next, s.idle) {
+        crate::smp::wake(other);
+    }
 }
 
 /// Wakes the cells whose sockets changed since the last call (design D2 of
@@ -1039,15 +1080,18 @@ fn nudge(s: &mut Shared, live: &mut Live) {
     }
 }
 
-/// Waits for work: until `wake`, or a wake-up interrupt.
+/// Waits for work: until `wake`, or a wake-up interrupt. Without `wake`,
+/// the CPU's timer is off for the wait (design D2 of `add-tickless-idle`):
+/// another idle CPU's timer covers the earliest deadline, or there is none.
 fn wait(wake: Option<u64>) {
     let _p = cost::scope(Part::Idle);
     match wake {
-        // With several CPUs, look again at least every slice: what wakes a
-        // cell may happen on another CPU (a safety net; wake-ups are sent).
-        Some(at) if crate::smp::count() > 1 => idle_until(at.min(now_ns() + SLICE_NS)),
         Some(at) => idle_until(at),
-        None => prof::idle(crate::smp::idle),
+        None => {
+            irq::stop_tick();
+            prof::idle(crate::smp::idle);
+            irq::start_tick();
+        }
     }
     cost::after_idle();
 }
@@ -1947,6 +1991,7 @@ impl Host {
                 stopping: false,
                 nudged: BTreeSet::new(),
                 gangs: Gangs::new(),
+                timer: IdleTimer::new(),
             }),
             finished: Vec::new(),
             templates: Vec::new(),
@@ -2222,10 +2267,10 @@ impl Host {
             Take::Run(live, now) => run_slice(&self.shared, 0, live, now, false),
             Take::Join(gang) => join_gang(&self.shared, 0, gang),
             Take::Wait(wake) => {
-                self.wait_or_poll(wake);
+                self.wait_or_poll(wake, false);
             }
             Take::Done => {
-                self.wait_or_poll(None);
+                self.wait_or_poll(None, true);
             }
             Take::Stop | Take::Look => {}
         }
@@ -2288,11 +2333,11 @@ impl Host {
                 Take::Run(live, now) => run_slice(&self.shared, 0, live, now, cpus > 1),
                 Take::Join(gang) => join_gang(&self.shared, 0, gang),
                 Take::Wait(wake) => {
-                    self.wait_or_poll(wake);
+                    self.wait_or_poll(wake, false);
                 }
                 Take::Look => {}
                 Take::Done => {
-                    if !self.wait_or_poll(None) {
+                    if !self.wait_or_poll(None, true) {
                         break;
                     }
                 }
@@ -2314,6 +2359,7 @@ impl Host {
             let state = self.state();
             state.stopping = false;
             state.idle = 0;
+            state.timer = IdleTimer::new();
             debug_assert!(state.gangs.is_empty(), "every CPU left every cell");
         }
         // Between runs every live cell is in the scheduler: a cell nudged
@@ -2332,8 +2378,10 @@ impl Host {
     /// for the network card, so it polls the card now (a cell may just have
     /// opened a connection) and, if that changed nothing, waits until `wake`
     /// or until the card wants polling (design D4 of `add-virtio-net`).
-    /// Returns `false` when nothing can ever wake a cell.
-    fn wait_or_poll(&mut self, wake: Option<u64>) -> bool {
+    /// Without `wake` it waits for a wake-up, unless `done` (no deadline
+    /// anywhere) and no CPU runs a cell. Returns `false` when nothing can
+    /// ever wake a cell.
+    fn wait_or_poll(&mut self, wake: Option<u64>, done: bool) -> bool {
         let now = now_ns();
         let waiting = self.shared.with(|s| s.sched.waiting()) > 0;
         let mut wake = match (wake, self.look_every) {
@@ -2356,7 +2404,7 @@ impl Host {
                 wait(Some(at));
                 true
             }
-            None if self.shared.with(|s| s.running) > 0 => {
+            None if !done || self.shared.with(|s| s.running) > 0 => {
                 wait(None);
                 true
             }
