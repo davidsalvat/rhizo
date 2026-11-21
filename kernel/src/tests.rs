@@ -1451,7 +1451,10 @@ fn one_page_mapped_without_end_cannot_stop_the_kernel() {
     let sharer = spawn(&mut host, "sharer", &[]);
     let other = spawn(&mut host, "hello", &[]);
     host.run(|_| false);
-    assert_eq!(ended(&host, sharer), (Ending::Exit(0), "shares ok\n".into()));
+    assert_eq!(
+        ended(&host, sharer),
+        (Ending::Exit(0), "shares ok\n".into())
+    );
     assert_eq!(ended(&host, other).0, Ending::Exit(0));
     drop(host);
     assert_eq!(memory_balance(), before, "every frame back");

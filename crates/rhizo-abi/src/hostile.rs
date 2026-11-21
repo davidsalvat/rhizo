@@ -549,7 +549,20 @@ fn file_calls() -> impl Strategy<Value = Vec<(u64, [u64; 6])>> {
         258, 263, 264, 290, 262, 16, 42, 49,
     ]);
     let small = || prop_oneof![4 => (0u64..24).boxed(), 1 => arg().boxed()].boxed();
-    prop::collection::vec((nr, [small(), arg().boxed(), small(), small(), small(), arg().boxed()]), 1..30)
+    prop::collection::vec(
+        (
+            nr,
+            [
+                small(),
+                arg().boxed(),
+                small(),
+                small(),
+                small(),
+                arg().boxed(),
+            ],
+        ),
+        1..30,
+    )
 }
 
 /// `bytes` with `edits` (position modulo the length, new byte) made and
@@ -632,6 +645,9 @@ fn buffer_lengths_that_overflow_their_sum_are_harmless() {
     let (_, sent) = m.call(X_SENDMSG, [a, msg, 0, 0, 0, 0]);
     assert!(sent == -EFAULT || sent > 0, "sendmsg: {sent}");
     let (_, got) = m.call(X_RECVMSG, [b, msg, 0x40, 0, 0, 0]);
-    assert!(got == -EAGAIN || got == -EFAULT || got >= 0, "recvmsg: {got}");
+    assert!(
+        got == -EAGAIN || got == -EFAULT || got >= 0,
+        "recvmsg: {got}"
+    );
     m.end();
 }

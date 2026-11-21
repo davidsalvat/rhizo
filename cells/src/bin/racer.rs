@@ -70,7 +70,10 @@ fn unmap(at: usize) {
 extern "C" fn copier(i: usize) -> usize {
     STARTED.fetch_add(1, Ordering::Release);
     let page = PAGE_AT.load(Ordering::Acquire);
-    let (r, w) = (PIPE[0].load(Ordering::Acquire), PIPE[1].load(Ordering::Acquire));
+    let (r, w) = (
+        PIPE[0].load(Ordering::Acquire),
+        PIPE[1].load(Ordering::Acquire),
+    );
     while STOP.load(Ordering::Acquire) == 0 {
         // Any answer will do (bytes, EFAULT, EAGAIN): the kernel must not
         // touch a frame it gave back.
@@ -89,7 +92,10 @@ fn io() -> i32 {
     let mut fds = [0u32; 2];
     const O_NONBLOCK: usize = 0x800;
     check(
-        syscall(nr::PIPE2, [fds.as_mut_ptr() as usize, O_NONBLOCK, 0, 0, 0, 0]) == 0,
+        syscall(
+            nr::PIPE2,
+            [fds.as_mut_ptr() as usize, O_NONBLOCK, 0, 0, 0, 0],
+        ) == 0,
         "pipe2",
     );
     PIPE[0].store(fds[0] as usize, Ordering::Release);
@@ -187,7 +193,10 @@ fn protect() -> i32 {
     wait_started(1);
     for _ in 0..ROUNDS {
         for prot in [1, 3] {
-            check(syscall(MPROTECT, [page, PAGE, prot, 0, 0, 0]) == 0, "mprotect");
+            check(
+                syscall(MPROTECT, [page, PAGE, prot, 0, 0, 0]) == 0,
+                "mprotect",
+            );
         }
     }
     STOP.store(1, Ordering::Release);

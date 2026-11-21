@@ -17,7 +17,14 @@ const MAPPINGS: usize = 70_000;
 fn main() -> i32 {
     let fd = syscall(
         nr::OPENAT,
-        [AT_FDCWD, c"/shared".as_ptr() as usize, O_RDWR_CREAT, 0o600, 0, 0],
+        [
+            AT_FDCWD,
+            c"/shared".as_ptr() as usize,
+            O_RDWR_CREAT,
+            0o600,
+            0,
+            0,
+        ],
     );
     check(fd >= 0, "open");
     let fd = fd as usize;

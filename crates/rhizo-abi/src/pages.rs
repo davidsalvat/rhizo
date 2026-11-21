@@ -180,7 +180,11 @@ mod tests {
             .map(|_| cache.get(&page, &mut mem, &mut frames).unwrap())
             .collect();
         let kept = got[0].0;
-        assert_eq!(got[..2], [(kept, true), (kept, false)], "shared while it counts");
+        assert_eq!(
+            got[..2],
+            [(kept, true), (kept, false)],
+            "shared while it counts"
+        );
         for &(copy, fresh) in &got[2..] {
             assert!(copy != kept && fresh && !frames.is_shared(copy));
             assert_eq!(mem.read_u64(copy), u64::from(b'!'), "the page's bytes");

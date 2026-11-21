@@ -203,6 +203,40 @@ mod tests {
         assert_eq!(m.frames.outstanding(), 0);
     }
 
+    /// Finding S18: an entry point past the cell's addresses, the
+    /// executable's or its interpreter's, is refused (entering there would
+    /// fault in the kernel on x86_64) and leaves nothing behind.
+    #[test]
+    fn entry_points_outside_the_cell_are_refused() {
+        let ld_path = b"/lib/ld.so";
+        let bad = 0x40_0000_0000_0000u64;
+        let mut ld = elf_with(183, 3, &[(0, 5, b"LDSO", 4)], None);
+        ld[24..32].copy_from_slice(&bad.to_le_bytes());
+        let prog = elf_with(183, 3, &[(0x1000, 5, b"MAIN", 4)], Some(ld_path));
+        let mut fixed = elf_with(183, 2, &[(0x40_0000, 5, b"STAT", 4)], None);
+        fixed[24..32].copy_from_slice(&0x8000_0000_0000u64.to_le_bytes());
+        let mut fs = Fs::new();
+        fs.put_file(b"/prog", &prog).unwrap();
+        fs.put_file(ld_path, &ld).unwrap();
+        fs.put_file(b"/static", &fixed).unwrap();
+        let mut m = Machine {
+            fs,
+            mem: FakePhysicalMemory::new(),
+            frames: CountingFrames::new(1024),
+            cache: PageCache::new(64),
+        };
+        assert_eq!(
+            m.exec(b"/prog").unwrap_err(),
+            ExecError::Elf(ElfError::BadEntry(bad.wrapping_add(MMAP_BASE)))
+        );
+        assert_eq!(
+            m.exec(b"/static").unwrap_err(),
+            ExecError::Elf(ElfError::BadEntry(0x8000_0000_0000))
+        );
+        m.cache.clear(&mut m.frames);
+        assert_eq!(m.frames.outstanding(), 0, "nothing left behind");
+    }
+
     proptest::proptest! {
         /// A program and an interpreter with any bytes changed (the cell
         /// may have written both): `exec` refuses them leaving nothing
