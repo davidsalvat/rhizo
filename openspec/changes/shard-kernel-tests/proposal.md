@@ -20,6 +20,11 @@ beside them take 65 s.
   no connection through the card is still closing (`settle_wire()`, the
   loop two tests already had), as it already drops the kept images. A
   connection a test leaves open still fails it.
+- **Shares dealt by cost.** Dealt by position modulo `N`, one of two VMs
+  got most of the expensive tests (75.6 s against 30.4 s in CI). A test
+  may carry its estimated cost (`ktest_case!(name, 120)`, tenths of a
+  second; 1 otherwise); the 19 tests of 3 s or more do. The runner ranks
+  the tests by cost and deals the ranks back and forth over the shares.
 - **Shards in CI.** The AArch64 parts of `ci-arm64` run their in-kernel
   tests split over two VMs each (`RHIZO_SHARDS=2`).
 - **A shard's failure reproduces as printed.** The `reproduce` command of a
@@ -29,10 +34,16 @@ beside them take 65 s.
 
 ## Impact
 
-- Specs: `kernel-testing` (tests do not depend on their order: card
-  connections settle before a memory check), `developer-feedback` (CI
-  splits the AArch64 in-kernel tests; a split step's reproduce command).
-- Code: `kernel/src/tests/density.rs`, `cpython.rs`, `packages.rs`;
-  `xtask/src/lib.rs`; `.github/workflows/ci.yml`; `docs/security.md`.
+- Specs: `kernel-testing` (shares dealt by cost; tests do not depend on
+  their order: card connections settle before a memory check),
+  `developer-feedback` (CI splits the AArch64 in-kernel tests; a split
+  step's reproduce command).
+- Code: `crates/rhizo-core/src/ktest.rs`; `kernel/src/tests.rs` and the
+  area files of the costly tests; `kernel/src/tests/density.rs`,
+  `cpython.rs`, `packages.rs`; `xtask/src/lib.rs`;
+  `.github/workflows/ci.yml`; AGENTS.md; `docs/security.md`.
+- Timing: the AArch64 parts' VM phases get 3 to 8 s shorter; they are
+  CPU-bound, and the run's wall clock is set by other jobs (design
+  *Result*).
 - Coverage: every in-kernel test still runs on every code pull request,
   exactly once per step.
