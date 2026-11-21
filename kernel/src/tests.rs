@@ -2283,6 +2283,11 @@ fn the_cards_interrupt_wakes_the_idle_cpu() {
         arch::console::BootConsole.write_bytes(b"(virtio-pci card, polled: not run) ");
         return;
     }
+    if crate::smp::count() > 1 {
+        // The count of wake-ups is every CPU's.
+        arch::console::BootConsole.write_bytes(b"(several CPUs: wake-ups not counted) ");
+        return;
+    }
     const ROUNDS: u64 = 20;
     let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
     let port = alloc::format!("{port}");

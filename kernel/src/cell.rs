@@ -2345,10 +2345,14 @@ impl Host {
     /// Polls the network card when it is due (every scheduling step at most
     /// once per [`WIRE_PERIOD_NS`]), and reports a new address.
     fn poll_wire(&mut self, now: u64) {
-        let work = WIRE_WORK.swap(false, Ordering::Acquire);
-        if now < self.wire_due && !work && !(crate::wire::interrupts() && crate::wire::pending()) {
+        // A plain load first: the common step has nothing to do here.
+        if now < self.wire_due
+            && !WIRE_WORK.load(Ordering::Relaxed)
+            && !(crate::wire::interrupts() && crate::wire::pending())
+        {
             return;
         }
+        WIRE_WORK.store(false, Ordering::Relaxed);
         let _p = cost::scope(Part::Net);
         let (delay, addr) = with_net(|net| (crate::wire::poll(net, now), net.wire_addr()));
         // As often as the wire needs, but not more than once per period,
