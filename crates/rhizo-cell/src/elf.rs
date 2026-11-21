@@ -19,6 +19,21 @@ pub enum Machine {
     X86_64 = 62,
 }
 
+impl Machine {
+    /// What `AT_HWCAP` tells a program of the machine (0: no entry). On
+    /// AArch64, as Linux: FP and Advanced SIMD (`HWCAP_FP`, `HWCAP_ASIMD`),
+    /// and `HWCAP_CPUID`: the ID registers can be read, the kernel answering
+    /// for EL0 (change `add-pip-packages`). Nothing more, so nothing a cell
+    /// cannot use (SVE, for one, is left off at EL0). On x86_64 programs ask
+    /// the CPU itself (`CPUID`), and there is no entry, as before.
+    pub fn hwcap(self) -> u64 {
+        match self {
+            Machine::Aarch64 => 1 | 1 << 1 | 1 << 11,
+            Machine::X86_64 => 0,
+        }
+    }
+}
+
 /// Why an image cannot become a cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElfError {
@@ -472,6 +487,7 @@ mod auxv {
     pub const AT_PAGESZ: u64 = 6;
     pub const AT_BASE: u64 = 7;
     pub const AT_ENTRY: u64 = 9;
+    pub const AT_HWCAP: u64 = 16;
     pub const AT_RANDOM: u64 = 25;
 }
 
@@ -487,6 +503,9 @@ pub struct Aux {
     pub entry: u64,
     /// Where the interpreter was loaded (`AT_BASE`), if there is one.
     pub base: Option<u64>,
+    /// `AT_HWCAP`, absent when 0: the machine's [`Machine::hwcap`], which
+    /// [`crate::start_at`] sets.
+    pub hwcap: u64,
 }
 
 impl Aux {
@@ -498,6 +517,7 @@ impl Aux {
             phnum: image.phnum,
             entry: image.entry.wrapping_add(bias),
             base: None,
+            hwcap: 0,
         }
     }
 }
@@ -554,15 +574,17 @@ pub fn build_stack<F: EntryFormat>(
         (auxv::AT_PAGESZ, FRAME_SIZE),
         (auxv::AT_BASE, aux.base.unwrap_or(0)),
         (auxv::AT_ENTRY, aux.entry),
+        (auxv::AT_HWCAP, aux.hwcap),
         (auxv::AT_RANDOM, random_addr),
         (auxv::AT_NULL, 0),
     ];
     // `AT_BASE` only for a program with an interpreter (static ones keep
-    // the stack they had).
-    let aux = all
-        .iter()
-        .copied()
-        .filter(|&(key, _)| key != auxv::AT_BASE || aux.base.is_some());
+    // the stack they had), `AT_HWCAP` only where the machine has one.
+    let aux = all.iter().copied().filter(|&(key, _)| match key {
+        auxv::AT_BASE => aux.base.is_some(),
+        auxv::AT_HWCAP => aux.hwcap != 0,
+        _ => true,
+    });
     // argc + argv + NULL + envp + NULL + auxv pairs, as 8-byte words.
     let words = 1 + argv.len() + 1 + envp.len() + 1 + aux.clone().count() * 2;
     let sp = align_down(top - words as u64 * 8, 16);
@@ -894,6 +916,10 @@ pub(crate) mod tests {
         }
         assert!(seen.contains(&(auxv::AT_PAGESZ, 4096)));
         assert!(seen.contains(&(auxv::AT_ENTRY, 0x40_0000)));
+        assert!(
+            seen.iter().all(|&(k, _)| k != auxv::AT_HWCAP),
+            "no AT_HWCAP without one"
+        );
         let random = seen.iter().find(|(k, _)| *k == auxv::AT_RANDOM).unwrap().1;
         let mut r = [0u8; 16];
         memory::copy_from(&pt, &mem, random, &mut r).unwrap();
@@ -904,5 +930,32 @@ pub(crate) mod tests {
             pt.translate(&mem, STACK_TOP - (STACK_PAGES + 1) * FRAME_SIZE)
                 .is_none()
         );
+    }
+
+    /// AArch64 programs are told FP, Advanced SIMD and readable ID
+    /// registers (`HWCAP_CPUID`), as on Linux; x86_64 ones nothing.
+    #[test]
+    fn stack_tells_the_machine_hardware_capabilities() {
+        assert_eq!(Machine::Aarch64.hwcap(), 0b1000_0000_0011);
+        assert_eq!(Machine::X86_64.hwcap(), 0);
+        let data = sample();
+        let image = Image::parse(&data, Machine::Aarch64).unwrap();
+        let (pt, mut mem, mut alloc) = table();
+        let aux = Aux {
+            hwcap: Machine::Aarch64.hwcap(),
+            ..Aux::of(&image, 0)
+        };
+        let sp = build_stack(&pt, &mut mem, &mut alloc, &aux, &[b"a"], &[], [0; 16]).unwrap();
+        let word = |at: u64| {
+            let mut b = [0u8; 8];
+            memory::copy_from(&pt, &mem, at, &mut b).unwrap();
+            u64::from_le_bytes(b)
+        };
+        // argc, argv[0], NULL, NULL (no envp), then the pairs.
+        let pairs: Vec<(u64, u64)> = (0..)
+            .map(|i| (word(sp + 32 + i * 16), word(sp + 40 + i * 16)))
+            .take_while(|&(k, _)| k != auxv::AT_NULL)
+            .collect();
+        assert!(pairs.contains(&(auxv::AT_HWCAP, 0x803)), "{pairs:?}");
     }
 }

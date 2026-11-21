@@ -9,5 +9,5 @@
 ## 2. Measuring
 
 - [x] 2.1 `cell.syscall_scaling_pct` (D3); verify `cargo test -p xtask smp_line_is_parsed` and a local `cargo xtask bench --vmm qemu-microvm`
-- [ ] 2.2 The metric with the lock taken eagerly and lazily, in the pull request; then the metric in the `ci` baseline from two agreeing CI runs; verify the CI benchmark job
-- [ ] 2.3 `bench/README.md`: the metric; verify by reading it next to a CI run's output
+- [x] 2.2 The metric with the lock taken eagerly and lazily, in the pull request; then the metric in the `ci` baseline from two agreeing CI runs; verify the CI benchmark job
+- [x] 2.3 `bench/README.md`: the metric; verify by reading it next to a CI run's output

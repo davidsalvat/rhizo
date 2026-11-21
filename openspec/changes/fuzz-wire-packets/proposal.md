@@ -25,7 +25,7 @@ is attached to can send it.
   unaffected, its bytes sent only to its peer, and the kernel heap back to
   where it was once every socket is closed. A second property feeds
   changed, cut and random DHCP replies to a card asking for a lease.
-- Fixes for what it found:
+- What it found:
   - S22 (Medium): one poll of the card took frames for as long as they
     kept coming (`smoltcp`'s `Interface::poll` loops until the device is
     empty), so a flood held the polling CPU, and the cells on it, for as
@@ -34,8 +34,8 @@ is attached to can send it.
   - S23 (Low, a `smoltcp` 0.14 behaviour): the 20 s timeout set on
     connections to the outside also aborted an open connection on which
     nothing arrived for 20 s, though `smoltcp` documents it for
-    outstanding data only. The timeout is now cleared once a connection
-    opens; it still bounds the handshake.
+    outstanding data only. Found at the same time by `fix-tcp-long-wait`,
+    which fixed it on `main`; this change records it as a finding only.
 - `docs/audit-scope.md` marks B5 as reviewed and fuzzed; the weekly job
   runs the new fuzzer with a random seed.
 
@@ -51,15 +51,14 @@ them: design D3).
 
 ### Modified Capabilities
 
-- `networking`: frames from the network are hostile input; idle
-  connections to the outside stay open.
+- `networking`: frames from the network are hostile input; a flood
+  cannot hold the kernel.
 
 ## Impact
 
-- `crates/rhizo-net` (`wire.rs`: poll budget and timeout; `hostile.rs`:
+- `crates/rhizo-net` (`wire.rs`: poll budget; `hostile.rs`:
   the fuzzer; `wire_tests.rs`: regression tests), `docs/security.md`,
   `docs/audit-scope.md`, `.github/workflows/weekly.yml`.
 - No new dependency. No benchmarked path changes: the benchmarks never
-  have more than a ring of frames waiting at one poll, and clearing a
-  timeout is one store per connection. Host tests take about 7 s longer
+  have more than a ring of frames waiting at one poll. Host tests take about 7 s longer
   (they run in parallel with the others).

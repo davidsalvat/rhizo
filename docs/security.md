@@ -96,10 +96,12 @@ What makes the boundary hold:
   a cell cannot pick its privilege level or mask interrupts.
 - **Address spaces.** Each cell has its own page-table root for the lower
   half. On AArch64 the kernel lives in `TTBR1_EL1` and is never in a
-  cell's table; on x86_64 the cell's root shares the kernel's upper-half
-  entries, all without the user bit. Address-space tags (ASID / PCID) are
-  flushed when a tag changes hands. User pages are never executable by the
-  kernel on AArch64 (`PXN`).
+  cell's table, and `TCR_EL1.E0PD1` (where the CPU has FEAT_E0PD) makes
+  cell accesses to it fault in constant time; on x86_64 the cell's root
+  shares the kernel's upper-half entries, all without the user bit, or,
+  with KPTI (see *Speculation*), only the entry pages. Address-space tags
+  (ASID / PCID) are flushed when a tag changes hands. User pages are never
+  executable by the kernel on AArch64 (`PXN`).
 - **Copies.** The kernel never dereferences a cell address. Every copy
   translates the address in the cell's own table, requires the user bit
   (and writability for writes) on the effective permissions, and copies
@@ -152,6 +154,37 @@ What makes the boundary hold:
   copies of shared pages (whole-page copy), resumed pages (whole-page
   copy), new file blocks (`[0; 4096]`).
 
+## Speculation (Meltdown)
+
+`add-kpti` closed the Meltdown part of O3.
+
+- **x86_64: KPTI.** On CPUs open to rogue data cache load (Intel CPUs
+  without `IA32_ARCH_CAPABILITIES.RDCL_NO`, unknown vendors; not AMD or
+  Hygon), the kernel half of a cell's tables maps only the entry pages:
+  the entry code (two page-aligned sections), per-CPU data, GDTs, TSSs,
+  IDT and trap and double-fault stacks, supervisor only. Nothing of the
+  direct map, heap, kernel data, code or page tables is mapped while a
+  cell runs. The entry code switches to the kernel's tables first thing
+  on every system call, exception or interrupt from a cell, and back last
+  thing before `SYSRETQ`/`IRETQ` (the frame for `IRETQ` is built on the
+  mapped trap stack). The kernel keeps PCID 0 and each cell its own, so
+  neither switch flushes the TLB; an untagged cell's CR3 always flushes
+  PCID 0. Kernel flushes of a cell's translations cannot reach its PCID,
+  so the cell flushes it on its next entry on every CPU. The test build
+  runs every in-kernel test with KPTI on.
+- **AArch64: E0PD.** Where the CPU has FEAT_E0PD, `TCR_EL1.E0PD1` is set:
+  what KPTI buys, for free. A CPU with neither E0PD nor `CSV3` (Cortex-A75)
+  is reported at start (`may be open to Meltdown`); there is no trampoline.
+- **Cost.** Every benchmark run measures `cell.syscall_ns` and, with KPTI
+  forced on, `cell.syscall_kpti_ns`, `cell.switch_kpti_ns` and
+  `cell.run_kpti_us` (`bench/README.md`), so the price is known even on
+  runners whose CPUs do not need it. On CI's KVM runners (nested
+  virtualization, PCIDs): a system call 70 → 187 ns, a switch between
+  cells 234 → 281 ns (+20 %), spawn to exit of `hello` 7.0 → 7.2 µs.
+- **Left open.** Spectre v1/v2, L1TF, MDS and their mitigations; the entry
+  pages themselves are readable by speculation (they hold per-CPU stack
+  pointers and the cell's own saved RDI, no other cell's data).
+
 ## Randomness
 
 `add-crypto-random` closed O4. `getrandom` and `AT_RANDOM` come from
@@ -183,12 +216,14 @@ that decode to nothing return `-ENOSYS`. General rules that every row
 relies on:
 
 - **Pointers** go through `memory::read` / `memory::write` (above): a bad
-  pointer is `-EFAULT`; calls that stream (`read`, `write`, `getrandom`,
-  `writev`) return the bytes done before the fault, as Linux does.
+  pointer is `-EFAULT`; calls that stream (`read`, `write`, `readv`,
+  `writev`, `getrandom`) return the bytes done before the fault, as Linux does.
 - **Descriptors** are the low 32 bits of the argument (Linux's `int`), looked
   up in the cell's own table (`-EBADF` otherwise); at most 1024.
 - **Lengths** are never used to size a kernel buffer, except where capped
-  (paths: 4096 bytes; `getdents64`: 64 KiB). Data moves in pieces of at
+  (paths: 4096 bytes; `getdents64`: 64 KiB; `poll` arrays and `select`
+  sets: 1024 descriptors; a pipe write: 64 KiB; a socket send: one
+  datagram or the 256 KiB socket buffer). Data moves in pieces of at
   most one page (and one file block, or 256 bytes for the console), so a
   huge length costs time only for memory the cell really has.
 - **Paths** are read up to their NUL, at most `PATH_MAX` (4096) bytes,
@@ -196,35 +231,50 @@ relies on:
 
 | Call (AArch64 / x86_64 number) | Takes from the cell | Checked |
 |---|---|---|
-| `read` (63/0), `pread64` (67/17) | fd, buffer, length, offset | fd is a readable file (console: 0 bytes); offset ≥ 0; one piece at a time into the buffer, `-EFAULT` before any byte |
-| `write` (64/1), `pwrite64` (68/18) | fd, buffer, length, offset | console in 256-byte pieces; files one piece at a time, each asking memory (`can_store`) first, ≤ 64 MiB of file data per cell (`ENOSPC`/`EFBIG`) |
-| `writev` (66/20) | fd, iovec array, count | count ≤ 1024 (`EINVAL`); each 16-byte entry copied in, then as `write` |
-| `exit`, `exit_group` (93, 94 / 60, 231) | status | low 8 bits kept |
+| `read` (63/0), `pread64` (67/17), `readv` (65/19) | fd, buffer, length, offset, iovec array | a file one piece at a time into the buffer, `-EFAULT` before any byte; offset ≥ 0 and only on files (`ESPIPE`); pipes, event counters and sockets as below; console: 0 bytes; `readv` count ≤ 1024 (`EINVAL`), each 16-byte entry copied in, then as `read` |
+| `write` (64/1), `pwrite64` (68/18), `writev` (66/20) | fd, buffer, length, offset, iovec array | console in 256-byte pieces; files one piece at a time, each asking memory (`can_store`) first, ≤ 256 MiB of file data per cell (`ENOSPC`/`EFBIG`); pipes, event counters and sockets as below; `writev` as `readv` |
+| `exit`, `exit_group` (93, 94 / 60, 231) | status | low 8 bits kept; `exit` of one thread among several ends only it: its clear-tid word is zeroed (if mapped) and one waiter woken |
+| `clone` (220/56), `clone3` (435/435) | flags, stack, thread pointer, tid addresses; `struct clone_args` and its size | threads only: without `CLONE_VM`, `CLONE_SIGHAND` and `CLONE_THREAD`, `-ENOSYS` (cells have no processes); unknown flags `EINVAL`; thread pointer below the lower half's end (`EPERM`); the thread's record asked from memory first (`EAGAIN`); `clone3` size 64–4096 bytes, at most 88 read, no exit signal, `set_tid` or cgroup (`EINVAL`); tid words written as on Linux (a bad address does not undo the thread) |
+| `futex` (98/202) | address, operation, value, timeout, bitset | `WAIT`, `WAKE` and their `_BITSET` forms only (`ENOSYS`), `FUTEX_CLOCK_REALTIME` only with `WAIT_BITSET`; address 4-byte aligned and bitset non-zero (`EINVAL`); a wait reads the 4-byte word through `memory::read` (`EFAULT`), `EAGAIN` if it changed; timeout read as for `nanosleep`; a wake touches no memory and wakes only the cell's own waiters |
 | `brk` (214/12) | new break | between the heap start and `MMAP_BASE`; growth asks memory first (finding S11), zeroed, `rw-`, never executable |
-| `mmap` (222/9) | length, protection, flags | anonymous private only, no `MAP_FIXED` (`EINVAL`); W^X (`EACCES`); length rounded with overflow check; the kernel picks the address below the stack's floor; memory asked first (S11) |
+| `mmap` (222/9) | address, length, protection, flags, fd, offset | private only (`EINVAL`; shared file mappings `ENODEV`); W^X (`EACCES`); length rounded with overflow check; files: a readable regular file (`EBADF`, `EACCES`, `ENODEV`), offset page aligned, its pages shared from the page cache copy-on-write; `MAP_FIXED`: page aligned, end ≤ `USER_END` (`EINVAL`), not page 0 (`EPERM`), replaces what was there; otherwise the kernel picks the address below the stack's floor (`ENOMEM`); `PROT_NONE` reserves addresses without memory; anonymous memory asked first (S11) |
 | `munmap` (215/11) | address, length | page aligned, length > 0, end ≤ `USER_END` (`EINVAL`); holes skipped by table entry (S4); 2 MiB pages not split |
-| `mprotect` (226/10) | address, length, protection | aligned, known bits only, W^X, no `PROT_NONE` yet; end ≤ `USER_END` (`ENOMEM`, S1); every page mapped or brought in, else `ENOMEM` at the first one (S4); a shared frame becomes writable only copy-on-write (S12) |
+| `mprotect` (226/10) | address, length, protection | aligned, known bits only, W^X; end ≤ `USER_END` (`ENOMEM`, S1); `PROT_NONE` frees the pages; otherwise every page mapped, brought in, or reserved and backed now, else `ENOMEM` at the first one (S4); part of a 2 MiB page `EINVAL`; a shared frame becomes writable only copy-on-write (S12) |
 | `madvise` (233/28), `sigaltstack` (132/131) | — | accepted, nothing read or changed |
-| `getpid`, `gettid`, `set_tid_address` (172, 178, 96 / 39, 186, 218) | — | the cell's identifier; the address is not kept |
+| `getpid`, `gettid`, `set_tid_address` (172, 178, 96 / 39, 186, 218) | address | the cell's or the thread's identifier; the address is kept as the thread's clear-tid word |
 | `getuid` … `getegid` (174–177 / 102, 104, 107, 108), `getppid` (173/110) | — | 0 |
 | `uname` (160/63) | buffer | 390 bytes written |
-| `clock_gettime` (113/228) | clock, buffer | known clocks only (`EINVAL`); 16 bytes written |
+| `clock_gettime` (113/228), `clock_getres` (114/229) | clock, buffer | known clocks only (`EINVAL`); 16 bytes written |
+| `gettimeofday` (169/96), `time` (—/201) | buffers | 16 (and 8 for the time zone) and 8 bytes written, each unless null |
 | `getrandom` (278/318) | buffer, length | 256-byte pieces until the length or a fault; from the cell's own ChaCha20 generator (see *Randomness*) |
 | `rt_sigaction` (134/13), `rt_sigprocmask` (135/14) | old-state buffer, size | new state not read; at most 32 / 128 zero bytes written |
-| `ioctl` (29/16) | — | `-ENOTTY` |
+| `ioctl` (29/16) | fd, request, argument | `FIONBIO` (4 bytes read), `FIOCLEX` and `FIONCLEX` on the cell's own descriptors; anything else `-ENOTTY` |
 | `arch_prctl` (—/158) | code, address | `ARCH_SET_FS` only below `USER_END` (`EPERM`, S3); `ARCH_GET_FS` writes 8 bytes; others `EINVAL` |
+| `prctl` (167/157), `capget` (90/125) | option, buffer; header, data | `PR_SET_NAME` accepted (not kept), `PR_GET_NAME` writes 16 zero bytes, others `EINVAL`; `capget` reads the 8-byte header and writes empty sets (12 or 24 bytes) |
 | `sched_yield` (124/24) | — | the cell goes to the back of the run queue |
-| `nanosleep` (101/35), `clock_nanosleep` (115/230) | clock, flags, `timespec` | 16 bytes read; negative or ≥ 10⁹ ns `EINVAL`; known clocks only; deadline saturates; only this cell waits |
-| `select` (—/23), `pselect6` (72/270) | descriptor count, timeout | descriptors not supported (`ENOSYS`); null timeout `EINVAL`; timeout read as above |
+| `sched_getaffinity` (123/204), `sched_getparam` (121/143), `sched_getscheduler` (120/145) | size, buffer, pid | affinity size ≥ 8 (`EINVAL`), 8 bytes written; pid 0, the cell or one of its threads (`ESRCH`); normal policy, priority 0 |
+| `nanosleep` (101/35), `clock_nanosleep` (115/230) | clock, flags, `timespec` | 16 bytes read; negative or ≥ 10⁹ ns `EINVAL`; known clocks only; deadline saturates; only this thread waits |
+| `pipe2` (59/293), `pipe` (—/22) | flags, 8-byte buffer | flags `O_NONBLOCK` and `O_CLOEXEC` only (`EINVAL`); both ends closed again if the buffer faults; a write asks memory first (`ENOBUFS`), at most 64 KiB held |
+| `eventfd2` (19/290), `eventfd` (—/284) | initial count, flags | flags `EFD_SEMAPHORE`, `O_NONBLOCK` and `O_CLOEXEC` only; reads and writes of exactly 8 bytes (`EINVAL`) |
+| `poll` (—/7), `ppoll` (73/271) | array, count, timeout | count ≤ 1024 (`EINVAL`); the array copied in and out whole; unknown descriptors `POLLNVAL`; timeout read as above; the signal mask ignored |
+| `select` (—/23), `pselect6` (72/270) | descriptor count, three sets, timeout | count 0–1024 (`EINVAL`); sets read and written as count/64 words, an unknown descriptor `EBADF`; without descriptors a sleep, whose null timeout is `EINVAL` |
+| `epoll_create1` (20/291), `epoll_create` (—/213), `epoll_ctl` (21/233), `epoll_wait` (—/232), `epoll_pwait` (22/281) | flags, size, operation, fd, event, buffer, count, timeout | flags `EPOLL_CLOEXEC` only, size > 0; operations add, delete and modify (`EINVAL`), the event in each architecture's layout (12 or 16 bytes); count > 0 (`EINVAL`), at most one event per registered descriptor written |
+| `socket` (198/41), `socketpair` (199/53) | family, type, protocol, 8-byte buffer | `AF_UNIX` stream, `AF_INET` stream and datagram (`EAFNOSUPPORT`, `ESOCKTNOSUPPORT`, `EPROTONOSUPPORT`); pairs `AF_UNIX` stream only; the descriptors released again if the buffer faults |
+| `bind` (200/49), `connect` (203/42) | fd, address, length | a socket descriptor; address length 2–128 bytes read (`EINVAL`), `AF_INET` ≥ 16 bytes and of the socket's family (`EAFNOSUPPORT`), Unix paths ≤ 108 bytes, no abstract names; Unix names in the cell's own file system (`EADDRINUSE`); ports from the kernel's shared table; a blocking connect through the card waits |
+| `listen` (201/50), `accept` (202/43), `accept4` (242/288), `shutdown` (210/48) | fd, backlog, address buffer and length, flags, how | backlog ≤ 4096; `accept4` flags `SOCK_NONBLOCK` and `SOCK_CLOEXEC` only; stream sockets only (`EOPNOTSUPP`); the peer's address written up to the room given, the new descriptor closed if that faults; `how` 0–2 |
+| `sendto` (206/44), `sendmsg` (211/46) | fd, buffer or `msghdr`, flags, destination | datagrams ≤ 65,507 bytes (`EMSGSIZE`), stream sends cut to the 256 KiB socket buffer; `msghdr` 56 bytes, ≤ 1024 iovec entries (`EMSGSIZE`), each length ≤ `SSIZE_MAX`, their sum saturating (S16); memory asked first (`ENOBUFS`); no control data |
+| `recvfrom` (207/45), `recvmsg` (212/47) | fd, buffer or `msghdr`, flags, address buffer | written piece by piece into the cell's buffers; `MSG_PEEK`, `MSG_TRUNC` and `MSG_DONTWAIT`; the source address written up to the room given; no control data, `msg_flags` written |
+| `getsockname` (204/51), `getpeername` (205/52) | fd, buffer, length | the address written up to the room given (negative room `EINVAL`), its full length after it |
+| `setsockopt` (208/54), `getsockopt` (209/55) | fd, level, name, value, length | known options only (`ENOPROTOOPT`; TCP options on TCP sockets only, `EOPNOTSUPP`); value length checked (`EINVAL`), at most 16 bytes read; ranges checked |
 | `set_robust_list` (99/273) | — | accepted, never walked |
-| `rseq` (293/334) | — | `-ENOSYS` (declined) |
+| `rseq` (293/334), `io_uring_setup` (425/425) | — | `-ENOSYS` (declined, not reported) |
 | `prlimit64` (261/302), `getrlimit` (163/97) | resource, old-limit buffer | resource ≤ 15 (`EINVAL`); new limit and pid not read; 16 bytes written |
+| `sysinfo` (179/99) | buffer | 112 bytes written |
 | `readlink` (—/89), `readlinkat` (78/267) | — | `-ENOENT` (no links exist), nothing read |
-| `futex` (98/202) | operation | no memory touched: wake 0, others `EAGAIN` |
-| `fstat` (80/5) | fd, buffer | 128 / 144 bytes written |
+| `fstat` (80/5), `statx` (291/332) | fd, buffer; dirfd, path, flags, mask, buffer | 128 / 144 bytes written; `statx` 256 bytes, its path as `newfstatat` |
 | `newfstatat` (79/262), `stat` (—/4), `lstat` (—/6) | dirfd, path, buffer, flags | dirfd as `int` (`AT_FDCWD`, else ≥ 0 or `EBADF`); path; `AT_EMPTY_PATH` |
 | `openat` (56/257), `open` (—/2) | dirfd, path, flags | access mode 3 `EINVAL`; with `O_CREAT`, memory asked first and ≤ 4096 files and directories per cell (`ENOSPC`, S5); ≤ 1024 descriptors (`EMFILE`) |
-| `close` (57/3) | fd | own table |
+| `close` (57/3) | fd | own table; a socket is released with its last descriptor |
 | `lseek` (62/8) | fd, offset, whence | whence 0–2; result checked for overflow and ≥ 0 |
 | `getdents64` (61/217) | fd, buffer, size | a directory fd; at most min(size, 64 KiB) built (S5) |
 | `mkdirat` (34/258), `mkdir` (—/83) | dirfd, path | memory asked first, file limit (S5) |
@@ -232,8 +282,8 @@ relies on:
 | `renameat` (38/264), `renameat2` (276/316), `rename` (—/82) | two dirfds and paths, flags | flags must be 0; a directory cannot move into itself |
 | `getcwd` (17/79) | buffer, size | `ERANGE` if too small; the path is bounded by the file limit |
 | `chdir` (49/80) | path | must be a directory |
-| `ftruncate` (46/77) | fd, length | file open for writing; 0 ≤ length ≤ 64 MiB |
-| `fsync`, `fdatasync` (82, 83 / 74, 75) | fd | checked, nothing else |
+| `ftruncate` (46/77) | fd, length | a file; 0 ≤ length (`EINVAL`) ≤ 256 MiB (`EFBIG`) |
+| `fsync`, `fdatasync` (82, 83 / 74, 75), `fadvise64` (223/221) | fd | checked, nothing else (`fadvise64` on a pipe or socket: `ESPIPE`) |
 | `dup` (23/32), `dup2` (—/33), `dup3` (24/292), `fcntl` (25/72) | fds, flags, command | target < 1024; `dup3` flags only `O_CLOEXEC`; known commands only |
 | `faccessat` (48/269), `faccessat2` (439/439), `access` (—/21) | dirfd, path, mode | mode bits ≤ 7 |
 | anything else | number | `-ENOSYS`; one console report per number below 1023 and one for all larger (S9) |
@@ -269,7 +319,7 @@ the threat model above.
 | S20 | Low | both | `mmap` of a file maps holes and pages past its end with fresh zeroed frames without asking memory first (as S11 did for anonymous memory) | Accepted (below) |
 | S21 | Medium | both | Sockets are bounded kernel-wide (4096): one cell can hold about half, two all, and every other cell gets `ENFILE` | Accepted until per-cell socket quotas (O1, `add-cell-quotas`) |
 | S22 | Medium | both | A flood of frames from the network kept the CPU that polls the card in `smoltcp` for as long as it lasted | Fixed (`fuzz-wire-packets`) |
-| S23 | Low | both | A connection to the outside on which nothing arrived for 20 s was reset (`smoltcp` 0.14 applies its timeout to idle connections) | Worked around (`fuzz-wire-packets`) |
+| S23 | Low | both | A connection to the outside on which nothing arrived for 20 s was reset (`smoltcp` 0.14 applies its timeout to idle connections) | Worked around (`fix-tcp-long-wait`) |
 
 **S1. `mprotect` reached the kernel half (Critical, x86_64).** On x86_64 a
 cell's root table shares the kernel's upper-half entries, and those
@@ -561,7 +611,7 @@ returns 0 so the caller polls again soon. *Test:*
 
 **S23. Idle connections to the outside were reset after 20 s (Low,
 both; `smoltcp` 0.14).** Connections to the outside were given
-`set_timeout(20 s)` to bound the handshake. `smoltcp` documents that
+`set_timeout(20 s)`. `smoltcp` documents that
 timeout for a peer that does not answer the handshake or stays silent
 while data is outstanding, but its `poll_at` comes due at the last
 received segment plus the timeout whatever the transmit buffer holds, and
@@ -569,14 +619,17 @@ received segment plus the timeout whatever the transmit buffer holds, and
 buffer). So any connection on which nothing arrived for 20 s, such as an
 idle keep-alive connection or a request whose answer took longer, was
 reset and its peer got an RST. Not caused by an attacker; found by the
-fuzzer (a case that shrank to "wait 20 s"). Reproduction in `smoltcp`
+fuzzer (a case that shrank to "wait 20 s"), and at the same time, from a
+model that thought for 45 s, by `fix-tcp-long-wait`. Reproduction in `smoltcp`
 alone: two interfaces on a wire, a client socket with
 `set_timeout(Some(20 s))` connects to a listener, neither sends; 20 s
 after the last segment the client sends an RST and is `Closed`.
-`smoltcp` is a crates.io dependency and is not patched. *Workaround:*
-the timeout is cleared when `poll_wire` first sees the connection open; it
-still bounds the handshake, and a connection the cell closed is still
-aborted after the 60 s linger. *Test:* `an_idle_connection_stays_open`.
+`smoltcp` is a crates.io dependency and is not patched. *Workaround*
+(`fix-tcp-long-wait`): the card clears the timeout while an open
+connection has nothing waiting for an acknowledgment and sets it again
+when it sends. *Tests:* `a_connection_silent_for_long_still_gets_its_reply`
+and `bytes_a_peer_never_acknowledges_are_given_up`; the fuzzer's waits of
+up to 30 s keep it covered.
 
 ### The fuzzer
 
@@ -615,7 +668,7 @@ These are not fixed by this change; each needs its own design.
 |---|---|---|
 | O1 | Medium | **No per-cell quota.** One cell may take all memory down to the kernel's reserve; others are then refused (`ENOMEM`, `ENOSPC`), and the kernel survives (spec `cells`). Host-set quotas need per-cell accounting of frames and heap. |
 | O2 | Medium | **Kernel time proportional to what a cell holds.** A call runs without preemption: reading or writing up to 64 MiB of file data, `getrandom` or `write` over gigabytes of the cell's own memory, or mapping and zeroing a large region delays every other cell for as long as it takes. Bounded by the cell's own memory, not by a time slice. |
-| O3 | High on affected CPUs | **Side channels are out of scope.** Caches, branch predictors, speculation and timing are not reviewed. On x86_64 the kernel half is mapped (supervisor only) in every cell's table, with no KPTI: on CPUs vulnerable to Meltdown a cell could read kernel memory. Cells see a nanosecond clock. |
+| O3 | Medium | **Side channels other than Meltdown are out of scope.** Meltdown is closed by `add-kpti` (KPTI on x86_64 where needed, E0PD on AArch64; see *Speculation*). Caches, branch predictors, other speculation attacks (Spectre, L1TF, MDS) and timing are not reviewed. An AArch64 CPU with neither E0PD nor CSV3 is reported, not protected. Cells see a nanosecond clock. |
 | O4 | — | **Closed by `add-crypto-random`** (see *Randomness*). What remains: a CPU without a hardware random source (an AArch64 host without FEAT_RNG under KVM) falls back to the cycle counter, and the boot says `getrandom is predictable`; there is no virtio-rng driver yet. |
 | O5 | Low | **SMEP, SMAP and PAN closed by `add-user-access-guards`.** Left: SMAP and PAN cannot see accesses through the direct map (software checks guard it); on x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
 | O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. |
@@ -639,6 +692,9 @@ review:
   tables, data and code unchanged, console reports bounded, every frame
   back), `pointers_outside_the_cell_give_efault` (property, 27 calls taking
   a pointer), and one test per finding.
+- KPTI: `kpti_leaves_cells_only_the_entry_pages` (x86_64),
+  `e0pd_is_on_where_present` (AArch64), `cells_run_alike_with_and_without_kpti`;
+  every other in-kernel test runs with KPTI on.
 - Host, elsewhere: `ranges_outside_the_user_half_are_refused` (property,
   `rhizo-cell`), `the_kernel_half_is_out_of_reach` (`space`, both formats),
   `hostile_headers_never_panic` (ELF), `kernel_half_is_never_made_writable_or_private`

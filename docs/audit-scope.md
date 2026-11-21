@@ -187,16 +187,16 @@ attacker code by definition and out of scope.
 
 All are written up in [`security.md`](security.md), with the threat
 model, a per-call table of checks, each finding's reproduction and fix,
-and the tests that keep it fixed. Note that its per-call table describes
-the calls of the first review; the calls added since (threads, sockets,
-`poll`/`select`/`epoll`, file `mmap`) are covered by the second review's
-area table instead.
+and the tests that keep it fixed. Its per-call table covers every call
+the kernel decodes, those added since the first review (threads,
+sockets, `poll`/`select`/`epoll`, file `mmap`) included; the second
+review's area table says how each area was reviewed.
 
 ### Findings
 
 | Status | Findings |
 |---|---|
-| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S22 (Medium); S9, S10, S11, S17, S19 (Low); S23 (Low, a `smoltcp` behaviour worked around). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5). |
+| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S22 (Medium); S9, S10, S11, S17, S19 (Low); S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5). |
 | Accepted until quotas | S20 (Low, file holes mapped without asking memory first), S21 (Medium, kernel-wide pool of 4096 sockets), O1 (no per-cell quota), O2 (call time proportional to what a cell holds). Fix proposed in [PR #61](https://github.com/davidsalvat/rhizo/pull/61), open. |
 | Open | O3 (side channels; no KPTI on x86_64: [PR #63](https://github.com/davidsalvat/rhizo/pull/63), open), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies). See [Known limitations](security.md#known-limitations-and-open-findings). |
 
@@ -320,8 +320,8 @@ Ordered by what we most want answered.
   `kernel/src/wire.rs`), for example with SYN floods, out-of-window
   segments, DHCP replies or oversized frames? Is the `smoltcp` 0.14
   feature set in use free of known issues? (Covered internally since
-  `fuzz-wire-packets`: floods were bounded (S22), idle connections fixed
-  (S23); see [Frames from the network](security.md#frames-from-the-network-b5).
+  `fuzz-wire-packets`: floods were bounded (S22); idle connections (S23)
+  were fixed by `fix-tcp-long-wait`; see [Frames from the network](security.md#frames-from-the-network-b5).
   An independent look is still wanted.)
 - Q12. Can a cell make the kernel's console text, which shares the serial
   line with the protocol's frames, contain the byte `0x01` and so forge a

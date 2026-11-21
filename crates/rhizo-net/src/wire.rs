@@ -20,7 +20,11 @@ const TCP_BUF: usize = 64 << 10;
 /// Datagrams and bytes a UDP socket buffers to and from the wire.
 const UDP_PACKETS: usize = 16;
 const UDP_BYTES: usize = 64 << 10;
-/// A connection whose SYN gets no answer gives up after this long.
+/// A connection that gets no answer gives up after this long (by default):
+/// while it connects, or while bytes it sent wait for their
+/// acknowledgment. An open connection with nothing to acknowledge waits for
+/// its peer for as long as it takes (design D1 of `fix-tcp-long-wait`):
+/// `smoltcp` would count its timeout from the peer's last segment even then.
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// A closed connection whose peer does not close is aborted after this
 /// long (as Linux's FIN_WAIT_2 timeout does).
@@ -53,6 +57,8 @@ pub(crate) struct Wire {
     /// Connections closed by the cells, dropped from `smoltcp` once done,
     /// or aborted at the time given (a peer that never closes its side).
     closing: Vec<(SocketHandle, Option<Instant>)>,
+    /// [`TIMEOUT`], or shorter in tests.
+    timeout: Duration,
 }
 
 impl core::fmt::Debug for Wire {
@@ -195,6 +201,7 @@ impl Net {
             dhcp: None,
             addr: None,
             closing: Vec::new(),
+            timeout: TIMEOUT,
         };
         match config {
             WireConfig::Dhcp => wire.dhcp = Some(wire.sockets.add(dhcpv4::Socket::new())),
@@ -205,6 +212,16 @@ impl Net {
             } => wire.set_address(Some((addr, prefix)), gateway),
         }
         self.wire = Some(wire);
+    }
+
+    /// Sets how long connections started or written to from now on wait
+    /// for an answer before they give up ([`TIMEOUT`] by default): in-kernel
+    /// tests shorten it to outlast it quickly (design D3 of
+    /// `fix-tcp-long-wait`).
+    pub fn set_wire_timeout(&mut self, ns: u64) {
+        if let Some(wire) = self.wire.as_mut() {
+            wire.timeout = Duration::from_micros(ns / 1000);
+        }
     }
 
     /// The card's address, once it has one.
@@ -233,26 +250,24 @@ impl Net {
         if changed == PollResult::SocketStateChanged {
             self.changes += 1;
             // Every socket on the wire may have changed; connections that
-            // opened are marked, so a later close is a reset, not a refusal.
+            // opened are marked, so a later close is a reset, not a refusal,
+            // and those with nothing left to acknowledge stop timing out.
             for s in self.sockets.iter_mut().flatten() {
                 if matches!(s.state, State::Wire { .. }) || s.udp.is_some() {
                     self.woken.append(&mut s.waiters);
                 }
                 if let State::Wire {
-                    handle,
-                    ever_open: ever_open @ false,
-                    ..
+                    handle, ever_open, ..
                 } = &mut s.state
                 {
                     let socket = wire.sockets.get_mut::<tcp::Socket>(*handle);
-                    *ever_open = !matches!(
-                        socket.state(),
+                    let state = socket.state();
+                    let open = !matches!(
+                        state,
                         tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Closed
                     );
-                    if *ever_open {
-                        // The timeout is for the handshake: `smoltcp` 0.14
-                        // would also abort a connection idle for that long
-                        // (finding S23 of `docs/security.md`).
+                    *ever_open |= open;
+                    if open && socket.send_queue() == 0 {
                         socket.set_timeout(None);
                     }
                 }
@@ -326,7 +341,7 @@ impl Net {
             tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
             tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
         );
-        socket.set_timeout(Some(TIMEOUT));
+        socket.set_timeout(Some(wire.timeout));
         let opts = self.sockets[h as usize]
             .as_ref()
             .map(|s| s.opts)
@@ -370,6 +385,7 @@ impl Net {
     /// Sends what fits of `data` on connection `handle`.
     pub(crate) fn wire_send(&mut self, handle: SocketHandle, data: &[u8]) -> Result<usize> {
         let wire = self.wire.as_mut().ok_or(Error::Pipe)?;
+        let timeout = wire.timeout;
         let s = wire.tcp(handle);
         if !s.may_send() {
             return Err(Error::Pipe);
@@ -377,6 +393,8 @@ impl Net {
         if !s.can_send() {
             return Err(Error::Again);
         }
+        // Until these bytes are acknowledged, a silent peer is given up.
+        s.set_timeout(Some(timeout));
         s.send_slice(data).map_err(|_| Error::Pipe)
     }
 
@@ -452,10 +470,12 @@ impl Net {
     }
 
     /// The cells are done with connection `handle`: it closes, and leaves
-    /// `smoltcp` once closed.
+    /// `smoltcp` once closed or after [`LINGER`].
     pub(crate) fn wire_close(&mut self, handle: SocketHandle) {
         if let Some(wire) = self.wire.as_mut() {
-            wire.tcp(handle).close();
+            let s = wire.tcp(handle);
+            s.set_timeout(None);
+            s.close();
             wire.closing.push((handle, None));
         }
     }

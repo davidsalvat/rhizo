@@ -24,12 +24,3 @@ than the kernel handles them cannot hold the CPU that polls the card.
 #### Scenario: Flood
 - **WHEN** frames keep arriving faster than the kernel handles them
 - **THEN** a poll of the card returns after 64 frames and asks to be polled again at once
-
-### Requirement: Idle connections to the outside stay open
-A TCP connection through the card that has opened SHALL stay open while
-neither side sends, for as long as its peer keeps it. Only a connection
-whose handshake gets no answer within 20 s SHALL be given up.
-
-#### Scenario: Idle connection
-- **WHEN** a cell's connection to a host outside carries nothing for 30 s
-- **THEN** it reports no error and data still crosses it

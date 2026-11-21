@@ -9,7 +9,7 @@
 ## 2. Fixes
 
 - [x] 2.1 S22: at most `POLL_FRAMES` frames per `poll_wire`, which then returns `Some(0)` (D5); `a_flood_from_the_wire_lets_the_kernel_go` failed before; verify `cargo test -p rhizo-net flood`
-- [x] 2.2 S23: the handshake timeout is cleared once a connection opens (D6); `an_idle_connection_stays_open` failed before; verify `cargo test -p rhizo-net idle`
+- [x] 2.2 S23: recorded only, fixed on `main` by `fix-tcp-long-wait` (D6); verify the fuzzer's 20 s and 30 s waits pass after the merge
 
 ## 3. Documentation and checks
 

@@ -94,18 +94,13 @@ and the card is drained at up to 64 frames per 20 µs. A ring holds at most
 64 frames, so no benchmark or ordinary load is slowed: more than 64 frames
 waiting at one poll means the ring had already refilled during the poll.
 
-## D6. Idle connections stay open (S23)
+## D6. Idle connections (S23)
 
-`smoltcp` 0.14's `set_timeout` is documented to abort a connection when the
-peer does not answer the handshake, or is silent while data is
-outstanding; its `poll_at` and `dispatch` also abort an idle connection
-once nothing has arrived for the timeout. Rhizo set 20 s on every
-connection to the outside, so an idle keep-alive connection, or a request
-whose answer took more than 20 s after the server acknowledged it, was
-reset. The fix keeps the 20 s for the handshake and clears the timeout
-when `poll_wire` first sees the connection open (where it sets
-`ever_open`). A peer that disappears while data is outstanding is then
-retransmitted to with backoff until the cell closes the connection (then
-the 60 s linger aborts it), as on Linux until `tcp_retries2`.
-`smoltcp` itself is not patched (it is a crates.io dependency); the
-behaviour and a reproduction are recorded in `docs/security.md`.
+The fuzzer's first failing case shrank to a 20 s wait: `smoltcp` 0.14
+counts `set_timeout` from the peer's last segment even when nothing waits
+for an acknowledgment, so an idle connection to the outside was reset.
+`fix-tcp-long-wait` found the same cause from a slow model and fixed it on
+`main` (the timeout is cleared while nothing is outstanding); this change
+keeps no fix of its own and records the finding (S23 in
+`docs/security.md`, with a reproduction in `smoltcp` alone). The
+fuzzer's waits of up to 30 s keep it covered.

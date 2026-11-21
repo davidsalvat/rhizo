@@ -177,14 +177,19 @@ fn build_interpreter(tarball: &Path) -> Result<PathBuf> {
     Ok(python)
 }
 
-/// Checks the tarball against [`SHA256`].
-fn check_sha256(tarball: &Path) -> Result {
+/// The SHA-256 of `file`, in hexadecimal.
+pub(crate) fn sha256(file: &Path) -> Result<String> {
     let out = Command::new("sha256sum")
-        .arg(tarball)
+        .arg(file)
         .output()
         .map_err(|e| format!("cannot run sha256sum: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let got = text.split_whitespace().next().unwrap_or_default();
+    Ok(text.split_whitespace().next().unwrap_or_default().into())
+}
+
+/// Checks the tarball against [`SHA256`].
+pub(crate) fn check_sha256(tarball: &Path) -> Result {
+    let got = sha256(tarball)?;
     if got == SHA256 {
         return Ok(());
     }
@@ -192,7 +197,7 @@ fn check_sha256(tarball: &Path) -> Result {
         Failure::new("build", "the CPython tarball is not the pinned release")
             .location(tarball.display().to_string())
             .expected(format!("Python-{VERSION}.tar.xz, SHA-256 {SHA256}"))
-            .actual(got.to_string())
+            .actual(got)
             .hint("download the pinned release from python.org, or update VERSION and SHA256 on purpose")
             .reproduce(format!("sha256sum {}", tarball.display()))
             .into_error(),
@@ -200,7 +205,7 @@ fn check_sha256(tarball: &Path) -> Result {
 }
 
 /// Runs `cmd` with its output in `log`; on failure, reports the log's end.
-fn run(cmd: &mut Command, what: &str, log: &Path) -> Result {
+pub(crate) fn run(cmd: &mut Command, what: &str, log: &Path) -> Result {
     let file = std::fs::File::create(log).map_err(|e| e.to_string())?;
     let status = cmd
         .stdout(file.try_clone().map_err(|e| e.to_string())?)

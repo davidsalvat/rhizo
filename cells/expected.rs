@@ -45,6 +45,7 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ),
     ("libc_alloc", "allocator checksum 154285459\n", Ending::Exit(0)),
     ("libc_float", "fp ok: 20100.0\n", Ending::Exit(0)),
+    ("libc_hwcap", "cpu features ok\n", Ending::Exit(0)),
     (
         "libc_files",
         "cwd ends in /work\n\
@@ -298,3 +299,26 @@ pub const DYNAMIC: &[(&str, &[&str], &str)] = &[
         "{\"dynamic\": true, \"sum\": 45}\n",
     ),
 ];
+
+/// Packages from PyPI in a dynamically linked CPython (change
+/// `add-pip-packages`, files `packages-files`), run from the top of its
+/// files as the [`DYNAMIC`] programs are: numpy's computation, which prints
+/// `ready` first and pauses when given `wait` (a template that imported
+/// numpy), and what the requests script prints of its GET to the host's
+/// fake model (whose URL it is given last). `-s`: packages come from the
+/// interpreter's own `site-packages`, never a user's (on Linux, the home
+/// directory's).
+#[allow(dead_code)]
+pub const NUMPY_ARGV: [&str; 3] = ["usr/bin/python3", "-s", "app/numpy_demo.py"];
+#[allow(dead_code)]
+pub const NUMPY_STDOUT: &str = "numpy 2.5.4\n\
+     sum 78 columns [15, 18, 21, 24] trace 650\n\
+     solve [1.0, -2.0, 3.0] det 70.0\n\
+     hypot [5.0, 13.0, 17.0]\n\
+     matmul 131072.0\n";
+#[allow(dead_code)]
+pub const REQUESTS_ARGV: [&str; 3] = ["usr/bin/python3", "-s", "app/requests_demo.py"];
+#[allow(dead_code)]
+pub const REQUESTS_STDOUT: &str = "requests 2.34.2 status 200\n\
+     type application/json encoding ascii\n\
+     call compute {\"n\": 537, \"seed\": 618}\n";

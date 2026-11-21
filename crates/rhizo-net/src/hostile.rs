@@ -17,7 +17,6 @@ use super::wire_tests::{ME, MS, PEER, Peer};
 use super::*;
 use proptest::prelude::*;
 use rhizo_hal::testing::QueueLink;
-use smoltcp::socket::tcp;
 use smoltcp::wire::{Icmpv4Packet, IpAddress, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -541,13 +540,8 @@ impl World {
     fn exchange(&mut self) {
         self.net.poll_wire(&mut self.link, self.now);
         self.route();
-        for p in [&mut self.peer, &mut self.evil] {
-            p.step(self.now);
-            let t = p.sockets.get_mut::<tcp::Socket>(p.tcp);
-            if t.state() == tcp::State::Closed {
-                t.listen(80).unwrap(); // ready for the next connection
-            }
-        }
+        self.peer.step(self.now);
+        self.evil.step(self.now);
         self.link.inbox.extend(self.peer.link.sent.drain(..));
         for f in self.evil.link.sent.drain(..) {
             if self.captured.len() == 32 {

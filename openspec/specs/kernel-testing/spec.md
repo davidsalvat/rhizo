@@ -83,3 +83,38 @@ and Cloud Hypervisor where KVM is available.
 #### Scenario: Rerun on several CPUs
 - **WHEN** a developer runs `cargo xtask test --only ktest-smp`
 - **THEN** the in-kernel tests run on 4 vCPUs and the step reports their result
+
+### Requirement: A share of the in-kernel tests
+An in-kernel test build booted with `shard=I/N` (`0 <= I < N`) SHALL run
+only the tests whose position across all test suites is `I` modulo `N`,
+reporting how many it runs, and SHALL ignore a malformed value.
+
+#### Scenario: Shares cover every test once
+- **WHEN** the test build boots `N` times with `shard=0/N` to `shard=N-1/N`
+- **THEN** every test runs in exactly one of the boots
+
+### Requirement: Tests do not depend on their order
+An in-kernel test SHALL pass whether or not the tests before it ran: work
+done once per boot (such as bringing up the network card) SHALL happen at
+boot, and a test that compares free memory SHALL warm the kernel heap
+first.
+
+#### Scenario: Memory check first in its VM
+- **WHEN** a test that checks every frame is returned runs first after boot
+- **THEN** it passes as it does after the other tests
+
+### Requirement: Node.js tests in their own VM
+Where Node.js is packed (`RHIZO_NODE`), `cargo xtask test` SHALL run the
+Node.js in-kernel tests in a kernel of their own, the only one embedding
+Node.js, on a VM with 1 GiB and 2 vCPUs (step `ktest-node`), and SHALL
+fail unless the kernel reports `cpus: 2 online` and every test passes.
+Without `RHIZO_NODE` the step SHALL say why it did not run. CI SHALL run
+it on both architectures.
+
+#### Scenario: Rerun the Node.js tests
+- **WHEN** a developer runs `cargo xtask test --only ktest-node` with `RHIZO_NODE` set
+- **THEN** the Node.js tests run on 2 vCPUs with 1 GiB and the step reports their result
+
+#### Scenario: Not downloaded
+- **WHEN** a developer runs `cargo xtask test` without `RHIZO_NODE`
+- **THEN** the step prints that the Node.js tests did not run and why, and the run passes

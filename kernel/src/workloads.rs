@@ -153,11 +153,8 @@ fn laptop(console: &mut impl Console) {
         snapshots.push(snapshot);
     }
     let after_suspend = memory::free_bytes();
-    let snapshot_bytes = snapshots
-        .iter()
-        .map(|s| s.as_bytes().len() as u64)
-        .sum::<u64>()
-        / snapshots.len() as u64;
+    let snapshot_bytes =
+        snapshots.iter().map(|s| s.heap_bytes() as u64).sum::<u64>() / snapshots.len() as u64;
 
     // Idle: five agents wait for their users, 45 are suspended; one timer
     // cell ends the window, so the CPU idles as the scheduler makes it.
