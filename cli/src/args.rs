@@ -41,6 +41,11 @@ Commands:
   fork <id> [n]              Fork a running cell into n (default 1)
   suspend <id>               Suspend a running cell into a snapshot
   resume <id>                Resume a suspended cell
+  freeze <id>                Freeze a running cell into a template, which
+                             `fork` makes cells from
+  save <id> <file>           Save a suspended cell or a template to a file
+  load <file> [--template]   Load a saved file as a suspended cell, or as a
+                             template, into this VM
   attach <id>                Show a cell's output until it ends
   kill <id>                  End a cell, or forget one that ended
   down                       Power the VM off
@@ -107,6 +112,15 @@ pub enum Command {
     },
     Suspend(u32),
     Resume(u32),
+    Freeze(u32),
+    Save {
+        id: u32,
+        file: PathBuf,
+    },
+    Load {
+        file: PathBuf,
+        template: bool,
+    },
     Attach(u32),
     Kill(u32),
     Down,
@@ -180,6 +194,25 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         },
         "suspend" => Command::Suspend(id(args, "suspend")?),
         "resume" => Command::Resume(id(args, "resume")?),
+        "freeze" => Command::Freeze(id(args, "freeze")?),
+        "save" => match args {
+            [id, file] => Command::Save {
+                id: number("cell", id)?,
+                file: PathBuf::from(file),
+            },
+            _ => return Err("usage: rhizo save <id> <file>".into()),
+        },
+        "load" => match args {
+            [file] => Command::Load {
+                file: PathBuf::from(file),
+                template: false,
+            },
+            [file, flag] | [flag, file] if flag == "--template" => Command::Load {
+                file: PathBuf::from(file),
+                template: true,
+            },
+            _ => return Err("usage: rhizo load <file> [--template]".into()),
+        },
         "attach" => Command::Attach(id(args, "attach")?),
         "kill" => Command::Kill(id(args, "kill")?),
         "down" => Command::Down,
@@ -364,6 +397,34 @@ mod tests {
         assert_eq!(command("suspend 7"), Command::Suspend(7));
         assert_eq!(command("resume 7"), Command::Resume(7));
         assert_eq!(command("attach 7"), Command::Attach(7));
+        assert_eq!(command("freeze 7"), Command::Freeze(7));
+        assert_eq!(
+            command("save 7 agent.rhz"),
+            Command::Save {
+                id: 7,
+                file: "agent.rhz".into()
+            }
+        );
+        for words in ["load agent.rhz --template", "load --template agent.rhz"] {
+            assert_eq!(
+                command(words),
+                Command::Load {
+                    file: "agent.rhz".into(),
+                    template: true
+                }
+            );
+        }
+        assert_eq!(
+            command("load agent.rhz"),
+            Command::Load {
+                file: "agent.rhz".into(),
+                template: false
+            }
+        );
+        assert!(parse_words("save 7").is_err());
+        assert!(parse_words("save x f").is_err());
+        assert!(parse_words("load").is_err());
+        assert!(parse_words("load a b").is_err());
         assert_eq!(command("kill 7"), Command::Kill(7));
         assert_eq!(command("down"), Command::Down);
         assert_eq!(command("list"), Command::Ps);

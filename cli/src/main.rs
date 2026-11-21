@@ -1,7 +1,8 @@
 //! `rhizo`: boots a Rhizo VM with the control kernel and runs, lists,
-//! suspends, resumes, forks and kills its cells, and talks to an agent in
-//! one (spec `control-plane`, changes `add-control-plane` and
-//! `add-interactive-chat`). Linux hosts only. Policy lives here: which
+//! suspends, resumes, forks, freezes and kills its cells, saves and loads
+//! them as files, and talks to an agent in one (spec `control-plane`,
+//! changes `add-control-plane`, `add-interactive-chat` and
+//! `snapshots-on-disk`). Linux hosts only. Policy lives here: which
 //! programs a template starts with which files, and when to suspend or
 //! fork, are this tool's choices; the kernel only executes requests.
 
@@ -19,6 +20,7 @@ use state::{Dir, Info};
 use std::io::Write;
 use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
+use xtask::vmm::Vmm;
 
 fn main() -> ExitCode {
     let words: Vec<String> = std::env::args().skip(1).collect();
@@ -65,6 +67,13 @@ fn main() -> ExitCode {
                 println!("resumed {id} in {}", reply.timing());
                 Ok(())
             }
+            Command::Freeze(id) => {
+                let reply = Client::connect(&dir)?.call(&Request::Freeze(id))?;
+                println!("froze {id} into a template in {}", reply.timing());
+                Ok(())
+            }
+            Command::Save { id, file } => save(&mut Client::connect(&dir)?, id, &file),
+            Command::Load { file, template } => load(&mut Client::connect(&dir)?, &file, template),
             Command::Kill(id) => {
                 let reply = Client::connect(&dir)?.call(&Request::Kill(id))?;
                 println!("killed {id} in {}", reply.timing());
@@ -256,6 +265,87 @@ fn attach(client: &mut Client, id: u32) -> Result<(), String> {
     }
 }
 
+/// `rhizo save`: the snapshot comes over TCP through the VM's network card
+/// (design D2 of `snapshots-on-disk`), and is written once all came.
+fn save(client: &mut Client, id: u32, file: &std::path::Path) -> Result<(), String> {
+    let transfer = xtask::control::Transfer::new(Vmm::parse(&client.info.vmm)?)?;
+    let host = transfer.host;
+    let received = transfer.receive();
+    let reply = client.call(&Request::Save { cell: id, host })?;
+    let bytes = received.join().map_err(|_| "the transfer panicked")??;
+    if reply.body != Body::Bytes(bytes.len() as u64) {
+        return Err(format!(
+            "received {} bytes, the kernel sent {:?}",
+            bytes.len(),
+            reply.body
+        ));
+    }
+    let tmp = file.with_extension("partial");
+    std::fs::write(&tmp, &bytes)
+        .and_then(|()| std::fs::rename(&tmp, file))
+        .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+    println!(
+        "saved {id} to {} ({}) in {}, {}",
+        file.display(),
+        size(bytes.len()),
+        reply.timing(),
+        rate(bytes.len(), reply.round_trip)
+    );
+    Ok(())
+}
+
+/// `rhizo load`: the file goes over TCP through the VM's network card.
+fn load(client: &mut Client, file: &std::path::Path, template: bool) -> Result<(), String> {
+    let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let n = bytes.len();
+    let transfer = xtask::control::Transfer::new(Vmm::parse(&client.info.vmm)?)?;
+    let host = transfer.host;
+    let sent = transfer.send(bytes);
+    let reply = client
+        .call(&Request::Load {
+            size: n as u64,
+            template,
+            host,
+        })
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    sent.join().map_err(|_| "the transfer panicked")??;
+    let &Body::Cell(cell) = &reply.body else {
+        return Err(format!("unexpected reply {:?}", reply.body));
+    };
+    println!(
+        "loaded {} as {} {cell} ({}) in {}, {}",
+        file.display(),
+        if template {
+            "template"
+        } else {
+            "suspended cell"
+        },
+        size(n),
+        reply.timing(),
+        rate(n, reply.round_trip)
+    );
+    Ok(())
+}
+
+fn refusal(error: rhizo_control::Error, message: &[u8]) -> String {
+    if message.is_empty() {
+        error.as_str().to_string()
+    } else {
+        format!("{}: {}", error.as_str(), String::from_utf8_lossy(message))
+    }
+}
+
+fn size(bytes: usize) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1 << 20) as f64)
+}
+
+fn rate(bytes: usize, took: Duration) -> String {
+    format!(
+        "{:.2} MiB/s",
+        bytes as f64 / (1 << 20) as f64 / took.as_secs_f64().max(1e-9)
+    )
+}
+
 fn describe(state: State) -> String {
     match state {
         State::Running => "running".into(),
@@ -263,6 +353,7 @@ fn describe(state: State) -> String {
         State::Exited(code) => format!("exited {code}"),
         State::Fault => "faulted".into(),
         State::Killed => "killed".into(),
+        State::Template => "template".into(),
     }
 }
 
@@ -291,11 +382,12 @@ fn cmd_stats(dir: &Dir) -> Result<(), String> {
     };
     let mib = |b: u64| b as f64 / (1 << 20) as f64;
     println!(
-        "cells: {} running, {} suspended ({:.1} MiB of snapshots), {} ended\n\
+        "cells: {} running, {} suspended ({:.1} MiB of snapshots), {} templates, {} ended\n\
          memory: {:.1} MiB free of {:.1} MiB\n(in {})",
         s.running,
         s.suspended,
         mib(s.snapshot_bytes),
+        s.templates,
         s.ended,
         mib(s.memory_free),
         mib(s.memory_total),

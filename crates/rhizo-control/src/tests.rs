@@ -100,6 +100,24 @@ fn every_request_round_trips() {
             data: vec![0x01; MAX_INPUT],
         },
         Request::CloseInput(10),
+        Request::Freeze(11),
+        Request::Save {
+            cell: 12,
+            host: Host {
+                ip: [10, 0, 2, 2],
+                port: 40123,
+                token: 0x0123_4567_89ab_cdef,
+            },
+        },
+        Request::Load {
+            size: 40 << 20,
+            template: true,
+            host: Host {
+                ip: [172, 16, 0, 1],
+                port: 1,
+                token: u64::MAX,
+            },
+        },
     ];
     for (id, request) in requests.iter().enumerate() {
         let found = frames(&request.encode(id as u32));
@@ -157,6 +175,11 @@ fn every_message_round_trips() {
                     image: b"hog".to_vec(),
                     state: State::Killed,
                 },
+                CellInfo {
+                    id: 6,
+                    image: b"cpython".to_vec(),
+                    state: State::Template,
+                },
             ]),
         },
         Message::Done {
@@ -165,6 +188,7 @@ fn every_message_round_trips() {
                 running: 1,
                 suspended: 2,
                 ended: 3,
+                templates: 4,
                 snapshot_bytes: 4,
                 memory_total: 128 << 20,
                 memory_free: 64 << 20,
@@ -182,6 +206,11 @@ fn every_message_round_trips() {
         Message::Ended {
             cell: 8,
             state: State::Exited(0),
+        },
+        Message::Failed {
+            ns: 7,
+            error: Error::BadSnapshot,
+            message: b"checksum".to_vec(),
         },
     ];
     for message in &messages {
@@ -301,10 +330,28 @@ fn input_is_bounded_and_its_flag_checked() {
     let last = run.len() - 1;
     run[last] = 2;
     assert_eq!(Request::decode(&frames(&run)[0]), Err(Error::Malformed));
+    // `load`'s template flag is 0 or 1.
+    let mut load = Request::Load {
+        size: 1,
+        template: false,
+        host: Host::default(),
+    }
+    .encode(5);
+    let flag = load.len() - 15;
+    load[flag] = 2;
+    assert_eq!(Request::decode(&frames(&load)[0]), Err(Error::Malformed));
 }
 
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..24)
+}
+
+fn host() -> impl Strategy<Value = Host> {
+    (any::<[u8; 4]>(), any::<u16>(), any::<u64>()).prop_map(|(ip, port, token)| Host {
+        ip,
+        port,
+        token,
+    })
 }
 
 fn request() -> impl Strategy<Value = Request> {
@@ -343,6 +390,13 @@ fn request() -> impl Strategy<Value = Request> {
         Just(Request::Shutdown),
         (any::<u32>(), bytes()).prop_map(|(cell, data)| Request::Input { cell, data }),
         any::<u32>().prop_map(Request::CloseInput),
+        any::<u32>().prop_map(Request::Freeze),
+        (any::<u32>(), host()).prop_map(|(cell, host)| Request::Save { cell, host }),
+        (any::<u64>(), any::<bool>(), host()).prop_map(|(size, template, host)| Request::Load {
+            size,
+            template,
+            host
+        }),
     ]
 }
 
@@ -353,6 +407,7 @@ fn state() -> impl Strategy<Value = State> {
         any::<i32>().prop_map(State::Exited),
         Just(State::Fault),
         Just(State::Killed),
+        Just(State::Template),
     ]
 }
 
@@ -375,6 +430,7 @@ fn message() -> impl Strategy<Value = Message> {
             running,
             suspended,
             ended,
+            templates: 4,
             snapshot_bytes: 1,
             memory_total: 2,
             memory_free: 3,
@@ -383,7 +439,7 @@ fn message() -> impl Strategy<Value = Message> {
     prop_oneof![
         any::<u8>().prop_map(|version| Message::Hello { version }),
         (any::<u64>(), body).prop_map(|(ns, body)| Message::Done { ns, body }),
-        (any::<u64>(), 1u8..=10, bytes()).prop_map(|(ns, code, message)| Message::Failed {
+        (any::<u64>(), 1u8..=11, bytes()).prop_map(|(ns, code, message)| Message::Failed {
             ns,
             error: Error::from_code(code).expect("a code"),
             message

@@ -37,6 +37,21 @@ use rhizo_prof::Part;
 use rhizo_sched::{Gangs, IdleTimer, SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::{Data, Snapshot};
 
+/// How long a snapshot transfer through the network card may go without
+/// moving a byte.
+const TRANSFER_STALL_NS: u64 = 10_000_000_000;
+
+/// Why a snapshot transfer through the network card failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    /// The sockets said so (no card or address: `NetUnreach`).
+    Net(rhizo_net::Error),
+    /// The host closed before sending every byte.
+    Short,
+    /// No byte moved for [`TRANSFER_STALL_NS`].
+    Stalled,
+}
+
 /// How a cell ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ending {
@@ -334,7 +349,7 @@ pub fn drop_images() -> bool {
 
 /// Whether cells may take `bytes` more, dropping the images kept loaded if
 /// that is what it takes (design D4 of `add-image-cache`).
-fn cells_may_take(bytes: u64) -> bool {
+pub(crate) fn cells_may_take(bytes: u64) -> bool {
     memory::cells_may_take(bytes) || (drop_images() && memory::cells_may_take(bytes))
 }
 
@@ -2551,6 +2566,7 @@ impl Host {
             Snapshot::capture::<Format>(
                 user::MACHINE,
                 &live.cell,
+                &live.deadlines,
                 &live.demand.wx,
                 &files,
                 &sockets,
@@ -2565,8 +2581,10 @@ impl Host {
     }
 
     /// Resumes `snapshot` as a new live cell (new identifier and tag) that
-    /// continues exactly where the snapshot was taken. Gives the snapshot
-    /// back if memory cannot hold the cell (eagerly: all its pages).
+    /// continues exactly where the snapshot was taken: its threads waiting
+    /// on descriptors make their calls again with the time they had left
+    /// (design D5 of `snapshots-on-disk`). Gives the snapshot back if
+    /// memory cannot hold the cell (eagerly: all its pages).
     pub fn resume(
         &mut self,
         snapshot: Snapshot,
@@ -2575,6 +2593,42 @@ impl Host {
         echo: bool,
     ) -> Result<u32, Snapshot> {
         let _p = cost::scope(Part::Spawn);
+        let mut live = self.restore(snapshot, mode, capture, echo)?;
+        live.cell.threads.wake_io();
+        let id = live.cell.id;
+        file(self.state(), None, live);
+        Ok(id)
+    }
+
+    /// Makes `snapshot` a template (spec `fork`), restored eagerly and never
+    /// run (design D3 of `snapshots-on-disk`); returns its identifier, or
+    /// gives the snapshot back if memory cannot hold it.
+    #[cfg_attr(
+        not(any(feature = "control", feature = "ktest")),
+        allow(dead_code, reason = "used by the control kernel and in-kernel tests")
+    )]
+    pub fn load_template(&mut self, snapshot: Snapshot) -> Result<u32, Snapshot> {
+        let _p = cost::scope(Part::Spawn);
+        let live = self.restore(snapshot, Resume::Eager, false, false)?;
+        if live.tag != 0 {
+            self.state().tags.free(live.tag);
+        }
+        let Live {
+            cell, fs, demand, ..
+        } = *live;
+        let id = cell.id;
+        self.templates.push((cell, fs, demand.wx));
+        Ok(id)
+    }
+
+    /// The live cell `snapshot` holds, not yet scheduled.
+    fn restore(
+        &mut self,
+        snapshot: Snapshot,
+        mode: Resume,
+        capture: bool,
+        echo: bool,
+    ) -> Result<Box<Live>, Snapshot> {
         if mode == Resume::Eager {
             let bytes = (0..snapshot.pages())
                 .map(|i| snapshot.page(i))
@@ -2592,7 +2646,9 @@ impl Host {
         if user::CELL_ROOT_HAS_KERNEL_HALF {
             pt.share_upper_half(&mut DirectMap, &user::cell_kernel_half());
         }
-        let cell = snapshot.cell(id, pt.root(), now_ns());
+        let now = now_ns();
+        let cell = snapshot.cell(id, pt.root(), now);
+        let deadlines = snapshot.deadlines(now);
         let mut fs = files_of(&snapshot);
         import_sockets(&mut fs, &snapshot.sockets());
         let wx = snapshot.wx();
@@ -2605,8 +2661,8 @@ impl Host {
         live.frames.set_used(used.used());
         live.demand.lazy = (lazy.left > 0).then_some(lazy);
         live.demand.wx = wx;
-        file(self.state(), None, live);
-        Ok(id)
+        live.deadlines = deadlines;
+        Ok(live)
     }
 
     /// Page-table frames of the own half of live cell `id`.
@@ -2846,6 +2902,139 @@ impl Host {
         }
     }
 
+    /// Sends `bytes` to `port` at `ip` over TCP through the network card,
+    /// and returns once the host has them all and closed its end (design
+    /// D2 of `snapshots-on-disk`: how a snapshot file leaves the kernel).
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn send_bytes(
+        &mut self,
+        ip: [u8; 4],
+        port: u16,
+        token: u64,
+        bytes: &[u8],
+    ) -> Result<(), Transfer> {
+        let mut sent = 0;
+        let mut shut = false;
+        self.stream(ip, port, token, |net, h| {
+            if sent < bytes.len() {
+                return match net.send(h, &bytes[sent..], None) {
+                    Ok(n) => {
+                        sent += n;
+                        Ok(Some(n > 0))
+                    }
+                    Err(rhizo_net::Error::Again) => Ok(Some(false)),
+                    Err(e) => Err(Transfer::Net(e)),
+                };
+            }
+            if !shut {
+                shut = true;
+                net.shutdown(h, rhizo_net::Shutdown::Write)
+                    .map_err(Transfer::Net)?;
+            }
+            // Done when the host, having read everything, closes.
+            match net.recv(h, 1, false, &mut |_| true) {
+                Ok(r) if r.len == 0 => Ok(None),
+                Ok(_) | Err(rhizo_net::Error::Again) => Ok(Some(false)),
+                Err(e) => Err(Transfer::Net(e)),
+            }
+        })
+    }
+
+    /// Receives `size` bytes from `port` at `ip` over TCP through the
+    /// network card (design D2 of `snapshots-on-disk`: how a snapshot file
+    /// enters the kernel), into `out`, which has room for them.
+    #[cfg_attr(
+        not(feature = "control"),
+        allow(dead_code, reason = "used by the control kernel")
+    )]
+    pub fn fetch_bytes(
+        &mut self,
+        ip: [u8; 4],
+        port: u16,
+        token: u64,
+        size: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Transfer> {
+        self.stream(ip, port, token, |net, h| {
+            if out.len() == size {
+                return Ok(None);
+            }
+            let left = size - out.len();
+            match net.recv(h, left, false, &mut |b| {
+                out.extend_from_slice(b);
+                true
+            }) {
+                Ok(r) if r.len == 0 => Err(Transfer::Short),
+                Ok(_) => Ok(Some(true)),
+                Err(rhizo_net::Error::Again) => Ok(Some(false)),
+                Err(e) => Err(Transfer::Net(e)),
+            }
+        })
+    }
+
+    /// Connects to `port` at `ip`, sends `token` (the request's, which the
+    /// host checks before it sends or keeps a byte), and polls the card and
+    /// `step` until
+    /// `step` says the transfer is done (`None`), fails, or makes no
+    /// progress for [`TRANSFER_STALL_NS`]; the socket is released either
+    /// way. `step` says whether it moved bytes.
+    fn stream(
+        &mut self,
+        ip: [u8; 4],
+        port: u16,
+        token: u64,
+        mut step: impl FnMut(&mut Net, rhizo_net::Handle) -> Result<Option<bool>, Transfer>,
+    ) -> Result<(), Transfer> {
+        use rhizo_net::{Addr, Error, Family, Type};
+        let h = with_net(|net| net.socket(Family::Inet, Type::Stream)).map_err(Transfer::Net)?;
+        let to = Addr::Inet { ip, port };
+        let (mut connected, mut last) = (false, now_ns());
+        let token = token.to_le_bytes();
+        let mut told = 0;
+        let result = loop {
+            let now = now_ns();
+            if now - last > TRANSFER_STALL_NS {
+                break Err(Transfer::Stalled);
+            }
+            self.wire_due = 0;
+            self.poll_wire(now);
+            let moved = with_net(|net| {
+                if !connected {
+                    return match net.connect(h, &to) {
+                        Ok(()) => {
+                            connected = true;
+                            Ok(Some(true))
+                        }
+                        Err(Error::InProgress | Error::Again) => Ok(Some(false)),
+                        Err(e) => Err(Transfer::Net(e)),
+                    };
+                }
+                if told < token.len() {
+                    return match net.send(h, &token[told..], None) {
+                        Ok(n) => {
+                            told += n;
+                            Ok(Some(n > 0))
+                        }
+                        Err(Error::Again) => Ok(Some(false)),
+                        Err(e) => Err(Transfer::Net(e)),
+                    };
+                }
+                step(net, h)
+            });
+            match moved {
+                Ok(None) => break Ok(()),
+                Ok(Some(true)) => last = now,
+                Ok(Some(false)) => core::hint::spin_loop(),
+                Err(e) => break Err(e),
+            }
+        };
+        with_net(|net| net.release(h));
+        result
+    }
+
     /// Forks live cell `id` into `n` children that share its memory
     /// copy-on-write (spec `fork`); returns their identifiers. A child has
     /// the cell's state, a new identifier and tag, and its own output.
@@ -2950,8 +3139,11 @@ impl Host {
     /// Freezes live cell `id` into a template: it never runs again, and
     /// [`spawn_from_template`](Self::spawn_from_template) forks it.
     #[cfg_attr(
-        not(any(feature = "ktest", feature = "bench-cell")),
-        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+        not(any(feature = "ktest", feature = "bench-cell", feature = "control")),
+        allow(
+            dead_code,
+            reason = "used by in-kernel tests, benchmarks and the control kernel"
+        )
     )]
     pub fn freeze(&mut self, id: u32) -> bool {
         let _p = cost::scope(Part::Spawn);
@@ -2974,12 +3166,67 @@ impl Host {
         true
     }
 
+    /// A snapshot of template `id` (design D3 of `snapshots-on-disk`): it
+    /// refers to the template's pages it shares, which stay the
+    /// template's. Its sockets are recorded, none parked. `None` when the
+    /// kernel heap could not hold it and its export.
+    #[cfg_attr(
+        not(any(feature = "control", feature = "ktest")),
+        allow(dead_code, reason = "used by the control kernel and in-kernel tests")
+    )]
+    pub fn template_snapshot(&mut self, id: u32) -> Option<Snapshot> {
+        let _p = cost::scope(Part::Spawn);
+        let (cell, fs, wx) = self.templates.iter().find(|(c, ..)| c.id == id)?;
+        let mut bytes = 0;
+        PageTable::<Format>::from_root(cell.root)
+            .for_each_lower_leaf(&DirectMap, &mut |_, _, size, _| bytes += size.bytes());
+        if !cells_may_take(2 * bytes) {
+            return None;
+        }
+        let (files, sockets) = export_sockets(fs);
+        let snapshot = sharing(true, || {
+            Snapshot::capture::<Format>(
+                user::MACHINE,
+                cell,
+                &[],
+                wx,
+                &files,
+                &sockets,
+                now_ns(),
+                &mut DirectMap,
+                &mut KernelFrames,
+                release_frame,
+            )
+        });
+        close_parked(&snapshot);
+        Some(snapshot)
+    }
+
+    /// Drops template `id`: its memory and sockets go back once no copy
+    /// shares them. Returns whether it existed.
+    pub fn drop_template(&mut self, id: u32) -> bool {
+        let Some(index) = self.templates.iter().position(|(c, ..)| c.id == id) else {
+            return false;
+        };
+        let (template, fs, _) = self.templates.swap_remove(index);
+        space::destroy(
+            PageTable::<Format>::from_root(template.root),
+            &mut DirectMap,
+            &mut KernelFrames,
+        );
+        release_sockets(&fs, template.id);
+        true
+    }
+
     /// Starts a new cell from template `id`: a fork of the frozen cell, with
     /// every deadline of its threads expired (spec `fork`, templates keep no
     /// time).
     #[cfg_attr(
-        not(any(feature = "ktest", feature = "bench-cell")),
-        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+        not(any(feature = "ktest", feature = "bench-cell", feature = "control")),
+        allow(
+            dead_code,
+            reason = "used by in-kernel tests, benchmarks and the control kernel"
+        )
     )]
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
         let _p = cost::scope(Part::Spawn);
@@ -3199,13 +3446,9 @@ impl Drop for Host {
         while let Some(live) = self.state().sched.remove(|_| true) {
             self.end(live, Ending::Killed);
         }
-        for (template, fs, _) in self.templates.drain(..) {
-            space::destroy(
-                PageTable::<Format>::from_root(template.root),
-                &mut DirectMap,
-                &mut KernelFrames,
-            );
-            release_sockets(&fs, template.id);
+        while let Some((template, ..)) = self.templates.first() {
+            let id = template.id;
+            self.drop_template(id);
         }
     }
 }

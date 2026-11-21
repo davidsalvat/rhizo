@@ -1,7 +1,9 @@
 //! The control protocol between the host and a control kernel (spec
 //! `control-plane`, design D2 of `add-control-plane`): the host asks the
-//! kernel to run, list, suspend, resume, fork and kill cells, and the kernel
-//! answers each request with its outcome and the time it took.
+//! kernel to run, list, suspend, resume, fork and kill cells, to freeze
+//! them into templates, and to save and load snapshots as bytes (change
+//! `snapshots-on-disk`), and the kernel answers each request with its
+//! outcome and the time it took.
 //!
 //! Both directions carry the same frames on one byte stream, which may also
 //! carry plain text (the kernel's console, on a serial line it shares):
@@ -24,8 +26,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 /// The protocol's version, in every frame (2: standard input, design D2 of
-/// `add-interactive-chat`).
-pub const VERSION: u8 = 2;
+/// `add-interactive-chat`; 3: templates, save and load, design D2 of
+/// `snapshots-on-disk`).
+pub const VERSION: u8 = 3;
 /// The bytes every frame starts with.
 pub const MAGIC: [u8; 2] = [0x01, b'Z'];
 /// Bytes of a frame before its payload.
@@ -51,6 +54,9 @@ mod kind {
     pub const SHUTDOWN: u8 = 0x0a;
     pub const INPUT: u8 = 0x0b;
     pub const CLOSE_INPUT: u8 = 0x0c;
+    pub const FREEZE: u8 = 0x0d;
+    pub const SAVE: u8 = 0x0e;
+    pub const LOAD: u8 = 0x0f;
     // Kernel to host.
     pub const HELLO: u8 = 0x80;
     pub const DONE: u8 = 0x81;
@@ -76,6 +82,9 @@ pub enum Error {
     NotRunning,
     /// The cell is not suspended.
     NotSuspended,
+    /// The bytes are not a snapshot this kernel can load (the message says
+    /// why).
+    BadSnapshot,
     /// No executable or file set has this name.
     NoImage,
     /// Memory cannot hold what the request needs.
@@ -97,6 +106,7 @@ impl Error {
             Error::NoImage => 8,
             Error::NoMemory => 9,
             Error::Failed => 10,
+            Error::BadSnapshot => 11,
         }
     }
 
@@ -112,6 +122,7 @@ impl Error {
             8 => Error::NoImage,
             9 => Error::NoMemory,
             10 => Error::Failed,
+            11 => Error::BadSnapshot,
             _ => return None,
         })
     }
@@ -129,6 +140,7 @@ impl Error {
             Error::NoImage => "no such executable or file set",
             Error::NoMemory => "not enough memory",
             Error::Failed => "failed",
+            Error::BadSnapshot => "not a snapshot this kernel can load",
         }
     }
 }
@@ -299,6 +311,11 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
     }
+    fn host(&mut self, h: &Host) -> &mut Self {
+        self.u32(u32::from_be_bytes(h.ip));
+        self.0.extend_from_slice(&h.port.to_le_bytes());
+        self.u64(h.token)
+    }
     fn bytes(&mut self, v: &[u8]) -> &mut Self {
         self.u32(v.len() as u32);
         self.0.extend_from_slice(v);
@@ -340,6 +357,22 @@ impl<'a> Reader<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, Error> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
+    }
+    fn host(&mut self) -> Result<Host, Error> {
+        let ip = self.u32()?.to_be_bytes();
+        let b = self.take(2)?;
+        Ok(Host {
+            ip,
+            port: u16::from_le_bytes([b[0], b[1]]),
+            token: self.u64()?,
+        })
+    }
+    fn flag(&mut self) -> Result<bool, Error> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::Malformed),
+        }
     }
     /// A list: its count is bounded by the bytes left (every item takes at
     /// least one), so a forged count allocates nothing.
@@ -420,6 +453,32 @@ pub enum Request {
     /// Close the host's end of a running cell's standard input: once the
     /// cell has read what is left, it reads end of file.
     CloseInput(u32),
+    /// Freeze a running cell into a template: it never runs again, and
+    /// [`Request::Fork`] makes cells from it.
+    Freeze(u32),
+    /// Send the snapshot of a suspended cell or a template, as bytes that
+    /// stand alone, over TCP to `port` at `host` (the host as the guest
+    /// reaches it, through the network card); replies [`Body::Bytes`],
+    /// their total, once the host has them all.
+    Save { cell: u32, host: Host },
+    /// Fetch a snapshot of `size` bytes over TCP from `port` at `host`, and
+    /// make it a suspended cell, or a template; replies [`Body::Cell`].
+    Load {
+        size: u64,
+        template: bool,
+        host: Host,
+    },
+}
+
+/// Where the guest reaches the host's end of a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Host {
+    pub ip: [u8; 4],
+    pub port: u16,
+    /// A random number for this transfer only: the kernel sends it first
+    /// on the connection, and the host takes no other (design D2 of
+    /// `snapshots-on-disk`).
+    pub token: u64,
 }
 
 impl Request {
@@ -476,6 +535,22 @@ impl Request {
                 w.u32(*cell);
                 kind::CLOSE_INPUT
             }
+            Request::Freeze(cell) => {
+                w.u32(*cell);
+                kind::FREEZE
+            }
+            Request::Save { cell, host } => {
+                w.u32(*cell).host(host);
+                kind::SAVE
+            }
+            Request::Load {
+                size,
+                template,
+                host,
+            } => {
+                w.u64(*size).u8(*template as u8).host(host);
+                kind::LOAD
+            }
         };
         encode_frame(kind, id, &w.0)
     }
@@ -490,11 +565,7 @@ impl Request {
                 argv: r.list(Reader::bytes)?,
                 envp: r.list(Reader::bytes)?,
                 files: r.list(|r| Ok((r.bytes()?, r.bytes()?)))?,
-                input: match r.u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(Error::Malformed),
-                },
+                input: r.flag()?,
             }),
             kind::LIST => Request::List,
             kind::SUSPEND => Request::Suspend(r.u32()?),
@@ -521,6 +592,16 @@ impl Request {
                 Request::Input { cell, data }
             }
             kind::CLOSE_INPUT => Request::CloseInput(r.u32()?),
+            kind::FREEZE => Request::Freeze(r.u32()?),
+            kind::SAVE => Request::Save {
+                cell: r.u32()?,
+                host: r.host()?,
+            },
+            kind::LOAD => Request::Load {
+                size: r.u64()?,
+                template: r.flag()?,
+                host: r.host()?,
+            },
             _ => return Err(Error::UnknownKind),
         };
         r.end()?;
@@ -542,6 +623,8 @@ pub enum State {
     Fault,
     /// It was killed.
     Killed,
+    /// It is a template.
+    Template,
 }
 
 impl State {
@@ -562,6 +645,9 @@ impl State {
             State::Killed => {
                 w.u8(4);
             }
+            State::Template => {
+                w.u8(5);
+            }
         }
     }
 
@@ -572,6 +658,7 @@ impl State {
             2 => State::Exited(r.u32()? as i32),
             3 => State::Fault,
             4 => State::Killed,
+            5 => State::Template,
             _ => return Err(Error::Malformed),
         })
     }
@@ -592,6 +679,7 @@ pub struct Stats {
     pub running: u32,
     pub suspended: u32,
     pub ended: u32,
+    pub templates: u32,
     /// Bytes held by snapshots of suspended cells.
     pub snapshot_bytes: u64,
     pub memory_total: u64,
@@ -665,6 +753,7 @@ impl Message {
                             .u32(s.running)
                             .u32(s.suspended)
                             .u32(s.ended)
+                            .u32(s.templates)
                             .u64(s.snapshot_bytes)
                             .u64(s.memory_total)
                             .u64(s.memory_free);
@@ -712,6 +801,7 @@ impl Message {
                         running: r.u32()?,
                         suspended: r.u32()?,
                         ended: r.u32()?,
+                        templates: r.u32()?,
                         snapshot_bytes: r.u64()?,
                         memory_total: r.u64()?,
                         memory_free: r.u64()?,
