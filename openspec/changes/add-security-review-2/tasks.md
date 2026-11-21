@@ -23,4 +23,4 @@
 ## 4. Hostile cells
 
 - [x] 4.1 `racer` (`io`, `futex`, `exit`, `protect`) and `threads_racing_on_several_cpus_cannot_hurt_the_kernel` (D4); verify `cargo xtask --arch x86_64 test --only ktest-smp`
-- [ ] 4.2 Everything on both architectures; verify `cargo xtask test`, `cargo xtask test --only ktest-smp` and `cargo xtask --arch x86_64 test`
+- [x] 4.2 Everything on both architectures; verify `cargo xtask test`, `cargo xtask test --only ktest-smp` and `cargo xtask --arch x86_64 test`
