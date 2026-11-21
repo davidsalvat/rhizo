@@ -6,6 +6,8 @@ pub mod cpu;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub mod irq;
 pub mod platform;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod pmu;
 pub mod port;
 pub mod power;
 pub mod serial;

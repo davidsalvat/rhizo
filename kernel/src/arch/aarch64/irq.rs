@@ -204,9 +204,33 @@ pub fn stop_tick() {
     unsafe { asm!("msr cntv_ctl_el0, xzr", "isb", options(nostack)) };
 }
 
-/// Acknowledges a pending interrupt (if any); a timer interrupt re-arms the
-/// periodic tick.
-pub fn acknowledge() {
+/// Makes the periodic tick fire every `ns` from now on (spec `profiling`:
+/// sampling by the timer where there is no PMU).
+#[cfg(feature = "sampling")]
+pub fn set_tick_ns(ns: u64) {
+    TICK.store(ns_to_ticks(ns), Ordering::Relaxed);
+    start_tick();
+}
+
+/// Enables private peripheral interrupt `intid` (16–31) on this CPU, like
+/// the timer's; returns whether there is a GIC to do it.
+#[cfg(feature = "sampling")]
+pub fn enable_ppi(intid: u32) -> bool {
+    let gicr = GICR[crate::arch::cpu::index()].load(Ordering::Relaxed);
+    if gicr == 0 || !(16..32).contains(&intid) {
+        return false;
+    }
+    let sgi = gicr + 0x1_0000;
+    write32(sgi + 0x80, read32(sgi + 0x80) | (1 << intid));
+    // SAFETY: byte access to the priority register of the interrupt.
+    unsafe { ((sgi + 0x400 + intid as u64) as *mut u8).write_volatile(0x80) };
+    write32(sgi + 0x100, 1 << intid);
+    true
+}
+
+/// Acknowledges a pending interrupt (if any) and returns its INTID; a timer
+/// interrupt re-arms the periodic tick.
+pub fn acknowledge() -> u64 {
     let intid: u64;
     // SAFETY: reading IAR1 acknowledges the highest-priority pending group 1
     // interrupt.
@@ -218,6 +242,7 @@ pub fn acknowledge() {
         // SAFETY: ends the interrupt acknowledged above.
         unsafe { asm!("msr S3_0_C12_C12_1, {}", "isb", in(reg) intid, options(nostack)) };
     }
+    intid
 }
 
 /// Waits about `ns` nanoseconds (or until any interrupt): with interrupts

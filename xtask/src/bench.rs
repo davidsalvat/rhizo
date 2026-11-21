@@ -46,6 +46,8 @@ pub struct Options {
     pub update_baseline: bool,
     pub readme: bool,
     pub reference: bool,
+    /// Also count instructions under QEMU with `-icount` (spec `profiling`).
+    pub icount: bool,
     /// Measure only this reference workload.
     pub workload: Option<Only>,
     /// The long versions of the workloads (the weekly soak).
@@ -69,6 +71,7 @@ impl Default for Options {
             update_baseline: false,
             readme: false,
             reference: true,
+            icount: true,
             workload: None,
             soak: false,
             llm_delay_ms: 0,
@@ -111,6 +114,7 @@ impl Options {
                 "--update-baseline" => o.update_baseline = true,
                 "--readme" => o.readme = true,
                 "--no-reference" => o.reference = false,
+                "--no-icount" => o.icount = false,
                 "--workload" => {
                     o.workload = Some(match value("--workload")?.as_str() {
                         "laptop" => Only::Laptop,
@@ -371,6 +375,7 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
     measure_comparisons(opts, &mut metrics, &mut skipped)?;
     Ok(Results {
@@ -401,7 +406,7 @@ fn measure_comparisons(
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("linux-process/firecracker".into(), e)),
         }
-        match crate::compare::cpython_in_vm(opts.accel, &scratch) {
+        match crate::compare::cpython_in_vm(opts.accel, &scratch, skipped) {
             Ok(m) => metrics.extend(m),
             Err(e) => skipped.push(("cpython/linux-process/firecracker".into(), e)),
         }
@@ -467,8 +472,15 @@ fn measure_cells(
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
+        let (mut agent_turn, mut agent_model) = (Vec::new(), Vec::new());
+        let (mut agent_suspend_resume, mut agent_fork) = (Vec::new(), Vec::new());
+        let mut agent_skipped = None;
         let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
+        let mut syscall = Vec::new();
+        // The PMU's passes, where the guest has one (spec `profiling`).
+        let mut counted = crate::profile::Samples::default();
+        let mut pmu = None;
         for _ in 0..opts.runs.clamp(1, 5) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match parse_cell_line(&out.output) {
@@ -504,6 +516,16 @@ fn measure_cells(
                         cpy_cold.push(c as f64 / 1000.0);
                         cpy_warm.push(w as f64 / 1000.0);
                     }
+                    match parse_agent_line(&out.output) {
+                        Some(Ok([turn, model, suspend_resume, fork])) => {
+                            agent_turn.push(turn as f64 / 1000.0);
+                            agent_model.push(model as f64 / 1000.0);
+                            agent_suspend_resume.push(suspend_resume as f64 / 1000.0);
+                            agent_fork.push(fork as f64 / 1000.0);
+                        }
+                        Some(Err(why)) => agent_skipped = Some(why),
+                        None => {}
+                    }
                     if let Some((r, t)) = parse_dynamic_line(&out.output) {
                         dyn_run.push(r as f64 / 1000.0);
                         dyn_template.push(t as f64 / 1000.0);
@@ -529,6 +551,19 @@ fn measure_cells(
                         thread_create.push(c as f64 / 1000.0);
                         futex_wake.push(w as f64);
                     }
+                    if let Some(ns) = crate::profile::field(&out.output, "rhizo-ops", "syscall_ns")
+                    {
+                        syscall.push(ns as f64);
+                    }
+                    for (name, value) in crate::profile::pmu_passes(&out.output) {
+                        let unit = if name.ends_with("_insns") {
+                            "insns"
+                        } else {
+                            "cycles"
+                        };
+                        counted.add(name, unit, value);
+                    }
+                    pmu = crate::profile::pmu_line(&out.output).map(str::to_string);
                     if let Some(snap) = parse_snapshot_line(&out.output) {
                         suspend.push(snap.suspend_ns as f64 / 1000.0);
                         resume.push(snap.resume_ns as f64 / 1000.0);
@@ -608,6 +643,14 @@ fn measure_cells(
             ("workload.python_warm_us", "us", &mut py_warm),
             ("workload.cpython_cold_us", "us", &mut cpy_cold),
             ("workload.cpython_warm_us", "us", &mut cpy_warm),
+            ("workload.agent_cpython_turn_us", "us", &mut agent_turn),
+            ("workload.agent_cpython_model_us", "us", &mut agent_model),
+            (
+                "workload.agent_suspend_resume_us",
+                "us",
+                &mut agent_suspend_resume,
+            ),
+            ("workload.agent_fork_us", "us", &mut agent_fork),
             ("workload.dynamic_run_us", "us", &mut dyn_run),
             ("workload.dynamic_template_us", "us", &mut dyn_template),
             ("cell.thread_create_us", "us", &mut thread_create),
@@ -618,6 +661,7 @@ fn measure_cells(
             ("cell.thread_scaling_pct", "%", &mut thread_scaling),
             ("cell.shootdown_us", "us", &mut shootdown),
             ("cell.timer_error_us", "us", &mut timer_error),
+            ("cell.syscall_ns", "ns", &mut syscall),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
                 let why = match crate::hostnet::for_vmm(vmm) {
@@ -627,6 +671,12 @@ fn measure_cells(
                         .unwrap_or_else(|| "not measured".into()),
                 };
                 skipped.push((format!("{name}/{}", vmm.id()), why));
+            }
+            if values.is_empty()
+                && name == "workload.agent_cpython_turn_us"
+                && let Some(why) = &agent_skipped
+            {
+                skipped.push((format!("workload.agent_*/{}", vmm.id()), why.clone()));
             }
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
@@ -639,6 +689,16 @@ fn measure_cells(
                     p90,
                     runs: values.len(),
                 });
+            }
+        }
+        metrics.extend(counted.metrics(vmm.id()));
+        if let Some(pmu) = pmu {
+            report::text(&format!("performance counters on {}: {pmu}", vmm.id()));
+            if pmu == "none" {
+                skipped.push((
+                    format!("pmu/{}", vmm.id()),
+                    "the guest has no performance counters: no instruction or cycle counts".into(),
+                ));
             }
         }
     }
@@ -690,6 +750,30 @@ fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("cold_ns")?, field("warm_ns")?))
+}
+
+/// `[turn_ns, model_ns, suspend_resume_ns, fork_ns]` of the CPython agent's line of
+/// a `bench-cell` kernel, or why the kernel skipped it.
+fn parse_agent_line(output: &str) -> Option<Result<[u64; 4]>> {
+    let line = output
+        .lines()
+        .find_map(|l| l.strip_prefix("rhizo-agent "))?;
+    if let Some(why) = line.strip_prefix("skipped: ") {
+        return Some(Err(why.to_string()));
+    }
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    let figures = [
+        field("turn_ns")?,
+        field("model_ns")?,
+        field("suspend_resume_ns")?,
+        field("fork_ns")?,
+    ];
+    Some(Ok(figures))
 }
 
 /// `(run_ns, template_ns)` of the dynamic linking line of a `bench-cell`
@@ -1048,21 +1132,29 @@ fn load_baseline() -> Result<Value> {
 
 /// Whether `metric` is gated in `env`. Metrics listed under `ungated.<env>`
 /// are recorded but never fail the gate (for example, TSC cycles on shared CI
-/// runners, whose hosts run at different TSC frequencies).
+/// runners, whose hosts run at different TSC frequencies); an entry ending
+/// in `.` covers every metric it starts (`breakdown.`).
 fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
-    !baseline["ungated"][env]
-        .as_array()
-        .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(metric)))
+    !baseline["ungated"][env].as_array().is_some_and(|names| {
+        names
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|n| n == metric || (n.ends_with('.') && metric.starts_with(n)))
+    })
 }
 
 /// Memory of the cell benchmark VM, in MiB.
-const CELL_BENCH_MEMORY_MIB: u32 = 256;
+pub(crate) const CELL_BENCH_MEMORY_MIB: u32 = 256;
 
-/// Allowed regression, in percent, for `metric` in `env`.
-fn threshold_pct(baseline: &Value, env: &str, metric: &str) -> f64 {
+/// Allowed regression, in percent, for `m` in `env`: instructions counted
+/// under QEMU's `-icount` are exact, so their threshold is narrow (spec
+/// `profiling`).
+fn threshold_pct(baseline: &Value, env: &str, m: &Metric) -> f64 {
     let t = &baseline["thresholds_pct"];
-    if DETERMINISTIC.contains(&metric) {
+    if DETERMINISTIC.contains(&m.name.as_str()) {
         t["deterministic"].as_f64().unwrap_or(1.0)
+    } else if m.vmm.as_deref().is_some_and(|v| v.ends_with("-icount")) {
+        t["instructions"].as_f64().unwrap_or(2.0)
     } else {
         t["timing"][env].as_f64().unwrap_or(50.0)
     }
@@ -1116,7 +1208,7 @@ pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regres
             key: m.key(),
             baseline: base,
             current: m.median,
-            allowed_pct: threshold_pct(baseline, env, &m.name),
+            allowed_pct: threshold_pct(baseline, env, m),
             higher_is_better: HIGHER_IS_BETTER.contains(&m.name.as_str()),
         };
         let worse = if r.higher_is_better {
@@ -1783,6 +1875,62 @@ mod tests {
     }
 
     #[test]
+    fn instruction_counts_have_their_own_threshold() {
+        let baseline = json!({
+            "thresholds_pct": {"deterministic": 1, "instructions": 2, "timing": {"ci": 100}},
+            "environments": {"ci": {
+                "cell.switch_insns/rhizo/qemu-microvm-icount": 1000.0,
+                "cell.switch_ns/rhizo/qemu-microvm": 100.0
+            }}
+        });
+        let within = results(vec![
+            metric(
+                "cell.switch_insns",
+                "rhizo",
+                Some("qemu-microvm-icount"),
+                1019.0,
+            ),
+            metric("cell.switch_ns", "rhizo", Some("qemu-microvm"), 150.0),
+        ]);
+        assert!(regressions(&baseline, "ci", &within).is_empty());
+        let worse = results(vec![metric(
+            "cell.switch_insns",
+            "rhizo",
+            Some("qemu-microvm-icount"),
+            1021.0,
+        )]);
+        let found = regressions(&baseline, "ci", &worse);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].allowed_pct, 2.0);
+    }
+
+    #[test]
+    fn an_ungated_prefix_covers_its_metrics() {
+        let baseline = json!({
+            "thresholds_pct": {"timing": {"ci": 10}},
+            "ungated": {"ci": ["breakdown."]},
+            "environments": {"ci": {
+                "breakdown.fork_touch.cow_us/rhizo/qemu-q35": 1.0,
+                "breakdowns_us/rhizo/qemu-q35": 1.0
+            }}
+        });
+        let r = results(vec![
+            metric(
+                "breakdown.fork_touch.cow_us",
+                "rhizo",
+                Some("qemu-q35"),
+                9.0,
+            ),
+            metric("breakdowns_us", "rhizo", Some("qemu-q35"), 9.0),
+        ]);
+        let keys: Vec<_> = regressions(&baseline, "ci", &r)
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["breakdowns_us/rhizo/qemu-q35"]);
+    }
+
+    #[test]
     fn higher_is_better_metrics_fail_when_they_drop() {
         let baseline = json!({
             "thresholds_pct": {"deterministic": 1, "timing": {"ci": 100}},
@@ -2011,6 +2159,21 @@ mod tests {
             Some((900_000, 40_000))
         );
         assert_eq!(parse_python_line("no python here"), None);
+    }
+
+    #[test]
+    fn agent_line_is_parsed() {
+        let out = "rhizo-cpython cold_ns=1 warm_ns=2\n\
+                   rhizo-agent turn_ns=900000 model_ns=300000 suspend_resume_ns=400000 fork_ns=700000\n";
+        assert_eq!(
+            parse_agent_line(out),
+            Some(Ok([900_000, 300_000, 400_000, 700_000]))
+        );
+        assert_eq!(
+            parse_agent_line("rhizo-agent skipped: CPython not built\n"),
+            Some(Err("CPython not built".into()))
+        );
+        assert_eq!(parse_agent_line("rhizo-cpython cold_ns=1 warm_ns=2"), None);
     }
 
     #[test]

@@ -44,6 +44,10 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.python_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off MicroPython frozen after its warm-up |
 | `workload.cpython_cold_us/rhizo/<vmm>` | timing | CPython (static, pinned 3.13.18) answering one agent tool call (`cells/python/agent_demo.py`: JSON, regular expressions, dates, a CRC) started from its executable, with the standard library it imports as compiled modules in the cell's files: interpreter start, imports, warm-up, answer, exit. Measured only where CPython is built (`RHIZO_CPYTHON_SRC`, set in CI) |
 | `workload.cpython_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off CPython frozen after its warm-up |
+| `workload.agent_cpython_turn_us/rhizo/<vmm>` | timing | One turn of the CPython agent (`cells/python/agent_loop.py`) as it times itself: the conversation sent over a kept-alive HTTP connection to the host's fake model (`llm=` on the command line, answering at once), the JSON answer parsed, the tool run (a computation, a file written and read back), the result appended. Median of turns 2 to 8 of 3 runs (the first turn connects and runs cold code). Needs CPython and a network card |
+| `workload.agent_cpython_model_us/rhizo/<vmm>` | timing | The part of those turns spent on the model: from sending the request to having read the whole answer (network card, TCP, the host's server), as the agent times it |
+| `workload.agent_suspend_resume_us/rhizo/<vmm>` | timing | In the same runs, the agent suspended in its pause after a turn and resumed eagerly (every page back, nothing left to page faults), its connection to the model parked in the kernel meanwhile |
+| `workload.agent_fork_us/rhizo/<vmm>` | timing | In the same runs, the agent frozen at its decision point as a template and three cells started from it, each told its branch in `/branch`, until every branch has printed its first line |
 | `workload.dynamic_run_us/rhizo/<vmm>` | timing | The dynamically linked `hello` (`cells/c/dynamic/hello.c`, glibc) started from the cell's files and run to its exit: the kernel maps it and `ld.so`, `ld.so` maps `libc.so.6` with `mmap` of files, relocates and runs `main`; file pages come from frames kept by content after a first run (change `add-dynamic-linking`). Robust figure over 25 runs; compare with `cell.run_us` (a static `hello`) |
 | `workload.dynamic_template_us/rhizo/<vmm>` | timing | The same program forked from a template frozen once it printed `ready` (`hello wait`), its libraries mapped and relocated: what a dynamically linked program costs once a template absorbs the dynamic linking |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
@@ -63,6 +67,12 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.shootdown_us/rhizo/<vmm>` | timing | With 4 vCPUs: one `munmap` of a written page by a thread of the `shootdown` cell while its three other threads run on the other CPUs, median of 200 (x86_64: interrupts the other CPUs and waits until they left the cell's code; AArch64: broadcast invalidation, no interrupt) |
 | `cell.futex_wake_ns/rhizo/<vmm>` | timing | One futex hand-off between two threads of a cell (wake the other, wait; the other runs): half a ping-pong round trip, best of five rounds of 200 |
 | `cell.timer_error_us/rhizo/<vmm>` | timing | With 4 vCPUs: a 10 ms wait on a secondary CPU's own timer (as an idle CPU waits), the median of five per CPU, its distance from 10 ms by the counter, the worst CPU's (change `fix-secondary-cpu-timer`: x86_64 secondary CPUs once woke after about 1.3 ms) |
+| `cell.syscall_ns/rhizo/<vmm>` | timing | One system call round trip: `yielder getpid 20000` run to its exit minus `yielder getpid 0`, per call (robust figure) |
+| `cell.cow_fault_ns/rhizo/<vmm>` | timing | The kernel's side of one copy-on-write fault of a 4 KiB page (frame, copy, entry, TLB flush; the trap itself is about `cell.syscall_ns`), accounted alone (`profile` build) while a fork of a cell holding 1 MiB writes every page |
+| `<metric>_insns/rhizo/<vmm>-icount` | instructions | Every timed figure above, and every breakdown, counted in retired instructions under QEMU with `-icount` (see below) |
+| `<metric>_insns/rhizo/<vmm>`, `<metric>_cycles/rhizo/<vmm>` | counts | Every single-CPU timed figure counted by the guest's PMU in retired instructions and core cycles, where the guest has one (see below) |
+| `breakdown.<workload>.<part>_us/rhizo/<vmm>` | timing, not gated | Where a workload's time goes (see below) |
+| `lock.<name>_waits/rhizo/<vmm>` | count, not gated | During the four-CPU breakdown: acquisitions that found the lock held by another CPU, for `frames` (frame allocator), `heap`, `refs` (frame reference counts), `sharing` (memory shared by forks), `net` (sockets), `sched` (run queues) |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded
@@ -153,6 +163,96 @@ moment of the host does not decide them.
 Each timing is the median (and p90) of `--runs` boots after one discarded
 warm-up boot. Lower is better for every metric not marked "higher is better".
 
+## Where the time goes (spec `profiling`)
+
+### Breakdowns
+
+A second kernel, built with the `profile` feature, has hooks at every
+transition of the kernel and charges each CPU's time to one part at a time
+(`crates/rhizo-prof`). The parts are exclusive: a part nested in another (a
+copy inside a copy-on-write fault) is not counted in it, and the parts add
+up to `total`. `cargo xtask bench` boots it three times per VMM and
+publishes the medians as `breakdown.<workload>.<part>_us`:
+
+| Workload | What |
+|---|---|
+| `cell_loop` | The cell benchmark loop: `hello` spawned and run to its exit 101 times |
+| `fork_touch` | A fork of a cell holding 50 MiB written (a template), the child writing every page until it exits |
+| `cpython_cold` | CPython answering one request from cold (where CPython is built) |
+| `parallel` | With 4 vCPUs: sixteen CPU-bound cells (`spin 5`) on every CPU |
+
+| Part | Time spent |
+|---|---|
+| `user` | In the cell's own code |
+| `entry_exit` | Entering and leaving cell code: entries times the cost of one, measured on a cell that only calls `getpid` (an estimate; the rest of the cell's time is `user`) |
+| `syscall` | Handling system calls other than socket calls |
+| `fault` | Page faults: lazily resumed pages coming back, stacks growing |
+| `cow` | Resolving copy-on-write faults |
+| `frames` | The frame allocator and frame reference counts |
+| `copy` | Copying and zeroing memory through the direct map |
+| `net` | Socket calls and polling the network card |
+| `sched` | Taking a cell to run and giving it back |
+| `idle` | Waiting for work |
+| `lock` | Waiting for a lock another CPU holds |
+| `spawn` | Cell operations: spawn (loading included), fork, suspend, resume |
+| `teardown` | Ending a cell: its address space and frames freed |
+| `other` | The rest of the kernel |
+| `total` | All of the above, summed over the CPUs |
+
+The kernel also prints the scopes entered per part
+(`rhizo-breakdown-counts`) and the eight system calls that took most time
+(`rhizo-breakdown-calls`, `name=count/ns`). Without `profile` the hooks
+compile to nothing, so no other figure is measured with them.
+
+### Sampling: `cargo xtask profile`
+
+```bash
+cargo xtask --arch x86_64 profile [--vmm <name>] [--accel <a>] [--out <dir>] [--per-cell]
+```
+
+runs a kernel built with `sampling` (which includes `profile`): the same
+workloads (five rounds each, CPython where built), accounted as above and
+sampled. The PMU counts cycles of cell code only and interrupts every
+100,000 (x86_64 counter 2 on vector 34; AArch64 event counter 1 on the PMU's
+PPI); without a PMU the timer samples every 100 µs instead. Each sample is
+the cell and its program counter; kernel addresses are not sampled (the
+kernel runs with interrupts masked), its time is the accounted parts. It
+writes to `target/profile` (or `--out`):
+
+- `<workload>.folded`: `<workload>;<image>[;cell <id>];<function> <ns>`,
+  the samples sharing the workload's `user` time by count, and
+  `<workload>;kernel;<part> <ns>`;
+- `<workload>.calls.folded`: `<workload>;<system call> <ns>` (each call's
+  own time, nested parts included).
+
+Functions come from `nm` on the image (CPython: the interpreter before it
+was stripped); the Rust test cells are stripped, so their addresses fold by
+4 KiB page. Render with `flamegraph.pl`, `inferno-flamegraph` or speedscope.
+
+### Instructions and cycles
+
+Where the guest has performance counters (`rhizo-pmu` in the output), the
+`bench-cell` kernel runs its single-CPU benchmarks again with the PMU as
+their clock (all but the fork benchmarks, which need memory the first pass
+keeps), once counting retired instructions and once core cycles:
+`<metric>_insns` and `<metric>_cycles`. Where it has none, these are listed
+as skipped (`pmu/<vmm>`).
+
+`cargo xtask bench` also runs both kernels once under QEMU's TCG with
+`-icount shift=0,sleep=off` (`--accel icount`): the guest's clock advances
+one nanosecond per instruction, so every figure the kernel times is a count
+of retired instructions, the same on every run and every host (without the
+network card, the only input from outside). These are the
+`<metric>_insns/rhizo/<vmm>-icount` metrics, gated at +2 %
+(`thresholds_pct.instructions`). `--no-icount` skips them.
+
+| VMM | Performance counters in the guest |
+|---|---|
+| QEMU TCG, x86_64 | None (QEMU emulates no x86 PMU): `-icount` gives the instruction counts |
+| QEMU TCG, AArch64 | PMUv3: cycles; instructions only under `-icount` |
+| QEMU (`microvm`, `q35`) and Cloud Hypervisor with KVM | What KVM gives the guest: on GitHub-hosted x86_64 runners it depends on the machine: some give Intel architectural performance monitoring with 8 counters, others none. So the PMU counts are recorded but not in the `ci` baseline (a gated figure missing on a VMM that ran fails the gate) |
+| Firecracker with KVM | None: Firecracker hides the PMU from its guests (CPUID leaf 0xA cleared on x86_64) |
+
 ## Comparisons with existing mechanisms
 
 Measured in the same `cargo xtask bench` run, on the same machine and with the
@@ -169,6 +269,9 @@ same clock as the cells (spec `comparisons`):
 | `snapshot.restore_ms/criu/host` | `criu restore -d` of a dumped process holding 8 MiB written (`bench/host/criu_target.c`), as long as CRIU's log says it took (from its start to "Restore finished"). First restore dropped |
 | `workload.cpython_cold_us/linux-process/firecracker` | The same static CPython, files and script in a Linux guest in Firecracker: `fork` and `execve` of `python3 /app/agent_demo.py`, output read from a pipe, until it exits (`bench/host/linux_cpython.c` as `/init`). Pairs with `workload.cpython_cold_us/rhizo/firecracker` |
 | `workload.cpython_warm_us/linux-process/firecracker` | In the same guest, a CPython process that imported and warmed up the script forks one child per request; the child answers and exits normally, the parent waits (`bench/host/cpython_forkserver.py`, the pre-fork pattern). Pairs with `workload.cpython_warm_us/rhizo/firecracker` |
+| `workload.agent_cpython_turn_us/linux-process/firecracker` | The same agent as a Linux process in that guest, which brings its network card up on the Firecracker tap device and reaches the same fake model: its turns, timed the same way. Pairs with `workload.agent_cpython_turn_us/rhizo/firecracker` |
+| `workload.agent_cpython_model_us/linux-process/firecracker` | The part of its turns spent on the model, timed the same way. Pairs with `workload.agent_cpython_model_us/rhizo/firecracker` |
+| `workload.agent_fork_us/linux-process/firecracker` | Its `os.fork` into the same three branches, from the first fork until every branch has written its first line to its pipe. Pairs with `workload.agent_fork_us/rhizo/firecracker`. The Linux process has no suspend-and-resume figure: CRIU is not in the guest (design D5 of `add-agent-workload`) |
 | `process.spawn_us/linux-process/host` | `posix_spawn` of the same static `hello` the cell benchmark runs, until it exits |
 | `workload.dynamic_run_us/linux-process/firecracker` | `posix_spawn` of the same dynamically linked `hello` the cell benchmark runs, with the same `ld.so` and `libc.so.6` at their paths in the guest's initramfs, until it exits (`bench/host/linux_process.c` as `/init`). Pairs with `workload.dynamic_run_us/rhizo/firecracker` |
 | `workload.dynamic_run_us/linux-process/host` | The same on the benchmark host, with the host's own `ld.so` and `libc` |
@@ -195,8 +298,11 @@ baseline by more than its threshold:
 
 | Environment | Where | Timing threshold | Deterministic threshold |
 |---|---|---|---|
-| `ci` | GitHub-hosted runners (shared, noisy) | +100 % on time to ready; TSC cycles recorded but not gated | +1 % |
-| `dedicated` | A self-hosted runner labelled `rhizo-bench`: bare metal or a pinned VM with KVM, fixed CPU frequency, nothing else running | +5 % | +1 % |
+| `ci` | GitHub-hosted runners (shared, noisy) | +100 % on time to ready; TSC cycles recorded but not gated | +1 %; instructions under `-icount` +2 % |
+| `dedicated` | A self-hosted runner labelled `rhizo-bench`: bare metal or a pinned VM with KVM, fixed CPU frequency, nothing else running | +5 % | +1 %; instructions under `-icount` +2 % |
+
+Breakdowns (`breakdown.`) and lock waits (`lock.`) are recorded but not gated
+(entries of `ungated` that end in `.` cover every metric they start).
 
 Why so wide: two CI runs of identical code differed by up to +41 % in time to
 ready and +53 % in kernel cycles. Hosted runners land on different physical
