@@ -19,7 +19,7 @@ start. The breakdown line SHALL report when that moment came as
 `settle_ns` (0: never).
 
 #### Scenario: Cells runnable at the start
-- **WHEN** counting starts with a cell that yields 2,000 times and four cells that sleep 250 ms
+- **WHEN** counting starts with a cell that yields 2,000 times, then four cells that sleep 250 ms start
 - **THEN** the yields are not counted, and the four wake-ups and their scheduling are
 
 #### Scenario: Counting from the start

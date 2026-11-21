@@ -1949,8 +1949,9 @@ fn only_the_cells_waiting_on_a_socket_wake() {
 
 /// After `prof::settle`, latencies count from the first moment no cell runs
 /// or waits for a CPU (design D6 of `add-socket-wait-queues`): a cell that
-/// yields 2,000 times as the count starts is not counted, the deadlines
-/// that pass after it are. Without it, every latency counts.
+/// yields 2,000 times once counting starts is not counted, the deadlines of
+/// cells started after it, which pass once they all sleep, are. Without
+/// it, every latency counts.
 fn latencies_count_from_the_first_idle_moment() {
     use crate::prof;
     const SLEEPERS: u64 = 4;
@@ -1960,11 +1961,14 @@ fn latencies_count_from_the_first_idle_moment() {
         if settle {
             prof::settle();
         }
-        let mut cells = alloc::vec![spawn(&mut host, "yielder", &[])];
-        cells.extend((0..SLEEPERS).map(|_| spawn(&mut host, "sleeper", &[b"250"])));
-        host.run(|h| cells.iter().all(|&id| h.finished(id).is_some()));
+        let yielder = spawn(&mut host, "yielder", &[]);
+        host.run(|h| h.finished(yielder).is_some());
+        let sleepers: Vec<u32> = (0..SLEEPERS)
+            .map(|_| spawn(&mut host, "sleeper", &[b"250"]))
+            .collect();
+        host.run(|h| sleepers.iter().all(|&id| h.finished(id).is_some()));
         let report = prof::stop();
-        for &id in &cells {
+        for &id in sleepers.iter().chain([&yielder]) {
             assert_eq!(ended(&host, id).0, Ending::Exit(0));
         }
         assert_eq!(report.wake.count(), SLEEPERS, "each deadline counts");
