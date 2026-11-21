@@ -139,8 +139,7 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
     }
     // What a server that did not end cleanly left.
     dir.clean();
-    std::fs::create_dir_all(&dir.0)
-        .map_err(|e| format!("cannot create {}: {e}", dir.0.display()))?;
+    dir.create()?;
     xtask::arch::select(up.arch);
     let vmm = serve::vmm_of(up)?;
     if let Some(reason) = vmm.unavailable_reason(up.accel) {
