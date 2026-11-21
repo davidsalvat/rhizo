@@ -4376,10 +4376,10 @@ fn multi_core() -> (u64, u64, u64, u64, u64) {
 /// `host-ops-per-cell`): `progress` and a spinner run; in each round the
 /// host forks the spinner, kills the child, suspends the spinner and
 /// resumes it. The figure is the median over rounds of the longest gap
-/// `progress` saw from just before the round's operations until the boot
-/// CPU next looks (at most 1 ms later): with the operations made from the
-/// run's stop condition, and, for comparison, between runs (every CPU
-/// stopped, as host operations were before that change).
+/// `progress` saw from just before the round's operations until it has
+/// counted again after them: with the operations made from the run's stop
+/// condition, and, for comparison, between runs (every CPU stopped, as
+/// host operations were before that change).
 #[cfg(feature = "bench-cell")]
 fn host_op_stall() -> (u64, u64) {
     const ROUNDS: usize = 21;
@@ -4409,7 +4409,7 @@ fn host_op_stall() -> (u64, u64) {
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
         .expect("the address of its words");
     let watched = host.watch(progress, addr, 2).expect("its own page");
-    let gap = watched.word(1);
+    let (count, gap) = (watched.word(0), watched.word(1));
     let mut spinner = host
         .spawn(test_image("spin"), &[b"spin".as_slice()], false, false)
         .expect("spawn spin");
@@ -4417,31 +4417,34 @@ fn host_op_stall() -> (u64, u64) {
         gaps.sort_unstable();
         timer::cycles_to_ns(gaps[gaps.len() / 2]).unwrap_or(0)
     };
-    // From the stop condition: odd calls operate, even ones read the gap.
-    let (mut running, mut calls) = (Vec::new(), 0);
+    // From the stop condition: a round operates, then its gap is read once
+    // `progress` has counted again.
+    let (mut running, mut calls, mut after) = (Vec::new(), 0, None);
     host.run(|h| {
         calls += 1;
-        match calls % 2 {
+        match after {
             _ if calls == 1 => {} // before the other CPUs start
-            0 => {
+            None => {
                 gap.store(0, Ordering::Relaxed);
                 operate(h, &mut spinner);
+                after = Some(count.load(Ordering::Relaxed));
             }
-            _ => running.push(gap.load(Ordering::Relaxed)),
+            Some(c) if count.load(Ordering::Relaxed) > c => {
+                running.push(gap.load(Ordering::Relaxed));
+                after = None;
+            }
+            Some(_) => {}
         }
         running.len() == ROUNDS
     });
-    // Between runs: each run ends, the host operates, and the next run
-    // reads the gap after the boot CPU's first look.
+    // Between runs: the run ends, the host operates, and the next run goes
+    // on until `progress` has counted again.
     let mut stopped = Vec::new();
     for _ in 0..ROUNDS {
         gap.store(0, Ordering::Relaxed);
         operate(&mut host, &mut spinner);
-        let mut looks = 0;
-        host.run(|_| {
-            looks += 1;
-            looks > 2
-        });
+        let c = count.load(Ordering::Relaxed);
+        host.run(|_| count.load(Ordering::Relaxed) > c);
         stopped.push(gap.load(Ordering::Relaxed));
     }
     assert!(host.kill(spinner) && host.kill(progress));

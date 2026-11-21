@@ -116,7 +116,7 @@ host reads both through the direct map while it runs (`Host::watch`,
 tests and benchmarks only). The 4-vCPU `bench-cell` boot runs `progress`
 and a spinner; in each of 21 rounds the host forks the spinner, kills the
 child, suspends the spinner and resumes it, and reads the longest gap from
-just before the operations until its next look (at most 1 ms later). The
+just before the operations until it has counted again after them. The
 median is `cell.host_op_stall_us` with the operations made from `stop`,
 and `cell.host_op_stall_stopped_us` with each round between runs (every
 CPU stopped and started again, as before this change), for comparison.
