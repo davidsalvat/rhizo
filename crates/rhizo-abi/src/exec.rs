@@ -72,7 +72,8 @@ pub fn exec<F: EntryFormat, M: PhysicalMemory, A: Frames>(
         frames,
         &mut |interp, i, mem, frames| {
             let page = fs.page(if interp { interp_ino } else { ino }, i).ok()?;
-            pages.borrow_mut().frame(&page, mem, frames)
+            // A new cell is the root of a domain of its own: its identifier.
+            pages.borrow_mut().frame(&page, id, mem, frames)
         },
         &mut |phys| pages.borrow_mut().code(phys),
     )?;
@@ -108,7 +109,7 @@ mod tests {
                 &mut self.mem,
                 &mut RecordingTlb::default(),
                 &mut self.frames,
-                &mut crate::Scoped(&mut self.cache, 1),
+                &mut self.cache,
                 &[path],
                 &[b"LD_LIBRARY_PATH=/opt"],
                 [1; 16],

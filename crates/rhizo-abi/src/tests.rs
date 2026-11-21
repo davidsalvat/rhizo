@@ -107,7 +107,10 @@ impl World {
         let ro = PageFlags::USER | PageFlags::NO_EXECUTE;
         space::map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, RO, FRAME_SIZE, ro).unwrap();
         Self {
-            cell: Cell::new(5, pt.root(), 0x40_0000, STACK_TOP - 64, HEAP),
+            cell: Cell {
+                domain: 5, // a root's domain is its identifier
+                ..Cell::new(5, pt.root(), 0x40_0000, STACK_TOP - 64, HEAP)
+            },
             abi: Abi::new(arch),
             mem,
             tlb,
@@ -152,7 +155,7 @@ impl World {
             net: &mut Noting(&mut self.net, &mut self.used_net),
             deadline: self.deadline.take(),
             pager: &mut self.pager,
-            pages: &mut crate::Scoped(&mut self.pages, 1), // one domain
+            pages: &mut self.pages,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
         // A thread waiting on descriptors keeps its deadline and makes its

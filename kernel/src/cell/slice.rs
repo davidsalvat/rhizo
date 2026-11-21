@@ -39,7 +39,7 @@ pub(super) fn syscall(
             net: &mut sockets,
             deadline,
             pager: &mut CellPager(&mut live.demand, &mut pager_tlb, &live.frames),
-            pages: &mut KernelPages(live.cell.domain),
+            pages: &mut KernelPages,
         };
         let outcome = live.abi.handle(&mut live.cell, &mut cx);
         let deadline = cx.deadline;

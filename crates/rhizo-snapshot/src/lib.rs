@@ -523,6 +523,11 @@ impl Snapshot {
         self.bytes.len()
     }
 
+    /// Whether it refers to a frame instead of holding the page.
+    pub fn refers(&self) -> bool {
+        self.frames > 0
+    }
+
     /// Bytes of the frames it refers to.
     pub fn shared_bytes(&self) -> u64 {
         (0..self.page_count())

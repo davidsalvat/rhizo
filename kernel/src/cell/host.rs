@@ -401,7 +401,7 @@ impl Host {
             &mut DirectMap,
             &mut NewSpace,
             &mut KernelFrames,
-            &mut KernelPages(id), // its domain until it is placed
+            &mut KernelPages,
             argv,
             envp,
             random,

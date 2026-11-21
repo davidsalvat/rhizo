@@ -16,12 +16,18 @@ const KEPT_PAGES: usize = 65536;
 /// frames are taken and given back like those of [`IMAGES`].
 pub(super) static PAGES: Global<PageCache> = Global::new(PageCache::new(KEPT_PAGES));
 
-/// The frames of mapped file pages of the cells of a domain, from
-/// [`PAGES`]; a page written now is made visible to instruction fetch.
-pub(super) struct KernelPages(pub(super) u32);
+/// The frames of mapped file pages, from [`PAGES`]; a page written now is
+/// made visible to instruction fetch.
+pub(super) struct KernelPages;
 
 impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
-    fn frame(&mut self, page: &rhizo_fs::Page, mem: &mut DirectMap, frames: &mut A) -> Option<u64> {
+    fn frame(
+        &mut self,
+        page: &rhizo_fs::Page,
+        scope: u32,
+        mem: &mut DirectMap,
+        frames: &mut A,
+    ) -> Option<u64> {
         if page.key().is_none() {
             // A hole or a page past the end is the cell's alone, never kept:
             // it comes from the cell's frames, counted in its memory quota
@@ -31,7 +37,6 @@ impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
             return Some(phys);
         }
         // Short of frames, what is kept goes first (outside the lock).
-        let scope = self.0;
         let share =
             || PAGES.with(|pages| pages.share(page, scope, &mut DirectMap, &mut ImageFrames));
         let shared = match share() {

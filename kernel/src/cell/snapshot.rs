@@ -114,11 +114,14 @@ impl Host {
         // first stops referring to its old domain's frames (design D21 of
         // `add-cell-hierarchy`).
         let origin = snapshot.origin();
-        let to = match self.suspended.contains(&origin) {
+        let to = || match self.suspended.contains(&origin) {
             true => self.tree.domain(origin).unwrap_or(id),
             false => id, // a new root
         };
-        if to != snapshot.domain() {
+        if snapshot.refers()
+            && let to = to()
+            && to != snapshot.domain()
+        {
             if !cells_may_take(snapshot.shared_bytes()) {
                 return Err(snapshot);
             }
@@ -418,7 +421,7 @@ impl Host {
         let (cell, fs, wx) = (cell.clone(), fs.clone(), wx.clone());
         // Only a published template shares its frames with copies in other
         // domains (design D21 of `add-cell-hierarchy`).
-        let full = (self.copies_leave_domain(id) && !self.is_published(id)).then_some(true);
+        let full = (!self.is_published(id) && self.copies_leave_domain(id)).then_some(true);
         let pt = PageTable::<Format>::from_root(cell.root);
         if full.is_some() && !cells_may_take(mapped_bytes(&pt)) {
             return None;

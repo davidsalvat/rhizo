@@ -1045,6 +1045,7 @@ fn frames_stay_in_the_domain<F: EntryFormat>() {
     snap.move_to(9, &mem, &mut |phys| phys == code);
     assert_eq!(snap.domain(), 9);
     assert_eq!(snap.shared_bytes(), 0x1000, "only the kept frame");
+    assert!(snap.refers());
     assert_eq!(snap.page(0).data, Data::Frame(code));
     let released = RELEASED.with(|r| r.take());
     assert_eq!(released.len(), 2, "the data and 2 MiB pages given back");
@@ -1084,7 +1085,7 @@ fn frames_stay_in_the_domain<F: EntryFormat>() {
     frames.free(code, PageSize::Small);
     // From bytes: no domain and no frame, and nothing to move.
     let mut loaded = Snapshot::from_bytes(exported, Machine::Aarch64, crc32c).unwrap();
-    assert_eq!(loaded.domain(), 0);
+    assert!(loaded.domain() == 0 && !loaded.refers());
     loaded.move_to(3, &mem, &mut |_| unreachable!("no frame"));
     assert_eq!((loaded.domain(), loaded.shared_bytes()), (3, 0));
     for pt in [pt, tpt] {

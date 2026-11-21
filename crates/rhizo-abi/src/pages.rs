@@ -18,8 +18,9 @@ pub const PUBLIC: u32 = 0;
 /// Where the frames of mapped file pages come from.
 pub trait FilePages<M, A> {
     /// A frame holding `page`'s bytes, the rest of it zero, with one
-    /// reference for the caller; `None` when memory runs out.
-    fn frame(&mut self, page: &Page, mem: &mut M, frames: &mut A) -> Option<u64>;
+    /// reference for the caller, for a cell of domain `scope`; `None` when
+    /// memory runs out.
+    fn frame(&mut self, page: &Page, scope: u32, mem: &mut M, frames: &mut A) -> Option<u64>;
 
     /// `phys` was just written and will be executable (the kernel makes
     /// instruction fetch see it).
@@ -350,13 +351,9 @@ impl PageCache {
     }
 }
 
-/// A [`PageCache`] as the file pages of the cells of one domain.
-#[derive(Debug)]
-pub struct Scoped<'a>(pub &'a mut PageCache, pub u32);
-
-impl<M: PhysicalMemory, A: Frames> FilePages<M, A> for Scoped<'_> {
-    fn frame(&mut self, page: &Page, mem: &mut M, frames: &mut A) -> Option<u64> {
-        self.0.get(page, self.1, mem, frames).map(|(phys, _)| phys)
+impl<M: PhysicalMemory, A: Frames> FilePages<M, A> for PageCache {
+    fn frame(&mut self, page: &Page, scope: u32, mem: &mut M, frames: &mut A) -> Option<u64> {
+        self.get(page, scope, mem, frames).map(|(phys, _)| phys)
     }
 }
 
