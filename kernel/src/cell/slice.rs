@@ -158,8 +158,11 @@ pub(super) fn run_slice(
                                 fp_mine = false;
                             }
                             // Another thread of the cell runs at once, in
-                            // this slice, without changing address space.
-                            if live.cell.threads.next(now_ns()) {
+                            // this slice, without changing address space;
+                            // not while the host waits for the cell to
+                            // pause, which it sees only between slices
+                            // (change `fix-warm-wait-race`).
+                            if !live.hold && live.cell.threads.next(now_ns()) {
                                 continue 'thread;
                             }
                             break 'thread Back::File;

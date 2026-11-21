@@ -53,6 +53,8 @@ mod image;
 mod live;
 mod ops;
 mod pages;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+mod pause;
 mod sched;
 mod services;
 mod slice;
@@ -74,6 +76,8 @@ pub use host::*;
 pub use image::*;
 use live::*;
 pub use pages::*;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub use pause::*;
 use sched::*;
 use services::*;
 use slice::*;

@@ -55,6 +55,9 @@ pub(super) struct Live {
     /// Most CPUs that ran its threads at the same time (design D5 of
     /// `add-parallel-threads`).
     pub(super) peak: u32,
+    /// The host waits for it to pause ([`Host::run_to_pause`]): a call
+    /// that blocks ends its slice, even when a thread could go on at once.
+    pub(super) hold: bool,
 }
 
 impl Live {

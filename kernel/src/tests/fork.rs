@@ -118,10 +118,8 @@ fn spawn_from_template_runs_like_the_program() {
 fn copies_report() -> (alloc::string::String, Vec<alloc::string::String>) {
     let ready = |host: &mut Host| {
         let id = spawn(host, "copies", &[]);
-        while host.output(id) != Some(b"ready\n") {
-            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
-            host.step();
-        }
+        host.run_to_pause(id, b"ready", Pause::Waits)
+            .unwrap_or_else(|why| panic!("{why}: {:?}", ended(host, id)));
         id
     };
     let mut host = Host::new();
@@ -213,9 +211,8 @@ fn copy_pid_differs() {
 fn tainted_template_not_published() {
     let mut host = Host::new();
     let quiet = spawn(&mut host, "copies", &[]);
-    while host.output(quiet) != Some(b"ready\n") {
-        host.step();
-    }
+    host.run_to_pause(quiet, b"ready", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(quiet));
     assert_eq!(host.may_publish(quiet, false), Some(true));
     assert_eq!(host.may_publish(quiet + 1000, true), None, "no template");
@@ -254,15 +251,12 @@ fn tainted_template_not_published() {
 fn loads_of_a_copied_template_see_new_generations() {
     let mut host = Host::new();
     let first = spawn(&mut host, "copies", &[b"wait"]);
-    while host.output(first) != Some(b"start\n") {
-        host.step();
-    }
+    host.run_to_pause(first, b"start", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(first));
     let copy = host.spawn_from_template(first, true, false).expect("copy");
-    while host.output(copy) != Some(b"ready\n") {
-        assert!(host.finished(copy).is_none(), "{:?}", ended(&host, copy));
-        host.step();
-    }
+    host.run_to_pause(copy, b"ready", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}: {:?}", ended(&host, copy)));
     assert!(host.freeze(copy));
     let crc = crate::arch::mem::crc32c;
     let bytes = host
