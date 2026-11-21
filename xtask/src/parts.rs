@@ -21,7 +21,7 @@ const COSTS: &[(&str, u32)] = &[
     ("ktest-hang", 5),
 ];
 
-fn cost( step: &str) -> u32 {
+fn cost(step: &str) -> u32 {
     COSTS
         .iter()
         .find(|(s, _)| *s == step)
