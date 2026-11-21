@@ -1157,10 +1157,24 @@ recommended for production.
   after 32 zero bytes. `audit/head` holds the last line's file and hash,
   so a cut end or an edited last line shows as well. `rhizo down` keeps
   `audit/` (spec `control-plane`, state after down).
-- SHA-256 is written out in `rhizo` (about 60 lines, checked against the
-  FIPS 180-4 vectors) rather than taken from a crate, which would add
-  seven crates to the build for one function. The JSON lines use
-  `serde_json`, already in the workspace through `xtask`.
+- SHA-256 is written out in `rhizo` (about 60 lines) rather than taken
+  from a crate, which would add seven crates to the binary for one
+  function. Tests check it against the FIPS 180-4 vectors, and against
+  RustCrypto's `sha2` (MIT OR Apache-2.0, a dev-dependency only) at every
+  padding boundary (0, 55, 56, 63, 64, 65, 119, 120, 128 bytes) and on
+  arbitrary inputs up to 1,000 bytes. The JSON lines use `serde_json`,
+  already in the workspace through `xtask`.
+- What `verify` proves, and what it does not. The chain is unkeyed: it
+  detects an edit, removal or reordering of part of the log by someone
+  who does not rewrite everything after it. Anyone with write access to
+  the state directory can rewrite the whole chain from the edited line
+  on, and `audit/head`, and `verify` then passes. What it cannot hide
+  while a VM runs: the kernel's sequence numbers and drop counts, so
+  records missing from a live session show as a gap unless the rest of
+  that session is rewritten too. A possible later mitigation, not built:
+  export `head` (or each file's last hash) to a sink outside the host's
+  reach, or sign it with a key kept outside the state directory.
+  `docs/security.md` (audit log) says the same.
 - `rhizo audit tail [--cell N] [--domain N] [--kind K] [--follow]` shows
   records, `--follow` then polls for new lines; `rhizo audit verify`
   names each edited, removed or reordered line, each gap in sequence

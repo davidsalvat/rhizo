@@ -996,6 +996,36 @@ Not covered:
   no buffer. A VMM sends one after it restores a VM snapshot, and VMM
   snapshots of a control kernel are not supported.
 
+## The audit log (design D18 of `add-cell-hierarchy`)
+
+The kernel records what it refused and what the host administered in a
+ring of 64 KiB that no cell can read; `rhizo` appends the records to
+`<state>/audit/` as JSON lines, each carrying the SHA-256 of the line
+before, and `audit/head` names the last line's hash.
+
+**What `rhizo audit verify` proves.** That the log is the one the server
+wrote, unless someone rewrote it from some line to its end: an edited,
+removed or reordered line in the middle, a removed file, or a cut end
+breaks the chain or disagrees with `head`, and `verify` names where.
+Within one boot it also reports records that never reached the log (a gap
+in the kernel's sequence numbers) apart from those the kernel dropped
+when its ring was full (the drop count the next record carries).
+
+**What it does not prove.** The chain has no key. Anyone who can write the
+state directory (root, or the user who runs `rhizo`) can rewrite the log
+from an edited line on, recompute every hash and `head`, and `verify`
+passes; deleting the whole directory removes the log. The kernel's
+sequence numbers and drop counts make records missing from a live
+session visible only if the rest of that session was not rewritten to
+match. Records come only from the kernel, so a host that rewrites the log
+lies about the past but cannot make the kernel's live state agree.
+
+**Mitigation, not built.** Forward the files as they are written
+(journald, syslog, a SIEM), and export `head` to an append-only sink
+outside the host's reach, or sign it with a key kept outside the state
+directory. Then a rewrite of the chain no longer matches the exported
+hash.
+
 ## Known limitations and open findings
 
 These are not fixed by this change; each needs its own design.

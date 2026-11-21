@@ -25,6 +25,9 @@ serde_json = "1"
 
 [dev-dependencies]
 proptest = "1"
+# Checks the hand-written SHA-256 of the audit log against RustCrypto's
+# (MIT OR Apache-2.0); tests only, not in the `rhizo` binary.
+sha2 = "0.10"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

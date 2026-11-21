@@ -681,6 +681,28 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn reference(data: &[u8]) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(data).into()
+    }
+
+    /// The lengths where padding goes wrong: one block or two, the length
+    /// fitting after the 0x80 byte or not.
+    #[test]
+    fn sha256_matches_rustcrypto_at_padding_boundaries() {
+        for len in [0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 1000] {
+            let data: Vec<u8> = (0..len).map(|k| (k * 31 + 7) as u8).collect();
+            assert_eq!(sha256(&data), reference(&data), "{len} bytes");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn sha256_matches_rustcrypto(data in proptest::collection::vec(any::<u8>(), 0..=1000)) {
+            prop_assert_eq!(sha256(&data), reference(&data));
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
