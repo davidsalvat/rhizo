@@ -29,7 +29,16 @@
 //! sockets  length u64, then one record per socket as `rhizo_net` encodes
 //!          them (version 6: a connection may be parked in the kernel);
 //!          a socket descriptor's index is its record's
+//! tree     (version 11) length u64, then the cell's place in the cell tree,
+//!          its policies, copy generation, sticky bit and wipe ranges
+//!          ([`TreeState`], laid out in `tree.rs`)
 //! ```
+//!
+//! This code writes version 11 and reads version 10 too, through
+//! [`upgrade`], which gives a version-10 file the safest tree section
+//! (design D20 of `add-cell-hierarchy`): egress and ceiling `none`, the
+//! limits of its quotas, no CPU set, an unknown number and generation, and
+//! the sticky bit set (it may hold a secret).
 //!
 //! Every value is little endian; records are sorted by address.
 //!
@@ -63,13 +72,19 @@ use rhizo_mm::FRAME_SIZE;
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_net::Record;
 
+mod tree;
+pub use tree::TreeState;
+
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
-/// The copy generation of a cell loaded from bytes, which do not hold it
-/// yet (design D22 of `add-cell-hierarchy`, until format version 11): the
-/// kernel then gives the cell a value its source cannot have seen.
+/// The copy generation of a cell loaded from a version-10 file, which does
+/// not hold it (design D22 of `add-cell-hierarchy`): the kernel then gives
+/// the cell a value its source cannot have seen.
 pub const UNKNOWN_GENERATION: u64 = u64::MAX;
 /// Format version written by this code.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
+/// The version before it, which this code also reads (design D20 of
+/// `add-cell-hierarchy`).
+pub const PREVIOUS: u32 = 10;
 const HEADER: usize = 24;
 const STATE: usize = 8 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.
@@ -112,6 +127,10 @@ pub enum FormatError {
     /// The sockets section does not decode, or its records do not match
     /// the socket descriptors one to one.
     BadSockets,
+    /// The tree section does not decode: an unknown budget mode or policy,
+    /// a malformed rule or label, a CPU weight out of bounds, bad wipe
+    /// ranges, or a length unlike its contents.
+    BadTree,
     /// Registers the kernel cannot enter safely: a program counter (or, on
     /// x86_64, a thread pointer) outside the cell's addresses, or reserved
     /// `MXCSR` bits, any of which would fault in the kernel itself.
@@ -168,15 +187,9 @@ pub struct Snapshot {
     /// `add-cell-hierarchy`): the frames it refers to are of this domain or
     /// public. 0 for one read from bytes, which refers to no frame.
     domain: u32,
-    /// The cell's copy generation, whether it may hold a secret, and its
-    /// wipe ranges (design D22 of `add-cell-hierarchy`): kept beside the
-    /// bytes, in the kernel only, until the tree section of format version
-    /// 11 holds them (task 1.10). A snapshot made from bytes has none, and
-    /// its generation is [`UNKNOWN_GENERATION`].
-    generation: u64,
-    exposed: bool,
-    /// Only its wipe ranges: one word, as in a cell.
-    wiped: WxRanges,
+    /// Where the tree section starts (its length), found once: every
+    /// resume reads it.
+    tree: usize,
 }
 
 impl PartialEq for Snapshot {
@@ -330,11 +343,27 @@ impl Snapshot {
         files.encode(&mut encoded);
         let mut records = Vec::new();
         rhizo_net::encode_records(sockets, &mut records);
+        // Its policies are the defaults until the kernel sets its node's
+        // (`set_tree`).
+        let mut tree = Vec::new();
+        tree::encode(
+            &TreeState {
+                spec: rhizo_cap::Spec {
+                    limits: limits_of(&cell.quota),
+                    ..rhizo_cap::Spec::default()
+                },
+                pid: cell.pid,
+                generation: cell.generation,
+                exposed: cell.exposed,
+                wiped: wx.wiped().to_vec(),
+            },
+            &mut tree,
+        );
         // Allocated zeroed at its final size, then filled in place: no copy
         // of the pages when it grows, and no zeroing loop, which unoptimized
         // builds run a byte at a time.
         let data_end = data_start + data_len;
-        let mut b = vec![0u8; data_end + 16 + encoded.len() + records.len()];
+        let mut b = vec![0u8; data_end + 16 + encoded.len() + records.len() + tree.len()];
         let mut rec = 0;
         let mut put = |bytes: &[u8]| {
             b[rec..rec + bytes.len()].copy_from_slice(bytes);
@@ -393,6 +422,7 @@ impl Snapshot {
             b[tail + 8..tail + 8 + part.len()].copy_from_slice(part);
             tail += 8 + part.len();
         }
+        b[tail..].copy_from_slice(&tree); // with its length
         Self {
             bytes: b,
             frames: refers.iter().filter(|&&r| r).count(),
@@ -400,11 +430,7 @@ impl Snapshot {
             records: data_start - pages * RECORD,
             origin: cell.id,
             domain: cell.domain,
-            generation: cell.generation,
-            exposed: cell.exposed,
-            wiped: WxRanges::default()
-                .with_wiped(wx.wiped().to_vec())
-                .unwrap_or_default(),
+            tree: tail,
         }
     }
 
@@ -499,6 +525,8 @@ impl Snapshot {
         }
         let bytes = self.laid_out(mem, keep);
         let old = core::mem::replace(&mut self.bytes, bytes);
+        // The tree section ends both, unchanged.
+        self.tree = self.bytes.len() - (old.len() - self.tree);
         let records = self.records;
         let mut kept = 0;
         for i in 0..self.page_count() {
@@ -552,7 +580,9 @@ impl Snapshot {
             return Err(FormatError::BadMagic);
         }
         let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if version != VERSION {
+        if version == PREVIOUS {
+            bytes = upgrade(bytes, crc)?;
+        } else if version != VERSION {
             return Err(FormatError::Version(version));
         }
         let found = u16::from_le_bytes([bytes[12], bytes[13]]);
@@ -579,9 +609,7 @@ impl Snapshot {
             records: 0,
             origin: 0,
             domain: 0,
-            generation: UNKNOWN_GENERATION,
-            exposed: false,
-            wiped: WxRanges::default(),
+            tree: 0,
         };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
@@ -630,11 +658,19 @@ impl Snapshot {
         let sockets_at = u64_at(&snapshot.bytes, files_at as usize)
             .checked_add(files_at + 8)
             .ok_or(FormatError::Truncated)?;
-        if len < sockets_at.saturating_add(8)
-            || len - sockets_at - 8 != u64_at(&snapshot.bytes, sockets_at as usize)
+        if len < sockets_at.saturating_add(8) {
+            return Err(FormatError::Truncated);
+        }
+        let tree_at = u64_at(&snapshot.bytes, sockets_at as usize)
+            .checked_add(sockets_at + 8)
+            .ok_or(FormatError::Truncated)?;
+        if len < tree_at.saturating_add(8)
+            || len - tree_at - 8 != u64_at(&snapshot.bytes, tree_at as usize)
         {
             return Err(FormatError::Truncated);
         }
+        tree::decode(&snapshot.bytes[tree_at as usize + 8..]).ok_or(FormatError::BadTree)?;
+        snapshot.tree = tree_at as usize;
         let fs = Fs::decode(snapshot.files_bytes()).map_err(|_| FormatError::BadFiles)?;
         let records = rhizo_net::decode_records(snapshot.sockets_bytes())
             .map_err(|_| FormatError::BadSockets)?;
@@ -705,11 +741,11 @@ impl Snapshot {
         } else {
             WxRanges::from_ranges(self.range_list()).unwrap_or_default()
         };
-        if self.wiped.wiped().is_empty() {
+        let wiped = tree::wiped(&self.bytes[self.tree_at() + 8..]);
+        if wiped.is_empty() {
             return wx;
         }
-        wx.with_wiped(self.wiped.wiped().to_vec())
-            .unwrap_or_default()
+        wx.with_wiped(wiped).unwrap_or_default()
     }
 
     /// Validates the threads (`from_bytes`; the size was checked).
@@ -869,10 +905,75 @@ impl Snapshot {
         &self.bytes[at + 8..at + 8 + u64_at(&self.bytes, at) as usize]
     }
 
+    /// Where the sockets section starts (its length).
+    fn sockets_at(&self) -> usize {
+        let at = self.files_at();
+        at + 8 + u64_at(&self.bytes, at) as usize
+    }
+
     /// The encoded socket records (after the file system and their length).
     fn sockets_bytes(&self) -> &[u8] {
-        let at = self.files_at();
-        &self.bytes[at + 16 + u64_at(&self.bytes, at) as usize..]
+        let at = self.sockets_at();
+        &self.bytes[at + 8..at + 8 + u64_at(&self.bytes, at) as usize]
+    }
+
+    /// Where the tree section starts (its length).
+    fn tree_at(&self) -> usize {
+        self.tree
+    }
+
+    /// The cell's place in the tree, policies, copy generation, sticky bit
+    /// and wipe ranges (format version 11).
+    pub fn tree(&self) -> TreeState {
+        // Validated by `from_bytes` or written by `capture`.
+        tree::decode(&self.bytes[self.tree_at() + 8..]).unwrap_or_else(|| TreeState {
+            spec: rhizo_cap::Spec::default(),
+            pid: 0,
+            generation: UNKNOWN_GENERATION,
+            exposed: true,
+            wiped: Vec::new(),
+        })
+    }
+
+    /// Records `spec`, the policies and limits of the cell's node, in place
+    /// of the defaults [`capture`](Self::capture) wrote. The section is
+    /// last: no page moves.
+    pub fn set_tree(&mut self, spec: &rhizo_cap::Spec) {
+        let state = TreeState {
+            spec: spec.clone(),
+            ..self.tree()
+        };
+        self.bytes.truncate(self.tree_at());
+        tree::encode(&state, &mut self.bytes);
+    }
+
+    /// What a cell loaded from these bytes may have under a parent whose
+    /// egress and ceiling are `egress` and `ceiling` (the host's choice for
+    /// a root) and whose budget leaves `most` (spec `snapshots`, loaded
+    /// snapshots hold no authority): its egress and ceiling intersected
+    /// with those, its limits at most `most`, no CPU set; its label, CPU
+    /// weight and cap and its policy for when its parent ends as written.
+    pub fn placed(
+        &self,
+        egress: &rhizo_cap::Egress,
+        ceiling: &rhizo_cap::Egress,
+        most: rhizo_cap::Limits,
+    ) -> Result<rhizo_cap::Spec, rhizo_cap::Error> {
+        let spec = self.tree().spec;
+        let l = spec.limits;
+        let own = spec.ceiling.as_ref().unwrap_or(&spec.egress);
+        Ok(rhizo_cap::Spec {
+            limits: rhizo_cap::Limits {
+                memory: l.memory.min(most.memory),
+                cpu_ns: l.cpu_ns.min(most.cpu_ns),
+                sockets: l.sockets.min(most.sockets),
+                cells: l.cells.min(most.cells),
+            },
+            ceiling: Some(own.intersect(ceiling)?),
+            egress: spec.egress.intersect(egress)?,
+            cpus: 0,
+            ..spec
+        })
     }
 
     /// The records of the cell's sockets, in the order its descriptors
@@ -1004,14 +1105,18 @@ impl Snapshot {
 
     /// A cell `id` with root `root` (an empty user half, sharing the kernel
     /// half as the architecture needs) in the snapshot's state, its threads'
-    /// deadlines counted from monotonic time `now`. Its copy generation is
-    /// the captured cell's ([`UNKNOWN_GENERATION`] for bytes): the kernel
-    /// counts the resume as a copy.
+    /// deadlines counted from monotonic time `now`, its number in its domain
+    /// as captured. Its copy generation is
+    /// the captured cell's ([`UNKNOWN_GENERATION`] for a version-10 file):
+    /// the kernel counts the resume as a copy.
     pub fn cell(&self, id: u32, root: u64, now: u64) -> Cell {
         let s = self.state();
+        let (pid, generation, exposed) = tree::copy_state(&self.bytes[self.tree_at() + 8..]);
         Cell {
             id,
-            pid: id,
+            // Its number as it was (unknown in a version-10 file); the
+            // kernel gives a resumed or loaded cell a new one.
+            pid: if pid == 0 { id } else { pid },
             domain: 0,
             root,
             threads: self.threads(now),
@@ -1021,10 +1126,93 @@ impl Snapshot {
             exit_status: None,
             quota: s.quota,
             cpu_ns: s.cpu_ns,
-            generation: self.generation,
-            exposed: self.exposed,
+            generation,
+            exposed,
         }
     }
+}
+
+/// A cell's tree limits from its quotas (no limit on descendants).
+fn limits_of(q: &Quota) -> rhizo_cap::Limits {
+    rhizo_cap::Limits {
+        memory: q.memory,
+        cpu_ns: q.cpu_ns,
+        sockets: q.sockets,
+        cells: u32::MAX,
+    }
+}
+
+/// Converts `bytes`, a snapshot file of any version this code converts,
+/// into the current version and checks the result as a kernel of the
+/// architecture it names would (`rhizo snapshot upgrade`, design D20 of
+/// `add-cell-hierarchy`); returns the bytes to write.
+pub fn upgrade_file(bytes: Vec<u8>, crc: Crc32c) -> Result<Vec<u8>, FormatError> {
+    let bytes = upgrade(bytes, crc)?;
+    let machine = match u16::from_le_bytes([bytes[12], bytes[13]]) {
+        183 => Machine::Aarch64,
+        62 => Machine::X86_64,
+        found => {
+            return Err(FormatError::Machine {
+                expected: Machine::X86_64 as u16,
+                found,
+            });
+        }
+    };
+    Snapshot::from_bytes(bytes.clone(), machine, crc)?;
+    Ok(bytes)
+}
+
+/// Converts the exported form of a snapshot of the previous format version
+/// into the current one, checksum included (design D20 of
+/// `add-cell-hierarchy`); a current one comes back as it is. The bytes are
+/// checked as far as the conversion needs (magic, version, checksum, the
+/// quota words); [`Snapshot::from_bytes`] checks the rest. A version-10
+/// file gets the safest tree section: the limits of its quotas, egress and
+/// ceiling `none`, no CPU set, an unknown number and generation, the sticky
+/// bit set. Deterministic: the same file always converts to the same bytes.
+pub fn upgrade(mut bytes: Vec<u8>, crc: Crc32c) -> Result<Vec<u8>, FormatError> {
+    if bytes.len() < HEADER + STATE + CHECKSUM {
+        return Err(FormatError::Truncated);
+    }
+    if &bytes[..8] != MAGIC {
+        return Err(FormatError::BadMagic);
+    }
+    match u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) {
+        VERSION => return Ok(bytes),
+        PREVIOUS => {}
+        other => return Err(FormatError::Version(other)),
+    }
+    let end = bytes.len() - CHECKSUM;
+    let mut sum = [0; CHECKSUM];
+    sum.copy_from_slice(&bytes[end..]);
+    if crc(&bytes[..end]) != u32::from_le_bytes(sum) {
+        return Err(FormatError::Checksum);
+    }
+    bytes.truncate(end);
+    let w = |i: usize| u64_at(&bytes, HEADER + i * 8);
+    let quota = Quota {
+        memory: w(4),
+        cpu_ns: w(5),
+        files: w(7) as u32,
+        sockets: (w(7) >> 32) as u32,
+    };
+    tree::encode(
+        &TreeState {
+            spec: rhizo_cap::Spec {
+                limits: limits_of(&quota),
+                ..rhizo_cap::Spec::default()
+            },
+            pid: 0,
+            generation: UNKNOWN_GENERATION,
+            exposed: true,
+            wiped: Vec::new(),
+        },
+        &mut bytes,
+    );
+    bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    let sum = crc(&bytes);
+    bytes.extend_from_slice(&sum.to_le_bytes());
+    Ok(bytes)
 }
 
 /// A function computing the CRC-32C of exported snapshots: [`crc32c`], or

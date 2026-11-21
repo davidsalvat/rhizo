@@ -41,9 +41,8 @@ fn micropython_in_a_cell() {
     let template = host
         .spawn_with_files(image, &argv, files(), true, false)
         .expect("spawn");
-    while host.output(template) != Some(b"warm\n") {
-        host.step();
-    }
+    host.run_to_pause(template, b"warm", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
     let answer = expected::PYTHON_STDOUT
         .strip_prefix("warm\n")

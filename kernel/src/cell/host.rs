@@ -298,6 +298,7 @@ impl Host {
             ready: Ready::default(),
             last: 0,
             peak: 1,
+            hold: false,
         })
     }
 

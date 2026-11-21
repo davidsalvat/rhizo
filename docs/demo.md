@@ -185,7 +185,7 @@ Inside a chat:
 `model` is the time the agent waited for the model's answers (requests
 sent until answers read); `rhizo` is everything else from Enter to the
 answer's last line: the agent's own work in the cell (JSON, tools,
-printing) and the delivery both ways (the kernel and the serial line).
+printing) and the delivery both ways (the kernel and the control channel).
 
 How it works: a cell started for a chat reads its standard input from a
 pipe whose write end the host holds; each line is a control request
@@ -277,12 +277,13 @@ model runs natively on the host, so the demo stays usable.
   `add-agent-workload`), so hosted APIs over HTTPS are out of reach; run
   the model locally, or put a plain-HTTP proxy next to it.
 - **IPv4 addresses**, not host names, in `--llm`.
-- **The guest polls.** Its network card and its serial line (the control
-  channel) are polled: a turn's model time includes up to one polling
-  period, and an idle control kernel wakes every 2 ms (design D4 of
-  `add-control-plane`).
-- **The serial line is the control channel** on every VMM (design D2 of
-  `add-control-plane`): fine for requests and output, slow for bulk data.
+- **The guest polls.** Its network card and its control channel are
+  polled: a turn's model time includes up to one polling period, and an
+  idle control kernel wakes every 2 ms (design D4 of `add-control-plane`).
+- **The control channel is the VM's vsock** where it has one (always on
+  Firecracker and Cloud Hypervisor, on QEMU when the host's vhost-vsock
+  device is usable) and the serial line otherwise, which is fine for
+  requests and output but slow for bulk data (change `control-over-vsock`).
 - **Snapshots stay in the VM's memory**; `rhizo down` drops them.
 - **Memory.** `rhizo up` gives the guest 256 MiB: the agent and its three
   branches fit easily (they share their pages copy-on-write).

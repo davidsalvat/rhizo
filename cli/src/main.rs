@@ -34,6 +34,7 @@ fn main() -> ExitCode {
             Command::Up(up) => cmd_up(&dir, &up),
             Command::Serve(up) => serve::serve(&dir, &up),
             Command::Down => cmd_down(&dir),
+            Command::SnapshotUpgrade { input, output } => snapshot_upgrade(&input, &output),
             Command::Run(run) if run.template == "python-agent" => {
                 agent::run(&mut Client::connect(&dir)?, &run)
             }
@@ -164,6 +165,37 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
         info.boot_ms,
         duration(reply.round_trip.as_nanos() as u64),
         dir.0.display()
+    );
+    Ok(())
+}
+
+/// `rhizo snapshot upgrade`: converts a file saved by the kernel of the
+/// previous format version to the current one, checks it as a kernel
+/// would, and writes it (design D20 of `add-cell-hierarchy`).
+fn snapshot_upgrade(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    let bytes =
+        std::fs::read(input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+    let version = |b: &[u8]| {
+        b.get(8..12)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+    };
+    let from = version(&bytes);
+    let upgraded = rhizo_snapshot::upgrade_file(bytes, rhizo_snapshot::crc32c).map_err(|e| {
+        format!(
+            "{}: cannot convert it ({e:?}); this rhizo converts format version {} to {}",
+            input.display(),
+            rhizo_snapshot::PREVIOUS,
+            rhizo_snapshot::VERSION
+        )
+    })?;
+    std::fs::write(output, &upgraded)
+        .map_err(|e| format!("cannot write {}: {e}", output.display()))?;
+    println!(
+        "upgraded {} (format version {}) to {} (version {})",
+        input.display(),
+        from.unwrap_or(0),
+        output.display(),
+        rhizo_snapshot::VERSION
     );
     Ok(())
 }
@@ -399,4 +431,37 @@ fn cmd_stats(dir: &Dir) -> Result<(), String> {
         reply.timing()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// `rhizo snapshot upgrade` converts a file a version-10 kernel saved
+    /// (recorded in `rhizo-snapshot`'s test data) into one the current
+    /// kernel loads, leaves a current file as it is, and refuses a damaged
+    /// one (design D20 of `add-cell-hierarchy`).
+    #[test]
+    fn snapshot_upgrade_converts_a_version_10_file() {
+        let dir = std::env::temp_dir().join(format!("rhizo-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.rhz"), dir.join("new.rhz"));
+        let v10 = include_bytes!("../../crates/rhizo-snapshot/tests/data/version-10.rhz");
+        std::fs::write(&old, v10).unwrap();
+        super::snapshot_upgrade(&old, &new).unwrap();
+        let bytes = std::fs::read(&new).unwrap();
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(version, rhizo_snapshot::VERSION);
+        let again = dir.join("again.rhz");
+        super::snapshot_upgrade(&new, &again).unwrap();
+        assert_eq!(
+            std::fs::read(&again).unwrap(),
+            bytes,
+            "a current file stays"
+        );
+        let mut bad = v10.to_vec();
+        bad[40] ^= 1;
+        std::fs::write(&old, bad).unwrap();
+        let e = super::snapshot_upgrade(&old, &new).unwrap_err();
+        assert!(e.contains("Checksum"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

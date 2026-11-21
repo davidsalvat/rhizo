@@ -79,10 +79,8 @@ fn a_node_cell_suspends_resumes_and_forks() {
     let mut host = Host::new();
     let warm = |host: &mut Host| {
         let id = spawn_node(host, &files, &["wait"]);
-        while host.output(id) != Some(b"warm\n") {
-            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
-            host.step();
-        }
+        host.run_to_pause(id, b"warm", Pause::Waits)
+            .unwrap_or_else(|why| panic!("{why}: {:?}", ended(host, id)));
         id
     };
     let id = warm(&mut host);
@@ -128,14 +126,8 @@ fn copies_draw_different_random() {
     };
     let mut host = Host::new();
     let template = spawn_node(&mut host, &files, &["wait", "random"]);
-    while host.output(template) != Some(b"warm\n") {
-        assert!(
-            host.finished(template).is_none(),
-            "{:?}",
-            ended(&host, template)
-        );
-        host.step();
-    }
+    host.run_to_pause(template, b"warm", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}: {:?}", ended(&host, template)));
     assert!(host.freeze(template));
     let ids: Vec<u32> = (0..2)
         .map(|_| {

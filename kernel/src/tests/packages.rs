@@ -91,10 +91,8 @@ fn a_cell_that_imported_numpy_suspends_resumes_and_forks() {
     let mut host = Host::new();
     let ready = |host: &mut Host| {
         let id = spawn_python(host, &files, &[python, flag, script, "wait"]);
-        while host.output(id) != Some(b"ready\n") {
-            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
-            host.step();
-        }
+        host.run_to_pause(id, b"ready", Pause::Slice)
+            .unwrap_or_else(|why| panic!("{why}: {:?}", ended(host, id)));
         id
     };
     let id = ready(&mut host);

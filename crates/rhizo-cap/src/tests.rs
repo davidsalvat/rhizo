@@ -286,6 +286,39 @@ fn ending_cascades_or_promotes() {
 }
 
 #[test]
+fn cells_that_left_leave_no_trace() {
+    let mut t = Tree::new();
+    for id in 1..=100 {
+        t.add_root(id, spec(limits(MIB, 0)), 0).unwrap();
+    }
+    // Ends and resumes among many cells, as the kernel's.
+    for id in (1..=80).step_by(2) {
+        t.end(id, &mut fresh()).unwrap();
+        assert!(t.rekey(id + 1, 1000 + id).is_some());
+        t.check().unwrap();
+    }
+    assert_eq!(t.len(), 60);
+    assert_eq!(t.iter().count(), 60);
+    assert_eq!(t.children(HOST).count(), 60);
+    assert!(t.get(79).is_none() && t.get(80).is_none() && t.get(1079).is_some());
+    assert_eq!(t.end(79, &mut fresh()), Err(Error::NotFound));
+    // Identifiers that just left may come back, as any new cell.
+    let (mut a, mut b, mut c) = (t.clone(), t.clone(), t);
+    assert_eq!(a.add_root(79, spec(limits(MIB, 0)), 0), Ok(1));
+    b.add_copies(81, &[77], &none, &mut |_, _, _| {}).unwrap();
+    assert!(c.rekey(82, 75).is_some() && c.get(82).is_none());
+    for (t, len) in [(&a, 61), (&b, 61), (&c, 60)] {
+        assert_eq!(t.len(), len);
+        t.check().unwrap();
+        let mut u = Tree::new();
+        for n in t.iter() {
+            u.add_root(n.id(), spec(limits(MIB, 0)), 0).unwrap();
+        }
+        assert!(t.iter().map(Node::id).eq(u.iter().map(Node::id)));
+    }
+}
+
+#[test]
 fn copies_are_siblings_with_new_numbers() {
     let mut t = Tree::new();
     t.add_root(1, spec(limits(64 * MIB, 8)), 0).unwrap();
@@ -378,6 +411,22 @@ fn labels_and_weights_are_checked() {
     assert_eq!(t.add_root(1, heavy, 0), Err(Error::Invalid));
     assert_eq!(t.add_root(HOST, Spec::default(), 0), Err(Error::Invalid));
     t.add_root(1, spec(limits(MIB, 1)), 0).unwrap();
+    let labelled = Spec {
+        label: Label::new(b"tools").unwrap(),
+        weight: 250,
+        egress: Egress::Full,
+        ..spec(limits(MIB, 0))
+    };
+    t.add_root(3, labelled.clone(), 0).unwrap();
+    let back = t.get(3).unwrap().spec();
+    assert_eq!(
+        back,
+        Spec {
+            ceiling: Some(Egress::Full),
+            ..labelled
+        },
+        "a node gives back its spec"
+    );
     let set = Spec {
         cpus: 0b1100,
         ..spec(limits(0, 0))

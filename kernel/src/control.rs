@@ -80,8 +80,9 @@ struct Server {
     decoder: Decoder,
     /// Frames and refusals read, not yet handled.
     items: Vec<Item>,
-    /// Whether frames go over the vsock stream (else the serial line).
-    on_vsock: bool,
+    /// The vsock connection frames go over, by its number (else the
+    /// serial line).
+    vsock: Option<u32>,
 }
 
 /// The control channel: the vsock stream while the host is connected to
@@ -90,17 +91,21 @@ mod link {
     use crate::arch::console::control as serial;
     use crate::vsock;
 
-    /// Whether the host is connected over vsock (the device is polled).
-    pub fn on_vsock() -> bool {
+    /// The host's vsock connection, if it is connected (the device is
+    /// polled).
+    pub fn connection() -> Option<u32> {
         vsock::poll()
     }
 
-    /// The next byte the host sent, if one is waiting.
-    pub fn read_byte() -> Option<u8> {
-        if vsock::poll() {
-            vsock::read_byte()
-        } else {
-            serial::read_byte()
+    /// The next byte the host sent on the channel `on` (a vsock
+    /// connection, else the serial line), if one is waiting; none once the
+    /// channel changed, so a new connection's bytes wait for its greeting
+    /// and a fresh decoder (`Server::read`).
+    pub fn read_byte(on: Option<u32>) -> Option<u8> {
+        match (vsock::poll(), on) {
+            (Some(_), Some(on)) => vsock::read_byte(on),
+            (None, None) => serial::read_byte(),
+            _ => None,
         }
     }
 
@@ -138,7 +143,7 @@ pub fn serve() {
         next: 1,
         decoder: Decoder::new(),
         items: Vec::new(),
-        on_vsock: false,
+        vsock: None,
     };
     // Cells may talk to the host's network as soon as they start.
     server.host.wire_address(10_000_000_000);
@@ -183,19 +188,20 @@ pub fn serve() {
             host,
             decoder,
             items,
-            on_vsock,
+            vsock,
             ..
         } = &mut server;
+        let on = *vsock;
         host.look_every(Some(every));
         host.run(|h| {
-            while let Some(byte) = link::read_byte() {
+            while let Some(byte) = link::read_byte(on) {
                 if let Some(item) = decoder.push(byte) {
                     items.push(item);
                 }
             }
             !items.is_empty()
                 || decoder.in_frame()
-                || crate::vsock::connected() != *on_vsock
+                || crate::vsock::connection() != on
                 || h.has_finished()
                 || (!watched.is_empty() && now_ns() >= flush_at)
                 || watched.iter().any(|&cell| h.has_output(cell))
@@ -205,19 +211,20 @@ pub fn serve() {
 
 impl Server {
     /// Reads what the host sent; a frame begun is read to its end. A new
-    /// vsock connection is greeted, and frames go there from then on.
+    /// vsock connection, even one that replaced another between two looks,
+    /// is greeted, and frames go there from then on.
     fn read(&mut self) {
-        let on_vsock = link::on_vsock();
-        if on_vsock != self.on_vsock {
-            self.on_vsock = on_vsock;
+        let vsock = link::connection();
+        if vsock != self.vsock {
+            self.vsock = vsock;
             self.decoder = Decoder::new();
-            if on_vsock {
+            if vsock.is_some() {
                 send(0, &Message::Hello { version: VERSION });
             }
         }
         let mut last = now_ns();
         loop {
-            match link::read_byte() {
+            match link::read_byte(self.vsock) {
                 Some(byte) => {
                     last = now_ns();
                     if let Some(item) = self.decoder.push(byte) {
@@ -683,8 +690,14 @@ fn describe(e: FormatError) -> String {
         FormatError::Truncated => String::from("truncated"),
         FormatError::BadMagic => String::from("not a Rhizo snapshot"),
         FormatError::Version(v) => format!(
-            "snapshot format version {v}; this kernel reads version {}",
-            rhizo_snapshot::VERSION
+            "snapshot format version {v}; this kernel reads versions {} and {}{}",
+            rhizo_snapshot::PREVIOUS,
+            rhizo_snapshot::VERSION,
+            if v < rhizo_snapshot::PREVIOUS {
+                " (convert it with `rhizo snapshot upgrade`)"
+            } else {
+                ""
+            }
         ),
         FormatError::Machine { expected, found } => format!(
             "taken on {}; this kernel runs on {}",

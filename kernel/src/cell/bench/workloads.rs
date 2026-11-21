@@ -39,9 +39,8 @@ pub(super) fn numpy() -> Option<(u64, u64)> {
             false,
         )
         .expect("spawn");
-    while host.output(template) != Some(b"ready\n") {
-        host.step();
-    }
+    host.run_to_pause(template, b"ready", Pause::Slice)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
     // Shipped by the host: its copies, each a root, share it (design D21
     // of `add-cell-hierarchy`).
@@ -89,9 +88,8 @@ pub(super) fn dynamic() -> Option<(u64, u64)> {
     let template = host
         .spawn_file(files, PATH, &[b"hello", b"wait"], &[], true, false)
         .expect("spawn");
-    while host.output(template) != Some(b"ready\n") {
-        host.step();
-    }
+    host.run_to_pause(template, b"ready", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
     // Shipped by the host: its copies, each a root, share it (design D21
     // of `add-cell-hierarchy`).
@@ -130,9 +128,8 @@ pub(super) fn workload() -> (u64, u64) {
     let template = host
         .spawn(image, &[b"libc_warm"], true, false)
         .expect("spawn");
-    while host.output(template) != Some(b"warm\n") {
-        host.step();
-    }
+    host.run_to_pause(template, b"warm", Pause::Slice)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
     // Shipped by the host: its copies, each a root, share it (design D21
     // of `add-cell-hierarchy`).
@@ -191,9 +188,8 @@ pub(super) fn python() -> Option<(u64, u64)> {
     let template = host
         .spawn_with_files(image, &argv, files(), true, false)
         .expect("spawn");
-    while host.output(template) != Some(b"warm\n") {
-        host.step();
-    }
+    host.run_to_pause(template, b"warm", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
     // Shipped by the host: its copies, each a root, share it (design D21
     // of `add-cell-hierarchy`).
@@ -256,9 +252,8 @@ pub(super) fn node(jit: bool) -> Option<(u64, u64, u64)> {
     // `warm` ended: the same state on every VMM (design D2 of
     // `fast-node-template`).
     let template = spawn(&mut host, argv);
-    while !(host.output(template) == Some(b"warm\n") && host.waits(template)) {
-        host.step();
-    }
+    host.run_to_pause(template, b"warm", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
     // Shipped by the host: its copies, each a root, share it (design D21
     // of `add-cell-hierarchy`).
@@ -308,9 +303,8 @@ pub(super) fn cpython() -> Option<(u64, u64)> {
     let template = host
         .spawn_with_files(image, &ARGV, files, true, false)
         .expect("spawn");
-    while host.output(template) != Some(b"warm\n") {
-        host.step();
-    }
+    host.run_to_pause(template, b"warm", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
     // Shipped by the host: its copies, each a root, share it (design D21
     // of `add-cell-hierarchy`).

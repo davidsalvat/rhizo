@@ -275,3 +275,31 @@ when forked, suspended and resumed between its steps.
 #### Scenario: A small JIT
 - **WHEN** `libc_jit` runs in a cell, plain, forked at `ready`, or suspended and resumed there
 - **THEN** every copy prints its expected output and exits with 0
+
+### Requirement: The host sees every turn of the agent
+The host running the CPython agent SHALL recognize the end of every turn,
+and its decision point, from the agent's output however that output
+reaches it, and SHALL suspend and resume the agent once after each turn.
+
+#### Scenario: A pause the host does not see
+- **WHEN** the agent's pause after its last turn passes before the host reads its output, so the turn's line and the decision point are read in one piece
+- **THEN** the host still suspends and resumes the agent after that turn before forking it, and the agent is suspended once per turn
+
+#### Scenario: Output split anywhere
+- **WHEN** the agent's output is read in pieces split at arbitrary bytes
+- **THEN** every turn's line is found exactly once, in order, and the decision point once, after the last turn
+
+### Requirement: Templates frozen at their pause
+A host that freezes a cell as a template after a line it prints (`warm`,
+`ready`, `start`) SHALL freeze it at the pause that follows that line,
+before the cell runs past it, however long the pause and however late the
+host reads the cell's output; a cell that ends or prints past the line
+before pausing SHALL be reported as such instead of being waited for.
+
+#### Scenario: A pause the host does not see
+- **WHEN** the pause after `warm` (a 1 ms sleep) is already over when the cell's sleep blocks, as on a loaded host
+- **THEN** the host still freezes the template asleep after `warm`, and every cell forked from it prints the whole answer
+
+#### Scenario: Output split anywhere
+- **WHEN** the cell's output is read in pieces split at arbitrary bytes
+- **THEN** the line is found once all of it has been read, never before, and every byte after it is counted

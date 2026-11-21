@@ -15,8 +15,11 @@ scope are noted where they apply: per-cell quotas (`add-cell-quotas`,
 closing S20, S21 and O1), KPTI and E0PD (`add-kpti`, closing the
 Meltdown part of O3), snapshots that refer to shared frames
 (`add-shared-snapshots`), the network review (`fuzz-wire-packets`,
-S22, S23) and the first cross-cell leaks closed (`close-cross-cell-leaks`,
-S24 to S26).
+S22, S23), the first cross-cell leaks closed (`close-cross-cell-leaks`,
+S24 to S26) and the control channel over virtio-vsock
+(`control-over-vsock`, reviewed in
+[The control channel over vsock](security.md#the-control-channel-over-vsock-b7-b8):
+S27, O8).
 
 ## 1. System overview
 
@@ -36,10 +39,10 @@ to the cell. There is no KASLR and no secrecy about the kernel's layout.
 ```text
  ┌──────────────────────────── host machine ────────────────────────────┐
  │  rhizo CLI ── Unix socket ── rhizo server                            │
- │                                  │ serial line (frames)              │
+ │                                  │ vsock or serial line (frames)     │
  │  ┌──────────────────────── VMM (trusted) ─────────────────────────┐  │
  │  │  ┌────────────────────── Rhizo kernel ──────────────────────┐  │  │
- │  │  │  control loop (rhizo-control) ◄── serial line            │  │  │
+ │  │  │  control loop (rhizo-control) ◄── vsock, serial line     │  │  │
  │  │  │  cell host, scheduler, SMP, snapshots (rhizo-snapshot)   │  │  │
  │  │  │  system calls (rhizo-abi), files (rhizo-fs)              │  │  │
  │  │  │  sockets (rhizo-net, smoltcp), virtio-net ◄── packets    │  │  │
@@ -60,8 +63,8 @@ to the cell. There is no KASLR and no secrecy about the kernel's layout.
 | B4 | **Cell files to program loader**: `Host::spawn_file` and `rhizo_abi::exec` start an executable and its `PT_INTERP` interpreter from the cell's own files | A cell that wrote those files | **Untrusted** (ELF headers are hostile). |
 | B5 | **Network packets to `smoltcp` and `rhizo-net`**: TCP, UDP, DHCPv4, Ethernet frames from the virtio-net card | Any host on the network the VM is attached to | **Untrusted.** Reviewed and fuzzed (`fuzz-wire-packets`, S22, S23). See note below. |
 | B6 | **virtio device to driver**: virtio-mmio and virtio-pci configuration, BARs, virtqueue rings | The VMM's device model | **Trusted**, reviewed for robustness only (a broken device must not crash the kernel). |
-| B7 | **Host control protocol to control kernel**: frames on the serial line (run, suspend, resume, fork, kill, freeze, save, load, write file, input, stats, shutdown); a save's or load's bytes on a TCP connection the host admits only from the guest with the request's one-time token (`snapshots-on-disk`) | The host's `rhizo` server, and anyone who can write to the VM's serial line or the server's Unix socket | **Trusted host**, but the decoder is treated as an attack surface (never panics, never allocates more than it receives). |
-| B8 | **Kernel to host on the serial line**: replies, cell output in frames, console text | The kernel; cell output travels inside it | Cells are untrusted: their output must never be able to forge a frame the host would act on. |
+| B7 | **Host control protocol to control kernel**: frames (run, suspend, resume, fork, kill, freeze, save, load, write file, input, stats, shutdown) on the connection the host makes to vsock port 1024 of a virtio socket device (`control-over-vsock`: always on Firecracker and Cloud Hypervisor, on QEMU when the host's `/dev/vhost-vsock` is usable), else on the serial line; under the frames, the vsock packets (headers, credit, resets) and the device's rings; a save's or load's bytes on a TCP connection the host admits only from the guest with the request's one-time token (`snapshots-on-disk`) | The host's `rhizo` server, and anyone who can write to the VM's serial line, the server's Unix socket or the VMM's vsock Unix socket (Firecracker, Cloud Hypervisor); on QEMU, any local user, since `AF_VSOCK` connections to a guest need no privilege (O8) | **Trusted host**, but the frame decoder and the vsock stream are treated as an attack surface (never panic, never allocate more than they receive, never send past the peer's credit or hold more than 256 KiB unread). |
+| B8 | **Kernel to host**: replies and cell output in frames, on the vsock connection when the host holds one, else on the serial line; console text, on the serial line only | The kernel; cell output travels inside it | Cells are untrusted: their output must never be able to forge a frame the host would act on. |
 | B9 | **VMM, firmware, hardware** | The hypervisor and CPU | **Trusted.** Out of scope. |
 
 Note on B5: [`security.md`](security.md) treats the network *device* as
@@ -87,7 +90,8 @@ the fuzzer is not coverage-guided and runs on the host.
 4. **A remote network peer**. Sends arbitrary packets to the VM's card, or
    answers a cell's outbound connection.
 5. **A local host user** who can reach the `rhizo` server's Unix socket
-   (low priority; see questions).
+   or, on QEMU, the control kernel's vsock port (low priority; see Q15,
+   Q17 and O8).
 
 ### What we promise
 
@@ -146,7 +150,7 @@ only), see section 4.
 | 6 | **Snapshot decode and restore** | B3 | `crates/rhizo-snapshot/src/lib.rs`, `crates/rhizo-fs/src/codec.rs`, `crates/rhizo-net/src/record.rs`; restore and lazy resume in `kernel/src/cell.rs` (`Lazy`, `Host::resume`, `Host::load_template`); the load path in `kernel/src/control.rs` (`Server::load_data`) | 574 + 535 + 239 = 1,348 (before `snapshots-on-disk`) | 609 (snapshot) | Fully attacker-controlled bytes: `rhizo load` reads them from a file. Validates the checksum, page records, threads, registers, the file tree and socket records; caps quotas. Fuzzed, no finding in D.2. Format version 10. |
 | 7 | **Sockets and the TCP/IP stack** (`rhizo-net`, `smoltcp`) | B2, B5 | `crates/rhizo-net/src/{lib,wire}.rs`, `kernel/src/wire.rs`, plus `smoltcp` 0.14 (features `medium-ethernet`, `proto-ipv4`, `socket-tcp`, `socket-udp`, `socket-dhcpv4`) | 1,389 + 548 + 159 = 2,096 (Rhizo) | 2,378 (with the fuzzer) | Shared by all cells: ports, backlogs, buffers, parked connections (S15, S21). Remote packets reviewed and fuzzed since `fuzz-wire-packets` (B5, S22, S23). |
 | 8 | **In-memory file system** (`rhizo-fs`, outside the codec) | B1, B2 | `crates/rhizo-fs/src/{lib,io}.rs` | 1,222 + 601 = 1,823 | 962 | Per-cell tree, descriptors, pipes, `epoll`, file blocks shared copy-on-write between forks; limits from S5. |
-| 9 | **Control protocol and control kernel** | B7, B8 | `crates/rhizo-control/src/lib.rs`, `kernel/src/control.rs`, UART receive in `kernel/src/arch/{x86_64,aarch64}/console.rs`; host side `cli/src/{serve,client,state}.rs` | 742 + 485 = 1,227 (kernel side); `cli` 1,698 in all | 494 (control) + 274 (cli) | Host is trusted, so the risk is in decoding robustness and in output framing (can a cell make kernel console text contain a frame?). Fuzzed by property tests; reviewed by neither D.1 nor D.2. |
+| 9 | **Control protocol and control kernel** | B7, B8 | `crates/rhizo-control/src/lib.rs`, `kernel/src/control.rs`, UART receive in `kernel/src/arch/{x86_64,aarch64}/console.rs`; the vsock channel `crates/rhizo-virtio/src/vsock.rs` and `kernel/src/vsock.rs` (`control-over-vsock`); host side `cli/src/{serve,client,state}.rs` | 742 + 485 = 1,227 (kernel side, before vsock), plus 501 + 187 = 688 (vsock, tests in their own file); `cli` 1,698 in all | 494 (control) + 274 (cli) + 781 (vsock) | Host is trusted, so the risk is in decoding robustness, output framing (can a cell make kernel console text contain a frame?) and who can reach the channel (O8). Fuzzed by property tests (frames; vsock packets and credit). The vsock layer was reviewed when it landed (S27, O8); the frame decoder and host framing were reviewed by neither D.1 nor D.2. |
 | 10 | **virtio drivers** | B6 | `crates/rhizo-virtio/src/{lib,pci}.rs` | 481 + 311 = 792 | 839 | Trusted device; robustness only. S17 found by the configuration-space fuzzer. |
 | 11 | **Boot-time parsing** | B9 | `crates/rhizo-core/src/{fdt,acpi,options}.rs`, `crates/rhizo-mm/src/memmap.rs` | 490 + 216 + 261 + 135 = 1,102 | 696 + 107 | Input from the trusted VMM and firmware. Listed for completeness; low priority. |
 
@@ -193,6 +197,11 @@ attacker code by definition and out of scope.
   covert-channel inventory of `add-cell-hierarchy`: what one cell can
   learn about another through `sysinfo`, ephemeral ports and the page
   cache, with hostile two-cell tests. Findings S24 to S26.
+- **The control channel over vsock (B7, B8, `control-over-vsock`).** The
+  vsock packet protocol and driver read as an auditor: hostile host-side
+  packets, credit overflows, resets, CIDs and ports, the host's
+  `/dev/vhost-vsock` policy, and what is and is not fuzzed. Finding S27
+  (fixed by `fix-vsock-reconnect`) and open finding O8.
 
 All are written up in [`security.md`](security.md), with the threat
 model, a per-call table of checks, each finding's reproduction and fix,
@@ -205,8 +214,8 @@ review's area table says how each area was reviewed.
 
 | Status | Findings |
 |---|---|
-| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S21, S22, S24, S25, S26 (Medium); S9, S10, S11, S17, S19, S20 (Low), S20 and S21 by `add-cell-quotas`; S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`); S24 to S26 by `close-cross-cell-leaks`. Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5), [Cross-cell leaks](security.md#cross-cell-leaks). |
-| Open | O1 remainder (a cell without a memory quota; file data outside the memory quota), O2 (call time proportional to what a cell holds), O3 remainder (side channels other than Meltdown, which `add-kpti` closed; an AArch64 CPU with neither E0PD nor CSV3 is reported, not protected), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies), the cross-cell channels left for `add-cell-hierarchy` (ports as one namespace, page-cache deduplication, shared pools' errors, timing). See [Known limitations](security.md#known-limitations-and-open-findings). |
+| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S21, S22, S24, S25, S26 (Medium); S9, S10, S11, S17, S19, S20 (Low), S20 and S21 by `add-cell-quotas`; S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`); S24 to S26 by `close-cross-cell-leaks`; S27 (Low) by `fix-vsock-reconnect` (PR #142, in review). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5), [Cross-cell leaks](security.md#cross-cell-leaks), [The control channel over vsock](security.md#the-control-channel-over-vsock-b7-b8). |
+| Open | O1 remainder (a cell without a memory quota; file data outside the memory quota), O2 (call time proportional to what a cell holds), O3 remainder (side channels other than Meltdown, which `add-kpti` closed; an AArch64 CPU with neither E0PD nor CSV3 is reported, not protected), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies), O8 (on QEMU any local user can take the control kernel's vsock connection while the host holds none), the cross-cell channels left for `add-cell-hierarchy` (ports as one namespace, page-cache deduplication, shared pools' errors, timing). See [Known limitations](security.md#known-limitations-and-open-findings). |
 
 ### Fuzzers (property tests)
 
@@ -225,6 +234,7 @@ kernel binary, and they are not coverage-guided.
 | `any_configuration_space_is_set_up_or_refused` | `rhizo-virtio` | virtio-pci configuration space and BAR sizes |
 | `hostile_headers_never_panic`, `ranges_outside_the_user_half_are_refused` | `rhizo-cell` | ELF headers; user ranges |
 | `any_bytes_never_panic`, `any_payload_never_panics`, `any_input_payload_is_bounded` | `rhizo-control` | Bytes on the control stream, payloads of every kind |
+| `hostile_packets_are_survived`, `credit_is_never_exceeded` | `rhizo-virtio` (`src/vsock/tests.rs`) | vsock packets with any addresses, operation, socket type, length and credit between the stream's writes and reads; credit updates with wrapping counters. Not in the weekly random-seed run (its filter `hostile::` misses them) |
 | `frames_from_the_wire_cannot_hurt_the_kernel`, `dhcp_replies_cannot_hurt_the_kernel` | `rhizo-net` (`src/hostile.rs`) | Valid, changed, cut, replayed and random Ethernet frames and floods next to two cells' sockets; DHCP replies to a card asking for a lease |
 
 Run them:
@@ -232,7 +242,7 @@ Run them:
 ```sh
 cargo test -p rhizo-abi -- hostile:: exec::
 cargo test -p rhizo-snapshot -- hostile::
-cargo test -p rhizo-virtio -- hostile::
+cargo test -p rhizo-virtio -- hostile:: vsock::
 cargo test -p rhizo-cell -- hostile
 cargo test -p rhizo-control
 cargo test -p rhizo-net -- hostile::
@@ -274,8 +284,12 @@ on a kernel access to a cell page.
 - Races are found only when an interleaving happens; CI runs QEMU, with
   software emulation where the runner has no KVM, whose memory ordering is stronger than some
   hardware's.
-- The control protocol (B7, B8) has not had a dedicated review. Remote
-  network input (B5) has, with a host fuzzer, but no coverage-guided one.
+- The control protocol (B7, B8) has had a review of its vsock transport
+  only (S27, O8); the frame decoder and the host's framing have not had a
+  dedicated review. The vsock driver is tested against chosen hostile
+  device cases, not fuzzed, and the kernel's vsock glue runs only in the
+  `control` test step. Remote network input (B5) has had a review, with a
+  host fuzzer, but no coverage-guided one.
 
 ## 6. Suggested priorities and questions
 
@@ -355,6 +369,13 @@ Ordered by what we most want answered.
   is created with the default umask. Should it be restricted?
 - Q16. Should the library crates that have no `unsafe` enforce it with
   `#![forbid(unsafe_code)]`?
+- Q17. The control channel over vsock (`crates/rhizo-virtio/src/vsock.rs`,
+  `kernel/src/vsock.rs`): can host-side packets or a misbehaving device
+  make the stream send past its peer's credit, hold more than it
+  advertises, or read one connection's bytes as another's (S27)? Is the
+  mitigation proposed for O8 (a secret only the host knows, presented
+  first on the connection) sound, and is anything else on the host able
+  to reach port 1024?
 
 ## 7. How to build and run everything
 
@@ -374,7 +395,7 @@ command takes `--arch aarch64` (default) or `--arch x86_64` right after
 | `cargo xtask test --only ktest` | Only the in-kernel suite (1 CPU). |
 | `cargo xtask test --only ktest-smp` | The in-kernel suite with 4 vCPUs (races, shootdowns). |
 | `cargo xtask test --only ktest-user-read` | Self-check: a kernel read of a cell page must fault (SMAP / PAN). Also `ktest-user-exec`. |
-| `cargo xtask --arch x86_64 test --only control` | `rhizo` driving a control kernel over the serial line (needs the CPython cell). |
+| `cargo xtask --arch x86_64 test --only control` | `rhizo` driving a control kernel over vsock where the VMM has a socket device (on QEMU, when `/dev/vhost-vsock` opens), else over the serial line (the agent part needs the CPython cell). |
 | `cargo xtask test --vmm firecracker` | The same on Firecracker (also `cloud-hypervisor`, `qemu-q35`; needs KVM). |
 | `cargo xtask run` | Boot a kernel with its console on standard output. `--gdb` waits for a debugger (QEMU). |
 | `cargo xtask ci` | Everything CI runs. Minutes. |
@@ -395,7 +416,7 @@ Hostile test programs are added in `cells/src/bin` and registered in
 2. **Proof-of-concept inputs** for every finding rated Medium or above, in
    a form we can turn into regression tests (a `cells/src/bin` program, a
    property-test case, or raw bytes).
-3. **Answers to Q1 to Q16**, including "looked, found nothing" with what
+3. **Answers to Q1 to Q17**, including "looked, found nothing" with what
    was examined, so we know what coverage the audit had.
 4. **Coverage notes**: which files and functions were reviewed in depth,
    which were skimmed, and which were not reached.
