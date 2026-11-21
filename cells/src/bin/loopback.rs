@@ -9,11 +9,12 @@
 //!   echo, print `pinged`;
 //! - `twice PORT`: as `ping PORT 2`, but print `once` and yield after the
 //!   first echo (where a host suspends it), then `twice` after the second;
-//! - `pair PORT N [wait]`: both in one cell, as two threads (each cell has a
+//! - `pair PORT N [wait|yield]`: both in one cell, as two threads (each cell has a
 //!   loopback network of its own, design D5 of `add-cell-hierarchy`): a
 //!   server thread does `serve PORT N` while the first thread does `ping
 //!   PORT N` (after sleeping an hour with `wait`, until the host wakes it
-//!   or a copy finds its sleep expired), then print `paired`;
+//!   or a copy finds its sleep expired; with `yield`, yielding after each
+//!   round trip, where a host may suspend it), then print `paired`;
 //! - `pair PORT twice`: the same, the first thread doing `twice PORT`;
 //! - `sibling PORT`: connect to 127.0.0.1:PORT once, expecting
 //!   `ECONNREFUSED` (another cell's listener is not in this cell's
@@ -78,7 +79,7 @@ extern "C" fn server_thread(_: usize) -> usize {
 
 /// Both ends in one cell: a server thread echoing `n` messages on `port`,
 /// and this thread as the client (`twice`: as `twice PORT`).
-fn pair(port: u16, n: usize, wait: bool, twice_mode: bool) -> i32 {
+fn pair(port: u16, n: usize, then: Option<&[u8]>, twice_mode: bool) -> i32 {
     SERVER_LISTENER.store(listen(port), Ordering::Release);
     SERVER_N.store(if twice_mode { 2 } else { n }, Ordering::Release);
     // Only the address is taken: the stack is the server thread's alone.
@@ -87,7 +88,7 @@ fn pair(port: u16, n: usize, wait: bool, twice_mode: bool) -> i32 {
         spawn_thread(server_thread, 0, top, 0, &SERVER_TID) > 0,
         "clone",
     );
-    if wait {
+    if then == Some(b"wait") {
         sleep_ns(3_600_000_000_000);
     }
     if twice_mode {
@@ -96,6 +97,9 @@ fn pair(port: u16, n: usize, wait: bool, twice_mode: bool) -> i32 {
         let c = connect(port, [127, 0, 0, 1]);
         for i in 0..n {
             round_trip(c, i);
+            if then == Some(b"yield") {
+                yield_now();
+            }
         }
     }
     join(&SERVER_TID);
@@ -217,8 +221,8 @@ fn main() -> i32 {
         Some(b"serve") => serve(port, n),
         Some(b"ping") => ping(port, n, arg(4).map_or([127, 0, 0, 1], ipv4)),
         Some(b"twice") => twice(port),
-        Some(b"pair") if arg(3) == Some(b"twice") => pair(port, 2, false, true),
-        Some(b"pair") => pair(port, n, arg(4) == Some(b"wait"), false),
+        Some(b"pair") if arg(3) == Some(b"twice") => pair(port, 2, None, true),
+        Some(b"pair") => pair(port, n, arg(4), false),
         Some(b"sibling") => sibling(port),
         _ => alone(),
     }

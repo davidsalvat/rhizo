@@ -902,6 +902,24 @@ fn a_change_wakes_only_the_waiters_of_its_socket() {
     assert_eq!(woken(&mut net), [2], "once, for the end of the stream");
 }
 
+/// A cell that woke its own waiters takes them off the woken ones (its
+/// threads run next in its slice); the others stay for the scheduler.
+#[test]
+fn a_cell_takes_its_own_woken_waiters() {
+    let mut net = Net::new();
+    let (c1, s1, _) = connection(&mut net, 23);
+    let (c2, s2, _) = connection(&mut net, 24);
+    wait_on(&mut net, 1, s1);
+    wait_on(&mut net, 2, s2);
+    net.send(c1, b"x", None).unwrap();
+    net.send(c2, b"x", None).unwrap();
+    net.end_call(|| None);
+    assert!(net.take_woken(1));
+    assert!(!net.take_woken(1), "taken once");
+    assert!(!net.take_woken(3), "never woken");
+    assert_eq!(woken(&mut net), [2]);
+}
+
 #[test]
 fn a_call_that_does_not_block_joins_no_queue() {
     let mut net = Net::new();

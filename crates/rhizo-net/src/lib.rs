@@ -507,6 +507,16 @@ impl Net {
         !self.woken.is_empty()
     }
 
+    /// Takes waiter `key` off the waiters woken since the last
+    /// [`drain_woken`](Self::drain_woken); returns whether it was there. A
+    /// cell whose call woke its own waiting threads wakes them itself, in
+    /// its slice.
+    pub fn take_woken(&mut self, key: u32) -> bool {
+        let before = self.woken.len();
+        self.woken.retain(|&k| k != key);
+        self.woken.len() != before
+    }
+
     /// Hands `f` the waiters woken by changes since the last call, in the
     /// order they were woken (a waiter may come more than once); the list
     /// keeps its room, so a change allocates nothing.

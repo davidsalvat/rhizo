@@ -245,11 +245,12 @@ fn suspended_every_step(host: &mut Host, argv: &[&[u8]], pause: Option<&str>) ->
 
 /// A loopback TCP connection between the two threads of a cell keeps
 /// working while the cell, both ends with it, is suspended and resumed
-/// after every scheduling step (cells no longer share a loopback network,
+/// after every scheduling step (its client yields after each round trip) (cells no longer share a loopback network,
 /// design D5 of `add-cell-hierarchy`).
 fn loopback_connection_across_suspend_of_one_end() {
     let mut host = Host::new();
-    let (output, resumes) = suspended_every_step(&mut host, &[b"pair", b"7304", b"20"], None);
+    let (output, resumes) =
+        suspended_every_step(&mut host, &[b"pair", b"7304", b"20", b"yield"], None);
     assert!(resumes >= 20, "suspended {resumes} times");
     assert_eq!(alloc::string::String::from_utf8_lossy(&output), "paired\n");
     drop(host);
