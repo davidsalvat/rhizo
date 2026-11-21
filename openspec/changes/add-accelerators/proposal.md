@@ -102,6 +102,19 @@ The architecture (design D1 to D3):
 - **Graphics and display.** Only compute and inference.
 - **Sharing one device across domains by time-slicing alone.**
 
+## Decisions
+
+Recorded from the user's review of the design (task 0.2):
+
+- **Architecture:** the host-side broker (D1, D2); no vendor driver in the
+  Rhizo kernel.
+- **Sharing across domains:** a device or hardware partition serves one
+  domain at a time and is scrubbed between domains; the operator may turn
+  on an explicit cross-domain override, off by default and audited (D5, D9).
+- **Order:** phases A to C start after `add-cell-hierarchy` and
+  `add-cell-modules`, which supply the capabilities and budgets they use;
+  phases D to F, which need GPU hardware, are decided after phase C.
+
 ## Capabilities
 
 ### New Capabilities

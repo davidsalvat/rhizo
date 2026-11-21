@@ -9,7 +9,7 @@ D11).
 ## 0. Design
 
 - [x] 0.1 Proposal, design (options, numbers, sources, decision table) and delta specs; verify with `openspec validate add-accelerators --strict`
-- [ ] 0.2 The user's decisions on the open choices (recommended architecture, the cross-domain override, phase order); verify by recording them in the proposal and `openspec validate add-accelerators --strict`
+- [x] 0.2 The user's decisions on the open choices (recommended architecture, the cross-domain override, phase order); verify by recording them in the proposal and `openspec validate add-accelerators --strict`
 
 ## 1. Phase A: broker and model sessions (no GPU)
 
