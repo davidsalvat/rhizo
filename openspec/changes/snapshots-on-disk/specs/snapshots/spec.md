@@ -3,10 +3,10 @@
 ## MODIFIED Requirements
 
 ### Requirement: Snapshot format
-A snapshot SHALL encode to a versioned byte sequence tagged with its
-architecture, independent of in-memory layouts, and decoding SHALL reject a
+A snapshot SHALL encode to a versioned byte sequence (format version 9)
+tagged with its architecture, independent of in-memory layouts, and decoding SHALL reject a
 sequence that is truncated, corrupted, of another version or of another
-architecture with an error naming the reason. The version SHALL be 9.
+architecture with an error naming the reason.
 
 #### Scenario: Wrong architecture
 - **WHEN** a snapshot taken on one architecture is decoded on the other
