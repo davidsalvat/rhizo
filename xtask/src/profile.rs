@@ -42,6 +42,7 @@ pub const COUNTED: &[(&str, &str, &str)] = &[
     ("rhizo-snapshot", "export_ns", "cell.snapshot_export"),
     ("rhizo-snapshot", "import_ns", "cell.snapshot_import"),
     ("rhizo-ops", "syscall_ns", "cell.syscall"),
+    ("rhizo-shares", "switch_ns", "cell.switch_domains"),
     ("rhizo-ops", "cow_fault_ns", "cell.cow_fault"),
 ];
 
