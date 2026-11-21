@@ -57,7 +57,7 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `workload.node_warm_us/rhizo/<vmm>` | timing | The same answer from a cell forked off Node.js frozen after its warm-up (its seven threads included) |
 | `workload.node_jit_cold_us/rhizo/<vmm>` | timing | `workload.node_cold_us` with V8's JIT (no `--jitless`): its code in write-or-execute pages, each changed between writing and running on a fault, never both (change `node-jit`) |
 | `workload.node_jit_warm_us/rhizo/<vmm>` | timing | `workload.node_warm_us` with V8's JIT, from a template frozen after a warm-up with its JIT |
-| `workload.node_jit_flips/rhizo/<vmm>` | rate | Changes of write-or-execute pages between writing and running (faults that flip a page) in one cold run of Node.js with its JIT, counted in a run of its own after the timed ones: what W^X costs the JIT, in faults |
+| `workload.node_jit_flips/rhizo/<vmm>` | rate | Write-or-execute pages made running by an instruction fetch in one cold run of Node.js with its JIT (each made writing by a write before: about twice as many faults in all), counted in a run of its own after the timed ones: what W^X costs the JIT, in faults |
 | `cell.switch_untagged_ns/rhizo/<vmm>` | timing | The same without tags (TLB flushed on every switch): the baseline the tags are measured against |
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |

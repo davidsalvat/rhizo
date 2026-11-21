@@ -104,9 +104,16 @@ change is done), and walk the tables, while the first only returns to its
 instruction. The test cell `libc_jit` measures it: one thread runs a
 function in a page while another writes a second function in the same
 page, both a fixed number of times; both finish, and the kernel counts the
-changes (`Count::WxFlips`). Measured on QEMU (design D10), the bounce
-costs time but never stalls; no bound beyond that is needed. If it ever
-were, V8's `--no-concurrent-sparkplug` avoids the pattern.
+changes (`Count::WxFlips`, changes to running). Measured on QEMU
+(counting both directions at the time): two runs of `libc_jit` make 812
+changes on one CPU, 814 (x86_64) and 820 (AArch64) on four, where the
+two threads of the bounce run on two CPUs at once. The 200 turns of each
+run account for 800 of them; 2000 rounds of writing next to running code
+add at most 10 more, because a change costs far more than the 2000
+writes or calls it interrupts: the writer finishes its loop between two
+of the runner's faults. Both threads always finished; no bound beyond
+the fault path's own cost is needed. If one ever were, V8's
+`--no-concurrent-sparkplug` avoids the pattern.
 
 ## D5. Write-or-execute memory backed on first touch
 
@@ -219,7 +226,21 @@ its own page), suspended and resumed eagerly and lazily, and on 4 CPUs
 exactly as `workload.node_cold_us` and `workload.node_warm_us` (which keep
 `--jitless`), without the flag, in the same `node` benchmark kernel
 (`--workload node` measures all of them; its line `rhizo-node-jit`).
-`workload.node_jit_flips` is the number of changes between writing and
-running in one more cold run, counted after the timed ones (counting adds
-to every system call), the cost in faults that W^X adds to the JIT.
-Figures from CI are in the pull request.
+`workload.node_jit_flips` is the number of pages made running in one
+more cold run, counted after the timed ones (counting adds to every
+system call): the faults W^X adds to the JIT, about twice that with the
+writes that made them writing. Figures from CI are in the pull request;
+under QEMU without KVM (x86_64, one run) the JIT costs 381 ms cold
+against 369 ms with `--jitless`, 124 ms warm against 133 ms, with 33
+changes (both directions) per cold run: under TCG the JIT's code is
+emulated like the interpreter, so only KVM figures say what it buys.
+
+The fault paths add nothing to the hot paths but where the compiler's
+register allocation moved: against `origin/main` under `-icount`,
+x86_64 `cell.syscall_insns` +7 instructions (+2.1%), `cell.pipe_rtt_insns`
++2.6%, `cell.loopback_rtt_insns` +1.3%, `cell.fork_insns` and
+`cell.spawn_from_template_insns` +0.5% (a range list per cell);
+`cell.cow_fault_insns` -2.4% and `cell.resume_insns` -1.9% (the record
+offset read once). AArch64 stays within its gate. The six x86_64 metrics
+that crossed their 2% gate (main sits up to 1.6% above its baseline)
+have their baseline moved by the ratio measured against main.

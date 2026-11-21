@@ -4,7 +4,7 @@
 Where Node.js is packed, `cargo xtask bench` SHALL report the times of
 `workload.node_cold_us` and `workload.node_warm_us` measured the same way
 with V8's JIT (`workload.node_jit_cold_us`, `workload.node_jit_warm_us`),
-and the changes of write-or-execute pages between writing and running in
+and the write-or-execute pages made running by a fault in
 one cold run with the JIT (`workload.node_jit_flips`), from the same
 kernel; where it is not packed, they SHALL be listed as skipped with the
 reason.

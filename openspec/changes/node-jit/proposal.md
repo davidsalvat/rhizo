@@ -53,8 +53,8 @@ JIT (V8, LuaJIT, PyPy, the JVM) is in the same place.
   `a_node_cell_suspends_resumes_and_forks`) and the differential check run
   Node.js without `--jitless`. The benchmarks keep the `--jitless`
   figures and add `workload.node_jit_cold_us`,
-  `workload.node_jit_warm_us` and `workload.node_jit_flips` (state changes
-  of write-or-execute pages in one cold run).
+  `workload.node_jit_warm_us` and `workload.node_jit_flips` (pages made
+  running by a fault in one cold run).
 
 ### Out of scope
 
