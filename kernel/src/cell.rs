@@ -787,6 +787,14 @@ impl Pager<Format, DirectMap> for CellPager<'_, '_> {
     }
 }
 
+/// The instruction at `pc` in the cell with tables `pt`, if it is mapped
+/// (for the faults the kernel answers by emulating the instruction).
+fn instruction(pt: &PageTable<Format>, pc: u64) -> Option<u32> {
+    let mut word = [0; 4];
+    rhizo_cell::memory::copy_from(pt, &DirectMap, pc, &mut word).ok()?;
+    Some(u32::from_le_bytes(word))
+}
+
 /// Grows the stack of the cell with tables `pt` to cover `addr` (design D5
 /// of `add-cpython`), if memory allows.
 fn grow_stack(pt: &PageTable<Format>, addr: u64) -> bool {
@@ -1370,6 +1378,11 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     live.clean = flushed_on(cpu);
                     continue;
                 }
+                Trap::Fault(fault)
+                    if fault.emulate(live.cell.regs_mut(), |pc| instruction(&pt, pc)) =>
+                {
+                    continue;
+                }
                 Trap::Fault(fault) => {
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
@@ -1824,6 +1837,12 @@ fn run_gang(
                         break None;
                     }
                 }
+                // Under the cell lock: no other CPU changes its tables.
+                Trap::Fault(fault)
+                    if gang.locked(shared, ptr, |_| {
+                        let pt = PageTable::<Format>::from_root(gang.root);
+                        fault.emulate(&mut regs, |pc| instruction(&pt, pc))
+                    }) => {}
                 Trap::Fault(fault) => {
                     if !gang.locked(shared, ptr, |cell| cell.fault(gang, cpu, &fault)) {
                         break None;

@@ -29,7 +29,8 @@ calls was needed: numpy and requests run on C.1's as they are, and the
 tests below hold that. The one call they make that Rhizo does not
 implement is `mbind` (OpenBLAS placing its buffers on a NUMA node): it
 fails with `ENOSYS`, as on a Linux kernel built without NUMA, and
-OpenBLAS goes on without it.
+OpenBLAS goes on without it. One gap was found on AArch64 only: what a
+program learns of the CPU (D8).
 
 Which CPython: the distribution's `python3` is already packed by
 `add-dynamic-linking`, but its version is the runner's (3.12 on Ubuntu
@@ -182,6 +183,50 @@ process that imported numpy and forks one child per request, which runs
 the script's computation and exits. They report `workload.numpy_cold_us`
 and `workload.numpy_warm_us` for guest `linux-process`, VMM
 `firecracker`.
+
+## D8. What a program learns of the CPU (AArch64)
+
+numpy faulted on AArch64 only, reading address 0 inside `libc`. OpenBLAS
+picks its kernels from the CPU's `MIDR_EL1`. When `AT_HWCAP` lacks
+`HWCAP_CPUID` it looks in `/sys/devices/system/cpu` and then
+`/proc/cpuinfo` instead, and calls `fgets` on the `NULL` the second
+`fopen` returns: Rhizo gave no `AT_HWCAP` and has neither directory.
+Linux tells every AArch64 program `HWCAP_CPUID` and answers its reads of
+ID registers, which EL0 cannot make, by emulating the instruction (the
+"CPU feature registers" ABI). Rhizo now does the same:
+
+- `AT_HWCAP` (`rhizo_cell::elf::Machine::hwcap`, set by `start_at` for
+  every cell, static or dynamic) is `HWCAP_FP | HWCAP_ASIMD |
+  HWCAP_CPUID` on AArch64. Nothing more: a capability Rhizo does not
+  enable at EL0 (SVE, SME, MTE) must not be announced, or glibc's string
+  functions would pick SVE code that traps. The other features of the CPU
+  stay unannounced (no `AES` or `ATOMICS` bits): programs use their
+  baseline code, correct and slower; deriving the bits from the ID
+  registers is left for later. On x86_64 nothing changes: programs ask
+  the CPU with `CPUID`, which runs at ring 3, and the auxiliary vector
+  keeps its shape (static cells' stacks are what they were).
+- A read of an ID register by cell code (`MRS Xt, <reg>`, op0 3, op1 0,
+  CRn 0, CRm 0 to 7) arrives as an undefined instruction (class 0x0,
+  decoded from the instruction, read through the cell's tables) or, on
+  CPUs with FEAT_IDST, as a trapped system register access (class 0x18,
+  decoded from the syndrome). `rhizo_core::exception::IdRegisterRead`
+  decodes both (host tests). The kernel answers as Linux does:
+  `MIDR_EL1` and `REVIDR_EL1` as the CPU has them, `MPIDR_EL1` with only
+  bit 31 (no CPU number: a cell may run on any CPU, and moves), and every
+  other register as zero, where Linux shows the sanitized fields of the
+  features it announces: none here beyond FP and Advanced SIMD, whose
+  "implemented" value is zero. The value goes to `Xt` (none for `XZR`) and
+  the cell resumes after the instruction; under the cell lock when its
+  threads run on several CPUs, so its tables do not change meanwhile.
+  Anything else stays a fault.
+
+glibc reads `MIDR_EL1` once at start when `HWCAP_CPUID` is set, so every
+glibc program on AArch64, static or dynamic, now takes one such exception
+at start (a few hundred instructions next to the millions of a start).
+glibc also picks some string functions by CPU model (`MIDR_EL1`, zero
+until now): under QEMU, where CI runs AArch64, none of its models
+matches and the choice is unchanged; on hardware glibc picks what it
+picks on Linux.
 
 ## D7. Still missing for "pip install X in a cell"
 

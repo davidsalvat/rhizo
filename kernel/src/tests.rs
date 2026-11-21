@@ -82,6 +82,7 @@ macro_rules! suite {
             ktest_case!(fork_allocates_only_a_root),
             ktest_case!(spawn_from_template_runs_like_the_program),
             ktest_case!(real_libc_programs_behave_as_on_linux),
+            ktest_case!(cells_learn_the_cpu_as_on_linux),
             ktest_case!(fp_state_is_private_to_each_cell),
             ktest_case!(fp_state_survives_suspend_and_resume),
             ktest_case!(warm_template_of_a_real_program),
@@ -1051,6 +1052,14 @@ fn real_libc_programs_behave_as_on_linux() {
     for name in ["libc_hello", "libc_alloc", "libc_float"] {
         run_expected(name);
     }
+}
+
+/// What a program learns of the CPU is what Linux tells it (spec
+/// `linux-abi`, CPU features): on AArch64, `AT_HWCAP` with FP, Advanced
+/// SIMD and `HWCAP_CPUID`, and ID registers read at EL0 answered by the
+/// kernel (`MIDR_EL1` the CPU's, `MPIDR_EL1` only bit 31).
+fn cells_learn_the_cpu_as_on_linux() {
+    run_expected("libc_hwcap");
 }
 
 /// Two FP programs holding values in FP/SIMD registers across yields, run

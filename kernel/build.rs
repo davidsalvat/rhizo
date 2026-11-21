@@ -10,15 +10,16 @@ const OPTIONAL: [&str; 6] = [
     "packages-files",
 ];
 /// Cells embedded in test kernels only (`ktest`): elsewhere they read as
-/// not built, and take no memory from the cells a benchmark runs (its guest
-/// has 128 MiB, and the 50 MiB fork benchmark needs most of it). The C
+/// not built, and take no memory from the cells a benchmark runs (the
+/// 50 MiB fork benchmark and numpy need most of its guest's). The C
 /// cells here are those no benchmark runs.
-const TEST_ONLY: [&str; 8] = [
+const TEST_ONLY: [&str; 9] = [
     "distro-files",
     "libc_alloc",
     "libc_deep_stack",
     "libc_files",
     "libc_float",
+    "libc_hwcap",
     "libc_hello",
     "libc_net",
     "libc_threads",

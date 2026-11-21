@@ -65,6 +65,27 @@ impl UserFault {
         ((esr >> 26) & 0x3f == 0x24 && permission && write).then_some(self.0.far)
     }
 
+    /// Answers the cell's read of an ID register (`MRS Xt, MIDR_EL1`...,
+    /// which EL0 cannot do; `HWCAP_CPUID` tells programs they may, as on
+    /// Linux): the value goes to `regs`, which then resume after the
+    /// instruction. `insn` reads the instruction at an address of the cell.
+    /// Returns whether the fault was such a read.
+    pub fn emulate(&self, regs: &mut Registers, insn: impl FnOnce(u64) -> Option<u32>) -> bool {
+        let Some(read) = exception::IdRegisterRead::decode(self.0.esr, || insn(self.0.elr)) else {
+            return false;
+        };
+        let (midr, revidr): (u64, u64);
+        // SAFETY: reading two ID registers at EL1 has no side effect.
+        unsafe {
+            asm!("mrs {}, midr_el1", "mrs {}, revidr_el1", out(reg) midr, out(reg) revidr, options(nomem, nostack));
+        }
+        if let Some(rt) = regs.gpr.get_mut(read.rt) {
+            *rt = read.value(midr, revidr);
+        }
+        regs.pc += 4;
+        true
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_aarch64(console, cell, &self.0);

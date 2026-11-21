@@ -32,6 +32,12 @@ imported numpy once saves.
   dynamic packing finds a library a file's run path names relative to the
   file (`$ORIGIN`) in the tree. The result is `packages-files`, a cell file
   system with CPython, `ld.so` and every library they need.
+- **CPU features on AArch64**: OpenBLAS faulted without `HWCAP_CPUID`
+  (it falls back to `/proc` and `/sys`, which cells lack, and does not
+  check `fopen`). Cells now get `AT_HWCAP` with FP, Advanced SIMD and
+  `HWCAP_CPUID`, and the kernel answers their reads of ID registers
+  (`MIDR_EL1`...) as Linux does, emulating the instruction EL0 cannot
+  run. x86_64 is unchanged (`CPUID` runs in ring 3).
 - **Tests**: in-kernel tests that numpy's computation (array operations, a
   linear solve, a ufunc, a matrix product through OpenBLAS) prints what it
   prints on Linux, that `requests.get` reaches the host's fake model
@@ -70,12 +76,18 @@ None.
 - `benchmarks`: numpy metrics.
 - `comparisons`: numpy as a Linux process in the same VM.
 - `files`: the bound on a cell's file data.
+- `linux-abi`: CPU features as Linux tells them (AArch64 `AT_HWCAP`, ID
+  registers read at EL0).
 
 ## Impact
 
-`crates/rhizo-fs` (`DATA_MAX`), `xtask/src/packages.rs` (new), `xtask/src/{cpython,dynamic,differential,bench,compare,lib,vmm}.rs`,
+`crates/rhizo-fs` (`DATA_MAX`), `crates/rhizo-cell` (`AT_HWCAP`),
+`crates/rhizo-core` (`IdRegisterRead`), `kernel/src/arch/*/user.rs`
+(`UserFault::emulate`), `xtask/src/packages.rs` (new),
+`xtask/src/{cpython,dynamic,differential,bench,compare,lib}.rs`,
 `cells/python/{numpy_demo,requests_demo,pack_stdlib}.py`,
-`cells/expected.rs`, `kernel/build.rs`, `kernel/src/{cell,tests}.rs`,
+`cells/c/libc_hwcap.c`, `cells/expected.rs`, `kernel/build.rs`,
+`kernel/src/{cell,tests}.rs`,
 `bench/host/linux_numpy.c`, `bench/host/numpy_forkserver.py`,
 `bench/README.md`, `.github/workflows/ci.yml` (the CPython cache key
 covers the pinned wheels). No change to the loader or the system calls

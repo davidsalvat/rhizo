@@ -9,6 +9,8 @@
 
 - [ ] 2.1 In-kernel tests `numpy_from_a_wheel_computes_as_on_linux`, `requests_gets_from_the_host_as_on_linux` and `a_cell_that_imported_numpy_suspends_resumes_and_forks` (D5); test VMs with 1 GiB, the tests that fill memory run with 96 MiB free (D4); verify `cargo xtask test --only ktest` and `cargo xtask test --only ktest-smp` on both architectures
 
+- [ ] 2.2 AArch64 CPU features (D8): `Machine::hwcap` and `AT_HWCAP` in the initial stack, `IdRegisterRead` decoding both exception classes, `UserFault::emulate` (both architectures) in the single-CPU and gang paths, `cells/c/libc_hwcap.c` and the in-kernel test `cells_learn_the_cpu_as_on_linux`; verify `cargo test -p rhizo-core id_register`, `cargo test -p rhizo-cell stack_tells`, `cargo xtask --arch aarch64 test --only ktest` and the numpy tests on AArch64 in CI
+
 ## 3. Benchmarks and documentation
 
 - [x] 3.1 `rhizo-numpy` line of the `bench-cell` kernel and `workload.numpy_cold_us`, `workload.numpy_warm_us` in `xtask/src/bench.rs` with a parser test; the cell benchmark VM with 512 MiB (D4); verify `cargo test -p xtask numpy`
