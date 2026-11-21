@@ -142,6 +142,7 @@ jobs:
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT: ${{ github.event_name }}
         run: |
+          # shellcheck disable=SC2016 # backticks in printf formats are Markdown
           title="bench: timing gate failing on main"
           good=$(gh api "repos/$REPO/actions/workflows/bench.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty')
           if [ -n "$good" ]; then

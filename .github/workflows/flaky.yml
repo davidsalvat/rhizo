@@ -34,6 +34,7 @@ jobs:
           WORKFLOW: ${{ github.event.workflow_run.name }}
           URL: ${{ github.event.workflow_run.html_url }}
         run: |
+          # shellcheck disable=SC2016 # backticks in printf formats are Markdown
           for ((a = 1; a < ATTEMPT; a++)); do
             gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$a/jobs?per_page=100" \
               --jq '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)\t\(.html_url)\t\([.steps[] | select(.conclusion == "failure") | .name] | join(", "))"' |
