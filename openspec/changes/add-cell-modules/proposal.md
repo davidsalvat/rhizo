@@ -36,6 +36,12 @@ there. This change adds the module-specific parts:
   agent's limits, and allow entries with version prefixes, caps, `ask`,
   `egress = "granted"`). It is cell state, inherited only as a subset.
   Adding a module never widens egress.
+- **Module children start with nothing.** A module child gets an empty
+  module policy and no `spawn` right: when it needs another capability it
+  asks its agent, which may add it as a sibling and pass an attenuated
+  handle. Delegation of a subset of the agent's whitelist and a slice of
+  its module budget is explicit, opt-in, audited and shown in
+  `rhizo ps --tree` (D3a).
 - **Signed catalogue.** Module files are snapshot files plus a canonical
   manifest, signed with minisign (Ed25519). Keys stay on the host; cells
   and the kernel never hold them. `rhizo module load` verifies
@@ -61,7 +67,8 @@ there. This change adds the module-specific parts:
   - `load`, `build [--twice]`, `review`, `approve`, `request`, `list`;
   - `rhizo approvals`, `approve`, `deny`;
   - `rhizo run --modules FILE`.
-- **Tests:** add, refusals, approval paths, "`requests` grants no
+- **Tests:** add, refusals, module children asking their agent,
+  delegation bounds, approval paths, "`requests` grants no
   internet", signatures, builder egress and reproducibility, private pip,
   the static chat transcript.
 - **Benchmarks:** `module.add_us`, `module.extra_bytes`,
@@ -101,6 +108,12 @@ The rule is **design for production, not just the proof of concept**.
    - where keys live on the host.
 
    Module events go to the audit log of `add-cell-hierarchy`.
+5. **What a module child gets by default:** an empty module policy and
+   no `spawn` right. It asks its agent, which decides and adds the module
+   as a sibling of the requester, so the tree stays flat, the budget stays
+   whole and the least trusted cells choose nothing. Delegation is
+   opt-in, bounded by the delegator at every level, and meant for
+   orchestrator-style agents (D3a).
 
 ## Capabilities
 

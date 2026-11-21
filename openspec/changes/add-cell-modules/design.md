@@ -31,6 +31,15 @@ not just the proof of concept**:
    keys live) is specified (D4a). Module events go to the audit log of
    H-D18.
 
+Decided after the second review:
+
+9. A module child gets an empty module policy and no `spawn` right by
+   default. When it needs another capability, it asks its agent, which
+   adds it as a sibling if it agrees (D3a).
+10. Delegation is opt-in: an agent may give a module a subset of its own
+    whitelist and a slice of its module budget, for orchestrator-style
+    agents (D3a).
+
 ## D1. A module is a template, used as a child cell
 
 A **module** is a frozen cell (a template) with a manifest. Adding it to an
@@ -163,10 +172,10 @@ or the host").
 Alternatives:
 
 - **The parent as broker for every request**, holding template handles
-  and spawning itself. Rejected as the default: every capability would
-  wake another cell, and an agent at the root has no parent to ask. It
-  remains possible, since a parent with the `spawn` right can do
-  exactly that with H-D10.
+  and spawning itself. Rejected for the agent's own requests: every
+  capability would wake another cell, and an agent at the root has no
+  parent to ask. It is, however, the default for a module child's
+  requests (D3a): there the agent's judgement is the point.
 - **A new system call.** Rejected for the reasons given in H-D10.
 
 ## D3. Whitelist and budget format
@@ -201,8 +210,10 @@ ask     = true        # every add needs approval
 [[allow]]
 module  = "pip-tools"
 egress  = "granted"   # may get egress within the agent's, no approval
-modules = false       # the child gets no module policy (the default)
 ```
+
+A module added from these entries gets an empty policy unless the add
+request delegates one (D3a).
 
 **Rules.**
 
@@ -224,6 +235,86 @@ modules = false       # the child gets no module policy (the default)
 - In a snapshot or a fork the policy travels with the cell. A snapshot
   loaded from bytes gets its policy intersected with what its new parent
   allows (H-D13).
+
+## D3a. What a module child gets: nothing by default
+
+A module child (Data analysis, Coding tools, Browser, Documents, an MCP
+tool cell) runs code a model wrote. It is the least trusted cell of the
+tree, so by default it gets:
+
+- an **empty module policy**: no entries and a budget of zero;
+- a kernel endpoint with the `modules` right only, and **no `spawn`
+  right**: every `add` it sends fails the whitelist check with `EACCES`,
+  and the refusal is an audit record (H-D18).
+
+**When a module needs another capability, it asks its agent**, over the
+channel that already joins them, in whatever words its interface uses.
+The agent decides. If it agrees, it adds the module itself, as **another
+child of its own**: a sibling of the requester, carved from the agent's
+own module budget. It may then pass the requester a handle to the new
+sibling over their channel, attenuated with `derive` (H-D9): for
+example a cell handle with the `message` right only, so the requester can
+open a channel to its sibling but cannot observe, feed or control it.
+
+```text
+default: the module asks its agent      opt-in: the agent delegates
+agent                                   agent
+├── browser ─ "need documents" ─► agent └── coder   (delegated: python,
+│      ◄─ cell/docs, message only                    numpy; 2 children)
+└── docs     (added by the agent)           ├── python   (grandchild)
+                                            └── numpy    (grandchild)
+```
+
+Why this default:
+
+- the agent understands the whole task, and a module sees only its part;
+- modules run model-generated code, so they should not decide on their
+  own which further capabilities to create;
+- budgets do not fragment: one module budget, held by the agent;
+- the tree stays flat, and an operator reading `rhizo ps --tree` or the
+  audit log sees every capability as a direct child of the agent that
+  chose it.
+
+**Opt-in delegation.** An `add` request may carry a `delegate` section, in
+the policy structure of D3: entries and a budget. The policy of a root
+agent is the operator's delegation to it; an agent delegates to a module
+in the same way. The kernel checks, at every level:
+
+- **entries**: each delegated entry matches one of the delegator's, with a
+  version prefix at least as long, caps no higher, `ask` kept, and
+  `egress = "granted"` only where the delegator's entry has it;
+- **budget**: the slice is carved from what is left of the delegator's
+  module budget, on top of the module's own limits, and given back when
+  the module ends;
+- **egress**: the module's grandchildren get at most the module's egress,
+  which is at most the delegator's (D2);
+- **approval**: sensitive adds of the module go to its approver, which is
+  the delegator or the host; if the delegator's approver is the host, it
+  stays the host, and a root's sensitive modules always go to the
+  operator (D2);
+- **depth**: the tree depth limit of 16 (H-D19) applies, with `EMLINK`.
+
+A request past any of these is refused with its reason (`EACCES` for
+entries and egress, `EDQUOT` for the budget) and nothing is made. A
+delegation grants no `spawn` right: the module can add only modules,
+which become the agent's grandchildren under the same rules.
+
+Delegation is explicit and visible: the audit record of the add carries
+the delegated entries and budget, and `rhizo ps --tree` marks a module
+holding a delegated policy with its entries and budget. It is meant for
+orchestrator-style agents that hand a sub-task, with its own budget, to a
+module that plans on its own.
+
+Alternatives:
+
+- **Modules inherit the agent's whitelist by default.** Rejected: the
+  least trusted cell would decide what to create, budgets would split
+  across the tree without the agent knowing, and the tree would grow deep.
+- **Modules ask the kernel, and the agent approves each add.** Rejected
+  as the default: grandchildren would still deepen the tree and fragment
+  the budget, and the agent would approve requests without having chosen
+  the capability. With delegation the same thing is available when
+  wanted.
 
 ## D4. The catalogue, the kernel's module table and signing
 
@@ -569,6 +660,14 @@ authority:
 - **Refusals.** A module not in the whitelist, one over the budget's
   children or memory, an unsigned module, and one whose request asks for
   egress beyond the agent's are each refused with their reason.
+- **Module children ask their agent.** A module with the default policy
+  sends `add` and is refused with `EACCES`; the agent then adds the
+  module as a sibling and passes a message-only handle, with which the
+  requester opens a channel but cannot observe or control its sibling.
+- **Delegation.** A module given a delegated policy adds a grandchild
+  within its slice. Delegations that name an entry the agent lacks, a
+  budget above what is left, or egress above the agent's are refused,
+  and so is an add past depth 16.
 - **`requests` grants nothing.** An agent with egress `model` adds
   `requests` (approved). The child's connection to any host other than
   the model fails with `EACCES`.

@@ -9,11 +9,14 @@ questions (proposal, "Decisions taken by the user").
 - [x] 0.1 Proposal, design and delta specs, and the modules section of `docs/cell-hierarchy.md`; verify with `openspec validate add-cell-modules --strict`
 - [x] 0.2 The user's decisions recorded (operator approval for roots, Rhizo's own package proxy, static chat as default) with key management (D2, D4a, D5a, D6); verify with `openspec validate add-cell-modules --strict`
 
+- [x] 0.3 The default for module children (empty policy, no `spawn`, ask the agent) and opt-in delegation recorded (D3a); verify with `openspec validate add-cell-modules --strict`
+
 ## 1. Modules and requests
 
 - [ ] 1.1 Module policy (budget, entries, approver) in `rhizo-cap`, with subset and intersection (D3); verify `cargo test -p rhizo-cap module_policy` (property: a child's policy never exceeds its parent's)
 - [ ] 1.2 Kernel module table; the `add` request on the kernel endpoint with the `modules` right; whitelist, catalogue, budget and egress checks; spawn and channel (D1, D2); verify the in-kernel `modules_are_child_cells` on both architectures
 - [ ] 1.3 Approvals: the parent's `approvals` channel, host events, deadline, one pending request per cell, the operator always for roots, audit records (D2); verify the in-kernel `module_approvals` and `root_adds_need_the_operator` and the `control` test step (`rhizo approve`, `deny`)
+- [ ] 1.3a Module children: empty policy and no `spawn` by default; the `delegate` section of `add` with its entry, budget, egress, approver and depth checks, audit records and `rhizo ps --tree` (D3a); verify `cargo test -p rhizo-cap delegation` (property: a delegated policy never exceeds its delegator's), the in-kernel `module_child_asks_its_agent` and `delegated_grandchildren`, and the `control` test step (`ps --tree`)
 - [ ] 1.4 `exec` and `repl:python` interfaces, `rhizo_module.py` and `rhizo-mod` (D1); verify the in-kernel `numpy_as_a_capability` with CPython built
 - [ ] 1.5 File-only modules as snapshot views (D1); verify the in-kernel `file_only_module`
 - [ ] 1.6 Snapshot format version 14: module policy, with its upgrade step from 13 and a recorded version-13 file (D7, H-D20); verify `cargo test -p rhizo-snapshot module_policy` and `version_13_file_upgrades`
