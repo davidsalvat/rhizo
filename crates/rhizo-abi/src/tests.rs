@@ -451,6 +451,29 @@ fn x86_64_numbers_and_registers() {
 }
 
 #[test]
+fn call_numbers_names_and_socket_calls_for_reports() {
+    let mut w = World::new(Arch::X86_64);
+    w.cell.regs_mut().gpr[0] = 41;
+    assert_eq!(Arch::X86_64.call_number(&w.cell), 41);
+    assert_eq!(
+        format!("{:?}", Arch::X86_64.call_name(41).unwrap()),
+        "Socket"
+    );
+    assert_eq!(
+        format!("{:?}", Arch::Aarch64.call_name(63).unwrap()),
+        "Read"
+    );
+    assert!(Arch::X86_64.call_name(9999).is_none());
+    assert!(Arch::X86_64.is_socket_call(41));
+    assert!(Arch::Aarch64.is_socket_call(206), "sendto");
+    assert!(
+        !Arch::Aarch64.is_socket_call(63),
+        "read is not only for sockets"
+    );
+    assert!(!Arch::X86_64.is_socket_call(9999));
+}
+
+#[test]
 fn clocks_uname_random_and_signals() {
     let mut w = World::new(Arch::Aarch64);
     w.services.clock = 3_000_000_123;

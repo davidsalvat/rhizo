@@ -23,16 +23,44 @@ impl<T> Global<T> {
     /// # Panics
     /// If called again from inside `f` on the same CPU.
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        // Profile builds account the time a CPU waits here (spec
+        // `profiling`); the hook runs only when the lock is held elsewhere.
+        #[cfg(feature = "profile")]
+        return self.0.with_waiting(
+            crate::arch::cpu::index(),
+            || crate::cost::scope(rhizo_prof::Part::Lock),
+            drop,
+            f,
+        );
+        #[cfg(not(feature = "profile"))]
         self.0.with(crate::arch::cpu::index(), f)
     }
 
     /// Exclusive access to the value until the guard is dropped (taken by
-    /// a holder only once it turns out to need it).
+    /// a holder only once it turns out to need it), accounted as
+    /// [`with`](Self::with) is.
     ///
     /// # Panics
     /// If this CPU holds it already.
     pub fn lock(&self) -> rhizo_core::sync::Guard<'_, T> {
+        #[cfg(feature = "profile")]
+        return self.0.lock_waiting(
+            crate::arch::cpu::index(),
+            || crate::cost::scope(rhizo_prof::Part::Lock),
+            drop,
+        );
+        #[cfg(not(feature = "profile"))]
         self.0.lock(crate::arch::cpu::index())
+    }
+
+    /// How often CPUs waited for it.
+    #[cfg_attr(
+        not(feature = "bench-cell"),
+        allow(dead_code, reason = "benchmark metric")
+    )]
+    #[cfg(feature = "profile")]
+    pub fn contention(&self) -> rhizo_core::sync::Contention {
+        self.0.contention()
     }
 
     /// The value, without locking: `&mut self` proves nobody else has it.

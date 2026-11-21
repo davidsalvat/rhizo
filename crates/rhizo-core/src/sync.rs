@@ -5,9 +5,13 @@
 //!
 //! The kernel passes its CPU number, so this logic runs unchanged in host
 //! tests with threads standing for CPUs.
+//!
+//! Each lock counts how often a CPU had to wait for it and how many times
+//! it spun meanwhile (spec `profiling`): counters touched only on the
+//! waiting path, so a lock that is free costs nothing more.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// A value shared between CPUs, reached only through [`SpinLock::with`].
 #[derive(Debug)]
@@ -15,6 +19,19 @@ pub struct SpinLock<T> {
     value: UnsafeCell<T>,
     /// 0: free; else the holder's CPU number plus one.
     holder: AtomicU32,
+    /// Acquisitions that found the lock held by another CPU.
+    contended: AtomicU64,
+    /// Loads of `holder` made while waiting.
+    spins: AtomicU64,
+}
+
+/// How much a lock was fought over ([`SpinLock::contention`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Contention {
+    /// Acquisitions that had to wait.
+    pub waits: u64,
+    /// Times the waiting CPUs looked at the lock again.
+    pub spins: u64,
 }
 
 // SAFETY: `with` hands out the only reference to the value while `holder`
@@ -29,6 +46,8 @@ impl<T> SpinLock<T> {
         Self {
             value: UnsafeCell::new(value),
             holder: AtomicU32::new(0),
+            contended: AtomicU64::new(0),
+            spins: AtomicU64::new(0),
         }
     }
 
@@ -38,35 +57,92 @@ impl<T> SpinLock<T> {
     /// # Panics
     /// If `cpu` already holds it (reentrance).
     pub fn with<R>(&self, cpu: usize, f: impl FnOnce(&mut T) -> R) -> R {
-        let mut guard = self.lock(cpu);
-        f(&mut guard)
+        f(&mut self.lock(cpu))
     }
 
     /// Exclusive access to the value, on behalf of CPU `cpu`, until the
-    /// guard is dropped (for a holder that takes the lock only when it
-    /// turns out to need it, then keeps it).
+    /// guard is dropped: for a holder that takes the lock only once it
+    /// turns out to need it, then keeps it.
     ///
     /// # Panics
     /// If `cpu` already holds it (reentrance).
     pub fn lock(&self, cpu: usize) -> Guard<'_, T> {
+        self.lock_waiting(cpu, || (), drop)
+    }
+
+    /// [`with`](Self::with), calling `wait` when the lock is found held by
+    /// another CPU and `done` with its result once it is taken: the kernel
+    /// measures a waiting CPU's time (spec `profiling`) without reading a
+    /// clock when the lock is free.
+    ///
+    /// # Panics
+    /// If `cpu` already holds it (reentrance).
+    pub fn with_waiting<R, W>(
+        &self,
+        cpu: usize,
+        wait: impl FnOnce() -> W,
+        done: impl FnOnce(W),
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        f(&mut self.lock_waiting(cpu, wait, done))
+    }
+
+    /// [`lock`](Self::lock), with the hooks of
+    /// [`with_waiting`](Self::with_waiting).
+    ///
+    /// # Panics
+    /// If `cpu` already holds it (reentrance).
+    pub fn lock_waiting<W>(
+        &self,
+        cpu: usize,
+        wait: impl FnOnce() -> W,
+        done: impl FnOnce(W),
+    ) -> Guard<'_, T> {
         let me = cpu as u32 + 1;
-        loop {
-            match self
-                .holder
-                .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
+        if self
+            .holder
+            .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            let waiting = wait();
+            while let Err(held) =
+                self.holder
+                    .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
             {
-                Ok(_) => break,
-                Err(held) if held == me => panic!("reentrant access to a kernel global"),
-                Err(_) => {
-                    // Wait with plain loads until it looks free (no cache
-                    // line ping-pong from repeated writes).
-                    while self.holder.load(Ordering::Relaxed) != 0 {
-                        core::hint::spin_loop();
-                    }
-                }
+                self.wait_while_held(held, me);
             }
+            done(waiting);
         }
         Guard(self)
+    }
+
+    /// The lock was found held by `held` (a CPU number plus one, 0 for a
+    /// spurious failure): waits until it looks free, counting the wait.
+    #[cold]
+    fn wait_while_held(&self, held: u32, me: u32) {
+        if held == me {
+            panic!("reentrant access to a kernel global");
+        }
+        if held == 0 {
+            return;
+        }
+        // Wait with plain loads until it looks free (no cache line
+        // ping-pong from repeated writes).
+        let mut spins = 0u64;
+        while self.holder.load(Ordering::Relaxed) != 0 {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        self.contended.fetch_add(1, Ordering::Relaxed);
+        self.spins.fetch_add(spins, Ordering::Relaxed);
+    }
+
+    /// How often CPUs waited for this lock, and spun meanwhile.
+    pub fn contention(&self) -> Contention {
+        Contention {
+            waits: self.contended.load(Ordering::Relaxed),
+            spins: self.spins.load(Ordering::Relaxed),
+        }
     }
 
     /// The value, without locking: `&mut self` proves nobody else has it.
@@ -151,6 +227,37 @@ mod tests {
     fn exclusive_owner_needs_no_lock() {
         let mut lock = SpinLock::new(1);
         *lock.get_mut() += 1;
+        assert_eq!(lock.with(0, |v| *v), 2);
+    }
+
+    #[test]
+    fn waits_are_counted_and_reported() {
+        let lock = Arc::new(SpinLock::new(0u64));
+        assert_eq!(lock.contention(), Contention::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = {
+            let lock = Arc::clone(&lock);
+            std::thread::spawn(move || {
+                // CPU 1 takes it, tells CPU 0, and holds it a while.
+                lock.with(1, |v| {
+                    tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    *v += 1;
+                });
+            })
+        };
+        rx.recv().unwrap();
+        let (mut waited, mut done) = (0, 0);
+        lock.with_waiting(0, || waited += 1, |()| done += 1, |v| *v += 1);
+        other.join().unwrap();
+        assert_eq!((waited, done), (1, 1), "one wait, measured once");
+        let c = lock.contention();
+        assert_eq!(c.waits, 1);
+        assert!(c.spins > 0);
+        // A free lock does not wait.
+        lock.with_waiting(0, || waited += 1, |()| done += 1, |_| ());
+        assert_eq!((waited, done), (1, 1));
+        assert_eq!(lock.contention().waits, 1);
         assert_eq!(lock.with(0, |v| *v), 2);
     }
 

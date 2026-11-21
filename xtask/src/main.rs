@@ -13,6 +13,7 @@ mod deps;
 mod differential;
 mod dynamic;
 mod hostnet;
+mod profile;
 mod refguest;
 mod report;
 mod tools;
@@ -48,7 +49,9 @@ Commands:
       --vmm <name>           qemu-microvm (default), qemu-q35, firecracker,
                              cloud-hypervisor
       --machine <microvm|q35>  Shorthand for the QEMU VMMs
-      --accel <auto|kvm|tcg> QEMU acceleration (default auto: KVM if usable)
+      --accel <auto|kvm|tcg|icount>
+                             QEMU acceleration (default auto: KVM if usable;
+                             icount: emulated, clock counts instructions)
       --gdb                  QEMU only: wait for a debugger on localhost:1234
   test [--vmm <name>] [--accel <a>] [--only <step>]
                              Host tests, boot check, in-kernel tests and
@@ -66,6 +69,7 @@ Commands:
       --update-baseline      Store the results as the baseline for --env
       --readme               Regenerate the README benchmark section
       --no-reference         Skip the reference Linux guest
+      --no-icount            Skip the instruction counts under QEMU -icount
       --workload <laptop|server>
                              Only this reference workload (both run by
                              default, after the cell figures)
@@ -907,7 +911,7 @@ fn cmd_ci() -> Result {
 
     let features = [""]
         .into_iter()
-        .chain(["ktest", "bench-cell"])
+        .chain(["ktest", "bench-cell", "bench-cell,profile"])
         .chain(SELF_CHECKS.iter().map(|c| c.feature));
     step("clippy (cells)");
     cargo(&[

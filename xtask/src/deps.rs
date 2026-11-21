@@ -30,6 +30,7 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("rhizo-sched", &[]),
+    ("rhizo-prof", &[]),
     (
         "rhizo-snapshot",
         &[
@@ -54,6 +55,7 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
             "rhizo-fs",
             "rhizo-net",
             "rhizo-virtio",
+            "rhizo-prof",
         ],
     ),
     ("rhizo-cells", &[]),
