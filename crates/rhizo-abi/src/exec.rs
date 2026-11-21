@@ -199,7 +199,7 @@ mod tests {
                 &mut m.frames,
             );
         }
-        m.cache.clear(&mut m.frames);
+        m.cache.trim(&mut m.frames);
         assert_eq!(m.frames.outstanding(), 0);
     }
 
@@ -233,7 +233,7 @@ mod tests {
             m.exec(b"/static").unwrap_err(),
             ExecError::Elf(ElfError::BadEntry(0x8000_0000_0000))
         );
-        m.cache.clear(&mut m.frames);
+        m.cache.trim(&mut m.frames);
         assert_eq!(m.frames.outstanding(), 0, "nothing left behind");
     }
 
@@ -280,7 +280,7 @@ mod tests {
                 proptest::prop_assert!(cell.regs().pc < rhizo_cell::USER_END);
                 space::destroy(pt, &mut m.mem, &mut m.frames);
             }
-            m.cache.clear(&mut m.frames);
+            m.cache.trim(&mut m.frames);
             proptest::prop_assert_eq!(m.frames.outstanding(), 0, "every frame back");
         }
     }

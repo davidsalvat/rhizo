@@ -17,7 +17,7 @@ mod sockets;
 mod threads;
 
 pub use exec::{ExecError, exec};
-pub use pages::{FilePages, PageCache};
+pub use pages::{FilePages, PageCache, Share, own_copy};
 
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
@@ -379,8 +379,9 @@ pub trait Services: Console {
     /// data such as file blocks, names and thread records) without eating
     /// into the memory the kernel keeps for itself.
     fn can_store(&mut self, bytes: u64) -> bool;
-    /// Memory in bytes for `sysinfo`: the total cells share and how much of
-    /// it is free.
+    /// The calling cell's memory in bytes for `sysinfo`: its limit (at
+    /// most the memory cells share) and how much of it the cell uses.
+    /// Nothing about other cells (design D1 of `close-cross-cell-leaks`).
     fn memory(&mut self) -> (u64, u64) {
         (0, 0)
     }
@@ -616,7 +617,7 @@ impl Abi {
             Some(Sys::Ioctl) => files::ioctl(cx, a[0], a[1], a[2]),
             Some(Sys::ArchPrctl) => arch_prctl(cell, cx, a[0], a[1]),
             Some(Sys::Mprotect) => mprotect(cell, cx, a[0], a[1], a[2]),
-            Some(Sys::Sysinfo) => sysinfo(cx, a[0]),
+            Some(Sys::Sysinfo) => sysinfo(cell, cx, a[0]),
             Some(Sys::Statx) => files::statx(cx, a),
             // One CPU: what a cell's threads may count on running at once.
             Some(Sys::SchedGetaffinity) if a[1] < 8 => -EINVAL,
@@ -1030,19 +1031,24 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     }
 }
 
-/// `sysinfo`: uptime, memory (from the kernel), one process; no swap, no
-/// load.
+/// `sysinfo`, as the cell sees itself (design D1 of
+/// `close-cross-cell-leaks`): uptime; its memory limit as the total and
+/// what it leaves as free; its threads as the processes; no swap, no load.
+/// Nothing in it depends on other cells.
 fn sysinfo<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+    cell: &Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     addr: u64,
 ) -> i64 {
-    let (total, free) = cx.services.memory();
+    let (total, used) = cx.services.memory();
+    let free = total.saturating_sub(used);
+    let procs = cell.threads.len().min(u16::MAX as usize) as u16;
     let mut info = [0u8; 112];
     let uptime = cx.services.monotonic_ns() / 1_000_000_000;
     info[..8].copy_from_slice(&uptime.to_le_bytes());
     info[32..40].copy_from_slice(&total.to_le_bytes());
     info[40..48].copy_from_slice(&free.to_le_bytes());
-    info[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs
+    info[80..82].copy_from_slice(&procs.to_le_bytes());
     info[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
     put(cx, addr, &info)
 }

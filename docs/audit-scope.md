@@ -14,8 +14,9 @@ test files, "tests" counts them. Changes merged since then that touch the
 scope are noted where they apply: per-cell quotas (`add-cell-quotas`,
 closing S20, S21 and O1), KPTI and E0PD (`add-kpti`, closing the
 Meltdown part of O3), snapshots that refer to shared frames
-(`add-shared-snapshots`) and the network review (`fuzz-wire-packets`,
-S22, S23).
+(`add-shared-snapshots`), the network review (`fuzz-wire-packets`,
+S22, S23) and the first cross-cell leaks closed (`close-cross-cell-leaks`,
+S24 to S26).
 
 ## 1. System overview
 
@@ -54,7 +55,7 @@ to the cell. There is no KASLR and no secrecy about the kernel's layout.
 | # | Boundary | Who is on the other side | Trust |
 |---|---|---|---|
 | B1 | **Cell to kernel**: exceptions, system calls (107 Linux calls decoded, both calling conventions), page faults, timer interrupts | Arbitrary code at EL0 / ring 3 | **Untrusted.** The main boundary. |
-| B2 | **Cell to cell**: shared frames after fork and template copies, shared page cache, loopback and Unix sockets, the kernel-wide socket and port pools | Another hostile cell | **Untrusted.** |
+| B2 | **Cell to cell**: shared frames after fork and template copies, shared page cache, loopback and Unix sockets, the kernel-wide socket and port pools, and any kernel state one cell changes and another reads (covert channels: the inventory in `add-cell-hierarchy` D12) | Another hostile cell | **Untrusted.** `sysinfo`, ephemeral ports and page-cache eviction no longer cross cells (S24 to S26); what is left is listed in [Cross-cell leaks](security.md#cross-cell-leaks). |
 | B3 | **Snapshot bytes to kernel**: `Snapshot::from_bytes` (header, CRC-32C, then everything), `Fs::decode`, socket records; reached from the host by the control kernel's `load` request (`rhizo load`, change `snapshots-on-disk`), the bytes fetched over TCP through the network card from the address the host names, the connection admitted by the host only from the guest's address and with the request's one-time token | Whoever wrote the file: any snapshot file a user loads, such as a downloaded template | **Untrusted.** A loaded file is validated before anything of it is used, refers to no physical frame (`REFERS` must be zero), and its cell gets no more quota than a cell the host starts (`Snapshot::cap_quota`). The checksum only catches damage: a forged file passes it and is contained by validation. Fuzzed on the sealed (import) form. |
 | B4 | **Cell files to program loader**: `Host::spawn_file` and `rhizo_abi::exec` start an executable and its `PT_INTERP` interpreter from the cell's own files | A cell that wrote those files | **Untrusted** (ELF headers are hostile). |
 | B5 | **Network packets to `smoltcp` and `rhizo-net`**: TCP, UDP, DHCPv4, Ethernet frames from the virtio-net card | Any host on the network the VM is attached to | **Untrusted.** Reviewed and fuzzed (`fuzz-wire-packets`, S22, S23). See note below. |
@@ -188,6 +189,10 @@ attacker code by definition and out of scope.
 - **Frames from the network (B5, `fuzz-wire-packets`).** A host on the
   network against `smoltcp` and the wire glue, with a fuzzer. Findings
   S22 and S23.
+- **Cross-cell leaks (B2, `close-cross-cell-leaks`).** From the
+  covert-channel inventory of `add-cell-hierarchy`: what one cell can
+  learn about another through `sysinfo`, ephemeral ports and the page
+  cache, with hostile two-cell tests. Findings S24 to S26.
 
 All are written up in [`security.md`](security.md), with the threat
 model, a per-call table of checks, each finding's reproduction and fix,
@@ -200,8 +205,8 @@ review's area table says how each area was reviewed.
 
 | Status | Findings |
 |---|---|
-| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S21, S22 (Medium); S9, S10, S11, S17, S19, S20 (Low), S20 and S21 by `add-cell-quotas`; S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`). Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5). |
-| Open | O1 remainder (a cell without a memory quota; file data outside the memory quota), O2 (call time proportional to what a cell holds), O3 remainder (side channels other than Meltdown, which `add-kpti` closed; an AArch64 CPU with neither E0PD nor CSV3 is reported, not protected), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies). See [Known limitations](security.md#known-limitations-and-open-findings). |
+| Fixed, with a regression test | S1, S12 (Critical); S2, S3, S4, S5, S14 (High); S6, S7, S8, S13, S15, S16, S18, S21, S22, S24, S25, S26 (Medium); S9, S10, S11, S17, S19, S20 (Low), S20 and S21 by `add-cell-quotas`; S23 (Low, a `smoltcp` behaviour worked around by `fix-tcp-long-wait`); S24 to S26 by `close-cross-cell-leaks`. Details: [Findings](security.md#findings), [Second review](security.md#second-review-d2), [Frames from the network](security.md#frames-from-the-network-b5), [Cross-cell leaks](security.md#cross-cell-leaks). |
+| Open | O1 remainder (a cell without a memory quota; file data outside the memory quota), O2 (call time proportional to what a cell holds), O3 remainder (side channels other than Meltdown, which `add-kpti` closed; an AArch64 CPU with neither E0PD nor CSV3 is reported, not protected), O4 remainder (no hardware entropy: predictable `getrandom`, reported at boot), O5 remainder (no IST stack for NMI or machine check on x86_64), O6 (global cell identifiers), O7 (host-only panics past 65535 copies), the cross-cell channels left for `add-cell-hierarchy` (ports as one namespace, page-cache deduplication, shared pools' errors, timing). See [Known limitations](security.md#known-limitations-and-open-findings). |
 
 ### Fuzzers (property tests)
 
@@ -241,7 +246,9 @@ Programs in `cells/src/bin` run as cells by the in-kernel suite
 (`kernel/src/tests.rs`, 117 tests) on both architectures, with 1 and 4
 CPUs: `fuzz` (20,000 random calls next to a well-behaved cell),
 `hostile_ptrs`, `fault_kernel`, `poke_kernel`, `hog`, `storm`, `spin`,
-`scrub`, `namer`, `rewrite`, `flags`, `dice`, `sharer`, `racer`. Self-checks
+`scrub`, `namer`, `rewrite`, `flags`, `dice`, `sharer`, `racer`,
+`observer` (two cells: one observes `sysinfo`, its ports or a kept page
+while the other allocates, binds or exhausts memory). Self-checks
 `ktest-user-read` and `ktest-user-exec` show SMAP/PAN and SMEP/PXN fault
 on a kernel access to a cell page.
 
@@ -310,7 +317,12 @@ Ordered by what we most want answered.
   freed object?
 - Q9. The page cache shares file pages *by content* between cells. Can a
   cell learn whether another cell holds a given page (a deduplication side
-  channel), or change a page another cell sees?
+  channel), or change a page another cell sees? (Eviction by another cell
+  is closed since S26, except of pages no cell maps under memory
+  pressure; deduplication is known and left to the hierarchy.) More
+  generally, is there kernel state besides those listed in
+  [Cross-cell leaks](security.md#cross-cell-leaks) through which one cell
+  can signal to another?
 
 **P4. Untrusted input decoders (ranks 6, 7, 9).**
 

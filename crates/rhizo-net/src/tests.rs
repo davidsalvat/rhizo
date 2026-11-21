@@ -779,6 +779,70 @@ fn each_boot_starts_its_ephemeral_ports_elsewhere() {
     assert_eq!(first(42), first(42), "the boot decides");
 }
 
+/// A socket bound to an ephemeral port, and that port.
+fn ephemeral_port(net: &mut Net) -> (Handle, u16) {
+    let s = net.socket(Family::Inet, Type::Stream).unwrap();
+    net.bind(s, &inet(LOOPBACK, 0)).unwrap();
+    match net.local_addr(s) {
+        Ok(Some(Addr::Inet { port, .. })) => (s, port),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Hostile (finding S25): what other cells bind does not show in a cell's
+/// ephemeral ports. Each cell takes them in order from a start of its own
+/// (design D2 of `close-cross-cell-leaks`); with one counter for all, the
+/// second port would be 101 past the first.
+#[test]
+fn a_cells_ephemeral_ports_do_not_show_other_cells_binds() {
+    let mut net = Net::new();
+    net.set_boot(7);
+    net.set_secret([0x1234_5678, 0x9abc_def0]);
+    let kernel_first = net.next_port;
+    net.enter(Ports::new(1));
+    let (_, first) = ephemeral_port(&mut net);
+    let mine = net.leave().unwrap();
+    // Another cell binds 100 ports and closes them again.
+    net.enter(Ports::new(2));
+    let theirs: Vec<Handle> = (0..100).map(|_| ephemeral_port(&mut net).0).collect();
+    net.leave();
+    theirs.into_iter().for_each(|h| net.release(h));
+    net.enter(mine);
+    let (_, second) = ephemeral_port(&mut net);
+    net.leave();
+    let next = if first == *EPHEMERAL.end() {
+        *EPHEMERAL.start()
+    } else {
+        first + 1
+    };
+    assert_eq!(second, next, "only my own binds move my ports");
+    assert_eq!(net.next_port, kernel_first, "nor the kernel's");
+    // Starts are spread over the range, and depend on the secret.
+    let starts: alloc::collections::BTreeSet<u16> = (1..=64).map(|k| net.first_port(k)).collect();
+    assert!(starts.iter().all(|p| EPHEMERAL.contains(p)));
+    assert!(starts.len() > 60, "cells start far apart: {starts:?}");
+    let before = net.first_port(1);
+    net.set_secret([1, 2]);
+    assert_ne!(net.first_port(1), before, "the secret decides");
+}
+
+/// A cell's ports skip those in use, its own and other cells' alike.
+#[test]
+fn a_cells_ephemeral_ports_skip_ports_in_use() {
+    let mut net = Net::new();
+    net.enter(Ports::new(9));
+    let (_, first) = ephemeral_port(&mut net);
+    let held = net.leave().unwrap();
+    let start = net.first_port(9);
+    assert_eq!(first, start);
+    // The kernel holds the port after it.
+    let k = net.socket(Family::Inet, Type::Stream).unwrap();
+    net.bind(k, &inet(LOOPBACK, start + 1)).unwrap();
+    net.enter(held);
+    assert_eq!(ephemeral_port(&mut net).1, start + 2);
+    net.leave();
+}
+
 /// The waiters woken since the last call.
 pub(crate) fn woken(net: &mut Net) -> Vec<u32> {
     let mut out = Vec::new();

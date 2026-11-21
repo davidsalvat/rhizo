@@ -251,7 +251,7 @@ impl<F: EntryFormat> Machine<F> {
     fn end(mut self) {
         let pt = PageTable::<F>::from_root(self.cell.root);
         space::destroy(pt, &mut self.mem, &mut self.frames);
-        self.pages.clear(&mut self.frames);
+        self.pages.trim(&mut self.frames);
         assert_eq!(
             self.frames.outstanding(),
             0,

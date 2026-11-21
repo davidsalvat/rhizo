@@ -52,6 +52,24 @@ fn names(fs: &mut Fs, path: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// A page knows whether anything else still holds its block: once the file
+/// dropped it, the page alone can name those bytes.
+#[test]
+fn a_page_knows_whether_its_block_is_held_elsewhere() {
+    let mut fs = Fs::new();
+    fs.put_file(b"/f", &[1u8; 100]).unwrap();
+    let (ino, _) = fs.file_at(b"/f").unwrap();
+    let page = fs.page(ino, 0).unwrap();
+    assert!(page.is_held_elsewhere(), "the file holds it");
+    let fork = fs.clone();
+    let fd = fs.open(None, b"/f", RW, 2).unwrap();
+    fs.write(fd, b"!", Some(0)).unwrap();
+    assert!(page.is_held_elsewhere(), "the fork still holds it");
+    drop(fork);
+    assert!(!page.is_held_elsewhere(), "written over in the only file");
+    assert!(!fs.page(ino, 1).unwrap().is_held_elsewhere(), "no block");
+}
+
 /// A page of a file names its bytes for as long as it is held: a later
 /// write to the file goes to a copy, and the page keeps what it held.
 #[test]

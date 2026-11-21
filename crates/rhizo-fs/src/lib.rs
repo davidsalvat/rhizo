@@ -137,6 +137,15 @@ impl Page {
         Some((Arc::as_ptr(block) as usize, self.len))
     }
 
+    /// Whether anything besides this `Page` holds its block (a file, a
+    /// copy of the page). When nothing does, no other page can ever have
+    /// its [`key`](Page::key).
+    pub fn is_held_elsewhere(&self) -> bool {
+        self.block
+            .as_ref()
+            .is_some_and(|b| Arc::strong_count(b) > 1)
+    }
+
     /// The file's bytes in this page (at most [`BLOCK`]); the rest of the
     /// page reads as zero.
     pub fn bytes(&self) -> &[u8] {

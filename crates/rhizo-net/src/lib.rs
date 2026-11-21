@@ -279,13 +279,38 @@ impl Socket {
     }
 }
 
+/// Where one cell's ephemeral ports go next (design D2 of
+/// `close-cross-cell-leaks`). Each cell walks the range in order from a
+/// start of its own, which the kernel's secret and the cell's `key` choose,
+/// so the ports a cell gets do not show how many other cells took: the
+/// kernel keeps it with the cell and hands it to [`Net::enter`] for the
+/// cell's calls. Not part of a snapshot: a resumed cell has a new
+/// identifier, hence a new start, as a new boot has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ports {
+    key: u32,
+    /// The next port to try; 0 before the first.
+    next: u16,
+}
+
+impl Ports {
+    /// The ports of the cell with identifier `key`, none taken yet.
+    pub const fn new(key: u32) -> Self {
+        Self { key, next: 0 }
+    }
+}
+
 /// Every socket of the kernel.
 #[derive(Debug)]
 pub struct Net {
     sockets: Vec<Option<Socket>>,
     open: usize,
     changes: u64,
+    /// The next ephemeral port of sockets the kernel opens for itself
+    /// (calls made with no [`Ports`] entered).
     next_port: u16,
+    /// The ephemeral ports of the cell whose call holds the sockets.
+    caller: Option<Ports>,
     next_name: u64,
     /// The network card, once attached.
     wire: Option<Wire>,
@@ -343,6 +368,7 @@ impl Net {
             open: 0,
             changes: 0,
             next_port: *EPHEMERAL.start(),
+            caller: None,
             next_name: 1,
             wire: None,
             boot: 0,
@@ -371,6 +397,28 @@ impl Net {
     /// randomness, never read here; design D1 of `fix-parked-keys`).
     pub fn set_secret(&mut self, secret: [u64; 2]) {
         self.secret = secret;
+    }
+
+    /// Starts a call of the cell whose ephemeral ports are `ports`: ports
+    /// it binds implicitly or to port 0 come from them, until
+    /// [`leave`](Self::leave).
+    pub fn enter(&mut self, ports: Ports) {
+        self.caller = Some(ports);
+    }
+
+    /// Ends the call [`enter`](Self::enter) started; returns its ports as
+    /// the call left them.
+    pub fn leave(&mut self) -> Option<Ports> {
+        self.caller.take()
+    }
+
+    /// Where the ephemeral ports of the cell with `key` start: anywhere in
+    /// the range, as the kernel's secret and the boot choose for it, so no
+    /// cell can tell another's.
+    fn first_port(&self, key: u32) -> u16 {
+        let span = u64::from(EPHEMERAL.end() - EPHEMERAL.start()) + 1;
+        let at = siphash24(self.secret, u64::from(key)).wrapping_add(mix(self.boot));
+        EPHEMERAL.start() + (at % span) as u16
     }
 
     /// Counts every change a waiter may wait for (data, connections,
@@ -591,21 +639,33 @@ impl Net {
         })
     }
 
-    /// A free ephemeral port for `ty`.
+    /// A free ephemeral port for `ty`: the next one of the calling cell's
+    /// [`Ports`], or of the kernel's own when no cell entered.
     fn ephemeral(&mut self, me: Handle, ty: Type) -> Result<u16> {
         let span = (EPHEMERAL.end() - EPHEMERAL.start()) as u32 + 1;
+        let mut next = match self.caller {
+            Some(Ports { key, next: 0 }) => self.first_port(key),
+            Some(Ports { next, .. }) => next,
+            None => self.next_port,
+        };
+        let mut found = Err(Error::AddrInUse);
         for _ in 0..span {
-            let port = self.next_port;
-            self.next_port = if port == *EPHEMERAL.end() {
+            let port = next;
+            next = if port == *EPHEMERAL.end() {
                 *EPHEMERAL.start()
             } else {
                 port + 1
             };
             if !self.port_taken(me, ty, ANY, port, &Options::default()) {
-                return Ok(port);
+                found = Ok(port);
+                break;
             }
         }
-        Err(Error::AddrInUse)
+        match self.caller.as_mut() {
+            Some(caller) => caller.next = next,
+            None => self.next_port = next,
+        }
+        found
     }
 
     /// `bind`. An Inet address must be on the loopback network or
