@@ -46,6 +46,8 @@ SNIPPET_SECONDS = 10.0
 OUTPUT_CAP = 4000
 # Most characters of a file `read_file` returns.
 READ_CAP = 16000
+# The host's fake model (xtask/src/hostnet.rs) knows the chat agent by
+# "inside an isolated Rhizo cell" near the start of its requests.
 SYSTEM = (
     "You are a helpful agent running inside an isolated Rhizo cell. "
     "Your tools run inside the cell: Python snippets, and files in its own "

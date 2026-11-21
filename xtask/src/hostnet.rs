@@ -215,7 +215,10 @@ fn model_answer(request: &[u8], served: u32) -> String {
         .fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
             (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
         });
-    if contains(&request[head..], b"\"run_python\"") {
+    // The chat agent's requests start with its system prompt (looked for
+    // in their first bytes only: the scripted agent's turns are timed).
+    let start = &request[head..request.len().min(head + 160)];
+    if contains(start, b"inside an isolated Rhizo cell") {
         return chat_answer(&request[head..], hash, served);
     }
     let (n, seed, id) = (500 + hash % 500, (hash >> 20) % 1000, hash as u32);
@@ -419,8 +422,9 @@ mod tests {
     fn the_chat_model_calls_the_snippet_tool_then_quotes_it() {
         let port = llm_server("127.0.0.1", 0).unwrap();
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let tools = r#""tools": [{"function": {"name": "run_python"}}]"#;
-        let asked = format!(r#"{{"messages": [{{"role": "user", "content": "hi"}}], {tools}}}"#);
+        let system =
+            r#"{"role": "system", "content": "You are an agent inside an isolated Rhizo cell."}"#;
+        let asked = format!(r#"{{"messages": [{system}, {{"role": "user", "content": "hi"}}]}}"#);
         let a = chat(&mut s, &asked, false);
         let call = &a["choices"][0]["message"]["tool_calls"][0];
         assert_eq!(call["function"]["name"], "run_python");
@@ -434,7 +438,7 @@ mod tests {
         let again = chat(&mut s, &asked, false);
         assert_eq!(again["choices"], a["choices"], "deterministic");
         let answered = format!(
-            r#"{{"messages": [{{"role": "user", "content": "hi"}}, {{"role": "tool", "tool_call_id": "c", "content": "a \"quoted\" 42\n"}}], {tools}}}"#
+            r#"{{"messages": [{system}, {{"role": "user", "content": "hi"}}, {{"role": "tool", "tool_call_id": "c", "content": "a \"quoted\" 42\n"}}]}}"#
         );
         let b = chat(&mut s, &answered, true);
         assert_eq!(

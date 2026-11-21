@@ -65,12 +65,16 @@ impl Tables {
         }
     }
 
+    // Inlined into the pipe calls whatever else uses them: one pipe round
+    // trip costs 12 instructions more otherwise (`cell.pipe_rtt_insns`).
+    #[inline(always)]
     fn object(&self, i: u32) -> &Object {
         self.objects[i as usize]
             .as_deref()
             .expect("objects in use are valid")
     }
 
+    #[inline(always)]
     fn object_mut(&mut self, i: u32) -> &mut Object {
         Arc::make_mut(
             self.objects[i as usize]
