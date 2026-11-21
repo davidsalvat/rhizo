@@ -241,21 +241,9 @@ impl Host {
         live.frames.set_used(1); // its root
         live.shares = true;
         live.demand.wx = wx.clone();
-        if !wx.wiped().is_empty() {
-            let mut frames = cell_frames(&live.frames);
-            let wiped = sharing(true, || {
-                space::wipe(
-                    &child,
-                    &mut DirectMap,
-                    &mut NewSpace,
-                    &mut frames,
-                    wx.wiped(),
-                )
-            });
-            if wiped.is_err() {
-                self.discard(&live);
-                return None;
-            }
+        if !wx.wiped().is_empty() && !wipe_copy(&live) {
+            self.discard(&live);
+            return None;
         }
         Some(live)
     }
@@ -389,4 +377,19 @@ impl Host {
         self.admit(|s| file(s, None, child));
         Some(child_id)
     }
+}
+
+/// Makes the wipe ranges of `live`, a copy that never ran, read as zero
+/// (design D22 of `add-cell-hierarchy`); returns whether it could. Kept
+/// out of line: copies of cells without wipe ranges never come here.
+#[cold]
+#[inline(never)]
+fn wipe_copy(live: &Live) -> bool {
+    let pt = PageTable::<Format>::from_root(live.cell.root);
+    let mut frames = cell_frames(&live.frames);
+    let ranges = live.demand.wx.wiped();
+    sharing(true, || {
+        space::wipe(&pt, &mut DirectMap, &mut NewSpace, &mut frames, ranges)
+    })
+    .is_ok()
 }
