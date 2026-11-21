@@ -148,10 +148,22 @@ fn cpuid_frequency() -> Option<u64> {
     None
 }
 
-/// Times 10 ms of the PIT (channel 2, gated through port 0x61).
+/// Times 10 ms of the PIT (channel 2, gated through port 0x61), after a
+/// first, short count that only gets the code translated under emulation:
+/// translated between the two TSC reads, it put the frequency found 0.2%
+/// too high (design D1 of `fix-tcg-clock-rate`).
 fn pit_frequency() -> Option<u64> {
     const PIT_HZ: u64 = 1_193_182;
     const COUNT: u16 = 11_932; // ~10 ms
+    pit_cycles(100)?;
+    let hz = pit_cycles(COUNT)? * PIT_HZ / COUNT as u64;
+    (hz > 250_000_000).then_some(hz)
+}
+
+/// TSC cycles while the PIT counts `count` ticks; `None` without a PIT.
+/// Never inlined: both counts run the same code.
+#[inline(never)]
+fn pit_cycles(count: u16) -> Option<u64> {
     // SAFETY: ports 0x42, 0x43 and 0x61 belong to the legacy PIT and speaker
     // gate; nothing else in the kernel uses them.
     unsafe {
@@ -161,8 +173,8 @@ fn pit_frequency() -> Option<u64> {
         }
         outb(0x61, (gate & !0x02) | 0x01); // gate on, speaker off
         outb(0x43, 0xb0); // channel 2, low/high byte, mode 0
-        outb(0x42, COUNT as u8);
-        outb(0x42, (COUNT >> 8) as u8);
+        outb(0x42, count as u8);
+        outb(0x42, (count >> 8) as u8);
         let start = Counter.cycles();
         let mut spins = 0u64;
         while inb(0x61) & 0x20 == 0 {
@@ -173,7 +185,6 @@ fn pit_frequency() -> Option<u64> {
         }
         let cycles = Counter.cycles() - start;
         outb(0x61, gate);
-        let hz = cycles * PIT_HZ / COUNT as u64;
-        (hz > 250_000_000).then_some(hz)
+        Some(cycles)
     }
 }
