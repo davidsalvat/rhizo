@@ -9,7 +9,7 @@
 //! the suite evenly (change `shard-kernel-tests`).
 
 use crate::arch;
-use crate::cell::{Ending, Host, Resume};
+use crate::cell::{Ending, Host, Pause, Resume};
 use crate::memory::{self, DirectMap};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
