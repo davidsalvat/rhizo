@@ -147,13 +147,21 @@ pub fn fp_save(state: &mut FpState) {
     }
 }
 
-/// Loads the FP/SIMD registers for the cell about to run.
+/// Loads the FP/SIMD registers for the cell about to run, leaving FP/SIMD
+/// trapping as it was, like [`fp_save`] (enable it first to load for a
+/// thread that runs with FP/SIMD: no `CR0` write is then undone).
 pub fn fp_load(state: &FpState) {
-    fp_trap(false);
+    let trapping = FP_TRAPS[index()].load(Ordering::Relaxed);
+    if trapping {
+        fp_trap(false);
+    }
     // SAFETY: as for `fp_save`; `FXRSTOR` only loads valid images (reserved
     // MXCSR bits are cleared by the kernel's initial image and cannot be set
     // by a cell without faulting in `LDMXCSR` first).
     unsafe { asm!("fxrstor64 [{}]", in(reg) state, options(nostack)) };
+    if trapping {
+        fp_trap(true);
+    }
 }
 
 /// Enables SSE for cells (and for the save and load above), SMEP and SMAP,

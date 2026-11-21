@@ -701,6 +701,9 @@ static CLEAN_FP: FpState = FpState::initial(user::MACHINE);
 /// Whether FP/SIMD traps follows the owner: never while a thread owns the
 /// registers, always while they are [`FP_CLEAN`] (either way while they
 /// are [`FP_STALE`]), so the cases that need no change cost no write.
+/// `fp_save` and `fp_load` never change it on either architecture, so a
+/// load or save outside switching (a test reading the registers) keeps
+/// this true.
 #[inline(always)]
 fn fp_enter(key: u64, regs: &Registers) -> bool {
     // Only a thread that has used FP/SIMD can own the registers.
@@ -717,8 +720,8 @@ fn fp_enter(key: u64, regs: &Registers) -> bool {
 #[inline(never)]
 fn fp_switch(key: u64, regs: &Registers) -> bool {
     if regs.fp_used != 0 {
-        user::fp_load(&regs.fp);
         user::fp_trap(false);
+        user::fp_load(&regs.fp);
         set_fp_owner(key);
     } else {
         user::fp_load(&CLEAN_FP);
@@ -742,8 +745,8 @@ fn fp_save_thread(live: &mut Live, key: u64) {
 fn fp_first_use(key: u64, regs: &mut Registers) {
     debug_assert_eq!(fp_owner(), FP_CLEAN, "FP/SIMD trap with registers in use");
     regs.fp_used = 1;
-    user::fp_load(&regs.fp);
     user::fp_trap(false);
+    user::fp_load(&regs.fp);
     set_fp_owner(key);
 }
 
