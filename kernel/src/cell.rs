@@ -674,6 +674,11 @@ struct Live {
     lazy: Option<Lazy>,
     /// Frames counted against its memory quota.
     frames: Tally<u64>,
+    /// CPU time it used not yet counted in `cell.cpu_ns`, in counter ticks
+    /// (design D2 of `add-cell-quotas`): converted at the end of each slice
+    /// only for a cell with a CPU quota, else when it is suspended or given
+    /// a quota.
+    cpu_ticks: u64,
     /// Its files and open descriptors (spec `files`).
     fs: Fs,
     /// Deadlines of its threads' calls waiting on descriptors, kept for
@@ -696,6 +701,14 @@ struct Live {
 }
 
 impl Live {
+    /// Counts the CPU ticks not yet counted into the cell's CPU time;
+    /// returns whether it is still within its quota.
+    fn count_cpu(&mut self) -> bool {
+        let ticks = core::mem::take(&mut self.cpu_ticks);
+        self.cell
+            .charge_cpu(timer::cycles_to_ns(ticks).unwrap_or(0))
+    }
+
     /// The deadline thread `tid`'s call keeps, if it waited with one.
     fn take_deadline(&mut self, tid: u32) -> Option<u64> {
         let i = self.deadlines.iter().position(|&(t, _)| t == tid)?;
@@ -1331,6 +1344,7 @@ impl Live {
 /// (several CPUs, not stepping), a cell with several threads runs as a
 /// [`Gang`] instead, which other CPUs may join.
 fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64, share: bool) {
+    let t0 = Counter.cycles();
     if share && live.cell.threads.len() > 1 {
         start_gang(shared, cpu, live, false);
         return;
@@ -1452,11 +1466,12 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
             }
         }
     };
-    // CPU time counts from when the cell was picked, its calls included; a
-    // cell past its quota ends at the end of the slice that used it up
-    // (design D2 of `add-cell-quotas`).
+    // CPU time counts for the whole slice, its calls included; a cell past
+    // its quota ends at the end of the slice that used it up (design D2 of
+    // `add-cell-quotas`). Without a quota, the ticks are only added up.
     let mut back = back;
-    if !live.cell.charge_cpu(now_ns().saturating_sub(now)) && !matches!(back, Back::End(_)) {
+    live.cpu_ticks += Counter.cycles().wrapping_sub(t0);
+    if live.cell.quota.cpu_ns != u64::MAX && !live.count_cpu() && !matches!(back, Back::End(_)) {
         out_of_cpu(&mut live);
         back = Back::End(Ending::OutOfCpu);
     }
@@ -2087,6 +2102,7 @@ impl Host {
             random: None,
             lazy: None,
             frames: Tally::new(0),
+            cpu_ticks: 0,
             fs,
             deadlines: Vec::new(),
             io_woken: false,
@@ -2226,6 +2242,7 @@ impl Host {
             lazy.finish(&pt, &live.frames);
         }
         sync_fp(&mut live, true);
+        live.count_cpu(); // the CPU time used goes into the snapshot
         let (files, sockets) = export_sockets(&live.fs);
         let snapshot = Snapshot::capture::<Format>(
             user::MACHINE,
@@ -2732,6 +2749,7 @@ impl Host {
         let Some(live) = self.state().sched.find_mut(|l| l.cell.id == id) else {
             return false;
         };
+        live.count_cpu(); // the time used so far counts against the new quota
         live.cell.quota = quota;
         live.fs
             .set_limits(quota.files() as usize, quota.sockets as usize);

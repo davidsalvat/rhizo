@@ -51,8 +51,11 @@ frames and is counted (finding S20).
 `Cell::cpu_ns`, system calls included. A cell past its quota ends there
 with `Ending::OutOfCpu`, and `cell N killed: CPU time quota used up` goes
 to its output. A cell overruns its quota by at most one slice (10 ms) plus
-one system call; one clock read per slice is the whole cost (none on the
-system-call path).
+one system call. The cost is two counter reads and an addition per slice
+(none on the system-call path): the ticks are added up in the live cell
+and converted to nanoseconds at the end of each slice only for a cell
+with a CPU quota, else when it is suspended or given a quota. Converting
+every slice cost about 40 instructions per switch between cells.
 
 Alternative: a timer at the exact deadline. Rejected: the preemption tick
 already bounds the overrun, and a second timer per CPU is more code.
