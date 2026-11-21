@@ -70,6 +70,11 @@ def icon(s, name, x, y, size=24, color=None, sw=2, fill=None):
                '<path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>',
         "eye": '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
         "user": '<circle cx="12" cy="7" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+        "chart": '<path d="M3 3v18h18"/><path d="M8 17v-5M13 17V8M18 17V5"/>',
+        "code": '<path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/>',
+        "window": '<rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="M2.5 9h19"/>'
+                  '<path d="M5.5 6.5h.01M8 6.5h.01"/>',
+        "plug": '<path d="M9 2v5M15 2v5"/><path d="M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v5"/>',
     }[name]
     s.add(f'<g transform="translate({x - size / 2:g} {y - size / 2:g}) scale({k:g})" '
           f'fill="none" stroke="{c}" stroke-width="{sw / k * k:g}" stroke-linecap="round" '
@@ -749,73 +754,107 @@ def hierarchy(t):
 
 
 # ---------------------------------------------------------------- modules
+MODULES = [
+    # (icon, name, task, contents, egress, kind of egress, base template)
+    ("chart", "Data analysis", ["“Analyse this sheet", "and chart it”"],
+     ["Python, pandas,", "plotting"], "egress: none", "none", "Python + data"),
+    ("code", "Coding tools", ["“Fix the failing", "test in my repo”"],
+     ["git, Node.js,", "a test runner"], "egress: proxy only", "some", "Node.js + git"),
+    ("window", "Web browser", ["“Check this on", "a website”"],
+     ["headless Chromium"], "egress: allowlist", "approve", "Chromium"),
+    ("file", "Documents", ["“Read these", "invoices”"],
+     ["PDF reader,", "OCR"], "egress: none", "none", "Python + OCR"),
+    ("plug", "Your own tools", ["“Update the", "customer record”"],
+     ["your MCP servers:", "CRM, database"], "egress: you choose", "some", "your image"),
+]
+
+
 def modules(t):
-    s = Svg(t, 560, "Designed: modular cells",
-            "Designed, not built yet. Supply: a builder cell in its own domain installs "
-            "packages only through rhizo proxy on the host, which serves only the files "
-            "the lockfile names, checks each pinned SHA-256, takes a token per build and "
-            "logs every request; the operator reviews and signs the result into a signed "
-            "catalogue of templates. Use: templates form a tree that shares memory (python, "
-            "python plus numpy, plus pandas; node). An agent asks to add numpy; the kernel "
-            "checks the whitelist, budget and egress, asks the parent for sensitive "
-            "modules, and forks a child from the warm template, reached over a channel. "
-            "Adding a module, even the requests library, never grants network access.")
-    heading(s, "Next: abilities as child cells, from a signed catalogue")
+    s = Svg(t, 700, "Designed: abilities as child cells",
+            "Designed, not built yet. A small static chat agent starts with egress to its "
+            "model only. Each task that needs an ability adds a child cell, forked from a "
+            "signed, warm template and reached only over a channel: " + "; ".join(
+                f"{' '.join(task)} adds {name.lower()} ({' '.join(c)}), {eg}"
+                for _, name, task, c, eg, _, _ in MODULES) + ". The web browser is the "
+            "sensitive one: the parent or the operator approves it first, and it may reach "
+            "only allowed sites. Children fork in milliseconds from templates that share "
+            "their base runtime (measured for CPython and Node.js). Templates are built by "
+            "a builder cell through rhizo proxy from a lockfile and signed by the operator. "
+            "Every child talks only to its agent, over a channel, with a budget carved from "
+            "the agent's and never more egress; what the browser reads stays in that "
+            "agent's tree.")
+    heading(s, "Next: an agent grows the abilities each task needs")
     tagline(s, 776, 20, "designed, not built yet")
-    s.text(24, 104, "Building a module", 14, weight=700, fill=t["muted"])
-    boxes = [("globe", "Packages", ["from PyPI, over", "verified TLS"], "box"),
-             ("lock", "rhizo proxy", ["lockfile files only,", "SHA-256 checked"], "box"),
-             ("cube", "Builder cell", ["own domain,", "same tree twice"], "cell"),
-             ("key", "Operator", ["reviews and signs:", "minisign, Ed25519"], "box"),
-             ("shield", "Catalogue", ["signed snapshot", "files + manifest"], "cell")]
-    bw, step = 140, 152
-    for i, (ic, name, lines, kind) in enumerate(boxes):
-        x = 24 + i * step
-        cell = kind == "cell"
-        s.rect(x, 116, bw, 90, t["cell"] if cell else t["box"],
-               t["cellline"] if cell else t["boxline"], rx=12, sw=2 if cell else 1.3)
-        icon(s, ic, x + 24, 141, 20, t["accent"] if cell else t["text"])
-        s.text(x + 42, 146, name, 13.5, weight=700)
-        for j, ln in enumerate(lines):
-            s.text(x + 14, 172 + j * 18, ln, 12, fill=t["muted"])
-        if i < len(boxes) - 1:
-            s.line(x + bw, 161, x + step, 161, sw=2)
-    s.line(24, 226, 776, 226, color=t["boxline"], arrow=False, sw=1)
-    s.text(24, 254, "Using a module: templates from the catalogue, then a child cell", 14,
-           weight=700, fill=t["muted"])
-    # Template tree.
-    for x, y, w, name in [(24, 270, 170, "python"), (24, 336, 170, "python + numpy"),
-                          (40, 402, 170, "+ pandas"), (210, 270, 120, "node")]:
-        s.rect(x, y, w, 42, t["cell"], t["cellline"], rx=14, sw=1.8)
-        icon(s, "snow", x + 22, y + 21, 16, t["accent"])
-        s.text(x + 38, y + 26, name, 13.5, weight=700)
-    s.line(44, 312, 44, 336, sw=2)
-    s.line(60, 378, 60, 402, sw=2)
-    s.text(24, 470, "templates share memory", 12.5, fill=t["muted"])
-    s.text(24, 488, "copy-on-write, delta files", 12.5, fill=t["muted"])
-    # Agent, kernel checks, child cell.
-    s.rect(380, 280, 150, 90, t["cell"], t["cellline"], rx=18, sw=2)
-    icon(s, "robot", 404, 304, 22, t["accent"])
-    s.text(424, 310, "Agent", 14.5, weight=700)
-    s.text(396, 334, "static chat agent", 12, fill=t["muted"])
-    s.text(396, 352, "asks: add numpy", 12, fill=t["muted"])
-    s.line(530, 320, 590, 320, sw=2)
-    s.rect(590, 270, 186, 120, t["box"], t["boxline"], rx=12)
-    s.text(606, 298, "Kernel checks", 13.5, weight=700)
-    for j, ln in enumerate(["on the whitelist?", "within the budget?",
-                            "sensitive? ask parent", "egress: never more"]):
-        icon(s, "check", 614, 316 + j * 18, 12, t["accent"], sw=2.6)
-        s.text(626, 320 + j * 18, ln, 12, fill=t["muted"])
-    s.line(683, 390, 683, 420, sw=2)
-    s.rect(590, 420, 186, 62, t["cell"], t["cellline"], rx=18, sw=2)
-    icon(s, "cube", 614, 451, 20, t["accent"])
-    s.text(632, 447, "numpy child cell", 13.5, weight=700)
-    s.text(632, 466, "fork of the template", 12, fill=t["muted"])
-    s.path("M590 451 H 455 V 370", color=t["gold"], dash=True, arrow=False, sw=2.2)
-    s.text(466, 440, "channel", 12, fill=t["gold"], weight=700)
-    s.path("M194 357 C 280 357, 300 470, 400 470 H 590", dash=True)
-    s.text(250, 520, "Adding the \u201crequests\u201d library grants no internet:", 12.5, fill=t["muted"])
-    s.text(250, 538, "a module never gets more egress than its agent.", 12.5, fill=t["muted"])
+    # The agent, small, talking to its model only.
+    s.text(24, 122, "Starts small", 15, weight=700)
+    s.text(24, 142, "then grows per task", 12.5, fill=t["muted"])
+    s.rect(250, 92, 220, 66, t["cell"], t["cellline"], rx=18, sw=2)
+    icon(s, "robot", 276, 125, 24, t["accent"])
+    s.text(298, 120, "Your agent", 14.5, weight=700)
+    s.text(298, 140, "small static chat agent", 12, fill=t["muted"])
+    s.rect(600, 92, 176, 66, t["bluefill"], t["blueline"], rx=14)
+    icon(s, "chip", 626, 125, 24, t["blue"])
+    s.text(648, 130, "Your model", 14, weight=700)
+    s.line(470, 125, 600, 125, color=t["blue"], sw=2)
+    s.text(535, 116, "egress: model only", 12, fill=t["blue"], weight=700, anchor="middle")
+    # Channels: one trunk from the agent, one drop to each child.
+    cw, gap, top = 140, 12, 214
+    xs = [24 + i * (cw + gap) for i in range(len(MODULES))]
+    mids = [x + cw / 2 for x in xs]
+    trunk = (f"M360 158 V 186 M{mids[0]} 186 H {mids[-1]} "
+             + " ".join(f"M{m} 186 V {top}" for m in mids))
+    s.path(trunk, color=t["gold"], arrow=False, sw=2, dash=True)
+    s.text(520, 178, "channels only", 12, fill=t["gold"], weight=700)
+    # The children.
+    for x, (ic, name, task, contents, egress, kind, base) in zip(xs, MODULES):
+        cx = x + cw / 2
+        sensitive = kind == "approve"
+        s.rect(x, top, cw, 200, t["cell"], t["warn"] if sensitive else t["cellline"], rx=14,
+               sw=2.5 if sensitive else 2)
+        for j, ln in enumerate(task):
+            s.text(cx, top + 26 + j * 17, ln, 12, fill=t["muted"], anchor="middle",
+                   italic=True)
+        icon(s, ic, cx, top + 74, 26, t["accent"])
+        s.text(cx, top + 108, name, 13.5, weight=700, anchor="middle")
+        for j, ln in enumerate(contents):
+            s.text(cx, top + 127 + j * 17, ln, 12, fill=t["muted"], anchor="middle")
+        if sensitive:
+            s.text(cx, top + 147, "approved first by", 12, fill=t["warn"], anchor="middle",
+                   weight=700)
+            s.text(cx, top + 163, "parent or operator", 12, fill=t["warn"], anchor="middle",
+                   weight=700)
+        s.text(cx, top + 182, egress, 12, weight=700, anchor="middle",
+               fill={"none": t["muted"], "some": t["blue"], "approve": t["warn"]}[kind])
+        # Forked from its warm template, below.
+        s.line(cx, 440, cx, top + 200, sw=2)
+        s.text(cx + 14, 431, "fork", 12, fill=t["muted"])
+        s.rect(x, 440, cw, 44, t["box"], t["boxline"], rx=10)
+        icon(s, "snow", x + 24, 462, 16, t["accent"])
+        s.text(x + 40, 467, base, 12.5, weight=700)
+    s.text(24, 508, "Signed, warm templates: a child forks from one in milliseconds "
+           "(measured for CPython and Node.js),", 12.5, fill=t["muted"])
+    s.text(24, 526, "and templates share their base runtime, so Python under data and "
+           "documents is held once.", 12.5, fill=t["muted"])
+    s.line(24, 542, 776, 542, color=t["boxline"], arrow=False, sw=1)
+    s.text(24, 566, "How a template reaches the catalogue", 14, weight=700, fill=t["muted"])
+    steps = [("lock", "rhizo proxy", "lockfile files only"),
+             ("cube", "Builder cell", "its own domain"),
+             ("key", "Operator", "reviews and signs"),
+             ("shield", "Catalogue", "signed templates")]
+    for i, (ic, name, sub) in enumerate(steps):
+        x = 24 + i * 194
+        last = i == len(steps) - 1
+        s.rect(x, 578, 170, 62, t["cell"] if last else t["box"],
+               t["cellline"] if last else t["boxline"], rx=12, sw=2 if last else 1.3)
+        icon(s, ic, x + 26, 609, 20, t["accent"] if last else t["text"])
+        s.text(x + 46, 605, name, 13.5, weight=700)
+        s.text(x + 46, 624, sub, 12, fill=t["muted"])
+        if not last:
+            s.line(x + 170, 609, x + 194, 609, sw=2)
+    s.text(24, 666, "Each child talks only to its agent, over a channel, with a budget carved "
+           "from the agent's and never more egress;", 12.5, fill=t["muted"])
+    s.text(24, 684, "what the browser reads stays in this agent's tree.", 12.5,
+           fill=t["muted"])
     return s
 
 

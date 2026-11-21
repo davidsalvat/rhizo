@@ -339,8 +339,9 @@ and what is still open: [`docs/security.md`](docs/security.md).
 
 Designed and coming next ([`docs/cell-hierarchy.md`](docs/cell-hierarchy.md)):
 agents that live in families, each family walled off from the others, and
-abilities such as Python or numpy added as child cells from a signed
-catalogue.
+abilities (data analysis, coding tools, a web browser, documents, your own
+tools) added to an agent as child cells from a signed catalogue, as each task
+needs them.
 
 <p align="center">
   <picture>
@@ -352,7 +353,7 @@ catalogue.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/modules-dark.svg">
-    <img src="docs/img/modules.svg" alt="Designed, not built yet: modular cells. Building a module: packages from PyPI over verified TLS go through rhizo proxy, which serves only lockfile files with their SHA-256 checked, to a builder cell in its own domain that builds the same tree twice; the operator reviews and signs it with minisign (Ed25519) into a catalogue of signed snapshot files and manifests. Using a module: templates form a tree that shares memory (python, python with numpy, plus pandas, and node). A small static chat agent asks to add numpy; the kernel checks the whitelist and the budget, asks the parent for sensitive modules and never grants more egress, then forks a numpy child cell from the template, reached over a channel. Adding the requests library grants no internet access." width="800">
+    <img src="docs/img/modules.svg" alt="Designed, not built yet. A small static chat agent starts with egress to its model only. Each task that needs an ability adds a child cell, forked from a signed, warm template and reached only over a channel: “Analyse this sheet and chart it” adds data analysis (Python, pandas, plotting), egress: none; “Fix the failing test in my repo” adds coding tools (git, Node.js, a test runner), egress: proxy only; “Check this on a website” adds web browser (headless Chromium), egress: allowlist; “Read these invoices” adds documents (PDF reader, OCR), egress: none; “Update the customer record” adds your own tools (your MCP servers: CRM, database), egress: you choose. The web browser is the sensitive one: the parent or the operator approves it first, and it may reach only allowed sites. Children fork in milliseconds from templates that share their base runtime (measured for CPython and Node.js). Templates are built by a builder cell through rhizo proxy from a lockfile and signed by the operator. Every child talks only to its agent, over a channel, with a budget carved from the agent's and never more egress; what the browser reads stays in that agent's tree." width="800">
   </picture>
 </p>
 
@@ -362,11 +363,19 @@ catalogue.
   policies per family (none, the model, an allowlist), checked on every
   socket; and an inventory of the 40 shared resources that could leak
   between families, each closed or measured.
-- **Modular cells.** Python, numpy or Node.js added to an agent as child
-  cells forked from warm templates, which share memory in a tree; a signed
-  catalogue; a builder cell whose only way out is `rhizo proxy`, which serves
-  only pinned, hash-checked files; and a small static chat agent that adds
-  Python only when the model needs it.
+- **Abilities as child cells.** An agent starts as a small static chat agent
+  that can reach only its model. Each task that needs more adds a child cell,
+  forked from a signed, warm template: data analysis (Python with data and
+  plotting libraries), coding tools (git, Node.js, a test runner), a web
+  browser (headless Chromium: the sensitive one, approved first by the parent
+  or the operator and limited to an allowlist of sites), documents (PDF and
+  OCR), or your own tools as MCP servers. Each child talks to its agent only
+  over a channel, with a budget carved from the agent's and never more egress,
+  so what the browser reads cannot leak to another agent's tree. Forking from
+  a warm template takes milliseconds for CPython and Node.js today; Chromium is
+  not measured yet. Templates share their base runtime, and reach the
+  catalogue through a builder cell whose only way out is `rhizo proxy`
+  (pinned, hash-checked files) and the operator's signature.
 - **The product.** Ready agents to download, an app on your own computer
   (macOS and Windows hosts too), your own model next to it
   ([`docs/vision.md`](docs/vision.md)).
