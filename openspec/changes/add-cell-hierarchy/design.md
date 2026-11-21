@@ -1599,10 +1599,16 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   requeueing in one call, `requeue_charged`; a filed cell is charged
   apart). A copy of a plain cell, a root of default weight and a resumed
   cell keep the host round robin, so spawn, fork and resume test the policy
-  without computing anything. Measured with `--icount-only` against
-  `main` (d211ad7): `cell.switch_insns` 875, unchanged (x86_64), and 817
-  to 819 (AArch64, +0.24 %); every other figure within +0.53 % (forks
-  and spawns: the tests of the policy and the tree).
+  without computing anything: the host keeps it in a field of its own
+  (`Host::by_weight`), so a tree change on round robin tests that field,
+  takes no lock and calls nothing, and the scheduler's `place`, `requeue`
+  and `push` stay inlined into their callers with the by-weight path out
+  of line. Measured with `--icount-only` against `main` (8f942c6):
+  `cell.switch_insns` 875, unchanged (x86_64), and 817 to 819 (AArch64);
+  `cell.resume_insns` +3 and +4; `cell.spawn_insns` +78 (x86_64, +0.28 %:
+  code generation around the spawn path, whose helpers the tests' and
+  benchmarks' placements now also call) and +2; `cell.fork_insns` +22 and
+  +16; every other figure within +0.53 %.
 - **No search, no allocation per switch.** While the host shares by
   weight, the scheduler tells `Fair` each entry it queues and each it
   takes out other than by a pick, so a pick never reads the queue:
@@ -1629,9 +1635,9 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
     section learns the queues again (O(entries), on tree changes only).
 - **Cost of sharing by weight.** `cell.switch_domains_insns` (gated with
   `-icount`, ±2 %) is the switch with the two cells in two domains and a
-  third, waiting cell placed under the first: 1,373 instructions on
-  x86_64 and 1,286 on AArch64. The same three cells in round robin take
-  887 and 829, so sharing by weight costs 486 and 457 instructions per
+  third, waiting cell placed under the first: 1,372 instructions on
+  x86_64 and 1,279 on AArch64. The same three cells in round robin take
+  887 and 829, so sharing by weight costs 485 and 450 instructions per
   switch (it was 1,250 and 1,070 with ordered maps, a list built at each
   pick and 64-bit divisions). Of those, measured with callgrind on the
   library alone (x86_64, `lto = "fat"` as the kernel builds, 105

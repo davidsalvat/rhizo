@@ -32,9 +32,9 @@ impl Host {
     /// shares again. Round robin needs none, and keeps holding: a root of
     /// the default weight, a copy of a plain cell and a cell resumed where
     /// it was are plain again.
-    #[inline]
+    #[inline(always)]
     pub(super) fn reshare_if_by_weight(&mut self) {
-        if self.locked(|s| s.sched.shares().is_some()) {
+        if self.by_weight {
             self.reshare();
         }
     }
@@ -43,9 +43,11 @@ impl Host {
     /// every node is plain; otherwise each cell's domain, flattened share
     /// and capped ancestors, each domain's weight and each cap. Time used so
     /// far stays counted.
+    #[cold]
     #[inline(never)]
     pub(super) fn reshare(&mut self) {
-        if self.tree.iter().all(plain) {
+        self.by_weight = !self.tree.iter().all(plain);
+        if !self.by_weight {
             self.locked(|s| *s.sched.shares() = None);
             return;
         }

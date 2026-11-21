@@ -182,6 +182,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// test of how entries share: by weight, one that `arrives` (it did not
     /// just run) is not owed back what it did not use while idle, and one a
     /// cap holds sleeps until its period ends.
+    #[inline(always)]
     fn push(&mut self, cpu: usize, key: u32, entry: T, arrives: bool) {
         if self.share.by_weight() {
             return self.push_by_weight(cpu, key, entry, arrives);
@@ -212,6 +213,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     }
 
     /// Puts `entry` at the end of `cpu`'s queue.
+    #[inline(always)]
     fn queue(&mut self, cpu: usize, key: u32, entry: T) {
         self.queues[cpu].push_back((self.arrivals, key, entry));
         self.arrivals += 1;
@@ -241,6 +243,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
 
     /// Makes a new entry runnable on the CPU with the shortest queue;
     /// returns that CPU.
+    #[inline(always)]
     pub fn place(&mut self, entry: T) -> usize {
         let cpu = self.shortest();
         self.push(cpu, entry.key(), entry, true);
@@ -251,6 +254,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// `cpu`'s queue, unless that queue would hold more than one entry more
     /// than the shortest; then at the end of the shortest. Returns the CPU
     /// whose queue it joined.
+    #[inline(always)]
     pub fn requeue(&mut self, cpu: usize, entry: T) -> usize {
         let cpu = self.back_to(cpu);
         self.push(cpu, entry.key(), entry, false);
@@ -281,6 +285,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
 
     /// Where an entry that just ran on `cpu` goes back: `cpu`'s queue,
     /// unless it holds more entries than the shortest.
+    #[inline]
     fn back_to(&self, cpu: usize) -> usize {
         let shortest = self.shortest();
         if self.queues[cpu].len() > self.queues[shortest].len() {

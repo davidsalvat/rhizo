@@ -27,6 +27,10 @@ pub struct Finished {
 #[derive(Debug)]
 pub struct Host {
     pub(super) shared: Global<Shared>,
+    /// Whether cells share the CPUs by weight (design D23 of
+    /// `add-cell-hierarchy`): what the scheduler's policy says, kept here
+    /// so that a tree change on round robin tests one field, no lock.
+    pub(super) by_weight: bool,
     pub(super) finished: Vec<Finished>,
     /// Frozen cells and their files: never run, only forked (spec `fork`,
     /// templates).
@@ -112,6 +116,7 @@ impl Host {
             look_every: None,
             peeked: Vec::new(),
             others: false,
+            by_weight: false,
             until: None,
             tree: rhizo_cap::Tree::new(),
             suspended: Vec::new(),

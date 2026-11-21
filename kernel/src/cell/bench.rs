@@ -151,21 +151,6 @@ fn benchmarks(console: &mut impl Console) {
         "rhizo-fp switch_fp_ns={}",
         switch_fp_ns()
     );
-    // Cells sharing by weight (design D23 of `add-cell-hierarchy`): a
-    // switch with a domain pick in every pass, the shares in time only.
-    let _ = write!(
-        rhizo_hal::ConsoleWriter(console),
-        "rhizo-shares switch_ns={}",
-        switch_domains_ns()
-    );
-    if CLOCK.load(Ordering::Relaxed) == CLOCK_TIME {
-        let _ = write!(
-            rhizo_hal::ConsoleWriter(console),
-            " domain_share_pct={}",
-            domain_share_pct()
-        );
-    }
-    let _ = writeln!(rhizo_hal::ConsoleWriter(console));
     // KPTI's cost (design D5 of `add-kpti`): the same figures with it
     // forced on (`cell.syscall_ns` itself is on the `rhizo-ops` line).
     let default = user::kpti();
@@ -280,6 +265,22 @@ fn benchmarks(console: &mut impl Console) {
         "rhizo-ops syscall_ns={}",
         bench_ns(syscall_ticks()).unwrap_or(0)
     );
+    // Cells sharing by weight (design D23 of `add-cell-hierarchy`): a
+    // switch with a domain pick in every pass, the shares in time only.
+    // After the other cell figures, whose heap it would leave otherwise.
+    let _ = write!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-shares switch_ns={}",
+        switch_domains_ns()
+    );
+    if CLOCK.load(Ordering::Relaxed) == CLOCK_TIME {
+        let _ = write!(
+            rhizo_hal::ConsoleWriter(console),
+            " domain_share_pct={}",
+            domain_share_pct()
+        );
+    }
+    let _ = writeln!(rhizo_hal::ConsoleWriter(console));
     // Last: its files stay decoded in the kernel heap.
     if let Some((run, template)) = dynamic() {
         let _ = writeln!(
