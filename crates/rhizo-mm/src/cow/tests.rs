@@ -72,6 +72,8 @@ const RW: PageFlags = PageFlags::USER
     .union(PageFlags::WRITABLE)
     .union(PageFlags::NO_EXECUTE);
 const RO: PageFlags = PageFlags::USER.union(PageFlags::NO_EXECUTE);
+/// A write-or-execute page, writing (change `node-jit`).
+const WX: PageFlags = RW.union(PageFlags::WRITE_OR_EXEC);
 
 struct World<F> {
     mem: FakePhysicalMemory,
@@ -128,7 +130,7 @@ impl<F: EntryFormat> World<F> {
         let t = pt.translate(&self.mem, virt).unwrap();
         if !t.flags.is_writable()
             && !pt
-                .resolve_write(
+                .resolve_write_wx(
                     &mut self.mem,
                     &mut self.frames,
                     &mut RecordingTlb::default(),
@@ -165,6 +167,163 @@ impl<F: EntryFormat> World<F> {
         self.mem
             .read_u64(pt.translate(&self.mem, virt).unwrap().phys & !7)
     }
+
+    /// Fetches an instruction like a cell: resolves a writing
+    /// write-or-execute page first if needed; returns whether it may run.
+    fn fetch(&mut self, pt: &PageTable<F>, virt: u64) -> bool {
+        if self.flags(pt, virt).is_executable() {
+            return true;
+        }
+        if !pt
+            .resolve_exec(&mut self.mem, &mut self.frames, virt)
+            .unwrap()
+        {
+            return false;
+        }
+        let flags = self.flags(pt, virt);
+        assert!(flags.is_executable() && !flags.is_writable(), "running");
+        true
+    }
+}
+
+/// No leaf of `pt` allows writes and instruction fetches at once, and every
+/// write-or-execute page is writing or running (change `node-jit`).
+fn assert_never_wx<F: EntryFormat>(w: &World<F>, pt: &PageTable<F>) {
+    for (virt, _, _, f) in w.leaves(pt) {
+        assert!(
+            !(f.is_writable() && f.is_executable()),
+            "{virt:#x} writable and executable: {f:?}"
+        );
+        if f.contains(PageFlags::WRITE_OR_EXEC) {
+            let cow = f.contains(PageFlags::COPY_ON_WRITE);
+            let writing = (f.is_writable() || cow) && !f.is_executable();
+            let running = !f.is_writable() && !cow && f.is_executable();
+            assert!(writing || running, "{virt:#x} in no state: {f:?}");
+        }
+    }
+}
+
+/// A write-or-execute page alone: written while writing, made running by a
+/// fetch (same frame, read-only, executable), made writing again by a write
+/// (same frame, writable, not executable), and so on; an ordinary page
+/// never runs.
+fn wx_page_flips_on_faults<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let pt = w.table();
+    w.map(&pt, 0x1000, PageSize::Small, WX);
+    w.map(&pt, 0x2000, PageSize::Small, RW);
+    let frame = w.page(&pt, 0x1000);
+    for round in 1..4 {
+        assert!(w.write(&pt, 0x1000, round));
+        let f = w.flags(&pt, 0x1000);
+        assert!(f.is_writable() && !f.is_executable(), "writing {f:?}");
+        assert!(w.fetch(&pt, 0x1008));
+        assert_eq!(w.read(&pt, 0x1000), round);
+        assert_eq!(w.page(&pt, 0x1000), frame, "never copied");
+        assert_eq!(
+            pt.resolve_exec(&mut w.mem, &mut w.frames, 0x1000),
+            Ok(true),
+            "a stale fault changes nothing"
+        );
+        assert_never_wx(&w, &pt);
+    }
+    assert!(w.fetch(&pt, 0x1000));
+    let mut tlb = RecordingTlb::default();
+    assert_eq!(
+        pt.resolve_write(&mut w.mem, &mut w.frames, &mut tlb, 0x1000),
+        Ok(false),
+        "copy-on-write resolution leaves running pages to resolve_write_wx"
+    );
+    assert!(w.flags(&pt, 0x1000).is_executable());
+    assert!(!w.fetch(&pt, 0x2000), "an ordinary page never runs");
+    assert!(w.flags(&pt, 0x2000).is_writable());
+    assert_eq!(
+        pt.resolve_exec(&mut w.mem, &mut w.frames, 0x3000),
+        Ok(false),
+        "nothing mapped"
+    );
+    pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    assert_eq!(w.frames.live(), 0);
+}
+
+/// After a fork, each side's changes between writing and running stay its
+/// own: a fetch makes the tables private first, and a write copies the
+/// frame still shared (spec `isolation`).
+fn wx_pages_stay_private_after_fork<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let parent = w.table();
+    w.map(&parent, 0x1000, PageSize::Small, WX);
+    w.map(&parent, 0x2000, PageSize::Small, WX);
+    assert!(w.write(&parent, 0x1000, 1) && w.write(&parent, 0x2000, 2));
+    assert!(w.fetch(&parent, 0x2000)); // one running, one writing
+    let child = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    let shared = w.page(&parent, 0x1000);
+    // The child runs the writing page: its tables become its own, and the
+    // parent's entry stays writing (copy-on-write now).
+    assert!(w.fetch(&child, 0x1000));
+    assert!(!w.flags(&parent, 0x1000).is_executable());
+    assert_eq!(w.page(&child, 0x1000), shared, "running shares the frame");
+    // Each rewrites both pages: private copies, the other's untouched.
+    assert!(w.write(&child, 0x1000, 10) && w.write(&child, 0x2000, 20));
+    assert_ne!(w.page(&child, 0x1000), shared);
+    assert_eq!((w.read(&parent, 0x1000), w.read(&parent, 0x2000)), (1, 2));
+    assert!(w.write(&parent, 0x2000, 3));
+    assert!(w.fetch(&parent, 0x1000) && w.fetch(&parent, 0x2000));
+    assert!(w.fetch(&child, 0x1000) && w.fetch(&child, 0x2000));
+    assert_eq!((w.read(&parent, 0x1000), w.read(&parent, 0x2000)), (1, 3));
+    assert_eq!((w.read(&child, 0x1000), w.read(&child, 0x2000)), (10, 20));
+    for pt in [&parent, &child] {
+        assert_never_wx(&w, pt);
+        for at in [0x1000, 0x2000] {
+            assert!(w.flags(pt, at).contains(PageFlags::WRITE_OR_EXEC));
+        }
+    }
+    for pt in [parent, child] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0);
+}
+
+/// A clone (a template's instance) copies writing pages and shares running
+/// ones, which a write then copies: the bit survives both ways.
+fn wx_pages_in_clones<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let source = w.table();
+    w.map(&source, 0x1000, PageSize::Small, WX);
+    w.map(&source, 0x2000, PageSize::Small, WX);
+    assert!(w.write(&source, 0x1000, 1) && w.write(&source, 0x2000, 2));
+    assert!(w.fetch(&source, 0x2000));
+    let copy = source
+        .clone_lower_half(&mut w.mem, &mut w.frames, 0..LOWER_HALF_END)
+        .unwrap();
+    assert_ne!(w.page(&copy, 0x1000), w.page(&source, 0x1000), "copied");
+    assert_eq!(w.page(&copy, 0x2000), w.page(&source, 0x2000), "shared");
+    assert!(w.write(&copy, 0x2000, 20));
+    assert_ne!(w.page(&copy, 0x2000), w.page(&source, 0x2000));
+    assert_eq!(w.read(&source, 0x2000), 2);
+    assert!(w.fetch(&copy, 0x1000) && w.fetch(&copy, 0x2000));
+    assert_eq!((w.read(&copy, 0x1000), w.read(&copy, 0x2000)), (1, 20));
+    for pt in [&source, &copy] {
+        assert_never_wx(&w, pt);
+    }
+    for pt in [source, copy] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0);
+}
+
+#[test]
+fn wx_aarch64() {
+    wx_page_flips_on_faults::<Aarch64>();
+    wx_pages_stay_private_after_fork::<Aarch64>();
+    wx_pages_in_clones::<Aarch64>();
+}
+
+#[test]
+fn wx_x86_64() {
+    wx_page_flips_on_faults::<X86_64>();
+    wx_pages_stay_private_after_fork::<X86_64>();
+    wx_pages_in_clones::<X86_64>();
 }
 
 fn fork_shares_everything_and_writes_stay_private<F: EntryFormat>() {
@@ -426,6 +585,10 @@ const ADDRS: [u64; 6] = [
 #[derive(Debug, Clone)]
 enum Op {
     Map(usize, usize),
+    /// Maps a write-or-execute page (change `node-jit`).
+    MapWx(usize, usize),
+    /// Fetches an instruction from a page.
+    Fetch(usize, usize),
     Write(usize, usize, u64),
     Unmap(usize, usize),
     Fork(usize),
@@ -439,6 +602,8 @@ enum Op {
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         (0..4usize, 0..ADDRS.len()).prop_map(|(c, a)| Op::Map(c, a)),
+        (0..4usize, 0..ADDRS.len()).prop_map(|(c, a)| Op::MapWx(c, a)),
+        (0..4usize, 0..ADDRS.len()).prop_map(|(c, a)| Op::Fetch(c, a)),
         (0..4usize, 0..ADDRS.len(), 1..1000u64).prop_map(|(c, a, v)| Op::Write(c, a, v)),
         (0..4usize, 0..ADDRS.len()).prop_map(|(c, a)| Op::Unmap(c, a)),
         (0..4usize).prop_map(Op::Fork),
@@ -449,20 +614,35 @@ fn op() -> impl Strategy<Value = Op> {
 }
 
 /// Random sequences on up to four cells against a model of each cell's
-/// memory: every read matches the model, a page held never changes, and all
+/// memory: every read matches the model, a page held never changes, no
+/// page is ever writable and executable, a write-or-execute page always
+/// runs and an ordinary one never does (spec `virtual-memory`), and all
 /// frames return at the end.
 fn model_check<F: EntryFormat>(ops: &[Op]) {
     let mut w = World::<F>::new();
     let mut held: Vec<(u64, PageSize, u64)> = Vec::new();
     let first = w.table();
     let mut cells: Vec<(PageTable<F>, BTreeMap<u64, u64>)> = vec![(first, BTreeMap::new())];
+    // Write-or-execute addresses, the same in every cell (forks keep them).
+    let mut wx = std::collections::BTreeSet::new();
     for op in ops {
         let n = cells.len();
+        let used = |a: usize| cells.iter().any(|cell| cell.1.contains_key(&ADDRS[a]));
         match *op {
-            Op::Map(c, a) if c < n && !cells[c].1.contains_key(&ADDRS[a]) => {
+            Op::Map(c, a) if c < n && !cells[c].1.contains_key(&ADDRS[a]) && !wx.contains(&a) => {
                 let pt = PageTable::<F>::from_root(cells[c].0.root());
                 w.map(&pt, ADDRS[a], PageSize::Small, RW);
                 cells[c].1.insert(ADDRS[a], 0);
+            }
+            Op::MapWx(c, a) if c < n && !used(a) => {
+                let pt = PageTable::<F>::from_root(cells[c].0.root());
+                w.map(&pt, ADDRS[a], PageSize::Small, WX);
+                cells[c].1.insert(ADDRS[a], 0);
+                wx.insert(a);
+            }
+            Op::Fetch(c, a) if c < n && cells[c].1.contains_key(&ADDRS[a]) => {
+                let pt = PageTable::<F>::from_root(cells[c].0.root());
+                assert_eq!(w.fetch(&pt, ADDRS[a]), wx.contains(&a), "{op:?}");
             }
             Op::Write(c, a, v) if c < n && cells[c].1.contains_key(&ADDRS[a]) => {
                 let pt = PageTable::<F>::from_root(cells[c].0.root());
@@ -510,6 +690,7 @@ fn model_check<F: EntryFormat>(ops: &[Op]) {
             assert_eq!(w.mem.read_u64(page), v, "held {page:#x} after {op:?}");
         }
         for (pt, model) in &cells {
+            assert_never_wx(&w, pt);
             for &a in &ADDRS {
                 match model.get(&a) {
                     Some(&v) => assert_eq!(w.read(pt, a), v, "{a:#x} after {op:?}"),

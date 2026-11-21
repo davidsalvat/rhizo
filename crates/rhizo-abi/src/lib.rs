@@ -22,7 +22,7 @@ pub use pages::{FilePages, PageCache};
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
 use rhizo_cell::quota::Quota;
-use rhizo_cell::space::{self, Frames};
+use rhizo_cell::space::{self, Frames, TooManyRanges, WxRanges};
 use rhizo_cell::threads::Wait;
 use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_LIMIT, STACK_TOP, USER_END};
 use rhizo_hal::{Console, PhysicalMemory, Tlb};
@@ -843,8 +843,17 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell.brk as i64
 }
 
-/// The page permissions of `prot` (`PROT_READ` is implied).
+/// Whether `prot` asks for writable and executable memory.
+fn is_wx(prot: u64) -> bool {
+    prot & (PROT_WRITE | PROT_EXEC) == PROT_WRITE | PROT_EXEC
+}
+
+/// The page permissions of `prot` (`PROT_READ` is implied): writable and
+/// executable make a write-or-execute page, writing (change `node-jit`).
 fn page_flags(prot: u64) -> PageFlags {
+    if is_wx(prot) {
+        return space::WX_WRITING;
+    }
     let mut pf = PageFlags::USER;
     if prot & PROT_WRITE != 0 {
         pf = pf | PageFlags::WRITABLE;
@@ -855,9 +864,45 @@ fn page_flags(prot: u64) -> PageFlags {
     pf
 }
 
+/// The write-or-execute ranges `wx` once `addr..end` is taken out of them,
+/// and added back when `add`, or `None` when nothing changes; checked
+/// before anything else changes (design D5 of `node-jit`). A cell whose
+/// pager keeps no ranges (`None`) can have none.
+fn wx_after(
+    wx: Option<&mut WxRanges>,
+    addr: u64,
+    end: u64,
+    add: bool,
+) -> Result<Option<WxRanges>, TooManyRanges> {
+    let Some(wx) = wx else {
+        return if add { Err(TooManyRanges) } else { Ok(None) };
+    };
+    if wx.ranges().is_empty() && !add {
+        return Ok(None);
+    }
+    let mut after = wx.clone();
+    after.remove(addr, end)?;
+    if add {
+        after.add(addr, end)?;
+    }
+    Ok(Some(after))
+}
+
+/// Makes `ranges` (from [`wx_after`]) the cell's write-or-execute ranges.
+fn set_wx<F: EntryFormat, M: PhysicalMemory>(
+    pager: &mut dyn Pager<F, M>,
+    ranges: Option<WxRanges>,
+) {
+    if let (Some(ranges), Some(wx)) = (ranges, pager.wx()) {
+        *wx = ranges;
+    }
+}
+
 /// `mmap`: anonymous private memory, or a private mapping of a file's
 /// pages (spec `linux-abi`, file mappings), at the next free address or,
 /// with `MAP_FIXED`, in place of whatever was mapped at the address given.
+/// Anonymous memory both writable and executable becomes a write-or-execute
+/// range, backed on first touch (design D5 of `node-jit`).
 fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
@@ -872,8 +917,8 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     if len == 0 || flags & (MAP_SHARED | MAP_PRIVATE) != MAP_PRIVATE {
         return -EINVAL;
     }
-    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
-        return -EACCES; // cells are W^X
+    if is_wx(prot) && !anonymous {
+        return -EACCES; // writable and executable: anonymous memory only
     }
     let Some(len) = len
         .checked_add(FRAME_SIZE - 1)
@@ -920,9 +965,13 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
         }
         addr
     };
-    if prot != 0 && anonymous && !cx.services.can_store(len) {
+    let wx = is_wx(prot);
+    if prot != 0 && !wx && anonymous && !cx.services.can_store(len) {
         return -ENOMEM; // refused before any of it is zeroed
     }
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, addr + len, wx) else {
+        return -ENOMEM;
+    };
     if fixed {
         // What was mapped there goes, as on Linux.
         if space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, len).is_err() {
@@ -930,9 +979,11 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
         }
         cx.pager.discard(addr, len);
     }
+    set_wx(cx.pager, ranges);
     let pf = page_flags(prot);
     let mapped = match file {
-        _ if prot == 0 => Ok(()), // reserved (spec `linux-abi`)
+        // Reserved (spec `linux-abi`), or a write-or-execute range.
+        _ if prot == 0 || wx => Ok(()),
         None => space::map_anonymous(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, len, pf),
         Some((ino, first)) => {
             let (fs, pages) = (&*cx.fs, &mut *cx.pages);
@@ -966,9 +1017,13 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     if len == 0 || !addr.is_multiple_of(FRAME_SIZE) || end > STACK_TOP {
         return -EINVAL;
     }
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, false) else {
+        return -ENOMEM; // as Linux, when a split needs one area too many
+    };
     match space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr) {
         Ok(()) => {
             cx.pager.discard(addr, end - addr);
+            set_wx(cx.pager, ranges);
             0
         }
         Err(_) => -EINVAL,
@@ -1262,9 +1317,6 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     if !addr.is_multiple_of(FRAME_SIZE) || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return -EINVAL;
     }
-    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
-        return -EACCES; // cells are W^X
-    }
     // Only the cell's own addresses (spec `isolation`): on x86_64 its table
     // also holds the kernel half, whose pages must never become the cell's.
     let Some(end) = addr
@@ -1274,6 +1326,20 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     else {
         return -ENOMEM;
     };
+    // Write-or-execute ranges lose what this call covers, or take it all
+    // (design D5 of `node-jit`); checked before anything changes.
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, is_wx(prot)) else {
+        return -ENOMEM;
+    };
+    if is_wx(prot) {
+        return match protect_wx(cell, cx, addr, end) {
+            Ok(()) => {
+                set_wx(cx.pager, Some(ranges.unwrap_or_default()));
+                0
+            }
+            Err(e) => e,
+        };
+    }
     if prot == 0 {
         // Inaccessible pages hold nothing: their memory goes, and in the
         // mapping area their addresses stay reserved (design D4 of
@@ -1281,11 +1347,13 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         return match space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr) {
             Ok(()) => {
                 cx.pager.discard(addr, end - addr);
+                set_wx(cx.pager, ranges);
                 0
             }
             Err(_) => -ENOMEM,
         };
     }
+    set_wx(cx.pager, ranges);
     let flags = page_flags(prot);
     // Pages not in memory yet (lazy resume) are brought in first; holes
     // below the mapping cursor are reserved (`PROT_NONE`) addresses, backed
@@ -1325,6 +1393,66 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         Err(space::ProtectError::PartialLargePage(_)) => -EINVAL,
         Err(_) => -ENOMEM,
     }
+}
+
+/// `mprotect` with `PROT_WRITE|PROT_EXEC` over `addr..end` (design D5 of
+/// `node-jit`): every page the cell has (brought in first if still pending)
+/// becomes a write-or-execute page, writing, keeping its frame; the holes
+/// must be reserved addresses, which take no memory (the caller adds them
+/// to the write-or-execute ranges). Every page is checked before one
+/// changes; a hole costs one step per empty table entry unless pages are
+/// still pending (spec `isolation`).
+fn protect_wx<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
+    cell: &Cell,
+    cx: &mut Context<'_, F, M, T, A, S>,
+    addr: u64,
+    end: u64,
+) -> Result<(), i64> {
+    let reserved = MMAP_BASE..cell.mmap_next;
+    let pending = cx.pager.has_pending();
+    let mut at = addr;
+    while at < end {
+        if cx.pt.translate(cx.mem, at).is_none() && !cx.pager.page_in(&cx.pt, cx.mem, at, false) {
+            let hole_end = match pending {
+                true => at + FRAME_SIZE,
+                false => cx.pt.hole_end(cx.mem, at).unwrap_or(at + FRAME_SIZE),
+            };
+            if at < reserved.start || hole_end.min(end) > reserved.end {
+                return Err(-ENOMEM);
+            }
+            at = hole_end;
+            continue;
+        }
+        let size = cx
+            .pt
+            .translate(cx.mem, at)
+            .map_or(FRAME_SIZE, |t| t.size.bytes());
+        let base = at & !(size - 1);
+        if base < addr || base + size > end {
+            return Err(-EINVAL); // part of a 2 MiB page
+        }
+        at = base + size;
+    }
+    let mut at = addr;
+    while at < end {
+        let Some(t) = cx.pt.translate(cx.mem, at) else {
+            at = cx.pt.hole_end(cx.mem, at).unwrap_or(at + FRAME_SIZE);
+            continue;
+        };
+        let size = t.size.bytes();
+        space::protect(
+            &cx.pt,
+            cx.mem,
+            cx.tlb,
+            cx.frames,
+            at,
+            size,
+            space::WX_WRITING,
+        )
+        .map_err(|_| -ENOMEM)?;
+        at += size;
+    }
+    Ok(())
 }
 
 /// Makes the current call wait (design D3 of `add-sockets-and-poll`) for at

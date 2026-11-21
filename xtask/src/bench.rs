@@ -821,6 +821,9 @@ struct Runtime {
     /// (`rhizo-<name> cold_ns=<median> warm_ns=<median>`, parsed by `parse`).
     name: &'static str,
     parse: fn(&str) -> Option<(u64, u64)>,
+    /// Further metrics from the same output, `(metric, unit, value)`;
+    /// none when their line is missing.
+    extra: fn(&str) -> Vec<(&'static str, &'static str, f64)>,
     /// What it is called in reports.
     title: &'static str,
     /// Why it is not packed, if it is not.
@@ -833,6 +836,7 @@ const NODE: Runtime = Runtime {
     feature: "node",
     name: "node",
     parse: parse_node_line,
+    extra: parse_node_jit_line,
     title: "Node.js",
     unavailable: crate::node_unavailable_reason,
     memory_mib: crate::NODE_MEMORY_MIB,
@@ -843,6 +847,7 @@ const NUMPY: Runtime = Runtime {
     feature: "packages",
     name: "numpy",
     parse: parse_numpy_line,
+    extra: |_| Vec::new(),
     title: "numpy",
     unavailable: crate::packages_unavailable_reason,
     memory_mib: crate::PACKAGES_MEMORY_MIB,
@@ -882,12 +887,19 @@ fn measure_runtime(
         }
         report::text(&format!("{} on {}", rt.title, vmm.id()));
         let (mut cold, mut warm) = (Vec::new(), Vec::new());
+        let mut extra: Vec<(&str, &str, Vec<f64>)> = Vec::new();
         for _ in 0..opts.runs.clamp(1, 3) {
             let out = vmm::run(vmm, &guest, run_opts)?;
             match (rt.parse)(&out.output) {
                 Some((c, w)) if out.result != VmResult::Failed => {
                     cold.push(c as f64 / 1000.0);
                     warm.push(w as f64 / 1000.0);
+                    for (name, unit, value) in (rt.extra)(&out.output) {
+                        match extra.iter_mut().find(|e| e.0 == name) {
+                            Some(e) => e.2.push(value),
+                            None => extra.push((name, unit, vec![value])),
+                        }
+                    }
                 }
                 _ => {
                     skipped.push((
@@ -901,17 +913,23 @@ fn measure_runtime(
                 }
             }
         }
-        for (name, values) in [
-            (format!("workload.{}_cold_us", rt.name), &mut cold),
-            (format!("workload.{}_warm_us", rt.name), &mut warm),
-        ] {
+        let extra = extra
+            .iter_mut()
+            .map(|(name, unit, values)| (name.to_string(), *unit, values));
+        for (name, unit, values) in [
+            (format!("workload.{}_cold_us", rt.name), "us", &mut cold),
+            (format!("workload.{}_warm_us", rt.name), "us", &mut warm),
+        ]
+        .into_iter()
+        .chain(extra)
+        {
             if !values.is_empty() {
                 let (median, p90) = summarize(values);
                 metrics.push(Metric {
                     name,
                     guest: "rhizo".into(),
                     vmm: Some(vmm.id().into()),
-                    unit: "us".into(),
+                    unit: unit.into(),
                     median,
                     p90,
                     runs: values.len(),
@@ -933,6 +951,21 @@ fn parse_node_line(output: &str) -> Option<(u64, u64)> {
             .ok()
     };
     Some((field("cold_ns")?, field("warm_ns")?))
+}
+
+/// The metrics of the `rhizo-node-jit` line of a Node.js `bench-cell`
+/// kernel: Node.js with its JIT, cold and warm, and the changes of
+/// write-or-execute pages in one cold run (change `node-jit`).
+fn parse_node_jit_line(output: &str) -> Vec<(&'static str, &'static str, f64)> {
+    let field = |key| crate::profile::field(output, "rhizo-node-jit", key);
+    match (field("cold_ns"), field("warm_ns"), field("flips")) {
+        (Some(cold), Some(warm), Some(flips)) => vec![
+            ("workload.node_jit_cold_us", "us", cold as f64 / 1000.0),
+            ("workload.node_jit_warm_us", "us", warm as f64 / 1000.0),
+            ("workload.node_jit_flips", "flips", flips as f64),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
@@ -2611,6 +2644,18 @@ mod tests {
             Some((90_000_000, 4_000_000))
         );
         assert_eq!(parse_node_line("rhizo-node not packed\n"), None);
+        let jit =
+            "rhizo-node cold_ns=9 warm_ns=4\nrhizo-node-jit cold_ns=60000 warm_ns=3000 flips=812\n";
+        assert_eq!(
+            parse_node_jit_line(jit),
+            vec![
+                ("workload.node_jit_cold_us", "us", 60.0),
+                ("workload.node_jit_warm_us", "us", 3.0),
+                ("workload.node_jit_flips", "flips", 812.0),
+            ]
+        );
+        assert_eq!(parse_node_line(jit), Some((9, 4)), "the jitless line");
+        assert!(parse_node_jit_line("rhizo-node cold_ns=9 warm_ns=4\n").is_empty());
     }
 
     #[test]

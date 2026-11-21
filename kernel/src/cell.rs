@@ -23,14 +23,14 @@ use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::images::{self, Images};
 use rhizo_cell::memory::Pager;
 use rhizo_cell::quota::{Meter, Metered, Quota};
-use rhizo_cell::space::{self, Frames};
+use rhizo_cell::space::{self, Frames, WxRanges};
 use rhizo_cell::threads::Wait;
 use rhizo_cell::{Cell, FpState, Registers};
 use rhizo_core::random::{self, Batched, Generator};
 use rhizo_core::smp::MAX_CPUS;
 use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
-use rhizo_mm::paging::{PageSize, PageTable};
+use rhizo_mm::paging::{PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
 use rhizo_net::Net;
 use rhizo_prof::Part;
@@ -701,8 +701,9 @@ struct Live {
     /// snapshot, and never shared with a fork (design D2 of
     /// `add-crypto-random`).
     random: Option<Generator>,
-    /// Pages still to restore, for a lazily resumed cell.
-    lazy: Option<Lazy>,
+    /// Pages it gets on demand: still to restore, and of its
+    /// write-or-execute ranges.
+    demand: OnDemand,
     /// Frames counted against its memory quota.
     frames: Meter,
     /// The counter at the start of the running slice, negated, then the
@@ -763,6 +764,16 @@ impl Live {
         }
         self.cell.threads.expire_timers();
     }
+}
+
+/// The pages a live cell gets on demand: those of a lazy resume still only
+/// in the snapshot, and those of its write-or-execute ranges (design D5 of
+/// `node-jit`), together so the pager of system calls reaches both through
+/// one pointer.
+#[derive(Debug, Default)]
+struct OnDemand {
+    lazy: Option<Lazy>,
+    wx: WxRanges,
 }
 
 /// The snapshot of a lazily resumed cell and which of its pages are still
@@ -879,7 +890,7 @@ impl Tlb for CellTlb<'_> {
 
 /// The pager of system calls: a lazily resumed cell's pending pages, and
 /// copy-on-write pages shared after a fork (resolved through the TLB given).
-struct CellPager<'a, 'g>(&'a mut Option<Lazy>, &'a mut CellTlb<'g>, &'a Meter);
+struct CellPager<'a, 'g>(&'a mut OnDemand, &'a mut CellTlb<'g>, &'a Meter);
 
 impl Pager<Format, DirectMap> for CellPager<'_, '_> {
     fn page_in(
@@ -891,19 +902,51 @@ impl Pager<Format, DirectMap> for CellPager<'_, '_> {
     ) -> bool {
         if self
             .0
+            .lazy
             .as_mut()
             .is_some_and(|lazy| lazy.page_in(pt, &mut cell_frames(self.2), addr))
         {
             return true;
         }
-        (write && resolve_write(pt, self.1, addr)) || grow_stack(pt, &mut cell_frames(self.2), addr)
+        (write && resolve_write(pt, self.1, addr))
+            || grow_stack(pt, &mut cell_frames(self.2), addr)
+            || wx_page_in(&self.0.wx, self.1, self.2, pt, addr, write)
     }
 
     fn discard(&mut self, addr: u64, len: u64) {
-        if let Some(lazy) = self.0.as_mut() {
+        if let Some(lazy) = self.0.lazy.as_mut() {
             lazy.discard(addr, len);
         }
     }
+
+    fn has_pending(&self) -> bool {
+        self.0.lazy.is_some()
+    }
+
+    fn wx(&mut self) -> Option<&mut WxRanges> {
+        Some(&mut self.0.wx)
+    }
+}
+
+/// A system call's access to a page of write-or-execute memory (design D5
+/// of `node-jit`): a write to a running page makes it writing, and a page
+/// of the ranges not mapped yet is backed. Out of line and cold: a cell
+/// without such memory never comes here but on a real fault.
+#[cold]
+#[inline(never)]
+fn wx_page_in(
+    wx: &WxRanges,
+    tlb: &mut CellTlb<'_>,
+    meter: &Meter,
+    pt: &PageTable<Format>,
+    addr: u64,
+    write: bool,
+) -> bool {
+    if write && resolve_write_wx(pt, tlb, addr) {
+        return true;
+    }
+    let (mem, frames) = (&mut DirectMap, &mut cell_frames(meter));
+    cells_may_take(FRAME_SIZE) && space::back_wx(pt, mem, &mut CpuTlb, frames, wx, addr)
 }
 
 /// The instruction at `pc` in the cell with tables `pt`, if it is mapped
@@ -940,6 +983,94 @@ fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bo
         tlb.flush_page(addr);
     }
     resolved
+}
+
+/// Makes the running write-or-execute page holding `addr` writing for a
+/// write (design D3 of `node-jit`), copying a frame still shared, its old
+/// translation flushed through `tlb`. Not metered, as [`resolve_write`].
+#[cold]
+#[inline(never)]
+fn resolve_write_wx(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bool {
+    let _p = cost::scope(Part::Fault);
+    let resolved = pt.resolve_write_wx(&mut DirectMap, &mut KernelFrames, tlb, addr) == Ok(true);
+    if resolved {
+        tlb.flush_page(addr);
+    }
+    resolved
+}
+
+/// Backs the page of `live`'s write-or-execute ranges holding `addr` with
+/// a zeroed page, writing, if it is not mapped and memory and the cell's
+/// quota allow (design D5 of `node-jit`).
+fn back_wx(live: &Live, pt: &PageTable<Format>, addr: u64) -> bool {
+    let _p = cost::scope(Part::Fault);
+    let (mem, frames) = (&mut DirectMap, &mut cell_frames(&live.frames));
+    let wx = &live.demand.wx;
+    wx.contains(addr)
+        && cells_may_take(FRAME_SIZE)
+        && sharing(live.shares, || {
+            space::back_wx(pt, mem, &mut CpuTlb, frames, wx, addr)
+        })
+}
+
+/// A fault of `live`'s code on `cpu`, run alone, resolved for its
+/// write-or-execute memory (design D3 and D5 of `node-jit`): a page of a
+/// range backed, a writing page made running, or a running page made
+/// writing (unless the instruction writes the page it runs from). Only
+/// faults no other path resolved come here: the cell loop is unchanged.
+#[cold]
+#[inline(never)]
+fn wx_fault(live: &mut Live, pt: &PageTable<Format>, cpu: usize, fault: &UserFault) -> bool {
+    if fault
+        .missing_page()
+        .is_some_and(|addr| back_wx(live, pt, addr))
+    {
+        return true;
+    }
+    let pc = live.cell.regs().pc;
+    let resolved = fault.exec_denied().is_some_and(|addr| {
+        sharing(live.shares, || {
+            resolve_exec(pt, &mut CellTlb::new(None), addr)
+        })
+    }) || fault.write_denied().is_some_and(|addr| {
+        !writes_own_code(pt, pc, addr)
+            && sharing(live.shares, || {
+                resolve_write_wx(pt, &mut CellTlb::new(None), addr)
+            })
+    });
+    if resolved {
+        live.clean = flushed_by_kernel_on(cpu);
+    }
+    resolved
+}
+
+/// Makes the write-or-execute page holding `addr`, writing, running for an
+/// instruction fetch (design D3 of `node-jit`): read-only and executable,
+/// its old translation flushed through `tlb` from every CPU that may hold
+/// it, then (on AArch64) its contents made visible to instruction fetches.
+/// Returns `false` for any other page.
+fn resolve_exec(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bool {
+    let _p = cost::scope(Part::Fault);
+    if pt.resolve_exec(&mut DirectMap, &mut KernelFrames, addr) != Ok(true) {
+        return false;
+    }
+    tlb.flush_page(addr);
+    if let Some(t) = pt.translate(&DirectMap, addr) {
+        let size = t.size.bytes();
+        user::sync_code(DirectMap::virt(t.phys & !(size - 1)), size);
+    }
+    prof::add(Count::WxFlips, 1);
+    true
+}
+
+/// Whether a write fault at `addr` from the instruction at `pc` writes the
+/// running write-or-execute page it runs from: no change of state lets it
+/// complete, so it is a fault (spec `linux-abi`, design D3 of `node-jit`).
+fn writes_own_code(pt: &PageTable<Format>, pc: u64, addr: u64) -> bool {
+    pc >> 12 == addr >> 12
+        && pt
+            .translate(&DirectMap, addr)
+            .is_some_and(|t| t.flags.contains(PageFlags::WRITE_OR_EXEC) && t.flags.is_executable())
 }
 
 /// How [`Host::resume`] restores memory.
@@ -1006,7 +1137,7 @@ pub struct Host {
     finished: Vec<Finished>,
     /// Frozen cells and their files: never run, only forked (spec `fork`,
     /// templates).
-    templates: Vec<(Cell, Fs)>,
+    templates: Vec<(Cell, Fs, WxRanges)>,
     /// When the network card is to be polled next, and what its last poll
     /// said: nanoseconds until it wants polling (design D4 of
     /// `add-virtio-net`; `None`: no card). The boot CPU polls it.
@@ -1411,7 +1542,7 @@ fn syscall(
             fs: &mut live.fs,
             net: &mut sockets,
             deadline,
-            pager: &mut CellPager(&mut live.lazy, &mut pager_tlb, &live.frames),
+            pager: &mut CellPager(&mut live.demand, &mut pager_tlb, &live.frames),
             pages: &mut KernelPages,
         };
         let outcome = live.abi.handle(&mut live.cell, &mut cx);
@@ -1546,15 +1677,15 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                 }
                 Trap::Fault(fault)
                     if fault.missing_page().is_some_and(|addr| {
-                        live.lazy.as_mut().is_some_and(|l| {
+                        live.demand.lazy.as_mut().is_some_and(|l| {
                             let _p = cost::scope(Part::Fault);
                             l.page_in(&pt, &mut cell_frames(&live.frames), addr)
                         })
                     }) =>
                 {
                     prof::add(Count::LazyFaults, 1);
-                    if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
-                        live.lazy = None; // fully restored: drop the snapshot
+                    if live.demand.lazy.as_ref().is_some_and(|l| l.left == 0) {
+                        live.demand.lazy = None; // fully restored: drop the snapshot
                     }
                     continue;
                 }
@@ -1582,6 +1713,9 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     continue;
                 }
                 Trap::Fault(fault) => {
+                    if wx_fault(&mut live, &pt, cpu, &fault) {
+                        continue;
+                    }
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
                         echo: live.echo,
@@ -1881,23 +2015,23 @@ impl GangCell {
     /// stack grown, a copy-on-write page copied, or a page another CPU
     /// mapped meanwhile), or the cell ends. Returns whether the thread runs
     /// on.
-    fn fault(&mut self, gang: &Gang, cpu: usize, fault: &UserFault) -> bool {
+    fn fault(&mut self, gang: &Gang, cpu: usize, fault: &UserFault, pc: u64) -> bool {
         if self.ending.is_some() {
             return false;
         }
         let live = &mut *self.live;
         let pt = PageTable::<Format>::from_root(gang.root);
         if let Some(addr) = fault.missing_page() {
-            if live.lazy.as_mut().is_some_and(|l| {
+            if live.demand.lazy.as_mut().is_some_and(|l| {
                 let _p = cost::scope(Part::Fault);
                 l.page_in(&pt, &mut cell_frames(&live.frames), addr)
             }) {
-                if live.lazy.as_ref().is_some_and(|l| l.left == 0) {
-                    live.lazy = None;
+                if live.demand.lazy.as_ref().is_some_and(|l| l.left == 0) {
+                    live.demand.lazy = None;
                 }
                 return true;
             }
-            if grow_stack(&pt, &mut cell_frames(&live.frames), addr) {
+            if grow_stack(&pt, &mut cell_frames(&live.frames), addr) || back_wx(live, &pt, addr) {
                 return true;
             }
             if pt.translate(&DirectMap, addr).is_some() {
@@ -1908,6 +2042,22 @@ impl GangCell {
         if let Some(addr) = fault.write_denied()
             && sharing(live.shares, || {
                 resolve_write(&pt, &mut CellTlb::new(Some((gang, cpu))), addr)
+            })
+        {
+            return true;
+        }
+        // Write-or-execute pages (design D3 of `node-jit`).
+        if let Some(addr) = fault.exec_denied()
+            && sharing(live.shares, || {
+                resolve_exec(&pt, &mut CellTlb::new(Some((gang, cpu))), addr)
+            })
+        {
+            return true;
+        }
+        if let Some(addr) = fault.write_denied()
+            && !writes_own_code(&pt, pc, addr)
+            && sharing(live.shares, || {
+                resolve_write_wx(&pt, &mut CellTlb::new(Some((gang, cpu))), addr)
             })
         {
             return true;
@@ -2093,7 +2243,7 @@ fn run_gang(
                         fault.emulate(&mut regs, |pc| instruction(&pt, pc))
                     }) => {}
                 Trap::Fault(fault) => {
-                    if !gang.locked(shared, ptr, |cell| cell.fault(gang, cpu, &fault)) {
+                    if !gang.locked(shared, ptr, |cell| cell.fault(gang, cpu, &fault, regs.pc)) {
                         break None;
                     }
                 }
@@ -2246,7 +2396,7 @@ impl Host {
             output: output.then(Vec::new),
             echo,
             random: None,
-            lazy: None,
+            demand: OnDemand::default(),
             frames,
             cpu_ticks: 0,
             fs,
@@ -2376,7 +2526,7 @@ impl Host {
         let mut bytes = 0;
         PageTable::<Format>::from_root(live.cell.root)
             .for_each_lower_leaf(&DirectMap, &mut |_, _, size, _| bytes += size.bytes());
-        if let Some(lazy) = &live.lazy {
+        if let Some(lazy) = &live.demand.lazy {
             bytes += 2 * lazy.pending_bytes();
         }
         if !cells_may_take(bytes) {
@@ -2384,7 +2534,7 @@ impl Host {
         }
         let mut live = self.state().sched.remove(|l| l.cell.id == id)?;
         let pt = PageTable::<Format>::from_root(live.cell.root);
-        if let Some(lazy) = live.lazy.as_mut() {
+        if let Some(lazy) = live.demand.lazy.as_mut() {
             lazy.finish(&pt, &live.frames);
         }
         sync_fp(&mut live, true);
@@ -2396,6 +2546,7 @@ impl Host {
             Snapshot::capture::<Format>(
                 user::MACHINE,
                 &live.cell,
+                &live.demand.wx,
                 &files,
                 &sockets,
                 now_ns(),
@@ -2439,6 +2590,7 @@ impl Host {
         let cell = snapshot.cell(id, pt.root(), now_ns());
         let mut fs = files_of(&snapshot);
         import_sockets(&mut fs, &snapshot.sockets());
+        let wx = snapshot.wx();
         let mut lazy = Lazy::new(snapshot);
         let used = Meter::new(1, u64::MAX); // the root
         if mode == Resume::Eager {
@@ -2446,7 +2598,8 @@ impl Host {
         }
         let mut live = self.new_live(cell, capture, echo, fs);
         live.frames.set_used(used.used());
-        live.lazy = (lazy.left > 0).then_some(lazy);
+        live.demand.lazy = (lazy.left > 0).then_some(lazy);
+        live.demand.wx = wx;
         file(self.state(), None, live);
         Ok(id)
     }
@@ -2521,7 +2674,7 @@ impl Host {
     )]
     pub fn pending_pages(&mut self, id: u32) -> Option<usize> {
         let live = self.state().sched.find(|l| l.cell.id == id)?;
-        Some(live.lazy.as_ref().map_or(0, |l| l.left))
+        Some(live.demand.lazy.as_ref().map_or(0, |l| l.left))
     }
 
     /// Runs cells on every CPU until none is left that can ever run or
@@ -2683,16 +2836,17 @@ impl Host {
         let _p = cost::scope(Part::Spawn);
         let (mut parent, wake) = self.state().sched.remove_with_wake(|l| l.cell.id == id)?;
         let pt = PageTable::<Format>::from_root(parent.cell.root);
-        if let Some(lazy) = parent.lazy.as_mut() {
+        if let Some(lazy) = parent.demand.lazy.as_mut() {
             lazy.finish(&pt, &parent.frames);
         }
-        parent.lazy = None;
+        parent.demand.lazy = None;
         sync_fp(&mut parent, false);
         let mut children = Vec::with_capacity(n);
         for _ in 0..n {
             let Some(child) = self.child_of(
                 &parent.cell,
                 &parent.fs,
+                &parent.demand.wx,
                 parent.output.is_some(),
                 parent.echo,
             ) else {
@@ -2734,8 +2888,16 @@ impl Host {
         );
     }
 
-    /// A new live cell sharing `cell`'s memory copy-on-write.
-    fn child_of(&mut self, cell: &Cell, fs: &Fs, capture: bool, echo: bool) -> Option<Box<Live>> {
+    /// A new live cell sharing `cell`'s memory copy-on-write, with its
+    /// files `fs` and its write-or-execute ranges `wx`.
+    fn child_of(
+        &mut self,
+        cell: &Cell,
+        fs: &Fs,
+        wx: &WxRanges,
+        capture: bool,
+        echo: bool,
+    ) -> Option<Box<Live>> {
         let pt = PageTable::<Format>::from_root(cell.root);
         let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
         // The child has the cell's quotas and none of its usage (design D3
@@ -2749,6 +2911,7 @@ impl Host {
         let mut live = self.new_live(cell, capture, echo, fork_files(fs));
         live.frames.set_used(1); // its root
         live.shares = true;
+        live.demand.wx = wx.clone();
         Some(live)
     }
 
@@ -2775,7 +2938,7 @@ impl Host {
             return false;
         };
         let pt = PageTable::<Format>::from_root(live.cell.root);
-        if let Some(lazy) = live.lazy.as_mut() {
+        if let Some(lazy) = live.demand.lazy.as_mut() {
             lazy.finish(&pt, &live.frames);
         }
         sync_fp(&mut live, true);
@@ -2783,8 +2946,10 @@ impl Host {
         if live.tag != 0 {
             self.state().tags.free(live.tag);
         }
-        let Live { cell, fs, .. } = *live;
-        self.templates.push((cell, fs));
+        let Live {
+            cell, fs, demand, ..
+        } = *live;
+        self.templates.push((cell, fs, demand.wx));
         true
     }
 
@@ -2797,10 +2962,10 @@ impl Host {
     )]
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
         let _p = cost::scope(Part::Spawn);
-        let index = self.templates.iter().position(|(c, _)| c.id == id)?;
-        let (cell, fs) = &self.templates[index];
-        let (cell, fs) = (cell.clone(), fs.clone());
-        let mut child = self.child_of(&cell, &fs, capture, echo)?;
+        let index = self.templates.iter().position(|(c, ..)| c.id == id)?;
+        let (cell, fs, wx) = &self.templates[index];
+        let (cell, fs, wx) = (cell.clone(), fs.clone(), wx.clone());
+        let mut child = self.child_of(&cell, &fs, &wx, capture, echo)?;
         child.expire_timers();
         let child_id = child.cell.id;
         file(self.state(), None, child);
@@ -3013,7 +3178,7 @@ impl Drop for Host {
         while let Some(live) = self.state().sched.remove(|_| true) {
             self.end(live, Ending::Killed);
         }
-        for (template, fs) in self.templates.drain(..) {
+        for (template, fs, _) in self.templates.drain(..) {
             space::destroy(
                 PageTable::<Format>::from_root(template.root),
                 &mut DirectMap,
@@ -3071,13 +3236,20 @@ pub fn bench(console: &mut impl Console) {
     return profiled(console);
     // The Node.js kernel measures Node.js only (its VM has the memory).
     if cfg!(feature = "node") {
-        let _ = match node() {
-            Some((cold, warm)) => writeln!(
+        let _ = match node(false) {
+            Some((cold, warm, _)) => writeln!(
                 rhizo_hal::ConsoleWriter(console),
                 "rhizo-node cold_ns={cold} warm_ns={warm}"
             ),
             None => writeln!(rhizo_hal::ConsoleWriter(console), "rhizo-node not packed"),
         };
+        // With its JIT (change `node-jit`).
+        if let Some((cold, warm, flips)) = node(true) {
+            let _ = writeln!(
+                rhizo_hal::ConsoleWriter(console),
+                "rhizo-node-jit cold_ns={cold} warm_ns={warm} flips={flips}"
+            );
+        }
         return;
     }
     // The packages' kernel measures numpy only (its VM has the memory).
@@ -3592,15 +3764,21 @@ fn python() -> Option<(u64, u64)> {
     Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
 }
 
-/// Node.js answering one tool call (`cells/node/demo.js` with `--jitless`;
-/// change `add-node-workload`): spawned cold from its files (`ld.so`,
-/// Node's start-up, warm-up, answer, exit), and forked from a template
-/// frozen after its warm-up. Medians over 7 rounds, after a first spawn
-/// that fills the page cache; `None` when Node.js was not packed.
+/// Node.js answering one tool call (`cells/node/demo.js`; change
+/// `add-node-workload`), with `--jitless` or with its JIT (`jit`, change
+/// `node-jit`): spawned cold from its files (`ld.so`, Node's start-up,
+/// warm-up, answer, exit), and forked from a template frozen after its
+/// warm-up. Medians over 7 rounds, after a first spawn that fills the page
+/// cache, and the changes of write-or-execute pages in one more cold run;
+/// `None` when Node.js was not packed.
 #[cfg(feature = "bench-cell")]
-fn node() -> Option<(u64, u64)> {
+fn node(jit: bool) -> Option<(u64, u64, u64)> {
     const ROUNDS: usize = 7;
-    const ARGV: [&[u8]; 4] = [b"/usr/bin/node", b"--jitless", b"/app/demo.js", b"wait"];
+    let argv: &[&[u8]] = match jit {
+        false => &[b"/usr/bin/node", b"--jitless", b"/app/demo.js", b"wait"],
+        true => &[b"/usr/bin/node", b"/app/demo.js", b"wait"],
+    };
+    let script = argv.len() - 1; // without `wait`
     let files = node_files()?;
     let ns = |t0: u64, t1: u64| bench_ns(t1 - t0).unwrap_or(0);
     let mut host = Host::new();
@@ -3613,18 +3791,24 @@ fn node() -> Option<(u64, u64)> {
     for round in 0..=ROUNDS {
         host.finished.clear();
         let t0 = bench_clock();
-        let id = spawn(&mut host, &ARGV[..3]);
+        let id = spawn(&mut host, &argv[..script]);
         host.run(|h| h.finished(id).is_some());
         if round > 0 {
             cold.push(ns(t0, bench_clock()));
         }
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
+    // Counting slows system calls a little: a run of its own.
+    prof::start();
+    let id = spawn(&mut host, &argv[..script]);
+    host.run(|h| h.finished(id).is_some());
+    let flips = prof::stop().count(Count::WxFlips);
+    host.finished.clear();
     // Frozen in its pause after `warm`, every thread waiting (the main one
     // in `epoll_pwait`, for the timer), not wherever the slice that printed
     // `warm` ended: the same state on every VMM (design D2 of
     // `fast-node-template`).
-    let template = spawn(&mut host, &ARGV);
+    let template = spawn(&mut host, argv);
     while !(host.output(template) == Some(b"warm\n") && host.waits(template)) {
         host.step();
     }
@@ -3646,7 +3830,7 @@ fn node() -> Option<(u64, u64)> {
     }
     cold.sort_unstable();
     warm.sort_unstable();
-    Some((cold[ROUNDS / 2], warm[ROUNDS / 2]))
+    Some((cold[ROUNDS / 2], warm[ROUNDS / 2], flips))
 }
 
 /// The files a CPython cell starts with (`cpython-files`, packed by `xtask`:
