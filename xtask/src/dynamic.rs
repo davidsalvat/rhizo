@@ -7,13 +7,20 @@
 //!   small, for every kernel that runs cells (tests and benchmarks);
 //! - `distro-files`: where the cells' architecture is the host's, the
 //!   distribution's own `ls`, `sort` and `python3`, embedded in test
-//!   kernels only (the benchmark kernel keeps its memory for cells).
+//!   kernels only (the benchmark kernel keeps its memory for cells);
+//! - `node-files`: when `RHIZO_NODE` is set, the official Node.js build
+//!   for the cells' architecture (`tools::node`) with
+//!   `cells/node/demo.js`, embedded only in the kernels built with the
+//!   `node` feature (change `add-node-workload`).
 //!
 //! The interpreter, libraries and programs are the build host's (glibc:
 //! LGPL-2.1-or-later; coreutils: GPL-3.0-or-later; libselinux: public
 //! domain; PCRE2: BSD-3-Clause; OpenSSL: Apache-2.0; zlib: Zlib; expat:
-//! MIT; CPython: PSF-2.0), copied at build time as test inputs and run
-//! unmodified. Nothing of them is copied into the repository.
+//! MIT; CPython: PSF-2.0; libstdc++ and libgcc_s: GPL-3.0-or-later with the
+//! GCC Runtime Library Exception; Node.js: MIT, with the licenses of its
+//! bundled dependencies in the release's `LICENSE`), copied at build time as
+//! test inputs and run unmodified. Nothing of them is copied into the
+//! repository.
 
 use crate::Result;
 use crate::report::Failure;
@@ -36,12 +43,17 @@ const PROGRAMS: [(&str, &str); 3] = [
     ("/usr/bin/python3", "usr/bin/python3"),
 ];
 
-/// The trees the cells' files are made from, as directories on the host.
-pub fn roots() -> [PathBuf; 2] {
+/// Where Node.js and its script are in the cell's files.
+pub const NODE: &str = "usr/bin/node";
+pub const NODE_SCRIPT: &str = "app/demo.js";
+
+/// The trees the cells' files are made from, as directories on the host:
+/// the dynamic `hello`, the distribution's programs, Node.js.
+pub fn roots() -> [PathBuf; 3] {
     let dir = crate::target_dir()
         .join("dynamic")
         .join(crate::arch::current().id());
-    [dir.join("dynamic"), dir.join("distro")]
+    [dir.join("dynamic"), dir.join("distro"), dir.join("node")]
 }
 
 /// GNU triple of the cells' architecture (the distribution's library
@@ -51,13 +63,29 @@ fn triple() -> String {
 }
 
 /// Builds the trees ([`roots`]) and writes them, encoded as cell file
-/// systems, to `out/dynamic-files` and (natively) `out/distro-files`.
+/// systems, to `out/dynamic-files` and (natively) `out/distro-files` and,
+/// with `RHIZO_NODE`, `out/node-files`.
 pub fn build(out: &Path) -> Result {
-    let [hello, distro] = roots();
+    let [hello, distro, node] = roots();
     let native = crate::differential::unavailable_reason().is_none();
     fresh(&hello, "usr/bin")?;
     compile_hello(&hello.join("usr/bin/hello"))?;
     pack(&hello, native, &out.join("dynamic-files"))?;
+    let node_files = out.join("node-files");
+    if std::env::var_os("RHIZO_NODE").is_some() {
+        // Linked, not copied, where it can be: it is over 100 MiB.
+        let (from, to) = (crate::tools::node()?, node.join(NODE));
+        fresh(&node, "usr/bin")?;
+        std::fs::hard_link(&from, &to).or_else(|_| copy(&from, &to))?;
+        copy(
+            &crate::workspace_root().join("cells/node/demo.js"),
+            &node.join(NODE_SCRIPT),
+        )?;
+        pack(&node, native, &node_files)?;
+    } else {
+        let _ = std::fs::remove_dir_all(&node);
+        let _ = std::fs::remove_file(&node_files);
+    }
     let files = out.join("distro-files");
     if !native {
         let _ = std::fs::remove_dir_all(&distro);

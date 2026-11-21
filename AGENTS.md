@@ -89,7 +89,9 @@ second architecture, `qemu-system-x86_64`, plus gcc with a static glibc for
 the C cells (`gcc`, `libc6-dev`; to cross-build, `gcc-aarch64-linux-gnu` or
 `gcc-x86-64-linux-gnu`), and `zlib1g-dev` to build the CPython cell
 (when `RHIZO_CPYTHON_SRC` names its tarball; it is built natively on each
-architecture). Every `cargo xtask` command takes
+architecture). With `RHIZO_NODE` set, `xtask` downloads the pinned Node.js
+build and runs its tests (step `ktest-node`, a kernel of its own in a
+1 GiB VM) and benchmarks. Every `cargo xtask` command takes
 `--arch aarch64` (default) or `--arch x86_64` right after `xtask`.
 
 The feedback loop, fastest first:
@@ -98,7 +100,7 @@ The feedback loop, fastest first:
 |---|---|---|
 | `cargo test -p <crate> <name>` | < 1 s | One host test |
 | `cargo xtask check` | seconds | fmt, clippy (all crates), host tests, crate dependency rules. **Run after every edit.** |
-| `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, `ktest-smp` (4 vCPUs), or a self-check such as `ktest-page-fault` |
+| `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, `ktest-smp` (4 vCPUs), `ktest-node` (Node.js, with `RHIZO_NODE`), or a self-check such as `ktest-page-fault` |
 | `cargo xtask test` | ~1 min | Host tests, boot check, in-kernel tests, all self-checks |
 | `cargo xtask ci` | minutes | Everything CI runs. **Run before pushing.** |
 | `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates) |
@@ -146,9 +148,9 @@ The feedback loop, fastest first:
 | `crates/rhizo-sched` | Run queues (one per CPU, stealing, balancing), sleep list, waiting set and time slice (time and CPU passed in, never read); cells whose threads run on several CPUs (`Gangs`); address-space tag pool | — |
 | `crates/rhizo-prof` | Cost accounting: where a CPU's time goes, in exclusive parts and per system call (ticks passed in, never read), and the breakdown lines the benchmarks print | — |
 | `kernel` | Platform code (`src/arch/aarch64`, `src/arch/x86_64`) and wiring; the cell host and scheduler loop, threads switching inside a cell's slice, threads of one cell on several CPUs (gangs, the cell lock, x86_64 TLB shootdowns), the kernel's sockets (`src/cell.rs`); the network card (`src/wire.rs`); secondary CPUs' stacks, idle loop and mailboxes (`src/smp.rs`); cost accounting hooks (`src/cost.rs`, feature `profile`); the control kernel's table of cells and request loop (`src/control.rs`, feature `control`); shared in-kernel tests (`src/tests.rs`) | `rhizo-hal`, `rhizo-core`, `rhizo-mm`, `rhizo-cell`, `rhizo-abi`, `rhizo-sched`, `rhizo-snapshot`, `rhizo-fs`, `rhizo-net`, `rhizo-virtio`, `rhizo-prof`, `rhizo-control` |
-| `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building), and dynamically linked (`c/dynamic`); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
+| `cells` | Test programs run as cells: `no_std` Rust static executables (`src/bin`) and real C programs linked statically with the system glibc (`c/`, built by `xtask` with the native gcc or `aarch64-linux-gnu-gcc`/`x86_64-linux-gnu-gcc` when cross-building), and dynamically linked (`c/dynamic`); scripts for CPython (`python/`) and Node.js (`node/`); expectations in `cells/expected.rs`, also checked natively on a Linux host | — |
 | `crates/rhizo-control` | The control protocol between the host and a control kernel: frames (versioned, length-prefixed, with a request identifier) told apart from console text, requests and replies, checked decoding | — |
-| `xtask` | Developer tooling (host only), a library with a thin binary; builds the static CPython cell and encodes its files (`cpython.rs`); packs the dynamically linked programs with their interpreter and libraries (`dynamic.rs`); builds the dynamically linked CPython and installs pinned wheels from PyPI (numpy, requests) into the packages cell's files (`packages.rs`); drives a control kernel over its serial line (`control.rs`) | `rhizo-fs`, `rhizo-control` |
+| `xtask` | Developer tooling (host only), a library with a thin binary; builds the static CPython cell and encodes its files (`cpython.rs`); packs the dynamically linked programs and Node.js (downloaded by `tools.rs`) with their interpreter and libraries (`dynamic.rs`); builds the dynamically linked CPython and installs pinned wheels from PyPI (numpy, requests) into the packages cell's files (`packages.rs`); drives a control kernel over its serial line (`control.rs`) | `rhizo-fs`, `rhizo-control` |
 | `cli` (`rhizo-cli`) | `rhizo`, the control plane's command-line tool (host only, Linux): `up` (VM and background server relaying a Unix socket to the serial line), `run` with templates, `ps`, `fork`, `suspend`, `resume`, `attach`, `kill`, `down` | `rhizo-control`, `xtask` |
 
 Planned crates are created by the milestone that adds their code, not

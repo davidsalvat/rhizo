@@ -38,12 +38,6 @@ const KERNEL_PACKAGE: &str = "rhizo-kernel";
 /// Test programs run as cells (bare-metal targets only).
 const CELLS_PACKAGE: &str = "rhizo-cells";
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
-/// Memory of the in-kernel test VMs (`ktest`, `ktest-smp`), in MiB: the
-/// packages cell's files (numpy) are embedded, decoded and mapped, and a
-/// snapshot of a cell that imported numpy holds those files and every page
-/// it mapped (design D4 of `add-pip-packages`).
-pub(crate) const KTEST_MEMORY_MIB: u32 = 1024;
-
 /// Virtual CPUs of the `ktest-smp` step (spec `multi-core`).
 pub(crate) const SMP_CPUS: u32 = 4;
 /// Timeout for the self-check that expects a hanging kernel.
@@ -86,9 +80,9 @@ Commands:
       --no-icount            Skip the instruction counts under QEMU -icount
       --icount-only          Only those instruction counts (hosts without
                              KVM, such as GitHub's ARM64 runners)
-      --workload <laptop|server>
-                             Only this reference workload (both run by
-                             default, after the cell figures)
+      --workload <laptop|server|node>
+                             Only this workload (all run by default, after
+                             the cell figures; Node.js with RHIZO_NODE)
       --soak                 The long versions of the workloads (weekly)
       --cells <n>            Cells of the server workload (default 10000)
       --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
@@ -366,6 +360,8 @@ fn test_steps() -> Vec<&'static str> {
         "boot",
         "ktest",
         "ktest-smp",
+        "ktest-node",
+        "ktest-packages",
         "control",
     ];
     steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
@@ -435,7 +431,6 @@ fn cmd_test(args: &RunArgs) -> Result {
                 kernel.clone(),
                 RunOptions {
                     network: true,
-                    memory_mib: KTEST_MEMORY_MIB,
                     shard: shard(i, shards),
                     ..opts
                 },
@@ -457,7 +452,6 @@ fn cmd_test(args: &RunArgs) -> Result {
                     // virtio-mmio in `ktest`, so both transports run on AArch64.
                     pci_card: true,
                     cpus: SMP_CPUS,
-                    memory_mib: KTEST_MEMORY_MIB,
                     shard: shard(i, shards),
                     ..opts
                 },
@@ -466,8 +460,51 @@ fn cmd_test(args: &RunArgs) -> Result {
             ));
         }
     }
+    if args.wants("ktest-node") {
+        match node_unavailable_reason() {
+            Some(why) => report::text(&format!("[xtask] Node.js tests not run: {why}")),
+            None => jobs.push(Job::vm(
+                format!("Node.js in cells on {} CPUs", NODE_CPUS),
+                keep_kernel(
+                    "ktest-node",
+                    &build_kernel(Profile::Debug, &["ktest", "node"])?,
+                )?,
+                RunOptions {
+                    network: true,
+                    cpus: NODE_CPUS,
+                    memory_mib: NODE_MEMORY_MIB,
+                    ..opts
+                },
+                Check::Ktest { cpus: NODE_CPUS },
+                args.reproduce("ktest-node"),
+            )),
+        }
+    }
+    if args.wants("ktest-packages") {
+        match packages_unavailable_reason() {
+            Some(why) => report::text(&format!("[xtask] package tests not run: {why}")),
+            None => jobs.push(Job::vm(
+                format!("PyPI packages in cells on {} CPUs", PACKAGES_CPUS),
+                keep_kernel(
+                    "ktest-packages",
+                    &build_kernel(Profile::Debug, &["ktest", "packages"])?,
+                )?,
+                RunOptions {
+                    network: true,
+                    cpus: PACKAGES_CPUS,
+                    memory_mib: PACKAGES_MEMORY_MIB,
+                    ..opts
+                },
+                Check::Ktest {
+                    cpus: PACKAGES_CPUS,
+                },
+                args.reproduce("ktest-packages"),
+            )),
+        }
+    }
     if args.wants("control") {
         let kernel = keep_kernel("control", &build_kernel(Profile::Debug, &["control"])?)?;
+        check_kernel_reused(Profile::Debug, &["control"])?;
         jobs.push(Job {
             name: format!("control plane through `rhizo` on {}", args.vmm.id()),
             work: JobWork::Control {
@@ -499,6 +536,39 @@ fn cmd_test(args: &RunArgs) -> Result {
         ));
     }
     run_jobs(args.vmm, &jobs, parallel)
+}
+
+/// Memory of the VMs that run Node.js (change `add-node-workload`): its
+/// files embedded in the kernel and decoded into a cell file system (over
+/// 100 MiB each), the file pages it maps, and its heap.
+pub(crate) const NODE_MEMORY_MIB: u32 = 1024;
+/// CPUs of the Node.js test VM: its threads run on several at once.
+const NODE_CPUS: u32 = 2;
+
+/// Why the Node.js kernels are not built, if they are not: Node.js is
+/// downloaded only with `RHIZO_NODE` set.
+pub(crate) fn node_unavailable_reason() -> Option<String> {
+    env::var_os("RHIZO_NODE")
+        .is_none()
+        .then(|| "RHIZO_NODE is not set".into())
+}
+
+/// Memory of the VMs that run the packages' CPython (design D4 of
+/// `add-pip-packages`): its 65 MiB of files embedded in the kernel and
+/// decoded, the file pages numpy maps, and a snapshot of a cell that
+/// imported numpy, which holds both.
+pub(crate) const PACKAGES_MEMORY_MIB: u32 = 1024;
+/// CPUs of the packages test VM: OpenBLAS runs threads on several, and a
+/// cell's faults then go through the gang path.
+const PACKAGES_CPUS: u32 = 2;
+
+/// Why the packages' kernels are not built, if they are not: the packages
+/// come with CPython (`RHIZO_CPYTHON_SRC`), natively only.
+pub(crate) fn packages_unavailable_reason() -> Option<String> {
+    if env::var_os("RHIZO_CPYTHON_SRC").is_none() {
+        return Some("RHIZO_CPYTHON_SRC is not set".into());
+    }
+    differential::unavailable_reason().map(|why| format!("built natively only ({why})"))
 }
 
 /// Most in-kernel test VMs one step is split into.
@@ -973,7 +1043,14 @@ fn cmd_ci() -> Result {
 
     let features = [""]
         .into_iter()
-        .chain(["ktest", "bench-cell", "bench-cell,profile", "control"])
+        .chain([
+            "ktest",
+            "bench-cell",
+            "bench-cell,profile",
+            "control",
+            "ktest,packages",
+            "bench-cell,packages",
+        ])
         .chain(SELF_CHECKS.iter().map(|c| c.feature));
     step("clippy (cells)");
     cargo(&[
@@ -1033,7 +1110,6 @@ fn cmd_ci() -> Result {
         &Guest::Rhizo(kernel),
         RunOptions {
             network: true,
-            memory_mib: KTEST_MEMORY_MIB,
             ..q35.run_options(test_timeout()?)
         },
     )?;
@@ -1175,18 +1251,67 @@ const SELF_CHECKS: &[SelfCheck] = &[
 /// Builds the kernel for the selected architecture and returns the image the
 /// VMMs boot (the ELF on x86_64, a flat arm64 Image on AArch64).
 pub fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBuf> {
-    let target = arch::current().target();
     let cells = build_cells()?;
-    let mut args = vec!["build", "-p", KERNEL_PACKAGE, "--target", target];
-    if profile == Profile::Release {
-        args.push("--release");
-    }
-    let joined = features.join(",");
-    if !features.is_empty() {
-        args.extend(["--features", &joined]);
-    }
+    let args = kernel_build_args(profile, features);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     cargo_env(&args, &[("RHIZO_CELLS_DIR", cells.as_os_str())])?;
     arch::current().bootable_image(&kernel_elf(profile))
+}
+
+/// The `cargo` arguments that build the kernel.
+fn kernel_build_args(profile: Profile, features: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["build", "-p", KERNEL_PACKAGE, "--target"]
+        .map(String::from)
+        .into();
+    args.push(arch::current().target().into());
+    if profile == Profile::Release {
+        args.push("--release".into());
+    }
+    if !features.is_empty() {
+        args.extend(["--features".into(), features.join(",")]);
+    }
+    args
+}
+
+/// Fails unless building the kernel [`build_kernel`] just built again, with
+/// nothing changed, compiles nothing: an unchanged `rhizo up` reuses its
+/// build (spec `control-plane`, change `fix-cli-nits`).
+fn check_kernel_reused(profile: Profile, features: &[&str]) -> Result {
+    let mut args = kernel_build_args(profile, features);
+    args.push("--message-format=json".into());
+    let out = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(&args)
+        .env("RHIZO_CELLS_DIR", cells_dir())
+        .current_dir(workspace_root())
+        .output()
+        .map_err(|e| format!("failed to run cargo: {e}"))?;
+    let messages = String::from_utf8_lossy(&out.stdout);
+    match (out.status.success(), kernel_fresh(&messages)) {
+        (true, Some(true)) => Ok(()),
+        (_, fresh) => Err(Failure::new("build", "an unchanged kernel is built again")
+            .location(format!("cargo {}", args.join(" ")))
+            .expected("the kernel reported fresh")
+            .actual(match fresh {
+                Some(false) => "compiled again".into(),
+                _ => format!("no kernel artifact ({})", out.status),
+            })
+            .hint(
+                "a build script watches something that changes or is missing on every \
+                 build: run the command with CARGO_LOG=cargo::core::compiler::fingerprint=info",
+            )
+            .reproduce(format!("cargo {}", args.join(" ")))
+            .into_error()),
+    }
+}
+
+/// Whether cargo's JSON `messages` report the kernel executable fresh
+/// (`None`: they do not name it).
+fn kernel_fresh(messages: &str) -> Option<bool> {
+    messages
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == KERNEL_PACKAGE)
+        .find_map(|m| m["fresh"].as_bool())
 }
 
 /// Builds the test cells (`cells/`, static Linux executables for the selected
@@ -1206,13 +1331,21 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
         "--target-dir",
         &dir_str,
     ])?;
-    let out = dir.join(target).join("release");
+    let out = cells_dir();
     build_c_cells(&out)?;
     build_micropython(&out)?;
     cpython::build(&out)?;
     dynamic::build(&out)?;
     packages::build(&out)?;
     Ok(out)
+}
+
+/// Where [`build_cells`] puts the cells.
+fn cells_dir() -> PathBuf {
+    target_dir()
+        .join("cells")
+        .join(arch::current().target())
+        .join("release")
 }
 
 /// MicroPython's commit, pinned (v1.24.1, MIT license).
@@ -1486,6 +1619,37 @@ fn check_vm(ok: bool, check: VmCheck, run: &VmRun) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kernel_s_freshness_is_read_from_cargo_messages() {
+        let artifact = |name: &str, fresh: bool| {
+            format!(
+                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\"}},\"fresh\":{fresh}}}"
+            )
+        };
+        let script = "{\"reason\":\"build-script-executed\",\"package_id\":\"rhizo-kernel\"}";
+        let messages = |lines: &[&str]| lines.join("\n");
+        assert_eq!(
+            kernel_fresh(&messages(&[
+                &artifact("rhizo-mm", false),
+                script,
+                &artifact("rhizo-kernel", true),
+                "{\"reason\":\"build-finished\",\"success\":true}",
+            ])),
+            Some(true)
+        );
+        assert_eq!(
+            kernel_fresh(&messages(&[
+                &artifact("rhizo-mm", true),
+                &artifact("rhizo-kernel", false)
+            ])),
+            Some(false)
+        );
+        assert_eq!(
+            kernel_fresh(&messages(&[&artifact("rhizo-mm", true), script, "garbage"])),
+            None
+        );
+    }
 
     #[test]
     fn run_args_parse_vmm_machine_and_accel() {

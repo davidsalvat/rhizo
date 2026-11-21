@@ -1,17 +1,18 @@
 use std::path::Path;
 
 /// Cells built only when their source is given, or by `xtask` only.
-const OPTIONAL: [&str; 6] = [
+const OPTIONAL: [&str; 7] = [
     "micropython",
     "cpython",
     "cpython-files",
     "dynamic-files",
     "distro-files",
     "packages-files",
+    "node-files",
 ];
 /// Cells embedded in test kernels only (`ktest`): elsewhere they read as
-/// not built, and take no memory from the cells a benchmark runs (the
-/// 50 MiB fork benchmark and numpy need most of its guest's). The C
+/// not built, and take no memory from the cells a benchmark runs (its guest
+/// has 128 MiB, and the 50 MiB fork benchmark needs most of it). The C
 /// cells here are those no benchmark runs.
 const TEST_ONLY: [&str; 9] = [
     "distro-files",
@@ -44,6 +45,12 @@ fn main() {
 /// spawning them fails with `NotElf`, which the in-kernel tests report.
 fn embed_cells() {
     println!("cargo:rerun-if-env-changed=RHIZO_CELLS_DIR");
+    // An optional cell that is not built is not watched (cargo would run
+    // this script again on every build for a missing file): `xtask` builds
+    // it only once its source is given, which these variables say (change
+    // `fix-cli-nits`).
+    println!("cargo:rerun-if-env-changed=RHIZO_MICROPYTHON_SRC");
+    println!("cargo:rerun-if-env-changed=RHIZO_CPYTHON_SRC");
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
     // Rust cells (cells/src/bin/*.rs) and C cells (cells/c/*.c).
     let mut names: Vec<String> = Vec::new();
@@ -80,15 +87,24 @@ fn embed_cells() {
          /// The embedded cell named `name`, if any (empty: not built).\n\
          pub fn find_image(name: &[u8]) -> Option<&'static [u8]> {\n    Some(match name {\n",
     );
+    let ktest = std::env::var_os("CARGO_FEATURE_KTEST").is_some();
+    // Node.js (over 100 MiB) only in the kernels built to run it, whose VMs
+    // get the memory it needs (change `add-node-workload`).
+    let node = std::env::var_os("CARGO_FEATURE_NODE").is_some();
+    // The packages' CPython (65 MiB) likewise (change `add-pip-packages`).
+    let packages = std::env::var_os("CARGO_FEATURE_PACKAGES").is_some();
     for name in &names {
-        let ktest = std::env::var_os("CARGO_FEATURE_KTEST").is_some();
         let data = match &from {
             Some(_) if TEST_ONLY.contains(&name.as_str()) && !ktest => Vec::new(),
+            Some(_) if name == "node-files" && !node => Vec::new(),
+            Some(_) if name == "packages-files" && !packages => Vec::new(),
             Some(dir) => {
                 let path = Path::new(dir).join(name);
-                println!("cargo:rerun-if-changed={}", path.display());
                 match std::fs::read(&path) {
-                    Ok(data) => data,
+                    Ok(data) => {
+                        println!("cargo:rerun-if-changed={}", path.display());
+                        data
+                    }
                     Err(_) if OPTIONAL.contains(&name.as_str()) => Vec::new(),
                     Err(e) => panic!("{}: {e}", path.display()),
                 }

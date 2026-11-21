@@ -12,8 +12,9 @@ mod expected {
     include!("../../cells/expected.rs");
 }
 use expected::{
-    AGENT_TRANSCRIPT, AGENT_TURNS, CPYTHON_ARGV, CPYTHON_STDOUT, DYNAMIC, Ending, NUMPY_ARGV,
-    NUMPY_STDOUT, PROGRAMS, PYTHON_COMMAND, PYTHON_STDOUT, REQUESTS_ARGV, REQUESTS_STDOUT,
+    AGENT_TRANSCRIPT, AGENT_TURNS, CPYTHON_ARGV, CPYTHON_STDOUT, DYNAMIC, Ending, NODE_ARGV,
+    NODE_MODEL_LINE, NODE_STDOUT, NUMPY_ARGV, NUMPY_STDOUT, PROGRAMS, PYTHON_COMMAND,
+    PYTHON_STDOUT, REQUESTS_ARGV, REQUESTS_STDOUT,
 };
 
 /// Why the check cannot run on this host, if it cannot.
@@ -73,7 +74,64 @@ pub fn check(dir: &Path) -> Result {
     check_python(dir, &scratch)?;
     check_cpython(&scratch)?;
     check_dynamic()?;
+    check_node()?;
     check_packages()
+}
+
+/// Node.js, when packed (`RHIZO_NODE`): from its tree laid out as in a cell,
+/// with an empty environment, it prints [`NODE_STDOUT`], then, given the
+/// URL of the host's fake model, [`NODE_MODEL_LINE`], and nothing on
+/// standard error (change `add-node-workload`).
+fn check_node() -> Result {
+    let root = &crate::dynamic::roots()[2];
+    let node = root.join(crate::dynamic::NODE);
+    if !node.exists() {
+        crate::report::text("[xtask] Node.js not packed (RHIZO_NODE unset): skipped");
+        return Ok(());
+    }
+    let url = format!(
+        "http://127.0.0.1:{}",
+        crate::hostnet::llm_server("127.0.0.1", 0)?
+    );
+    let script = root.join(NODE_ARGV[2].trim_start_matches('/'));
+    for (url, stdout) in [
+        (None, NODE_STDOUT.to_string()),
+        (Some(url), format!("{NODE_STDOUT}{NODE_MODEL_LINE}")),
+    ] {
+        let out = Command::new(&node)
+            .arg(NODE_ARGV[1])
+            .arg(&script)
+            .args(&url)
+            .env_clear()
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", node.display()))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || text != stdout || !out.stderr.is_empty() {
+            return Err(
+                Failure::new("differential", "Node.js behaves differently on Linux")
+                    .location("cells/node/demo.js")
+                    .expected(format!(
+                        "exit 0, stdout {stdout:?} (cells/expected.rs), no stderr"
+                    ))
+                    .actual(format!(
+                        "{:?}, stdout {text:?}, stderr {:?}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr)
+                    ))
+                    .hint("Linux is the reference: fix the script or the expectation")
+                    .reproduce(format!(
+                        "env -i {} {} {} {}",
+                        node.display(),
+                        NODE_ARGV[1],
+                        script.display(),
+                        url.unwrap_or_default()
+                    ))
+                    .into_error(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The packages' CPython (`crate::packages`), when built: run natively from

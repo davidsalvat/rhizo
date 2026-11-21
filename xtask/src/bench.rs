@@ -31,6 +31,8 @@ const HIGHER_IS_BETTER: [&str; 3] = ["density.cells", "density.ops_per_s", "dens
 pub enum Only {
     Laptop,
     Server,
+    /// The Node.js workload (change `add-node-workload`).
+    Node,
 }
 
 /// Options for `cargo xtask bench`.
@@ -125,9 +127,10 @@ impl Options {
                     o.workload = Some(match value("--workload")?.as_str() {
                         "laptop" => Only::Laptop,
                         "server" => Only::Server,
+                        "node" => Only::Node,
                         other => {
                             return Err(format!(
-                                "unknown workload `{other}` (expected laptop or server)"
+                                "unknown workload `{other}` (expected laptop, server or node)"
                             ));
                         }
                     });
@@ -323,6 +326,8 @@ fn measure(opts: &Options) -> Result<Results> {
         let (mut metrics, mut skipped) = (Vec::new(), Vec::new());
         if opts.icount_only {
             crate::profile::measure_icount(&mut metrics, &mut skipped)?;
+        } else if opts.workload == Some(Only::Node) {
+            measure_runtime(opts, &mut metrics, &mut skipped, &NODE)?;
         } else {
             crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
         }
@@ -410,6 +415,8 @@ fn measure(opts: &Options) -> Result<Results> {
         ));
     }
     measure_cells(opts, &mut metrics, &mut skipped)?;
+    measure_runtime(opts, &mut metrics, &mut skipped, &NODE)?;
+    measure_runtime(opts, &mut metrics, &mut skipped, &NUMPY)?;
     crate::control::measure(&opts.vmms, opts.accel, &mut metrics, &mut skipped)?;
     crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
@@ -448,7 +455,11 @@ fn measure_comparisons(
         }
         match crate::compare::numpy_in_vm(opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
-            Err(e) => skipped.push(("numpy/linux-process/firecracker".into(), e)),
+            Err(e) => skipped.push(("workload.numpy_*/linux-process/firecracker".into(), e)),
+        }
+        match crate::compare::node_in_vm(opts.accel, &scratch) {
+            Ok(m) => metrics.extend(m),
+            Err(e) => skipped.push(("workload.node_cold_us/linux-process/firecracker".into(), e)),
         }
         match crate::compare::firecracker_restore(opts.runs.clamp(3, 20), opts.accel, &scratch) {
             Ok(m) => metrics.extend(m),
@@ -517,7 +528,6 @@ fn measure_cells(
         let (mut agent_suspend_resume, mut agent_fork) = (Vec::new(), Vec::new());
         let mut agent_skipped = None;
         let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
-        let (mut numpy_cold, mut numpy_warm) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         let mut syscall = Vec::new();
         // The PMU's passes, where the guest has one (spec `profiling`).
@@ -571,10 +581,6 @@ fn measure_cells(
                     if let Some((r, t)) = parse_dynamic_line(&out.output) {
                         dyn_run.push(r as f64 / 1000.0);
                         dyn_template.push(t as f64 / 1000.0);
-                    }
-                    if let Some((c, w)) = parse_numpy_line(&out.output) {
-                        numpy_cold.push(c as f64 / 1000.0);
-                        numpy_warm.push(w as f64 / 1000.0);
                     }
                     if let Some(d) = parse_density_line(&out.output) {
                         density = Some(d);
@@ -632,7 +638,8 @@ fn measure_cells(
             }
         }
         let (mut parallel, mut scaling, mut ipi_wake) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut thread_scaling, mut shootdown) = (Vec::new(), Vec::new());
+        let (mut thread_scaling, mut shootdown, mut timer_error) =
+            (Vec::new(), Vec::new(), Vec::new());
         let mut syscall_scaling = Vec::new();
         for _ in 0..opts.runs.clamp(1, 3) {
             let smp = RunOptions {
@@ -651,6 +658,7 @@ fn measure_cells(
                             .push(100.0 * s.threads4_ns as f64 * 4.0 / s.threads1_ns as f64);
                     }
                     shootdown.push(s.shootdown_ns as f64 / 1000.0);
+                    timer_error.push(s.timer_error_ns as f64 / 1000.0);
                     if s.syscalls_serial_ns > 0 {
                         syscall_scaling.push(
                             100.0 * s.syscalls_parallel_ns as f64 * s.cpus as f64
@@ -704,8 +712,6 @@ fn measure_cells(
             ("workload.agent_fork_us", "us", &mut agent_fork),
             ("workload.dynamic_run_us", "us", &mut dyn_run),
             ("workload.dynamic_template_us", "us", &mut dyn_template),
-            ("workload.numpy_cold_us", "us", &mut numpy_cold),
-            ("workload.numpy_warm_us", "us", &mut numpy_warm),
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
             ("cell.parallel_us", "us", &mut parallel),
@@ -713,6 +719,7 @@ fn measure_cells(
             ("cell.ipi_wake_us", "us", &mut ipi_wake),
             ("cell.thread_scaling_pct", "%", &mut thread_scaling),
             ("cell.shootdown_us", "us", &mut shootdown),
+            ("cell.timer_error_us", "us", &mut timer_error),
             ("cell.syscall_ns", "ns", &mut syscall),
             ("cell.syscall_scaling_pct", "%", &mut syscall_scaling),
         ] {
@@ -794,6 +801,130 @@ fn parse_python_line(output: &str) -> Option<(u64, u64)> {
 
 /// `(cold_ns, warm_ns)` of the CPython line of a `bench-cell` kernel
 /// (absent when CPython was not built).
+/// A runtime too large for the cell benchmark kernel, measured by a
+/// `bench-cell` kernel of its own, the only one embedding its files, in a
+/// VM with the memory it needs.
+struct Runtime {
+    /// The kernel feature that embeds it.
+    feature: &'static str,
+    /// Its metrics (`workload.<name>_cold_us`, `_warm_us`) and its line
+    /// (`rhizo-<name> cold_ns=<median> warm_ns=<median>`, parsed by `parse`).
+    name: &'static str,
+    parse: fn(&str) -> Option<(u64, u64)>,
+    /// What it is called in reports.
+    title: &'static str,
+    /// Why it is not packed, if it is not.
+    unavailable: fn() -> Option<String>,
+    memory_mib: u32,
+}
+
+/// Node.js (change `add-node-workload`).
+const NODE: Runtime = Runtime {
+    feature: "node",
+    name: "node",
+    parse: parse_node_line,
+    title: "Node.js",
+    unavailable: crate::node_unavailable_reason,
+    memory_mib: crate::NODE_MEMORY_MIB,
+};
+
+/// The packages' CPython computing with numpy (change `add-pip-packages`).
+const NUMPY: Runtime = Runtime {
+    feature: "packages",
+    name: "numpy",
+    parse: parse_numpy_line,
+    title: "numpy",
+    unavailable: crate::packages_unavailable_reason,
+    memory_mib: crate::PACKAGES_MEMORY_MIB,
+};
+
+/// The metrics of runtime `rt`: its kernel prints its line; each VMM boots
+/// it a few times. Skipped with the reason when it is not packed.
+fn measure_runtime(
+    opts: &Options,
+    metrics: &mut Vec<Metric>,
+    skipped: &mut Vec<(String, String)>,
+    rt: &Runtime,
+) -> Result {
+    let all = format!("workload.{}_*", rt.name);
+    if let Some(why) = (rt.unavailable)() {
+        skipped.push((all, why));
+        return Ok(());
+    }
+    let guest = Guest::Rhizo(build_kernel(Profile::Release, &["bench-cell", rt.feature])?);
+    let run_opts = RunOptions {
+        stop_at_ready: false,
+        timeout: RUN_TIMEOUT,
+        echo: false,
+        accel: opts.accel,
+        gdb: false,
+        network: false,
+        pci_card: false,
+        cpus: 1,
+        memory_mib: rt.memory_mib,
+        bench: None,
+        shard: None,
+        control: false,
+    };
+    for &vmm in &opts.vmms {
+        if vmm.unavailable_reason(opts.accel).is_some() {
+            continue; // already reported by the boot benchmark
+        }
+        report::text(&format!("{} on {}", rt.title, vmm.id()));
+        let (mut cold, mut warm) = (Vec::new(), Vec::new());
+        for _ in 0..opts.runs.clamp(1, 3) {
+            let out = vmm::run(vmm, &guest, run_opts)?;
+            match (rt.parse)(&out.output) {
+                Some((c, w)) if out.result != VmResult::Failed => {
+                    cold.push(c as f64 / 1000.0);
+                    warm.push(w as f64 / 1000.0);
+                }
+                _ => {
+                    skipped.push((
+                        format!("{all}/{}", vmm.id()),
+                        format!(
+                            "no `rhizo-{}` line ({:?}); output:\n{}",
+                            rt.name, out.result, out.output
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        for (name, values) in [
+            (format!("workload.{}_cold_us", rt.name), &mut cold),
+            (format!("workload.{}_warm_us", rt.name), &mut warm),
+        ] {
+            if !values.is_empty() {
+                let (median, p90) = summarize(values);
+                metrics.push(Metric {
+                    name,
+                    guest: "rhizo".into(),
+                    vmm: Some(vmm.id().into()),
+                    unit: "us".into(),
+                    median,
+                    p90,
+                    runs: values.len(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `(cold_ns, warm_ns)` of the `rhizo-node` line of a Node.js `bench-cell`
+/// kernel.
+fn parse_node_line(output: &str) -> Option<(u64, u64)> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-node "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some((field("cold_ns")?, field("warm_ns")?))
+}
+
 fn parse_cpython_line(output: &str) -> Option<(u64, u64)> {
     let line = output.lines().find(|l| l.starts_with("rhizo-cpython "))?;
     let field = |key: &str| -> Option<u64> {
@@ -902,6 +1033,9 @@ struct SmpLine {
     threads1_ns: u64,
     threads4_ns: u64,
     shootdown_ns: u64,
+    /// The worst secondary CPU's distance from 10 ms of a 10 ms timed wait
+    /// (change `fix-secondary-cpu-timer`).
+    timer_error_ns: u64,
     /// 4 `piper` cells per CPU making system calls, one CPU after the other
     /// and on every CPU (design D3 of `split-sockets-lock`).
     syscalls_serial_ns: u64,
@@ -924,6 +1058,7 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         threads1_ns: field("threads1_ns")?,
         threads4_ns: field("threads4_ns")?,
         shootdown_ns: field("shootdown_ns")?,
+        timer_error_ns: field("timer_error_ns")?,
         syscalls_serial_ns: field("syscalls_serial_ns")?,
         syscalls_parallel_ns: field("syscalls_parallel_ns")?,
     })
@@ -1206,10 +1341,8 @@ fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
     })
 }
 
-/// Memory of the cell benchmark VM, in MiB: the 50 MiB fork benchmark,
-/// and the packages cell's files (numpy) embedded, decoded and mapped
-/// (design D4 of `add-pip-packages`).
-pub(crate) const CELL_BENCH_MEMORY_MIB: u32 = 512;
+/// Memory of the cell benchmark VM, in MiB.
+pub(crate) const CELL_BENCH_MEMORY_MIB: u32 = 256;
 
 /// Allowed regression, in percent, for `m` in `env`: instructions counted
 /// under QEMU's `-icount` are exact, so their threshold is narrow (spec
@@ -2360,6 +2493,15 @@ mod tests {
     }
 
     #[test]
+    fn node_line_is_parsed() {
+        assert_eq!(
+            parse_node_line("rhizo-ready\nrhizo-node cold_ns=90000000 warm_ns=4000000\n"),
+            Some((90_000_000, 4_000_000))
+        );
+        assert_eq!(parse_node_line("rhizo-node not packed\n"), None);
+    }
+
+    #[test]
     fn python_line_is_parsed() {
         assert_eq!(
             parse_python_line("rhizo-python cold_ns=900000 warm_ns=40000\n"),
@@ -2468,8 +2610,8 @@ mod tests {
         assert_eq!(
             parse_smp_line(
                 "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000 \
-                 threads1_ns=400 threads4_ns=110 shootdown_ns=3000 syscalls_serial_ns=900 \
-                 syscalls_parallel_ns=250\n"
+                 threads1_ns=400 threads4_ns=110 shootdown_ns=3000 timer_error_ns=40000 \
+                 syscalls_serial_ns=900 syscalls_parallel_ns=250\n"
             ),
             Some(SmpLine {
                 cpus: 4,
@@ -2479,6 +2621,7 @@ mod tests {
                 threads1_ns: 400,
                 threads4_ns: 110,
                 shootdown_ns: 3000,
+                timer_error_ns: 40000,
                 syscalls_serial_ns: 900,
                 syscalls_parallel_ns: 250,
             })
