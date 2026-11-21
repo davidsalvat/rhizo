@@ -122,27 +122,25 @@ def hero(t):
     s.text(262, 52, "Sealed off", 17, weight=700, fill=t["accent"])
     s.text(262, 71, "nothing gets in or out unless you allow it", 13, fill=t["muted"])
 
-    # Catalogue (left, top).
-    s.rect(24, 40, 158, 156, t["box"], t["boxline"], rx=16)
+    # Catalogue (left, top) and your model (left, bottom): each reaches the
+    # agent in a straight line, square to both boxes and to the sealed edge.
+    s.rect(24, 60, 158, 156, t["box"], t["boxline"], rx=16)
     for i, (dx, dy) in enumerate([(-30, 0), (0, -6), (30, 0)]):
-        icon(s, "cube", 103 + dx, 86 + dy, 30, t["blue"] if i == 1 else t["muted"])
-    s.text(103, 136, "Ready-made", 16, weight=700, anchor="middle")
-    s.text(103, 156, "agents", 16, weight=700, anchor="middle")
-    s.text(103, 177, "download and go", 13, fill=t["muted"], anchor="middle")
-    s.path("M182 120 C 220 120, 230 206, 266 206", color=t["blue"], sw=2.2, marker="b")
-    badge(s, 205, 140, 13, "download", t["blue"], t["bg"])
+        icon(s, "cube", 103 + dx, 106 + dy, 30, t["blue"] if i == 1 else t["muted"])
+    s.text(103, 156, "Ready-made", 16, weight=700, anchor="middle")
+    s.text(103, 176, "agents", 16, weight=700, anchor="middle")
+    s.text(103, 197, "download and go", 13, fill=t["muted"], anchor="middle")
+    s.line(182, 198, 266, 198, color=t["blue"], sw=2.2)
 
-    # Your model (left, bottom).
-    s.rect(24, 262, 158, 150, t["box"], t["boxline"], rx=16)
-    icon(s, "chip", 103, 306, 40, t["blue"])
-    s.text(103, 358, "Your own model", 16, weight=700, anchor="middle")
-    s.text(103, 378, "Ollama, llama.cpp,", 13, fill=t["muted"], anchor="middle")
-    s.text(103, 396, "any API", 13, fill=t["muted"], anchor="middle")
-    s.path("M182 320 C 225 320, 235 252, 266 252", color=t["blue"], sw=2, dash=True,
-           marker="b")
+    s.rect(24, 244, 158, 156, t["box"], t["boxline"], rx=16)
+    icon(s, "chip", 103, 290, 40, t["blue"])
+    s.text(103, 342, "Your own model", 16, weight=700, anchor="middle")
+    s.text(103, 362, "Ollama, llama.cpp,", 13, fill=t["muted"], anchor="middle")
+    s.text(103, 380, "any API", 13, fill=t["muted"], anchor="middle")
+    s.line(182, 262, 266, 262, color=t["blue"], sw=2, dash=True)
 
     # The agent.
-    s.rect(266, 178, 136, 104, t["cell"], t["cellline"], rx=30, sw=2.5)
+    s.rect(266, 178, 136, 104, t["cell"], t["cellline"], rx=18, sw=2.5)
     icon(s, "robot", 334, 216, 42, t["accent"], fill=t["bg"])
     s.text(334, 266, "Your agent", 15, weight=700, anchor="middle")
     badge(s, 398, 182, 16, "bolt", t["gold"], t["bg"])
@@ -150,11 +148,10 @@ def hero(t):
     s.text(334, 151, "microseconds, not seconds", 13, fill=t["muted"], anchor="middle")
 
     # Fork into branches; keep the best.
-    ys = [104, 206, 308]
+    ys = [96, 199, 302]
     for i, y in enumerate(ys):
-        s.path(f"M402 230 C 470 230, 500 {y + 31}, 592 {y + 31}",
-               color=t["gold"] if i == 0 else t["cellline"], sw=2.5 if i == 0 else 2,
-               marker="o" if i == 0 else "g")
+        s.path(f"M402 230 C 480 230, 520 {y + 31}, 556 {y + 31} H 592",
+               color=t["gold"] if i == 0 else t["cellline"], sw=2.5 if i == 0 else 2)
     s.text(496, 98, "Clone it", 15, weight=700, anchor="middle")
     s.text(496, 117, "try ideas in parallel", 13, fill=t["muted"], anchor="middle")
     for i, y in enumerate(ys):
@@ -253,7 +250,7 @@ def scene_research(t):
         s.circle(x, 120, 7, t["cellline"] if i != 1 else t["gold"])
     icon(s, "flag", 150, 98, 20, t["gold"])
     s.text(170, 152, "frozen", 12, weight=700, fill=t["gold"], anchor="middle")
-    s.path("M300 113 C 290 60, 196 60, 175 115", color=t["accent"], sw=2)
+    s.path("M300 113 C 300 56, 170 56, 170 88 V 113", color=t["accent"], sw=2)
     s.text(238, 52, "replay from here", 12, weight=700, fill=t["accent"], anchor="middle")
     s.text(330, 176, "same state, every time", 12, fill=t["muted"], anchor="end")
     return s
@@ -422,7 +419,7 @@ def memory(t):
     fx = 316
     fys = [96, 216, 336]
     for (name, state, writes), fy in zip(forks, fys):
-        s.path(f"M{tx + 196} {ty + 58} C 270 {ty + 58}, 270 {fy + 44}, {fx} {fy + 44}")
+        s.path(f"M{tx + 196} {ty + 58} C 252 {ty + 58}, 258 {fy + 44}, 288 {fy + 44} H {fx}")
         s.rect(fx, fy, 196, 88, t["bg"], t["cellline"], rx=18, sw=2)
         s.text(fx + 18, fy + 28, name, 15, weight=700)
         s.text(fx + 178, fy + 28, state, 12.5, anchor="end",
@@ -511,7 +508,7 @@ def arch(t):
     s.path("M309 178 V 190 H 200 V 344", dash=True, sw=1.8)
     s.text(208, 262, "serial line", 12, fill=t["muted"], weight=700)
     nx = 72 + 2 * (bw + 8) + bw / 2
-    s.path(f"M720 178 V 294 H {nx} V 344", color=t["blue"], sw=2, marker="b")
+    s.path(f"M720 178 V 294 H {nx} V 344", color=t["blue"], sw=2)
     s.text(712, 226, "network card", 12, fill=t["blue"], weight=700, anchor="end")
     return s
 
@@ -595,11 +592,11 @@ def snapshot_path(t):
         s.text(x + 112, 184, "request +", 12, fill=t["muted"], anchor="end")
         s.text(x + 112, 199, "one-time token", 12, fill=t["muted"], anchor="end")
         if saving:
-            s.line(x + 218, 254, x + 218, 164, color=t["blue"], sw=2.2, marker="b")
+            s.line(x + 218, 254, x + 218, 164, color=t["blue"], sw=2.2)
         else:
-            s.line(x + 218, 164, x + 218, 254, color=t["blue"], sw=2.2, marker="b")
-        s.text(x + 226, 184, "bytes", 12, fill=t["blue"], weight=700)
-        s.text(x + 226, 199, "over TCP", 12, fill=t["blue"], weight=700)
+            s.line(x + 218, 164, x + 218, 254, color=t["blue"], sw=2.2)
+        s.text(x + 230, 184, "bytes", 12, fill=t["blue"], weight=700)
+        s.text(x + 230, 199, "over TCP", 12, fill=t["blue"], weight=700)
 
     machine(24, "Machine A", "rhizo save 7 agent.snap", "cell 7",
             ["suspend, then send the bytes;", "shared pages written in full,",
@@ -642,7 +639,7 @@ def security(t):
         icon(s, {24: "robot", 284: "file", 544: "globe"}[x], x + 30, 116, 24, t["red"])
         s.text(x + 54, 111, name, 15, weight=700)
         s.text(x + 54, 131, sub, 12.5, fill=t["muted"])
-        s.line(x + 116, 148, x + 116, 190, color=t["red"], sw=2, marker="r")
+        s.line(x + 116, 148, x + 116, 190, color=t["red"], sw=2)
     s.text(776, 72, "untrusted", 12.5, weight=700, fill=t["red"], anchor="end")
     # Kernel with defences.
     s.rect(24, 190, 752, 206, t["cell"], t["cellline"], rx=16, sw=2.5)
@@ -705,8 +702,9 @@ def hierarchy(t):
     s.text(40, 166, "Domain 1", 13, weight=700, fill=t["accent"])
     s.rect(500, 140, 276, 304, t["bg"], t["cellline"], rx=18, dash=True, sw=1.8)
     s.text(760, 166, "Domain 2", 13, weight=700, fill=t["accent"], anchor="end")
-    s.path("M380 116 C 380 146, 236 146, 236 180")
-    s.path("M420 116 C 420 146, 638 146, 638 180")
+    # Square elbows: each edge crosses a domain's border at a right angle.
+    s.path("M360 116 V 122 Q 360 128 354 128 H 242 Q 236 128 236 134 V 180")
+    s.path("M440 116 V 122 Q 440 128 446 128 H 632 Q 638 128 638 134 V 180")
 
     def node(x, y, w, name, egress, budget=None, mod=False):
         s.rect(x, y, w, 86 if budget else 68, t["cell"], t["cellline"], rx=16, sw=2)
@@ -725,11 +723,11 @@ def hierarchy(t):
     node(554, 180, 168, "Agent B", "allowlist", "512 MiB · 4 cells")
     node(554, 330, 168, "worker", "none")
     # Tree edges; the two children of A are also reached over a channel.
-    s.path("M200 266 C 200 300, 128 296, 128 330")
-    s.path("M272 266 C 272 300, 350 296, 350 330")
+    s.path("M200 266 V 292 Q 200 298 194 298 H 134 Q 128 298 128 304 V 330")
+    s.path("M272 266 V 292 Q 272 298 278 298 H 344 Q 350 298 350 304 V 330")
     s.path("M638 266 V 330")
-    s.text(138, 300, "+ channel", 12, fill=t["gold"], weight=700, anchor="end")
-    s.text(334, 300, "+ channel", 12, fill=t["gold"], weight=700)
+    s.text(124, 292, "+ channel", 12, fill=t["gold"], weight=700, anchor="end")
+    s.text(358, 292, "+ channel", 12, fill=t["gold"], weight=700)
     s.text(246, 426, "authority flows down: a cell acts only on its descendants", 12.5,
            fill=t["muted"], anchor="middle")
     s.text(638, 426, "budget carved from its parent", 12.5, fill=t["muted"],
@@ -815,7 +813,7 @@ def modules(t):
     s.text(632, 466, "fork of the template", 12, fill=t["muted"])
     s.path("M590 451 H 455 V 370", color=t["gold"], dash=True, arrow=False, sw=2.2)
     s.text(466, 440, "channel", 12, fill=t["gold"], weight=700)
-    s.path("M194 357 C 300 357, 330 520, 590 470", dash=True)
+    s.path("M194 357 C 280 357, 300 470, 400 470 H 590", dash=True)
     s.text(250, 520, "Adding requests grants no internet:", 12.5, fill=t["muted"])
     s.text(250, 538, "a module never gets more egress than its agent.", 12.5, fill=t["muted"])
     return s

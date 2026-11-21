@@ -162,11 +162,15 @@ function inPage(pageBack) {
       if (ratio < 3) out.push(`line contrast ${ratio.toFixed(2)} < 3 (${stroke})`);
     }
     if (!l.getAttribute('marker-end')) continue;
+    const mk = svg.querySelector(l.getAttribute('marker-end').replace(/^url\((.*)\)$/, '$1') + ' path');
+    if (!mk || rgb(mk.getAttribute('fill')).join() !== rgb(stroke).join()) {
+      out.push(`arrowhead colour differs from its line (${stroke})`);
+    }
     const key = [a.x, a.y, e.x, e.y].map(v => Math.round(v)).join(',');
     if (seen.has(key)) out.push(`duplicate arrow at ${key}`);
     seen.set(key, true);
     // The head must sit on the edge of a box or a dot: not short of it, not inside it.
-    let nearest = Infinity;
+    let nearest = Infinity, target = null;
     for (const r of rects.concat(dots)) {
       const q = r.b;
       const d = r.el.tagName === 'circle'
@@ -174,9 +178,82 @@ function inPage(pageBack) {
         : inside(e, q)
         ? Math.min(e.x - q.x, q.x + q.w - e.x, e.y - q.y, q.y + q.h - e.y)
         : Math.hypot(Math.max(q.x - e.x, 0, e.x - q.x - q.w), Math.max(q.y - e.y, 0, e.y - q.y - q.h));
-      nearest = Math.min(nearest, d);
+      if (d < nearest) { nearest = d; target = r; }
     }
     if (nearest > 1.5) out.push(`arrowhead ${nearest.toFixed(1)} away from any box edge at ${key}`);
+
+    // The head is oriented by the path's tangent at its very end; the line
+    // under and just before the head must run the same way, or the head and
+    // the line visibly point in different directions.
+    const sw = parseFloat(l.getAttribute('stroke-width') || '1');
+    const HEAD = 7 * sw;
+    const deg = (u, v) => {
+      let d = Math.abs(Math.atan2(u.y, u.x) - Math.atan2(v.y, v.x)) * 180 / Math.PI;
+      return d > 180 ? 360 - d : d;
+    };
+    const near = l.getPointAtLength(Math.max(0, n - 0.25));
+    const head = { x: e.x - near.x, y: e.y - near.y };
+    const back = l.getPointAtLength(Math.max(0, n - HEAD - 6));
+    const body = { x: e.x - back.x, y: e.y - back.y };
+    const bend = deg(head, body);
+    if (bend > 5) out.push(`arrowhead turned ${bend.toFixed(0)}° from its line at ${key}`);
+    // ...and it must arrive square to the edge it ends on.
+    if (target && nearest <= 1.5) {
+      const q = target.b;
+      let normal;
+      if (target.el.tagName === 'circle') {
+        normal = { x: q.x + q.w / 2 - e.x, y: q.y + q.h / 2 - e.y };
+      } else {
+        const sides = [[Math.abs(e.x - q.x), { x: 1, y: 0 }], [Math.abs(q.x + q.w - e.x), { x: -1, y: 0 }],
+                       [Math.abs(e.y - q.y), { x: 0, y: 1 }], [Math.abs(q.y + q.h - e.y), { x: 0, y: -1 }]];
+        sides.sort((u, v) => u[0] - v[0]);
+        normal = sides[0][1];
+      }
+      // An arrow leaving a box it started in points out of that edge.
+      if (inside(a, q)) normal = { x: -normal.x, y: -normal.y };
+      const skew = deg(body, normal);
+      if (skew > 10) out.push(`arrow enters its target ${skew.toFixed(0)}° off square at ${key}`);
+    }
+  }
+
+  // No icon or badge may sit on a connector. Two things are not connectors
+  // and badges: a dot centred on a line is a station of a timeline, and a
+  // stroke drawn inside a dot is part of that dot.
+  const within = (u, v) => u.x >= v.x - 0.5 && u.y >= v.y - 0.5 &&
+                           u.x + u.w <= v.x + v.w + 0.5 && u.y + u.h <= v.y + v.h + 0.5;
+  const onLine = (dot, l) => {
+    const c = { x: dot.b.x + dot.b.w / 2, y: dot.b.y + dot.b.h / 2 };
+    const n = l.getTotalLength();
+    for (let d = 0; d <= n; d += 1) {
+      const p = l.getPointAtLength(d);
+      if (Math.hypot(p.x - c.x, p.y - c.y) < 1.5) return true;
+    }
+    return false;
+  };
+  for (const l of lines) {
+    const n = l.getTotalLength();
+    if (n < 20 || dots.some(d => within(box(l), d.b))) continue;
+    // A connector never runs through a box it neither starts nor ends in.
+    const a0 = l.getPointAtLength(0), a1 = l.getPointAtLength(n);
+    for (const r of rects) {
+      if (inside(a0, r.b, -1.5) || inside(a1, r.b, -1.5) || r.b.w < 4 || r.b.h < 4) continue;
+      for (let d = 0; d <= n; d += 1.5) {
+        const p = l.getPointAtLength(d);
+        if (inside(p, r.b, 1)) {
+          out.push(`a connector crosses a box near ${Math.round(p.x)},${Math.round(p.y)}`);
+          break;
+        }
+      }
+    }
+    for (const i of iconBoxes.concat(dots.filter(d => !onLine(d, l)))) {
+      for (let d = 3; d <= n - 3; d += 1.5) {
+        const p = l.getPointAtLength(d);
+        if (inside(p, i.b, -1)) {
+          out.push(`a connector runs under an icon or badge near ${Math.round(p.x)},${Math.round(p.y)}`);
+          break;
+        }
+      }
+    }
   }
 
   // Graphics: icons, bars, dots and box outlines need 3:1 against what is behind.
@@ -206,7 +283,7 @@ function inPage(pageBack) {
   try { browser = await playwright.chromium.launch(launch); } catch (e) {
     browser = await playwright.chromium.launch({ executablePath: '/usr/bin/google-chrome' });
   }
-  const page = await browser.newPage({ deviceScaleFactor: 1.5 });
+  const page = await browser.newPage({ deviceScaleFactor: 2 });
   let failed = 0;
   for (const f of files) {
     const svg = fs.readFileSync(f, 'utf8');

@@ -32,8 +32,10 @@ THEMES = {
 }
 
 
-# Arrowheads, one per line colour: `marker=` names them.
-MARKERS = {"a": "arrow", "g": "cellline", "b": "blue", "o": "gold", "r": "red"}
+# Arrowheads, one per line colour; each arrow takes the one in its colour, and
+# orient="auto" turns it along the end of its path.
+MARKERS = {"a": "arrow", "g": "cellline", "b": "blue", "o": "gold", "r": "red",
+           "c": "accent"}
 
 
 def esc(s):
@@ -49,7 +51,7 @@ class Svg:
             f"<title>{esc(title)}</title>\n<desc>{esc(desc)}</desc>\n"
             "<defs>" + "".join(
                 f'<marker id="{k}" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" '
-                f'markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" '
+                f'markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" '
                 f'fill="{t[c]}"/></marker>' for k, c in MARKERS.items()) + "</defs>\n"
             + (f'<rect class="bg" x="0.5" y="0.5" width="{w-1}" height="{h-1}" rx="12" '
                f'fill="{t["bg"]}" stroke="{t["border"]}"/>\n' if frame else
@@ -82,16 +84,23 @@ class Svg:
         self.add(f'<text x="{x}" y="{y}" font-size="{size}" fill="{fill}"{w}{a}{i}{h}>'
                  f'{esc(s)}</text>')
 
-    def line(self, x1, y1, x2, y2, color=None, arrow=True, sw=1.8, dash=False, marker="a"):
+    def arrowhead(self, color):
+        """The arrowhead drawn in the line's own colour."""
+        for k, c in MARKERS.items():
+            if self.t[c] == color:
+                return f' marker-end="url(#{k})"'
+        raise ValueError(f"no arrowhead in {color}")
+
+    def line(self, x1, y1, x2, y2, color=None, arrow=True, sw=1.8, dash=False):
         color = color or self.t["arrow"]
-        m = f' marker-end="url(#{marker})"' if arrow else ""
+        m = self.arrowhead(color) if arrow else ""
         d = ' stroke-dasharray="4 4"' if dash else ""
         self.add(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{color}" '
                  f'stroke-width="{sw}"{m}{d}/>')
 
-    def path(self, d, color=None, arrow=True, sw=1.8, dash=False, fill="none", marker="a"):
+    def path(self, d, color=None, arrow=True, sw=1.8, dash=False, fill="none"):
         color = color or self.t["arrow"]
-        m = f' marker-end="url(#{marker})"' if arrow else ""
+        m = self.arrowhead(color) if arrow else ""
         da = ' stroke-dasharray="4 4"' if dash else ""
         self.add(f'<path d="{d}" fill="{fill}" stroke="{color}" stroke-width="{sw}" '
                  f'stroke-linecap="round" stroke-linejoin="round"{m}{da}/>')

@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 490" width="800" height="490" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Saving a cell to a file and loading it elsewhere</title>
 <desc>On machine A, rhizo save sends a request with a one-time token on the serial line; the kernel streams the snapshot's bytes over TCP through the VM's network card to a listener rhizo opened, which writes a file ending in a checksum. On machine B, rhizo load asks the kernel to fetch the file the same way; the kernel checks the header, the checksum and every field, caps the cell's quotas, and then resumes the cell or forks copies of the template.</desc>
-<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1f9d6b"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#0a5cc2"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8a6100"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b42318"/></marker></defs>
+<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#1f9d6b"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#0a5cc2"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8a6100"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b42318"/></marker><marker id="c" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#146c4a"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="489" rx="12" fill="#ffffff" stroke="#d0d7de"/>
 <text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">A cell travels as a file</text>
 <text x="24" y="64" font-size="14" fill="#4b5c55">rhizo save on one machine, rhizo load on another.</text>
@@ -23,8 +23,8 @@
 <text x="136" y="184" font-size="12" fill="#4b5c55" text-anchor="end">request +</text>
 <text x="136" y="199" font-size="12" fill="#4b5c55" text-anchor="end">one-time token</text>
 <line x1="242" y1="254" x2="242" y2="164" stroke="#0a5cc2" stroke-width="2.2" marker-end="url(#b)"/>
-<text x="250" y="184" font-size="12" fill="#0a5cc2" font-weight="700">bytes</text>
-<text x="250" y="199" font-size="12" fill="#0a5cc2" font-weight="700">over TCP</text>
+<text x="254" y="184" font-size="12" fill="#0a5cc2" font-weight="700">bytes</text>
+<text x="254" y="199" font-size="12" fill="#0a5cc2" font-weight="700">over TCP</text>
 <rect x="476" y="84" width="300" height="332" rx="16" fill="#ffffff" stroke="#858f8a" stroke-width="1.5"/>
 <text x="492" y="108" font-size="13.5" fill="#4b5c55" font-weight="700">Machine B</text>
 <rect x="492" y="120" width="268" height="44" rx="10" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
@@ -43,8 +43,8 @@
 <text x="588" y="184" font-size="12" fill="#4b5c55" text-anchor="end">request +</text>
 <text x="588" y="199" font-size="12" fill="#4b5c55" text-anchor="end">one-time token</text>
 <line x1="694" y1="164" x2="694" y2="254" stroke="#0a5cc2" stroke-width="2.2" marker-end="url(#b)"/>
-<text x="702" y="184" font-size="12" fill="#0a5cc2" font-weight="700">bytes</text>
-<text x="702" y="199" font-size="12" fill="#0a5cc2" font-weight="700">over TCP</text>
+<text x="706" y="184" font-size="12" fill="#0a5cc2" font-weight="700">bytes</text>
+<text x="706" y="199" font-size="12" fill="#0a5cc2" font-weight="700">over TCP</text>
 <rect x="352" y="190" width="96" height="120" rx="12" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
 <g transform="translate(380 208) scale(1.66667)" fill="none" stroke="#0e2a20" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4"/></g>
 <text x="400" y="272" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="middle">agent.snap</text>
