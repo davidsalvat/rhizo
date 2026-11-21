@@ -71,10 +71,10 @@ start it again.
   or a template to a file on the host; `rhizo load` brings it into a fresh
   VM, on another boot or another machine of the same architecture. The bytes
   travel over TCP through the VM's network card, admitted with a one-time
-  token, while requests stay on the serial line; a loaded file is checked
+  token, while requests stay on the control channel; a loaded file is checked
   (header, CRC-32C, every field), may not name a physical page, and its
-  quotas are capped. A cell of a loaded template answers about 3 times
-  sooner than a cold agent.
+  quotas are capped. A cell of a loaded template answers about 11 to 12
+  times sooner than a cold agent.
 - **Threads.** `pthread_create`, mutexes, condition variables and futexes;
   snapshots, forks and templates carry every thread.
 - **Network.** Pipes, `poll`/`select`/`epoll`, Unix and TCP/UDP sockets
@@ -98,11 +98,12 @@ start it again.
   unmodified, runs as a cell with its JIT: V8 asks for memory both writable
   and executable, and the kernel gives it pages that are either, changed on
   faults, never both (change `node-jit`); with the JIT a cold start is about
-  16 to 23% faster than with `--jitless`. A cell forked from Node.js frozen after
+  16 to 24% faster than with `--jitless`. A cell forked from Node.js frozen after
   its warm-up answers in about 4 to 6 ms, against about 35 to 46 ms from a
   cold start, in a cell or as a Linux process (which cannot fork Node.js).
 - **Control plane.** `rhizo`, a command-line tool on the host, drives a
-  running kernel over its serial line: `rhizo up`, `run`, `ps`, `fork`,
+  running kernel over its vsock, or its serial line where it has none
+  (every VMM answers): `rhizo up`, `run`, `ps`, `fork`,
   `suspend`, `resume`, `freeze`, `save`, `load`, `attach`, `kill`, `down`;
   `rhizo chat` is an interactive conversation with an agent in a cell, whose
   tools run in the cell, and which can be forked, suspended and picked up

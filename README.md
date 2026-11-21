@@ -123,14 +123,14 @@ runs.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/highlights-dark.svg">
-    <img src="docs/img/highlights.svg" alt="Six headline figures from one benchmark run. Node.js, ready to answer, forked from a warm template: 3.60 ms (warm fork 3.60 ms, cold start 31.31 ms); with its JIT, cold is 22% faster. numpy from PyPI wheels, forked after import numpy: 12.02 ms (Rhizo cell 12.02 ms, Linux process 16.68 ms); cold: cell 61.55 ms, Linux 71.11 ms. 50 agents on a laptop, 45 of them suspended: 6.6 MB (shared snapshots 6.6 MB, full copies (before) 60 MB); snapshots point at shared pages. A template saved to a file, loaded into a fresh VM: 3.4× sooner (loaded template 10.88 ms, cold agent 37.26 ms); to its first answer (QEMU). Host operation on one cell, how long other cells stall: 19 µs (now 19 µs, every CPU stopped 106 µs); 6× shorter. 10,000 busy cells, 1 vCPU, 99th percentile wait to wake: 0.6–3.1 ms; 39k–46k operations/s." width="800">
+    <img src="docs/img/highlights.svg" alt="Six headline figures from one benchmark run. Node.js, ready to answer, forked from a warm template: 6.03 ms (warm fork 6.03 ms, cold start 39.35 ms); with its JIT, cold is 24% faster. numpy from PyPI wheels, forked after import numpy: 15.14 ms (Rhizo cell 15.14 ms, Linux process 18.23 ms); cold: cell 67.97 ms, Linux 75.41 ms. 50 agents on a laptop, 45 of them suspended: 6.6 MB (shared snapshots 6.6 MB, full copies (before) 60 MB); snapshots point at shared pages. A template saved to a file, loaded into a fresh VM: 11.6× sooner (loaded template 2.31 ms, cold agent 26.83 ms); to its first answer (QEMU). Host operation on one cell, how long other cells stall: 18 µs (now 18 µs, every CPU stopped 117 µs); 6× shorter. 10,000 busy cells, 1 vCPU, 99th percentile wait to wake: 0.5–2.9 ms; 39k–46k operations/s." width="800">
   </picture>
 </p>
 
 - **Node.js** forked from a warm template answers in about **3.5 to 6 ms**,
   against **31 to 46 ms** from a cold start; a Linux process cannot fork
   Node.js at all. With its JIT (under write-or-execute pages), a cold start is
-  about **16 to 23% faster** than with `--jitless`.
+  about **16 to 24% faster** than with `--jitless`.
 - **numpy** runs **about as fast as in a Linux process** in the same kind of
   VM: a fork after `import numpy` takes 12 to 18 ms against 16 to 19 ms, and
   cold starts are within about 15% of each other.
@@ -138,12 +138,13 @@ runs.
   **6.6 MB** together, down from **60 MB** before snapshots referred to the
   pages they share.
 - **A template saved to a file** and loaded into a fresh VM answers about
-  **3 times sooner** than a cold agent (2.6 to 4.1 times over recent runs).
+  **11 to 12 times sooner** than a cold agent (2.1 to 2.4 ms against 25 to
+  27 ms) since the control channel moved to vsock; 2.6 to 4.1 times before.
 - **Host operations** on one cell stall the others about **6 to 7 times
   less**: 16 to 20 µs against 106 to 121 µs when every CPU stopped (one run
   saw only 3 times less on Cloud Hypervisor).
 - **10,000 busy cells** on one vCPU: the 99th percentile of the wait to wake
-  stays between **0.6 and 4 ms** depending on the VMM and the run, and is
+  stays between **0.5 and 4 ms** depending on the VMM and the run, and is
   gated on main like every other timing.
 - For scale: a cell starts a program and runs it to its end in **7 to
   12 µs**, 37 to 73 times faster than a Linux process in the same VM, and
@@ -180,10 +181,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 5.8 | 6.4 | 168.8 | 172.5 | 20 |
-| Cloud Hypervisor | 8.0 | 10.3 | 93.7 | 111.6 | 20 |
-| QEMU microvm | 41.4 | 42.8 | — | — | 20 |
-| QEMU q35 | 53.6 | 56.2 | 159.7 | 164.5 | 20 |
+| Firecracker | 5.7 | 6.8 | 172.5 | 176.7 | 20 |
+| Cloud Hypervisor | 8.8 | 11.2 | 97.4 | 108.2 | 20 |
+| QEMU microvm | 42.3 | 44.7 | — | — | 20 |
+| QEMU q35 | 53.8 | 58.2 | 162.9 | 169.4 | 20 |
 
 ### A cell against a Linux process, in the same kind of VM
 
@@ -191,10 +192,10 @@ Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux gue
 
 | Operation | Rhizo cell | Linux process, same VM | Linux process, host |
 |---|---:|---:|---:|
-| The `fork` call, holding 50 MiB written | 1.8 µs | 255.7 µs | 817.2 µs |
-| Fork, then the child writes all 50 MiB and exits | 3.03 ms | 30.62 ms | 28.18 ms |
-| Start a program and run it to its exit (`hello`) | 10.3 µs | 516.7 µs | 131.0 µs |
-| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 0.8 µs / 236.5 µs | — | 4.62 ms (CRIU) |
+| The `fork` call, holding 50 MiB written | 1.8 µs | 255.7 µs | 832.8 µs |
+| Fork, then the child writes all 50 MiB and exits | 3.21 ms | 31.69 ms | 31.05 ms |
+| Start a program and run it to its exit (`hello`) | 10.2 µs | 520.8 µs | 132.9 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.0 µs / 253.6 µs | — | 4.86 ms (CRIU) |
 
 ### Whole VMs and sandboxes, for scale
 
@@ -202,8 +203,8 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 10.3 µs | 168.76 ms | 76.74 ms |
-| Resume a suspended environment until it runs (eager for the cell) | 236.5 µs | 4.70 ms | 103.64 ms |
+| Start a program and run it to its exit (`hello`) | 10.2 µs | 172.48 ms | 78.71 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 253.6 µs | 3.67 ms | 106.98 ms |
 
 ### A real interpreter
 
@@ -211,29 +212,29 @@ CPython (static, 3.13.18) answering one agent tool call (`cells/python/agent_dem
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 17.68 ms | 21.36 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.38 ms (5.2× faster) | 5.95 ms |
+| Cold, from its executable (interpreter start, imports, warm-up) | 18.02 ms | 22.49 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.48 ms (5.2× faster) | 6.27 ms |
 
 MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 3.54 ms |
-| Forked from a template frozen after the warm-up | 436.8 µs (8.1× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.57 ms |
+| Forked from a template frozen after the warm-up | 433.7 µs (8.2× faster) |
 
 numpy and its OpenBLAS, installed from their PyPI wheels into a dynamically linked CPython, computing on arrays (`cells/python/numpy_demo.py`: a linear solve, a ufunc, a matrix product), in a cell and as a Linux process in the same Firecracker VM:
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold (interpreter start, `import numpy`, compute) | 61.55 ms | 71.11 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after `import numpy` | 12.02 ms (5.1× faster) | 16.68 ms |
+| Cold (interpreter start, `import numpy`, compute) | 67.97 ms | 75.41 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after `import numpy` | 15.14 ms (4.5× faster) | 18.23 ms |
 
 Node.js (the official build, dynamically linked, run unmodified with `--jitless`) answering one agent tool call (`cells/node/demo.js`), in a cell and as a Linux process in the same Firecracker VM (Node.js cannot fork itself, so the process has no warm row):
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (`ld.so`, V8 start-up, warm-up) | 31.31 ms | 39.63 ms |
-| Forked from Node.js frozen after its warm-up | 3.60 ms (8.7× faster) | — |
+| Cold, from its executable (`ld.so`, V8 start-up, warm-up) | 39.35 ms | 50.08 ms |
+| Forked from Node.js frozen after its warm-up | 6.03 ms (6.5× faster) | — |
 
 ### Both architectures, in instructions
 
@@ -241,12 +242,12 @@ Retired instructions per operation, counted under QEMU with `-icount` (the same 
 
 | Operation | x86_64 | AArch64 |
 |---|---:|---:|
-| Switch between two cells | 888 | 821 |
-| Create the `hello` cell | 27,850 | 21,248 |
-| Run `hello` from start to exit | 87,991 | 93,712 |
-| Fork a cell holding 50 MiB | 6,763 | 7,488 |
-| A static glibc program, cold | 35,245,674 | 36,518,800 |
-| The same, forked from a warm template | 76,314 | 73,408 |
+| Switch between two cells | 888 | 823 |
+| Create the `hello` cell | 27,854 | 21,264 |
+| Run `hello` from start to exit | 87,998 | 93,744 |
+| Fork a cell holding 50 MiB | 6,787 | 7,504 |
+| A static glibc program, cold | 35,245,698 | 36,518,816 |
+| The same, forked from a warm template | 76,344 | 73,424 |
 
 Environment: `ci`, KVM: yes, measured 2026-11-21. Regenerate with
 `cargo xtask bench --readme`.
@@ -283,13 +284,17 @@ Without a model, `cargo xtask test` boots the kernel and runs every test cell
 ## Under the hood
 
 One Rhizo kernel runs in one VM; cells are unmodified Linux programs above
-it. The host drives the kernel with `rhizo` over the VM's serial line, and
-cells reach the model through its network card.
+it. The host drives the kernel with `rhizo` over the VM's virtio socket
+device (vsock), or its serial line where it has none, on QEMU, Firecracker
+and Cloud Hypervisor alike: a request that starts a cell sees the cell's
+first output in about **0.2 to 0.3 ms**, against 3 to 5 ms when every byte
+crossed the serial line. Cells reach the model through the VM's network
+card.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture-dark.svg">
-    <img src="docs/img/architecture.svg" alt="Architecture. On the host machine, Linux with KVM, the rhizo command-line tool talks to the rhizo server, which owns one VM (QEMU, Firecracker or Cloud Hypervisor) and reaches the kernel's control loop over the serial line; your model runs on the host and is reached through the VM's network card by the sockets layer. In the VM, cells (an agent, a fork, a template, tools) run above the Rhizo kernel, written in Rust: control loop (rhizo-control), Linux system calls (rhizo-abi), sockets (rhizo-net), files (rhizo-fs), memory and copy-on-write (rhizo-mm), scheduler (rhizo-sched), cells, ELF and quotas (rhizo-cell) and snapshots (rhizo-snapshot), over narrow hardware interfaces (rhizo-hal, arch for AArch64 and x86_64, virtio) so the core is tested on the host." width="800">
+    <img src="docs/img/architecture.svg" alt="Architecture. On the host machine, Linux with KVM, the rhizo command-line tool talks to the rhizo server, which owns one VM (QEMU, Firecracker or Cloud Hypervisor) and reaches the kernel's control loop over the VM's vsock (or its serial line); your model runs on the host and is reached through the VM's network card by the sockets layer. In the VM, cells (an agent, a fork, a template, tools) run above the Rhizo kernel, written in Rust: control loop (rhizo-control), Linux system calls (rhizo-abi), sockets (rhizo-net), files (rhizo-fs), memory and copy-on-write (rhizo-mm), scheduler (rhizo-sched), cells, ELF and quotas (rhizo-cell) and snapshots (rhizo-snapshot), over narrow hardware interfaces (rhizo-hal, arch for AArch64 and x86_64, virtio) so the core is tested on the host." width="800">
   </picture>
 </p>
 
@@ -303,7 +308,7 @@ cells reach the model through its network card.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/snapshot-path-dark.svg">
-    <img src="docs/img/snapshot-path.svg" alt="A cell travels as a file. On machine A, rhizo save sends a request with a one-time token over the serial line; the kernel suspends cell 7 and sends its bytes over TCP through the VM's network card to rhizo, which writes agent.snap ending in a CRC-32C checksum. On machine B, rhizo load asks the kernel to fetch the file the same way; the kernel checks the header, the checksum and every field, caps the quotas, then resumes the cell or forks copies of the template." width="800">
+    <img src="docs/img/snapshot-path.svg" alt="A cell travels as a file. On machine A, rhizo save sends a request with a one-time token over the control channel (vsock, or the serial line); the kernel suspends cell 7 and sends its bytes over TCP through the VM's network card to rhizo, which writes agent.snap ending in a CRC-32C checksum. On machine B, rhizo load asks the kernel to fetch the file the same way; the kernel checks the header, the checksum and every field, caps the quotas, then resumes the cell or forks copies of the template." width="800">
   </picture>
 </p>
 

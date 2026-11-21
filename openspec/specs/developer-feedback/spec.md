@@ -78,11 +78,17 @@ run one at a time.
 
 ### Requirement: Split in-kernel tests
 `RHIZO_SHARDS=N` SHALL split the in-kernel tests of `ktest` and `ktest-smp`
-over `N` VMs that together run each test exactly once.
+over `N` VMs that together run each test exactly once. A failing VM's
+reproduce command SHALL carry `RHIZO_SHARDS=N`. CI SHALL run the AArch64
+in-kernel tests split this way.
 
 #### Scenario: Two shares
 - **WHEN** `RHIZO_SHARDS=2 cargo xtask test --only ktest` runs
 - **THEN** two VMs run, each prints the tests it ran, and every test runs in one of them
+
+#### Scenario: A share fails
+- **WHEN** a test fails in one VM of `RHIZO_SHARDS=2 cargo xtask test --only ktest`
+- **THEN** the reproduce command printed starts with `RHIZO_SHARDS=2`
 
 ### Requirement: Pull requests classified by path
 CI SHALL classify each pull request by the paths it changes since its
@@ -113,13 +119,14 @@ request, and every push to main, SHALL run every job.
 
 ### Requirement: Quick checks first
 CI SHALL run formatting, lints for every crate and architecture, host
-tests and the crate dependency rules (`cargo xtask check`) in one job
-before the jobs that build kernels or boot VMs, and those jobs SHALL wait
-for it and not run when it fails.
+tests and the crate dependency rules (`cargo xtask check`) in one job that
+starts together with the jobs that build kernels or boot VMs. When it
+fails, it SHALL cancel the run, so those jobs stop, and the run SHALL
+fail.
 
 #### Scenario: Lint warning
 - **WHEN** a pull request introduces a lint warning
-- **THEN** the quick job fails and no kernel is built or booted for that run
+- **THEN** the quick job fails, the jobs that build kernels or boot VMs are cancelled, and `ci-ok` fails
 
 ### Requirement: One aggregate CI result
 CI SHALL end with one job, `ci-ok`, that succeeds only when every other job
@@ -144,3 +151,80 @@ SHALL NOT retry a job or skip a test automatically.
 #### Scenario: Passes on a re-run
 - **WHEN** a job fails, is re-run on the same commit and the run then succeeds
 - **THEN** an issue named after that job's failure holds a link to both attempts, and the workflows are unchanged
+
+### Requirement: Few kernel builds
+`cargo xtask test` SHALL compile one kernel per set of contents it needs,
+never one per test step: what differs only in what runs (CPUs, a share of
+the tests, a self-check) SHALL be chosen on the kernel command line. A
+full `test` or `ci` SHALL compile at most 3 kernels per architecture,
+plus one per large embedded image whose variable (`RHIZO_NODE`,
+`RHIZO_CPYTHON_SRC`) is set.
+
+#### Scenario: Edit loop
+- **WHEN** a developer edits a kernel source file and runs `cargo xtask test`
+- **THEN** the run compiles the plain, test and control kernels once each, and every self-check, `ktest` and `ktest-smp` boots the same test kernel
+
+#### Scenario: Self-checks after the suite
+- **WHEN** `cargo xtask test --only ktest-hang` runs right after `cargo xtask test --only ktest` with no source changed
+- **THEN** no kernel is compiled
+
+### Requirement: Test steps split over machines
+`cargo xtask test --part K/N` and `cargo xtask ci --part K/N` SHALL run
+the `K`-th of `N` shares of the test steps, dealt by each step's estimated
+cost and independently of any other option, so that for every `N` the `N`
+parts together run every step exactly once, including steps added later.
+`ci` SHALL run its lints and its x86_64-only steps in part 1 only. CI
+SHALL split the AArch64 tests over two runners this way.
+
+#### Scenario: Two runners
+- **WHEN** `cargo xtask --arch aarch64 ci --part 1/2` and `--part 2/2` run on two machines
+- **THEN** each test step of `cargo xtask --arch aarch64 ci` runs on exactly one of them, and only the first runs the lints
+
+#### Scenario: A new step
+- **WHEN** a step is added to `test` without a cost estimate
+- **THEN** it runs in exactly one part
+
+### Requirement: Affected steps for the local loop
+`cargo xtask test --affected` SHALL run only the host tests of the crates
+that the files changed against `origin/main` (committed, staged, unstaged
+and untracked) reach through the crate dependency table, with every crate
+that depends on them, and only the VM steps those crates reach. It SHALL
+print the steps it selected. CI SHALL NOT use it.
+
+#### Scenario: Command-line tool only
+- **WHEN** only `cli/src/main.rs` changed and a developer runs `cargo xtask test --affected`
+- **THEN** the host tests of `rhizo-cli` and the control-plane step run, and no in-kernel test runs
+
+#### Scenario: Documentation only
+- **WHEN** only Markdown files changed
+- **THEN** no test runs and the selection printed is empty
+
+### Requirement: VM steps an affected crate reaches
+For `--affected`, the kernel's steps (boot check, in-kernel tests,
+self-checks) SHALL run when the kernel or the cells are reached, the
+differential check when the cells are, and the control plane when the
+kernel or the command-line tool is. A changed file in `xtask`, or outside
+every crate and the documentation, SHALL select every step.
+
+#### Scenario: Cells changed
+- **WHEN** only a file under `cells/` changed
+- **THEN** the kernel's steps and the differential check run, and no host test runs
+
+#### Scenario: Cargo files changed
+- **WHEN** `Cargo.lock` changed
+- **THEN** every step runs
+
+### Requirement: In-kernel tests grouped by area
+The in-kernel tests SHALL be grouped by area, one source file per area
+under `kernel/src/tests/`, each listing its own tests in execution order.
+The suite SHALL run the areas in one fixed order, each area's tests in its
+order. Adding a test to an existing area SHALL change only that area's
+file; only adding an area SHALL change the list of areas.
+
+#### Scenario: A new test
+- **WHEN** a change adds an in-kernel test to an existing area
+- **THEN** the only test source file it changes is that area's file, and the test runs in `ktest` and `ktest-smp` at its place in the area's list
+
+#### Scenario: Same tests after a regrouping
+- **WHEN** tests are moved between files without changing any area's list or the order of areas
+- **THEN** `cargo xtask test` runs the same tests, by the same names, in the same order

@@ -457,7 +457,8 @@ def memory(t):
 def arch(t):
     s = Svg(t, 600, "Architecture of Rhizo",
             "On the host machine, the rhizo command-line tool talks to a small server, "
-            "which drives one virtual machine over its serial line. The VMM (QEMU, "
+            "which drives one virtual machine over its virtio socket device (vsock), or "
+            "its serial line where it has none. The VMM (QEMU, "
             "Firecracker or Cloud Hypervisor) runs the Rhizo kernel; above it run the "
             "cells, unmodified Linux programs. The kernel is a set of Rust crates: the "
             "control loop, Linux system calls, sockets, files, memory, the scheduler, "
@@ -509,9 +510,10 @@ def arch(t):
            "virtio", 13, weight=700, anchor="middle")
     s.text(400, 529, "so the core runs and is tested on the host, deterministically", 12,
            anchor="middle", fill=t["muted"])
-    # Serial line to the control loop; network card to the sockets.
+    # vsock (or the serial line) to the control loop; network card to the sockets.
     s.path("M309 178 V 190 H 200 V 344", dash=True, sw=1.8)
-    s.text(208, 262, "serial line", 12, fill=t["muted"], weight=700)
+    s.text(208, 262, "vsock, or", 12, fill=t["muted"], weight=700)
+    s.text(208, 277, "serial line", 12, fill=t["muted"], weight=700)
     nx = 72 + 2 * (bw + 8) + bw / 2
     s.path(f"M720 178 V 294 H {nx} V 344", color=t["blue"], sw=2)
     s.text(712, 226, "network card", 12, fill=t["blue"], weight=700, anchor="end")
@@ -568,8 +570,8 @@ def hostops(t):
 # ---------------------------------------------------------------- snapshot path
 def snapshot_path(t):
     s = Svg(t, 490, "Saving a cell to a file and loading it elsewhere",
-            "On machine A, rhizo save sends a request with a one-time token on the serial "
-            "line; the kernel streams the snapshot's bytes over TCP through the VM's "
+            "On machine A, rhizo save sends a request with a one-time token on the control "
+            "channel (vsock, or the serial line); the kernel streams the snapshot's bytes over TCP through the VM's "
             "network card to a listener rhizo opened, which writes a file ending in a "
             "checksum. On machine B, rhizo load asks the kernel to fetch the file the same "
             "way; the kernel checks the header, the checksum and every field, caps the "
@@ -592,7 +594,7 @@ def snapshot_path(t):
         s.text(x + 218, 296, "card", 12.5, weight=700, anchor="middle")
         for j, ln in enumerate(note):
             s.text(x + 32, 340 + j * 19, ln, 12.5, fill=t["muted"])
-        # The request and its token on the serial line (dashed), the bytes over TCP.
+        # The request and its token on the control channel (dashed), the bytes over TCP.
         s.line(x + 120, 164, x + 120, 254, dash=True, sw=1.6)
         s.text(x + 112, 184, "request +", 12, fill=t["muted"], anchor="end")
         s.text(x + 112, 199, "one-time token", 12, fill=t["muted"], anchor="end")
