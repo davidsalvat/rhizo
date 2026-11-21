@@ -533,11 +533,19 @@ pub fn init(smp: Option<u16>) -> usize {
     // The network card comes up once, at boot, rather than with the first
     // host: what it allocates is never charged to a cell or a test.
     let mut seed = [0; 8];
-    RANDOM.with(|g| g.fill(&mut seed));
+    // The parked records' key secret, from the kernel's generator (finding
+    // S15: keys cannot be guessed without it).
+    let mut secret = [0u8; 16];
+    RANDOM.with(|g| {
+        g.fill(&mut seed);
+        g.fill(&mut secret);
+    });
     NET.with(|net| {
         // Parked connections re-attach only in this boot (design D2 of
         // `keep-tcp-across-suspend`).
         net.set_boot(Counter.cycles());
+        let word = |i: usize| u64::from_le_bytes(secret[i..i + 8].try_into().unwrap_or_default());
+        net.set_secret([word(0), word(8)]);
         crate::wire::init(net, now_ns(), u64::from_le_bytes(seed));
     });
     crate::smp::start(smp)
