@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 412" width="800" height="412" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Both architectures, in instructions</title>
+<desc>Bar chart of retired instructions per operation under QEMU -icount, lower is better, bars to scale within each operation. Switch between two cells: x86_64 862, AArch64 818. Run hello, start to exit: x86_64 89,026, AArch64 123,040. Fork a 50 MiB cell: x86_64 6,617, AArch64 7,424. glibc program, warm: x86_64 76,717, AArch64 92,560.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="411" rx="12" fill="#0d1117" stroke="#30363d"/>
+<text x="24" y="40" font-size="20" fill="#e6edf3" font-weight="700">Both architectures, in instructions</text>
+<text x="24" y="64" font-size="14" fill="#9ba7b3">Retired instructions per operation under QEMU -icount; bars to scale within each operation</text>
+<rect x="24" y="78" width="14" height="14" rx="3" fill="#63d4a0" stroke="#63d4a0" stroke-width="0"/>
+<text x="44" y="90" font-size="14" fill="#e6edf3">AArch64 (virt)</text>
+<rect x="160" y="78" width="14" height="14" rx="3" fill="#768390" stroke="#768390" stroke-width="0"/>
+<text x="180" y="90" font-size="14" fill="#e6edf3">x86_64 (microvm)</text>
+<text x="218" y="134" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="end">Switch between two cells</text>
+<rect x="230" y="112" width="398.6" height="18" rx="3" fill="#63d4a0" stroke="#63d4a0" stroke-width="0"/>
+<text x="636.6" y="126" font-size="14" fill="#e6edf3" font-weight="700">818</text>
+<rect x="230" y="136" width="420.0" height="18" rx="3" fill="#768390" stroke="#768390" stroke-width="0"/>
+<text x="658.0" y="150" font-size="14" fill="#e6edf3">862</text>
+<text x="218" y="198" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="end">Run hello, start to exit</text>
+<rect x="230" y="176" width="420.0" height="18" rx="3" fill="#63d4a0" stroke="#63d4a0" stroke-width="0"/>
+<text x="658.0" y="190" font-size="14" fill="#e6edf3" font-weight="700">123,040</text>
+<rect x="230" y="200" width="303.9" height="18" rx="3" fill="#768390" stroke="#768390" stroke-width="0"/>
+<text x="541.9" y="214" font-size="14" fill="#e6edf3">89,026</text>
+<text x="218" y="262" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="end">Fork a 50 MiB cell</text>
+<rect x="230" y="240" width="420.0" height="18" rx="3" fill="#63d4a0" stroke="#63d4a0" stroke-width="0"/>
+<text x="658.0" y="254" font-size="14" fill="#e6edf3" font-weight="700">7,424</text>
+<rect x="230" y="264" width="374.3" height="18" rx="3" fill="#768390" stroke="#768390" stroke-width="0"/>
+<text x="612.3" y="278" font-size="14" fill="#e6edf3">6,617</text>
+<text x="218" y="326" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="end">glibc program, warm</text>
+<rect x="230" y="304" width="420.0" height="18" rx="3" fill="#63d4a0" stroke="#63d4a0" stroke-width="0"/>
+<text x="658.0" y="318" font-size="14" fill="#e6edf3" font-weight="700">92,560</text>
+<rect x="230" y="328" width="348.1" height="18" rx="3" fill="#768390" stroke="#768390" stroke-width="0"/>
+<text x="586.1" y="342" font-size="14" fill="#e6edf3">76,717</text>
+<text x="24" y="390" font-size="13" fill="#9ba7b3">Exact counts: the same on every run and host. GitHub's ARM64 runners have no KVM, so no AArch64 timings.</text>
+</svg>

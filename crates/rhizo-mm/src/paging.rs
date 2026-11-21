@@ -453,7 +453,9 @@ impl<F: EntryFormat> PageTable<F> {
         self.root
     }
 
-    /// Maps the page at `virt` to `phys` with `flags`.
+    /// Maps the page at `virt` to `phys` with `flags`. A writable page with
+    /// `COPY_ON_WRITE` in `flags` is mapped copy-on-write: read-only until
+    /// written (its frame is shared).
     ///
     /// Intermediate tables are allocated (zeroed) with `alloc_frame`. Fails
     /// without changing any existing entry if anything is already mapped
@@ -498,7 +500,11 @@ impl<F: EntryFormat> PageTable<F> {
         if F::is_valid(mem.read_u64(slot)) {
             return Err(MapError::AlreadyMapped(virt));
         }
-        mem.write_u64(slot, F::leaf(phys, size, flags));
+        let mut leaf = F::leaf(phys, size, flags);
+        if flags.contains(PageFlags::COPY_ON_WRITE) && flags.is_writable() {
+            leaf = F::with_cow(F::with_leaf_writable(leaf, false), true);
+        }
+        mem.write_u64(slot, leaf);
         Ok(())
     }
 

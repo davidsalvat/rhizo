@@ -359,6 +359,40 @@ fn clone_shares_read_only_pages_and_copies_the_rest<F: EntryFormat>() {
     assert_eq!(w.frames.live(), 0);
 }
 
+/// After `unshare_tables`, a child forked from a parent has tables of its
+/// own, every page it shares counts its reference and is write-protected in
+/// both, and nothing was copied but tables.
+fn unshare_tables_leaves_pages_shared<F: EntryFormat>() {
+    let mut w = World::<F>::new();
+    let parent = w.table();
+    w.map(&parent, 0x1000, PageSize::Small, RW);
+    w.map(&parent, 0x40_0000, PageSize::Small, RO);
+    w.map(&parent, 0x4000_0000_0000, PageSize::Large, RW);
+    let child = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    let pages = |w: &World<F>, pt| w.leaves(pt).iter().map(|l| l.1).collect::<Vec<_>>();
+    let (before, live) = (pages(&w, &parent), w.frames.live());
+    child.unshare_tables(&mut w.mem, &mut w.frames).unwrap();
+    assert_eq!(pages(&w, &child), before, "no page copied");
+    assert_eq!(
+        w.frames.live(),
+        live + child.lower_half_tables(&w.mem) - 1,
+        "a copy of each table below its root, and nothing else"
+    );
+    for &page in &before {
+        assert!(w.frames.is_shared(page), "{page:#x} counts both");
+    }
+    for pt in [&parent, &child] {
+        assert!(!w.flags(pt, 0x1000).is_writable());
+        assert!(!w.flags(pt, 0x4000_0000_0000).is_writable());
+    }
+    assert!(w.write(&child, 0x1000, 7) && w.write(&parent, 0x1000, 8));
+    assert_eq!((w.read(&child, 0x1000), w.read(&parent, 0x1000)), (7, 8));
+    for pt in [parent, child] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0);
+}
+
 #[test]
 fn fork_aarch64() {
     clone_shares_read_only_pages_and_copies_the_rest::<Aarch64>();
@@ -366,6 +400,7 @@ fn fork_aarch64() {
     mapping_in_a_child_is_not_seen_by_the_parent::<Aarch64>();
     large_page_copied_as_small_pages::<Aarch64>();
     copies_are_break_before_make::<Aarch64>();
+    unshare_tables_leaves_pages_shared::<Aarch64>();
 }
 
 #[test]
@@ -375,6 +410,7 @@ fn fork_x86_64() {
     mapping_in_a_child_is_not_seen_by_the_parent::<X86_64>();
     large_page_copied_as_small_pages::<X86_64>();
     copies_are_break_before_make::<X86_64>();
+    unshare_tables_leaves_pages_shared::<X86_64>();
 }
 
 /// Addresses spread over different tables at every level.
@@ -395,6 +431,9 @@ enum Op {
     Fork(usize),
     Clone(usize),
     Destroy(usize),
+    /// Holds a reference to every page of a cell another one can reach,
+    /// after `unshare_tables`, as a snapshot does.
+    Hold(usize),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -405,13 +444,16 @@ fn op() -> impl Strategy<Value = Op> {
         (0..4usize).prop_map(Op::Fork),
         (0..4usize).prop_map(Op::Clone),
         (0..4usize).prop_map(Op::Destroy),
+        (0..4usize).prop_map(Op::Hold),
     ]
 }
 
 /// Random sequences on up to four cells against a model of each cell's
-/// memory: every read matches the model, and all frames return at the end.
+/// memory: every read matches the model, a page held never changes, and all
+/// frames return at the end.
 fn model_check<F: EntryFormat>(ops: &[Op]) {
     let mut w = World::<F>::new();
+    let mut held: Vec<(u64, PageSize, u64)> = Vec::new();
     let first = w.table();
     let mut cells: Vec<(PageTable<F>, BTreeMap<u64, u64>)> = vec![(first, BTreeMap::new())];
     for op in ops {
@@ -452,7 +494,20 @@ fn model_check<F: EntryFormat>(ops: &[Op]) {
                 let (pt, _) = cells.remove(c);
                 pt.destroy_lower_half(&mut w.mem, &mut w.frames);
             }
+            Op::Hold(c) if c < n => {
+                let pt = PageTable::<F>::from_root(cells[c].0.root());
+                pt.unshare_tables(&mut w.mem, &mut w.frames).unwrap();
+                for (_, page, size, _) in w.leaves(&pt) {
+                    if w.frames.is_shared(page) {
+                        w.frames.share(page);
+                        held.push((page, size, w.mem.read_u64(page)));
+                    }
+                }
+            }
             _ => {}
+        }
+        for &(page, _, v) in &held {
+            assert_eq!(w.mem.read_u64(page), v, "held {page:#x} after {op:?}");
         }
         for (pt, model) in &cells {
             for &a in &ADDRS {
@@ -465,6 +520,9 @@ fn model_check<F: EntryFormat>(ops: &[Op]) {
     }
     for (pt, _) in cells {
         pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    for (page, size, _) in held {
+        w.frames.free(page, size);
     }
     assert_eq!(w.frames.live(), 0, "leaked frames");
 }

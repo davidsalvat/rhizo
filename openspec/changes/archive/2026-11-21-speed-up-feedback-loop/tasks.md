@@ -14,4 +14,4 @@
 ## 3. Verification
 - [x] 3.1 `cargo xtask check`
 - [x] 3.2 Full `cargo xtask --arch x86_64 test` passes in parallel (148 s against about 6 min)
-- [ ] 3.3 CI green on both architectures, with cell figures measured again on every VMM
+- [x] 3.3 CI green on both architectures, with cell figures measured again on every VMM

@@ -27,12 +27,16 @@ A cell SHALL NOT see or change another cell's files.
 - **THEN** each reads its own contents
 
 ### Requirement: Bounded file data
-A cell SHALL hold at most 64 MiB of file data; a write past that bound
-SHALL fail with `ENOSPC`, and a file SHALL NOT grow past 64 MiB (`EFBIG`).
+A cell SHALL hold at most 256 MiB of file data; a write past that bound
+SHALL fail with `ENOSPC`, and a file SHALL NOT grow past 256 MiB (`EFBIG`).
 
 #### Scenario: Out of file space
-- **WHEN** a cell holding 64 MiB of file data writes a new block
+- **WHEN** a cell holding 256 MiB of file data writes a new block
 - **THEN** the write fails with `ENOSPC` and the kernel keeps running
+
+#### Scenario: A runtime larger than 64 MiB
+- **WHEN** a cell is given a 121 MiB executable among its files
+- **THEN** it holds the whole file and can start it
 
 ### Requirement: Initial files
 The kernel SHALL let the host give a cell files when it spawns it.
@@ -43,7 +47,7 @@ The kernel SHALL let the host give a cell files when it spawns it.
 
 ### Requirement: File data takes its own size in memory
 A cell's file data SHALL take at most its size in kernel memory plus a small
-bookkeeping overhead (under 1/16), so the 64 MiB bound on file data is also
+bookkeeping overhead (under 1/16), so the 256 MiB bound on file data is also
 a bound on the memory it uses.
 
 #### Scenario: A 16 MiB file

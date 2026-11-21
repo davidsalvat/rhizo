@@ -111,7 +111,7 @@ The full picture, and what the kernel still needs for it, is in
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in eight stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running agent in microseconds), real programs (threads, networking, Python, every core) and proven with numbers (fair comparisons with Linux, VMs and sandboxes, and a security review). In progress: a real agent. Next: scale and compatibility. Vision: the product, with downloadable agents and your own model." width="800">
+    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in eight stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running agent in microseconds), real programs (threads, networking, Python, every core), proven with numbers (fair comparisons with Linux, VMs and sandboxes, and a security review), a real agent (calls a model, explores branches, pauses between turns) and scale and compatibility (thousands of busy cells, dynamically linked programs and Node.js). Vision: the product, with downloadable agents and your own model." width="800">
   </picture>
 </p>
 
@@ -124,8 +124,9 @@ virtio/QEMU, SDKs.
 
 ## What a cell can do
 
-A cell runs an unmodified static Linux program (Rust or C with glibc) through
-a Linux-compatible system call layer. Its whole state (memory, registers,
+A cell runs an unmodified Linux program (Rust or C with glibc, static or
+dynamically linked, or an interpreter such as CPython or Node.js) through a
+Linux-compatible system call layer. Its whole state (memory, registers,
 files) belongs to the kernel, so the kernel can stop it, copy it and start it
 again:
 
@@ -146,14 +147,22 @@ again:
   snapshots, forks and templates carry every thread.
 - **Network.** Pipes, `poll`/`select`/`epoll`, Unix and TCP/UDP sockets
   between cells, and a virtio-net card (smoltcp) to reach the outside;
-  established connections are reset on suspend, resume and fork, as CRIU
-  does by default.
+  the kernel keeps a suspended cell's connections open and hands them back
+  on resume, and a fork's copies of them are reset.
 - **Multi-core.** Cells run in parallel on up to 16 CPUs; CPUs that no
   other cell needs run more threads of a running cell at once (TLB
-  shootdowns on x86_64), and system calls of different cells take turns.
+  shootdowns on x86_64); only system calls on sockets take turns.
 - **CPython.** Unmodified CPython 3.13 (static) runs as a cell, its standard
   library in the cell's own files; a template frozen after its imports
   answers each request without starting the interpreter again.
+- **Node.js.** The official Node.js 24 build, dynamically linked and
+  unmodified, runs as a cell with `--jitless` (V8's compiler wants memory
+  both writable and executable, which cells refuse).
+- **Control plane.** `rhizo`, a command-line tool on the host, drives a
+  running kernel over its serial line: `rhizo up`, `run`, `ps`, `fork`,
+  `suspend`, `resume`, `attach`, `kill`, `down`; `rhizo chat` is an
+  interactive conversation with an agent in a cell, whose tools run in
+  the cell, and which can be suspended and picked up later.
 - **Isolation, reviewed.** An adversarial review of the cell boundary, with
   hostile cells and property tests that keep it fixed:
   [`docs/security.md`](docs/security.md) lists the threat model, the
@@ -219,6 +228,16 @@ on the same machine, with the same clock:
   </picture>
 </p>
 
+The same operations on both architectures, counted in instructions (exact,
+so comparable across runs):
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/arches-dark.svg">
+    <img src="docs/img/arches.svg" alt="Bar chart of retired instructions per operation under QEMU -icount, AArch64 next to x86_64: switching between two cells, running hello from start to exit, forking a 50 MiB cell and a glibc program started from a warm template. The values are in the tables below." width="800">
+  </picture>
+</p>
+
 The charts and the tables below come from the same run (the date is under the
 tables). Shared runners are noisy, so figures move between runs; publishable
 numbers will come from a dedicated machine. How benchmarks, environments and baselines work:
@@ -237,10 +256,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 8.3 | 9.1 | 192.3 | 195.0 | 20 |
-| Cloud Hypervisor | 6.5 | 13.5 | 97.0 | 106.8 | 20 |
-| QEMU microvm | 44.1 | 44.7 | — | — | 20 |
-| QEMU q35 | 63.0 | 67.0 | 183.4 | 186.5 | 20 |
+| Firecracker | 8.1 | 9.1 | 193.3 | 194.7 | 20 |
+| Cloud Hypervisor | 6.6 | 13.7 | 96.4 | 106.1 | 20 |
+| QEMU microvm | 41.4 | 42.0 | — | — | 20 |
+| QEMU q35 | 59.5 | 61.8 | 173.8 | 176.2 | 20 |
 
 ### A cell against a Linux process, in the same kind of VM
 
@@ -248,10 +267,10 @@ Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux gue
 
 | Operation | Rhizo cell | Linux process, same VM | Linux process, host |
 |---|---:|---:|---:|
-| The `fork` call, holding 50 MiB written | 1.4 µs | 87.2 µs | 856.5 µs |
-| Fork, then the child writes all 50 MiB and exits | 6.03 ms | 24.16 ms | 22.78 ms |
-| Start a program and run it to its exit (`hello`) | 7.3 µs | 534.1 µs | 98.0 µs |
-| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.3 µs / 588.6 µs | — | 2.37 ms (CRIU) |
+| The `fork` call, holding 50 MiB written | 1.1 µs | 86.5 µs | 823.4 µs |
+| Fork, then the child writes all 50 MiB and exits | 3.82 ms | 21.57 ms | 19.78 ms |
+| Start a program and run it to its exit (`hello`) | 7.1 µs | 595.9 µs | 94.9 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.2 µs / 590.9 µs | — | 2.34 ms (CRIU) |
 
 ### Whole VMs and sandboxes, for scale
 
@@ -259,8 +278,8 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 7.3 µs | 192.25 ms | 70.40 ms |
-| Resume a suspended environment until it runs (eager for the cell) | 588.6 µs | 3.67 ms | 97.17 ms |
+| Start a program and run it to its exit (`hello`) | 7.1 µs | 193.25 ms | 65.01 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 590.9 µs | 3.71 ms | 92.86 ms |
 
 ### A real interpreter
 
@@ -268,17 +287,30 @@ CPython (static, 3.13.18) answering one agent tool call (`cells/python/agent_dem
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 18.15 ms | 18.29 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.71 ms (4.9× faster) | 5.52 ms |
+| Cold, from its executable (interpreter start, imports, warm-up) | 16.95 ms | 18.28 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.83 ms (4.4× faster) | 5.48 ms |
 
 MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 3.59 ms |
-| Forked from a template frozen after the warm-up | 498.4 µs (7.2× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.43 ms |
+| Forked from a template frozen after the warm-up | 495.4 µs (6.9× faster) |
 
-Environment: `ci`, KVM: yes, measured 2026-11-20. Regenerate with
+### Both architectures, in instructions
+
+Retired instructions per operation, counted under QEMU with `-icount` (the same on every run and every host): x86_64 on `microvm`, AArch64 on `virt`. GitHub's ARM64 runners have no KVM, so AArch64 has no timings from CI.
+
+| Operation | x86_64 | AArch64 |
+|---|---:|---:|
+| Switch between two cells | 862 | 818 |
+| Create the `hello` cell | 28,400 | 50,768 |
+| Run `hello` from start to exit | 89,026 | 123,040 |
+| Fork a cell holding 50 MiB | 6,617 | 7,424 |
+| A static glibc program, cold | 35,428,187 | 39,872,288 |
+| The same, forked from a warm template | 76,717 | 92,560 |
+
+Environment: `ci`, KVM: yes, measured 2026-11-21. Regenerate with
 `cargo xtask bench --readme`.
 <!-- bench:end -->
 
@@ -320,7 +352,8 @@ cargo xtask --arch x86_64 bench
 A CPython agent in a cell talking to your own local model (Ollama or
 llama.cpp), forked and suspended live through `rhizo`, the control plane's
 command-line tool (`rhizo up`, `rhizo run python-agent`, `rhizo ps`,
-`rhizo fork`, `rhizo down`): [docs/demo.md](docs/demo.md).
+`rhizo fork`, `rhizo down`), or a conversation with an agent whose tools
+run in its cell (`rhizo chat`): [docs/demo.md](docs/demo.md).
 
 `cargo xtask check` is the fast loop (format, lints, host tests, crate rules)
 and `cargo xtask ci` runs everything CI runs. AArch64 is the primary

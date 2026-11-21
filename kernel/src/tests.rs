@@ -76,6 +76,7 @@ macro_rules! suite {
             ktest_case!(suspend_returns_all_memory),
             ktest_case!(lazy_resume_restores_only_touched_pages),
             ktest_case!(suspended_cells_hold_no_kernel_resources),
+            ktest_case!(a_suspended_fork_refers_to_its_template),
             ktest_case!(snapshot_of_another_architecture_is_rejected),
             ktest_case!(forked_cells_see_only_their_own_writes),
             ktest_case!(children_outlive_their_parent_and_frames_return),
@@ -83,6 +84,7 @@ macro_rules! suite {
             ktest_case!(fork_allocates_only_a_root),
             ktest_case!(spawn_from_template_runs_like_the_program),
             ktest_case!(real_libc_programs_behave_as_on_linux),
+            ktest_case!(cells_learn_the_cpu_as_on_linux),
             ktest_case!(fp_state_is_private_to_each_cell),
             ktest_case!(fp_state_survives_suspend_and_resume),
             ktest_case!(warm_template_of_a_real_program),
@@ -106,6 +108,7 @@ macro_rules! suite {
             ktest_case!(fresh_memory_never_holds_another_cells_data),
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
+            ktest_case!(cells_run_alike_with_and_without_kpti),
             ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
             ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
@@ -125,6 +128,7 @@ macro_rules! suite {
             ktest_case!(forked_servers_share_their_listener),
             ktest_case!(pipes_and_sockets_of_a_fork),
             ktest_case!(a_cell_reaches_the_host),
+            ktest_case!(a_silent_connection_outlasts_the_timeout_and_reconnects_at_once),
             ktest_case!(stack_grows_on_touch_and_returns_its_frames),
             ktest_case!(cpython_in_a_cell),
             ktest_case!(a_cpython_agent_talks_forks_and_survives_suspend),
@@ -165,6 +169,7 @@ macro_rules! suite {
     feature = "ktest-user-read",
     feature = "ktest-user-exec",
     feature = "node",
+    feature = "packages",
 )))]
 /// Every in-kernel test case, in execution order.
 pub static ALL: &[TestCase] = suite!();
@@ -176,6 +181,18 @@ pub static ALL: &[TestCase] = &[
     ktest_case!(console_output_works),
     ktest_case!(node_answers_as_on_linux),
     ktest_case!(a_node_cell_suspends_resumes_and_forks),
+];
+
+/// The package tests (change `add-pip-packages`), alone in the kernel
+/// built with the packages embedded, whose VM has the memory they need.
+/// requests first: the network card gets its address there, which takes
+/// memory for good, before numpy's test checks that none is left behind.
+#[cfg(feature = "packages")]
+pub static ALL: &[TestCase] = &[
+    ktest_case!(console_output_works),
+    ktest_case!(requests_gets_from_the_host_as_on_linux),
+    ktest_case!(numpy_from_a_wheel_computes_as_on_linux),
+    ktest_case!(a_cell_that_imported_numpy_suspends_resumes_and_forks),
 ];
 
 /// In self-check builds the regular suite is compiled but not run (it runs
@@ -190,6 +207,7 @@ pub static ALL: &[TestCase] = &[
     feature = "ktest-user-read",
     feature = "ktest-user-exec",
     feature = "node",
+    feature = "packages",
 ))]
 #[allow(dead_code, reason = "the suite runs in the regular `ktest` build")]
 static SUITE: &[TestCase] = suite!();
@@ -850,7 +868,7 @@ fn suspend_resume_after_every_step(mode: Resume) {
         }
         let snapshot = host.suspend(id).expect("the counter is live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let bytes = snapshot.into_bytes();
+        let bytes = snapshot.export(&DirectMap);
         let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
         id = host.resume(snapshot, mode, true, false).expect("resume");
         resumes += 1;
@@ -884,10 +902,7 @@ fn suspend_returns_all_memory() {
     drop(cycle()); // warm the heap up for the host's small allocations
     let before = free_or_in_heap();
     let snapshot = cycle();
-    assert!(
-        snapshot.as_bytes().len() > 8 << 20,
-        "8 MiB of pages captured"
-    );
+    assert!(snapshot.heap_bytes() > 8 << 20, "8 MiB of pages captured");
     drop(snapshot);
     assert_eq!(
         free_or_in_heap(),
@@ -924,6 +939,37 @@ fn lazy_resume_restores_only_touched_pages() {
     assert_eq!(ended(&host, id), (Ending::Exit(0), "checked\n".into()));
 }
 
+/// A cell forked from a template and suspended before it writes refers to
+/// the template's pages instead of copying them (spec `snapshots`, change
+/// `add-shared-snapshots`); resumed, it writes its own copies, and the
+/// template's pages stay as they were.
+fn a_suspended_fork_refers_to_its_template() {
+    let mut host = Host::new();
+    let template = spawn(&mut host, "ballast", &[b"write", b"2"]);
+    while host.output(template) != Some(b"filled\n") {
+        host.step();
+    }
+    assert!(host.freeze(template));
+    let checked = (Ending::Exit(0), "checked\n".into());
+    for mode in [Resume::Lazy, Resume::Eager] {
+        let id = host
+            .spawn_from_template(template, true, false)
+            .expect("fork");
+        let snapshot = host.suspend(id).expect("live");
+        let (heap, shared) = (snapshot.heap_bytes(), snapshot.shared_bytes());
+        assert!(shared >= 2 << 20, "{shared} bytes shared");
+        assert!(heap < 64 << 10, "{heap} bytes in the heap");
+        let id = host.resume(snapshot, mode, true, false).expect("resume");
+        host.run(|h| h.finished(id).is_some());
+        assert_eq!(ended(&host, id), checked, "{mode:?}");
+    }
+    let id = host
+        .spawn_from_template(template, true, false)
+        .expect("fork");
+    host.run(|h| h.finished(id).is_some());
+    assert_eq!(ended(&host, id), checked, "the template is unchanged");
+}
+
 fn suspended_cells_hold_no_kernel_resources() {
     let mut host = Host::new();
     let ids: Vec<u32> = (0..32).map(|_| spawn(&mut host, "chatter", &[])).collect();
@@ -950,7 +996,7 @@ fn suspended_cells_hold_no_kernel_resources() {
 fn snapshot_of_another_architecture_is_rejected() {
     let mut host = Host::new();
     let id = spawn(&mut host, "chatter", &[]);
-    let mut bytes = host.suspend(id).expect("live").into_bytes();
+    let mut bytes = host.suspend(id).expect("live").export(&DirectMap);
     let other: u16 = if crate::arch::user::MACHINE as u16 == 183 {
         62
     } else {
@@ -1063,6 +1109,14 @@ fn real_libc_programs_behave_as_on_linux() {
     for name in ["libc_hello", "libc_alloc", "libc_float"] {
         run_expected(name);
     }
+}
+
+/// What a program learns of the CPU is what Linux tells it (spec
+/// `linux-abi`): on AArch64, `AT_HWCAP` with FP, Advanced SIMD and
+/// `HWCAP_CPUID`, and ID registers read at EL0 answered by the kernel
+/// (`MIDR_EL1` the CPU's, `MPIDR_EL1` only bit 31).
+fn cells_learn_the_cpu_as_on_linux() {
+    run_expected("libc_hwcap");
 }
 
 /// Two FP programs holding values in FP/SIMD registers across yields, run
@@ -1206,8 +1260,9 @@ fn open_file_survives_suspend_and_resume() {
             }
             let snapshot = host.suspend(id).expect("live");
             output.extend_from_slice(&host.finished(id).expect("suspended").output);
-            let snapshot = Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE)
-                .expect("valid");
+            let snapshot =
+                Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
+                    .expect("valid");
             id = host.resume(snapshot, mode, true, false).expect("resume");
             resumes += 1;
         }
@@ -1542,6 +1597,32 @@ fn fresh_memory_never_holds_another_cells_data() {
     assert!(report.contains("address 0x400000000000: read"), "{report}");
 }
 
+/// Every other test runs with KPTI on (design D1 of `add-kpti`); the
+/// kernel without it, as most CPUs run it, behaves the same: system calls,
+/// faults, forks (copy-on-write flushes) and switches between cells.
+fn cells_run_alike_with_and_without_kpti() {
+    for kpti in [false, true] {
+        arch::user::set_kpti(kpti);
+        run_expected("abi");
+        run_expected("fault_kernel");
+        let mut host = Host::new();
+        let parent = spawn(&mut host, "rewrite", &[]);
+        let other = spawn(&mut host, "chatter", &[b"c"]);
+        while host.output(parent) != Some(b"ready\n") {
+            host.step();
+        }
+        let mut ids = host.fork(parent, 2).expect("fork");
+        ids.push(parent);
+        host.run(|_| false);
+        for id in ids {
+            let (ending, out) = ended(&host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            assert!(out.ends_with("own ok\n"), "{out}");
+        }
+        assert_eq!(ended(&host, other), (Ending::Exit(0), "c\nc\nc\n".into()));
+    }
+}
+
 /// After a fork, read-only pages are shared: a cell that makes one writable
 /// and writes it gets its own copy; the others keep theirs.
 fn shared_read_only_pages_stay_shared_after_mprotect() {
@@ -1673,7 +1754,7 @@ fn no_two_cells_draw_the_same_random_bytes() {
         );
     }
     let suspended = ready(&mut host);
-    let bytes = host.suspend(suspended).expect("suspend").into_bytes();
+    let bytes = host.suspend(suspended).expect("suspend").export(&DirectMap);
     for mode in [Resume::Eager, Resume::Lazy] {
         let snapshot = Snapshot::from_bytes(bytes.clone(), arch::user::MACHINE).expect("valid");
         ids.push(host.resume(snapshot, mode, true, false).expect("resume"));
@@ -2003,7 +2084,7 @@ fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
         id
     };
     let id = ready(&mut host);
-    let bytes = host.suspend(id).expect("live").into_bytes();
+    let bytes = host.suspend(id).expect("live").export(&DirectMap);
     let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
     let resumed = host
         .resume(snapshot, Resume::Lazy, true, true)
@@ -2103,7 +2184,7 @@ fn a_node_cell_suspends_resumes_and_forks() {
         id
     };
     let id = warm(&mut host);
-    let bytes = host.suspend(id).expect("live").into_bytes();
+    let bytes = host.suspend(id).expect("live").export(&DirectMap);
     let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
     let resumed = host
         .resume(snapshot, Resume::Lazy, true, true)
@@ -2125,6 +2206,130 @@ fn a_node_cell_suspends_resumes_and_forks() {
     host.run(|h| all.iter().all(|&id| h.finished(id).is_some()));
     for id in all {
         assert_eq!(ended(&host, id), (Ending::Exit(0), rest.into()));
+    }
+}
+
+// --- C.2: packages from PyPI --------------------------------------------------
+
+/// The files of the packages' CPython, or `None` (said on the console)
+/// when they were not packed.
+#[cfg(feature = "packages")]
+fn packages() -> Option<rhizo_fs::Fs> {
+    let files = crate::cell::packages_files();
+    if files.is_none() {
+        arch::console::BootConsole.write_bytes(b"(packages not packed: not run) ");
+    }
+    files
+}
+
+/// Spawns the packages' CPython with `argv` (spec `workloads`, packages
+/// from PyPI).
+#[cfg(feature = "packages")]
+fn spawn_python(host: &mut Host, files: &rhizo_fs::Fs, argv: &[&str]) -> u32 {
+    spawn_dynamic(host, files, expected::NUMPY_ARGV[0], argv)
+}
+
+/// numpy from its manylinux wheel: CPython opens its extension modules and
+/// the OpenBLAS they need with `dlopen`, and the computation prints what it
+/// prints on Linux (`cells/expected.rs`, by the differential check). Once
+/// the kept file pages are dropped, every frame and heap allocation is
+/// back.
+#[cfg(feature = "packages")]
+fn numpy_from_a_wheel_computes_as_on_linux() {
+    let Some(files) = packages() else { return };
+    let before = memory_balance();
+    let mut host = Host::new();
+    let id = spawn_python(&mut host, &files, &expected::NUMPY_ARGV);
+    host.run(|h| h.finished(id).is_some());
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::NUMPY_STDOUT.into())
+    );
+    drop(host);
+    assert!(crate::cell::drop_images(), "file pages were kept");
+    assert_eq!(memory_balance(), before, "nothing leaked");
+}
+
+/// requests (with urllib3, idna, charset_normalizer and certifi) makes an
+/// HTTP GET to the host's fake model through the network card and prints
+/// what a Linux process prints of the answer.
+#[cfg(feature = "packages")]
+fn requests_gets_from_the_host_as_on_linux() {
+    let Some(files) = packages() else { return };
+    let Some((ip, port)) = crate::wire::options().llm else {
+        arch::console::BootConsole.write_bytes(b"(no network card and model server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card got an address"
+    );
+    let url = alloc::format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+    let [python, flag, script] = expected::REQUESTS_ARGV;
+    let id = spawn_python(&mut host, &files, &[python, flag, script, &url]);
+    let end = crate::cell::now_ns() + 600_000_000_000;
+    while host.finished(id).is_none() && crate::cell::now_ns() < end {
+        host.step();
+    }
+    assert_eq!(
+        ended(&host, id),
+        (Ending::Exit(0), expected::REQUESTS_STDOUT.into())
+    );
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0);
+    // Its connection finishes closing with the host: the kernel goes back
+    // to holding nothing for it.
+    let mut host = Host::new();
+    let end = crate::cell::now_ns() + 10_000_000_000;
+    while crate::cell::wire_busy() && crate::cell::now_ns() < end {
+        host.wire_address(0);
+    }
+    assert!(!crate::cell::wire_busy(), "the card's connections closed");
+}
+
+/// The template case: a cell that imported numpy, suspended and resumed
+/// from the snapshot's bytes, forked, and frozen as a template, every copy
+/// finishes the computation without importing numpy again.
+#[cfg(feature = "packages")]
+fn a_cell_that_imported_numpy_suspends_resumes_and_forks() {
+    let Some(files) = packages() else { return };
+    let [python, flag, script] = expected::NUMPY_ARGV;
+    let mut host = Host::new();
+    let ready = |host: &mut Host| {
+        let id = spawn_python(host, &files, &[python, flag, script, "wait"]);
+        while host.output(id) != Some(b"ready\n") {
+            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
+            host.step();
+        }
+        id
+    };
+    let id = ready(&mut host);
+    let bytes = host.suspend(id).expect("live").into_bytes();
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let resumed = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    let children = host.fork(resumed, 2).expect("fork");
+    let template = ready(&mut host);
+    assert!(host.freeze(template));
+    let from_template: Vec<u32> = (0..2)
+        .map(|_| {
+            host.spawn_from_template(template, true, true)
+                .expect("fork")
+        })
+        .collect();
+    let all: Vec<u32> = [resumed]
+        .into_iter()
+        .chain(children)
+        .chain(from_template)
+        .collect();
+    host.run(|h| all.iter().all(|&id| h.finished(id).is_some()));
+    for id in all {
+        assert_eq!(
+            ended(&host, id),
+            (Ending::Exit(0), expected::NUMPY_STDOUT.into())
+        );
     }
 }
 
@@ -2228,8 +2433,9 @@ fn threaded_cell_survives_suspend_and_resume() {
             }
             let snapshot = host.suspend(id).expect("live");
             output.extend_from_slice(&host.finished(id).expect("suspended").output);
-            let snapshot = Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE)
-                .expect("valid");
+            let snapshot =
+                Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
+                    .expect("valid");
             id = host.resume(snapshot, mode, true, false).expect("resume");
             resumes += 1;
         }
@@ -2263,7 +2469,7 @@ fn sockets_across_suspend_and_resume() {
         3,
         "a suspended cell's listener and connection's two ends, parked"
     );
-    let bytes = snapshot.into_bytes();
+    let bytes = snapshot.export(&DirectMap);
     let copy = Snapshot::from_bytes(bytes.clone(), crate::arch::user::MACHINE).expect("valid");
     let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
     let id = host
@@ -2526,6 +2732,34 @@ fn a_cell_reaches_the_host() {
     assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
 }
 
+/// A connection through the network card that stays silent for three
+/// times the card's timeout (shortened to 500 ms here, 20 s otherwise)
+/// still carries the next echo, and a new connection after it closes is
+/// open and echoing within a second (spec `networking`, change
+/// `fix-tcp-long-wait`); not run without a card.
+fn a_silent_connection_outlasts_the_timeout_and_reconnects_at_once() {
+    let Some((ip, port)) = crate::wire::options().echo else {
+        arch::console::BootConsole.write_bytes(b"(no network card and echo server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card gets an address"
+    );
+    crate::cell::set_wire_timeout(500_000_000);
+    let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let port = alloc::format!("{port}");
+    let id = spawn(
+        &mut host,
+        "quiet",
+        &[port.as_bytes(), b"1500", ip.as_bytes()],
+    );
+    host.run(|_| false);
+    crate::cell::set_wire_timeout(20_000_000_000);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "quiet ok\n".into()));
+}
+
 fn forks_of_a_threaded_cell_run_all_threads() {
     let after_ready = expected_output("libc_threads")
         .strip_prefix("ready\n")
@@ -2781,7 +3015,7 @@ fn suspend_between_parallel_runs_is_invisible() {
         }
         let snapshot = host.suspend(id).expect("the counter is live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let bytes = snapshot.into_bytes();
+        let bytes = snapshot.export(&DirectMap);
         let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
         id = host
             .resume(snapshot, Resume::Lazy, true, false)
@@ -2871,7 +3105,8 @@ fn a_cell_on_several_cpus_survives_suspend_and_fork() {
         let snapshot = host.suspend(id).expect("live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
         let snapshot =
-            Snapshot::from_bytes(snapshot.into_bytes(), crate::arch::user::MACHINE).expect("valid");
+            Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
+                .expect("valid");
         id = host
             .resume(snapshot, Resume::Lazy, true, false)
             .expect("resume");

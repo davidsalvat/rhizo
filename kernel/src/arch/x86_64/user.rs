@@ -24,6 +24,7 @@ pub const TLB_FLUSH_IS_BROADCAST: bool = false;
 
 unsafe extern "C" {
     fn rhizo_enter_cell(regs: *mut Registers, sysret: u64) -> u64;
+    fn rhizo_enter_cell_kpti(regs: *mut Registers, sysret: u64) -> u64;
 }
 
 /// Why a cell stopped running.
@@ -67,6 +68,17 @@ impl UserFault {
             .flatten()
     }
 
+    /// Whether the kernel answered the fault by emulating the instruction
+    /// (the AArch64 ID registers): never on x86_64, where cell code reads
+    /// what it needs of the CPU itself (`CPUID`).
+    #[allow(
+        clippy::unused_self,
+        reason = "the interface of AArch64's, which decodes the fault"
+    )]
+    pub fn emulate(&self, _regs: &mut Registers, _insn: impl FnOnce(u64) -> Option<u32>) -> bool {
+        false
+    }
+
     /// Prints `cell N killed: <report>`.
     pub fn report(&self, console: &mut impl Console, cell: u32) {
         exception::report_cell_exception(console, cell, &self.0);
@@ -76,6 +88,9 @@ impl UserFault {
 /// CR3 value (root and PCID) when a cell last ran on each CPU, and whether
 /// PCIDs are on.
 static USER_CR3: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Whether each CPU's `SYSCALL` goes to the entry with KPTI (set as it
+/// enters a cell after [`set_kpti`]; off the path of every other entry).
+static KPTI_ENTRY: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 static PCID: AtomicBool = AtomicBool::new(false);
 /// FS base last written on each CPU (skipping the write when it does not
 /// change).
@@ -261,29 +276,28 @@ fn load_cr3(value: u64) {
 pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Trap {
     let cr3 = root | tag as u64;
     let cpu = index();
-    if USER_CR3[cpu].swap(cr3, Ordering::Relaxed) != cr3 || flush {
-        let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
-        load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
-    }
-    // SYSRETQ loads RIP from RCX and RFLAGS from R11, so it restores exactly
-    // what IRETQ would when they already hold those values, as after a
-    // system call. Threads of a cell share CR3, so this is a property of
-    // the registers entered, not of the last exit (design D9 of
-    // `add-threads`). It also needs a canonical lower-half RIP (else it
-    // faults in ring 0).
-    let user_flags = (regs.flags & 0xdd5) | 0x202;
-    let sysret =
-        regs.pc < 0x0000_8000_0000_0000 && regs.gpr[2] == regs.pc && regs.gpr[10] == user_flags;
-    if LAST_FS[cpu].swap(regs.tls, Ordering::Relaxed) != regs.tls {
-        // SAFETY: the FS base is the cell's thread pointer; the kernel does
-        // not use FS.
-        unsafe { wrmsr(FS_BASE, regs.tls) };
-    }
-    // SAFETY: `regs` lives across the call; the entry code returns to ring 3
-    // with user selectors and only the user flags, and comes back through
-    // the SYSCALL entry or a ring-3 exception, which restore the kernel
-    // stack and callee-saved registers.
-    let vector = unsafe { rhizo_enter_cell(regs, sysret as u64) };
+    // One test of KPTI on the way (design D2 of `add-kpti`): each case has
+    // its own copy of the entry code, and this path is the one from before.
+    let vector = if KPTI.load(Ordering::Relaxed) {
+        enter_with_kpti(cpu, cr3, tag, flush, regs)
+    } else {
+        if USER_CR3[cpu].swap(cr3, Ordering::Relaxed) != cr3 || flush {
+            // `set_kpti` puts every CPU on the kernel's tables: the first
+            // entry after it comes here and points `SYSCALL` at the entry
+            // without KPTI.
+            if KPTI_ENTRY[cpu].swap(false, Ordering::Relaxed) {
+                super::cpu::set_syscall_entry(false);
+            }
+            let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
+            load_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
+        }
+        let sysret = prepare_entry(cpu, regs);
+        // SAFETY: `regs` lives across the call; the entry code returns to
+        // ring 3 with user selectors and only the user flags, and comes back
+        // through the SYSCALL entry or a ring-3 exception, which restore the
+        // kernel stack and callee-saved registers.
+        unsafe { rhizo_enter_cell(regs, sysret as u64) }
+    };
     debug_assert_eq!(
         kernel_flags() & (DF | AC),
         0,
@@ -317,6 +331,46 @@ pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Tra
     }))
 }
 
+/// [`enter_user`] with KPTI: the cell's CR3 is loaded by the entry code,
+/// last, and the kernel's first on the way back. Kept apart so the path
+/// without KPTI stays as it was.
+#[cold]
+#[inline(never)]
+fn enter_with_kpti(cpu: usize, cr3: u64, tag: u16, flush: bool, regs: &mut Registers) -> u64 {
+    if !KPTI_ENTRY[cpu].swap(true, Ordering::Relaxed) {
+        super::cpu::set_syscall_entry(true);
+    }
+    // An untagged cell shares PCID 0 with the kernel: its CR3 always
+    // flushes it, so no kernel translation stays cached while it runs.
+    let keep = PCID.load(Ordering::Relaxed) && tag != 0 && !flush;
+    super::cpu::PERCPU.0[cpu].set_user_cr3(if keep { cr3 | NO_FLUSH } else { cr3 });
+    let sysret = prepare_entry(cpu, regs);
+    // SAFETY: as in `enter_user`, through the entry pages and the cell's
+    // tables, which map them.
+    unsafe { rhizo_enter_cell_kpti(regs, sysret as u64) }
+}
+
+/// Loads the cell's thread pointer and says whether `SYSRETQ` can return
+/// to it.
+#[inline(always)]
+fn prepare_entry(cpu: usize, regs: &Registers) -> bool {
+    // SYSRETQ loads RIP from RCX and RFLAGS from R11, so it restores exactly
+    // what IRETQ would when they already hold those values, as after a
+    // system call. Threads of a cell share CR3, so this is a property of
+    // the registers entered, not of the last exit (design D9 of
+    // `add-threads`). It also needs a canonical lower-half RIP (else it
+    // faults in ring 0).
+    let user_flags = (regs.flags & 0xdd5) | 0x202;
+    let sysret =
+        regs.pc < 0x0000_8000_0000_0000 && regs.gpr[2] == regs.pc && regs.gpr[10] == user_flags;
+    if LAST_FS[cpu].swap(regs.tls, Ordering::Relaxed) != regs.tls {
+        // SAFETY: the FS base is the cell's thread pointer; the kernel does
+        // not use FS.
+        unsafe { wrmsr(FS_BASE, regs.tls) };
+    }
+    sysret
+}
+
 /// Switches CR3 back to the kernel's tables: call before freeing the tables
 /// and the tag of the cell (`root`, `tag`).
 pub fn release_user(_root: u64, _tag: u16) {
@@ -330,6 +384,9 @@ pub fn release_user(_root: u64, _tag: u16) {
 /// translations (another CPU may run it next, or free it; design D4 of
 /// `add-smp-scheduling`).
 pub fn leave_user() {
+    if KPTI.load(Ordering::Relaxed) {
+        return; // the kernel's tables are loaded already
+    }
     let pcid = PCID.load(Ordering::Relaxed);
     let kernel = crate::memory::kernel_tables().root();
     USER_CR3[index()].store(kernel, Ordering::Relaxed);
@@ -340,10 +397,130 @@ pub fn leave_user() {
 /// shrank, as after a fork); the next entry reloads its tables.
 pub fn flush_user(root: u64, tag: u16) {
     let pcid = PCID.load(Ordering::Relaxed);
-    if pcid && tag != 0 {
+    // With KPTI the cell's tables cannot be loaded in the kernel (they map
+    // no kernel code): the caller marks it stale everywhere
+    // ([`stale_everywhere`]) and its next entry flushes its PCID.
+    if pcid && tag != 0 && !KPTI.load(Ordering::Relaxed) {
         load_cr3(root | tag as u64); // without bit 63: flushes this PCID
     }
     release_user(root, tag);
+}
+
+/// Whether a TLB flush done in the kernel leaves every CPU, this one
+/// included, with stale translations of the cell: yes with KPTI, where the
+/// kernel runs on its own PCID and `INVLPG` cannot reach the cell's.
+pub fn stale_everywhere() -> bool {
+    KPTI.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// KPTI (design D1-D3 of `add-kpti`)
+// ---------------------------------------------------------------------------
+
+/// Whether cells' tables carry only the entry pages of the kernel half.
+static KPTI: AtomicBool = AtomicBool::new(false);
+/// The kernel half of cells' tables with KPTI ([`init_kpti`]).
+static ENTRY_ROOT: AtomicU64 = AtomicU64::new(0);
+const IA32_ARCH_CAPABILITIES: u32 = 0x10a;
+
+/// Whether this CPU needs KPTI against Meltdown (rogue data cache load):
+/// not on AMD or Hygon CPUs, which are not affected, nor on Intel CPUs
+/// that say so (`IA32_ARCH_CAPABILITIES.RDCL_NO`); yes otherwise, as Linux
+/// decides.
+pub fn kpti_needed() -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let vendor = __cpuid(0);
+    let name = [vendor.ebx, vendor.edx, vendor.ecx];
+    // "AuthenticAMD", "HygonGenuine"
+    if name == [0x6874_7541, 0x6974_6e65, 0x444d_4163]
+        || name == [0x6f67_7948, 0x6e65_476e, 0x656e_6975]
+    {
+        return false;
+    }
+    if vendor.eax >= 7 && __cpuid_count(7, 0).edx & (1 << 29) != 0 {
+        // SAFETY: CPUID.7.0:EDX[29] says the MSR exists.
+        let caps = unsafe { super::cpu::rdmsr(IA32_ARCH_CAPABILITIES) };
+        return caps & 1 == 0;
+    }
+    true
+}
+
+/// Whether KPTI is on.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "read by the tests and the benchmarks")
+)]
+pub fn kpti() -> bool {
+    KPTI.load(Ordering::Relaxed)
+}
+
+/// Builds the kernel half cells' tables carry with KPTI: the entry code,
+/// per-CPU data, GDTs, TSSs, IDT and trap stacks of the `cpus` CPUs online,
+/// at their kernel addresses, supervisor only; nothing else of the kernel.
+/// Call once, after the other CPUs started.
+pub fn init_kpti(cpus: usize) {
+    use rhizo_mm::paging::{PageFlags, PageSize, PageTable};
+    let mut alloc = || crate::memory::with_frames(|f| f.alloc()).flatten();
+    let pt = PageTable::<super::platform::Format>::new(&mut crate::memory::DirectMap, &mut alloc)
+        .expect("a frame for the entry tables");
+    let mut ranges: alloc::vec::Vec<_> = super::cpu::entry_ranges().into();
+    for cpu in 1..cpus {
+        let stacks = crate::smp::stacks(cpu);
+        for top in [stacks.exception, stacks.double_fault] {
+            ranges.push((top - 16 * 1024, top, false));
+        }
+    }
+    for (start, end, code) in ranges {
+        let flags = if code {
+            PageFlags::empty()
+        } else {
+            PageFlags::WRITABLE | PageFlags::NO_EXECUTE
+        };
+        for virt in (start & !0xfff..end).step_by(4096) {
+            let phys = crate::memory::translate(virt)
+                .expect("entry page is mapped")
+                .phys;
+            pt.map(
+                &mut crate::memory::DirectMap,
+                &mut alloc,
+                virt,
+                phys & !0xfff,
+                PageSize::Small,
+                flags,
+            )
+            .expect("entry page mapped once");
+        }
+    }
+    ENTRY_ROOT.store(pt.root(), Ordering::Relaxed);
+}
+
+/// Turns KPTI on or off for the cells created from now on: none may be
+/// live. With it, every CPU's entry code loads the kernel's tables first.
+pub fn set_kpti(on: bool) {
+    leave_user();
+    KPTI.store(on, Ordering::Relaxed);
+    let root = crate::memory::kernel_tables().root();
+    let kernel = match (on, PCID.load(Ordering::Relaxed)) {
+        (false, _) => 0,
+        (true, true) => root | NO_FLUSH,
+        (true, false) => root,
+    };
+    for (percpu, user) in super::cpu::PERCPU.0.iter().zip(&USER_CR3) {
+        percpu.set_kernel_cr3(kernel);
+        percpu.set_user_cr3(0);
+        user.store(root, Ordering::Relaxed); // every CPU is on the kernel's
+    }
+}
+
+/// The kernel half a new cell's root carries: all of it, or with KPTI only
+/// the entry pages.
+pub fn cell_kernel_half() -> rhizo_mm::paging::PageTable<super::platform::Format> {
+    match ENTRY_ROOT.load(Ordering::Relaxed) {
+        root if KPTI.load(Ordering::Relaxed) && root != 0 => {
+            rhizo_mm::paging::PageTable::from_root(root)
+        }
+        _ => crate::memory::kernel_tables(),
+    }
 }
 
 /// Nothing to do on x86_64: instruction fetch sees data writes.

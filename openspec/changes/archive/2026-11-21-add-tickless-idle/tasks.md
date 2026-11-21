@@ -12,4 +12,4 @@
 
 ## 3. Metric
 
-- [ ] 3.1 `laptop.idle_wakeups_per_s` drops in the CI benchmark job; the `ci` baseline takes it from two CI runs that agree within the threshold, with the host CPU; `bench/README.md` says what still wakes idle CPUs; verify `cargo xtask bench --from <run> --env ci --check` on both runs
+- [x] 3.1 `laptop.idle_wakeups_per_s` drops in the CI benchmark job; the `ci` baseline takes it from two CI runs that agree within the threshold, with the host CPU; `bench/README.md` says what still wakes idle CPUs; verify `cargo xtask bench --from <run> --env ci --check` on both runs
