@@ -10,7 +10,7 @@
 - [x] 2.1 `bench --icount-only` (D2); host test `options_parse`; verify `cargo test -p xtask`
 - [x] 2.2 Under `-icount`, clock figures complete the PMU passes (D3); host test `icount_figures_take_the_pmu_pass_then_the_clock`; verify two local runs of `cargo xtask --arch aarch64 bench --icount-only` agree exactly and include `cell.fork_insns`
 - [x] 2.3 The AArch64 CI job runs it in `ci-arm` with `--check` and publishes `bench-aarch64-results-N`; the x86_64 job publishes compact JSON so its results fit its 39 pieces; verify the annotations of a CI run of this change
-- [ ] 2.4 `ci-arm` baseline from a CI run, after a second run agrees (D4); verify the next CI run passes the gate
+- [x] 2.4 `ci-arm` baseline from a CI run, after a second run agrees (D4); verify the next CI run passes the gate
 
 ## 3. README pipeline
 
