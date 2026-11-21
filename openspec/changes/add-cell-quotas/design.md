@@ -76,6 +76,20 @@ under an earlier quota).
 Alternative: a timer at the exact deadline. Rejected: the preemption tick
 already bounds the overrun, and a second timer per CPU is more code.
 
+### What quotas cost per switch
+
+On x86_64 (`-icount`), a switch between cells costs 9 instructions more
+than without quotas (871 to 880, +1.0 %): 6 for metering the system call
+each switch makes (a meter pointer in the call's context and one in its
+pager) and 3 for the CPU-quota tests at the ends of the slice. A system
+call costs 6 more (330 to 336). On AArch64 a switch costs 13 more (815 to
+828). The x86_64 switch baseline moves to 880 with this change.
+
+Rejected ways to cut it: a per-CPU pointer to the running cell's meter,
+read by a zero-sized allocator (hidden global state and `unsafe`, against
+the minimal-code and `unsafe` rules), and not metering frames the pager
+takes during system calls (stack growth unmetered, the hole quotas close).
+
 ## D3. Quotas are cell state
 
 `Quota` and `cpu_ns` live in `rhizo_cell::Cell`, plain data:
