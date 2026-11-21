@@ -14,7 +14,10 @@ on both architectures (AArch64 and x86_64), extended by a second review
 CPUs, sockets and the network card, virtio-pci, dynamically linked
 programs and file mappings, the image cache and 2 MiB image pages, the
 agent workload's host calls, and snapshots as untrusted input (findings
-S14 to S21, section [Second review](#second-review-d2)).
+S14 to S21, section [Second review](#second-review-d2)), then by a review
+of frames from the network (boundary B5 of the audit scope, change
+`fuzz-wire-packets`: findings S22 and S23, section
+[Frames from the network](#frames-from-the-network-b5)).
 
 The scope we would hand an external auditor (trust boundaries, components
 ranked by risk with their size, open questions and an effort estimate) is
@@ -53,7 +56,18 @@ run and which snapshots to resume. Executables and snapshot bytes are
 still validated. The hardware, firmware and VMM (QEMU, Firecracker, Cloud
 Hypervisor) are trusted, and so is the network card they emulate: the
 virtio drivers are reviewed for robustness only (a broken device must not
-crash the kernel), not against a malicious device.
+crash the kernel), not against a malicious device. The frames the card
+delivers are not trusted: they come from the network (third attacker,
+below).
+
+**Third attacker: a host on the network** (from the review of B5 on). Any
+host that can reach the VM's network card sends any Ethernet frames, in
+any order and as fast as the link allows. It must not crash, hang or
+exhaust the kernel, open sockets, change another cell's sockets, or learn
+a cell's bytes. It may do what any host may do to its own connections;
+and a host that can impersonate a connection's peer (its MAC or IP
+address) may reset or redirect that connection, since TCP and ARP have no
+authentication on any stack (cells that need more use TLS).
 
 ## Trust boundary
 
@@ -139,6 +153,34 @@ What makes the boundary hold:
   pages and the stack (`zero_frame` before copying), page tables, private
   copies of shared pages (whole-page copy), resumed pages (whole-page
   copy), new file blocks (`[0; 4096]`).
+
+## Quotas
+
+`add-cell-quotas` closed O1. The host sets a cell's quotas with
+`Host::set_quota`; without one a cell has the kernel's limits, as before,
+and at most 256 sockets (S21).
+
+- **Memory** (bytes of pages and page tables): every frame the kernel takes
+  for the cell goes through `rhizo_cell::quota::Metered`: system calls,
+  lazy pages, stack growth, holes and pages past the end of mapped files
+  (S20), spawn and resume. Copy-on-write copies are not metered: each
+  replaces a shared frame the cell gives back, net zero. Past
+  the quota, `mmap` and `brk` answer `ENOMEM`; a fault that needs a frame
+  kills the cell, as when memory runs out. Frames given back are credited
+  (never below zero), so a forked cell holds at most its quota plus what it
+  inherited (counted to its parent). File data (`rhizo_fs::DATA_MAX`) and
+  names (4096) keep their own bounds per cell, outside the memory quota: a
+  cell may hold that much file data above its quota.
+- **CPU time**, its system calls included, counted per slice from when
+  the quota is set (a cell without one is not timed); past the quota the cell ends (`Ending::OutOfCpu`,
+  `cell N killed: CPU time quota used up`) at the end of that slice, at
+  most 10 ms and one call late.
+- **Descriptors** (at most 1024): `EMFILE` past the quota. **Sockets**:
+  `ENFILE` past the quota, 256 by default (S21).
+- **Cell state.** Quotas live in the `Cell`: forks and template copies keep
+  them (with no usage), snapshots (format version 8) keep them and the CPU
+  time used, so a suspend and resume buys no time. `getrlimit` reports
+  them; nothing in a cell can raise them.
 
 ## Speculation (Meltdown)
 
@@ -254,7 +296,7 @@ relies on:
 | `setsockopt` (208/54), `getsockopt` (209/55) | fd, level, name, value, length | known options only (`ENOPROTOOPT`; TCP options on TCP sockets only, `EOPNOTSUPP`); value length checked (`EINVAL`), at most 16 bytes read; ranges checked |
 | `set_robust_list` (99/273) | — | accepted, never walked |
 | `rseq` (293/334), `io_uring_setup` (425/425) | — | `-ENOSYS` (declined, not reported) |
-| `prlimit64` (261/302), `getrlimit` (163/97) | resource, old-limit buffer | resource ≤ 15 (`EINVAL`); new limit and pid not read; 16 bytes written |
+| `prlimit64` (261/302), `getrlimit` (163/97) | resource, old-limit buffer | resource ≤ 15 (`EINVAL`); new limit and pid not read; 16 bytes written; the cell's quotas for `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_NOFILE` |
 | `sysinfo` (179/99) | buffer | 112 bytes written |
 | `readlink` (—/89), `readlinkat` (78/267) | — | `-ENOENT` (no links exist), nothing read |
 | `fstat` (80/5), `statx` (291/332) | fd, buffer; dirfd, path, flags, mask, buffer | 128 / 144 bytes written; `statx` 256 bytes, its path as `newfstatat` |
@@ -302,8 +344,10 @@ the threat model above.
 | S18 | Medium | x86_64 | An executable's or interpreter's entry point past `USER_END` was accepted; entering the cell there faults in the kernel | Fixed |
 | S17 | Low | both | virtio-pci accepted BAR size masks that are not a power of two, or that wrap past the top of memory: a broken device could have the kernel map memory outside its BAR | Fixed |
 | S19 | Low | both | `dup2(fd, fd)` returned its 64-bit argument as given, not the descriptor (neither a value nor an `errno` for a large one) | Fixed |
-| S20 | Low | both | `mmap` of a file maps holes and pages past its end with fresh zeroed frames without asking memory first (as S11 did for anonymous memory) | Accepted (below) |
-| S21 | Medium | both | Sockets are bounded kernel-wide (4096): one cell can hold about half, two all, and every other cell gets `ENFILE` | Accepted until per-cell socket quotas (O1, `add-cell-quotas`) |
+| S20 | Low | both | `mmap` of a file maps holes and pages past its end with fresh zeroed frames without asking memory first (as S11 did for anonymous memory) | Fixed (`add-cell-quotas`) |
+| S21 | Medium | both | Sockets are bounded kernel-wide (4096): one cell can hold about half, two all, and every other cell gets `ENFILE` | Fixed (`add-cell-quotas`) |
+| S22 | Medium | both | A flood of frames from the network kept the CPU that polls the card in `smoltcp` for as long as it lasted | Fixed (`fuzz-wire-packets`) |
+| S23 | Low | both | A connection to the outside on which nothing arrived for 20 s was reset (`smoltcp` 0.14 applies its timeout to idle connections) | Worked around (`fix-tcp-long-wait`) |
 
 **S1. `mprotect` reached the kernel half (Critical, x86_64).** On x86_64 a
 cell's root table shares the kernel's upper-half entries, and those
@@ -446,7 +490,7 @@ kernel; every finding reproduced before its fix and kept fixed by a test.
 | **Image cache and 2 MiB pages** (`add-image-cache`, `add-large-image-pages`) | Writing a read-only page or 2 MiB page shared with every spawn of the image | Copies share read-only pages and copy writable ones; `mprotect` of a shared page (2 MiB included) adds copy-on-write; `mprotect` of part of a 2 MiB page is refused; a 2 MiB copy-on-write fault copies into a 2 MiB frame or, without one, into 512 small pages. |
 | **Agent workload host calls** (`Host::write_file`, `Host::asleep`, `ioctl`) | — (host calls) | `write_file` reaches a cell only while no CPU runs it (a running cell is out of the scheduler's lists), and goes through the cell's own file limits; `asleep` only reads. |
 | **Write-or-execute pages** (`node-jit`) | A JIT's writable and executable memory: a page writable and executable at once, one cell changing another's code, a range list without bound, a page that flips forever | The page tables never hold both rights (a property test over maps, protects, forks, clones, writes and fetches on both formats); a change of state makes the cell's tables its own first and copies a frame still shared before writing it; each change flushes the old translation from every CPU that may hold it (broadcast on AArch64, the gang's hold and KPTI's stale marks on x86_64) and, on AArch64, cleans and invalidates the caches before the thread runs again; at most 64 ranges per cell; an instruction that writes its own page ends the cell. Cells may maintain caches by address on AArch64 (`SCTLR_EL1.UCT`, `UCI`), as on Linux: only their own readable memory. |
-| **Snapshots** (format v8) | Any bytes as a snapshot | `from_bytes` checks header, version, machine, the write-or-execute ranges (at most 64, aligned, sorted, apart, inside the user half), every page record (size, user-only flags, W^X, a write-or-execute page writing or running, alignment, order, inside the user half, data in bounds), every thread (identifier, wait, futex address, program counter and on x86_64 thread pointer and `MXCSR`), the file system (`Fs::decode`: every index, link count, tree shape and bound) and the sockets (each record held by exactly one description). The heap and mapping cursors are not checked: they only steer where the cell's own later calls map, and every mapping call refuses ranges past `USER_END`. Fuzzed with tampered and random snapshots restored into a cell that shares a kernel half (below); no finding. |
+| **Snapshots** (format v9) | Any bytes as a snapshot | `from_bytes` checks header, version, machine, the write-or-execute ranges (at most 64, aligned, sorted, apart, inside the user half), every page record (size, user-only flags, W^X, a write-or-execute page writing or running, alignment, order, inside the user half, data in bounds), every thread (identifier, wait, futex address, program counter and on x86_64 thread pointer and `MXCSR`), the file system (`Fs::decode`: every index, link count, tree shape and bound) and the sockets (each record held by exactly one description). The heap and mapping cursors are not checked: they only steer where the cell's own later calls map, and every mapping call refuses ranges past `USER_END`. Fuzzed with tampered and random snapshots restored into a cell that shares a kernel half (below); no finding. |
 | **Cost accounting and sampling** (`add-cost-accounting`, `add-sampling-profiler`) | — | Compiled in only with the `profile` / `sampling` features (benchmark and test builds); the kernel does not grant cells access to the performance counters. Not reviewed further. |
 
 ### Findings
@@ -505,22 +549,30 @@ half and a high half set, it returned a value that is neither a
 descriptor nor an `errno`. Found by the decoded-files fuzzer. *Fix:* both
 truncated to 32 bits, as Linux.
 
-**S20. File holes mapped without asking (Low, accepted).** A file mapping
-gives each hole, and each page past the file's end, a fresh zeroed frame
+**S20. File holes mapped without asking (Low, both).** A file mapping
+gave each hole, and each page past the file's end, a fresh zeroed frame
 without asking memory for the whole length first, as S11 made anonymous
-mappings do: a call over terabytes zeroes all free memory down to the
-kernel's reserve (kept by the frame allocator) before it is refused and
-gives everything back. Bounded by the reserve, no panic; accepted, and
-noted for per-cell quotas (`add-cell-quotas` must meter these frames,
-which the page cache takes from the kernel's frames, not the cell's).
+mappings do: a call over terabytes zeroed all free memory down to the
+kernel's reserve (kept by the frame allocator) before it was refused and
+gave everything back. The frames came from the page cache's pool, outside
+the cell's metering. *Fix* (`add-cell-quotas`): such a page is the cell's
+alone and never kept, so it comes from the cell's frames and counts in its
+memory quota like anonymous memory. *Test:* `hog file` in
+`memory_quota_refuses_the_cell_not_the_others`. A cell without a memory
+quota is still bounded only by the reserve, as for anonymous memory.
 
-**S21. One pool of sockets (Medium, accepted).** At most 4096 sockets are
-open in the kernel. A cell with 1024 descriptors can open as many
+**S21. One pool of sockets (Medium, both).** At most 4096 sockets are
+open in the kernel. A cell with 1024 descriptors could open as many
 connections to its own listener (each also holding the accepted end), so
-one cell holds about half the pool and two hold all of it; parked sockets
-count too. Others then get `ENFILE`; the kernel survives. Accepted until
-per-cell socket quotas (O1, `add-cell-quotas`, which bounds sockets per
-cell).
+one cell held about half the pool and two held all of it; parked sockets
+count too. Others then got `ENFILE`; the kernel survived. *Fix*
+(`add-cell-quotas`): every cell has a socket quota, 256 unless the host
+sets another (`Quota::DEFAULT`), so with the server ends of its own
+connections a cell holds at most 512 sockets, an eighth of the pool (a
+compile-time check keeps the default there). *Test:*
+`a_cell_holds_a_bounded_share_of_sockets` (`limits` and its fork, without
+a quota from the host). A host that lifts the quota (`Quota::NONE`) or
+runs many cells can still fill the pool, as with memory.
 
 ### Fuzzers and hostile cells
 
@@ -552,29 +604,123 @@ when the interleaving happens; the in-kernel tests run under QEMU with
 software emulation in CI (and KVM where available), whose memory ordering
 is stronger than some hardware's.
 
+## Frames from the network (B5)
+
+Change `fuzz-wire-packets`, answering Q11 of
+[`audit-scope.md`](audit-scope.md): the third attacker (a host on the
+network, above) against `crates/rhizo-net/src/wire.rs`, `kernel/src/wire.rs`
+and the parts of `smoltcp` 0.14 the kernel builds (Ethernet, ARP, IPv4,
+ICMP errors, UDP, TCP, the DHCPv4 client). Method: reading the code, then
+a host fuzzer that drives `Net::poll_wire` through the `QueueLink` test
+double (below); each finding reproduced by a test that failed before its
+fix.
+
+### What a host on the network can try
+
+| Input | What holds it |
+|---|---|
+| **Floods** of any frames | One poll takes at most one receive ring (64 frames) since S22, then asks to be polled again; the kernel polls at most every 20 µs, so cells run in between. |
+| **SYN floods**, SYN to a cell's listener | Listening sockets are loopback only: `listen` never makes a `smoltcp` listener, so a SYN to any port gets a reset and leaves no state. Fuzzed: nothing ever waits to be accepted. |
+| **TCP segments**: malformed headers and options, out of window, aimed at another cell's port | `smoltcp` checks lengths and checksums, then matches the four addresses and ports: a segment that is not from a connection's peer gets a reset, and a connection's state changes only for segments from its peer (D3 of the change: a host that can forge the peer's addresses is out of reach of any stack). Handshake options (zero MSS, window scale past 14, short or unknown options) fuzzed on a connection in `SYN-SENT`. |
+| **UDP** | Only a socket that sent to the outside has a `smoltcp` socket, bounded to 16 datagrams and 64 KiB: anyone may fill that socket's own queue, as on any stack; nothing else receives. Datagrams to other ports get an ICMP error quoting the sender's own datagram. |
+| **IPv4 fragments and options** | `smoltcp` is built without `proto-ipv4-fragmentation`: fragments are dropped, no reassembly buffer exists. Options are skipped. |
+| **Oversized frames** | The driver copies at most `FRAME_MAX` (2036 bytes) of a buffer; `smoltcp` checks every length against the bytes it got. Jumbo frames fuzzed. |
+| **ICMP** | No echo replies (feature `auto-icmp-echo-reply` off). Frames the card sends are built in zeroed buffers (`Tx`), so no stale heap bytes leave. |
+| **ARP** | A neighbour cache of 8 entries, filled only by ARP aimed at the card from its own network. A host can evict entries; `smoltcp` then asks again (one request a second), which delays a connection's frames by about a second (below). |
+| **DHCP** | A rogue server can give the card any unicast address or take it away (a NAK, a short lease): connections from the old address then fail. Inherent to DHCP; fuzzed for panics and for non-unicast addresses. |
+| **Memory** | In this configuration `smoltcp` allocates nothing per frame (fixed socket buffers, fixed-size neighbour cache); `Net` reuses one frame buffer per poll. Fuzzed: the heap comes back to its level once every socket is closed. |
+
+### Findings
+
+**S22. A flood held the polling CPU (Medium, both).** `Net::poll_wire` let
+`smoltcp`'s `Interface::poll` take frames until the card had none (its
+documentation warns that this is unbounded), and the virtio-net driver
+gives each buffer back to the device as it hands its frame over. A host
+sending faster than the kernel handles frames kept the CPU that polls the
+card in the kernel for as long as the flood lasted: the cells it runs did
+not run, and the cells' own frames waited (egress comes after ingress).
+Found by reading `smoltcp` while writing the fuzzer's flood step;
+reproduced by a card that always has another frame (the test panicked
+after 100000). *Fix:* the device `smoltcp` sees hands over at most
+`POLL_FRAMES` (64, one receive ring) per poll, and `poll_wire` then
+returns 0 so the caller polls again soon. *Test:*
+`a_flood_from_the_wire_lets_the_kernel_go`.
+
+**S23. Idle connections to the outside were reset after 20 s (Low,
+both; `smoltcp` 0.14).** Connections to the outside were given
+`set_timeout(20 s)`. `smoltcp` documents that
+timeout for a peer that does not answer the handshake or stays silent
+while data is outstanding, but its `poll_at` comes due at the last
+received segment plus the timeout whatever the transmit buffer holds, and
+`dispatch` then aborts the connection (`timed_out` does not look at the
+buffer). So any connection on which nothing arrived for 20 s, such as an
+idle keep-alive connection or a request whose answer took longer, was
+reset and its peer got an RST. Not caused by an attacker; found by the
+fuzzer (a case that shrank to "wait 20 s"), and at the same time, from a
+model that thought for 45 s, by `fix-tcp-long-wait`. Reproduction in `smoltcp`
+alone: two interfaces on a wire, a client socket with
+`set_timeout(Some(20 s))` connects to a listener, neither sends; 20 s
+after the last segment the client sends an RST and is `Closed`.
+`smoltcp` is a crates.io dependency and is not patched. *Workaround*
+(`fix-tcp-long-wait`): the card clears the timeout while an open
+connection has nothing waiting for an acknowledgment and sets it again
+when it sends. S23 is covered by that change's dedicated tests in
+`crates/rhizo-net/src/wire_tests.rs`:
+`a_connection_silent_for_long_still_gets_its_reply` (45 s of silence, then
+ten minutes idle) and `bytes_a_peer_never_acknowledges_are_given_up`.
+
+### The fuzzer
+
+In `crates/rhizo-net/src/hostile.rs`, run like the other fuzzers (fixed
+seed in `cargo xtask check`, random seed and 4096 cases weekly):
+
+| Property | Input | Checks |
+|---|---|---|
+| `frames_from_the_wire_cannot_hurt_the_kernel` | Up to 40 steps next to two cells' sockets (A: a connection to a well-behaved peer and a loopback connection; B: a connection to the attacker's stack, a connection whose handshake the test answers itself, a UDP socket, a listener): time passing, the cells sending, valid frames (SYN to the listener, to closed ports and to a loopback address, odd TCP options, segments to B's connections and to A's port, SYN-ACK and data on B's crafted connection, UDP to B's socket, to closed ports, broadcast and jumbo, IPv4 fragments and options, ICMP, ARP, a DHCP offer, other Ethernet types) with up to 3 bytes changed, maybe cut, checksums mostly fixed; the attacker's own frames replayed and changed; random bytes; floods. Frames claiming the peer's MAC or IP address are not sent. | No panic; always 8 sockets open and nothing to accept; no frame holds the loopback bytes, and only frames to the peer hold A's; A gets back exactly every byte it sent and keeps its addresses, with no error; once every socket is closed and 75 s pass, nothing is open, nothing is left in `smoltcp`, and the heap (counted per thread by the test binary's allocator) is back to its level |
+| `dhcp_replies_cannot_hurt_the_kernel` | A card asking for a lease: up to 30 steps of time passing, DHCP replies (offer, ACK, NAK or any type, any address and lease) to the client's last transaction with bytes changed and cuts, random frames | No panic; the address, if any, is unicast; the heap is back to its level |
+| `seeds_reach_what_they_aim_at`, `a_valid_lease_configures_the_card` | The seeds unchanged | Each reaches its target (a reset, an ICMP error, an ARP reply, a datagram, a handshake, data in order, a lease), so changed copies test the paths behind the first checks |
+
+Run it:
+
+```sh
+cargo test -p rhizo-net -- hostile::
+# Longer, with a new seed (the change's run: three seeds, 45 minutes each):
+PROPTEST_RNG_SEED=$RANDOM PROPTEST_CASES=100000 cargo test -p rhizo-net -- hostile::
+```
+
+A failure is saved under `crates/rhizo-net/proptest-regressions/` and
+replayed first on the next run; commit it with its fix.
+
+Limitations: property tests on the host, not coverage-guided, against
+`smoltcp` as configured in the kernel; the virtio rings themselves are B6
+(a trusted device). A host on the VM's network segment can still evict
+neighbour-cache entries and delay connections by about a second, and a
+rogue DHCP server can change the card's address: both come with sharing a
+network segment, and are listed below.
+
 ## Known limitations and open findings
 
 These are not fixed by this change; each needs its own design.
 
 | # | Severity | Item |
 |---|---|---|
-| O1 | Medium | **No per-cell quota.** One cell may take all memory down to the kernel's reserve; others are then refused (`ENOMEM`, `ENOSPC`), and the kernel survives (spec `cells`). Host-set quotas need per-cell accounting of frames and heap. |
+| O1 | — | **Closed by `add-cell-quotas`** (see *Quotas*). What remains: a cell without a quota may still take all memory down to the reserve, as before; file data (up to `DATA_MAX`) and names are bounded per cell but not by the memory quota, so a cell holds at most its memory quota plus `DATA_MAX` of file data; a cell may hold its quota plus what it inherited from a fork. |
 | O2 | Medium | **Kernel time proportional to what a cell holds.** A call runs without preemption: reading or writing up to 64 MiB of file data, `getrandom` or `write` over gigabytes of the cell's own memory, or mapping and zeroing a large region delays every other cell for as long as it takes. Bounded by the cell's own memory, not by a time slice. |
 | O3 | Medium | **Side channels other than Meltdown are out of scope.** Meltdown is closed by `add-kpti` (KPTI on x86_64 where needed, E0PD on AArch64; see *Speculation*). Caches, branch predictors, other speculation attacks (Spectre, L1TF, MDS) and timing are not reviewed. An AArch64 CPU with neither E0PD nor CSV3 is reported, not protected. Cells see a nanosecond clock. |
 | O4 | — | **Closed by `add-crypto-random`** (see *Randomness*). What remains: a CPU without a hardware random source (an AArch64 host without FEAT_RNG under KVM) falls back to the cycle counter, and the boot says `getrandom is predictable`; there is no virtio-rng driver yet. |
 | O5 | Low | **SMEP, SMAP and PAN closed by `add-user-access-guards`.** Left: SMAP and PAN cannot see accesses through the direct map (software checks guard it); on x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
 | O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. |
 | O7 | Low | **Host paths may panic.** Forking one cell, or spawning one kept image, more than 65535 times while every copy lives panics (frame reference counts are 16 bits; a cell's own path, mapping file pages, gives copies instead since S14); a frame lost when loading an executable fails half way. Only the host can do either. |
-| S20 | Low | **File holes mapped without asking first** (above): bounded by the kernel's reserve. |
-| S21 | Medium | **One kernel-wide pool of 4096 sockets** (above): closed by per-cell socket quotas. |
+| — | Low | **Hosts on the VM's network segment** (B5, above) can evict the card's neighbour-cache entries, delaying a connection's frames by about a second, and a rogue DHCP server can change or take away the card's address. Both come with sharing a segment; give the VM a network of its own. |
 | — | — | **Concurrency between CPUs** was reviewed by reading and by hostile cells (second review), not by a model checker or a proof. |
 | — | — | **No hardware, firmware or VMM audit.** Device emulation, the boot path and the VMMs are trusted. |
 | — | — | **No formal proof.** This is a review with tests, not a verification. |
 
 ## Tests that keep it fixed
 
-The second review's fuzzers and hostile cells are listed in its own
-section above. From the first review:
+The second review's fuzzers and hostile cells, and the network fuzzer of
+the review of B5, are listed in their own sections above. From the first
+review:
 
 - Host, `crates/rhizo-abi/src/hostile.rs`: `x86_64_cells_cannot_hurt_the_kernel`
   and `aarch64_cells_cannot_hurt_the_kernel` (properties: up to 40 calls of
@@ -610,6 +756,13 @@ section above. From the first review:
     cell taking all memory.
   - `shared_read_only_pages_stay_shared_after_mprotect`: `rewrite`, forked,
     each copy makes its constants writable and writes them.
+  - Quotas: `memory_quota_refuses_the_cell_not_the_others` (`hog` with a
+    quota next to `ballast`), `cpu_quota_ends_the_cell` (`spin`),
+    `file_and_socket_quotas_travel_with_the_cell` (`limits`, forked,
+    copied from a template, resumed), `a_cell_holds_a_bounded_share_of_sockets`
+    (S21); `hog file` for S20; host tests in `rhizo_cell::quota`,
+    `quotas_limit_descriptors_and_sockets` (`rhizo-fs`),
+    `rlimits_report_the_cells_quotas` (`rhizo-abi`).
   - `flags_a_cell_sets_stay_in_the_cell`: `flags`; `user_guards_are_on`
     (x86_64), `pan_is_on` (AArch64); self-checks `ktest-user-read` and
     `ktest-user-exec`.

@@ -40,7 +40,7 @@ JIT (V8, LuaJIT, PyPy, the JVM) is in the same place.
   cell; `munmap`, `MAP_FIXED` and any other `mprotect` drop what they
   cover.
 - **Cell state.** The bit and the ranges are cell state: the snapshot
-  format moves to version 8 (a permission bit for write-or-execute pages,
+  format moves to version 9 (a permission bit for write-or-execute pages,
   the ranges after the threads), forks and templates keep both, and
   copy-on-write treats a write-or-execute page like any page that may be
   written.
@@ -74,7 +74,7 @@ effect.
 - `isolation`: write-or-execute ranges are bounded; snapshots from outside
   still never resume writable and executable pages; changes stay the
   cell's; AArch64 cells may maintain caches by address.
-- `snapshots`: format version 8 carries the bit and the ranges.
+- `snapshots`: format version 9 carries the bit and the ranges.
 - `fork`: forks and templates keep write-or-execute pages and ranges.
 - `workloads`: Node.js runs with its JIT.
 - `benchmarks`: Node.js JIT metrics next to the `--jitless` ones.
@@ -85,7 +85,7 @@ effect.
 `resolve_write`, `resolve_exec`), `crates/rhizo-cell` (`space::WxRanges`,
 mapping and protecting write-or-execute memory), `crates/rhizo-abi`
 (`mmap`, `mprotect`, `munmap`, `exec`, user-memory access, `Context::wx`),
-`crates/rhizo-snapshot` (version 8), `kernel/src/cell.rs` (fault path,
+`crates/rhizo-snapshot` (version 9), `kernel/src/cell.rs` (fault path,
 ranges in `Live`, fork, templates, suspend and resume, benchmark),
 `kernel/src/arch/*/user.rs` (`exec_denied`, `SCTLR_EL1`),
 `kernel/src/tests.rs`, `cells/c/libc_jit.c`, `cells/expected.rs`,

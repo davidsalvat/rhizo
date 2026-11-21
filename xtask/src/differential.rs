@@ -12,9 +12,9 @@ mod expected {
     include!("../../cells/expected.rs");
 }
 use expected::{
-    AGENT_TRANSCRIPT, AGENT_TURNS, CPYTHON_ARGV, CPYTHON_STDOUT, DYNAMIC, Ending, NODE_ARGV,
-    NODE_MODEL_LINE, NODE_STDOUT, NUMPY_ARGV, NUMPY_STDOUT, PROGRAMS, PYTHON_COMMAND,
-    PYTHON_STDOUT, REQUESTS_ARGV, REQUESTS_STDOUT,
+    AGENT_TRANSCRIPT, AGENT_TURNS, CHAT_MESSAGES, CHAT_TRANSCRIPT, CPYTHON_ARGV, CPYTHON_STDOUT,
+    DYNAMIC, Ending, NODE_ARGV, NODE_MODEL_LINE, NODE_STDOUT, NUMPY_ARGV, NUMPY_STDOUT, PROGRAMS,
+    PYTHON_COMMAND, PYTHON_STDOUT, REQUESTS_ARGV, REQUESTS_STDOUT,
 };
 
 /// Why the check cannot run on this host, if it cannot.
@@ -265,7 +265,74 @@ fn check_cpython(scratch: &Path) -> Result {
                 .into_error(),
         );
     }
-    check_agent(&python, &root, scratch)
+    check_agent(&python, &root, scratch)?;
+    check_chat(&python, &root, scratch)
+}
+
+/// The chat agent as a Linux process, given [`CHAT_MESSAGES`] on its
+/// standard input against the host's fake model, prints the answers of
+/// [`CHAT_TRANSCRIPT`] (the lines `rhizo chat` echoes left out) between
+/// its marker lines, as the cell must (change `fix-chat-tools`).
+fn check_chat(python: &Path, root: &Path, scratch: &Path) -> Result {
+    use std::io::Write;
+    let port = crate::hostnet::llm_server("127.0.0.1", 0)?;
+    let _ = std::fs::remove_dir_all(scratch);
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let mut child = Command::new(python)
+        .arg(root.join("app/agent_chat.py"))
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg("fake")
+        .env_clear()
+        .current_dir(scratch)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", python.display()))?;
+    let input: String = CHAT_MESSAGES.iter().map(|m| format!("{m}\n")).collect();
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    stdin
+        .write_all(input.as_bytes())
+        .map_err(|e| e.to_string())?;
+    drop(stdin);
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(scratch);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let answers: String = text
+        .lines()
+        .filter(|l| !l.starts_with('\x1e'))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let expected: String = CHAT_TRANSCRIPT
+        .lines()
+        .filter(|l| !l.starts_with("> "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let markers = text.lines().filter(|l| l.starts_with("\x1eturn ")).count();
+    if !out.status.success()
+        || answers != expected
+        || markers != CHAT_MESSAGES.len()
+        || !out.stderr.is_empty()
+    {
+        return Err(Failure::new(
+            "differential",
+            "the CPython chat agent behaves differently on Linux",
+        )
+        .location("cells/python/agent_chat.py")
+        .expected(format!(
+            "exit 0, stdout {expected:?} (cells/expected.rs) with a turn line per message, \
+             no stderr"
+        ))
+        .actual(format!(
+            "{:?}, stdout {text:?}, stderr {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ))
+        .hint("Linux is the reference: fix the agent, the fake model or the expectation")
+        .reproduce("cargo xtask test --only differential (with RHIZO_CPYTHON_SRC; the model server runs inside xtask)")
+        .into_error());
+    }
+    Ok(())
 }
 
 /// The CPython agent as a Linux process (`linux` mode, its branches made

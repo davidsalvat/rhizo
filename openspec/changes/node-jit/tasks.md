@@ -13,7 +13,7 @@
 
 ## 3. Snapshots
 
-- [ ] 3.1 Format version 8: the page bit and the ranges, checked on decoding (D7); verify `cargo test -p rhizo-snapshot`
+- [ ] 3.1 Format version 9: the page bit and the ranges, checked on decoding (D7); verify `cargo test -p rhizo-snapshot`
 
 ## 4. Kernel
 

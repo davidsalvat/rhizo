@@ -8,9 +8,9 @@ use rhizo_mm::DIRECT_MAP_BASE;
 use rhizo_mm::heap::{Heap, PageSource};
 
 /// Pages for the heap: contiguous frames, used through the direct map.
-/// Single pages (most of them carved into small blocks, and kept) come from
-/// the top of memory, so they do not split the free runs that large
-/// allocations such as snapshots need.
+/// Single pages (most of them carved into small blocks, kept until the heap
+/// trims) come from the top of memory, so they do not split the free runs
+/// that large allocations such as snapshots need.
 #[derive(Debug)]
 struct FramePages;
 
@@ -47,9 +47,11 @@ impl PageSource for FramePages {
 /// freed allocation.
 #[cfg(feature = "cells")]
 pub mod window {
-    use crate::memory::{self, with_frames};
+    use crate::arch::cpu::CpuTlb;
+    use crate::memory::{self, DirectMap, with_frames};
     use core::ptr::NonNull;
     use core::sync::atomic::{AtomicU64, Ordering};
+    use rhizo_hal::PhysicalMemory;
     use rhizo_mm::FRAME_SIZE;
     use rhizo_mm::paging::PageFlags;
 
@@ -107,12 +109,47 @@ pub mod window {
         unmap(ptr.as_ptr() as u64, count);
     }
 
-    /// Unmaps `count` pages from `start` and frees their frames.
+    /// Tables taken out of the window, not yet freed: a list linked through
+    /// their first entry (a frame address: never a valid entry), 0 at its
+    /// end. Changed under the heap's lock.
+    static RETIRED: AtomicU64 = AtomicU64::new(0);
+
+    /// Unmaps `count` pages from `start` and frees their frames, and retires
+    /// the tables left empty (design D3 of `add-heap-trim`): addresses are
+    /// never reused, so they would never map anything again.
     fn unmap(start: u64, count: usize) {
         for i in 0..count as u64 {
             if let Ok(phys) = memory::unmap_page(start + i * FRAME_SIZE) {
                 with_frames(|f| f.free(phys));
             }
+        }
+        let end = start + count as u64 * FRAME_SIZE;
+        memory::kernel_tables().free_empty_tables(
+            &mut DirectMap,
+            &mut CpuTlb,
+            start..end,
+            &mut |table| {
+                DirectMap.write_u64(table, RETIRED.load(Ordering::Relaxed));
+                RETIRED.store(table, Ordering::Relaxed);
+            },
+        );
+        reclaim();
+    }
+
+    /// Frees the retired tables once every CPU has flushed its
+    /// paging-structure caches (`smp::flush_everywhere`): until then a CPU
+    /// may still hold an upper entry pointing at one, and walk through it
+    /// speculatively, so its frame must not hold anything else. During a
+    /// host run the other CPUs cannot be asked: the tables wait for its end.
+    pub(super) fn reclaim() {
+        if RETIRED.load(Ordering::Relaxed) == 0 || !crate::smp::flush_everywhere() {
+            return;
+        }
+        let mut table = RETIRED.swap(0, Ordering::Relaxed);
+        while table != 0 {
+            let next = DirectMap.read_u64(table);
+            with_frames(|f| f.free(table));
+            table = next;
         }
     }
 }
@@ -143,6 +180,21 @@ static ALLOCATOR: KernelAllocator = KernelAllocator {
 #[cfg(all(feature = "bench-cell", feature = "profile"))]
 pub fn contention() -> rhizo_core::sync::Contention {
     ALLOCATOR.heap.contention()
+}
+
+/// Gives the heap's wholly free pages back to the frame allocator if it is
+/// due (`Heap::trim_if_due`): called where many allocations may just have
+/// gone, as when a cell ends.
+#[cfg(feature = "cells")]
+pub fn trim_if_due() {
+    ALLOCATOR.heap.with(|heap| heap.trim_if_due());
+}
+
+/// Frees the page tables the window of large allocations retired, now that
+/// every CPU can be asked to flush (after a host run).
+#[cfg(feature = "cells")]
+pub fn reclaim_tables() {
+    ALLOCATOR.heap.with(|_| window::reclaim());
 }
 
 /// Pages the kernel heap holds and its live allocations.

@@ -4,7 +4,7 @@
 A snapshot SHALL encode to a versioned byte sequence tagged with its
 architecture, independent of in-memory layouts, and decoding SHALL reject a
 sequence that is truncated, corrupted, of another version or of another
-architecture with an error naming the reason. Version 8 SHALL record, for
+architecture with an error naming the reason. Version 9 SHALL record, for
 each page, whether it is a write-or-execute page, and the cell's
 write-or-execute ranges.
 

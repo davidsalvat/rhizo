@@ -715,6 +715,55 @@ impl<F: EntryFormat> PageTable<F> {
         None
     }
 
+    /// Frees the tables of the last two levels (each covering 2 MiB or
+    /// 1 GiB) that overlap `range` and map nothing any more: clears the
+    /// entry pointing at each, invalidates it through `tlb`, and gives its
+    /// frame to `free` (design D3 of `add-heap-trim`). The root and the
+    /// tables just below it stay, since copies of the root's entries may
+    /// point at them.
+    pub fn free_empty_tables(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        tlb: &mut impl Tlb,
+        range: core::ops::Range<u64>,
+        free: &mut impl FnMut(u64),
+    ) {
+        const GIB: u64 = 1 << 30;
+        let empty = |mem: &mut _, t: u64| {
+            (0..ENTRIES).all(|i| !F::is_valid(PhysicalMemory::read_u64(mem, t + i * 8)))
+        };
+        let table = |mem: &mut _, slot: u64, level: u32| {
+            let e = PhysicalMemory::read_u64(mem, slot);
+            (F::is_valid(e) && !F::is_leaf(e, level)).then(|| F::address(e))
+        };
+        let mut gib = range.start & !(GIB - 1);
+        while gib < range.end {
+            let Some(upper) = table(mem, self.root + index(gib, 3) * 8, 3) else {
+                gib += GIB;
+                continue;
+            };
+            let slot = upper + index(gib, 2) * 8;
+            if let Some(middle) = table(mem, slot, 2) {
+                let first = range.start.max(gib) & !(crate::LARGE_PAGE_SIZE - 1);
+                let end = range.end.min(gib + GIB);
+                for at in (first..end).step_by(crate::LARGE_PAGE_SIZE as usize) {
+                    let leaves = middle + index(at, 1) * 8;
+                    if let Some(last) = table(mem, leaves, 1).filter(|&t| empty(mem, t)) {
+                        mem.write_u64(leaves, 0);
+                        tlb.flush_page(at);
+                        free(last);
+                    }
+                }
+                if empty(mem, middle) {
+                    mem.write_u64(slot, 0);
+                    tlb.flush_page(gib);
+                    free(middle);
+                }
+            }
+            gib += GIB;
+        }
+    }
+
     /// Walks to the valid leaf entry for `virt`: (slot address, entry, level).
     fn leaf_slot(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<(u64, u64, u32)> {
         if !is_canonical(virt) {
@@ -778,6 +827,59 @@ mod tests {
             mod $module {
                 use super::*;
                 type PT = PageTable<$format>;
+
+                #[test]
+                fn empty_tables_are_freed_below_the_upper_levels() {
+                    let mut mem = FakePhysicalMemory::new();
+                    let mut alloc = frames();
+                    let pt = PT::new(&mut mem, &mut alloc).unwrap();
+                    let base = 0xffff_9000_0000_0000u64;
+                    // Two pages in one 2 MiB region, one in the next.
+                    for (i, at) in [base, base + 0x1000, base + (2 << 20)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        pt.map(
+                            &mut mem,
+                            &mut alloc,
+                            at,
+                            0x5000 + 0x1000 * i as u64,
+                            PageSize::Small,
+                            RW_NX,
+                        )
+                        .unwrap();
+                    }
+                    let mapped = |pt: &PT, mem: &FakePhysicalMemory| {
+                        [base, base + (2 << 20)].map(|at| pt.translate(mem, at).is_some())
+                    };
+                    let mut tlb = RecordingTlb::default();
+                    let mut freed = vec![];
+                    let range = base..base + (4 << 20);
+                    pt.unmap(&mut mem, &mut tlb, base).unwrap();
+                    pt.free_empty_tables(&mut mem, &mut tlb, range.clone(), &mut |t| freed.push(t));
+                    assert!(freed.is_empty(), "a page left in each region");
+                    assert_eq!(mapped(&pt, &mem), [false, true]);
+                    pt.unmap(&mut mem, &mut tlb, base + 0x1000).unwrap();
+                    pt.free_empty_tables(&mut mem, &mut tlb, range.clone(), &mut |t| freed.push(t));
+                    assert_eq!(freed.len(), 1, "the first region's last-level table");
+                    assert_eq!(pt.translate(&mem, base + (2 << 20)).unwrap().phys, 0x7000);
+                    pt.unmap(&mut mem, &mut tlb, base + (2 << 20)).unwrap();
+                    tlb.flushed.clear();
+                    pt.free_empty_tables(&mut mem, &mut tlb, range, &mut |t| freed.push(t));
+                    assert_eq!(freed.len(), 3, "its last-level table, then the 1 GiB one");
+                    assert_eq!(tlb.flushed, vec![base + (2 << 20), base]);
+                    // The table below the root stays; mapping again works.
+                    let upper = <$format>::address(mem.read_u64(pt.root() + index(base, 3) * 8));
+                    assert!(<$format>::is_valid(
+                        mem.read_u64(pt.root() + index(base, 3) * 8)
+                    ));
+                    assert!(!<$format>::is_valid(
+                        mem.read_u64(upper + index(base, 2) * 8)
+                    ));
+                    pt.map(&mut mem, &mut alloc, base, 0x5000, PageSize::Small, RW_NX)
+                        .unwrap();
+                    assert_eq!(pt.translate(&mem, base).unwrap().phys, 0x5000);
+                }
 
                 #[test]
                 fn map_translate_unmap_small_page() {

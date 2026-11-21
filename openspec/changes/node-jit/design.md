@@ -162,7 +162,7 @@ copy writing pages and share running ones, which a write copies later.
 The ranges are copied with the cell (fork, template, spawn from a
 template).
 
-## D7. Snapshots: version 8
+## D7. Snapshots: version 9
 
 Permission bit 8 of a page record is write-or-execute. Such a record is
 either writable and not executable (writing; a copy-on-write page records
@@ -175,9 +175,9 @@ referred to like other read-only pages; restored, they keep the bit and
 resolve their next write by copy. A resumed cell gets the ranges back, and
 its untouched pages there still come zeroed on first touch.
 
-Version 7 snapshots are refused, as every version change did. Open pull
-request #61 (`add-cell-quotas`) also takes version 8; whichever merges
-second takes the next number.
+Older snapshots are refused, as every version change did. Version 8 is
+`add-cell-quotas` (merged first: quotas in the state words); this change
+takes 9 on top of it.
 
 ## D8. AArch64 caches from EL0
 

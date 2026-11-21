@@ -11,6 +11,7 @@ use rhizo_core::ktest_case;
 use rhizo_hal::{Console, CycleCounter, PhysicalMemory};
 
 use rhizo_mm::FRAME_SIZE;
+use rhizo_mm::heap::TRIM_AT;
 use rhizo_mm::paging::PageFlags;
 
 /// Builds a harness self-check: one passing case, then the case the harness
@@ -53,6 +54,7 @@ macro_rules! suite {
             ktest_case!(heap_alignment_is_honored),
             ktest_case!(heap_memory_is_reused),
             ktest_case!(large_heap_allocations_survive_fragmentation),
+            ktest_case!(every_cpu_flushes_between_runs),
             ktest_case!(cell_says_hello),
             ktest_case!(cell_exit_status_and_frames_return),
             ktest_case!(cell_system_calls),
@@ -99,6 +101,7 @@ macro_rules! suite {
             ktest_case!(memory_full_of_cells_is_refused_cleanly),
             ktest_case!(a_woken_cell_runs_at_once),
             ktest_case!(a_wake_before_the_sleep_is_kept),
+            ktest_case!(a_wait_on_descriptors_keeps_no_time),
             ktest_case!(hostile_pointers_get_efault),
             ktest_case!(cell_cannot_write_kernel_memory),
             ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
@@ -107,6 +110,10 @@ macro_rules! suite {
             ktest_case!(fresh_memory_never_holds_another_cells_data),
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
+            ktest_case!(memory_quota_refuses_the_cell_not_the_others),
+            ktest_case!(cpu_quota_ends_the_cell),
+            ktest_case!(file_and_socket_quotas_travel_with_the_cell),
+            ktest_case!(a_cell_holds_a_bounded_share_of_sockets),
             ktest_case!(cells_run_alike_with_and_without_kpti),
             ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
@@ -118,6 +125,7 @@ macro_rules! suite {
             ktest_case!(cells_talk_over_loopback),
             ktest_case!(a_waiting_cell_uses_no_cpu),
             ktest_case!(only_the_cells_waiting_on_a_socket_wake),
+            ktest_case!(latencies_count_from_the_first_idle_moment),
             ktest_case!(sockets_across_suspend_and_resume),
             ktest_case!(a_discarded_snapshot_closes_its_connections),
             ktest_case!(loopback_connection_across_suspend_of_one_end),
@@ -460,9 +468,27 @@ fn large_heap_allocations_survive_fragmentation() {
     for phys in kept {
         memory::with_frames(|f| f.free(phys));
     }
-    // Back, but for the window's page tables (made once).
-    let lost = before - memory::free_bytes();
-    assert!(lost <= 2 * FRAME_SIZE, "{lost} bytes not returned");
+    // All back, the window's tables included (change `add-heap-trim`):
+    // those its setup left are freed too, the first time.
+    let free = memory::free_bytes();
+    assert!(free >= before, "{} bytes not returned", before - free);
+}
+
+/// Between host runs, every CPU can be made to flush its translations and
+/// paging-structure caches (what freeing the window's tables waits for,
+/// change `add-heap-trim`); while another CPU runs a job, it cannot.
+fn every_cpu_flushes_between_runs() {
+    assert!(crate::smp::flush_everywhere());
+    if crate::smp::count() > 1 && !crate::arch::user::TLB_FLUSH_IS_BROADCAST {
+        fn spin(rounds: u64) -> u64 {
+            (0..rounds).fold(0, |a, i| core::hint::black_box(a ^ i))
+        }
+        crate::smp::post(1, spin, 1 << 24);
+        let busy = crate::smp::flush_everywhere();
+        crate::smp::join(1);
+        assert!(!busy, "a busy CPU is not asked");
+        assert!(crate::smp::flush_everywhere());
+    }
 }
 
 // --- Self-checks ------------------------------------------------------------
@@ -774,11 +800,11 @@ fn many_cells_in_sequence_stay_isolated() {
         }
     }
     pair();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     for _ in 0..150 {
         pair();
     }
-    assert_eq!(memory::free_bytes(), before);
+    assert_eq!(free_or_in_heap(), before);
 }
 
 // --- Executables kept loaded (change `add-image-cache`) ---------------------
@@ -902,12 +928,12 @@ fn suspend_returns_all_memory() {
         snapshot
     }
     drop(cycle()); // warm the heap up for the host's small allocations
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     let snapshot = cycle();
     assert!(snapshot.heap_bytes() > 8 << 20, "8 MiB of pages captured");
     drop(snapshot);
     assert_eq!(
-        memory::free_bytes(),
+        free_or_in_heap(),
         before,
         "the suspended cell held nothing but its snapshot"
     );
@@ -1047,10 +1073,10 @@ fn children_outlive_their_parent_and_frames_return() {
         }
     }
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
     assert_eq!(
-        memory::free_bytes(),
+        free_or_in_heap(),
         before,
         "every shared frame and table returned"
     );
@@ -1333,16 +1359,19 @@ fn file_data_takes_its_own_size() {
 // --- H9: memory accounting and density -------------------------------------
 
 /// Memory that is not leaked: frames free in the allocator plus frames the
-/// kernel heap holds (it keeps small-object pages for reuse, by design), and
+/// kernel heap holds (it keeps some small-object pages for reuse), and
 /// the heap's live allocations; measured with no image kept loaded (spec
 /// `cells`, image cache: those frames are the kernel's until dropped).
 fn memory_balance() -> (u64, usize) {
     crate::cell::drop_images();
-    let heap = crate::heap::stats();
-    (
-        memory::free_bytes() + heap.pages as u64 * FRAME_SIZE,
-        heap.live,
-    )
+    (free_or_in_heap(), crate::heap::stats().live)
+}
+
+/// Frames free in the allocator plus the frames the kernel heap holds: the
+/// same whenever the heap gives its free pages back (change
+/// `add-heap-trim`), which depends on what ran before.
+fn free_or_in_heap() -> u64 {
+    memory::free_bytes() + crate::heap::stats().pages as u64 * FRAME_SIZE
 }
 
 /// Twenty cells each wanting 8 MiB of memory, or 16 MiB of files, at once:
@@ -1430,6 +1459,14 @@ fn memory_full_of_cells_is_refused_cleanly() {
         "{o:?}"
     );
     assert_eq!(o.leaked_bytes, 0, "{o:?}");
+    // The heap gave back the pages of the cells' kernel records (change
+    // `add-heap-trim`): it keeps at most what its next trim waits for.
+    let spike = o.heap_peak_bytes;
+    assert!(
+        spike > 2 * TRIM_AT as u64,
+        "a spike of {spike} bytes: {o:?}"
+    );
+    assert!(o.heap_kept_bytes <= 2 * TRIM_AT as u64, "{o:?}");
 }
 
 /// A sleeping cell woken by the host (the stand-in for a user's message)
@@ -1469,6 +1506,42 @@ fn a_wake_before_the_sleep_is_kept() {
         }
     }
     assert_eq!(ended(&host, id), (Ending::Exit(0), "ready\nwoken\n".into()));
+}
+
+/// A wait on descriptors with a timeout (an hour in `epoll_pwait`, as
+/// libuv waits for its next timer) is timed out in a cell spawned from a
+/// template frozen during it, and by a wake from the host: the call, made
+/// again, returns at once instead of waiting its whole timeout again
+/// (design D1 of `fast-node-template`; every fork of the Node.js template
+/// waited its 50 ms pause again).
+fn a_wait_on_descriptors_keeps_no_time() {
+    let mut host = Host::new();
+    let waiting = |host: &mut Host| {
+        let id = spawn(host, "sleeper", &[b"3600000", b"epoll"]);
+        while !(host.output(id) == Some(b"ready\n") && host.waits(id)) {
+            host.step();
+        }
+        id
+    };
+    let template = waiting(&mut host);
+    assert!(host.freeze(template));
+    let child = host
+        .spawn_from_template(template, true, false)
+        .expect("fork");
+    let woken = waiting(&mut host);
+    assert!(host.wake(woken));
+    // A slice each: the call made again, `timed out`, the exit.
+    for _ in 0..4 {
+        if host.finished(child).is_none() || host.finished(woken).is_none() {
+            host.step();
+        }
+    }
+    // The fork's output starts after the template's `ready`.
+    assert_eq!(ended(&host, child), (Ending::Exit(0), "timed out\n".into()));
+    assert_eq!(
+        ended(&host, woken),
+        (Ending::Exit(0), "ready\ntimed out\n".into())
+    );
 }
 
 // --- H13: isolation under attack (spec `isolation`) -------------------------
@@ -1629,6 +1702,144 @@ fn shared_read_only_pages_stay_shared_after_mprotect() {
         let (ending, out) = ended(&host, id);
         assert_eq!(ending, Ending::Exit(0), "{out}");
         assert!(out.ends_with("own ok\n"), "{out}");
+    }
+}
+
+// --- Quotas (spec `isolation`, `add-cell-quotas`) ---------------------------
+
+/// A cell with a memory quota is refused (`ENOMEM`) once its pages reach
+/// it, and keeps running; a cell without one, next to it, still gets the
+/// memory it asks for; every frame comes back.
+fn memory_quota_refuses_the_cell_not_the_others() {
+    // Anonymous memory, then pages of a file past its end (finding S20).
+    for args in [&[][..], &[&b"file"[..]]] {
+        quota_refuses_the_hog(args);
+    }
+}
+
+fn quota_refuses_the_hog(args: &[&[u8]]) {
+    use rhizo_cell::quota::Quota;
+    const QUOTA: u64 = 8 << 20;
+    let before = memory_balance();
+    let mut host = Host::new();
+    let hog = spawn(&mut host, "hog", args);
+    let quota = Quota {
+        memory: QUOTA,
+        ..Quota::NONE
+    };
+    assert!(host.set_quota(hog, quota));
+    while host.output(hog) != Some(b"exhausted\n") {
+        host.step();
+    }
+    let charged = host.charged_frames(hog).expect("still live") * FRAME_SIZE;
+    // `mmap` takes 1 MiB at a time, then `brk` 64 KiB: it stops within one
+    // brk step of the quota.
+    assert!(
+        charged <= QUOTA && charged > QUOTA - (128 << 10),
+        "{charged}"
+    );
+    let other = spawn(&mut host, "ballast", &[b"all", b"16"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, hog), (Ending::Exit(0), "exhausted\n".into()));
+    assert_eq!(
+        ended(&host, other),
+        (Ending::Exit(0), "filled\nchecked\n".into())
+    );
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame came back");
+}
+
+/// A cell past its CPU time quota is ended (`OutOfCpu`) at the end of the
+/// slice that used it up, whether one thread or several used it; the cell
+/// next to it runs to its end.
+fn cpu_quota_ends_the_cell() {
+    use rhizo_cell::quota::Quota;
+    let mut host = Host::new();
+    let quota = Quota {
+        cpu_ns: 30_000_000,
+        ..Quota::NONE
+    };
+    // One spinning thread, and four (on several CPUs at once with SMP: the
+    // time of every CPU counts).
+    let spin = spawn(&mut host, "spin", &[]);
+    let threads = spawn(&mut host, "threads", &[b"spin", b"4"]);
+    for id in [spin, threads] {
+        assert!(host.set_quota(id, quota));
+    }
+    let chatter = spawn(&mut host, "chatter", &[b"c"]);
+    host.run(|_| false);
+    for id in [spin, threads] {
+        let (ending, out) = ended(&host, id);
+        assert_eq!(ending, Ending::OutOfCpu);
+        assert!(out.ends_with("killed: CPU time quota used up\n"), "{out}");
+    }
+    assert_eq!(ended(&host, chatter), (Ending::Exit(0), "c\nc\nc\n".into()));
+}
+
+/// Quotas on descriptors and sockets: `getrlimit` reports them, sockets
+/// stop at `ENFILE` and descriptors at `EMFILE`; a fork, a copy of a
+/// template and a resumed snapshot of the cell keep them.
+fn file_and_socket_quotas_travel_with_the_cell() {
+    use rhizo_cell::quota::Quota;
+    fn ready(host: &mut Host) -> u32 {
+        let id = spawn(host, "limits", &[]);
+        let quota = Quota {
+            files: 16,
+            sockets: 3,
+            ..Quota::NONE
+        };
+        assert!(host.set_quota(id, quota));
+        while host.output(id) != Some(b"ready\n") {
+            host.step();
+        }
+        id
+    }
+    let mut host = Host::new();
+    let mut ids = alloc::vec![ready(&mut host)];
+    ids.extend(host.fork(ids[0], 1).expect("fork"));
+    let template = ready(&mut host);
+    assert!(host.freeze(template));
+    ids.push(
+        host.spawn_from_template(template, true, false)
+            .expect("copy"),
+    );
+    let suspended = ready(&mut host);
+    let bytes = host.suspend(suspended).expect("suspend").export(&DirectMap);
+    let snapshot = Snapshot::from_bytes(bytes, arch::user::MACHINE).expect("valid");
+    ids.push(
+        host.resume(snapshot, Resume::Lazy, true, false)
+            .expect("resume"),
+    );
+    host.run(|_| false);
+    for id in ids {
+        let (ending, out) = ended(&host, id);
+        assert_eq!(ending, Ending::Exit(0), "{out}");
+        assert!(
+            out.ends_with("nofile 16 sockets 3 errno 23 files 13 errno 24\n"),
+            "{out}"
+        );
+    }
+}
+
+/// Finding S21: without a quota from the host, a cell and its fork stop at
+/// the default socket quota (256, `ENFILE`), far below the kernel's 4096;
+/// descriptors are not limited beyond the kernel's own.
+fn a_cell_holds_a_bounded_share_of_sockets() {
+    let mut host = Host::new();
+    let id = spawn(&mut host, "limits", &[]);
+    while host.output(id) != Some(b"ready\n") {
+        host.step();
+    }
+    let mut ids = alloc::vec![id];
+    ids.extend(host.fork(id, 1).expect("fork"));
+    host.run(|_| false);
+    for id in ids {
+        let (ending, out) = ended(&host, id);
+        assert_eq!(ending, Ending::Exit(0), "{out}");
+        assert!(
+            out.ends_with("nofile 1024 sockets 256 errno 23 files 1021 errno 24\n"),
+            "{out}"
+        );
     }
 }
 
@@ -1911,6 +2122,41 @@ fn only_the_cells_waiting_on_a_socket_wake() {
     assert_eq!(host.waiting(), 1, "the idle server was never woken");
     assert!(host.kill(idle));
     assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// After `prof::settle`, latencies count from the first moment no cell runs
+/// or waits for a CPU (design D6 of `add-socket-wait-queues`): a cell that
+/// yields 2,000 times once counting starts is not counted, the deadlines of
+/// cells started after it, which pass once they all sleep, are. Without
+/// it, every latency counts.
+fn latencies_count_from_the_first_idle_moment() {
+    use crate::prof;
+    const SLEEPERS: u64 = 4;
+    for settle in [false, true] {
+        let mut host = Host::new();
+        prof::start();
+        if settle {
+            prof::settle();
+        }
+        let yielder = spawn(&mut host, "yielder", &[]);
+        host.run(|h| h.finished(yielder).is_some());
+        let sleepers: Vec<u32> = (0..SLEEPERS)
+            .map(|_| spawn(&mut host, "sleeper", &[b"250"]))
+            .collect();
+        host.run(|h| sleepers.iter().all(|&id| h.finished(id).is_some()));
+        let report = prof::stop();
+        for &id in sleepers.iter().chain([&yielder]) {
+            assert_eq!(ended(&host, id).0, Ending::Exit(0));
+        }
+        assert_eq!(report.wake.count(), SLEEPERS, "each deadline counts");
+        if settle {
+            assert!(report.settled_ns > 0, "a moment came when no cell ran");
+            assert_eq!(report.sched.count(), SLEEPERS, "only the woken cells");
+        } else {
+            assert_eq!(report.settled_ns, 0);
+            assert!(report.sched.count() > SLEEPERS + 1000, "the yields count");
+        }
+    }
 }
 
 /// Runs `netstate` to its `ready` line.
@@ -2345,9 +2591,9 @@ fn spinning_thread_does_not_starve_its_siblings() {
         assert_eq!(host.live(), 0);
     }
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
-    assert_eq!(memory::free_bytes(), before, "every frame returned");
+    assert_eq!(free_or_in_heap(), before, "every frame returned");
 }
 
 /// Scheduling steps until a `chatter` cell ends next to a cell of `n`
@@ -3117,9 +3363,9 @@ fn cells_in_parallel_stay_isolated() {
     // into (as `assert_no_leak` does), so the check does not depend on which
     // tests ran before this one.
     round();
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     round();
-    assert_eq!(memory::free_bytes(), before);
+    assert_eq!(free_or_in_heap(), before);
 }
 
 /// `counter` next to spinning cells, run on every CPU twenty slices (of
@@ -3201,11 +3447,11 @@ fn threads_of_a_cell_run_on_several_cpus_at_once() {
 /// every frame comes back.
 fn unmapped_page_is_gone_on_every_cpu() {
     run_expected("shootdown");
-    let before = memory::free_bytes();
+    let before = free_or_in_heap();
     for _ in 0..4 {
         run_expected("shootdown");
     }
-    assert_eq!(memory::free_bytes(), before, "every frame returned");
+    assert_eq!(free_or_in_heap(), before, "every frame returned");
 }
 
 /// `parsum` computing with 4 threads on every CPU, stopped after each slice

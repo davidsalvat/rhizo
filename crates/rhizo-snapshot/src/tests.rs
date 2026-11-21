@@ -30,6 +30,13 @@ fn cell<F: EntryFormat>(mem: &mut FakePhysicalMemory, frames: &mut CountingFrame
     r.fp.0[5] = 0x4009_21fb_5444_2d18; // pi, in V2 / XMM
     r.fp.0[65] = 0x10; // FPSR
     c.mmap_next = 0x4000_0020_0000;
+    c.quota = rhizo_cell::quota::Quota {
+        memory: 32 << 20,
+        cpu_ns: 7_000_000,
+        files: 64,
+        sockets: 3,
+    };
+    c.cpu_ns = 1234;
     c
 }
 
@@ -122,8 +129,18 @@ fn round_trip<F: EntryFormat>() {
     );
     assert_eq!(later.next_tid(), 12);
     assert_eq!(
-        (restored.brk, restored.mmap_next),
-        (original.brk, original.mmap_next)
+        (
+            restored.brk,
+            restored.mmap_next,
+            restored.quota,
+            restored.cpu_ns
+        ),
+        (
+            original.brk,
+            original.mmap_next,
+            original.quota,
+            original.cpu_ns
+        )
     );
     let mut buf = [0u8; 8];
     rhizo_cell::memory::copy_from(&pt, &mem, 0x4000_001f_fff8, &mut buf).unwrap();

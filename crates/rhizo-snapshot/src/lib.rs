@@ -7,16 +7,18 @@
 //!
 //! ```text
 //! header   "RHZSNAP1", version u32, machine u16, write-or-execute
-//!          ranges u16 (version 8), pages u32, threads u32    (24 bytes)
-//! state    brk_start, brk, mmap_next, next thread identifier  (4 x u64)
+//!          ranges u16 (version 9), pages u32, threads u32    (24 bytes)
+//! state    brk_start, brk, mmap_next, next thread identifier, then
+//!          (version 8) the quotas: memory bytes, CPU ns, CPU ns used,
+//!          files (low 32 bits) and sockets (high 32 bits)  (8 x u64)
 //! threads  per thread, the current one first: tid, clear_tid, wait kind
 //!          (0 runnable, 1 sleep, 2 futex), futex address, futex bitset,
 //!          time left in ns (u64::MAX: no deadline), pc, sp, gpr[31], tls,
 //!          flags, fp[66]                          (107 x u64, 856 bytes each)
-//! ranges   per write-or-execute range: start u64, end u64 (version 8)
+//! ranges   per write-or-execute range: start u64, end u64 (version 9)
 //! records  per page: virt u64, data offset u64, size u8 (0 = 4 KiB,
 //!          1 = 2 MiB), permissions u8 (1 W, 2 USER, 4 NX, 8 write-or-
-//!          execute: version 8), 6 zero bytes          (24 bytes each)
+//!          execute: version 9), 6 zero bytes          (24 bytes each)
 //! data     page contents, in record order
 //! files    length u64, then the cell's file system as `rhizo_fs` encodes
 //!          it (tree, open descriptions and descriptors, pipes, event
@@ -44,6 +46,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use rhizo_cell::elf::Machine;
+use rhizo_cell::quota::Quota;
 use rhizo_cell::space::{Frames, WxRanges};
 use rhizo_cell::threads::{Thread, Threads, Wait};
 use rhizo_cell::{Cell, Registers, USER_END};
@@ -55,9 +58,9 @@ use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
 /// Format version written by this code.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 const HEADER: usize = 24;
-const STATE: usize = 4 * 8;
+const STATE: usize = 8 * 8;
 /// Words per thread: 6 of identity and wait, then the registers.
 const THREAD_WORDS: usize = 6 + 35 + 66;
 const THREAD: usize = THREAD_WORDS * 8;
@@ -106,6 +109,9 @@ pub struct State {
     pub brk_start: u64,
     pub brk: u64,
     pub mmap_next: u64,
+    /// The cell's quotas and the CPU time it used (spec `isolation`).
+    pub quota: Quota,
+    pub cpu_ns: u64,
 }
 
 /// One page of a snapshot.
@@ -293,6 +299,10 @@ impl Snapshot {
             cell.brk,
             cell.mmap_next,
             cell.threads.next_tid() as u64,
+            cell.quota.memory,
+            cell.quota.cpu_ns,
+            cell.cpu_ns,
+            cell.quota.files as u64 | (cell.quota.sockets as u64) << 32,
         ];
         let words = cell.threads.iter().flat_map(|t| thread_words(t, now));
         let ranges = ranges.iter().flat_map(|&(start, end)| [start, end]);
@@ -575,6 +585,13 @@ impl Snapshot {
             brk_start: w(0),
             brk: w(1),
             mmap_next: w(2),
+            quota: Quota {
+                memory: w(4),
+                cpu_ns: w(5),
+                files: w(7) as u32,
+                sockets: (w(7) >> 32) as u32,
+            },
+            cpu_ns: w(6),
         }
     }
 
@@ -784,6 +801,8 @@ impl Snapshot {
             brk: s.brk,
             mmap_next: s.mmap_next,
             exit_status: None,
+            quota: s.quota,
+            cpu_ns: s.cpu_ns,
         }
     }
 }

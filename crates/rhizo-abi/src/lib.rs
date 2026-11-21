@@ -21,6 +21,7 @@ pub use pages::{FilePages, PageCache};
 
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
+use rhizo_cell::quota::Quota;
 use rhizo_cell::space::{self, Frames, TooManyRanges, WxRanges};
 use rhizo_cell::threads::Wait;
 use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_LIMIT, STACK_TOP, USER_END};
@@ -661,8 +662,8 @@ impl Abi {
             // Declined on purpose (as on Linux built without it): libc falls
             // back, so it is not reported as missing.
             Some(Sys::Rseq) => -ENOSYS,
-            Some(Sys::Prlimit64) => rlimit(cx, a[1], a[3]),
-            Some(Sys::Getrlimit) => rlimit(cx, a[0], a[1]),
+            Some(Sys::Prlimit64) => rlimit(cx, &cell.quota, a[1], a[3]),
+            Some(Sys::Getrlimit) => rlimit(cx, &cell.quota, a[0], a[1]),
             // No symbolic links exist.
             Some(Sys::Readlink | Sys::Readlinkat) => -ENOENT,
             // Cells run as root of their own world: uid, gid 0; no parent.
@@ -1492,18 +1493,26 @@ fn block<F, M, T, A, S: Services>(
     Some(BLOCK)
 }
 
-/// `getrlimit`/`prlimit64` (no new limit is enforced): an 8 MiB stack, 1024
-/// files, everything else unlimited.
+/// `getrlimit`/`prlimit64` (no new limit is taken): an 8 MiB stack, and the
+/// cell's quotas (spec `isolation`) as CPU seconds, address space and
+/// files; everything else unlimited.
 fn rlimit<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    quota: &Quota,
     resource: u64,
     old: u64,
 ) -> i64 {
     const INFINITY: u64 = u64::MAX;
+    let cpu_s = match quota.cpu_ns {
+        INFINITY => INFINITY,
+        ns => ns.div_ceil(1_000_000_000),
+    };
     let (cur, max) = match resource {
-        3 => (STACK_LIMIT, INFINITY), // RLIMIT_STACK
-        7 => (1024, 1024),            // RLIMIT_NOFILE
-        0..=15 => (INFINITY, INFINITY),
+        0 => (cpu_s, cpu_s),                               // RLIMIT_CPU
+        3 => (STACK_LIMIT, INFINITY),                      // RLIMIT_STACK
+        7 => (quota.files() as u64, quota.files() as u64), // RLIMIT_NOFILE
+        9 => (quota.memory, quota.memory),                 // RLIMIT_AS
+        _ if resource <= 15 => (INFINITY, INFINITY),
         _ => return -EINVAL,
     };
     if old == 0 {

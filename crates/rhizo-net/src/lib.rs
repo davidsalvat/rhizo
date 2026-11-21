@@ -1382,6 +1382,8 @@ fn siphash24(key: [u64; 2], m: u64) -> u64 {
 }
 
 #[cfg(test)]
+mod hostile;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod wire_tests;

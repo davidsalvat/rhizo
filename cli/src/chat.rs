@@ -4,13 +4,19 @@
 //! ends each answer with a line giving its times, which this splits into
 //! the model's time and Rhizo's. Commands fork the conversation, switch
 //! between its branches, suspend or end it. The kernel only executes: which
-//! branch receives input is decided here.
+//! branch receives input is decided here. Lines are read on a thread of
+//! their own, so that one typed while a turn runs is seen at once: it
+//! waits for the turn to end, and the chat says so (change
+//! `fix-chat-tools`).
 
 use crate::client::{Client, duration};
 use crate::{agent, args, describe};
 use rhizo_control::{Body, MAX_INPUT, Message, Request, Run, State};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 use xtask::control::{CHAT_READY, ChatTurn};
 use xtask::vmm::Vmm;
@@ -95,6 +101,62 @@ pub fn turn_line(total_ns: u64, turn: ChatTurn) -> String {
         duration(cell),
         duration(rhizo.saturating_sub(cell))
     )
+}
+
+/// Whether a typed line must wait: while the chat works on a line (a
+/// turn, a command) and behind lines typed before it.
+#[derive(Debug, Default)]
+pub struct Queue {
+    busy: bool,
+    waiting: usize,
+}
+
+impl Queue {
+    /// A line was typed: whether it waits.
+    pub fn typed(&mut self) -> bool {
+        self.waiting += 1;
+        self.busy || self.waiting > 1
+    }
+
+    /// The chat is done with its line: whether another one is already
+    /// waiting (then no prompt is shown for it: it was typed already).
+    pub fn done(&mut self) -> bool {
+        self.busy = false;
+        self.waiting > 0
+    }
+
+    /// The chat takes the next line and works on it.
+    pub fn take(&mut self) {
+        self.waiting -= 1;
+        self.busy = true;
+    }
+}
+
+/// Reads typed lines on a thread of their own and sends them, `None` at the
+/// end of the input; says at once when a line must wait.
+fn typed_lines(queue: Arc<Mutex<Queue>>) -> Receiver<Result<Option<String>, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut input = std::io::stdin().lock();
+        loop {
+            let mut line = String::new();
+            let read = match input.read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => {
+                    if queue.lock().unwrap().typed() {
+                        say("queued for the next turn");
+                    }
+                    Ok(Some(line))
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            let last = !matches!(read, Ok(Some(_)));
+            if tx.send(read).is_err() || last {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 struct Session<'a> {
@@ -259,16 +321,17 @@ impl<'a> Session<'a> {
 
     /// Reads lines until the conversation is left.
     fn talk(&mut self) -> Result<(), String> {
-        let stdin = std::io::stdin();
-        let typed = stdin.is_terminal();
-        let mut input = stdin.lock();
+        let typed = std::io::stdin().is_terminal();
+        let queue = Arc::new(Mutex::new(Queue::default()));
+        let lines = typed_lines(queue.clone());
         loop {
-            if typed {
+            let queued = queue.lock().unwrap().done();
+            if typed && !queued {
                 print!("[{}]> ", self.current);
                 let _ = std::io::stdout().flush();
             }
-            let mut line = String::new();
-            if input.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            let line = lines.recv().map_err(|e| e.to_string())??;
+            let Some(line) = line else {
                 // Ctrl-D: the agent reads the end of its input and ends.
                 if typed {
                     println!();
@@ -276,9 +339,12 @@ impl<'a> Session<'a> {
                 self.client.call(&Request::CloseInput(self.current))?;
                 self.wait(|_| None::<()>)?;
                 return Ok(());
-            }
-            if !typed {
-                println!("> {}", line.trim_end());
+            };
+            queue.lock().unwrap().take();
+            match (typed, queued) {
+                (true, true) => println!("[{}]> {}", self.current, line.trim_end()),
+                (false, _) => println!("> {}", line.trim_end()),
+                (true, false) => {}
             }
             let step = match parse_line(&line) {
                 Ok(Line::Nothing) => Ok(true),
@@ -429,6 +495,22 @@ mod tests {
         assert!(parse_line("/teleport").is_err());
         assert!(parse_line(&"a".repeat(MAX_INPUT)).is_err());
         assert!(parse_line(&"a".repeat(MAX_INPUT - 1)).is_ok());
+    }
+
+    #[test]
+    fn lines_typed_while_the_chat_works_wait_without_a_prompt() {
+        let mut queue = Queue::default();
+        assert!(!queue.done(), "nothing typed: a prompt");
+        assert!(!queue.typed(), "typed at the prompt: sent at once");
+        queue.take();
+        assert!(queue.typed(), "typed during the turn: queued");
+        assert!(queue.typed(), "typed behind a queued line: queued");
+        assert!(queue.done(), "turn over, a line waits: no prompt");
+        queue.take();
+        assert!(queue.done(), "the second queued line: still no prompt");
+        queue.take();
+        assert!(!queue.done(), "nothing waits: a prompt");
+        assert!(!queue.typed(), "typed at the prompt again: sent at once");
     }
 
     #[test]

@@ -851,6 +851,24 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
                 "`talking to cell N, resumed in ...`",
             )?;
             step(&mut again, expected::CHAT_MESSAGES[3], "[rhizo] model ")?;
+            // Two lines typed at once: the second waits for the first's
+            // turn, and the chat says so (change `fix-chat-tools`).
+            let both = expected::CHAT_MESSAGES[4..].join("\n");
+            let first_turn = step(&mut again, &both, "[rhizo] model ")?;
+            let second_turn = again
+                .until("[rhizo] model ")
+                .map_err(|e| fail(&e, "[rhizo] model "))?;
+            let typed = first_turn + &second_turn;
+            must(
+                typed.matches("[rhizo] queued for the next turn").count() == 1,
+                "a line typed while a turn runs is queued, and the chat says so once",
+                "one `[rhizo] queued for the next turn`",
+            )?;
+            must(
+                typed.contains("  [tool] ->\n      12.0\n"),
+                "a snippet ending in an expression returns its value to the model",
+                "the tool result `12.0`",
+            )?;
             let (exited, rest) = again.finish().map_err(|e| fail(&e, "an exit"))?;
             must(
                 exited && rest.contains(&format!("[rhizo] cell {branch} exited 0")),
@@ -871,9 +889,10 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
                 expected::CHAT_TRANSCRIPT,
             )?;
             must(
-                log.borrow().matches("chat| [rhizo] model ").count() == 4,
+                log.borrow().matches("chat| [rhizo] model ").count()
+                    == expected::CHAT_MESSAGES.len(),
                 "every turn prints the model's time apart from Rhizo's",
-                "four `[rhizo] model ..., rhizo ...` lines",
+                "one `[rhizo] model ..., rhizo ...` line per message",
             )?;
             for other in children[1..].iter().chain([&parent]) {
                 ok(&["kill", other])?;

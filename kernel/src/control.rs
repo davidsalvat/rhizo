@@ -412,7 +412,7 @@ impl Server {
                 entry.place = Place::Ended(match finished.ending {
                     Ending::Exit(code) => State::Exited(code),
                     Ending::Fault => State::Fault,
-                    Ending::Killed | Ending::Suspended => State::Killed,
+                    Ending::Killed | Ending::OutOfCpu | Ending::Suspended => State::Killed,
                 });
             }
         }
