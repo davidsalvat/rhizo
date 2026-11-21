@@ -2,6 +2,7 @@
 //! `snapshots` and `fork`).
 
 use super::*;
+use rhizo_snapshot::UNKNOWN_GENERATION;
 
 /// How [`Host::resume`] restores memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +129,11 @@ impl Host {
         let mut cell = snapshot.cell(id, pt.root(), now);
         // A resume or a load is a copy (design D22 of `add-cell-hierarchy`);
         // the snapshot holds its wipe ranges as zeros.
-        cell.generation += 1;
+        cell.generation = if cell.generation == UNKNOWN_GENERATION {
+            loaded_generation()
+        } else {
+            cell.generation + 1
+        };
         let deadlines = snapshot.deadlines(now);
         let mut fs = files_of(&snapshot);
         import_sockets(&mut fs, &snapshot.sockets());
@@ -392,4 +397,15 @@ fn wipe_copy(live: &Live) -> bool {
         space::wipe(&pt, &mut DirectMap, &mut NewSpace, &mut frames, ranges)
     })
     .is_ok()
+}
+
+/// The copy generation of a cell loaded from bytes that do not hold its
+/// own (until format version 11, task 1.10): drawn from the kernel's
+/// generator, so it equals no value the cell saw before it was saved but
+/// with chance 2^-62. Never 0, and below 2^62, so later copies counting up
+/// from it stay far from [`UNKNOWN_GENERATION`].
+fn loaded_generation() -> u64 {
+    let mut word = [0u8; 8];
+    RANDOM.with(|g| g.fill(&mut word));
+    (u64::from_le_bytes(word) >> 2) | 1
 }

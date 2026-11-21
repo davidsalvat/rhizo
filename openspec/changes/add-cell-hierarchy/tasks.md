@@ -29,7 +29,7 @@ change (design D16).
   - 1.7: numbering `getpid` per domain keeps a copy's identifier unlike its source's (`copy_pid_differs`, plus a copy made a new root once 1.9 can place one)
   - 1.8a: `publish` asks `Host::may_publish` and passes the host's attestation
   - 1.9b: the attestation goes into the audit log
-  - 1.10: the generation, the wipe ranges and the sticky bit move into the tree section of format version 11 (kept beside the snapshot in the kernel until then; a loaded file starts at generation 0)
+  - 1.10: the generation, the wipe ranges and the sticky bit move into the tree section of format version 11 (kept beside the snapshot in the kernel until then; a loaded file gets a random generation, which the stored one then replaces, and `loads_of_a_copied_template_see_new_generations` keeps holding)
   - 2.3, 2.5 and 3.2: receiving a message, a handle or a view sets the sticky bit (`Cell::exposed`)
   - 2.4: `/run/rhizo/generation` becomes a file of the `/run/rhizo` directory
 - [ ] 1.9 Tree operations in the kernel: placement, re-parenting, promotion, cascade, subtree kill, suspend and resume, authority checks (D1 to D3); verify the in-kernel `tree_operations` and `cascade_and_promote` on both architectures

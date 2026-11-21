@@ -12,6 +12,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(wipeonfork_reads_zero_in_copies),
     ktest_case!(generation_changes_only_in_copies),
     ktest_case!(copy_pid_differs),
+    ktest_case!(loads_of_a_copied_template_see_new_generations),
     ktest_case!(tainted_template_not_published),
 ];
 
@@ -178,13 +179,21 @@ fn wipeonfork_reads_zero_in_copies() {
 }
 
 /// `/run/rhizo/generation` keeps its value in the source of a fork, and
-/// reads another one in every copy (design D22 of `add-cell-hierarchy`).
+/// reads another one in every copy: one more in a copy made in the
+/// kernel, a value drawn at random in a load of bytes (design D22 of
+/// `add-cell-hierarchy`).
 fn generation_changes_only_in_copies() {
     let (source, copies) = copies_report();
     assert_eq!(reported(&source, "generation"), "0 0", "{source}");
-    for copy in copies {
-        assert_eq!(reported(&copy, "generation"), "0 1", "{copy}");
+    let (loaded, made_here) = copies.split_last().expect("copies");
+    for copy in made_here {
+        assert_eq!(reported(copy, "generation"), "0 1", "{copy}");
     }
+    let generation = reported(loaded, "generation");
+    assert!(
+        generation.starts_with("0 ") && generation != "0 0",
+        "{loaded}"
+    );
 }
 
 /// A copy's `getpid` is never its source's (design D22 of
@@ -235,4 +244,51 @@ fn tainted_template_not_published() {
         assert_eq!(host.may_publish(template, false), Some(false), "refused");
         assert_eq!(host.may_publish(template, true), Some(true), "attested");
     }
+}
+
+/// Two loads of the bytes of a template that was itself a copy (it read
+/// generation 1 before it was frozen) each read a generation that is not
+/// 1 and not the other's, so each reseeds and draws its own numbers
+/// (design D22 of `add-cell-hierarchy`: the bytes do not hold the
+/// generation until format version 11).
+fn loads_of_a_copied_template_see_new_generations() {
+    let mut host = Host::new();
+    let first = spawn(&mut host, "copies", &[b"wait"]);
+    while host.output(first) != Some(b"start\n") {
+        host.step();
+    }
+    assert!(host.freeze(first));
+    let copy = host.spawn_from_template(first, true, false).expect("copy");
+    while host.output(copy) != Some(b"ready\n") {
+        assert!(host.finished(copy).is_none(), "{:?}", ended(&host, copy));
+        host.step();
+    }
+    assert!(host.freeze(copy));
+    let crc = crate::arch::mem::crc32c;
+    let bytes = host
+        .template_snapshot(copy)
+        .expect("snapshot")
+        .export(&DirectMap, crc);
+    let loads: Vec<u32> = (0..2)
+        .map(|_| {
+            let snapshot = Snapshot::from_bytes(bytes.clone(), crate::arch::user::MACHINE, crc)
+                .expect("valid");
+            host.resume(snapshot, Resume::Eager, true, false)
+                .expect("load")
+        })
+        .collect();
+    host.run(|_| false);
+    let seen: Vec<alloc::string::String> = loads
+        .iter()
+        .map(|&id| {
+            let (ending, out) = ended(&host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            let generation = reported(&out, "generation");
+            let (before, after) = generation.split_once(' ').expect("two values");
+            assert_eq!(before, "1", "{out}");
+            assert!(after != "1" && after != "0", "{out}");
+            after.into()
+        })
+        .collect();
+    assert_ne!(seen[0], seen[1], "two loads alike");
 }

@@ -64,6 +64,10 @@ use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_net::Record;
 
 const MAGIC: &[u8; 8] = b"RHZSNAP1";
+/// The copy generation of a cell loaded from bytes, which do not hold it
+/// yet (design D22 of `add-cell-hierarchy`, until format version 11): the
+/// kernel then gives the cell a value its source cannot have seen.
+pub const UNKNOWN_GENERATION: u64 = u64::MAX;
 /// Format version written by this code.
 pub const VERSION: u32 = 10;
 const HEADER: usize = 24;
@@ -160,7 +164,8 @@ pub struct Snapshot {
     /// The cell's copy generation, whether it may hold a secret, and its
     /// wipe ranges (design D22 of `add-cell-hierarchy`): kept beside the
     /// bytes, in the kernel only, until the tree section of format version
-    /// 11 holds them (task 1.10). A snapshot made from bytes has none.
+    /// 11 holds them (task 1.10). A snapshot made from bytes has none, and
+    /// its generation is [`UNKNOWN_GENERATION`].
     generation: u64,
     exposed: bool,
     /// Only its wipe ranges: one word, as in a cell.
@@ -497,7 +502,7 @@ impl Snapshot {
             frames: 0,
             release: |_, _| {},
             records: 0,
-            generation: 0,
+            generation: UNKNOWN_GENERATION,
             exposed: false,
             wiped: WxRanges::default(),
         };
@@ -915,7 +920,8 @@ impl Snapshot {
     /// A cell `id` with root `root` (an empty user half, sharing the kernel
     /// half as the architecture needs) in the snapshot's state, its threads'
     /// deadlines counted from monotonic time `now`. Its copy generation is
-    /// the captured cell's: the kernel counts the resume as a copy.
+    /// the captured cell's ([`UNKNOWN_GENERATION`] for bytes): the kernel
+    /// counts the resume as a copy.
     pub fn cell(&self, id: u32, root: u64, now: u64) -> Cell {
         let s = self.state();
         Cell {

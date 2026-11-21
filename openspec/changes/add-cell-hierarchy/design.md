@@ -1478,8 +1478,11 @@ Templates pay one file read per request.
   file does either.
 - Until the tree section of format version 11 (task 1.10) holds them, the
   generation, the sticky bit and the wipe ranges stay beside a snapshot in
-  the kernel. A snapshot loaded from a file starts at generation 0
-  (resumed as 1), with no ranges and the bit clear.
+  the kernel. A cell loaded from a file gets a generation drawn from the
+  kernel's generator (never 0, below 2^62), not a count: the file does
+  not say what the cell saw, and a template that was itself a copy saw 1.
+  Counting would let two loads of it miss the change and draw the same
+  numbers. The loaded cell has no ranges and the bit clear.
 - The bit is set when a socket call of the cell reaches the network card.
   The kernel's publication check refuses a template whose bit is set,
   unless the host attests. Publishing (task 1.8a), the audit record (task

@@ -6,6 +6,9 @@
 //!   suspends it); then prints `page P generation G0 G1 pid same|changed`:
 //!   the word in the page, the generation before and after, and whether
 //!   `getpid` changed;
+//! - `wait`: prints `start` and sleeps 20 ms first (where a host freezes
+//!   it, so that its copies read the generation only once they are
+//!   copies), then as without argument;
 //! - `connect PORT ADDR`: connects to ADDR:PORT through the network card,
 //!   prints `connected` and sleeps 10 s (where a host freezes it).
 #![no_std]
@@ -102,6 +105,11 @@ fn main() -> i32 {
                 *o = number(part) as u8;
             }
             connect(arg(2).map_or(0, number) as u16, ip)
+        }
+        Some(b"wait") => {
+            print(b"start\n");
+            sleep_ns(20_000_000);
+            wipe()
         }
         _ => wipe(),
     }

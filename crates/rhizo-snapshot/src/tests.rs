@@ -1130,7 +1130,8 @@ fn quotas_from_outside_are_capped() {
 /// A snapshot in the kernel keeps the cell's copy generation, whether it
 /// may hold a secret, and its wipe ranges (design D22 of
 /// `add-cell-hierarchy`); its exported bytes do not hold them yet (format
-/// version 11 will), so one made from bytes starts with none.
+/// version 11 will), so one made from bytes has none and an unknown
+/// generation.
 #[test]
 fn copy_state_kept_in_the_kernel() {
     let mut mem = FakePhysicalMemory::new();
@@ -1171,5 +1172,8 @@ fn copy_state_kept_in_the_kernel() {
     assert_eq!(loaded.wx().ranges(), wx.ranges());
     assert!(loaded.wx().wiped().is_empty());
     let restored = loaded.cell(9, 0, 0);
-    assert_eq!((restored.generation, restored.exposed), (0, false));
+    assert_eq!(
+        (restored.generation, restored.exposed),
+        (UNKNOWN_GENERATION, false)
+    );
 }
