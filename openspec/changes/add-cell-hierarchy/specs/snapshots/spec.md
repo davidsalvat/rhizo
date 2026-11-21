@@ -3,12 +3,12 @@
 ## MODIFIED Requirements
 
 ### Requirement: Snapshot format
-A snapshot SHALL encode to a versioned byte sequence (format version 13:
-11 adds the tree state, 12 handles, 13 views) tagged with its
-architecture, independent of in-memory layouts. Decoding SHALL accept the
-current version and the one before it, and SHALL reject a sequence that
-is truncated, corrupted, of an older or newer version, or of another
-architecture, with an error naming the reason and the versions read.
+A snapshot SHALL encode to bytes of format version 13 (11: tree state,
+12: handles, 13: views) tagged with its architecture, independent of
+in-memory layouts, recording which pages are write-or-execute pages and
+the cell's write-or-execute ranges. Decoding SHALL accept the current
+and the previous version, and reject other versions, truncated or
+corrupted bytes and other architectures, naming the reason and versions.
 
 #### Scenario: Wrong architecture
 - **WHEN** a snapshot taken on one architecture is decoded on the other
@@ -17,6 +17,14 @@ architecture, with an error naming the reason and the versions read.
 #### Scenario: Deterministic encoding
 - **WHEN** the same cell state is encoded twice
 - **THEN** both byte sequences are identical
+
+#### Scenario: Write-or-execute page writable and executable
+- **WHEN** a page record marked write-or-execute is both writable and executable, or neither
+- **THEN** decoding fails with a page error
+
+#### Scenario: Bad ranges
+- **WHEN** a snapshot's write-or-execute ranges are unaligned, empty, out of order, touching, past `USER_END` or more than 64
+- **THEN** decoding fails with a ranges error
 
 ## ADDED Requirements
 

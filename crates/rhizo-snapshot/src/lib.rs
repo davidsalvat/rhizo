@@ -157,6 +157,9 @@ pub struct Snapshot {
     /// Where the page records start (after the threads and ranges), read
     /// once: every page lookup needs it.
     records: usize,
+    /// The identifier of the cell it was taken from in this kernel; 0 for
+    /// one read from bytes, which names no cell here.
+    origin: u32,
 }
 
 impl PartialEq for Snapshot {
@@ -366,6 +369,7 @@ impl Snapshot {
             frames: refers.iter().filter(|&&r| r).count(),
             release,
             records: data_start - pages * RECORD,
+            origin: cell.id,
         }
     }
 
@@ -472,6 +476,7 @@ impl Snapshot {
             frames: 0,
             release: |_, _| {},
             records: 0,
+            origin: 0,
         };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
@@ -877,6 +882,14 @@ impl Snapshot {
         Ok(())
     }
 
+    /// The identifier of the cell this snapshot was taken from in this
+    /// kernel, 0 if it was read from bytes: a snapshot from bytes refers to
+    /// no cell of this kernel (spec `snapshots`, loaded snapshots hold no
+    /// authority).
+    pub fn origin(&self) -> u32 {
+        self.origin
+    }
+
     /// A cell `id` with root `root` (an empty user half, sharing the kernel
     /// half as the architecture needs) in the snapshot's state, its threads'
     /// deadlines counted from monotonic time `now`.
@@ -884,6 +897,8 @@ impl Snapshot {
         let s = self.state();
         Cell {
             id,
+            pid: id,
+            domain: 0,
             root,
             threads: self.threads(now),
             brk_start: s.brk_start,

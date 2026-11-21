@@ -11,6 +11,10 @@ request, SHALL never panic nor allocate more than the frame's bytes.
 - **WHEN** the kernel receives an `input` request of 64 KiB plus one byte, or one whose length exceeds its payload
 - **THEN** it refuses it and keeps serving
 
+#### Scenario: Malformed load
+- **WHEN** a `load` request carries a template flag other than 0 or 1
+- **THEN** decoding refuses it
+
 #### Scenario: Malformed tree request
 - **WHEN** the kernel receives a `run` naming an unknown parent, an egress rule with a prefix over 32, or a `grant` with unknown rights
 - **THEN** it refuses it with the reason and keeps serving

@@ -125,7 +125,11 @@ impl Host {
             pt.share_upper_half(&mut DirectMap, &user::cell_kernel_half());
         }
         let now = now_ns();
-        let cell = snapshot.cell(id, pt.root(), now);
+        let mut cell = snapshot.cell(id, pt.root(), now);
+        if !self.enter_restored(&mut cell, snapshot.origin()) {
+            space::destroy(pt, &mut DirectMap, &mut KernelFrames);
+            return Err(snapshot);
+        }
         let deadlines = snapshot.deadlines(now);
         let mut fs = files_of(&snapshot);
         import_sockets(&mut fs, &snapshot.sockets());
@@ -178,7 +182,7 @@ impl Host {
         parent.clean = flushed_by_kernel_on(crate::arch::cpu::index());
         parent.shares = true;
         self.requeue(parent, wake);
-        if children.len() < n {
+        if children.len() < n || !self.enter_copies(id, &mut children) {
             // All or nothing: the children made so far never ran.
             for child in &children {
                 self.discard(child);
@@ -194,7 +198,7 @@ impl Host {
 
     /// Frees the memory, tag and sockets of a cell that never ran, leaving
     /// no trace (no [`Finished`]).
-    fn discard(&mut self, live: &Live) {
+    pub(super) fn discard(&mut self, live: &Live) {
         if live.tag != 0 {
             self.locked(|s| s.tags.free(live.tag));
         }
@@ -318,6 +322,17 @@ impl Host {
     /// Drops template `id`: its memory and sockets go back once no copy
     /// shares them. Returns whether it existed.
     pub fn drop_template(&mut self, id: u32) -> bool {
+        if !self.remove_template(id) {
+            return false;
+        }
+        self.ends.push(id);
+        self.settle();
+        true
+    }
+
+    /// Drops template `id` without applying it to the tree; returns whether
+    /// it existed.
+    pub(super) fn remove_template(&mut self, id: u32) -> bool {
         let Some(index) = self.templates.iter().position(|(c, ..)| c.id == id) else {
             return false;
         };
@@ -348,6 +363,12 @@ impl Host {
         let (cell, fs, wx) = (cell.clone(), fs.clone(), wx.clone());
         let mut child = self.child_of(&cell, &fs, &wx, capture, echo)?;
         child.expire_timers();
+        let mut copies = [child];
+        if !self.enter_copies(id, &mut copies) {
+            self.discard(&copies[0]);
+            return None;
+        }
+        let [child] = copies;
         let child_id = child.cell.id;
         self.admit(|s| file(s, None, child));
         Some(child_id)

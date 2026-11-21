@@ -287,7 +287,10 @@ impl Server {
                         self.host.kill(cell);
                         self.reap();
                     }
-                    Place::Suspended(snapshot) => cell::close_parked(&snapshot),
+                    Place::Suspended(snapshot) => {
+                        cell::close_parked(&snapshot);
+                        self.host.drop_snapshot(&snapshot);
+                    }
                     Place::Template(template) => {
                         self.host.drop_template(template);
                     }
@@ -528,6 +531,10 @@ impl Server {
             };
             keep(&mut entry.out, &finished.output);
             if finished.ending != Ending::Suspended {
+                // A suspended cell ends when its parent's end cascades.
+                if let Place::Suspended(snapshot) = &entry.place {
+                    cell::close_parked(snapshot);
+                }
                 entry.place = Place::Ended(match finished.ending {
                     Ending::Exit(code) => State::Exited(code),
                     Ending::Fault => State::Fault,

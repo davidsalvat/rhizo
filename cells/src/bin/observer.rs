@@ -14,7 +14,10 @@
 //!   ephemeral ports and closes them, connects to 127.0.0.1:PORT and waits
 //!   for the observer to close the connection;
 //! - `page`: maps a page of a file of its own, prints `mapped`, sleeps
-//!   until the host wakes it, reads the page again and prints `page ok`.
+//!   until the host wakes it, reads the page again and prints `page ok`;
+//! - `ids`: prints `pid P tid T` from `getpid` and `gettid`, yields three
+//!   times (the host may fork or suspend it there), and prints them again
+//!   (change `add-cell-hierarchy`, identifiers per domain).
 //!
 //! Never run on Linux.
 #![no_std]
@@ -175,6 +178,19 @@ fn page() {
     print(b"page ok\n");
 }
 
+fn ids() {
+    for round in 0..2 {
+        print(b"pid ");
+        print_number(syscall(nr::GETPID, [0; 6]) as u64);
+        print(b" tid ");
+        print_number(syscall(nr::GETTID, [0; 6]) as u64);
+        print(b"\n");
+        for _ in 0..3 * (1 - round) {
+            yield_now();
+        }
+    }
+}
+
 fn main() -> i32 {
     let port = arg(2).map_or(0, number) as u16;
     match arg(1) {
@@ -182,6 +198,7 @@ fn main() -> i32 {
         Some(b"memory") => memory(port),
         Some(b"neighbour") => neighbour(port, arg(3).map_or(0, number), arg(4).map_or(0, number)),
         Some(b"page") => page(),
+        Some(b"ids") => ids(),
         _ => check(false, "mode"),
     }
     0

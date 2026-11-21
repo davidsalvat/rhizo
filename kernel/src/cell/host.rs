@@ -51,6 +51,16 @@ pub struct Host {
     /// the boot CPU never waits past it (design D1 of
     /// `fix-lost-wakeup-smp`).
     until: Option<u64>,
+    /// The ownership tree of every cell: live, suspended and templates
+    /// (spec `cell-hierarchy`).
+    pub(super) tree: rhizo_cap::Tree,
+    /// Cells suspended into a snapshot the caller holds, whose node waits
+    /// for their resume.
+    pub(super) suspended: Vec<u32>,
+    /// Cells that ended, their end not yet applied to the tree.
+    pub(super) ends: Vec<u32>,
+    /// Ends are being applied (not again from inside).
+    pub(super) settling: bool,
 }
 
 /// Words of a running cell's memory ([`Host::watch`]), read through the
@@ -102,6 +112,10 @@ impl Host {
             peeked: Vec::new(),
             others: false,
             until: None,
+            tree: rhizo_cap::Tree::new(),
+            suspended: Vec::new(),
+            ends: Vec::new(),
+            settling: false,
         }
     }
 
@@ -234,7 +248,11 @@ impl Host {
     /// CPUs may be adding to them).
     fn collect(&mut self) {
         let ended = self.shared.with(|s| core::mem::take(&mut s.ended));
+        for f in &ended {
+            self.ends.push(f.id);
+        }
         self.finished.extend(ended);
+        self.settle();
     }
 
     /// A new live cell's record: its tag, nothing flushed yet.
@@ -336,8 +354,12 @@ impl Host {
             envp,
             random,
         )?;
-        let live = self.new_live(cell, capture, echo, files);
+        let mut live = self.new_live(cell, capture, echo, files);
         live.frames.set_used(used.used());
+        if !self.enter_root(&mut live.cell) {
+            self.discard(&live);
+            return Err(ElfError::OutOfMemory);
+        }
         self.admit(|s| s.sched.place(live));
         Ok(id)
     }
@@ -379,7 +401,11 @@ impl Host {
             envp,
             random,
         )?;
-        let live = self.new_live(cell, capture, echo, files);
+        let mut live = self.new_live(cell, capture, echo, files);
+        if !self.enter_root(&mut live.cell) {
+            self.discard(&live);
+            return Err(ElfError::OutOfMemory.into());
+        }
         self.admit(|s| s.sched.place(live));
         Ok(id)
     }
@@ -571,12 +597,15 @@ impl Host {
         if tag != 0 {
             self.locked(|s| s.tags.free(tag));
         }
+        self.ended(finished.id, ending);
         self.finished.push(finished);
+        self.settle();
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
+        self.settling = true; // every cell ends: nothing to cascade
         while let Some(live) = self.state().sched.pop() {
             self.end(live, Ending::Killed);
         }
