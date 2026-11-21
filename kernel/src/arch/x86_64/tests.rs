@@ -7,6 +7,8 @@ use rhizo_core::ktest_case;
 pub static ALL: &[TestCase] = &[
     ktest_case!(pvh_start_info_is_valid),
     ktest_case!(user_guards_are_on),
+    ktest_case!(a_cell_reads_the_counter),
+    ktest_case!(the_timer_is_never_periodic_with_a_short_count),
 ];
 
 /// SMEP and SMAP are on wherever the CPU has them (QEMU's `max` CPU has
@@ -23,4 +25,38 @@ fn user_guards_are_on() {
 
 fn pvh_start_info_is_valid() {
     super::boot::assert_boot_info_is_valid();
+}
+
+/// A cell reads the CPU's counter directly (`ticks`: `CNTVCT_EL0` and
+/// `CNTFRQ_EL0` on AArch64, `rdtsc` on x86_64), without a trap killing it,
+/// on whichever CPU it runs (change `add-node-workload`).
+fn a_cell_reads_the_counter() {
+    crate::tests::run_expected("ticks");
+}
+
+/// Across a wait and back to the periodic tick, the local APIC timer is
+/// never periodic with a count shorter than the tick's, whatever the wait
+/// was (design D1 of `fix-apic-tick-restart`): a periodic timer of one
+/// count (16 ns) fired back to back under QEMU's lock and stopped every
+/// CPU. The writes are replayed on a model of the timer's mode and count,
+/// after each one.
+fn the_timer_is_never_periodic_with_a_short_count() {
+    use super::irq::{INITIAL_COUNT, LVT_TIMER, PERIODIC, tick_writes, wait_writes};
+    const TICK: u32 = 625_000; // 10 ms
+    // The periodic tick, as `init` leaves it.
+    let (mut periodic, mut count) = (true, TICK);
+    for ns in [0, 1, 15, 16, 17, 1_000, 9_999_999, u64::MAX] {
+        for (reg, value) in wait_writes(ns).into_iter().chain(tick_writes(TICK)) {
+            match reg {
+                LVT_TIMER => periodic = value & PERIODIC != 0,
+                INITIAL_COUNT => count = value,
+                _ => panic!("unexpected register {reg:#x}"),
+            }
+            assert!(
+                !periodic || count == TICK,
+                "periodic with {count} counts after a wait of {ns} ns"
+            );
+        }
+        assert!(periodic && count == TICK, "back to the tick after {ns} ns");
+    }
 }

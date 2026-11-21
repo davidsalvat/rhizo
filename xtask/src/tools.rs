@@ -3,6 +3,8 @@
 //!
 //! Overrides: `RHIZO_FIRECRACKER`, `RHIZO_CLOUD_HYPERVISOR` and
 //! `RHIZO_REFERENCE_KERNEL` point at local files instead of downloading.
+//! Node.js is downloaded only when `RHIZO_NODE` is set (change
+//! `add-node-workload`).
 
 use crate::Result;
 use crate::arch::{self, Arch};
@@ -67,6 +69,56 @@ fn reference_kernel_artifact(arch: Arch) -> Artifact {
             sha256: "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591",
         },
     }
+}
+
+/// The pinned Node.js release (LTS "Krypton"; MIT license, its bundled
+/// dependencies under the licenses its `LICENSE` file lists).
+pub const NODE_VERSION: &str = "v24.22.3";
+
+/// The official Linux build of [`NODE_VERSION`] (dynamically linked with
+/// glibc), as nodejs.org publishes it with its SHA-256 (`SHASUMS256.txt`).
+fn node_artifact(arch: Arch) -> Artifact {
+    match arch {
+        Arch::X86_64 => Artifact {
+            file: "node-v24.22.3-linux-x64.tar.xz",
+            url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.xz",
+            sha256: "4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb",
+        },
+        Arch::Aarch64 => Artifact {
+            file: "node-v24.22.3-linux-arm64.tar.xz",
+            url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.xz",
+            sha256: "6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c",
+        },
+    }
+}
+
+/// The `node` executable of [`NODE_VERSION`] for the cells' architecture,
+/// unmodified from its archive, with the release's `LICENSE` next to it.
+pub fn node() -> Result<PathBuf> {
+    let dir = dir()?;
+    let arch = arch::current();
+    let binary = dir.join(format!("node-{NODE_VERSION}-{}", arch.id()));
+    if !binary.exists() {
+        let artifact = node_artifact(arch);
+        let archive = fetch(&artifact)?;
+        let top = artifact.file.trim_end_matches(".tar.xz");
+        run(Command::new("tar")
+            .arg("-xJf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&dir)
+            .arg(format!("{top}/bin/node"))
+            .arg(format!("{top}/LICENSE")))?;
+        fs::rename(
+            dir.join(top).join("LICENSE"),
+            dir.join(format!("node-{NODE_VERSION}-LICENSE")),
+        )
+        .map_err(|e| format!("unexpected Node.js archive layout: {e}"))?;
+        fs::rename(dir.join(top).join("bin/node"), &binary)
+            .map_err(|e| format!("unexpected Node.js archive layout: {e}"))?;
+        let _ = fs::remove_dir_all(dir.join(top));
+    }
+    Ok(binary)
 }
 
 /// The tools directory, created if needed.

@@ -93,8 +93,7 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
             None => {}
         }
     }
-    let _ = fs::remove_file(dir.state());
-    let _ = fs::remove_file(dir.socket());
+    dir.clean();
     Ok(())
 }
 

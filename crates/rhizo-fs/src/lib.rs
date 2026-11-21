@@ -41,7 +41,7 @@ pub const FD_MAX: usize = 1024;
 /// (`rhizo_cell::quota::SOCKETS_DEFAULT`, finding S21).
 pub const SOCKETS_DEFAULT: usize = 256;
 /// Most file data a cell may hold, and the largest file size (bytes).
-pub const DATA_MAX: u64 = 64 << 20;
+pub const DATA_MAX: u64 = 256 << 20;
 /// Most files and directories a cell may have (the root included): bounds
 /// the kernel memory its names take, and so how deep a path can nest.
 pub const INODES_MAX: usize = 4096;

@@ -47,7 +47,7 @@ Commands:
 
 Every command prints the time the kernel took and the round trip from the
 host. The state (VM, control socket, console log) lives in --state, or
-$RHIZO_STATE, or ~/.rhizo.
+$RHIZO_STATE, or ~/.rhizo; after `down` only the last console log stays.
 ";
 
 /// Options of `up` (and of the background server it starts).

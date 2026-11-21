@@ -210,7 +210,9 @@ sometimes with an invented result or an empty answer (shown as
 `rhizo up` builds the control kernel on first use (or takes `--kernel`) and
 leaves a small background server that owns the VM; its state (the control
 socket, the kernel's console in `console.log`) is in `~/.rhizo`, or
-`--state DIR`, or `$RHIZO_STATE`. Then:
+`--state DIR`, or `$RHIZO_STATE`; `rhizo down` leaves only `console.log`
+there, the last VM's console. Unchanged, `rhizo up` reuses the kernel it
+built. Then:
 
 ```bash
 rhizo run hello                       # a program the kernel holds, to its end

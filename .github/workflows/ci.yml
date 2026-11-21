@@ -20,6 +20,10 @@ jobs:
     name: x86_64 fmt, clippy, tests (host and QEMU)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Downloads and packs the pinned Node.js build (xtask/src/tools.rs)
+      # and runs its tests and benchmarks (change `add-node-workload`).
+      RHIZO_NODE: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -67,6 +71,12 @@ jobs:
           path: target/cpython
           key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
 
+      - name: Cache the Node.js download
+        uses: actions/cache@v4
+        with:
+          path: target/tools/node-*
+          key: node-${{ runner.arch }}-${{ hashFiles('xtask/src/tools.rs') }}
+
       - name: Run all checks
         run: cargo xtask --arch x86_64 ci 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
 
@@ -90,6 +100,10 @@ jobs:
     name: AArch64 fmt, clippy, tests, instruction counts (QEMU virt)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
+    env:
+      # Downloads and packs the pinned Node.js build (xtask/src/tools.rs)
+      # and runs its tests and benchmarks (change `add-node-workload`).
+      RHIZO_NODE: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -145,6 +159,12 @@ jobs:
         with:
           path: target/cpython
           key: cpython-${{ runner.arch }}-${{ hashFiles('xtask/src/cpython.rs') }}
+
+      - name: Cache the Node.js download
+        uses: actions/cache@v4
+        with:
+          path: target/tools/node-*
+          key: node-${{ runner.arch }}-${{ hashFiles('xtask/src/tools.rs') }}
 
       - name: Run all checks
         run: cargo xtask --arch aarch64 ci 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
@@ -225,6 +245,10 @@ jobs:
     name: VMM boots and benchmark gate
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Downloads and packs the pinned Node.js build (xtask/src/tools.rs)
+      # and runs its tests and benchmarks (change `add-node-workload`).
+      RHIZO_NODE: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -309,6 +333,9 @@ jobs:
 
       - name: In-kernel tests on 4 CPUs on Cloud Hypervisor
         run: cargo xtask --arch x86_64 test --only ktest-smp --vmm cloud-hypervisor
+
+      - name: Node.js tests on Firecracker
+        run: cargo xtask --arch x86_64 test --only ktest-node --vmm firecracker
 
       - name: Benchmarks and regression gate
         run: cargo xtask --arch x86_64 bench --env ci --check --output bench-results.json
