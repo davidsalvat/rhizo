@@ -189,7 +189,7 @@ pub fn index() -> usize {
 }
 
 /// Error code of the last exception from a cell on this CPU.
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub(super) fn trap_error() -> u64 {
     PERCPU.0[index()]
         .trap_error
@@ -198,7 +198,7 @@ pub(super) fn trap_error() -> u64 {
 
 /// Prepares the per-CPU data of secondary CPU `cpu`; returns its address
 /// (for its GS base).
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub(super) fn percpu(cpu: usize) -> u64 {
     PERCPU.0[cpu]
         .index

@@ -14,9 +14,8 @@
 //!   Firecracker on x86_64): read by [`virtio_mmio_devices`]
 //! - `smp=N`: use at most `N` CPUs (`N` from 1 to 65535; default: every CPU
 //!   the firmware describes)
-//! - `bench=laptop`, `bench=server` or `bench=agent-demo`: the reference
-//!   workload (or the agent demo) a benchmark kernel runs instead of its
-//!   cell figures (spec `benchmarks`), with
+//! - `bench=laptop` or `bench=server`: the reference workload a benchmark
+//!   kernel runs instead of its cell figures (spec `benchmarks`), with
 //!   `cells=N` (target cells, 1 to 65535), `secs=N` (seconds of load, 1 to
 //!   65535) and `llm=ADDR:PORT` (the host's model server, fake or real)
 //! - `shard=I/N`: an in-kernel test build runs only the tests whose position
@@ -67,9 +66,6 @@ pub enum Workload {
     Laptop,
     /// Many active cells on a server: density and tail latencies.
     Server,
-    /// The CPython agent's live demo against a real model (`llm=`, and
-    /// `model=NAME` read by the kernel; `cargo xtask demo agent`).
-    AgentDemo,
 }
 
 /// Parsed boot options.
@@ -202,7 +198,6 @@ impl BootOptions {
                 b"exit=semihosting" => options.exit = ExitKind::Semihosting,
                 b"bench=laptop" => options.bench = Some(Workload::Laptop),
                 b"bench=server" => options.bench = Some(Workload::Server),
-                b"bench=agent-demo" => options.bench = Some(Workload::AgentDemo),
                 _ => {
                     if let Some(v) = word.strip_prefix(b"ip=") {
                         options.ip = ip_option(v).or(options.ip);
@@ -375,10 +370,6 @@ mod tests {
     fn workload_options() {
         let o = BootOptions::parse(b"bench=server cells=10000 secs=3 llm=10.0.2.2:8080");
         assert_eq!(o.bench, Some(Workload::Server));
-        assert_eq!(
-            BootOptions::parse(b"bench=agent-demo model=qwen").bench,
-            Some(Workload::AgentDemo)
-        );
         assert_eq!((o.cells, o.secs), (Some(10000), Some(3)));
         assert_eq!(o.llm, Some(([10, 0, 2, 2], 8080)));
         assert_eq!(

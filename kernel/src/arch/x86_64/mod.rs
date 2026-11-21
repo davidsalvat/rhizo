@@ -3,22 +3,29 @@
 pub mod boot;
 pub mod console;
 pub mod cpu;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod irq;
 pub mod platform;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(
+        dead_code,
+        reason = "counting is for tests and benchmarks; sampling is wired in"
+    )
+)]
 pub mod pmu;
 pub mod port;
 pub mod power;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod random;
 pub mod serial;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod smp;
 #[cfg(feature = "ktest")]
 pub mod tests;
 pub mod timer;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
 pub mod user;
 
 /// Stops the CPU forever with interrupts disabled.

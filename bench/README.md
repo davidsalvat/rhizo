@@ -75,6 +75,12 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `<metric>_insns/rhizo/<vmm>`, `<metric>_cycles/rhizo/<vmm>` | counts | Every single-CPU timed figure counted by the guest's PMU in retired instructions and core cycles, where the guest has one (see below) |
 | `breakdown.<workload>.<part>_us/rhizo/<vmm>` | timing, not gated | Where a workload's time goes (see below) |
 | `lock.<name>_waits/rhizo/<vmm>` | count, not gated | During the four-CPU breakdown: acquisitions that found the lock held by another CPU, for `frames` (frame allocator), `heap`, `refs` (frame reference counts), `sharing` (memory shared by forks), `net` (sockets), `sched` (run queues) |
+| `control.roundtrip_us/rhizo/<vmm>` | timing | The control plane (spec `control-plane`): a `list` request from the host to a control kernel and its reply back, as the host times it (frame written to the VMM's standard input, the serial line both ways, the kernel's poll of its UART, the reply read from the VMM's standard output). Median of 200 in a row on one boot, 1 CPU, 128 MiB |
+| `control.run_us/rhizo/<vmm>` | timing | On the same boot, as the host times them: `run` of the `idle` cell (the reply comes once it is created) |
+| `control.suspend_us/rhizo/<vmm>` | timing | `suspend` of that cell (snapshot kept in the kernel) |
+| `control.resume_us/rhizo/<vmm>` | timing | `resume` of it (lazy: pages come back on first touch) |
+| `control.fork_us/rhizo/<vmm>` | timing | `fork` of it into one cell |
+| `control.kill_us/rhizo/<vmm>` | timing | `kill` of it. Each of these five over 20 rounds; each reply also carries the kernel's own time for the operation, which `rhizo` prints next to the round trip |
 
 The kernel keeps the executables it spawned loaded (spec `cells`): from the
 second spawn of an executable on, a cell starts on a copy of its loaded
