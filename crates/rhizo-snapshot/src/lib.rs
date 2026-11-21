@@ -163,7 +163,8 @@ pub struct Snapshot {
     /// 11 holds them (task 1.10). A snapshot made from bytes has none.
     generation: u64,
     exposed: bool,
-    wiped: Vec<(u64, u64)>,
+    /// Only its wipe ranges: one word, as in a cell.
+    wiped: WxRanges,
 }
 
 impl PartialEq for Snapshot {
@@ -387,7 +388,9 @@ impl Snapshot {
             records: data_start - pages * RECORD,
             generation: cell.generation,
             exposed: cell.exposed,
-            wiped: wx.wiped().to_vec(),
+            wiped: WxRanges::default()
+                .with_wiped(wx.wiped().to_vec())
+                .unwrap_or_default(),
         }
     }
 
@@ -496,7 +499,7 @@ impl Snapshot {
             records: 0,
             generation: 0,
             exposed: false,
-            wiped: Vec::new(),
+            wiped: WxRanges::default(),
         };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
@@ -620,10 +623,11 @@ impl Snapshot {
         } else {
             WxRanges::from_ranges(self.range_list()).unwrap_or_default()
         };
-        if self.wiped.is_empty() {
+        if self.wiped.wiped().is_empty() {
             return wx;
         }
-        wx.with_wiped(self.wiped.clone()).unwrap_or_default()
+        wx.with_wiped(self.wiped.wiped().to_vec())
+            .unwrap_or_default()
     }
 
     /// Validates the threads (`from_bytes`; the size was checked).
