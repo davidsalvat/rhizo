@@ -297,8 +297,11 @@ fn server(console: &mut impl Console) {
     // Load: the workers run for `secs`; meanwhile, at a constant rate, the
     // host suspends and resumes the next worker (its connections stay), and
     // forks the next one that computes or writes files (a fork's
-    // connections are reset).
+    // connections are reset). The latencies count from the first moment no
+    // cell runs: before it, every worker runs for the first time, all at
+    // once (design D6 of `add-socket-wait-queues`).
     prof::start();
+    prof::settle();
     let t0 = now_ns();
     let stop_ops = t0 + secs * 1_000_000_000;
     let deadline = stop_ops + 5_000_000_000;
@@ -405,7 +408,7 @@ fn server(console: &mut impl Console) {
         "rhizo-server-breakdown elapsed_ns={elapsed} idle_ns={} syscall_ns={} sched_ns={} \
          host_ns={} syscalls={} runs={} wakes={} io_woken={} net_changes={} cow_faults={} \
          lazy_faults={} interrupts={} untagged={untagged} host_ops={host_ops} suspend_ns={} resume_ns={} fork_ns={} \
-         sched_max_ns={} wake_max_ns={}",
+         sched_max_ns={} wake_max_ns={} settle_ns={}",
         cyc(report.count(Count::IdleCycles)),
         cyc(sys.sum()),
         cyc(report.count(Count::SchedCycles)),
@@ -423,6 +426,7 @@ fn server(console: &mut impl Console) {
         cyc(median(&mut fork_ns)),
         report.sched.max(),
         report.wake.max(),
+        report.settled_ns,
     );
 }
 
