@@ -276,7 +276,7 @@ impl Server {
                     return Err((Error::Failed, format!("from 1 to {MAX_FORK} children")));
                 }
                 let children = match self.entry(target)?.place {
-                    Place::Template(template) => self.from_template(template, n),
+                    Place::Template(template) => self.copies_of(template, n),
                     _ => {
                         let cell = self.live(target)?;
                         self.host.fork(cell, n as usize)
@@ -359,7 +359,7 @@ impl Server {
     }
 
     /// Cells made from template `template`, all or none.
-    fn from_template(&mut self, template: u32, n: u32) -> Option<Vec<u32>> {
+    fn copies_of(&mut self, template: u32, n: u32) -> Option<Vec<u32>> {
         let mut children = Vec::new();
         for _ in 0..n {
             match self.host.spawn_from_template(template, true, false) {
