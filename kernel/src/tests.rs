@@ -119,6 +119,9 @@ macro_rules! suite {
             ktest_case!(cpu_quota_ends_the_cell),
             ktest_case!(file_and_socket_quotas_travel_with_the_cell),
             ktest_case!(a_cell_holds_a_bounded_share_of_sockets),
+            ktest_case!(sysinfo_shows_a_cell_only_itself),
+            ktest_case!(ephemeral_ports_do_not_show_other_cells_binds),
+            ktest_case!(memory_pressure_keeps_the_pages_other_cells_map),
             ktest_case!(cells_run_alike_with_and_without_kpti),
             ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
@@ -2079,6 +2082,92 @@ fn a_cell_holds_a_bounded_share_of_sockets() {
             "{out}"
         );
     }
+}
+
+// --- Cross-cell leaks (change `close-cross-cell-leaks`) ---------------------
+
+/// Hostile (finding S24): `sysinfo` shows a cell its own memory limit and
+/// use, and its own threads; a neighbour taking 32 MiB changes nothing in
+/// it (it showed the kernel's free memory before).
+fn sysinfo_shows_a_cell_only_itself() {
+    use rhizo_cell::quota::Quota;
+    let mut host = Host::new();
+    let observer = spawn(&mut host, "observer", &[b"memory", b"7401"]);
+    let quota = Quota {
+        memory: 64 << 20,
+        ..Quota::NONE
+    };
+    assert!(host.set_quota(observer, quota));
+    while host.output(observer) != Some(b"ready\n") {
+        host.step();
+    }
+    let neighbour = spawn(&mut host, "observer", &[b"neighbour", b"7401", b"32", b"0"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, neighbour), (Ending::Exit(0), "".into()));
+    assert_eq!(
+        ended(&host, observer),
+        (
+            Ending::Exit(0),
+            "ready\nmemory total=64 change=0 procs=1\n".into()
+        )
+    );
+}
+
+/// Hostile (finding S25): the ephemeral ports a cell gets do not show how
+/// many other cells took. A neighbour binds 100 between the observer's
+/// two binds; the observer's ports are one apart (102 with the one counter
+/// all cells shared before).
+fn ephemeral_ports_do_not_show_other_cells_binds() {
+    let mut host = Host::new();
+    let observer = spawn(&mut host, "observer", &[b"ports", b"7400"]);
+    while host.output(observer) != Some(b"ready\n") {
+        host.step();
+    }
+    let neighbour = spawn(
+        &mut host,
+        "observer",
+        &[b"neighbour", b"7400", b"0", b"100"],
+    );
+    host.run(|_| false);
+    assert_eq!(ended(&host, neighbour), (Ending::Exit(0), "".into()));
+    assert_eq!(
+        ended(&host, observer),
+        (Ending::Exit(0), "ready\nports +1\n".into())
+    );
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// Hostile (finding S26): a cell that takes memory until refused makes the
+/// kernel drop the kept file pages no cell maps, but not the page another
+/// cell maps (it emptied the whole page cache before: a flush any cell
+/// could make). Every frame comes back.
+fn memory_pressure_keeps_the_pages_other_cells_map() {
+    let before = memory_balance();
+    assert_eq!(crate::cell::kept_pages(), 0);
+    let mut host = Host::new();
+    let user = spawn(&mut host, "observer", &[b"page"]);
+    while host.output(user) != Some(b"mapped\n") {
+        host.step();
+    }
+    assert_eq!(crate::cell::kept_pages(), 1);
+    let hog = spawn(&mut host, "hog", &[]);
+    while host.output(hog) != Some(b"exhausted\n") {
+        host.step();
+    }
+    assert_eq!(
+        crate::cell::kept_pages(),
+        1,
+        "the page another cell maps stays kept"
+    );
+    assert!(host.wake(user));
+    host.run(|_| false);
+    assert_eq!(ended(&host, hog), (Ending::Exit(0), "exhausted\n".into()));
+    assert_eq!(
+        ended(&host, user),
+        (Ending::Exit(0), "mapped\npage ok\n".into())
+    );
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
 }
 
 /// Hostile threads on several CPUs (spec `isolation`, `multi-core`):

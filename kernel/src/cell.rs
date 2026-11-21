@@ -18,7 +18,9 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use rhizo_abi::{Abi, Context, ExecError, FilePages, Outcome, PageCache, Services};
+use rhizo_abi::{
+    Abi, Context, ExecError, FilePages, Outcome, PageCache, Services, Share, own_copy,
+};
 use rhizo_cell::elf::{ElfError, Image};
 use rhizo_cell::images::{self, Images};
 use rhizo_cell::memory::Pager;
@@ -312,8 +314,18 @@ impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
             return Some(phys);
         }
         // Short of frames, what is kept goes first (outside the lock).
-        let get = || PAGES.with(|pages| pages.get(page, &mut DirectMap, &mut ImageFrames));
-        let (phys, fresh) = get().or_else(|| drop_images().then(get).flatten())?;
+        let share = || PAGES.with(|pages| pages.share(page, &mut DirectMap, &mut ImageFrames));
+        let shared = match share() {
+            Share::OutOfMemory if drop_images() => share(),
+            shared => shared,
+        };
+        let (phys, fresh) = match shared {
+            Share::Kept(phys, fresh) => (phys, fresh),
+            // Not kept (no room, or a count that is full): a copy from the
+            // cell's frames, counted in its quota.
+            Share::Own => (own_copy(page, mem, frames)?, true),
+            Share::OutOfMemory => return None,
+        };
         if fresh {
             <Self as FilePages<DirectMap, A>>::code(self, phys);
         }
@@ -325,8 +337,9 @@ impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
     }
 }
 
-/// Drops every image kept loaded and every file page kept; returns whether
-/// there was one. Pages that cells still share stay theirs.
+/// Drops every image kept loaded and every file page kept whose dropping
+/// frees memory (design D3 of `close-cross-cell-leaks`); returns whether
+/// there was one. Pages that cells map stay kept.
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "also used by in-kernel tests")
@@ -344,7 +357,16 @@ pub fn drop_images() -> bool {
         }
         any
     });
-    PAGES.with(|pages| pages.clear(&mut ImageFrames)) || any
+    PAGES.with(|pages| pages.trim(&mut ImageFrames)) || any
+}
+
+/// File pages kept now.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn kept_pages() -> usize {
+    PAGES.with(|pages| pages.len())
 }
 
 /// Whether cells may take `bytes` more, dropping the images kept loaded if
@@ -558,11 +580,10 @@ impl Services for KernelServices<'_> {
         cells_may_take(bytes)
     }
 
-    fn memory(&mut self) -> (u64, u64) {
-        memory::with_frames(|f| (f.usable_frames() as u64, f.free_frames() as u64))
-            .map_or((0, 0), |(total, free)| {
-                (total * FRAME_SIZE, free * FRAME_SIZE)
-            })
+    /// The frames cells may have, fixed at boot: nothing another cell does
+    /// changes it (design D1 of `close-cross-cell-leaks`).
+    fn memory(&mut self) -> u64 {
+        memory::with_frames(|f| f.usable_frames() as u64).unwrap_or(0) * FRAME_SIZE
     }
 
     fn save_fp(&mut self, fp: &mut FpState) {

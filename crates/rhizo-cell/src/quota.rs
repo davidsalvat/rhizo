@@ -167,6 +167,10 @@ impl<A: Frames> Frames for Metered<'_, A> {
     fn is_shared(&self, phys: u64) -> bool {
         self.frames.is_shared(phys)
     }
+
+    fn metered(&self) -> Option<(u64, u64)> {
+        Some((self.meter.used(), self.meter.limit()))
+    }
 }
 
 #[cfg(test)]
