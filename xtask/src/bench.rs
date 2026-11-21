@@ -62,6 +62,8 @@ pub struct Options {
     pub llm_delay_ms: u32,
     /// Cells the server workload aims for.
     pub cells: u16,
+    /// Virtual CPUs of the server VM (1 for the stored figures).
+    pub cpus: u32,
 }
 
 impl Default for Options {
@@ -83,6 +85,7 @@ impl Default for Options {
             soak: false,
             llm_delay_ms: 0,
             cells: 10_000,
+            cpus: 1,
         }
     }
 }
@@ -148,8 +151,22 @@ impl Options {
                         .filter(|&n| n > 0)
                         .ok_or("--cells needs a number from 1 to 65535")?;
                 }
+                "--cpus" => {
+                    o.cpus = value("--cpus")?
+                        .parse()
+                        .ok()
+                        .filter(|n| (1..=crate::SMP_CPUS).contains(n))
+                        .ok_or(format!(
+                            "--cpus needs a number from 1 to {}",
+                            crate::SMP_CPUS
+                        ))?;
+                }
                 other => return Err(format!("unknown bench option `{other}`")),
             }
+        }
+        if o.cpus != 1 && (o.check || o.update_baseline) {
+            // The baselines hold the server run on 1 CPU.
+            return Err("--cpus is for local runs: not with --check or --update-baseline".into());
         }
         Ok(o)
     }
@@ -2530,6 +2547,8 @@ mod tests {
             "500",
             "--llm-delay-ms",
             "250",
+            "--cpus",
+            "4",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -2537,8 +2556,15 @@ mod tests {
         let o = Options::parse(&args).unwrap();
         assert_eq!(o.workload, Some(Only::Server));
         assert!(o.soak);
-        assert_eq!((o.cells, o.llm_delay_ms), (500, 250));
-        for bad in [["--workload", "phone"], ["--cells", "0"]] {
+        assert_eq!((o.cells, o.llm_delay_ms, o.cpus), (500, 250, 4));
+        assert_eq!(Options::default().cpus, 1);
+        for bad in [
+            &["--workload", "phone"][..],
+            &["--cells", "0"],
+            &["--cpus", "0"],
+            &["--cpus", "5"],
+            &["--cpus", "4", "--check"],
+        ] {
             let bad: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
             assert!(Options::parse(&bad).is_err(), "{bad:?}");
         }
