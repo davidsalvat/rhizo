@@ -259,6 +259,17 @@ pub fn read_cmdline<'b>(mem: &impl PhysicalMemory, start_info: u64, buf: &'b mut
     &buf[..len]
 }
 
+/// The value of the last non-empty `selfcheck=NAME` of `cmdline` (which may
+/// end in NUL padding): the harness self-check an in-kernel test build runs
+/// instead of its tests (spec `kernel-testing`). Read apart from
+/// [`BootOptions`], so builds without tests never parse it.
+pub fn self_check(cmdline: &[u8]) -> Option<&[u8]> {
+    cmdline
+        .split(|&b| b.is_ascii_whitespace() || b == 0)
+        .filter_map(|word| word.strip_prefix(b"selfcheck="))
+        .rfind(|name| !name.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +313,27 @@ mod tests {
         ] {
             assert_eq!(BootOptions::parse(bad).smp, None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn self_check_names_one_check() {
+        assert_eq!(self_check(b""), None);
+        assert_eq!(self_check(b"console=e9 shard=0/2"), None);
+        assert_eq!(self_check(b"selfcheck="), None);
+        assert_eq!(self_check(b"xselfcheck=hang"), None);
+        assert_eq!(
+            self_check(b"console=e9 selfcheck=page-fault exit=psci"),
+            Some(&b"page-fault"[..])
+        );
+        assert_eq!(
+            self_check(b"selfcheck=hang selfcheck=oom selfcheck="),
+            Some(&b"oom"[..])
+        );
+        assert_eq!(
+            self_check(b"exit=psci selfcheck=hang\0\0\0"),
+            Some(&b"hang"[..])
+        );
+        assert_eq!(BootOptions::parse(b"selfcheck=oom"), BootOptions::default());
     }
 
     #[test]

@@ -16,11 +16,12 @@ Pick the cheapest level that can observe the behavior:
 2. **In-kernel test** (seconds): needs real page tables, CPU state or
    devices. Add a `fn` to `kernel/src/tests.rs` and list it in the `suite!`
    macro. Run: `cargo xtask test --only ktest`.
-3. **Self-check** (a run that must fail in a precise way): add a
-   `ktest-<name>` feature in `kernel/Cargo.toml`, a `suite!(<case>)` entry in
-   `kernel/src/tests.rs`, and a row in `SELF_CHECKS` in `xtask/src/main.rs`
-   with the expected result and output. Run:
-   `cargo xtask test --only ktest-<name>`.
+3. **Self-check** (a run that must fail in a precise way): the test kernel
+   runs one when booted with `selfcheck=<name>`, so it needs no build of its
+   own. Add a `("<name>", self_check!(<case>))` row to `SELF_CHECKS` in
+   `kernel/src/tests.rs`, and a row to `SELF_CHECKS` in `xtask/src/lib.rs`
+   (step `ktest-<name>`, option `<name>`) with the expected result and
+   output. Run: `cargo xtask test --only ktest-<name>`.
 
 Test observable behavior through public interfaces. Never weaken, skip or
 delete a test to make it pass; if the spec changed, change the spec first.

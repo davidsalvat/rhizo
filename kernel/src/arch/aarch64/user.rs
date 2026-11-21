@@ -531,7 +531,7 @@ pub fn sync_code(virt: u64, len: u64) {
 
 /// Loads the lower-half table `root` in `TTBR0_EL1`, untagged: for the
 /// self-checks that touch a user page from the kernel.
-#[cfg(any(feature = "ktest-user-read", feature = "ktest-user-exec"))]
+#[cfg(feature = "ktest")]
 pub fn load_tables(root: u64) {
     set_user_root(root, 0);
 }

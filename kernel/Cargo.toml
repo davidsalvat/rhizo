@@ -19,20 +19,11 @@ bench = false
 # alone): the cell host, preemption, the other CPUs and the network card.
 cells = []
 # Test build: run the in-kernel test suite instead of the normal boot path
-# (with cost accounting and sampling built in, which it tests).
+# (with cost accounting and sampling built in, which it tests), or, with
+# `selfcheck=NAME` on its command line, one harness self-check that must
+# fail in a precise way (`cargo xtask test`, change `fewer-kernel-builds`).
+# Test code stays behind this one feature: no other build contains it.
 ktest = ["cells", "sampling"]
-# Harness self-checks used by `cargo xtask test`: each adds one failing test
-# to prove panics, hangs, exceptions and out-of-memory are detected.
-ktest-should-panic = ["ktest"]
-ktest-hang = ["ktest"]
-ktest-page-fault = ["ktest"]
-ktest-stack-overflow = ["ktest"]
-ktest-invalid-opcode = ["ktest"]
-ktest-oom = ["ktest"]
-# Self-checks of the guards on user memory (SMAP/PAN, SMEP/PXN): the kernel
-# reading, then executing, a user page must fault.
-ktest-user-read = ["ktest"]
-ktest-user-exec = ["ktest"]
 # Node.js builds (change `add-node-workload`): embed `node-files` (over
 # 100 MiB, so only here); with `ktest`, run the Node.js tests only, with
 # `bench-cell`, measure the Node.js workload only. Their VMs get more memory.

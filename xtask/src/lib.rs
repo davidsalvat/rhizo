@@ -294,6 +294,7 @@ impl RunArgs {
             memory_mib: vmm::DEFAULT_MEMORY_MIB,
             bench: None,
             shard: None,
+            selfcheck: None,
             control: false,
         }
     }
@@ -366,7 +367,7 @@ fn test_steps() -> Vec<&'static str> {
         "ktest-packages",
         "control",
     ];
-    steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
+    steps.extend(SELF_CHECKS.iter().map(|c| c.step));
     steps
 }
 
@@ -418,10 +419,15 @@ fn cmd_test(args: &RunArgs) -> Result {
             args.reproduce("boot"),
         ));
     }
-    let ktest =
-        || -> Result<PathBuf> { keep_kernel("ktest", &build_kernel(Profile::Debug, &["ktest"])?) };
-    let ktest_kernel = if args.wants("ktest") || args.wants("ktest-smp") {
-        Some(ktest()?)
+    // One test kernel runs the suite, on one CPU and on several, and every
+    // self-check, chosen at boot (change `fewer-kernel-builds`).
+    let self_checks: Vec<&SelfCheck> = SELF_CHECKS.iter().filter(|c| args.wants(c.step)).collect();
+    let ktest_kernel = if args.wants("ktest") || args.wants("ktest-smp") || !self_checks.is_empty()
+    {
+        Some(keep_kernel(
+            "ktest",
+            &build_kernel(Profile::Debug, &["ktest"])?,
+        )?)
     } else {
         None
     };
@@ -517,24 +523,22 @@ fn cmd_test(args: &RunArgs) -> Result {
             },
         });
     }
-    for check in SELF_CHECKS.iter().filter(|c| args.wants(c.feature)) {
-        let kernel = keep_kernel(
-            check.feature,
-            &build_kernel(Profile::Debug, &[check.feature])?,
-        )?;
+    for check in self_checks {
+        let Some(kernel) = &ktest_kernel else { break };
         let limit = check
             .timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(timeout);
         jobs.push(Job::vm(
             format!("self-check: {}", check.description),
-            kernel,
+            kernel.clone(),
             RunOptions {
                 timeout: limit,
+                selfcheck: Some(check.option),
                 ..opts
             },
             Check::Fails(check),
-            args.reproduce(check.feature),
+            args.reproduce(check.step),
         ));
     }
     run_jobs(args.vmm, &jobs, parallel)
@@ -879,7 +883,7 @@ fn verify(vmm: Vmm, check: Check, reproduce: &str, run: &VmRun) -> Result {
             check_vm(
                 run.result == check.expected,
                 vm_check(
-                    format!("{} must end with {:?}", check.feature, check.expected),
+                    format!("{} must end with {:?}", check.step, check.expected),
                     format!("{:?}", check.expected),
                 ),
                 run,
@@ -888,7 +892,7 @@ fn verify(vmm: Vmm, check: Check, reproduce: &str, run: &VmRun) -> Result {
                 check_vm(
                     run.output.contains(needle),
                     vm_check(
-                        format!("{} output must contain `{needle}`", check.feature),
+                        format!("{} output must contain `{needle}`", check.step),
                         format!("output containing `{needle}`"),
                     ),
                     run,
@@ -1044,17 +1048,14 @@ fn cmd_ci() -> Result {
         "warnings",
     ])?;
 
-    let features = [""]
-        .into_iter()
-        .chain([
-            "ktest",
-            "bench-cell",
-            "bench-cell,profile",
-            "control",
-            "ktest,packages",
-            "bench-cell,packages",
-        ])
-        .chain(SELF_CHECKS.iter().map(|c| c.feature));
+    let features = [""].into_iter().chain([
+        "ktest",
+        "bench-cell",
+        "bench-cell,profile",
+        "control",
+        "ktest,packages",
+        "bench-cell,packages",
+    ]);
     step("clippy (cells)");
     cargo(&[
         "clippy",
@@ -1130,9 +1131,12 @@ fn cmd_ci() -> Result {
     )
 }
 
-/// A kernel build that must fail in a specific, detectable way.
+/// A run of the test kernel that must fail in a specific, detectable way.
 struct SelfCheck {
-    feature: &'static str,
+    /// The step of `test --only`.
+    step: &'static str,
+    /// What the kernel's `selfcheck=` names.
+    option: &'static str,
     description: &'static str,
     expected: VmResult,
     /// Overrides the test timeout (for checks that expect a timeout).
@@ -1154,7 +1158,8 @@ impl SelfCheck {
 
 const SELF_CHECKS: &[SelfCheck] = &[
     SelfCheck {
-        feature: "ktest-should-panic",
+        step: "ktest-should-panic",
+        option: "should-panic",
         description: "a panicking test fails the run",
         expected: VmResult::Failed,
         timeout_secs: None,
@@ -1166,7 +1171,8 @@ const SELF_CHECKS: &[SelfCheck] = &[
         output_aarch64: None,
     },
     SelfCheck {
-        feature: "ktest-hang",
+        step: "ktest-hang",
+        option: "hang",
         description: "a hanging test times out",
         expected: VmResult::TimedOut,
         timeout_secs: Some(HANG_CHECK_TIMEOUT_SECS),
@@ -1174,7 +1180,8 @@ const SELF_CHECKS: &[SelfCheck] = &[
         output_aarch64: None,
     },
     SelfCheck {
-        feature: "ktest-page-fault",
+        step: "ktest-page-fault",
+        option: "page-fault",
         description: "a null write is reported as a page fault",
         expected: VmResult::Failed,
         timeout_secs: None,
@@ -1188,7 +1195,8 @@ const SELF_CHECKS: &[SelfCheck] = &[
         ]),
     },
     SelfCheck {
-        feature: "ktest-stack-overflow",
+        step: "ktest-stack-overflow",
+        option: "stack-overflow",
         description: "stack exhaustion is reported, not a silent reset",
         expected: VmResult::Failed,
         timeout_secs: None,
@@ -1199,7 +1207,8 @@ const SELF_CHECKS: &[SelfCheck] = &[
         ]),
     },
     SelfCheck {
-        feature: "ktest-invalid-opcode",
+        step: "ktest-invalid-opcode",
+        option: "invalid-opcode",
         description: "an invalid instruction is reported",
         expected: VmResult::Failed,
         timeout_secs: None,
@@ -1207,7 +1216,8 @@ const SELF_CHECKS: &[SelfCheck] = &[
         output_aarch64: Some(&["EXCEPTION: undefined instruction (class 0x0"]),
     },
     SelfCheck {
-        feature: "ktest-oom",
+        step: "ktest-oom",
+        option: "oom",
         description: "an impossible allocation panics with its size",
         expected: VmResult::Failed,
         timeout_secs: None,
@@ -1218,7 +1228,8 @@ const SELF_CHECKS: &[SelfCheck] = &[
         output_aarch64: None,
     },
     SelfCheck {
-        feature: "ktest-user-read",
+        step: "ktest-user-read",
+        option: "user-read",
         description: "the kernel reading a user page faults (SMAP, PAN)",
         expected: VmResult::Failed,
         timeout_secs: None,
@@ -1232,7 +1243,8 @@ const SELF_CHECKS: &[SelfCheck] = &[
         ]),
     },
     SelfCheck {
-        feature: "ktest-user-exec",
+        step: "ktest-user-exec",
+        option: "user-exec",
         description: "the kernel executing a user page faults (SMEP, PXN)",
         expected: VmResult::Failed,
         timeout_secs: None,

@@ -111,6 +111,7 @@ pub fn run_options(accel: Accel, cpus: u32, memory_mib: u32) -> RunOptions {
         memory_mib,
         bench: None,
         shard: None,
+        selfcheck: None,
         control: true,
     }
 }

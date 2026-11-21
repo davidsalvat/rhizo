@@ -17,16 +17,6 @@ use rhizo_mm::paging::PageFlags;
 /// Builds a harness self-check: one passing case, then the case the harness
 /// must catch. A self-check proves the harness, not the suite (which runs on
 /// its own), so it stays short however long the suite grows.
-#[cfg(any(
-    feature = "ktest-should-panic",
-    feature = "ktest-hang",
-    feature = "ktest-page-fault",
-    feature = "ktest-stack-overflow",
-    feature = "ktest-invalid-opcode",
-    feature = "ktest-oom",
-    feature = "ktest-user-read",
-    feature = "ktest-user-exec",
-))]
 macro_rules! self_check {
     ($extra:path) => {
         &[ktest_case!(console_output_works), ktest_case!($extra)]
@@ -184,18 +174,7 @@ macro_rules! suite {
     };
 }
 
-#[cfg(not(any(
-    feature = "ktest-should-panic",
-    feature = "ktest-hang",
-    feature = "ktest-page-fault",
-    feature = "ktest-stack-overflow",
-    feature = "ktest-invalid-opcode",
-    feature = "ktest-oom",
-    feature = "ktest-user-read",
-    feature = "ktest-user-exec",
-    feature = "node",
-    feature = "packages",
-)))]
+#[cfg(not(any(feature = "node", feature = "packages")))]
 /// Every in-kernel test case, in execution order.
 pub static ALL: &[TestCase] = suite!();
 
@@ -220,54 +199,50 @@ pub static ALL: &[TestCase] = &[
     ktest_case!(a_cell_that_imported_numpy_suspends_resumes_and_forks),
 ];
 
-/// In self-check builds the regular suite is compiled but not run (it runs
-/// in the `ktest` build): referenced here so it keeps compiling everywhere.
-#[cfg(any(
-    feature = "ktest-should-panic",
-    feature = "ktest-hang",
-    feature = "ktest-page-fault",
-    feature = "ktest-stack-overflow",
-    feature = "ktest-invalid-opcode",
-    feature = "ktest-oom",
-    feature = "ktest-user-read",
-    feature = "ktest-user-exec",
-    feature = "node",
-    feature = "packages",
-))]
+/// In the Node.js and package builds the regular suite is compiled but not
+/// run (it runs in the plain `ktest` build): referenced here so it keeps
+/// compiling everywhere.
+#[cfg(any(feature = "node", feature = "packages"))]
 #[allow(dead_code, reason = "the suite runs in the regular `ktest` build")]
 static SUITE: &[TestCase] = suite!();
 
-/// Harness self-check: a test that panics.
-#[cfg(feature = "ktest-should-panic")]
-pub static ALL: &[TestCase] = self_check!(deliberate_panic);
+/// The harness self-checks, by the name `selfcheck=NAME` gives at boot
+/// (spec `kernel-testing`): each proves that one kind of failure ends the
+/// run and is reported, so the test build runs one instead of its suite.
+static SELF_CHECKS: &[(&str, &[TestCase])] = &[
+    // A test that panics.
+    ("should-panic", self_check!(deliberate_panic)),
+    // A test that never finishes.
+    ("hang", self_check!(hang_forever)),
+    // A write to address 0 must be reported as a page fault.
+    ("page-fault", self_check!(write_to_null)),
+    // Stack exhaustion must be reported as a double fault.
+    ("stack-overflow", self_check!(overflow_the_stack)),
+    // An invalid instruction must be reported.
+    ("invalid-opcode", self_check!(execute_invalid_opcode)),
+    // An impossible allocation must panic with its size.
+    ("oom", self_check!(allocate_too_much)),
+    // The kernel reading a user page must fault (SMAP, PAN).
+    ("user-read", self_check!(kernel_reads_a_user_page)),
+    // The kernel executing a user page must fault (SMEP, PXN).
+    ("user-exec", self_check!(kernel_executes_a_user_page)),
+];
 
-/// Harness self-check: a test that never finishes.
-#[cfg(feature = "ktest-hang")]
-pub static ALL: &[TestCase] = self_check!(hang_forever);
-
-/// Self-check: a write to address 0 must be reported as a page fault.
-#[cfg(feature = "ktest-page-fault")]
-pub static ALL: &[TestCase] = self_check!(write_to_null);
-
-/// Self-check: stack exhaustion must be reported as a double fault.
-#[cfg(feature = "ktest-stack-overflow")]
-pub static ALL: &[TestCase] = self_check!(overflow_the_stack);
-
-/// Self-check: an invalid instruction must be reported.
-#[cfg(feature = "ktest-invalid-opcode")]
-pub static ALL: &[TestCase] = self_check!(execute_invalid_opcode);
-
-/// Self-check: an impossible allocation must panic with its size.
-#[cfg(feature = "ktest-oom")]
-pub static ALL: &[TestCase] = self_check!(allocate_too_much);
-
-/// Self-check: the kernel reading a user page must fault (SMAP, PAN).
-#[cfg(feature = "ktest-user-read")]
-pub static ALL: &[TestCase] = self_check!(kernel_reads_a_user_page);
-
-/// Self-check: the kernel executing a user page must fault (SMEP, PXN).
-#[cfg(feature = "ktest-user-exec")]
-pub static ALL: &[TestCase] = self_check!(kernel_executes_a_user_page);
+/// The test cases this boot runs: the self-check `selfcheck=NAME` of the
+/// command line `cmdline` (NUL-padded) names, otherwise [`ALL`]. An unknown
+/// name fails the run.
+pub fn chosen(cmdline: &[u8]) -> &'static [TestCase] {
+    let Some(name) = rhizo_core::options::self_check(cmdline) else {
+        return ALL;
+    };
+    match SELF_CHECKS.iter().find(|(n, _)| n.as_bytes() == name) {
+        Some(&(_, cases)) => cases,
+        None => panic!(
+            "unknown self-check `{}`",
+            core::str::from_utf8(name).unwrap_or("?")
+        ),
+    }
+}
 
 // --- H0 tests ---------------------------------------------------------------
 
@@ -595,12 +570,10 @@ fn every_cpu_flushes_between_runs() {
 
 // --- Self-checks ------------------------------------------------------------
 
-#[cfg(feature = "ktest-should-panic")]
 fn deliberate_panic() {
     panic!("deliberate panic to check failure reporting");
 }
 
-#[cfg(feature = "ktest-hang")]
 fn hang_forever() {
     loop {
         core::hint::spin_loop();
@@ -610,7 +583,6 @@ fn hang_forever() {
 /// Maps a page as a cell's (user, readable, executable, holding a `ret`)
 /// at `0x40_0000` in a fresh lower half, loads that half, and returns the
 /// page's address: what a stray kernel pointer into a cell would reach.
-#[cfg(any(feature = "ktest-user-read", feature = "ktest-user-exec"))]
 fn load_a_user_page() -> u64 {
     use crate::arch::platform::Format;
     use rhizo_mm::paging::{PageSize, PageTable};
@@ -640,7 +612,6 @@ fn load_a_user_page() -> u64 {
     PAGE
 }
 
-#[cfg(feature = "ktest-user-read")]
 fn kernel_reads_a_user_page() {
     let page = load_a_user_page() as *const u64;
     // SAFETY: deliberately outside the user-access helpers; the guard must
@@ -649,7 +620,6 @@ fn kernel_reads_a_user_page() {
     panic!("the kernel read a user page: {value:#x}");
 }
 
-#[cfg(feature = "ktest-user-exec")]
 fn kernel_executes_a_user_page() {
     let page = load_a_user_page();
     // SAFETY: deliberately invalid: the page holds a `ret`, which the guard
@@ -659,14 +629,12 @@ fn kernel_executes_a_user_page() {
     panic!("the kernel executed a user page");
 }
 
-#[cfg(feature = "ktest-page-fault")]
 fn write_to_null() {
     let null = core::hint::black_box(0usize) as *mut u64;
     // SAFETY: deliberately invalid; the resulting page fault ends the run.
     unsafe { null.write_volatile(1) };
 }
 
-#[cfg(feature = "ktest-stack-overflow")]
 fn overflow_the_stack() {
     #[allow(unconditional_recursion)]
     fn recurse(depth: u64) -> u64 {
@@ -676,12 +644,10 @@ fn overflow_the_stack() {
     core::hint::black_box(recurse(0));
 }
 
-#[cfg(feature = "ktest-invalid-opcode")]
 fn execute_invalid_opcode() {
     arch::cpu::execute_invalid_instruction();
 }
 
-#[cfg(feature = "ktest-oom")]
 fn allocate_too_much() {
     let v: Vec<u8> = Vec::with_capacity(1 << 40);
     core::hint::black_box(v);

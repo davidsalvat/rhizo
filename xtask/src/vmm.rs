@@ -334,6 +334,9 @@ pub struct RunOptions {
     pub bench: Option<Bench>,
     /// The share of the in-kernel tests this VM runs (`shard=I/N`).
     pub shard: Option<(u16, u16)>,
+    /// The harness self-check a test kernel runs instead of its tests
+    /// (`selfcheck=NAME`, change `fewer-kernel-builds`).
+    pub selfcheck: Option<&'static str>,
     /// A control kernel (spec `control-plane`): its console is the serial
     /// line, both ways, on the VMM's standard input and output, also where
     /// the kernel would otherwise use a debug port.
@@ -350,11 +353,12 @@ fn rhizo_args(vmm: Vmm, kvm: bool, opts: &RunOptions) -> String {
     }
 }
 
-/// The `shard=I/N` option for a Rhizo command line, if any.
-fn shard_arg(opts: &RunOptions) -> String {
-    opts.shard
-        .map(|(i, n)| format!(" shard={i}/{n}"))
-        .unwrap_or_default()
+/// The `shard=I/N` and `selfcheck=NAME` options for a Rhizo command line,
+/// if any.
+fn test_args(opts: &RunOptions) -> String {
+    let shard = opts.shard.map(|(i, n)| format!(" shard={i}/{n}"));
+    let check = opts.selfcheck.map(|name| format!(" selfcheck={name}"));
+    shard.unwrap_or_default() + &check.unwrap_or_default()
 }
 
 /// Parses `rhizo-ready cycles=<n>` from console output.
@@ -466,7 +470,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(vmm);
             }
-            args += &shard_arg(opts);
+            args += &test_args(opts);
             cmd.arg("-kernel").arg(kernel).args(["-append", &args]);
         }
         Guest::ReferenceLinux { kernel, initramfs } => {
@@ -513,7 +517,7 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
         args += &bench.cmdline(Vmm::Firecracker);
     }
     if matches!(guest, Guest::Rhizo(_)) {
-        args += &shard_arg(opts);
+        args += &test_args(opts);
     }
     let initrd_json = match &initrd {
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
@@ -558,7 +562,7 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(Vmm::CloudHypervisor);
             }
-            args += &shard_arg(opts);
+            args += &test_args(opts);
             cmd.arg("--kernel").arg(kernel).args(["--cmdline", &args]);
             if arch::current() == Arch::X86_64 && !opts.control {
                 cmd.args(["--serial", "off", "--debug-console", "tty"]);

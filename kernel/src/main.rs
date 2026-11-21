@@ -73,8 +73,11 @@ pub extern "C" fn kernel_main(boot_arg: u64, entry_cycles: u64) -> ! {
     rhizo_core::boot::report_cpus(&mut console, cell::init(options.smp));
 
     #[cfg(feature = "ktest")]
-    let status =
-        rhizo_core::ktest::run(&mut console, &[tests::ALL, arch::tests::ALL], options.shard);
+    let status = rhizo_core::ktest::run(
+        &mut console,
+        &[tests::chosen(&cmdline), arch::tests::ALL],
+        options.shard,
+    );
 
     #[cfg(feature = "bench-cell")]
     cell::bench(&mut console);
