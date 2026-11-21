@@ -10,7 +10,7 @@
 - [x] 2.2 `DATA_MAX` of 256 MiB and `KEPT_PAGES` of 65536 (D3); verify `cargo test -p rhizo-fs file_data_is_limited_per_cell` and `cargo xtask check`
 - [x] 2.3 Feature `node` (`kernel/build.rs` embeds `node-files` only there; with `ktest` the Node.js suite alone), `node_files`, in-kernel tests `node_answers_as_on_linux` and `a_node_cell_suspends_resumes_and_forks` (D4), step `ktest-node` (1 GiB, 2 CPUs) in `xtask`; verify `RHIZO_NODE=1 cargo xtask test --only ktest-node` on x86_64 and on AArch64 (QEMU)
 
-- [x] 2.4 `CNTKCTL_EL1` set to `EL0VCTEN` on every CPU (D8), the `ticks` test cell in `cells/expected.rs` and `a_cell_reads_the_counter` in both architectures' tests; verify `RHIZO_NODE=1 cargo xtask --arch aarch64 test --only ktest-node` fails without it (system register trap) and passes with it
+- [x] 2.4 `CNTKCTL_EL1` set to `EL0VCTEN` on every CPU (D8), the `ticks` test cell in `cells/expected.rs` and `a_cell_reads_the_counter` in both architectures' tests; verify `RHIZO_NODE=1 cargo xtask --arch aarch64 test --only ktest-node` fails without it (system register trap) and passes with it; the PMU sampler stopped on every CPU (D8), so the test also passes after the shared suite: verify `cargo xtask --arch aarch64 test --only ktest-smp`
 
 ## 3. Benchmarks
 

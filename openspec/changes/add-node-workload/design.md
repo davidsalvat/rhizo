@@ -191,6 +191,16 @@ the counter's value under the kernel's control (a per-cell offset across
 suspend), but costs a trap per read on a path libraries use because it is
 cheap, and nothing needs that offset.
 
+Its test, the first arch test to run a cell, ran after the shared suite's
+last test (`samples_show_where_a_cell_spins`) and hung on four CPUs: the
+sampler's period is one global, and stopping it on the boot CPU cleared
+it first, so the other CPUs' `stop_sampling` returned early and left their
+counter counting and its overflow interrupt on. The next cell to run on
+such a CPU overflowed it, and the interrupt fired without end (nothing
+cleared the overflow), so that CPU never came back from its run. Each CPU
+now disables its own counter and interrupt whatever the shared period
+says, on both architectures.
+
 ## D7. Known limits
 
 Every thread stack Node.js creates (six of 8 MiB, reserved with
