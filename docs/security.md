@@ -1017,8 +1017,7 @@ from an edited line on, recompute every hash and `head`, and `verify`
 passes; deleting the whole directory removes the log. The kernel's
 sequence numbers and drop counts make records missing from a live
 session visible only if the rest of that session was not rewritten to
-match. Records come only from the kernel, so a host that rewrites the log
-lies about the past but cannot make the kernel's live state agree.
+match.
 
 **Mitigation, not built.** Forward the files as they are written
 (journald, syslog, a SIEM), and export `head` to an append-only sink
