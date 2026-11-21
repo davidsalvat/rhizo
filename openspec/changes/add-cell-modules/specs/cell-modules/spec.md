@@ -56,6 +56,58 @@ of its parent's.
 - **WHEN** an agent gives its child a policy naming a module its own policy lacks
 - **THEN** the child's creation is refused
 
+### Requirement: Module children start with nothing
+A module child SHALL get an empty module policy (no entries, a zero
+budget) and a kernel endpoint without the `spawn` right unless the add
+request delegates a policy to it. Every `add` it sends with that empty
+policy SHALL be refused with `EACCES`, make no cell, and leave an audit
+record.
+
+#### Scenario: Module asks the kernel
+- **WHEN** a module child added without delegation sends `add` for `python` on its kernel endpoint
+- **THEN** it is refused with `EACCES`, no cell is made, the agent's module budget is unchanged, and the audit log records the refusal
+
+### Requirement: The agent adds siblings for its modules
+A module child SHALL get further capabilities only through its agent:
+the agent MAY add the module as its own child, a sibling of the
+requester, carved from its own module budget, and pass the requester a
+handle to it derived with fewer rights over the channel joining them.
+
+#### Scenario: Sibling with a message-only handle
+- **WHEN** a module asks its agent for `documents` over their channel, and the agent adds it and passes a cell handle derived with only the `message` right
+- **THEN** the new module is the agent's child, the requester opens a channel to it through that handle, and observing, writing input to or controlling it fails with `EACCES`
+
+### Requirement: Delegated module policies
+An add request MAY delegate a module policy to the module: entries each
+within one of the delegator's (version prefix at least as long, caps no
+higher, `ask` kept, `egress = "granted"` only where the delegator's has
+it) and a budget slice carved from what is left of the delegator's
+module budget. The module's own adds SHALL then make its children under
+the same rules, the tree depth limit and the approver rules.
+
+#### Scenario: Grandchild within the slice
+- **WHEN** an agent adds `coder` delegating entries `python` and `numpy` with a budget of two children and 512 MiB, and `coder` adds `python`, `numpy`, then a third module
+- **THEN** `python` and `numpy` run as children of `coder`, the third is refused with `EDQUOT`, and the agent's budget shows the whole slice taken
+
+### Requirement: Delegation never exceeds the delegator
+The kernel SHALL refuse, making nothing, a delegation naming a module
+absent from the delegator's policy or a looser entry (`EACCES`), a budget
+over what is left of the delegator's (`EDQUOT`), or `egress = "granted"`
+the delegator lacks (`EACCES`). Each delegation SHALL be an audit record
+and SHALL show in `rhizo ps --tree`.
+
+#### Scenario: Delegations past the delegator
+- **WHEN** an agent with egress `model` and 512 MiB of module budget left delegates an entry for `requests` it lacks, a 1 GiB slice, and `egress = "granted"` on an entry whose own lacks it
+- **THEN** each add is refused with its reason, no cell is made, and the agent's budget is unchanged
+
+#### Scenario: Delegated module asks past its egress
+- **WHEN** a delegated module with egress `none` adds a module whose manifest requests egress `model`
+- **THEN** the add is refused and no grandchild is made
+
+#### Scenario: Delegation is visible
+- **WHEN** an agent delegates a policy to a module
+- **THEN** the audit log records the delegated entries and budget, and `rhizo ps --tree` shows them on the module
+
 ### Requirement: A module never widens egress
 A module child's egress SHALL be the intersection of what its manifest
 requests, what its entry grants, and its parent's egress. Adding a module

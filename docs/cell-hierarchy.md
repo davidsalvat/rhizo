@@ -300,6 +300,29 @@ agent ◄── /run/rhizo/chan/np ── child cell (copy of python+numpy templ
   grants no internet access.**
 - **A root agent's sensitive modules always wait for the operator.** No
   policy can make them automatic.
+- **A module child starts with nothing**: an empty module policy and no
+  `spawn` right, so an `add` it sends is refused with `EACCES`. Modules
+  run model-generated code and are the least trusted cells. When one
+  needs another capability, it asks its agent over their channel. The
+  agent, which sees the whole task, decides; if it agrees, it adds the
+  module as its own child, a sibling of the requester, and may pass the
+  requester an attenuated handle (message only). The tree stays flat and
+  the budget stays whole. **Delegation is opt-in**: an orchestrator-style
+  agent may give a module a subset of its whitelist and a slice of its
+  module budget, and the module's adds become the agent's grandchildren.
+  At every level budgets are carved from the parent, egress never exceeds
+  the parent's, sensitive modules wait for the parent or the operator,
+  and the depth limit of 16 holds. Each delegation is audited and shown
+  by `rhizo ps --tree`.
+
+  ```text
+  default: the module asks its agent      opt-in: the agent delegates
+  agent                                   agent
+  ├── browser ─ "need documents" ─► agent └── coder   (delegated: python,
+  │      ◄─ cell/docs, message only                    numpy; 2 children)
+  └── docs     (added by the agent)           ├── python   (grandchild)
+                                              └── numpy    (grandchild)
+  ```
 - **The catalogue holds only signed modules.** They are snapshot files
   plus a manifest, signed with minisign (Ed25519).
 - **Key management.**
@@ -358,6 +381,9 @@ production, not just the proof of concept**:
 7. **The builder's package proxy:** Rhizo ships its own minimal proxy
    that enforces the lockfile's allowlist and checks pinned hashes.
 8. **The static chat agent:** the default of `rhizo chat` once it exists.
+9. **What a module child gets:** an empty module policy and no `spawn`
+   right; it asks its agent, which adds a sibling. Delegation of a
+   subset of the agent's whitelist and budget is opt-in.
 
 The production requirements that came with these decisions are:
 
