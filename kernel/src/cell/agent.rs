@@ -86,46 +86,51 @@ pub fn agent(
         suspend_resume_ns: Vec::new(),
         fork_ns: 0,
     };
-    // Its turns: after each, it prints the turn's line and pauses briefly;
-    // the host suspends and resumes it once the line is out (a pause of a
-    // millisecond can pass unseen on a loaded host, so the host does not
-    // wait for it). At its decision point it waits, asleep, for `/branch`.
-    let mut seen = 0;
+    // Its turns: after each, it prints the turn's line and pauses briefly,
+    // and the host suspends and resumes it once it has read the line. The
+    // host reads the output between slices only, and the pause can end
+    // inside a slice (on a loaded host): the last turn's line then comes
+    // with the decision point, so every line counts, not only the last
+    // (design D1 of `fix-agent-turn-race`). At its decision point it waits,
+    // asleep, for `/branch`.
+    let mut watch = rhizo_core::agent::Watch::default();
+    let (mut read, mut turns, mut forked) = (0, 0, false);
     loop {
-        let printed = |host: &mut Host, id: u32| {
-            host.output(id)
-                .is_some_and(|o| o.len() > seen && o.ends_with(b"\n"))
-        };
-        let turn_done = |host: &mut Host, id: u32| {
-            host.output(id).is_some_and(|o| {
-                let body = &o[..o.len() - 1];
-                let start = body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-                body[start..].starts_with(b"turn ")
-            })
-        };
-        while !(printed(host, id) && (host.asleep(id) || turn_done(host, id))) {
-            if host.finished(id).is_some() || now_ns() > end {
-                return Err(said(host, id));
+        let seen = host.output(id).map_or(Default::default(), |o| {
+            let seen = watch.read(&o[read..]);
+            read = o.len();
+            seen
+        });
+        forked |= seen.fork;
+        turns += seen.turns;
+        if let Some(mode) = mode
+            && seen.turns > 0
+        {
+            if seen.turns > 1 {
+                return Err(format!(
+                    "turns {} to {turns} ended before the host looked",
+                    turns + 1 - seen.turns
+                ));
             }
-            host.step();
+            let t0 = Counter.cycles();
+            let snapshot = host.suspend(id).ok_or("cannot suspend the agent")?;
+            let resumed = host.resume(snapshot, mode, true, false);
+            let t2 = Counter.cycles();
+            run.suspend_resume_ns.push(ns(t0, t2));
+            let resumed = resumed.map_err(|_| "cannot resume the agent")?;
+            run.transcript
+                .extend_from_slice(&host.finished(id).expect("suspended").output);
+            id = resumed;
+            read = 0;
+            continue;
         }
-        if host.output(id).is_some_and(|o| o.ends_with(b"fork\n")) {
+        if forked && host.asleep(id) {
             break;
         }
-        let Some(mode) = mode else {
-            seen = host.output(id).map_or(0, <[u8]>::len);
-            continue;
-        };
-        let t0 = Counter.cycles();
-        let snapshot = host.suspend(id).ok_or("cannot suspend the agent")?;
-        let resumed = host.resume(snapshot, mode, true, false);
-        let t2 = Counter.cycles();
-        run.suspend_resume_ns.push(ns(t0, t2));
-        let resumed = resumed.map_err(|_| "cannot resume the agent")?;
-        run.transcript
-            .extend_from_slice(&host.finished(id).expect("suspended").output);
-        id = resumed;
-        seen = 0;
+        if host.finished(id).is_some() || now_ns() > end {
+            return Err(said(host, id));
+        }
+        host.step();
     }
     run.transcript
         .extend_from_slice(host.output(id).unwrap_or_default());
