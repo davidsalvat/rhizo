@@ -11,8 +11,12 @@ use super::*;
 #[derive(Debug)]
 pub(super) struct Shared {
     /// The live cells that are not running: one run queue per CPU, and the
-    /// sleepers (spec `scheduling`).
-    pub(super) sched: Scheduler<Box<Live>>,
+    /// sleepers (spec `scheduling`); round robin, or by weight once the
+    /// tree needs it ([`Host::reshare`]).
+    pub(super) sched: Scheduler<Box<Live>, Option<Fair>>,
+    /// When each CPU took the cell it runs: the start of the slice charged
+    /// to it while cells share by weight.
+    pub(super) taken: [u64; MAX_CPUS],
     pub(super) tags: TagPool,
     /// Cells that ended since the host last looked ([`Host::collect`]).
     pub(super) ended: Vec<Finished>,
@@ -144,6 +148,7 @@ pub(super) fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
             live.ready = Ready::default();
             s.running += 1;
             s.on_cpu[cpu] = live.cell.id;
+            s.taken[cpu] = now;
             s.idle &= !(1 << cpu);
             if s.idle != 0 || s.timer.armed().is_some() {
                 cover(s, cpu);
@@ -152,6 +157,7 @@ pub(super) fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
         }
         if !oldest && let Some(gang) = s.gangs.join(cpu, now) {
             s.on_cpu[cpu] = gang.1;
+            s.taken[cpu] = now; // the last CPU to leave gives the cell back
             s.idle &= !(1 << cpu);
             if s.idle != 0 || s.timer.armed().is_some() {
                 cover(s, cpu);
@@ -289,12 +295,18 @@ pub(super) fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>
             if filed {
                 wake_woken(s, cpu, now_ns);
             }
-            if claimed(live.cell.id) {
-                s.claimed = Some(live);
-            } else if filed {
-                file(s, Some(cpu), live);
+            let taken = s.taken[cpu];
+            if claimed(live.cell.id) || filed {
+                if s.sched.shares().is_some() {
+                    charge(s, cpu, live.cell.id);
+                }
+                if claimed(live.cell.id) {
+                    s.claimed = Some(live);
+                } else {
+                    file(s, Some(cpu), live);
+                }
             } else {
-                s.sched.requeue(cpu, live);
+                s.sched.requeue_charged(cpu, live, || slice(taken));
             }
         }
         s.running -= 1;
@@ -315,6 +327,21 @@ pub(super) fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>
         }
     });
     wake_cpus(wake);
+}
+
+/// The length and end of a slice taken at `taken`, ending now.
+fn slice(taken: u64) -> (u64, u64) {
+    let now = now_ns();
+    (now.saturating_sub(taken), now)
+}
+
+/// Charges cell `id` the slice it just ran on `cpu`, before it is put back
+/// (design D23 of `add-cell-hierarchy`): a subtree past its CPU cap leaves
+/// the run queues until its period ends. Only while cells share by weight.
+#[inline(never)]
+fn charge(s: &mut Shared, cpu: usize, id: u32) {
+    let (ns, now) = slice(s.taken[cpu]);
+    s.sched.charge(cpu, id, ns, now);
 }
 
 /// Files a cell whose threads may all wait: runnable if one of its threads
