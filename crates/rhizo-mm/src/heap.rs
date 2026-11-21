@@ -339,8 +339,8 @@ mod tests {
     use std::alloc::{alloc, dealloc};
 
     /// Page source backed by the host allocator, with an optional limit.
-    /// The heap keeps size-class pages forever (by design), so the double
-    /// returns whatever is still lent out when it is dropped.
+    /// The heap keeps size-class pages until a trim, so the double returns
+    /// whatever is still lent out when it is dropped.
     #[derive(Default)]
     struct HostPages {
         outstanding: usize,
