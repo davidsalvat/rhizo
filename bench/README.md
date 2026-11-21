@@ -144,16 +144,17 @@ come back, or the benchmark fails.
 
 In the `ci` environment (from two CI runs that agreed within the
 threshold) every workload metric is gated except these, recorded but
-listed under `ungated.ci`: `workload.agent_turn_us` and
-`laptop.resume_turn_us` (bimodal: about 0.3 ms, or 1 s when the answer
-arrives after the guest stopped polling its card and only smoltcp's
-retransmission timer wakes it), `laptop.idle_host_cpu_pct` (the host's
+listed under `ungated.ci`: `laptop.idle_host_cpu_pct` (the host's
 own load on a shared runner), the p99.9 latencies (`*_p999_*`: a
 handful of samples per run), and `density.sched_p99_us` and
 `density.wake_p99_us`: the server load runs close to saturation (every
 socket change wakes every cell waiting on a socket), so its tails moved
 up to 5x between runners of the same code. They are gated once that is
-fixed.
+fixed. The agent turns are gated since `fix-ephemeral-ports`: they took
+1 s in most runs on Firecracker and Cloud Hypervisor, because each boot
+started its ephemeral ports at 32768, so its first connections reused
+4-tuples the host still kept in `TIME_WAIT` from the previous run, and
+smoltcp retried the refused SYN after 1 s.
 
 The `rhizo-server-breakdown` line printed with the results says where the
 load's time went (idle, system calls, scheduling decisions, host
