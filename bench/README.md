@@ -35,6 +35,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.resume_eager_us/rhizo/<vmm>` | timing | Eager resume: every page restored before the cell runs (the baseline lazy resume is measured against) |
 | `cell.resume_touch_us/rhizo/<vmm>` | timing | Lazy resume plus the cell reading every page and exiting |
 | `cell.snapshot_bytes` | deterministic | Size of that snapshot |
+| `cell.snapshot_export_us/rhizo/<vmm>` | timing | That snapshot exported to bytes with its CRC-32C (computed by the CPU's CRC instructions where it has them, change `fast-mem-primitives`), median of 7: what saving a snapshot file costs in the kernel |
+| `cell.snapshot_import_us/rhizo/<vmm>` | timing | Those bytes checked (header, checksum) and decoded into a snapshot, median of 7: what loading a snapshot file costs in the kernel |
 | `cell.fork_us/rhizo/<vmm>` | timing | Forking a cell with 50 MiB written (frozen as a template): shares its page tables, copies nothing |
 | `cell.fork_touch_us/rhizo/<vmm>` | timing | That fork plus the child writing every page (copy-on-write of all 50 MiB) until it exits |
 | `cell.fork_pt_frames` | deterministic | Frames a fork allocates (the child's root only) |

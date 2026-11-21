@@ -5,6 +5,7 @@ pub mod console;
 pub mod cpu;
 #[cfg(feature = "cells")]
 pub mod irq;
+pub mod mem;
 pub mod platform;
 #[cfg(feature = "cells")]
 #[cfg_attr(

@@ -48,6 +48,8 @@ macro_rules! suite {
             ktest_case!(direct_map_uses_largest_pages),
             ktest_case!(frames_are_unique_and_aligned),
             ktest_case!(contiguous_frames),
+            ktest_case!(page_zero_and_copy_match_byte_loops),
+            ktest_case!(hardware_checksum_matches_the_table),
             ktest_case!(map_use_and_unmap_a_page),
             ktest_case!(double_mapping_is_rejected),
             ktest_case!(box_and_vec_work),
@@ -361,6 +363,94 @@ fn frames_are_unique_and_aligned() {
     }
     for frame in frames {
         memory::with_frames(|f| f.free(frame));
+    }
+}
+
+/// Pseudo-random bytes (xorshift64), the same on every run.
+fn noise(state: &mut u64, out: &mut [u8]) {
+    for b in out {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *b = *state as u8;
+    }
+}
+
+/// The architecture's page primitives (change `fast-mem-primitives`), as
+/// the direct map uses them, agree with byte loops for random contents:
+/// a zeroed frame, frame-to-frame copies of one page and of several, and
+/// copies of whole pages to and from kernel buffers at every alignment.
+fn page_zero_and_copy_match_byte_loops() {
+    const PAGES: usize = 3;
+    const PAGE: usize = FRAME_SIZE as usize;
+    const LEN: usize = PAGES * PAGE;
+    let run = memory::with_frames(|f| f.alloc_contiguous(2 * PAGES))
+        .flatten()
+        .expect("free run");
+    let (a, b) = (run, run + LEN as u64);
+    let mut state = 0x9e37_79b9_7f4a_7c15;
+    let mut want = alloc::vec![0u8; LEN + 16];
+    let mut got = alloc::vec![0u8; LEN + 16];
+    for round in 0..16 {
+        noise(&mut state, &mut want);
+        DirectMap.write_pages(a, &want[..LEN]);
+        for (i, byte) in want[..LEN].iter().enumerate() {
+            let word = DirectMap.read_u64(a + (i as u64 & !7));
+            assert_eq!(word.to_le_bytes()[i % 8], *byte, "round {round}: write");
+        }
+        DirectMap.copy(a, b, LEN as u64);
+        DirectMap.read_pages(b, &mut got[..LEN]);
+        assert_eq!(got[..LEN], want[..LEN], "round {round}: frame copy");
+        DirectMap.copy(a + FRAME_SIZE, b, FRAME_SIZE);
+        DirectMap.read_pages(b, &mut got[..PAGE]);
+        assert_eq!(got[..PAGE], want[PAGE..2 * PAGE], "round {round}: one page");
+        // To and from buffers at every offset modulo 16.
+        let (from, to) = (round, 15 - round);
+        DirectMap.write_pages(b, &want[from..from + LEN]);
+        DirectMap.read_pages(b, &mut got[to..to + LEN]);
+        assert_eq!(
+            got[to..to + LEN],
+            want[from..from + LEN],
+            "round {round}: offsets"
+        );
+        DirectMap.zero_frame(b + FRAME_SIZE);
+        DirectMap.read_pages(b, &mut got[..LEN]);
+        assert!(
+            got[PAGE..2 * PAGE].iter().all(|&x| x == 0),
+            "round {round}: zeroed"
+        );
+        assert_eq!(
+            got[..PAGE],
+            want[from..from + PAGE],
+            "the page before is untouched"
+        );
+        assert_eq!(
+            got[2 * PAGE..LEN],
+            want[from + 2 * PAGE..from + LEN],
+            "and the one after"
+        );
+    }
+    for i in 0..2 * PAGES as u64 {
+        memory::with_frames(|f| f.free(run + i * FRAME_SIZE));
+    }
+}
+
+/// The kernel's CRC-32C (the CPU's instructions where it has them) gives
+/// the bytes of the portable table for any length and alignment, so
+/// snapshot files stay the same (change `fast-mem-primitives`).
+fn hardware_checksum_matches_the_table() {
+    if !arch::mem::has_crc32() {
+        arch::console::BootConsole.write_bytes(b"(no CRC32 instructions on this CPU) ");
+    }
+    let mut bytes = alloc::vec![0u8; 9000];
+    noise(&mut 0x2545_f491_4f6c_dd1d, &mut bytes);
+    assert_eq!(arch::mem::crc32c(b"123456789"), 0xe306_9283);
+    for len in (0..64).chain([4095, 4096, 4097, 8990]) {
+        for skip in 0..8 {
+            let part = &bytes[skip..skip + len];
+            let want = rhizo_snapshot::crc32c(part);
+            assert_eq!(arch::mem::crc32c(part), want, "{len} bytes at {skip}");
+        }
     }
 }
 
@@ -902,8 +992,10 @@ fn suspend_resume_after_every_step(mode: Resume) {
         }
         let snapshot = host.suspend(id).expect("the counter is live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let bytes = snapshot.export(&DirectMap);
-        let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+        let bytes = snapshot.export(&DirectMap, crate::arch::mem::crc32c);
+        let snapshot =
+            Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+                .expect("valid");
         id = host.resume(snapshot, mode, true, false).expect("resume");
         resumes += 1;
     }
@@ -1030,7 +1122,10 @@ fn suspended_cells_hold_no_kernel_resources() {
 fn snapshot_of_another_architecture_is_rejected() {
     let mut host = Host::new();
     let id = spawn(&mut host, "chatter", &[]);
-    let mut bytes = host.suspend(id).expect("live").export(&DirectMap);
+    let mut bytes = host
+        .suspend(id)
+        .expect("live")
+        .export(&DirectMap, crate::arch::mem::crc32c);
     let other: u16 = if crate::arch::user::MACHINE as u16 == 183 {
         62
     } else {
@@ -1038,7 +1133,7 @@ fn snapshot_of_another_architecture_is_rejected() {
     };
     bytes[12..14].copy_from_slice(&other.to_le_bytes());
     assert!(matches!(
-        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE),
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c),
         Err(FormatError::Machine { .. })
     ));
 }
@@ -1294,9 +1389,12 @@ fn open_file_survives_suspend_and_resume() {
             }
             let snapshot = host.suspend(id).expect("live");
             output.extend_from_slice(&host.finished(id).expect("suspended").output);
-            let snapshot =
-                Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
-                    .expect("valid");
+            let snapshot = Snapshot::from_bytes(
+                snapshot.export(&DirectMap, crate::arch::mem::crc32c),
+                crate::arch::user::MACHINE,
+                crate::arch::mem::crc32c,
+            )
+            .expect("valid");
             id = host.resume(snapshot, mode, true, false).expect("resume");
             resumes += 1;
         }
@@ -1620,8 +1718,13 @@ fn a_suspended_wait_on_descriptors_keeps_its_time_left() {
     while crate::cell::now_ns() - waited < BEFORE_NS {
         crate::cell::timed_wait(BEFORE_NS / 10);
     }
-    let bytes = host.suspend(id).expect("live").export(&DirectMap);
-    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let bytes = host
+        .suspend(id)
+        .expect("live")
+        .export(&DirectMap, crate::arch::mem::crc32c);
+    let snapshot =
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+            .expect("valid");
     let left: Vec<u64> = snapshot.deadlines(0).iter().map(|d| d.1).collect();
     assert!(
         matches!(left[..], [ns] if ns > 0 && ns <= WAIT_NS - BEFORE_NS),
@@ -1652,8 +1755,10 @@ fn a_template_travels_as_bytes() {
     let bytes = host
         .template_snapshot(id)
         .expect("a template")
-        .export(&DirectMap);
-    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+        .export(&DirectMap, crate::arch::mem::crc32c);
+    let snapshot =
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+            .expect("valid");
     let loaded = host.load_template(snapshot).expect("fits");
     assert!(host.drop_template(id));
     assert!(host.template_snapshot(id).is_none(), "dropped");
@@ -1933,8 +2038,12 @@ fn file_and_socket_quotas_travel_with_the_cell() {
             .expect("copy"),
     );
     let suspended = ready(&mut host);
-    let bytes = host.suspend(suspended).expect("suspend").export(&DirectMap);
-    let snapshot = Snapshot::from_bytes(bytes, arch::user::MACHINE).expect("valid");
+    let bytes = host
+        .suspend(suspended)
+        .expect("suspend")
+        .export(&DirectMap, crate::arch::mem::crc32c);
+    let snapshot =
+        Snapshot::from_bytes(bytes, arch::user::MACHINE, crate::arch::mem::crc32c).expect("valid");
     ids.push(
         host.resume(snapshot, Resume::Lazy, true, false)
             .expect("resume"),
@@ -2085,9 +2194,14 @@ fn no_two_cells_draw_the_same_random_bytes() {
         );
     }
     let suspended = ready(&mut host);
-    let bytes = host.suspend(suspended).expect("suspend").export(&DirectMap);
+    let bytes = host
+        .suspend(suspended)
+        .expect("suspend")
+        .export(&DirectMap, crate::arch::mem::crc32c);
     for mode in [Resume::Eager, Resume::Lazy] {
-        let snapshot = Snapshot::from_bytes(bytes.clone(), arch::user::MACHINE).expect("valid");
+        let snapshot =
+            Snapshot::from_bytes(bytes.clone(), arch::user::MACHINE, crate::arch::mem::crc32c)
+                .expect("valid");
         ids.push(host.resume(snapshot, mode, true, false).expect("resume"));
     }
     host.run(|_| false);
@@ -2450,8 +2564,13 @@ fn a_dynamically_linked_cell_suspends_resumes_and_forks() {
         id
     };
     let id = ready(&mut host);
-    let bytes = host.suspend(id).expect("live").export(&DirectMap);
-    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let bytes = host
+        .suspend(id)
+        .expect("live")
+        .export(&DirectMap, crate::arch::mem::crc32c);
+    let snapshot =
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+            .expect("valid");
     let resumed = host
         .resume(snapshot, Resume::Lazy, true, true)
         .expect("resume");
@@ -2550,8 +2669,13 @@ fn a_node_cell_suspends_resumes_and_forks() {
         id
     };
     let id = warm(&mut host);
-    let bytes = host.suspend(id).expect("live").export(&DirectMap);
-    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let bytes = host
+        .suspend(id)
+        .expect("live")
+        .export(&DirectMap, crate::arch::mem::crc32c);
+    let snapshot =
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+            .expect("valid");
     let resumed = host
         .resume(snapshot, Resume::Lazy, true, true)
         .expect("resume");
@@ -2671,8 +2795,13 @@ fn a_cell_that_imported_numpy_suspends_resumes_and_forks() {
         id
     };
     let id = ready(&mut host);
-    let bytes = host.suspend(id).expect("live").export(&DirectMap);
-    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let bytes = host
+        .suspend(id)
+        .expect("live")
+        .export(&DirectMap, crate::arch::mem::crc32c);
+    let snapshot =
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+            .expect("valid");
     let resumed = host
         .resume(snapshot, Resume::Lazy, true, true)
         .expect("resume");
@@ -2799,9 +2928,12 @@ fn threaded_cell_survives_suspend_and_resume() {
             }
             let snapshot = host.suspend(id).expect("live");
             output.extend_from_slice(&host.finished(id).expect("suspended").output);
-            let snapshot =
-                Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
-                    .expect("valid");
+            let snapshot = Snapshot::from_bytes(
+                snapshot.export(&DirectMap, crate::arch::mem::crc32c),
+                crate::arch::user::MACHINE,
+                crate::arch::mem::crc32c,
+            )
+            .expect("valid");
             id = host.resume(snapshot, mode, true, false).expect("resume");
             resumes += 1;
         }
@@ -2835,9 +2967,16 @@ fn sockets_across_suspend_and_resume() {
         3,
         "a suspended cell's listener and connection's two ends, parked"
     );
-    let bytes = snapshot.export(&DirectMap);
-    let copy = Snapshot::from_bytes(bytes.clone(), crate::arch::user::MACHINE).expect("valid");
-    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+    let bytes = snapshot.export(&DirectMap, crate::arch::mem::crc32c);
+    let copy = Snapshot::from_bytes(
+        bytes.clone(),
+        crate::arch::user::MACHINE,
+        crate::arch::mem::crc32c,
+    )
+    .expect("valid");
+    let snapshot =
+        Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+            .expect("valid");
     let id = host
         .resume(snapshot, Resume::Lazy, true, true)
         .expect("resume");
@@ -3208,8 +3347,13 @@ fn code_written_at_run_time_survives_fork_suspend_and_templates() {
     let mut resumed = Vec::new();
     for mode in [Resume::Eager, Resume::Lazy] {
         let id = jit_ready(&mut host);
-        let bytes = host.suspend(id).expect("live").export(&DirectMap);
-        let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+        let bytes = host
+            .suspend(id)
+            .expect("live")
+            .export(&DirectMap, crate::arch::mem::crc32c);
+        let snapshot =
+            Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+                .expect("valid");
         resumed.push(host.resume(snapshot, mode, true, true).expect("resume"));
     }
     let template = jit_ready(&mut host);
@@ -3257,9 +3401,12 @@ fn code_written_at_run_time_survives_repeated_suspends() {
         }
         let snapshot = host.suspend(id).expect("live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let snapshot =
-            Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
-                .expect("valid");
+        let snapshot = Snapshot::from_bytes(
+            snapshot.export(&DirectMap, crate::arch::mem::crc32c),
+            crate::arch::user::MACHINE,
+            crate::arch::mem::crc32c,
+        )
+        .expect("valid");
         id = host
             .resume(snapshot, Resume::Lazy, true, false)
             .expect("resume");
@@ -3549,8 +3696,10 @@ fn suspend_between_parallel_runs_is_invisible() {
         }
         let snapshot = host.suspend(id).expect("the counter is live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let bytes = snapshot.export(&DirectMap);
-        let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
+        let bytes = snapshot.export(&DirectMap, crate::arch::mem::crc32c);
+        let snapshot =
+            Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
+                .expect("valid");
         id = host
             .resume(snapshot, Resume::Lazy, true, false)
             .expect("resume");
@@ -3638,9 +3787,12 @@ fn a_cell_on_several_cpus_survives_suspend_and_fork() {
         }
         let snapshot = host.suspend(id).expect("live");
         output.extend_from_slice(&host.finished(id).expect("suspended").output);
-        let snapshot =
-            Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
-                .expect("valid");
+        let snapshot = Snapshot::from_bytes(
+            snapshot.export(&DirectMap, crate::arch::mem::crc32c),
+            crate::arch::user::MACHINE,
+            crate::arch::mem::crc32c,
+        )
+        .expect("valid");
         id = host
             .resume(snapshot, Resume::Lazy, true, false)
             .expect("resume");
@@ -3741,8 +3893,12 @@ fn mixed_host_operations_during_a_run_are_invisible() {
     let mut child = None;
     let mut calls = 0u32;
     let through_bytes = |snapshot: Snapshot| {
-        Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
-            .expect("valid")
+        Snapshot::from_bytes(
+            snapshot.export(&DirectMap, crate::arch::mem::crc32c),
+            crate::arch::user::MACHINE,
+            crate::arch::mem::crc32c,
+        )
+        .expect("valid")
     };
     host.run(|h| {
         calls += 1;

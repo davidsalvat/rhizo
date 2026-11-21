@@ -77,6 +77,20 @@ pub trait PhysicalMemory {
         }
     }
 
+    /// Copies whole 4 KiB pages starting at physical address `phys` into
+    /// `out`, whose length is a multiple of 4 KiB: the same bytes as
+    /// [`Self::read_bytes`], for implementations with a faster page copy
+    /// (the kernel's, change `fast-mem-primitives`).
+    fn read_pages(&self, phys: u64, out: &mut [u8]) {
+        self.read_bytes(phys, out);
+    }
+
+    /// Copies `data`, whose length is a multiple of 4 KiB, to physical
+    /// address `phys`: [`Self::write_bytes`] for whole pages.
+    fn write_pages(&mut self, phys: u64, data: &[u8]) {
+        self.write_bytes(phys, data);
+    }
+
     /// Copies `len` bytes from physical address `from` to `to` (ranges that
     /// do not overlap, any alignment).
     fn copy(&mut self, from: u64, to: u64, len: u64) {
@@ -328,6 +342,21 @@ mod tests {
             mem.read_u64(0x1000) >> 24,
             u64::from_le_bytes(*b"rhizo\0\0\0")
         );
+    }
+
+    #[test]
+    fn whole_pages_read_back_from_any_buffer_offset() {
+        let mut mem = FakePhysicalMemory::new();
+        let data: Vec<u8> = (0..2 * 4096 + 7).map(|i| (i * 31 % 251) as u8).collect();
+        for skip in 0..8 {
+            mem.write_pages(0x2000, &data[skip..skip + 2 * 4096]);
+            let mut back = vec![0u8; 2 * 4096 + 7];
+            mem.read_pages(0x2000, &mut back[7 - skip..7 - skip + 2 * 4096]);
+            assert_eq!(
+                back[7 - skip..7 - skip + 2 * 4096],
+                data[skip..skip + 2 * 4096]
+            );
+        }
     }
 
     #[test]
