@@ -16,8 +16,8 @@ pub(crate) struct FakeServices {
     room: Option<u64>,
     /// Word 0 of the FP/SIMD state "in the CPU" (`save_fp`), if any.
     cpu_fp: Option<u64>,
-    /// The cell's memory limit and use (`memory`).
-    memory: (u64, u64),
+    /// The memory cells share (`memory`).
+    memory: u64,
 }
 
 impl Console for FakeServices {
@@ -49,7 +49,7 @@ impl Services for FakeServices {
             Some(_) => false,
         }
     }
-    fn memory(&mut self) -> (u64, u64) {
+    fn memory(&mut self) -> u64 {
         self.memory
     }
     fn save_fp(&mut self, fp: &mut rhizo_cell::FpState) {
@@ -478,7 +478,9 @@ fn sysinfo_affinity_and_advice() {
 #[test]
 fn sysinfo_shows_only_the_cell_itself() {
     let mut w = World::new(Arch::Aarch64);
-    w.services.memory = (64 << 20, 10 << 20);
+    w.services.memory = 1 << 30;
+    // 10 MiB used of a 64 MiB quota.
+    w.frames.metered = Some((10 << 8, 64 << 8));
     for _ in 0..2 {
         w.cell
             .threads
@@ -493,9 +495,14 @@ fn sysinfo_shows_only_the_cell_itself() {
     assert_eq!(info[80..82], 3u16.to_le_bytes(), "procs: its threads");
     assert_eq!(info[8..32], [0; 24], "no load");
     // Past its limit (memory it inherited from a fork), nothing is free.
-    w.services.memory = (8 << 20, 9 << 20);
+    w.frames.metered = Some((9 << 8, 8 << 8));
     assert_eq!(w.call(179, &[DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 32, 8), (8u64 << 20).to_le_bytes());
     assert_eq!(w.peek(DATA + 40, 8), [0; 8]);
+    // Without a quota: all the memory cells share, less its own use.
+    w.frames.metered = None;
+    assert_eq!(w.call(179, &[DATA]).0, 0);
+    assert_eq!(w.peek(DATA + 32, 8), (1u64 << 30).to_le_bytes());
 }
 
 /// The calls Node.js makes at start-up and under load (spec `linux-abi`,

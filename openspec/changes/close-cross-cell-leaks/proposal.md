@@ -71,12 +71,13 @@ that channel; numbering per domain belongs with domains. Global `ENOMEM`,
 
 ## Impact
 
-`crates/rhizo-abi` (`sysinfo`, `Services::memory`, `PageCache`),
-`crates/rhizo-net` (`Ports`, `Net::enter`, `Net::leave`),
-`crates/rhizo-fs` (`Page::is_held_elsewhere`), `kernel/src/cell.rs`
-(`CallNet`, `Live::ports`, `KernelServices::memory`, `KernelPages`,
+`crates/rhizo-abi` (`sysinfo`, `Services::memory`, `Abi`'s ports,
+`PageCache`), `crates/rhizo-net` (`Ports`, `Net::enter`, `Net::leave`),
+`crates/rhizo-mm` (`Frames::metered`), `crates/rhizo-cell` (`Metered`,
+`CountingFrames`), `crates/rhizo-fs` (`Page::is_held_elsewhere`),
+`kernel/src/cell.rs` (`KernelServices::memory`, `KernelPages`,
 `drop_images`), `kernel/src/tests.rs`, `cells/src/bin/observer.rs`,
-`docs/security.md`, `docs/audit-scope.md`. Benchmarked paths: a socket
-call stores the cell's ports into the sockets and reads them back (two
-copies of 8 bytes); a file page that misses the cache when it is full
-looks through it at most once every 4,096 misses.
+`docs/security.md`, `docs/audit-scope.md`. Benchmarked paths: only the
+calls that can bind a port enter and take back the cell's cursor; a file
+page that misses the cache when it is full looks through it at most once
+every 4,096 misses.

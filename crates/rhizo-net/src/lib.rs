@@ -288,9 +288,10 @@ impl Socket {
 /// identifier, hence a new start, as a new boot has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ports {
-    key: u32,
+    /// The cell's identifier.
+    pub key: u32,
     /// The next port to try; 0 before the first.
-    next: u16,
+    pub next: u16,
 }
 
 impl Ports {

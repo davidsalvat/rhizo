@@ -34,7 +34,7 @@ use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
 use rhizo_mm::paging::{PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
-use rhizo_net::{Net, Ports};
+use rhizo_net::Net;
 use rhizo_prof::Part;
 use rhizo_sched::{Gangs, IdleTimer, Keyed, SLICE_NS, Scheduler, TagPool};
 use rhizo_snapshot::{Data, Snapshot};
@@ -120,19 +120,16 @@ static WOKEN: AtomicBool = AtomicBool::new(false);
 /// The sockets as a system call reaches them (design D1 of
 /// `split-sockets-lock`): locked the first time the call uses them, until
 /// the call ends, with their change count then; a call that uses no socket
-/// never waits for another CPU's socket calls. The calling cell's
-/// ephemeral ports are entered when they are locked (design D2 of
-/// `close-cross-cell-leaks`), and taken back at the end of the call.
-struct CallNet(Option<(rhizo_core::sync::Guard<'static, Net>, u64)>, Ports);
+/// never waits for another CPU's socket calls.
+#[derive(Default)]
+struct CallNet(Option<(rhizo_core::sync::Guard<'static, Net>, u64)>);
 
 impl rhizo_abi::Sockets for CallNet {
     fn net(&mut self) -> &mut Net {
-        let ports = self.1;
         &mut self
             .0
             .get_or_insert_with(|| {
-                let mut net = NET.lock();
-                net.enter(ports);
+                let net = NET.lock();
                 let changes = net.changes();
                 (net, changes)
             })
@@ -546,8 +543,6 @@ struct KernelServices<'a> {
     random: &'a mut Option<Generator>,
     /// The calling thread's FP/SIMD state is in the CPU's registers.
     fp_in_cpu: bool,
-    /// The cell's memory meter, for `sysinfo` (system calls only).
-    meter: Option<&'a Meter>,
 }
 
 impl Console for KernelServices<'_> {
@@ -585,13 +580,10 @@ impl Services for KernelServices<'_> {
         cells_may_take(bytes)
     }
 
-    /// The cell's limit, at most the memory cells share, and what its
-    /// meter counts: nothing another cell does changes either (design D1 of
-    /// `close-cross-cell-leaks`).
-    fn memory(&mut self) -> (u64, u64) {
-        let total = memory::with_frames(|f| f.usable_frames() as u64).unwrap_or(0);
-        let (limit, used) = self.meter.map_or((total, 0), |m| (m.limit(), m.used()));
-        (total.min(limit) * FRAME_SIZE, used * FRAME_SIZE)
+    /// The frames cells may have, fixed at boot: nothing another cell does
+    /// changes it (design D1 of `close-cross-cell-leaks`).
+    fn memory(&mut self) -> u64 {
+        memory::with_frames(|f| f.usable_frames() as u64).unwrap_or(0) * FRAME_SIZE
     }
 
     fn save_fp(&mut self, fp: &mut FpState) {
@@ -727,9 +719,6 @@ struct Live {
     cell: Cell,
     /// Address-space tag (ASID/PCID), 0 if none was free.
     tag: u16,
-    /// Where its ephemeral ports go next (design D2 of
-    /// `close-cross-cell-leaks`).
-    ports: Ports,
     /// CPUs whose TLB holds nothing stale for this cell (bit `n` for CPU
     /// `n`): none for a cell new to its tag, which drops the tag's old
     /// translations on its first entry on each CPU, and only the CPU that
@@ -1669,14 +1658,13 @@ fn syscall(
         echo: live.echo,
         random: &mut live.random,
         fp_in_cpu,
-        meter: Some(&live.frames),
     };
     let (mut tlb, mut pager_tlb) = (CellTlb::new(gang), CellTlb::new(gang));
     let t0 = prof::syscall_start();
     // Lock order: the cell's (when shared), `SHARING`, then the sockets.
     let (outcome, deadline) = sharing(live.shares, || {
         let _call = cost::syscall(&live.cell);
-        let mut sockets = CallNet(None, live.ports);
+        let mut sockets = CallNet::default();
         let mut cx = Context {
             pt,
             mem: &mut DirectMap,
@@ -1693,9 +1681,6 @@ fn syscall(
         let deadline = cx.deadline;
         let waits = || matches!(live.cell.threads.current().wait, Wait::Io { .. });
         if let Some((net, changes)) = sockets.0.as_mut() {
-            if let Some(ports) = net.leave() {
-                live.ports = ports;
-            }
             // A call that waits on descriptors joins the wait queues of the
             // sockets it looked at (design D1 of `add-socket-wait-queues`),
             // under the lock it looked at them with.
@@ -1869,7 +1854,6 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                         echo: live.echo,
                         random: &mut live.random,
                         fp_in_cpu: false,
-                        meter: None,
                     };
                     fault.report(&mut services, live.cell.id);
                     break 'thread Back::End(Ending::Fault);
@@ -1924,7 +1908,6 @@ fn out_of_cpu(live: &mut Live) {
         echo: live.echo,
         random: &mut live.random,
         fp_in_cpu: false,
-        meter: None,
     };
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(&mut services),
@@ -2218,7 +2201,6 @@ impl GangCell {
             echo: live.echo,
             random: &mut live.random,
             fp_in_cpu: false,
-            meter: None,
         };
         fault.report(&mut services, live.cell.id);
         self.end(gang, cpu, Ending::Fault);
@@ -2660,7 +2642,6 @@ impl Host {
         }
         let frames = Meter::new(0, cell.quota.frames());
         Box::new(Live {
-            ports: Ports::new(cell.id),
             cell,
             tag: tag.unwrap_or(0),
             clean: 0,

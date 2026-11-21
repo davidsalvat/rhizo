@@ -28,6 +28,7 @@ use rhizo_cell::{Cell, FpState, MMAP_BASE, STACK_LIMIT, STACK_TOP, USER_END};
 use rhizo_hal::{Console, PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, PageFlags, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE, align_up};
+use rhizo_net::Ports;
 
 /// Linux `errno` values used here.
 pub mod errno {
@@ -379,11 +380,9 @@ pub trait Services: Console {
     /// data such as file blocks, names and thread records) without eating
     /// into the memory the kernel keeps for itself.
     fn can_store(&mut self, bytes: u64) -> bool;
-    /// The calling cell's memory in bytes for `sysinfo`: its limit (at
-    /// most the memory cells share) and how much of it the cell uses.
-    /// Nothing about other cells (design D1 of `close-cross-cell-leaks`).
-    fn memory(&mut self) -> (u64, u64) {
-        (0, 0)
+    /// The memory cells share in bytes, for `sysinfo` (fixed at boot).
+    fn memory(&mut self) -> u64 {
+        0
     }
     /// Brings `fp`, the calling thread's FP/SIMD state, up to date when the
     /// CPU's registers hold a newer copy (the kernel switches them lazily).
@@ -486,6 +485,10 @@ pub struct Abi {
     /// (beyond every Linux call number), and bit 1023 for all larger ones,
     /// so no cell can make the kernel print without end.
     reported: [u64; 16],
+    /// Where the cell's ephemeral ports go next, 0 before the first (design
+    /// D2 of `close-cross-cell-leaks`): two bytes, so the handler, kept
+    /// with every cell, does not grow.
+    next_port: u16,
 }
 
 /// `AT_FDCWD` as a system-call argument.
@@ -510,6 +513,7 @@ impl Abi {
         Self {
             arch,
             reported: [0; 16],
+            next_port: 0,
         }
     }
 
@@ -575,16 +579,20 @@ impl Abi {
             }
             Some(Sys::Socket) => sockets::socket(cx, a[0], a[1], a[2]),
             Some(Sys::Socketpair) => sockets::socketpair(cx, a),
-            Some(Sys::Bind) => sockets::bind(cx, a[0], a[1], a[2]),
-            Some(Sys::Listen) => sockets::listen(cx, a[0], a[1]),
+            Some(Sys::Bind) => self.with_ports(cell, cx, |cx| sockets::bind(cx, a[0], a[1], a[2])),
+            Some(Sys::Listen) => self.with_ports(cell, cx, |cx| sockets::listen(cx, a[0], a[1])),
             Some(Sys::Accept) => sockets::accept(cx, a[0], a[1], a[2], 0),
             Some(Sys::Accept4) => sockets::accept(cx, a[0], a[1], a[2], a[3]),
-            Some(Sys::Connect) => sockets::connect(cx, a[0], a[1], a[2]),
+            Some(Sys::Connect) => {
+                self.with_ports(cell, cx, |cx| sockets::connect(cx, a[0], a[1], a[2]))
+            }
             Some(Sys::Getsockname) => sockets::name(cx, a[0], a[1], a[2], false),
             Some(Sys::Getpeername) => sockets::name(cx, a[0], a[1], a[2], true),
-            Some(Sys::Sendto) => sockets::sendto(cx, a),
+            Some(Sys::Sendto) => self.with_ports(cell, cx, |cx| sockets::sendto(cx, a)),
             Some(Sys::Recvfrom) => sockets::recvfrom(cx, a),
-            Some(Sys::Sendmsg) => sockets::sendmsg(cx, a[0], a[1], a[2]),
+            Some(Sys::Sendmsg) => {
+                self.with_ports(cell, cx, |cx| sockets::sendmsg(cx, a[0], a[1], a[2]))
+            }
             Some(Sys::Recvmsg) => sockets::recvmsg(cx, a[0], a[1], a[2]),
             Some(Sys::Shutdown) => sockets::shutdown(cx, a[0], a[1]),
             Some(Sys::Setsockopt) => sockets::setsockopt(cx, a),
@@ -745,6 +753,25 @@ impl Abi {
         // The result goes in x0 / rax, which is gpr[0] on both.
         cell.regs_mut().gpr[0] = result as u64;
         Outcome::Resume
+    }
+
+    /// Runs `call`, a socket call that may bind an ephemeral port, with the
+    /// cell's own ports entered into the sockets (design D2 of
+    /// `close-cross-cell-leaks`).
+    fn with_ports<'c, F, M, T, A, S>(
+        &mut self,
+        cell: &Cell,
+        cx: &mut Context<'c, F, M, T, A, S>,
+        call: impl FnOnce(&mut Context<'c, F, M, T, A, S>) -> i64,
+    ) -> i64 {
+        let ports = Ports {
+            key: cell.id,
+            next: self.next_port,
+        };
+        cx.net.net().enter(ports);
+        let result = call(cx);
+        self.next_port = cx.net.net().leave().map_or(0, |p| p.next);
+        result
     }
 
     fn report_unimplemented(&mut self, cell: u32, nr: u64, out: &mut impl Services) {
@@ -1035,13 +1062,14 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
 /// `close-cross-cell-leaks`): uptime; its memory limit as the total and
 /// what it leaves as free; its threads as the processes; no swap, no load.
 /// Nothing in it depends on other cells.
-fn sysinfo<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+fn sysinfo<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cell: &Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     addr: u64,
 ) -> i64 {
-    let (total, used) = cx.services.memory();
-    let free = total.saturating_sub(used);
+    let (used, limit) = cx.frames.metered().unwrap_or((0, u64::MAX));
+    let total = cx.services.memory().min(limit.saturating_mul(FRAME_SIZE));
+    let free = total.saturating_sub(used * FRAME_SIZE);
     let procs = cell.threads.len().min(u16::MAX as usize) as u16;
     let mut info = [0u8; 112];
     let uptime = cx.services.monotonic_ns() / 1_000_000_000;

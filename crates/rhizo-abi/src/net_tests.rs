@@ -571,3 +571,44 @@ fn only_calls_on_sockets_reach_them() {
     assert!(w.call(SOCKET, &[2, 1, 0]).0 >= 0);
     assert!(w.used_net);
 }
+
+/// Hostile (finding S25): what another cell binds does not move a cell's
+/// ephemeral ports. Each cell's calls take them from its own cursor
+/// (design D2 of `close-cross-cell-leaks`); with the one counter all cells
+/// shared, the observer's second port would be 101 past its first.
+#[test]
+fn another_cells_binds_do_not_show_in_my_ports() {
+    fn bound(w: &mut World) -> (u64, u16) {
+        let s = w.call(SOCKET, &[2, 1, 0]).0 as u64;
+        w.poke(ADDR, &sin([127, 0, 0, 1], 0));
+        assert_eq!(w.call(BIND, &[s, ADDR, 16]).0, 0);
+        w.poke(LEN, &int(16));
+        assert_eq!(w.call(GETSOCKNAME, &[s, OUT, LEN]).0, 0);
+        let a = w.peek(OUT, 4);
+        (s, u16::from_be_bytes([a[2], a[3]]))
+    }
+    let mut observer = World::new(Arch::Aarch64);
+    let mut neighbour = World::new(Arch::Aarch64);
+    neighbour.cell.id = 6;
+    let (_, first) = bound(&mut observer);
+    core::mem::swap(&mut observer.net, &mut neighbour.net);
+    for _ in 0..100 {
+        let (s, _) = bound(&mut neighbour);
+        assert_eq!(neighbour.call(CLOSE, &[s]).0, 0);
+    }
+    core::mem::swap(&mut observer.net, &mut neighbour.net);
+    let (_, second) = bound(&mut observer);
+    let next = if first == *rhizo_net::EPHEMERAL.end() {
+        *rhizo_net::EPHEMERAL.start()
+    } else {
+        first + 1
+    };
+    assert_eq!(second, next);
+    // A listener and a connection take theirs from the same cursor.
+    let l = observer.call(SOCKET, &[2, 1, 0]).0 as u64;
+    assert_eq!(observer.call(LISTEN, &[l, 8]).0, 0);
+    observer.poke(LEN, &int(16));
+    assert_eq!(observer.call(GETSOCKNAME, &[l, OUT, LEN]).0, 0);
+    let a = observer.peek(OUT, 4);
+    assert_eq!(u16::from_be_bytes([a[2], a[3]]), next + 1);
+}

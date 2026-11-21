@@ -364,6 +364,8 @@ pub mod testing {
         /// Most references one page may have (sharing past it panics, as
         /// the kernel's counts would).
         pub max_refs: u32,
+        /// What [`Frames::metered`] answers.
+        pub metered: Option<(u64, u64)>,
     }
 
     /// Builds an ELF file of `kind` (2: executable, 3: shared object) with
@@ -425,6 +427,7 @@ pub mod testing {
                 live: BTreeMap::new(),
                 limit: usize::MAX,
                 max_refs: u32::MAX,
+                metered: None,
             }
         }
 
@@ -498,6 +501,10 @@ pub mod testing {
                 self.share(phys);
             }
             !full
+        }
+
+        fn metered(&self) -> Option<(u64, u64)> {
+            self.metered
         }
     }
 }

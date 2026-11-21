@@ -745,13 +745,14 @@ between two ports one cell took was one plus every port other cells took
 in between, connections to the outside included. *Fix:* each cell walks
 the range in order from a start of its own, SipHash-2-4 of its
 identifier under the kernel's secret (with the boot, as
-`fix-ephemeral-ports` wanted); the kernel keeps the cell's cursor with
-the cell and hands it to the sockets for its calls. A resumed or forked
+`fix-ephemeral-ports` wanted); the cell's system-call handler keeps its
+cursor and hands it to the sockets for the five calls that can bind. A resumed or forked
 cell has a new identifier, so a new start. *Tests:*
 `ephemeral_ports_do_not_show_other_cells_binds` (in the kernel: a
 neighbour binds 100 ports between an observer's two binds; the observer's
 ports are 1 apart, 102 before), `a_cells_ephemeral_ports_do_not_show_other_cells_binds`
-and `a_cells_ephemeral_ports_skip_ports_in_use` (`rhizo-net`).
+and `a_cells_ephemeral_ports_skip_ports_in_use` (`rhizo-net`),
+`another_cells_binds_do_not_show_in_my_ports` (`rhizo-abi`).
 
 **S26. Any cell could empty the page cache (Medium, both).** The cache of
 file pages (`add-dynamic-linking`) emptied itself when a page came past

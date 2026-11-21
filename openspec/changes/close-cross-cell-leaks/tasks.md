@@ -2,12 +2,12 @@
 
 ## 1. `sysinfo`
 
-- [ ] 1.1 `sysinfo` reports the cell's limit, its use and its threads; `KernelServices` gets the cell's meter (D1); verify `cargo test -p rhizo-abi sysinfo`
+- [ ] 1.1 `sysinfo` reports the cell's limit, its use and its threads, from `Frames::metered` (D1); verify `cargo test -p rhizo-abi sysinfo` and the in-kernel `sysinfo_shows_a_cell_only_itself` on both architectures
 
 ## 2. Ports
 
 - [ ] 2.1 `Ports`, `Net::enter`, `Net::leave`; `ephemeral` walks the entered cursor from its keyed start (D2); verify `cargo test -p rhizo-net ephemeral`
-- [ ] 2.2 `Live::ports`, entered by `CallNet` and taken back after the call (D2); verify the in-kernel `ephemeral_ports_do_not_show_other_cells_binds` on both architectures
+- [ ] 2.2 `Abi` keeps the cell's next port and enters it for the calls that can bind (D2); verify `cargo test -p rhizo-abi another_cells_binds` and the in-kernel `ephemeral_ports_do_not_show_other_cells_binds` on both architectures
 
 ## 3. Page cache
 

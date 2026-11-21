@@ -13,7 +13,7 @@ Before: `totalram` was the memory cells share, `freeram` the frames free
 in the kernel's allocator, `procs` 1. A cell reading `freeram` sees every
 other cell's allocations.
 
-Now `Services::memory` returns the calling cell's limit and use:
+Now `sysinfo` reports the calling cell:
 
 - `totalram` = min(memory cells share, the cell's memory quota);
 - `freeram` = `totalram` minus the frames counted against the cell's
@@ -23,9 +23,11 @@ Now `Services::memory` returns the calling cell's limit and use:
 - loads, swap and buffers stay 0, uptime stays boot-relative (no cell can
   change it: item 35 of the inventory).
 
-The quota's meter (`add-cell-quotas`) already counts the cell's frames.
-`KernelServices` gets the cell's meter for system calls; the total reads
-the allocator's usable frames, fixed at boot. A cell without a quota sees
+The quota's meter (`add-cell-quotas`) already counts the cell's frames,
+and the call's frames are the cell's `Metered` frames: a provided method
+`Frames::metered` (`None` by default) gives the count and the limit, so
+nothing is added to every call's context. `Services::memory` returns only
+the memory cells share (the allocator's usable frames, fixed at boot). A cell without a quota sees
 the whole of memory as its total and only its own use taken from it, as a
 container sees its cgroup: `freeram` can then promise more than is free
 when other cells hold memory. That is the price of not telling it; the
@@ -58,11 +60,13 @@ Considered:
 - **The cell's own cursor, carried with its calls**: chosen.
 
 `rhizo_net::Ports` is a cell's cursor: its key (the cell's identifier) and
-the next port to try (0 before the first). The kernel keeps it in the
-cell's `Live` record. `CallNet`, which locks the sockets the first time a
-call uses them, calls `Net::enter(ports)` under the lock; at the end of
-the call the kernel takes them back with `Net::leave()`. `Net::ephemeral`
-uses the entered cursor: its first port is
+the next port to try (0 before the first). The cell's system-call handler
+(`Abi`, one per live cell) keeps the next port, two bytes that fit in its
+padding. The five calls that can bind a port implicitly or to port 0
+(`bind`, `listen`, `connect`, `sendto`, `sendmsg`) enter the cursor into
+the sockets (`Net::enter`) before they run and take it back
+(`Net::leave`) after; no other call touches it. `Net::ephemeral` uses
+the entered cursor: its first port is
 
     32768 + (siphash24(secret, key) + mix(boot)) mod 28232
 
@@ -87,8 +91,12 @@ Properties:
   sockets, as after a new boot (rule 6: the cursor is plain data, 8
   bytes, and recomputed rather than restored).
 
-Cost: two copies of 8 bytes per call that uses sockets; nothing on calls
-that do not.
+Cost: nothing on calls other than those five. A first version kept the
+cursor in the kernel's per-call socket handle and the meter in the
+per-call services: that cost 5 to 9 instructions on every system call
+(`cell.syscall_insns` +2.7 %), and a 12-byte `Option<Ports>` in `Abi` cost
+137 instructions per fork and spawn (a record past a heap size class), so
+both were moved as above.
 
 ## D3. No cell evicts a page another cell maps
 
@@ -160,7 +168,7 @@ architectures, and host tests where the logic lives in a library:
 | Leak | In the kernel | On the host |
 |---|---|---|
 | S24 `sysinfo` | `sysinfo_shows_a_cell_only_itself`: an observer with a 64 MiB quota reads `sysinfo` before and while a neighbour holds 32 MiB: `total=64 change=0 procs=1` (before: the machine's total, `change=32`) | `sysinfo_shows_only_the_cell_itself` (`rhizo-abi`) |
-| S25 ports | `ephemeral_ports_do_not_show_other_cells_binds`: a neighbour binds 100 ports between the observer's two binds: `ports +1` (before: `+102`) | `a_cells_ephemeral_ports_do_not_show_other_cells_binds`, `a_cells_ephemeral_ports_skip_ports_in_use` (`rhizo-net`) |
+| S25 ports | `ephemeral_ports_do_not_show_other_cells_binds`: a neighbour binds 100 ports between the observer's two binds: `ports +1` (before: `+102`) | `a_cells_ephemeral_ports_do_not_show_other_cells_binds`, `a_cells_ephemeral_ports_skip_ports_in_use` (`rhizo-net`), `another_cells_binds_do_not_show_in_my_ports` (`rhizo-abi`, two cells through the call layer) |
 | S26 page cache | `memory_pressure_keeps_the_pages_other_cells_map`: `hog` exhausts memory while `observer page` maps a page of its own file: the page stays kept (before: the cache was empty) | `a_full_cache_keeps_what_others_map`, `a_full_cache_drops_pages_nobody_can_map` (`rhizo-abi`), `a_page_knows_whether_its_block_is_held_elsewhere` (`rhizo-fs`) |
 
 One existing test asserted the leak itself: `a_full_cache_starts_over`
@@ -170,9 +178,10 @@ changed, in this change's `cells` delta).
 
 ## D6. Benchmarks
 
-The `-icount` gates on the paths this touches: `cell.syscall_insns`
-(`getpid`: no socket, nothing added), `cell.loopback_rtt_insns` and
-`cell.tcp_resume_insns` (socket calls: the cursor's two copies),
-`cell.spawn_insns` and `cell.fork_insns` (one more 8-byte field in a new
-cell's record). Checked with `cargo xtask bench --icount-only --env ci
---check` on x86_64 and `--env ci-arm` on AArch64.
+The `-icount` gates on the paths this touches: `cell.syscall_insns` and
+`cell.switch_insns` (nothing added), `cell.loopback_rtt_insns`,
+`cell.pipe_rtt_insns` and `cell.tcp_resume_insns` (a connect enters and
+takes back the cursor), `cell.spawn_insns` and `cell.fork_insns` (the
+handler does not grow). Checked with `cargo xtask bench --icount-only
+--env ci --check` on x86_64 and `--env ci-arm` on AArch64, against the
+same commands on the base commit.
