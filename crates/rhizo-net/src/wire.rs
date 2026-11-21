@@ -4,7 +4,7 @@
 //! A TCP connection to the outside is a `smoltcp` socket in state
 //! [`State::Wire`]; a UDP socket that sent to the outside also has a
 //! `smoltcp` socket on its port. [`Net::poll_wire`] moves frames between the
-//! card and `smoltcp` and counts the changes waiting cells wait for.
+//! card and `smoltcp` and wakes the wait queues of the sockets on the wire.
 
 use super::*;
 use alloc::vec;
@@ -226,9 +226,12 @@ impl Net {
         let mut phy = Phy::new(link);
         if wire.iface.poll(now, &mut phy, &mut wire.sockets) == PollResult::SocketStateChanged {
             self.changes += 1;
-            // Connections that opened, so a later close is a reset, not a
-            // refusal.
+            // Every socket on the wire may have changed; connections that
+            // opened are marked, so a later close is a reset, not a refusal.
             for s in self.sockets.iter_mut().flatten() {
+                if matches!(s.state, State::Wire { .. }) || s.udp.is_some() {
+                    self.woken.append(&mut s.waiters);
+                }
                 if let State::Wire {
                     handle,
                     ever_open: ever_open @ false,
@@ -333,7 +336,7 @@ impl Net {
             report: true,
         };
         s.refused = false;
-        self.changes += 1;
+        self.touch(h);
         self.wire_work = true;
         Err(Error::InProgress)
     }
@@ -433,7 +436,6 @@ impl Net {
     pub(crate) fn wire_shutdown(&mut self, handle: SocketHandle) {
         if let Some(wire) = self.wire.as_mut() {
             wire.tcp(handle).close();
-            self.changes += 1;
             self.wire_work = true;
         }
     }

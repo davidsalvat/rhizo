@@ -389,7 +389,8 @@ fn server(console: &mut impl Console) {
         "rhizo-server target={target} cells={cells} limit={limit} per_cell_bytes={per_cell} \
          fill_ns={fill_ns} ops={ops} elapsed_ns={elapsed} unfinished={unfinished} \
          sched_p50_ns={} sched_p99_ns={} sched_p999_ns={} wake_p50_ns={} wake_p99_ns={} \
-         wake_p999_ns={} syscall_p50_ns={} syscall_p99_ns={} syscall_p999_ns={}",
+         wake_p999_ns={} syscall_p50_ns={} syscall_p99_ns={} syscall_p999_ns={} io_woken={} \
+         io_wasted={}",
         q(&report.sched, 500_000),
         q(&report.sched, 990_000),
         q(&report.sched, 999_000),
@@ -399,6 +400,8 @@ fn server(console: &mut impl Console) {
         cyc(q(sys, 500_000)),
         cyc(q(sys, 990_000)),
         cyc(q(sys, 999_000)),
+        report.count(Count::IoWoken),
+        report.count(Count::IoWasted),
     );
     // Where the time went (design D5): idle, in system calls, in scheduling
     // decisions, in host operations; the rest is cell code, faults and
