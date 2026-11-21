@@ -513,6 +513,10 @@ rhizo_syscall_entry:
     // RIP, CS, RFLAGS, RSP, SS (pushed by the stub and the CPU).
 rhizo_user_trap:
     swapgs
+    push 2                          // RFLAGS: only the reserved bit. The
+    popfq                           // cell's DF and AC (set by POPF in ring
+                                    // 3; an interrupt gate keeps them) must
+                                    // not reach Rust code or lift SMAP
     push rax
     mov rax, gs:[16]
     mov [rax + 24], rbx
