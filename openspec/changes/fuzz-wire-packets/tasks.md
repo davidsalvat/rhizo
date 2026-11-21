@@ -9,7 +9,7 @@
 ## 2. Fixes
 
 - [x] 2.1 S22: at most `POLL_FRAMES` frames per `poll_wire`, which then returns `Some(0)` (D5); `a_flood_from_the_wire_lets_the_kernel_go` failed before; verify `cargo test -p rhizo-net flood`
-- [x] 2.2 S23: recorded only, fixed on `main` by `fix-tcp-long-wait` (D6); verify the fuzzer's 20 s and 30 s waits pass after the merge
+- [x] 2.2 S23: recorded only, fixed on `main` by `fix-tcp-long-wait` (D6); verify `a_connection_silent_for_long_still_gets_its_reply` and `bytes_a_peer_never_acknowledges_are_given_up` pass after the merge
 
 ## 3. Documentation and checks
 

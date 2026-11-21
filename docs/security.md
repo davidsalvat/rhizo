@@ -627,9 +627,10 @@ after the last segment the client sends an RST and is `Closed`.
 `smoltcp` is a crates.io dependency and is not patched. *Workaround*
 (`fix-tcp-long-wait`): the card clears the timeout while an open
 connection has nothing waiting for an acknowledgment and sets it again
-when it sends. *Tests:* `a_connection_silent_for_long_still_gets_its_reply`
-and `bytes_a_peer_never_acknowledges_are_given_up`; the fuzzer's waits of
-up to 30 s keep it covered.
+when it sends. S23 is covered by that change's dedicated tests in
+`crates/rhizo-net/src/wire_tests.rs`:
+`a_connection_silent_for_long_still_gets_its_reply` (45 s of silence, then
+ten minutes idle) and `bytes_a_peer_never_acknowledges_are_given_up`.
 
 ### The fuzzer
 

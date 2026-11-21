@@ -102,5 +102,7 @@ for an acknowledgment, so an idle connection to the outside was reset.
 `fix-tcp-long-wait` found the same cause from a slow model and fixed it on
 `main` (the timeout is cleared while nothing is outstanding); this change
 keeps no fix of its own and records the finding (S23 in
-`docs/security.md`, with a reproduction in `smoltcp` alone). The
-fuzzer's waits of up to 30 s keep it covered.
+`docs/security.md`, with a reproduction in `smoltcp` alone). It is
+covered by the dedicated tests of `fix-tcp-long-wait`:
+`a_connection_silent_for_long_still_gets_its_reply` and
+`bytes_a_peer_never_acknowledges_are_given_up`.
