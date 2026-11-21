@@ -49,8 +49,15 @@ The entry code:
   trap stack (`gs:[64]`), which the cell's tables map, instead of the
   kernel stack.
 
-A zero CR3 in per-CPU data means no switch: with KPTI off the paths run
-as before, plus two `test`/`jz`.
+With KPTI off, entering a cell and system calls cost nothing: both come
+in two copies, assembled from one macro, and the kernel enters a cell
+through the copy that matches KPTI and points each CPU's `LSTAR` at the
+matching system-call entry (checked as it enters a cell). The copies with
+KPTI live in the entry pages; those without, in the kernel's code, are
+the code from before KPTI. Exceptions and interrupts share one entry
+(the IDT): there a zero CR3 in per-CPU data means no switch, one
+`test`/`jz`. A test per path instead cost 14 instructions per system
+call on CI (4 %), more than the benchmark gate allows.
 
 PCIDs: the kernel's CR3 is loaded with bit 63 (keep PCID 0's entries),
 the cell's with bit 63 unless it must flush, so neither switch flushes the

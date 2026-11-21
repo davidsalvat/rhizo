@@ -56,4 +56,6 @@ entry tables), `kernel/src/arch/aarch64/user.rs` (E0PD),
 `kernel/src/tests.rs`, `xtask/src/bench.rs`,
 `bench/README.md`, `docs/security.md`. The boot image is unchanged in
 size beyond a few instructions (page alignment only in builds that run
-cells). With KPTI off, the entry paths gain two tests of a zero CR3.
+cells). With KPTI off, entering a cell and system calls run the code
+from before (a second copy of each); exceptions gain one test of a zero
+CR3.

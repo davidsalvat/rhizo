@@ -553,7 +553,9 @@ pub(super) unsafe fn wrmsr(msr: u32, value: u64) {
 // code. With KPTI (design D2 of `add-kpti`) a cell's tables map only these
 // pages of code, the per-CPU data, GDT, TSS, IDT and trap stacks: entries
 // load the kernel's CR3 first, and returns load the cell's last, through
-// a register stashed in per-CPU data; a zero CR3 means no switch.
+// a register stashed in per-CPU data. Exceptions share one entry, where a
+// zero CR3 means no switch; entering a cell and system calls have a copy
+// for each case.
 //
 // `Registers` layout: pc 0, sp 8, gpr 16 + 8n (rax rbx rcx rdx rsi rdi rbp
 // r8-r15), tls 264, flags 272.
@@ -563,10 +565,10 @@ core::arch::global_asm!(
     "#,
     entry_page!(),
     r#"
-    .global rhizo_entry_b_start
-rhizo_entry_b_start:
-    .global rhizo_enter_cell
-rhizo_enter_cell:
+    // Entering a cell and its system calls come in two copies (design D5
+    // of `add-kpti`): with KPTI, in the entry pages, switching CR3; without,
+    // in the kernel's code, with nothing of KPTI on the way.
+    .macro RHIZO_ENTER_CELL kpti
     push rbx
     push rbp
     push r12
@@ -575,8 +577,10 @@ rhizo_enter_cell:
     push r15
     mov gs:[8], rsp
     mov gs:[16], rdi
+    .if \kpti
     mov rax, [rdi + 56]             // the cell's RDI, loaded last
     mov gs:[56], rax
+    .endif
     mov rax, [rdi + 272]
     and eax, 0xdd5                  // user flags only: CF PF AF ZF SF DF OF
     or eax, 0x202                   // reserved bit, IF: preemptible
@@ -597,14 +601,19 @@ rhizo_enter_cell:
     mov r13, [rdi + 112]
     mov r14, [rdi + 120]
     mov r15, [rdi + 128]
-    mov rdi, gs:[48]                // KPTI: the cell's CR3
-    test rdi, rdi
-    jz 1f
+    .if \kpti
+    mov rdi, gs:[48]                // the cell's CR3, last
     mov cr3, rdi
-1:  mov rdi, gs:[56]
+    mov rdi, gs:[56]
+    .else
+    mov rdi, [rdi + 56]
+    .endif
     swapgs
     sysretq
-2:  mov rsp, gs:[64]                // the trap stack, mapped for the cell
+2:
+    .if \kpti
+    mov rsp, gs:[64]                // the trap stack, mapped for the cell
+    .endif
     push 0x2b                       // user SS
     push qword ptr [rdi + 8]
     push rax
@@ -624,24 +633,26 @@ rhizo_enter_cell:
     mov r13, [rdi + 112]
     mov r14, [rdi + 120]
     mov r15, [rdi + 128]
-    mov rdi, gs:[48]                // KPTI: the cell's CR3
-    test rdi, rdi
-    jz 1f
+    .if \kpti
+    mov rdi, gs:[48]                // the cell's CR3, last
     mov cr3, rdi
-1:  mov rdi, gs:[56]
+    mov rdi, gs:[56]
+    .else
+    mov rdi, [rdi + 56]
+    .endif
     swapgs
     iretq
+    .endm
 
     // SYSCALL: RIP in RCX, RFLAGS in R11, still on the cell's stack.
-    .global rhizo_syscall_entry
-rhizo_syscall_entry:
+    .macro RHIZO_SYSCALL_ENTRY kpti
     swapgs
     mov gs:[24], rsp
-    mov rsp, gs:[40]                // KPTI: the kernel's CR3
-    test rsp, rsp
-    jz 1f
+    .if \kpti
+    mov rsp, gs:[40]                // the kernel's CR3, first
     mov cr3, rsp
-1:  mov rsp, gs:[16]
+    .endif
+    mov rsp, gs:[16]
     mov [rsp + 16], rax
     mov [rsp + 24], rbx
     mov [rsp + 32], rcx
@@ -663,6 +674,16 @@ rhizo_syscall_entry:
     mov [rsp + 8], rax
     mov eax, 256
     jmp rhizo_back_to_kernel
+    .endm
+
+    .global rhizo_entry_b_start
+rhizo_entry_b_start:
+    .global rhizo_enter_cell_kpti
+rhizo_enter_cell_kpti:
+    RHIZO_ENTER_CELL 1
+    .global rhizo_syscall_entry_kpti
+rhizo_syscall_entry_kpti:
+    RHIZO_SYSCALL_ENTRY 1
 
     // Exception from ring 3, on the TSS RSP0 stack: vector, error code,
     // RIP, CS, RFLAGS, RSP, SS (pushed by the stub and the CPU).
@@ -718,11 +739,30 @@ rhizo_back_to_kernel:
     .global rhizo_entry_b_end
 rhizo_entry_b_end:
     .text
+    .global rhizo_enter_cell
+rhizo_enter_cell:
+    RHIZO_ENTER_CELL 0
+    .global rhizo_syscall_entry
+rhizo_syscall_entry:
+    RHIZO_SYSCALL_ENTRY 0
     "#
 );
 
 unsafe extern "C" {
     fn rhizo_syscall_entry();
+    fn rhizo_syscall_entry_kpti();
+}
+
+/// Points this CPU's `SYSCALL` at the entry with KPTI or the one without.
+pub(super) fn set_syscall_entry(kpti: bool) {
+    let entry = if kpti {
+        rhizo_syscall_entry_kpti as *const ()
+    } else {
+        rhizo_syscall_entry as *const ()
+    };
+    // SAFETY: both are complete system-call entries; which one runs only
+    // decides whether CR3 is switched, as the per-CPU KPTI state expects.
+    unsafe { wrmsr(LSTAR, entry as u64) };
 }
 
 // ---------------------------------------------------------------------------

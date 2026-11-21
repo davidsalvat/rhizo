@@ -19,10 +19,10 @@ fn kpti_leaves_cells_only_the_entry_pages() {
     let half = super::user::cell_kernel_half();
     let mapped = |virt: u64| half.translate(&DirectMap, virt).is_some();
     unsafe extern "C" {
-        fn rhizo_syscall_entry();
+        fn rhizo_syscall_entry_kpti();
     }
-    let entry = rhizo_syscall_entry as *const () as u64;
-    assert!(mapped(entry), "the system-call entry is mapped");
+    let entry = rhizo_syscall_entry_kpti as *const () as u64;
+    assert!(mapped(entry), "the system-call entry with KPTI is mapped");
     assert!(
         half.translate(&DirectMap, entry)
             .unwrap()

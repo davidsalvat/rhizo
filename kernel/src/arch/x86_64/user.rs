@@ -24,6 +24,7 @@ pub const TLB_FLUSH_IS_BROADCAST: bool = false;
 
 unsafe extern "C" {
     fn rhizo_enter_cell(regs: *mut Registers, sysret: u64) -> u64;
+    fn rhizo_enter_cell_kpti(regs: *mut Registers, sysret: u64) -> u64;
 }
 
 /// Why a cell stopped running.
@@ -76,6 +77,8 @@ impl UserFault {
 /// CR3 value (root and PCID) when a cell last ran on each CPU, and whether
 /// PCIDs are on.
 static USER_CR3: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Whether each CPU's `SYSCALL` goes to the entry with KPTI.
+static KPTI_ENTRY: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 static PCID: AtomicBool = AtomicBool::new(false);
 /// FS base last written on each CPU (skipping the write when it does not
 /// change).
@@ -261,7 +264,12 @@ fn load_cr3(value: u64) {
 pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Trap {
     let cr3 = root | tag as u64;
     let cpu = index();
-    if KPTI.load(Ordering::Relaxed) {
+    let kpti = KPTI.load(Ordering::Relaxed);
+    if KPTI_ENTRY[cpu].load(Ordering::Relaxed) != kpti {
+        super::cpu::set_syscall_entry(kpti);
+        KPTI_ENTRY[cpu].store(kpti, Ordering::Relaxed);
+    }
+    if kpti {
         // The entry code loads it last, and the kernel's tables first on
         // the way back (design D2 of `add-kpti`). An untagged cell shares
         // PCID 0 with the kernel: its CR3 always flushes it, so no kernel
@@ -290,7 +298,13 @@ pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Tra
     // with user selectors and only the user flags, and comes back through
     // the SYSCALL entry or a ring-3 exception, which restore the kernel
     // stack and callee-saved registers.
-    let vector = unsafe { rhizo_enter_cell(regs, sysret as u64) };
+    let vector = unsafe {
+        if kpti {
+            rhizo_enter_cell_kpti(regs, sysret as u64)
+        } else {
+            rhizo_enter_cell(regs, sysret as u64)
+        }
+    };
     debug_assert_eq!(
         kernel_flags() & (DF | AC),
         0,
