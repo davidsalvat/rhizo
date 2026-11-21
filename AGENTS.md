@@ -104,8 +104,9 @@ The feedback loop, fastest first:
 | `cargo test -p <crate> <name>` | < 1 s | One host test |
 | `cargo xtask check` | seconds | fmt, clippy (all crates), host tests, crate dependency rules. **Run after every edit.** |
 | `cargo xtask test --only <step>` | seconds | One VM step: `boot`, `ktest`, `ktest-smp` (4 vCPUs), `ktest-node` (Node.js, with `RHIZO_NODE`), `ktest-packages` (numpy and requests, with `RHIZO_CPYTHON_SRC`), or a self-check such as `ktest-page-fault` |
+| `cargo xtask test --affected` | seconds to ~1 min | Only the host test crates and VM steps the files changed against `origin/main` reach, through the crate table below (local loop only; CI runs everything) |
 | `cargo xtask test` | ~1 min | Host tests, boot check, in-kernel tests, all self-checks |
-| `cargo xtask ci` | minutes | Everything CI runs. **Run before pushing.** |
+| `cargo xtask ci` | minutes | Everything CI runs. **Run before pushing.** (`--part K/N`: one of `N` shares of the test steps, as CI's two AArch64 runners do) |
 | `cargo xtask bench` | minutes | Release boot benchmarks per VMM (`--env ci --check` gates; `--icount-only` for the instruction counts alone, as pull requests run) |
 | `cargo xtask mutants` | long | Mutation testing (weekly in CI) |
 
@@ -136,8 +137,9 @@ The feedback loop, fastest first:
   docs only (`docs/`, `openspec/`, `.agents/`, `*.md`, images) runs the
   `docs` job (specs, changed changes, Markdown links, images when they
   change); `cli/` alone adds the quick checks and the control plane;
-  anything else runs everything, after a quick job (`cargo xtask check`)
-  that the heavy jobs wait for. Pull requests are gated on instruction
+  anything else runs everything at once, the AArch64 tests on two
+  runners (`ci --part`); a failing quick job (`cargo xtask check`)
+  cancels the run. Pull requests are gated on instruction
   counts (`-icount`) only; timing benchmarks run on main and nightly
   (`bench.yml`) and open an issue when their gate fails. `ci-ok` is the
   check that sums up a run. A job that fails and then passes on a re-run

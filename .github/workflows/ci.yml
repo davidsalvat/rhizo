@@ -6,7 +6,8 @@ name: CI
 # checks and the control plane, code runs everything. Pushes to main run
 # everything. Timing benchmarks run in bench.yml (main and nightly); pull
 # requests are gated on instruction counts only. `ci-ok` is the one job
-# branch protection should require.
+# branch protection should require. Every job starts right after `changes`;
+# a failing `quick` cancels the run (change `faster-ci-2`).
 on:
   push:
     branches: [main]
@@ -100,6 +101,10 @@ jobs:
     if: needs.changes.outputs.class != 'docs'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
+      # To cancel the run when these checks fail.
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -113,6 +118,14 @@ jobs:
           log=ci.log
           [ -f "$log" ] || log=/dev/null
           echo "::error title=ci-log::$(tail -c 3000 "$log" | tr -d '\r' | sed -e 's/%/%25/g' | tr '\n' '|')"
+      - name: Cancel the other jobs
+        # They started beside this one; a red quick check makes their
+        # results moot, so they stop instead of using runners for minutes.
+        # `ci-ok` still runs (it runs always) and fails on this job.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
 
   policy:
     name: Dependency policy, unused dependencies
@@ -132,7 +145,7 @@ jobs:
 
   control-plane:
     name: Control plane through `rhizo` (host-tools changes)
-    needs: [changes, quick]
+    needs: changes
     if: needs.changes.outputs.class == 'host-tools'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -146,7 +159,7 @@ jobs:
 
   ci:
     name: x86_64 tests (host and QEMU)
-    needs: [changes, quick]
+    needs: changes
     if: needs.changes.outputs.class == 'code'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -180,7 +193,7 @@ jobs:
 
   vmm:
     name: x86_64 tests on Firecracker and Cloud Hypervisor (KVM)
-    needs: [changes, quick]
+    needs: changes
     if: needs.changes.outputs.class == 'code'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -218,7 +231,7 @@ jobs:
     # Pull requests only: on main, bench.yml measures these counts with
     # every other metric and gates them in the same `ci` environment.
     name: x86_64 instruction counts and gate (QEMU -icount)
-    needs: [changes, quick]
+    needs: changes
     if: needs.changes.outputs.class == 'code' && github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -255,11 +268,17 @@ jobs:
           echo "::error title=ci-log::$(tail -c 3000 "$log" | tr -d '\r' | sed -e 's/%/%25/g' | tr '\n' '|')"
 
   ci-arm64:
-    name: AArch64 tests (host and QEMU virt)
-    needs: [changes, quick]
+    # Two runners share the steps of `xtask ci` (`--part`: every step runs
+    # in exactly one part; part 1 also lints).
+    name: AArch64 tests, part ${{ matrix.part }} of 2 (host and QEMU virt)
+    needs: changes
     if: needs.changes.outputs.class == 'code'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
     env:
       RHIZO_NODE: "1"
     steps:
@@ -279,7 +298,7 @@ jobs:
             echo "::notice title=kvm::no /dev/kvm on ubuntu-24.04-arm (no hardware virtualization); AArch64 runs are emulated"
           fi
       - name: Run all checks
-        run: cargo xtask --arch aarch64 ci 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
+        run: cargo xtask --arch aarch64 ci --part ${{ matrix.part }}/2 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
       - name: Save the CPython build
         if: always() && steps.setup.outputs.cpython-hit != 'true' && hashFiles('target/cpython/*/recipe') != ''
         uses: actions/cache/save@v4
@@ -295,7 +314,7 @@ jobs:
 
   icount-aarch64:
     name: AArch64 instruction counts and gate (QEMU virt -icount)
-    needs: [changes, quick]
+    needs: changes
     if: needs.changes.outputs.class == 'code'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -342,7 +361,7 @@ jobs:
 
   miri:
     name: Miri on the heap allocator
-    needs: [changes, quick]
+    needs: changes
     if: needs.changes.outputs.class == 'code'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -355,7 +374,26 @@ jobs:
           PROPTEST_CASES: "8"
           # proptest reads its regression files; Miri isolates the file system.
           MIRIFLAGS: "-Zmiri-disable-isolation"
-        run: "cargo +nightly miri test -p rhizo-mm -- heap::"
+        # Miri runs one test at a time: the two slowest (85 s each) run in
+        # processes of their own beside a third with every other heap test,
+        # so a new test lands in that one (change `faster-ci-2`).
+        run: |
+          cargo +nightly miri test -p rhizo-mm --no-run
+          slow="heap::tests::allocations_never_overlap heap::tests::whole_free_pages_go_back_when_due"
+          skips=""
+          pids=""
+          for t in $slow; do
+            skips="$skips --skip $t"
+            cargo +nightly miri test -p rhizo-mm -- --exact "$t" > "miri-${t##*::}.log" 2>&1 &
+            pids="$pids $!"
+          done
+          # shellcheck disable=SC2086 # one word per option
+          cargo +nightly miri test -p rhizo-mm -- heap:: $skips > miri-rest.log 2>&1 &
+          pids="$pids $!"
+          status=0
+          for pid in $pids; do wait "$pid" || status=1; done
+          cat miri-*.log
+          exit "$status"
 
   ci-ok:
     # The one required check: every job above succeeded or was skipped on
