@@ -16,6 +16,10 @@ programs and file mappings, the image cache and 2 MiB image pages, the
 agent workload's host calls, and snapshots as untrusted input (findings
 S14 to S21, section [Second review](#second-review-d2)).
 
+The scope we would hand an external auditor (trust boundaries, components
+ranked by risk with their size, open questions and an effort estimate) is
+in [`audit-scope.md`](audit-scope.md).
+
 ## Threat model
 
 **Attacker.** Arbitrary code running in a cell: any instruction the CPU

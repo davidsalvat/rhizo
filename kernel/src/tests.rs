@@ -128,6 +128,7 @@ macro_rules! suite {
             ktest_case!(forked_servers_share_their_listener),
             ktest_case!(pipes_and_sockets_of_a_fork),
             ktest_case!(a_cell_reaches_the_host),
+            ktest_case!(a_silent_connection_outlasts_the_timeout_and_reconnects_at_once),
             ktest_case!(stack_grows_on_touch_and_returns_its_frames),
             ktest_case!(cpython_in_a_cell),
             ktest_case!(a_cpython_agent_talks_forks_and_survives_suspend),
@@ -2653,6 +2654,34 @@ fn a_cell_reaches_the_host() {
     );
     host.run(|_| false);
     assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
+}
+
+/// A connection through the network card that stays silent for three
+/// times the card's timeout (shortened to 500 ms here, 20 s otherwise)
+/// still carries the next echo, and a new connection after it closes is
+/// open and echoing within a second (spec `networking`, change
+/// `fix-tcp-long-wait`); not run without a card.
+fn a_silent_connection_outlasts_the_timeout_and_reconnects_at_once() {
+    let Some((ip, port)) = crate::wire::options().echo else {
+        arch::console::BootConsole.write_bytes(b"(no network card and echo server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card gets an address"
+    );
+    crate::cell::set_wire_timeout(500_000_000);
+    let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let port = alloc::format!("{port}");
+    let id = spawn(
+        &mut host,
+        "quiet",
+        &[port.as_bytes(), b"1500", ip.as_bytes()],
+    );
+    host.run(|_| false);
+    crate::cell::set_wire_timeout(20_000_000_000);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "quiet ok\n".into()));
 }
 
 fn forks_of_a_threaded_cell_run_all_threads() {
