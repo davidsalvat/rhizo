@@ -4,15 +4,18 @@
 
 Every cargo feature set of the `kernel` crate is a separate compilation
 of it (its dependencies are shared: no kernel feature reaches them).
-Before this change, after an edit to kernel code (measured with
-`touch kernel/src/main.rs`, this host: 4 CPUs, no KVM; times are the wall
-time of the cargo calls that build or lint the kernel):
+Before this change, after an edit to kernel code (`touch
+kernel/src/main.rs`; this host: 4 CPUs, no KVM). "Compiled" counts the
+`kernel` crate's compilations and lints; the times are the wall time of
+the cargo calls that build or lint the kernel, first with each kernel
+compiled in full (`CARGO_INCREMENTAL=0`, the cost of an edit that
+reaches most of the crate), then with incremental reuse (a small edit):
 
-| Command | Kernels compiled (aarch64 / x86_64) | Their time (aarch64 / x86_64) |
-|---|---|---|
-| `cargo xtask check` | 0 built, 2 linted | MEASURE_BEFORE_CHECK |
-| `cargo xtask test` | 11 / 11 | MEASURE_BEFORE_TEST |
-| `cargo xtask ci` | 11 + 15 linted / 11 + 15 linted | MEASURE_BEFORE_CI |
+| Command | Compiled, per arch | Build time, full (aarch64 / x86_64) | Build time, incremental | Lint time, incremental |
+|---|---|---|---|---|
+| `cargo xtask check` | 2 linted (one per arch) | — | — | 2.0 s |
+| `cargo xtask test` | 11 built | 58.5 s / 36.6 s | 7.6 s / 9.0 s | — |
+| `cargo xtask ci` | 11 built, 15 linted | 31.3 s / — | 7.5 s / 9.3 s | 43.4 s / 29.3 s |
 
 The 11 are the plain kernel (boot check), `ktest` (in-kernel tests on 1
 and 4 CPUs), `control` (the control plane through `rhizo`) and one
@@ -103,13 +106,20 @@ benchmark metric can move; the `-icount` gates were run as well.
 
 ## Results
 
-After the change, with the same edit:
+After the change, with the same edit and host:
 
-| Command | Kernels compiled (aarch64 / x86_64) | Their time (aarch64 / x86_64) |
-|---|---|---|
-| `cargo xtask check` | 0 built, 2 linted | MEASURE_AFTER_CHECK |
-| `cargo xtask test` | 3 / 3 | MEASURE_AFTER_TEST |
-| `cargo xtask ci` | 3 + 7 linted / 3 + 7 linted | MEASURE_AFTER_CI |
+| Command | Compiled, per arch | Build time, full (aarch64 / x86_64) | Build time, incremental | Lint time, incremental |
+|---|---|---|---|---|
+| `cargo xtask check` | 2 linted (one per arch) | — | — | 2.0 s |
+| `cargo xtask test` | 3 built | 7.4 s / 6.7 s | 1.6 s / 2.4 s | — |
+| `cargo xtask ci` | 3 built, 7 linted | 5.3 s / — | 1.7 s / 1.9 s | 28.9 s / 14.0 s |
+
+The kernel compile time of `test` drops by a factor of 5 to 8. The whole
+commands gain less on this host: under emulation (no KVM) the in-kernel
+test VMs take 75 to 80 s and set the wall time (`test` took 116 to 256 s
+before and 119 to 194 s after, depending on the run). `check` builds no
+kernel and is unchanged. The aarch64 full `ci` figure is lower than its
+`test` one because `test` compiled the dependencies first.
 
 ## Risks
 
