@@ -115,6 +115,17 @@ pub struct Cell {
     /// CPU time it has used, in nanoseconds (counted against
     /// [`Quota::cpu_ns`]).
     pub cpu_ns: u64,
+    /// Its copy generation (design D22 of `add-cell-hierarchy`): 0 at
+    /// spawn, one more in each copy (a fork, a cell from a template, a
+    /// resume or load of a snapshot), unchanged in the source of a fork.
+    /// The cell reads it in `/run/rhizo/generation` to learn that it must
+    /// reseed the generators it keeps in its memory.
+    pub generation: u64,
+    /// It reached the network card (and, with handles and views, received
+    /// a message, a handle or a view): it may hold a secret, so a template
+    /// of it is published only on the host's word (design D22). Sticky,
+    /// and kept by its copies.
+    pub exposed: bool,
 }
 
 impl Cell {
@@ -136,6 +147,8 @@ impl Cell {
             exit_status: None,
             quota: Quota::DEFAULT,
             cpu_ns: 0,
+            generation: 0,
+            exposed: false,
         }
     }
 

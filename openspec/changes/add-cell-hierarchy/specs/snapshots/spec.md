@@ -18,6 +18,14 @@ architecture, with an error naming the reason and the versions read.
 - **WHEN** the same cell state is encoded twice
 - **THEN** both byte sequences are identical
 
+#### Scenario: Write-or-execute page writable and executable
+- **WHEN** a page record marked write-or-execute is both writable and executable, or neither
+- **THEN** decoding fails with a page error
+
+#### Scenario: Bad ranges
+- **WHEN** a snapshot's write-or-execute ranges are unaligned, empty, out of order, touching, past `USER_END` or more than 64
+- **THEN** decoding fails with a ranges error
+
 ## ADDED Requirements
 
 ### Requirement: Snapshot upgrades
