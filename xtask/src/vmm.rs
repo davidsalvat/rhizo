@@ -341,6 +341,83 @@ pub struct RunOptions {
     /// line, both ways, on the VMM's standard input and output, also where
     /// the kernel would otherwise use a debug port.
     pub control: bool,
+    /// A virtio socket device, for a control kernel's frames.
+    pub vsock: Option<Vsock>,
+}
+
+/// A virtio socket device and how the host reaches it (change
+/// `control-over-vsock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vsock {
+    /// QEMU's `vhost-vsock`, served by the host's kernel
+    /// (`/dev/vhost-vsock`): the host connects an `AF_VSOCK` socket to the
+    /// guest's context identifier `cid`, unique on the host.
+    Vhost { cid: u32 },
+    /// A Unix socket ([`Vsock::socket`]) where the host asks for a port
+    /// with `CONNECT <port>\n`: Firecracker's and Cloud Hypervisor's own
+    /// device.
+    Unix { cid: u32 },
+}
+
+impl Vsock {
+    /// The device a control kernel gets on `vmm`, or why there is none:
+    /// Firecracker and Cloud Hypervisor always have one; QEMU has one when
+    /// `/dev/vhost-vsock` is usable (made so with `sudo -n chmod` if it is
+    /// not).
+    pub fn for_vmm(vmm: Vmm) -> Result<Self> {
+        // Unique on the host: the process, then a counter.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed) & 0x3f;
+        let cid = 3 + ((std::process::id() << 6) | n);
+        if vmm.requires_kvm() {
+            Ok(Vsock::Unix { cid })
+        } else if vhost_vsock_usable() {
+            Ok(Vsock::Vhost { cid })
+        } else {
+            Err("/dev/vhost-vsock is missing or not usable".into())
+        }
+    }
+
+    pub fn cid(self) -> u32 {
+        match self {
+            Vsock::Vhost { cid } | Vsock::Unix { cid } => cid,
+        }
+    }
+
+    /// The Unix socket where the host connects to the guest.
+    pub fn socket(self) -> PathBuf {
+        std::env::temp_dir().join(format!("rhizo-vsock-{}.sock", self.cid()))
+    }
+}
+
+/// Whether `/dev/vhost-vsock` opens for reading and writing, after a
+/// `sudo -n chmod 0666` if it exists and does not (CI runners leave it to
+/// `root:kvm`). The module is loaded first: loading it on the first open
+/// has udev set the old mode back.
+fn vhost_vsock_usable() -> bool {
+    const DEVICE: &str = "/dev/vhost-vsock";
+    let opens = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(DEVICE)
+            .is_ok()
+    };
+    let sudo = |args: &[&str]| {
+        Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    opens()
+        || (Path::new(DEVICE).exists()
+            && sudo(&["modprobe", "vhost_vsock"])
+            && sudo(&["udevadm", "settle"])
+            && sudo(&["chmod", "0666", DEVICE])
+            && opens())
 }
 
 /// The console and exit options of a Rhizo kernel on `vmm`.
@@ -405,7 +482,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
         // Without ACPI, `microvm` lists its virtio-mmio devices on the
         // kernel command line (`virtio_mmio.device=`), where Rhizo finds its
         // network card.
-        (Vmm::QemuMicrovm, Guest::Rhizo(_)) if opts.network => cmd.args([
+        (Vmm::QemuMicrovm, Guest::Rhizo(_)) if opts.network || opts.vsock.is_some() => cmd.args([
             "-M",
             "microvm,rtc=off,pit=off,pic=off,isa-serial=on,acpi=off",
         ]),
@@ -467,6 +544,7 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
                 }
                 args += &cmdline;
             }
+            qemu_vsock(&mut cmd, vmm, opts);
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(vmm);
             }
@@ -488,8 +566,35 @@ fn qemu_command(vmm: Vmm, guest: &Guest, opts: &RunOptions) -> Command {
     cmd
 }
 
+/// QEMU's `vhost-vsock` for `opts.vsock`: virtio-pci on `q35`, virtio-mmio
+/// elsewhere.
+fn qemu_vsock(cmd: &mut Command, vmm: Vmm, opts: &RunOptions) {
+    let Some(Vsock::Vhost { cid }) = opts.vsock else {
+        return;
+    };
+    if vmm == Vmm::QemuQ35 {
+        cmd.args(["-device", &format!("vhost-vsock-pci,guest-cid={cid}")]);
+    } else {
+        cmd.args(["-device", &format!("vhost-vsock-device,guest-cid={cid}")])
+            .args(["-global", "virtio-mmio.force-legacy=false"]);
+    }
+}
+
 fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Result<Command> {
     let binary = tools::firecracker()?;
+    let path = scratch.join(format!("firecracker-{}.json", std::process::id()));
+    fs::write(&path, firecracker_config(guest, opts))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let mut cmd = Command::new(binary);
+    cmd.arg("--no-api")
+        .arg("--config-file")
+        .arg(&path)
+        .args(["--level", "Error"]);
+    Ok(cmd)
+}
+
+/// Firecracker's configuration file for `guest`.
+fn firecracker_config(guest: &Guest, opts: &RunOptions) -> String {
     let (kernel, initrd, mut args) = match guest {
         Guest::Rhizo(kernel) => (
             kernel.clone(),
@@ -523,28 +628,33 @@ fn firecracker_command(guest: &Guest, opts: &RunOptions, scratch: &Path) -> Resu
         Some(path) => format!(", \"initrd_path\": {:?}", path.display().to_string()),
         None => String::new(),
     };
-    let config = format!(
+    let vsock = match opts.vsock {
+        Some(v) => format!(
+            ", \"vsock\": {{\"guest_cid\": {}, \"uds_path\": {:?}}}",
+            v.cid(),
+            v.socket().display().to_string()
+        ),
+        None => String::new(),
+    };
+    format!(
         "{{\"boot-source\": {{\"kernel_image_path\": {:?}, \"boot_args\": {:?}{initrd_json}}}, \
          \"drives\": [], \"network-interfaces\": [{interfaces}], \
-         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": {}}}}}",
+         \"machine-config\": {{\"vcpu_count\": {}, \"mem_size_mib\": {}}}{vsock}}}",
         kernel.display().to_string(),
         args,
         opts.cpus,
         opts.memory_mib
-    );
-    let path = scratch.join(format!("firecracker-{}.json", std::process::id()));
-    fs::write(&path, config).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    let mut cmd = Command::new(binary);
-    cmd.arg("--no-api")
-        .arg("--config-file")
-        .arg(&path)
-        .args(["--level", "Error"]);
-    Ok(cmd)
+    )
 }
 
 fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command> {
-    let binary = tools::cloud_hypervisor()?;
-    let mut cmd = Command::new(binary);
+    let mut cmd = Command::new(tools::cloud_hypervisor()?);
+    cloud_hypervisor_args(&mut cmd, guest, opts);
+    Ok(cmd)
+}
+
+/// Cloud Hypervisor's arguments for `guest`.
+fn cloud_hypervisor_args(cmd: &mut Command, guest: &Guest, opts: &RunOptions) {
     cmd.args(["--cpus", &format!("boot={}", opts.cpus)])
         .args(["--memory", &format!("size={}M", opts.memory_mib)])
         .args(["--console", "off"]);
@@ -558,6 +668,16 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
                 // A virtio-pci card on the tap device.
                 cmd.args(["--net", &format!("tap={tap},mac=06:00:ac:10:01:02")]);
                 args += &cmdline;
+            }
+            // Its serial line takes input only from a terminal: a control
+            // kernel's frames take the socket device (design D5 of
+            // `control-over-vsock`).
+            if let Some(v) = opts.vsock {
+                let socket = v.socket();
+                cmd.args([
+                    "--vsock",
+                    &format!("cid={},socket={}", v.cid(), socket.display()),
+                ]);
             }
             if let Some(bench) = opts.bench {
                 args += &bench.cmdline(Vmm::CloudHypervisor);
@@ -579,7 +699,6 @@ fn cloud_hypervisor_command(guest: &Guest, opts: &RunOptions) -> Result<Command>
                 .args(["--serial", "tty"]);
         }
     }
-    Ok(cmd)
 }
 
 /// Boots `guest` on `vmm`, streams and captures its console, and measures
@@ -814,6 +933,69 @@ mod tests {
                 .rhizo_cmdline(true)
                 .contains("console=serial")
         );
+    }
+
+    fn control_options(vsock: Option<Vsock>) -> RunOptions {
+        RunOptions {
+            network: false,
+            vsock,
+            ..crate::control::run_options(Accel::Tcg, 1, DEFAULT_MEMORY_MIB)
+        }
+    }
+
+    fn args_of(cmd: &Command) -> String {
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        args.join(" ")
+    }
+
+    #[test]
+    fn control_kernels_on_firecracker_and_cloud_hypervisor_get_a_socket_device() {
+        let guest = Guest::Rhizo(PathBuf::from("/k"));
+        let (Ok(a), Ok(b)) = (
+            Vsock::for_vmm(Vmm::Firecracker),
+            Vsock::for_vmm(Vmm::CloudHypervisor),
+        ) else {
+            panic!("they always have one");
+        };
+        assert!(matches!(a, Vsock::Unix { .. }) && matches!(b, Vsock::Unix { .. }));
+        assert_ne!(a.cid(), b.cid(), "each VM its own");
+        assert!(a.cid() > 2, "0 to 2 are reserved");
+        let config = firecracker_config(&guest, &control_options(Some(a)));
+        let expected = format!(
+            "\"vsock\": {{\"guest_cid\": {}, \"uds_path\": {:?}}}",
+            a.cid(),
+            a.socket().display().to_string()
+        );
+        assert!(config.contains(&expected), "{config}");
+        let mut cmd = Command::new("cloud-hypervisor");
+        cloud_hypervisor_args(&mut cmd, &guest, &control_options(Some(b)));
+        let args = args_of(&cmd);
+        let expected = format!("--vsock cid={},socket={}", b.cid(), b.socket().display());
+        assert!(args.contains(&expected), "{args}");
+        assert!(!firecracker_config(&guest, &control_options(None)).contains("vsock"));
+    }
+
+    #[test]
+    fn control_kernels_on_qemu_get_vhost_vsock() {
+        let guest = Guest::Rhizo(PathBuf::from("/k"));
+        let opts = control_options(Some(Vsock::Vhost { cid: 77 }));
+        let scratch = Path::new("/tmp");
+        let args = |vmm| args_of(&command(vmm, &guest, &opts, scratch).unwrap());
+        let microvm = args(Vmm::QemuMicrovm);
+        assert!(microvm.contains("-device vhost-vsock-device,guest-cid=77"));
+        assert!(
+            microvm.contains("acpi=off"),
+            "virtio-mmio listed on the command line"
+        );
+        assert!(microvm.contains("virtio-mmio.force-legacy=false"));
+        assert!(args(Vmm::QemuQ35).contains("-device vhost-vsock-pci,guest-cid=77"));
+        assert!(args(Vmm::QemuVirt).contains("-device vhost-vsock-device,guest-cid=77"));
+        let none =
+            args_of(&command(Vmm::QemuQ35, &guest, &control_options(None), scratch).unwrap());
+        assert!(!none.contains("vsock"));
     }
 
     #[test]
