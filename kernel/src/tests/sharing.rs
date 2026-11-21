@@ -101,7 +101,10 @@ fn same_file_in_two_domains() {
 /// Spec `cell-hierarchy`, "Library in two domains": the host's file sets
 /// are published when decoded, their executables' pages loaded then;
 /// cells of two domains map one of them on one frame, and a map after the
-/// other cell ended is a hit too: nothing is ever filled for a domain.
+/// other cell ended is a hit too: nothing is ever filled for a domain. A
+/// whole run of a dynamically linked program (its executable, `ld.so` and
+/// the libraries `ld.so` maps) fills no page for its domain either, but
+/// for its files that are not executables (`ld.so`'s cache).
 fn public_library_always_hits() {
     let files = crate::cell::dynamic_files().expect("xtask packs the dynamic hello");
     let &(path, ..) = expected::DYNAMIC.first().expect("a dynamic program");
@@ -122,6 +125,15 @@ fn public_library_always_hits() {
     assert_eq!(domains.map(kept_pages_of), [0, 0], "no page of a domain");
     assert_eq!(kept_pages_of(PUBLIC), public, "every map a hit");
     assert!(host.kill(b));
+    let run = super::dynamic::spawn_dynamic(&mut host, &files, path, &["hello"]);
+    host.run(|_| false);
+    assert_eq!(ended(&host, run).0, Ending::Exit(0));
+    let filled = kept_pages_of(run);
+    assert!(
+        filled <= 2,
+        "{filled} pages filled for the program's domain"
+    );
+    assert_eq!(kept_pages_of(PUBLIC), public, "every map a hit");
 }
 
 /// Spec `isolation`, "Flushing another domain" (item 9 of design D12):

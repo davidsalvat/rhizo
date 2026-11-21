@@ -1386,11 +1386,12 @@ Alternatives:
   domain's pages, once dropped, leave no record behind. Each domain keeps
   at most 65,536 pages; one past its limit is the cell's own copy. Charging
   a domain's pages to its root (D4) comes with the metering of task 1.3.
-  A public page that was not published (a written template file, a page
-  outside an executable's loadable segments) is kept for each domain like
-  a private one: nothing is filled for every domain on demand.
-- **Published sets** fill a frame for every page of the loadable segments
-  of their executables and libraries, not of their other files.
+  A public page that was not published (a file the cell wrote, a file
+  that is no executable) is kept for each domain like a private one:
+  nothing is filled for every domain on demand.
+- **Published sets** fill a frame for every page of their executables and
+  libraries (ELF files: `ld.so` maps libraries by ranges of its own), not
+  of their other files.
 - **A dropped template that was published** keeps its tables while any
   table or page of them is shared with another cell, except pages a cache
   of the kernel holds (whose counts never fall to one); it goes when the

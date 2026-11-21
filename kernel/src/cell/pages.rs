@@ -63,37 +63,30 @@ impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
 
 /// Publishes the files of `fs` (design D21 of `add-cell-hierarchy`): makes
 /// them public, then fills and pins a public frame for every page of their
-/// executables' and libraries' loadable segments, so that a map of one by
-/// any domain always hits. Returns the pages pinned, for
-/// [`withdraw_pages`]; a page past what memory holds is not published (the
-/// domains that map it keep their own).
+/// executables and libraries (ELF files, mapped by the loader and by
+/// `ld.so`), so that a map of one by any domain always hits. Returns the
+/// pages pinned, for [`withdraw_pages`]; a page past what memory holds is
+/// not published (the domains that map it keep their own).
 pub(super) fn publish_files(fs: &mut Fs) -> Vec<rhizo_fs::Page> {
     fs.publish();
     let mut pinned = Vec::new();
     for (ino, size) in fs.files() {
-        let Ok(head) = fs.page(ino, 0) else {
-            continue;
-        };
-        let Ok(image) = Image::parse_file(head.bytes(), size, user::MACHINE) else {
-            continue; // not an executable or a library of this machine
-        };
-        for s in image.segments() {
-            let first = s.file_offset / FRAME_SIZE;
-            let end = (s.file_offset + s.file_size).div_ceil(FRAME_SIZE);
-            for index in first..end {
-                let Ok(page) = fs.page(ino, index) else {
-                    continue;
-                };
-                let published =
-                    PAGES.with(|pages| pages.publish(&page, &mut DirectMap, &mut ImageFrames));
-                let Some((phys, fresh)) = published else {
-                    continue;
-                };
-                if fresh {
-                    user::sync_code(DirectMap::virt(phys), FRAME_SIZE);
-                }
-                pinned.push(page);
+        let elf = fs
+            .page(ino, 0)
+            .is_ok_and(|p| p.bytes().starts_with(b"\x7fELF"));
+        for index in (0..size.div_ceil(FRAME_SIZE)).filter(|_| elf) {
+            let Ok(page) = fs.page(ino, index) else {
+                continue;
+            };
+            let published =
+                PAGES.with(|pages| pages.publish(&page, &mut DirectMap, &mut ImageFrames));
+            let Some((phys, fresh)) = published else {
+                continue; // a hole, or no memory
+            };
+            if fresh {
+                user::sync_code(DirectMap::virt(phys), FRAME_SIZE);
             }
+            pinned.push(page);
         }
     }
     pinned
