@@ -8,13 +8,13 @@
 ## 2. xtask
 
 - [x] 2.1 `--part K/N` for `test` and `ci`, steps dealt by cost (`xtask/src/parts.rs`), lints and q35 steps in part 1 (D2); verify `cargo test -p xtask parts` and `the_parts_of_a_run_hold_every_step_once`
-- [ ] 2.2 `test --affected` (`xtask/src/affected.rs`, D4); verify `cargo test -p xtask affected`, and `cargo xtask test --affected` on a branch that changes only `cli/` selecting `host` and `control`
+- [x] 2.2 `test --affected` (`xtask/src/affected.rs`, D4); verify `cargo test -p xtask affected`, and `cargo xtask test --affected --only boot` on this branch (it changes `xtask`, so every step is reachable) printing and running `boot`
 
 ## 3. Workflow
 
 - [ ] 3.1 `ci.yml`: heavy jobs need only `changes`; `quick` cancels the run on failure (D1); `ci-arm64` as a two-part matrix (D2); Miri in three processes (D3); verify `actionlint` and `cargo xtask check`
 - [ ] 3.2 AGENTS.md: the feedback loop table and the CI paragraph; verify by reading
-- [ ] 3.3 `openspec validate faster-ci-2 --strict`
+- [x] 3.3 `openspec validate faster-ci-2 --strict`
 
 ## 4. Measure the result
 

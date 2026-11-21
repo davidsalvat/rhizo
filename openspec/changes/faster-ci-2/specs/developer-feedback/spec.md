@@ -33,12 +33,8 @@ SHALL split the AArch64 tests over two runners this way.
 `cargo xtask test --affected` SHALL run only the host tests of the crates
 that the files changed against `origin/main` (committed, staged, unstaged
 and untracked) reach through the crate dependency table, with every crate
-that depends on them, and only the VM steps those crates reach: the
-kernel's steps when the kernel or the cells are reached, the differential
-check when the cells are, and the control plane when the kernel or the
-command-line tool is. A changed file outside every crate and the
-documentation, or in `xtask`, SHALL select every step. It SHALL print the
-steps it selected. CI SHALL NOT use it.
+that depends on them, and only the VM steps those crates reach. It SHALL
+print the steps it selected. CI SHALL NOT use it.
 
 #### Scenario: Command-line tool only
 - **WHEN** only `cli/src/main.rs` changed and a developer runs `cargo xtask test --affected`
@@ -47,3 +43,18 @@ steps it selected. CI SHALL NOT use it.
 #### Scenario: Documentation only
 - **WHEN** only Markdown files changed
 - **THEN** no test runs and the selection printed is empty
+
+### Requirement: VM steps an affected crate reaches
+For `--affected`, the kernel's steps (boot check, in-kernel tests,
+self-checks) SHALL run when the kernel or the cells are reached, the
+differential check when the cells are, and the control plane when the
+kernel or the command-line tool is. A changed file in `xtask`, or outside
+every crate and the documentation, SHALL select every step.
+
+#### Scenario: Cells changed
+- **WHEN** only a file under `cells/` changed
+- **THEN** the kernel's steps and the differential check run, and no host test runs
+
+#### Scenario: Cargo files changed
+- **WHEN** `Cargo.lock` changed
+- **THEN** every step runs
