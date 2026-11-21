@@ -173,14 +173,10 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         }
     }
 
-    /// Takes, of the entries in the queues of CPUs `queues`, the one for
-    /// `cpu` to run: the first (round robin, `queues` holds one CPU), or the
-    /// one owed the most CPU time by weight.
-    fn take(&mut self, cpu: usize, queues: core::ops::Range<usize>) -> Option<T> {
+    /// Takes, of the entries in the queues of CPUs `queues`, the one owed
+    /// the most CPU time by weight, for `cpu` to run.
+    fn take_by_weight(&mut self, cpu: usize, queues: core::ops::Range<usize>) -> Option<T> {
         let mut from = queues.start;
-        if !F::BY_WEIGHT {
-            return self.queues[from].pop_front().map(|(_, _, e)| e);
-        }
         let keys = self.queues[queues]
             .iter()
             .flat_map(|q| q.iter().map(|e| e.1));
@@ -203,9 +199,8 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// returns that CPU.
     pub fn place(&mut self, entry: T) -> usize {
         let cpu = self.shortest();
-        let key = entry.key();
-        self.arrive(cpu, key);
-        self.enqueue(cpu, key, entry);
+        self.arrive(cpu, entry.key());
+        self.push(cpu, entry);
         cpu
     }
 
@@ -278,7 +273,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         };
         f(&mut entry);
         self.arrive(cpu, key);
-        self.enqueue(cpu, key, entry);
+        self.push(cpu, entry);
         true
     }
 
@@ -316,7 +311,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
             if let Some(mut entry) = self.take_waiting(key) {
                 f(&mut entry);
                 self.arrive(cpu, key);
-                self.enqueue(cpu, key, entry);
+                self.push(cpu, entry);
             }
         }
     }
@@ -343,7 +338,10 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         } else {
             cpu
         };
-        self.take(cpu, from..from + 1)
+        if F::BY_WEIGHT {
+            return self.take_by_weight(cpu, from..from + 1);
+        }
+        self.queues[from].pop_front().map(|(_, _, e)| e)
     }
 
     /// Wakes the sleepers whose time has come (onto CPU 0's queue) and
@@ -353,9 +351,9 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         self.wake_due(0, now, |_| {});
         let from = self.oldest(None)?;
         if F::BY_WEIGHT {
-            return self.take(0, 0..self.queues.len());
+            return self.take_by_weight(0, 0..self.queues.len());
         }
-        self.take(0, from..from + 1)
+        self.queues[from].pop_front().map(|(_, _, e)| e)
     }
 
     /// Earliest wake-up time among sleepers and waiters with a deadline.
