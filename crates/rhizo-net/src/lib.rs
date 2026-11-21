@@ -6,7 +6,16 @@
 //! (127.0.0.0/8) a TCP connection is a pair of byte queues joined here and a
 //! UDP datagram goes straight into the queue of the socket bound at its
 //! destination; a Unix stream socket is reached by its name number, which a
-//! file of type socket in the cell's tree holds. Every other address goes
+//! file of type socket in the cell's tree holds.
+//!
+//! **Networks** (design D5 of `add-cell-hierarchy`). Every socket belongs to
+//! one loopback network, numbered by the kernel: each cell has its own, the
+//! number its calls enter with ([`Ports::key`], the cell's identifier), and
+//! network 0 is the kernel's own. Bind conflicts, the listener a `connect`
+//! reaches, UDP delivery and Unix names are all looked up in the socket's
+//! network only, so no cell reaches, or sees the ports of, another's. A
+//! copy's sockets are bound again in the copy's network ([`Net::fork`]), a
+//! resumed cell's come back in its new one ([`Net::import`]). Every other address goes
 //! through the network card, with `smoltcp` (module `wire`). Nothing here
 //! reads a clock or touches hardware: time is passed in, the card is a
 //! [`rhizo_hal::NetLink`], and blocking is the caller's business
@@ -226,6 +235,8 @@ enum State {
 #[derive(Debug, Clone)]
 struct Socket {
     refs: u32,
+    /// The loopback network it belongs to (0: the kernel's).
+    net: u32,
     family: Family,
     ty: Type,
     local: Option<Addr>,
@@ -250,9 +261,10 @@ struct Socket {
 }
 
 impl Socket {
-    fn new(family: Family, ty: Type, opts: Options) -> Self {
+    fn new(family: Family, ty: Type, opts: Options, net: u32) -> Self {
         Self {
             refs: 1,
+            net,
             family,
             ty,
             local: None,
@@ -279,16 +291,19 @@ impl Socket {
     }
 }
 
-/// Where one cell's ephemeral ports go next (design D2 of
-/// `close-cross-cell-leaks`). Each cell walks the range in order from a
-/// start of its own, which the kernel's secret and the cell's `key` choose,
-/// so the ports a cell gets do not show how many other cells took: the
-/// kernel keeps it with the cell and hands it to [`Net::enter`] for the
-/// cell's calls. Not part of a snapshot: a resumed cell has a new
-/// identifier, hence a new start, as a new boot has.
+/// A cell's loopback network as its calls enter it: the network's number
+/// and where its ephemeral ports go next (design D2 of
+/// `close-cross-cell-leaks`, D5 of `add-cell-hierarchy`). Each network
+/// walks the range in order from a start of its own, which the kernel's
+/// secret and `key` choose, skipping only its own ports in use, so the
+/// ports a cell gets do not show what other cells took: the kernel keeps
+/// it with the cell and hands it to [`Net::enter`] for the cell's calls.
+/// Not part of a snapshot: a resumed cell has a new identifier, hence a new
+/// network and start, as a new boot has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ports {
-    /// The cell's identifier.
+    /// The cell's identifier, which numbers its network (never 0, the
+    /// kernel's).
     pub key: u32,
     /// The next port to try; 0 before the first.
     pub next: u16,
@@ -317,7 +332,8 @@ pub struct Net {
     /// The next ephemeral port of sockets the kernel opens for itself
     /// (calls made with no [`Ports`] entered).
     next_port: u16,
-    /// The ephemeral ports of the cell whose call holds the sockets.
+    /// The network and ephemeral ports of the cell whose call holds the
+    /// sockets.
     caller: Option<Ports>,
     next_name: u64,
     /// The network card, once attached.
@@ -407,9 +423,9 @@ impl Net {
         self.secret = secret;
     }
 
-    /// Starts a call of the cell whose ephemeral ports are `ports`: ports
-    /// it binds implicitly or to port 0 come from them, until
-    /// [`leave`](Self::leave).
+    /// Starts a call of the cell whose network is `ports`: sockets it makes
+    /// belong to that network, and ports it binds implicitly or to port 0
+    /// come from it, until [`leave`](Self::leave).
     pub fn enter(&mut self, ports: Ports) {
         self.caller = Some(ports);
     }
@@ -534,12 +550,24 @@ impl Net {
         }
     }
 
-    /// A new socket with one reference. Unix sockets are streams only.
+    /// The network of the calling cell (0 when no cell entered).
+    fn caller_net(&self) -> u32 {
+        self.caller.map_or(0, |c| c.key)
+    }
+
+    /// A new socket with one reference, in the calling cell's network.
+    /// Unix sockets are streams only.
     pub fn socket(&mut self, family: Family, ty: Type) -> Result<Handle> {
         if family == Family::Unix && ty == Type::Dgram {
             return Err(Error::OpNotSupp);
         }
-        self.insert(Socket::new(family, ty, Options::default()))
+        let net = self.caller_net();
+        self.insert(Socket::new(family, ty, Options::default(), net))
+    }
+
+    /// The network `h` belongs to.
+    pub fn network(&self, h: Handle) -> Result<u32> {
+        Ok(self.get(h)?.net)
     }
 
     /// Two connected unnamed Unix stream sockets (`socketpair`).
@@ -638,11 +666,21 @@ impl Net {
         self.next_name - 1
     }
 
-    /// Whether another socket of `ty` holds `ip:port` in a way `opts`
-    /// cannot share.
-    fn port_taken(&self, me: Handle, ty: Type, ip: [u8; 4], port: u16, opts: &Options) -> bool {
+    /// Whether another socket of `ty` in network `net` holds `ip:port` in a
+    /// way `opts` cannot share. Other networks' ports never count.
+    fn port_taken(
+        &self,
+        net: u32,
+        me: Handle,
+        ty: Type,
+        ip: [u8; 4],
+        port: u16,
+        opts: &Options,
+    ) -> bool {
         self.sockets.iter().enumerate().any(|(i, s)| {
-            let Some(s) = s else { return false };
+            let Some(s) = s.as_ref().filter(|s| s.net == net) else {
+                return false;
+            };
             let Some((ip2, port2)) = s.port() else {
                 return false;
             };
@@ -654,9 +692,11 @@ impl Net {
         })
     }
 
-    /// A free ephemeral port for `ty`: the next one of the calling cell's
-    /// [`Ports`], or of the kernel's own when no cell entered.
+    /// A free ephemeral port for `ty` in `me`'s network: the next one of
+    /// the calling cell's [`Ports`], or of the kernel's own when no cell
+    /// entered.
     fn ephemeral(&mut self, me: Handle, ty: Type) -> Result<u16> {
+        let net = self.get(me)?.net;
         let span = (EPHEMERAL.end() - EPHEMERAL.start()) as u32 + 1;
         let mut next = match self.caller {
             Some(Ports { key, next: 0, .. }) => self.first_port(key),
@@ -671,7 +711,7 @@ impl Net {
             } else {
                 port + 1
             };
-            if !self.port_taken(me, ty, ANY, port, &Options::default()) {
+            if !self.port_taken(net, me, ty, ANY, port, &Options::default()) {
                 found = Ok(port);
                 break;
             }
@@ -690,7 +730,7 @@ impl Net {
         if s.local.is_some() {
             return Err(Error::Invalid);
         }
-        let (ty, opts) = (s.ty, s.opts);
+        let (ty, opts, net) = (s.ty, s.opts, s.net);
         let local = match (s.family, addr) {
             (Family::Inet, &Addr::Inet { ip, port }) => {
                 if ip != ANY && !is_loopback(ip) && Some(ip) != self.wire_addr() {
@@ -698,7 +738,9 @@ impl Net {
                 }
                 let port = match port {
                     0 => self.ephemeral(h, ty)?,
-                    p if self.port_taken(h, ty, ip, p, &opts) => return Err(Error::AddrInUse),
+                    p if self.port_taken(net, h, ty, ip, p, &opts) => {
+                        return Err(Error::AddrInUse);
+                    }
                     p => p,
                 };
                 Addr::Inet { ip, port }
@@ -774,10 +816,14 @@ impl Net {
         Ok(conn)
     }
 
-    /// The listener a stream connection to `addr` reaches.
-    fn listener(&self, family: Family, addr: &Addr) -> Result<Handle> {
+    /// The listener a stream connection to `addr` reaches in network
+    /// `net`: a Unix name is keyed by (network, name), so a name number
+    /// forged into a snapshot reaches nothing outside its own network.
+    fn listener(&self, net: u32, family: Family, addr: &Addr) -> Result<Handle> {
         let found = self.sockets.iter().position(|s| {
-            let Some(s) = s else { return false };
+            let Some(s) = s.as_ref().filter(|s| s.net == net) else {
+                return false;
+            };
             let listening = matches!(s.state, State::Listening { .. });
             listening
                 && s.family == family
@@ -797,7 +843,7 @@ impl Net {
     pub fn connect(&mut self, h: Handle, addr: &Addr) -> Result<()> {
         self.look(h);
         let s = self.get(h)?;
-        let (family, ty) = (s.family, s.ty);
+        let (family, ty, net) = (s.family, s.ty, s.net);
         let addr = match (family, addr) {
             (Family::Inet, &Addr::Inet { ip, port }) => {
                 let ip = if ip == ANY { LOOPBACK } else { ip };
@@ -821,7 +867,7 @@ impl Net {
             State::Listening { .. } => return Err(Error::Invalid),
             _ => return Err(Error::IsConn),
         }
-        let listener = self.listener(family, &addr)?;
+        let listener = self.listener(net, family, &addr)?;
         let l = self.get(listener)?;
         let State::Listening { backlog, queue } = &l.state else {
             return Err(Error::ConnRefused);
@@ -856,7 +902,7 @@ impl Net {
                 }
             }
         }
-        let mut server = Socket::new(family, Type::Stream, opts);
+        let mut server = Socket::new(family, Type::Stream, opts, net);
         server.refs = 0;
         server.local = Some(server_local);
         server.remote = self.get(h)?.local.clone();
@@ -1022,6 +1068,7 @@ impl Net {
             return Ok(data.len());
         }
         self.autobind(h, ANY)?;
+        let net = self.get(h)?.net;
         let from = match self.get(h)?.local {
             Some(Addr::Inet { ip: mine, port }) => Addr::Inet {
                 ip: if mine == ANY { ip } else { mine },
@@ -1030,7 +1077,7 @@ impl Net {
             _ => return Err(Error::Invalid),
         };
         let receiver = self.sockets.iter_mut().enumerate().find_map(|(i, r)| {
-            let r = r.as_mut()?;
+            let r = r.as_mut().filter(|r| r.net == net)?;
             let bound = r.ty == Type::Dgram
                 && r.port()
                     .is_some_and(|(rip, rport)| rport == port && (rip == ANY || rip == ip))
@@ -1295,24 +1342,65 @@ impl Net {
         Ok((reset == Some(true)).then_some(error))
     }
 
-    /// The socket a forked cell gets for `h` (design D4): the same one if it
-    /// is bound or listening (shared), a copy if it is a fresh one, a reset
-    /// one if it is (or was) a connection.
-    pub fn fork(&mut self, h: Handle) -> Result<Handle> {
+    /// The socket a copy of a cell gets for `h` in the copy's network `net`
+    /// (design D4 of `add-sockets-and-poll`, D5 of `add-cell-hierarchy`): a
+    /// listener or a bound socket is bound again at its address there (and
+    /// listens again, with no connection waiting), as a resume does; a
+    /// fresh one is copied; a connection (or one that was) is reset. `h` is
+    /// unchanged: the source keeps its sockets, and nobody shares a
+    /// listener.
+    pub fn fork(&mut self, h: Handle, net: u32) -> Result<Handle> {
         let s = self.get(h)?;
-        let (family, ty, opts) = (s.family, s.ty, s.opts);
-        let state = match (&s.state, &s.local) {
-            (State::Listening { .. }, _) | (State::Open, Some(_)) => {
-                self.retain(h);
-                return Ok(h);
+        let mut copy = Socket::new(s.family, s.ty, s.opts, net);
+        let again = match &s.state {
+            State::Listening { backlog, .. } => Some((s.local.clone(), Some(*backlog))),
+            State::Open => {
+                copy.remote = s.remote.clone();
+                Some((s.local.clone(), None))
             }
-            (State::Open, None) => State::Open,
-            _ => State::Reset { pending: true },
+            _ => {
+                copy.state = State::Reset { pending: true };
+                copy.eof = true;
+                None
+            }
         };
-        let mut copy = Socket::new(family, ty, opts);
-        copy.state = state;
-        copy.eof = matches!(copy.state, State::Reset { .. });
-        self.insert(copy)
+        let c = self.insert(copy)?;
+        if let Some((local, backlog)) = again {
+            self.bind_again(c, local.as_ref(), backlog);
+        }
+        Ok(c)
+    }
+
+    /// Binds new socket `h` at `local` and makes it listen with `backlog`
+    /// if given, in its own network; reset if that fails.
+    fn bind_again(&mut self, h: Handle, local: Option<&Addr>, backlog: Option<usize>) {
+        let bound = match local {
+            Some(Addr::UnixUnnamed) | None => Ok(()),
+            Some(addr) => self.bind(h, addr),
+        };
+        let ready = bound.and_then(|()| match backlog {
+            Some(backlog) => self.listen(h, backlog),
+            None => Ok(()),
+        });
+        if ready.is_err()
+            && let Ok(s) = self.get_mut(h)
+        {
+            s.state = State::Reset { pending: true };
+        }
+    }
+
+    /// Moves parked socket `h` and the connections waiting on it (if it
+    /// listens) into network `net`.
+    fn move_to(&mut self, h: Handle, net: u32) {
+        let Ok(s) = self.get_mut(h) else { return };
+        s.net = net;
+        if let State::Listening { queue, .. } = &s.state {
+            for q in queue.clone() {
+                if let Ok(q) = self.get_mut(q) {
+                    q.net = net;
+                }
+            }
+        }
     }
 
     /// What a snapshot keeps of `h` (design D4 of `add-sockets-and-poll`):
@@ -1367,14 +1455,16 @@ impl Net {
         (park.boot == self.boot).then(|| self.parked.swap_remove(i).1)
     }
 
-    /// A socket made from snapshot record `r`: one parked in this boot
-    /// comes back as it is now (once); otherwise a connection is reset and
-    /// others are bound and listening again where they were (reset if
-    /// their address is taken). A Unix name gets a new number: returned as
-    /// `(old, new)` so the cell's files can follow (the same number for a
-    /// listener that came back).
-    pub fn import(&mut self, r: &Record) -> Result<(Handle, Option<(u64, u64)>)> {
+    /// A socket made from snapshot record `r` in network `net`, the
+    /// resumed cell's: one parked in this boot comes back as it is now
+    /// (once), moved into `net`; otherwise a connection is reset and others
+    /// are bound and listening again where they were (reset if their
+    /// address is taken). A Unix name gets a new number: returned as `(old,
+    /// new)` so the cell's files can follow (the same number for a listener
+    /// that came back).
+    pub fn import(&mut self, r: &Record, net: u32) -> Result<(Handle, Option<(u64, u64)>)> {
         if let Some(h) = self.take_parked(r) {
+            self.move_to(h, net);
             let s = self.get(h)?;
             let name = match (&s.state, &s.local) {
                 (State::Listening { .. }, Some(Addr::Unix { name, .. })) => Some((*name, *name)),
@@ -1382,33 +1472,29 @@ impl Net {
             };
             return Ok((h, name));
         }
-        let mut s = Socket::new(r.family, r.ty, r.opts);
+        let mut s = Socket::new(r.family, r.ty, r.opts, net);
         if r.state == Saved::Reset {
             s.state = State::Reset { pending: true };
             s.eof = true;
         }
         let h = self.insert(s)?;
         let mut renamed = None;
-        let bound = match &r.local {
+        let local = match &r.local {
             Some(Addr::Unix { name, path }) => {
                 let new = self.new_name();
                 renamed = Some((*name, new));
-                let addr = Addr::Unix {
+                Some(Addr::Unix {
                     name: new,
                     path: path.clone(),
-                };
-                self.bind(h, &addr)
+                })
             }
-            Some(Addr::UnixUnnamed) | None => Ok(()),
-            Some(addr) => self.bind(h, addr),
+            local => local.clone(),
         };
-        let ready = bound.and_then(|()| match r.state {
-            Saved::Listening(backlog) => self.listen(h, backlog as usize),
-            _ => Ok(()),
-        });
-        if ready.is_err() {
-            self.get_mut(h)?.state = State::Reset { pending: true };
-        }
+        let backlog = match r.state {
+            Saved::Listening(backlog) => Some(backlog as usize),
+            _ => None,
+        };
+        self.bind_again(h, local.as_ref(), backlog);
         Ok((h, renamed))
     }
 

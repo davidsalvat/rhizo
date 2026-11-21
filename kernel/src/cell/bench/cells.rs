@@ -150,11 +150,15 @@ pub(super) fn files() -> (u64, u64) {
 }
 
 /// Robust figures (see [`robust`]) of the time per round trip: `piper`
-/// writing one byte into a pipe and reading it back, and two `loopback`
-/// cells exchanging a 64-byte message over TCP on 127.0.0.1 (design D7 of
-/// `add-sockets-and-poll`); and of the time to resume a `loopback twice`
-/// client suspended with its connection established until it has made one
-/// more round trip and exited (design D5 of `keep-tcp-across-suspend`).
+/// writing one byte into a pipe and reading it back, and the two threads
+/// of a `loopback pair` cell exchanging a 64-byte message over TCP on
+/// 127.0.0.1 (design D7 of `add-sockets-and-poll`; cells no longer share a
+/// loopback network, design D5 of `add-cell-hierarchy`, so the figure has
+/// no switch between cells; it counts from the moment its server thread
+/// waits in `accept` and the host wakes its client); and of the
+/// time to resume a `loopback pair PORT twice` cell suspended with its
+/// connection established until its client has made one more round trip
+/// and it exited (design D5 of `keep-tcp-across-suspend`).
 pub(super) fn net() -> (u64, u64, u64) {
     const RUNS: usize = 3 * ROUNDS;
     const PIPE_TRIPS: u64 = 2000;
@@ -176,49 +180,46 @@ pub(super) fn net() -> (u64, u64, u64) {
     let mut loopback = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         host.finished.clear();
-        let server = host
+        let pair = host
             .spawn(
                 image,
-                &[b"loopback", b"serve", b"7400", b"200"],
+                &[b"loopback", b"pair", b"7400", b"200", b"wait"],
                 true,
                 false,
             )
-            .expect("spawn server");
-        host.step(); // listening, waiting in `accept`
-        let t0 = bench_clock();
-        let client = host
-            .spawn(image, &[b"loopback", b"ping", b"7400", b"200"], true, false)
-            .expect("spawn client");
-        host.run(|h| h.finished(server).is_some() && h.finished(client).is_some());
-        loopback.push(ns(t0, bench_clock()) / NET_TRIPS);
-        for id in [server, client] {
-            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+            .expect("spawn pair");
+        // Its server thread waits in `accept`, its client sleeps.
+        while host.waiting() == 0 {
+            host.step();
         }
+        let t0 = bench_clock();
+        assert!(host.wake(pair));
+        host.run(|h| h.finished(pair).is_some());
+        loopback.push(ns(t0, bench_clock()) / NET_TRIPS);
+        assert_eq!(host.finished(pair).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     let mut resume = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         host.finished.clear();
-        let server = host
-            .spawn(image, &[b"loopback", b"serve", b"7401", b"2"], true, false)
-            .expect("spawn server");
-        host.step(); // listening, waiting in `accept`
-        let client = host
-            .spawn(image, &[b"loopback", b"twice", b"7401"], true, false)
-            .expect("spawn client");
-        while host.output(client) != Some(b"once\n") {
+        let pair = host
+            .spawn(
+                image,
+                &[b"loopback", b"pair", b"7401", b"twice"],
+                true,
+                false,
+            )
+            .expect("spawn pair");
+        while host.output(pair) != Some(b"once\n") {
             host.step();
         }
-        let snapshot = host.suspend(client).expect("live");
+        let snapshot = host.suspend(pair).expect("live");
         let t0 = bench_clock();
-        let client = host
+        let pair = host
             .resume(snapshot, Resume::Lazy, true, false)
             .expect("resume");
-        host.run(|h| h.finished(client).is_some());
+        host.run(|h| h.finished(pair).is_some());
         resume.push(ns(t0, bench_clock()));
-        host.run(|h| h.finished(server).is_some());
-        for id in [server, client] {
-            assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
-        }
+        assert_eq!(host.finished(pair).map(|f| f.ending), Some(Ending::Exit(0)));
     }
     (
         robust(&mut pipe),

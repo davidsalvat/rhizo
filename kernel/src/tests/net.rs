@@ -6,6 +6,7 @@ use super::*;
 pub(super) const ALL: &[TestCase] = &[
     ktest_case!(sockets_and_pipes_behave_as_on_linux),
     ktest_case!(cells_talk_over_loopback),
+    ktest_case!(separate_loopback_networks),
     ktest_case!(a_waiting_cell_uses_no_cpu),
     ktest_case!(only_the_cells_waiting_on_a_socket_wake),
     ktest_case!(latencies_count_from_the_first_idle_moment),
@@ -15,7 +16,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(a_connection_to_the_host_survives_suspend),
     ktest_case!(connections_of_a_template_reset_in_its_cells),
     ktest_case!(a_blocked_cell_survives_suspend),
-    ktest_case!(forked_servers_share_their_listener),
+    ktest_case!(forked_servers_in_their_network),
     ktest_case!(pipes_and_sockets_of_a_fork),
     ktest_case!(a_cell_reaches_the_host, 31),
     ktest_case!(a_silent_connection_outlasts_the_timeout_and_reconnects_at_once),
@@ -31,49 +32,79 @@ fn sockets_and_pipes_behave_as_on_linux() {
     assert_eq!(crate::cell::open_sockets(), 0, "every socket closed");
 }
 
-/// A server cell and a client cell exchange messages over TCP on 127.0.0.1.
+/// A server thread and a client thread of one cell exchange messages over
+/// TCP on 127.0.0.1 (spec `networking`, "Echo inside a cell"); a client in
+/// another cell is refused (the first half of "Echo between two cells":
+/// the channel comes with phase 2 of `add-cell-hierarchy`).
 fn cells_talk_over_loopback() {
     let mut host = Host::new();
-    let server = spawn(&mut host, "loopback", &[b"serve", b"7300", b"100"]);
-    let client = spawn(&mut host, "loopback", &[b"ping", b"7300", b"100"]);
+    let pair = spawn(&mut host, "loopback", &[b"pair", b"7300", b"100"]);
     host.run(|_| false);
-    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
-    assert_eq!(ended(&host, client), (Ending::Exit(0), "pinged\n".into()));
+    assert_eq!(ended(&host, pair), (Ending::Exit(0), "paired\n".into()));
+    let server = spawn(&mut host, "loopback", &[b"serve", b"7300", b"1"]);
+    step_until_waiting(&mut host);
+    let other = spawn(&mut host, "loopback", &[b"sibling", b"7300"]);
+    host.run(|h| h.finished(other).is_some());
+    assert_eq!(
+        ended(&host, other),
+        (Ending::Exit(0), "refused, then bound\n".into())
+    );
+    assert!(host.kill(server));
     assert_eq!(crate::cell::open_sockets(), 0);
 }
 
-/// A server waiting in `accept` does not run while another cell works; it
-/// runs once a client connects.
+/// Each cell has a loopback network of its own (spec `networking`,
+/// "Separate networks"): a sibling's connection to a cell's listener on
+/// 127.0.0.1:7300 is refused and it binds that port itself, while the two
+/// threads of a third cell talk on that port too.
+fn separate_loopback_networks() {
+    let mut host = Host::new();
+    let server = spawn(&mut host, "loopback", &[b"serve", b"7300", b"1"]);
+    step_until_waiting(&mut host);
+    let sibling = spawn(&mut host, "loopback", &[b"sibling", b"7300"]);
+    let pair = spawn(&mut host, "loopback", &[b"pair", b"7300", b"10"]);
+    host.run(|h| h.finished(sibling).is_some() && h.finished(pair).is_some());
+    assert_eq!(
+        ended(&host, sibling),
+        (Ending::Exit(0), "refused, then bound\n".into())
+    );
+    assert_eq!(ended(&host, pair), (Ending::Exit(0), "paired\n".into()));
+    assert!(host.finished(server).is_none(), "nobody reached the server");
+    assert_eq!(host.waiting(), 1);
+    assert!(host.kill(server));
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// A server thread waiting in `accept` does not run while another cell
+/// works; it runs once its cell's client thread, woken by the host,
+/// connects.
 fn a_waiting_cell_uses_no_cpu() {
     let mut host = Host::new();
-    let server = spawn(&mut host, "loopback", &[b"serve", b"7301", b"1"]);
-    host.step(); // it reaches `accept` and waits
+    let pair = spawn(&mut host, "loopback", &[b"pair", b"7301", b"1", b"wait"]);
+    step_until_waiting(&mut host); // in `accept`, its client asleep
     let chatter = spawn(&mut host, "chatter", &[]);
     host.run(|h| h.finished(chatter).is_some());
-    assert!(host.finished(server).is_none(), "the server still waits");
+    assert!(host.finished(pair).is_none(), "the server still waits");
     assert_eq!(host.waiting(), 1, "and it is not runnable");
-    let client = spawn(&mut host, "loopback", &[b"ping", b"7301", b"1"]);
+    assert!(host.wake(pair));
     host.run(|_| false);
-    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
-    assert_eq!(ended(&host, client).0, Ending::Exit(0));
+    assert_eq!(ended(&host, pair), (Ending::Exit(0), "paired\n".into()));
 }
 
 /// A socket change wakes only the cells waiting on that socket (design D1
 /// of `add-socket-wait-queues`): a server waiting for a client that never
-/// comes stays asleep while two other cells talk, and no wake-up finds
-/// nothing to do.
+/// comes stays asleep while the two threads of another cell talk, and no
+/// wake-up finds nothing to do.
 fn only_the_cells_waiting_on_a_socket_wake() {
     use crate::prof::{self, Count};
     let mut host = Host::new();
     let idle = spawn(&mut host, "loopback", &[b"serve", b"7310", b"1"]);
     step_until_waiting(&mut host); // it reaches `accept` and waits
     prof::start();
-    let server = spawn(&mut host, "loopback", &[b"serve", b"7311", b"50"]);
-    let client = spawn(&mut host, "loopback", &[b"ping", b"7311", b"50"]);
-    host.run(|h| h.finished(server).is_some() && h.finished(client).is_some());
+    let pair = spawn(&mut host, "loopback", &[b"pair", b"7311", b"50"]);
+    host.run(|h| h.finished(pair).is_some());
     let report = prof::stop();
-    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
-    assert_eq!(ended(&host, client), (Ending::Exit(0), "pinged\n".into()));
+    assert_eq!(ended(&host, pair), (Ending::Exit(0), "paired\n".into()));
     assert_eq!(report.count(Count::IoWasted), 0, "no wake-up found nothing");
     assert!(host.finished(idle).is_none());
     assert_eq!(host.waiting(), 1, "the idle server was never woken");
@@ -184,66 +215,45 @@ fn a_discarded_snapshot_closes_its_connections() {
     assert_eq!(crate::cell::open_sockets(), 0, "closed");
 }
 
-/// Runs `loopback serve PORT N` and `loopback ping PORT N` (with `addr`, or
-/// against the server), suspending cell `moving` (0: server, 1: client)
-/// after every scheduling step and resuming it at once, after `pause` when
-/// given (a cell run meanwhile); returns the moving cell's whole output and
-/// the number of resumes.
-fn suspended_every_step(
-    host: &mut Host,
-    port: &[u8],
-    n: &[u8],
-    moving: usize,
-    addr: Option<&[u8]>,
-    pause: Option<&str>,
-) -> (Vec<u8>, usize) {
-    let mut ids = alloc::vec::Vec::new();
-    if addr.is_none() {
-        ids.push(spawn(host, "loopback", &[b"serve", port, n]));
-    }
-    let mut ping = alloc::vec![b"ping".as_slice(), port, n];
-    ping.extend(addr);
-    ids.push(spawn(host, "loopback", &ping));
+/// Runs `loopback` with `argv`, suspending it after every scheduling step
+/// and resuming it at once, after `pause` when given (a cell run
+/// meanwhile); returns its whole output and the number of resumes.
+fn suspended_every_step(host: &mut Host, argv: &[&[u8]], pause: Option<&str>) -> (Vec<u8>, usize) {
+    let mut id = spawn(host, "loopback", argv);
     let mut output = Vec::new();
     let mut resumes = 0;
     loop {
         host.step();
-        if let Some(done) = host.finished(ids[moving]) {
+        if let Some(done) = host.finished(id) {
             assert_eq!(done.ending, Ending::Exit(0));
             output.extend_from_slice(&done.output);
             break;
         }
-        let snapshot = host.suspend(ids[moving]).expect("live");
-        output.extend_from_slice(&host.finished(ids[moving]).expect("suspended").output);
+        let snapshot = host.suspend(id).expect("live");
+        output.extend_from_slice(&host.finished(id).expect("suspended").output);
         if let Some(cell) = pause {
             let other = spawn(host, cell, &[]);
             host.run(|h| h.finished(other).is_some());
         }
-        ids[moving] = host
+        id = host
             .resume(snapshot, Resume::Lazy, true, true)
             .expect("resume");
         resumes += 1;
     }
-    host.run(|_| false);
-    for (i, &id) in ids.iter().enumerate() {
-        if i != moving {
-            assert_eq!(ended(host, id).0, Ending::Exit(0));
-        }
-    }
     (output, resumes)
 }
 
-/// A loopback TCP connection between two cells keeps working while either
-/// end is suspended and resumed after every scheduling step.
+/// A loopback TCP connection between the two threads of a cell keeps
+/// working while the cell, both ends with it, is suspended and resumed
+/// after every scheduling step (cells no longer share a loopback network,
+/// design D5 of `add-cell-hierarchy`).
 fn loopback_connection_across_suspend_of_one_end() {
-    for (moving, port, said) in [(0, b"7304", "served\n"), (1, b"7305", "pinged\n")] {
-        let mut host = Host::new();
-        let (output, resumes) = suspended_every_step(&mut host, port, b"20", moving, None, None);
-        assert!(resumes >= 20, "suspended {resumes} times");
-        assert_eq!(alloc::string::String::from_utf8_lossy(&output), said);
-        drop(host);
-        assert_eq!(crate::cell::open_sockets(), 0);
-    }
+    let mut host = Host::new();
+    let (output, resumes) = suspended_every_step(&mut host, &[b"pair", b"7304", b"20"], None);
+    assert!(resumes >= 20, "suspended {resumes} times");
+    assert_eq!(alloc::string::String::from_utf8_lossy(&output), "paired\n");
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0);
 }
 
 /// A connection to the host's echo server through the network card keeps
@@ -263,10 +273,7 @@ fn a_connection_to_the_host_survives_suspend() {
     let port = alloc::format!("{port}");
     let (output, resumes) = suspended_every_step(
         &mut host,
-        port.as_bytes(),
-        b"10",
-        0,
-        Some(ip.as_bytes()),
+        &[b"ping", port.as_bytes(), b"10", ip.as_bytes()],
         Some("sleeper"),
     );
     assert!(resumes >= 10, "suspended {resumes} times");
@@ -275,8 +282,6 @@ fn a_connection_to_the_host_survives_suspend() {
     assert_eq!(crate::cell::open_sockets(), 0);
 }
 
-/// A server suspended while it waits in `accept` waits there again after
-/// its resume, and serves the client that comes.
 /// Steps `host` until one cell waits on its descriptors (a server in
 /// `accept`): a slice may end, preempted, before it gets there (under
 /// emulation a tick can be due as the slice starts).
@@ -290,44 +295,49 @@ fn step_until_waiting(host: &mut Host) {
     assert_eq!(host.waiting(), 1, "the server waits in accept");
 }
 
+/// A server thread suspended while it waits in `accept` waits there again
+/// after its cell's resume, and serves the cell's client thread, woken by
+/// the host, when it comes.
 fn a_blocked_cell_survives_suspend() {
     let mut host = Host::new();
-    let server = spawn(&mut host, "loopback", &[b"serve", b"7302", b"1"]);
+    let pair = spawn(&mut host, "loopback", &[b"pair", b"7302", b"1", b"wait"]);
     step_until_waiting(&mut host);
-    assert_eq!(host.waiting(), 1);
-    let snapshot = host.suspend(server).expect("live");
-    let server = host
+    let snapshot = host.suspend(pair).expect("live");
+    let pair = host
         .resume(snapshot, Resume::Eager, true, true)
         .expect("resume");
-    let client = spawn(&mut host, "loopback", &[b"ping", b"7302", b"1"]);
+    step_until_waiting(&mut host);
+    assert!(host.wake(pair));
     host.run(|_| false);
-    assert_eq!(ended(&host, server), (Ending::Exit(0), "served\n".into()));
-    assert_eq!(ended(&host, client), (Ending::Exit(0), "pinged\n".into()));
+    assert_eq!(ended(&host, pair), (Ending::Exit(0), "paired\n".into()));
 }
 
-/// A server frozen while it waits in `accept`: two cells spawned from it
-/// share its listener and each serves one of two clients.
-fn forked_servers_share_their_listener() {
+/// A cell whose server thread waits in `accept` is frozen as a template;
+/// two cells spawned from it each listen again in their own network, and
+/// the client thread of each (its sleep expired in the copy) is served by
+/// its own cell's server only (spec `networking`, "Forked servers"): the
+/// template's listener got no connection.
+fn forked_servers_in_their_network() {
     let mut host = Host::new();
-    let template = spawn(&mut host, "loopback", &[b"serve", b"7303", b"1"]);
+    let template = spawn(&mut host, "loopback", &[b"pair", b"7303", b"1", b"wait"]);
     step_until_waiting(&mut host);
     assert!(host.freeze(template));
-    let servers: Vec<u32> = (0..2)
+    assert_eq!(crate::cell::open_sockets(), 1, "the template's listener");
+    let copies: Vec<u32> = (0..2)
         .map(|_| {
             host.spawn_from_template(template, true, true)
                 .expect("fork")
         })
         .collect();
-    let clients: Vec<u32> = (0..2)
-        .map(|_| spawn(&mut host, "loopback", &[b"ping", b"7303", b"1"]))
-        .collect();
     host.run(|_| false);
-    for id in servers {
-        assert_eq!(ended(&host, id), (Ending::Exit(0), "served\n".into()));
+    for id in copies {
+        assert_eq!(ended(&host, id), (Ending::Exit(0), "paired\n".into()));
     }
-    for id in clients {
-        assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
-    }
+    assert_eq!(
+        crate::cell::open_sockets(),
+        1,
+        "the template's listener, with no connection waiting on it"
+    );
     drop(host);
     assert_eq!(
         crate::cell::open_sockets(),
@@ -338,7 +348,7 @@ fn forked_servers_share_their_listener() {
 
 /// Forked at `ready`, `netstate` and its child both read the pipe's bytes;
 /// the child's connection is reset, the parent's is not, and both accept
-/// on the listener they share.
+/// on their listener, the child's bound again in its own network.
 fn pipes_and_sockets_of_a_fork() {
     let mut host = Host::new();
     let parent = netstate_ready(&mut host);
@@ -362,8 +372,8 @@ fn pipes_and_sockets_of_a_fork() {
 }
 
 /// Frozen at `ready`, `netstate` keeps its connection as a template; a cell
-/// spawned from it finds the connection reset and accepts on the listener
-/// it shares with the template.
+/// spawned from it finds the connection reset and accepts on its own
+/// listener, bound again at the template's address in its network.
 fn connections_of_a_template_reset_in_its_cells() {
     let mut host = Host::new();
     let template = netstate_ready(&mut host);

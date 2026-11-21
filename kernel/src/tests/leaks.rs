@@ -47,18 +47,17 @@ fn cells_run_alike_with_and_without_kpti() {
 fn sysinfo_shows_a_cell_only_itself() {
     use rhizo_cell::quota::Quota;
     let mut host = Host::new();
-    let observer = spawn(&mut host, "observer", &[b"memory", b"7401"]);
+    let observer = spawn(&mut host, "observer", &[b"memory"]);
     let quota = Quota {
         memory: 64 << 20,
         ..Quota::NONE
     };
     assert!(host.set_quota(observer, quota));
-    while host.output(observer) != Some(b"ready\n") {
-        host.step();
-    }
-    let neighbour = spawn(&mut host, "observer", &[b"neighbour", b"7401", b"32", b"0"]);
-    host.run(|_| false);
-    assert_eq!(ended(&host, neighbour), (Ending::Exit(0), "".into()));
+    let neighbour = neighbour_meanwhile(&mut host, observer, &[b"neighbour", b"32", b"0"]);
+    assert_eq!(
+        ended(&host, neighbour),
+        (Ending::Exit(0), "holding\n".into())
+    );
     assert_eq!(
         ended(&host, observer),
         (
@@ -68,23 +67,38 @@ fn sysinfo_shows_a_cell_only_itself() {
     );
 }
 
+/// Runs `observer` to its `ready`, then a neighbour `observer` with `argv`
+/// to its `holding`, then the observer to its end while the neighbour
+/// holds what it took, then the neighbour to its end; returns the
+/// neighbour. The host takes turns: cells share no loopback network to
+/// meet on (design D5 of `add-cell-hierarchy`).
+fn neighbour_meanwhile(host: &mut Host, observer: u32, argv: &[&[u8]]) -> u32 {
+    while host.output(observer) != Some(b"ready\n") {
+        host.step();
+    }
+    let neighbour = spawn(host, "observer", argv);
+    while host.output(neighbour) != Some(b"holding\n") {
+        host.step();
+    }
+    assert!(host.wake(observer));
+    host.run(|h| h.finished(observer).is_some());
+    assert!(host.wake(neighbour));
+    host.run(|_| false);
+    neighbour
+}
+
 /// Hostile (finding S25): the ephemeral ports a cell gets do not show how
 /// many other cells took. A neighbour binds 100 between the observer's
 /// two binds; the observer's ports are one apart (102 with the one counter
 /// all cells shared before).
 fn ephemeral_ports_do_not_show_other_cells_binds() {
     let mut host = Host::new();
-    let observer = spawn(&mut host, "observer", &[b"ports", b"7400"]);
-    while host.output(observer) != Some(b"ready\n") {
-        host.step();
-    }
-    let neighbour = spawn(
-        &mut host,
-        "observer",
-        &[b"neighbour", b"7400", b"0", b"100"],
+    let observer = spawn(&mut host, "observer", &[b"ports"]);
+    let neighbour = neighbour_meanwhile(&mut host, observer, &[b"neighbour", b"0", b"100"]);
+    assert_eq!(
+        ended(&host, neighbour),
+        (Ending::Exit(0), "holding\n".into())
     );
-    host.run(|_| false);
-    assert_eq!(ended(&host, neighbour), (Ending::Exit(0), "".into()));
     assert_eq!(
         ended(&host, observer),
         (Ending::Exit(0), "ready\nports +1\n".into())

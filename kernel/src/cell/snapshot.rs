@@ -140,7 +140,7 @@ impl Host {
         }
         let deadlines = snapshot.deadlines(now);
         let mut fs = files_of(&snapshot);
-        import_sockets(&mut fs, &snapshot.sockets());
+        import_sockets(&mut fs, &snapshot.sockets(), id);
         let wx = snapshot.wx();
         let mut lazy = Lazy::new(snapshot);
         let used = Meter::new(1, u64::MAX); // the root
@@ -239,14 +239,15 @@ impl Host {
         let child = pt.fork_lower_half(&mut DirectMap, &mut KernelFrames).ok()?;
         // The child has the cell's quotas and none of its usage (design D3
         // of `add-cell-quotas`): what it shares stays counted to the cell.
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let cell = Cell {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             root: child.root(),
             cpu_ns: 0,
             generation: cell.generation + 1,
             ..cell.clone()
         };
-        let mut live = self.new_live(cell, capture, echo, fork_files(fs));
+        let mut live = self.new_live(cell, capture, echo, fork_files(fs, id));
         live.frames.set_used(1); // its root
         live.shares = true;
         live.demand.wx = wx.clone();

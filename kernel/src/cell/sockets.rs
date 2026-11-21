@@ -1,11 +1,12 @@
-//! The kernel's sockets, shared by every cell (spec `networking`):
-//! their lock, and what a cell's sockets become when it forks, is
-//! suspended or resumed.
+//! The kernel's sockets (spec `networking`): their lock, and what a cell's
+//! sockets become when it forks, is suspended or resumed. Each cell has a
+//! loopback network of its own, numbered by its identifier (design D5 of
+//! `add-cell-hierarchy`).
 
 use super::*;
 
-/// The sockets of every cell (spec `networking`): cells of this kernel talk
-/// over its loopback network.
+/// The sockets of every cell (spec `networking`), each in its cell's own
+/// loopback network.
 pub(super) static NET: Global<Net> = Global::new(Net::new());
 
 /// Set, under the sockets' lock, when a change woke waiters that nobody
@@ -45,12 +46,14 @@ pub(super) fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
     })
 }
 
-/// The files of a fork of a cell with `fs`: its sockets as design D4 of
-/// `add-sockets-and-poll` says (listeners shared, connections reset).
-pub(super) fn fork_files(fs: &Fs) -> Fs {
+/// The files of copy `id` of a cell with `fs`: its sockets in the copy's
+/// own network (design D5 of `add-cell-hierarchy`: listeners and bound
+/// sockets bound again there, connections reset). A socket that cannot be
+/// made reads as reset.
+pub(super) fn fork_files(fs: &Fs, id: u32) -> Fs {
     let mut child = fs.clone();
     if fs.sockets().next().is_some() {
-        with_net(|net| child.map_sockets(|h| net.fork(h).unwrap_or(h)));
+        with_net(|net| child.map_sockets(|h| net.fork(h, id).unwrap_or(u32::MAX)));
     }
     child
 }
@@ -138,11 +141,11 @@ pub(super) fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     (out, records)
 }
 
-/// Makes the sockets of a resumed cell from its snapshot's records (its
-/// parked connections come back), and points its descriptors and Unix
-/// socket names at them. A socket that
-/// cannot be made at all is left out: its descriptor reads as reset.
-pub(super) fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
+/// Makes the sockets of resumed cell `id` from its snapshot's records, in
+/// its network (its parked connections come back), and points its
+/// descriptors and Unix socket names at them. A socket that cannot be made
+/// at all is left out: its descriptor reads as reset.
+pub(super) fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record], id: u32) {
     if records.is_empty() {
         return;
     }
@@ -156,7 +159,7 @@ pub(super) fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
                 parked: None,
                 ..r.clone()
             };
-            let made = net.import(r).or_else(|_| net.import(&reset));
+            let made = net.import(r, id).or_else(|_| net.import(&reset, id));
             let (h, name) = made.unwrap_or((u32::MAX, None));
             handles.push(h);
             renamed.extend(name);
