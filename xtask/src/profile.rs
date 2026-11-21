@@ -289,6 +289,295 @@ impl Samples {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `cargo xtask profile`: samples folded per workload, cell and system call
+// ---------------------------------------------------------------------------
+
+/// Options of `cargo xtask profile`.
+#[derive(Debug)]
+pub struct ProfileArgs {
+    pub vmm: Vmm,
+    pub accel: Accel,
+    pub out: std::path::PathBuf,
+    pub per_cell: bool,
+}
+
+impl ProfileArgs {
+    /// Parses `profile` arguments.
+    pub fn parse(args: &[String]) -> Result<Self> {
+        let mut o = Self {
+            vmm: Vmm::default_for(crate::arch::current()),
+            accel: Accel::Auto,
+            out: crate::target_dir().join("profile"),
+            per_cell: false,
+        };
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
+            let mut value = |name: &str| {
+                it.next()
+                    .cloned()
+                    .ok_or_else(|| format!("{name} needs a value"))
+            };
+            match arg.as_str() {
+                "--vmm" => o.vmm = Vmm::parse(&value("--vmm")?)?,
+                "--accel" => o.accel = Accel::parse(&value("--accel")?)?,
+                "--out" => o.out = value("--out")?.into(),
+                "--per-cell" => o.per_cell = true,
+                other => return Err(format!("unknown profile option `{other}`")),
+            }
+        }
+        Ok(o)
+    }
+}
+
+/// One workload of a sampling run: its samples and where its time went.
+#[derive(Debug, Default, PartialEq)]
+pub struct Profiled {
+    pub workload: String,
+    pub image: String,
+    pub sampler: String,
+    pub lost: u64,
+    /// `(cell, address, count)`.
+    pub samples: Vec<(u32, u64, u64)>,
+    /// Parts of the breakdown in nanoseconds (`user`, `syscall`…).
+    pub parts: Vec<(String, f64)>,
+    /// System calls that took most time: `(name, calls, ns)`.
+    pub calls: Vec<(String, u64, f64)>,
+}
+
+/// The workloads of a sampling run's output, in order.
+pub fn profiled(output: &str) -> Vec<Profiled> {
+    let mut out: Vec<Profiled> = Vec::new();
+    let find = |out: &mut Vec<Profiled>, name: &str| -> usize {
+        match out.iter().position(|p| p.workload == name) {
+            Some(i) => i,
+            None => {
+                out.push(Profiled {
+                    workload: name.into(),
+                    ..Profiled::default()
+                });
+                out.len() - 1
+            }
+        }
+    };
+    for line in output.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(kind), Some(workload)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let kv = |words: core::str::SplitWhitespace<'_>| -> Vec<(String, String)> {
+            words
+                .filter_map(|w| w.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        match kind {
+            "rhizo-samples" => {
+                let i = find(&mut out, workload);
+                for (k, v) in kv(words) {
+                    match k.as_str() {
+                        "image" => out[i].image = v,
+                        "sampler" => out[i].sampler = v,
+                        "lost" => out[i].lost = v.parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+            }
+            "rhizo-sample" => {
+                let rest: Vec<&str> = words.collect();
+                if let [cell, pc, count] = rest[..]
+                    && let (Ok(cell), Ok(pc), Ok(count)) =
+                        (cell.parse(), u64::from_str_radix(pc, 16), count.parse())
+                {
+                    let i = find(&mut out, workload);
+                    out[i].samples.push((cell, pc, count));
+                }
+            }
+            "rhizo-breakdown" => {
+                let i = find(&mut out, workload);
+                out[i].parts = kv(words)
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((k.strip_suffix("_ns")?.into(), v.parse().ok()?)))
+                    .collect();
+            }
+            "rhizo-breakdown-calls" => {
+                let i = find(&mut out, workload);
+                out[i].calls = kv(words)
+                    .into_iter()
+                    .filter_map(|(name, v)| {
+                        let (calls, ns) = v.split_once('/')?;
+                        Some((name, calls.parse().ok()?, ns.parse().ok()?))
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The function symbols of an ELF file, sorted by address, from `nm`.
+pub fn symbols(elf: &std::path::Path) -> Vec<(u64, String)> {
+    let out = std::process::Command::new("nm")
+        .args(["-n", "-C", "--defined-only"])
+        .arg(elf)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_nm(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// `nm -n` lines of code symbols (`T`, `t`, `W`, `w`) as `(address, name)`.
+pub fn parse_nm(text: &str) -> Vec<(u64, String)> {
+    let mut v: Vec<(u64, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, ' ');
+            let addr = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let kind = parts.next()?;
+            let name = parts.next()?;
+            matches!(kind, "T" | "t" | "W" | "w").then(|| (addr, name.to_string()))
+        })
+        .collect();
+    v.sort_by_key(|s| s.0);
+    v
+}
+
+/// The function at `pc`: the last symbol at or below it, else the 4 KiB
+/// page of `image` it is in.
+pub fn symbolize(symbols: &[(u64, String)], image: &str, pc: u64) -> String {
+    match symbols.partition_point(|s| s.0 <= pc) {
+        0 => format!("{image}+{:#x}", pc & !0xfff),
+        i => symbols[i - 1].1.replace(';', ":"),
+    }
+}
+
+/// Folded stacks of one workload (one `frames value` line each, the format
+/// of `flamegraph.pl`, `inferno` and speedscope), in nanoseconds: the
+/// samples share the cells' `user` time by count, under
+/// `<workload>;<image>[;cell <id>];<function>`; the kernel's parts are
+/// `<workload>;kernel;<part>`. Also the system calls alone:
+/// `<workload>;<call>` (each call's own time, nested parts included).
+pub fn folded(p: &Profiled, symbols: &[(u64, String)], per_cell: bool) -> (String, String) {
+    let part = |name: &str| p.parts.iter().find(|x| x.0 == name).map_or(0.0, |x| x.1);
+    let total: u64 = p.samples.iter().map(|s| s.2).sum();
+    let per_sample = if total == 0 {
+        0.0
+    } else {
+        part("user") / total as f64
+    };
+    let mut stacks: BTreeMap<String, f64> = BTreeMap::new();
+    for &(cell, pc, count) in &p.samples {
+        let function = symbolize(symbols, &p.image, pc);
+        let stack = if per_cell {
+            format!("{};{};cell {cell};{function}", p.workload, p.image)
+        } else {
+            format!("{};{};{function}", p.workload, p.image)
+        };
+        *stacks.entry(stack).or_default() += count as f64 * per_sample;
+    }
+    for (name, ns) in &p.parts {
+        if !matches!(name.as_str(), "user" | "total") && *ns > 0.0 {
+            stacks.insert(format!("{};kernel;{name}", p.workload), *ns);
+        }
+    }
+    let mut out = String::new();
+    for (stack, ns) in stacks {
+        if ns.round() > 0.0 {
+            out += &format!("{stack} {}\n", ns.round());
+        }
+    }
+    let mut calls = String::new();
+    for (name, _, ns) in &p.calls {
+        calls += &format!("{};{name} {}\n", p.workload, ns.round());
+    }
+    (out, calls)
+}
+
+/// `cargo xtask profile`: runs the workloads with sampling on and writes
+/// `<out>/<workload>.folded` and `<out>/<workload>.calls.folded`.
+pub fn cmd(args: &ProfileArgs) -> Result {
+    let kernel = build_kernel(Profile::Release, &["bench-cell", "sampling"])?;
+    let cells = crate::build_cells()?;
+    let opts = RunOptions {
+        stop_at_ready: false,
+        timeout: std::time::Duration::from_secs(300),
+        echo: false,
+        accel: args.accel,
+        gdb: false,
+        network: false,
+        pci_card: false,
+        cpus: 1,
+        memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
+        bench: None,
+        shard: None,
+        control: false,
+    };
+    let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;
+    if run.result == VmResult::Failed {
+        return Err(format!("the profile run failed; output:\n{}", run.output));
+    }
+    std::fs::create_dir_all(&args.out)
+        .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
+    let workloads = profiled(&run.output);
+    if workloads.is_empty() {
+        return Err(format!("no samples; output:\n{}", run.output));
+    }
+    for p in &workloads {
+        let elf = match p.image.as_str() {
+            "cpython" => crate::cpython::interpreter(),
+            image => cells.join(image),
+        };
+        let symbols = symbols(&elf);
+        let (stacks, calls) = folded(p, &symbols, args.per_cell);
+        for (name, text) in [("folded", &stacks), ("calls.folded", &calls)] {
+            let path = args.out.join(format!("{}.{name}", p.workload));
+            std::fs::write(&path, text)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        }
+        summary(p, &stacks);
+    }
+    report::text(&format!(
+        "folded stacks in {} (render with flamegraph.pl, inferno or speedscope)",
+        args.out.display()
+    ));
+    Ok(())
+}
+
+/// Prints where a workload's time went: the heaviest functions and parts.
+fn summary(p: &Profiled, stacks: &str) {
+    let total = p
+        .parts
+        .iter()
+        .find(|x| x.0 == "total")
+        .map_or(0.0, |x| x.1)
+        .max(1.0);
+    let samples: u64 = p.samples.iter().map(|s| s.2).sum();
+    report::text(&format!(
+        "\n{}: {samples} samples ({} sampler, {} lost), {:.3} ms in all",
+        p.workload,
+        p.sampler,
+        p.lost,
+        total / 1e6
+    ));
+    let mut rows: Vec<(f64, &str)> = stacks
+        .lines()
+        .filter_map(|l| {
+            let (stack, ns) = l.rsplit_once(' ')?;
+            Some((ns.parse().ok()?, stack.split_once(';')?.1))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (ns, frame) in rows.iter().take(20) {
+        report::text(&format!(
+            "{:>7.2} %  {:>10.1} us  {frame}",
+            100.0 * ns / total,
+            ns / 1000.0
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +593,62 @@ mod tests {
         rhizo-pass cycles\n\
         rhizo-cell spawn_ns=1500 run_ns=2500 pt_frames=7 switch_ns=350 switch_untagged_ns=450\n\
         rhizo-ops syscall_ns=95\n";
+
+    const SAMPLED: &str = "rhizo-samples w image=cpython sampler=pmu period=100000 lost=2\n\
+        rhizo-sample w 7 1010 3\n\
+        rhizo-sample w 7 2000 1\n\
+        rhizo-sample w 8 ffff0 1\n\
+        rhizo-breakdown w total_ns=2000 user_ns=1000 entry_exit_ns=0 syscall_ns=600 copy_ns=400 lock_ns=0\n\
+        rhizo-breakdown-counts w traps=3 syscall=2\n\
+        rhizo-breakdown-calls w Mmap=2/500 Read=1/100\n";
+
+    #[test]
+    fn a_sampling_run_is_parsed_per_workload() {
+        let p = profiled(SAMPLED);
+        assert_eq!(p.len(), 1);
+        let w = &p[0];
+        assert_eq!(
+            (w.image.as_str(), w.sampler.as_str(), w.lost),
+            ("cpython", "pmu", 2)
+        );
+        assert_eq!(w.samples, [(7, 0x1010, 3), (7, 0x2000, 1), (8, 0xffff0, 1)]);
+        assert!(w.parts.contains(&("user".into(), 1000.0)));
+        assert_eq!(w.calls[0], ("Mmap".into(), 2, 500.0));
+    }
+
+    #[test]
+    fn nm_output_gives_sorted_code_symbols() {
+        let nm = "0000000000002000 T main\n0000000000001000 t helper\n\
+                  0000000000003000 D data\n                 U undefined\n";
+        let s = parse_nm(nm);
+        assert_eq!(s, [(0x1000, "helper".into()), (0x2000, "main".into())]);
+        assert_eq!(symbolize(&s, "img", 0x1fff), "helper");
+        assert_eq!(symbolize(&s, "img", 0x2000), "main");
+        assert_eq!(symbolize(&s, "img", 0x0fff), "img+0x0");
+    }
+
+    #[test]
+    fn samples_share_user_time_and_parts_are_kernel_frames() {
+        let p = &profiled(SAMPLED)[0];
+        let symbols = parse_nm("0000000000001000 T PyEval\n0000000000002000 T memcpy\n");
+        let (stacks, calls) = folded(p, &symbols, false);
+        // 1000 ns of user time over 5 samples: 200 ns each.
+        assert_eq!(
+            stacks,
+            "w;cpython;PyEval 600\nw;cpython;memcpy 400\n\
+             w;kernel;copy 400\nw;kernel;syscall 600\n"
+        );
+        assert_eq!(calls, "w;Mmap 500\nw;Read 100\n");
+        let (per_cell, _) = folded(p, &symbols, true);
+        assert!(
+            per_cell.contains("w;cpython;cell 7;PyEval 600\n"),
+            "{per_cell}"
+        );
+        assert!(
+            per_cell.contains("w;cpython;cell 8;memcpy 200\n"),
+            "{per_cell}"
+        );
+    }
 
     fn find(v: &[(String, f64)], name: &str) -> Option<f64> {
         v.iter().find(|(n, _)| n == name).map(|(_, x)| *x)

@@ -926,6 +926,7 @@ fn wait(wake: Option<u64>) {
         Some(at) => idle_until(at),
         None => prof::idle(crate::smp::idle),
     }
+    cost::after_idle();
 }
 
 /// Puts `live`, back from a slice on `cpu`, where `how` says, and wakes an
@@ -1204,12 +1205,19 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     continue;
                 }
                 Trap::Interrupt => {
+                    if cost::timer_sampling() {
+                        cost::sample(live.cell.id, live.cell.regs().pc);
+                    }
                     prof::add(Count::Interrupts, 1);
                     ticks += 1;
-                    if ticks < 2 {
+                    if ticks < cost::ticks_per_slice() {
                         continue;
                     }
                     break 'thread Back::Requeue;
+                }
+                Trap::Sample => {
+                    cost::sample(live.cell.id, live.cell.regs().pc);
+                    continue;
                 }
                 Trap::Fault(fault)
                     if fault.missing_page().is_some_and(|addr| {
@@ -1684,9 +1692,13 @@ fn run_gang(
                     user::fp_trap(false);
                     set_fp_owner(key);
                 }
+                Trap::Sample => cost::sample(gang.id, regs.pc),
                 Trap::Interrupt => {
+                    if cost::timer_sampling() {
+                        cost::sample(gang.id, regs.pc);
+                    }
                     ticks += 1;
-                    if ticks >= 2 && !gang.ending.load(Ordering::Acquire) {
+                    if ticks >= cost::ticks_per_slice() && !gang.ending.load(Ordering::Acquire) {
                         // The end of this CPU's slice: it looks at the run
                         // queues again (a waiting cell goes first).
                         gang.locked(shared, ptr, |cell| cell.put_back(cpu, tid, Some(&regs)));
@@ -3791,15 +3803,43 @@ fn cow_fault_ticks() -> u64 {
     samples[ROUNDS / 2]
 }
 
+/// Rounds of each workload in a `sampling` build (one otherwise): more
+/// samples.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+const SAMPLED_ROUNDS: usize = if cfg!(feature = "sampling") { 5 } else { 1 };
+
+/// Room for samples on the CPU that takes them (spec `profiling`).
+#[cfg(all(feature = "bench-cell", feature = "sampling"))]
+const SAMPLE_ROOM: usize = 1 << 16;
+
 /// Runs `f` with every part accounted and prints its breakdown (spec
 /// `profiling`): the parts, the scopes entered, and the system calls that
 /// took most time. `per_trap` is the cost of one entry into cell code and
-/// back, in counter ticks.
+/// back, in counter ticks. A `sampling` build also samples where the cells
+/// (running `image`) are and prints the samples, folded.
 #[cfg(all(feature = "bench-cell", feature = "profile"))]
-fn breakdown(console: &mut impl Console, workload: &str, per_trap: u64, f: impl FnOnce()) {
+fn breakdown(
+    console: &mut impl Console,
+    workload: &str,
+    #[cfg_attr(not(feature = "sampling"), allow(unused_variables))] image: &str,
+    per_trap: u64,
+    f: impl FnOnce(),
+) {
     use core::fmt::Write;
     cost::start(cost::ALL);
+    #[cfg(feature = "sampling")]
+    let (sampler, period) = cost::start_sampling(SAMPLE_ROOM);
     f();
+    #[cfg(feature = "sampling")]
+    cost::stop_sampling(|samples| {
+        let mut w = rhizo_hal::ConsoleWriter(&mut *console);
+        let _ = writeln!(
+            w,
+            "rhizo-samples {workload} image={image} sampler={sampler} period={period} lost={}",
+            samples.lost()
+        );
+        let _ = rhizo_prof::samples::write(&mut w, workload, samples.sorted());
+    });
     cost::stop(|account, calls| {
         let ns = |t: u64| timer::cycles_to_ns(t).unwrap_or(0);
         let mut w = rhizo_hal::ConsoleWriter(console);
@@ -3839,7 +3879,7 @@ fn breakdowns(console: &mut impl Console) {
         cost::stop(|a, _| a.time(Part::Cell) / a.count(Part::Cell).max(1))
     };
     let mut host = Host::new();
-    breakdown(console, "cell_loop", per_trap, || {
+    breakdown(console, "cell_loop", "hello", per_trap, || {
         for _ in 0..101 {
             let id = host
                 .spawn(test_image("hello"), &[b"hello"], true, false)
@@ -3848,17 +3888,21 @@ fn breakdowns(console: &mut impl Console) {
         }
     });
     let big = ballast_template(&mut host, b"50");
-    breakdown(console, "fork_touch", per_trap, || {
-        let id = host.spawn_from_template(big, true, false).expect("fork");
-        host.run(|h| h.finished(id).is_some());
+    breakdown(console, "fork_touch", "ballast", per_trap, || {
+        for _ in 0..SAMPLED_ROUNDS {
+            let id = host.spawn_from_template(big, true, false).expect("fork");
+            host.run(|h| h.finished(id).is_some());
+        }
     });
     if let Some(files) = cpython_files() {
         const ARGV: [&[u8]; 2] = [b"/usr/bin/python3", b"/app/agent_demo.py"];
-        breakdown(console, "cpython_cold", per_trap, || {
-            let id = host
-                .spawn_with_files(test_image("cpython"), &ARGV, files, true, false)
-                .expect("spawn");
-            host.run(|h| h.finished(id).is_some());
+        breakdown(console, "cpython_cold", "cpython", per_trap, || {
+            for _ in 0..SAMPLED_ROUNDS {
+                let id = host
+                    .spawn_with_files(test_image("cpython"), &ARGV, files.clone(), true, false)
+                    .expect("spawn");
+                host.run(|h| h.finished(id).is_some());
+            }
         });
     }
 }
@@ -3887,7 +3931,7 @@ fn parallel_breakdown(console: &mut impl Console) {
         })
         .collect();
     let before = locks(&host);
-    breakdown(console, "parallel", 0, || host.run(|_| false));
+    breakdown(console, "parallel", "spin", 0, || host.run(|_| false));
     let after = locks(&host);
     for id in ids {
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));

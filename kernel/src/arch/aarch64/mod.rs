@@ -6,7 +6,14 @@ pub mod cpu;
 #[cfg(feature = "cells")]
 pub mod irq;
 pub mod platform;
-#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+#[cfg(feature = "cells")]
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(
+        dead_code,
+        reason = "counting is for tests and benchmarks; sampling is wired in"
+    )
+)]
 pub mod pmu;
 pub mod power;
 #[cfg(feature = "cells")]
