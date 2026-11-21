@@ -231,13 +231,18 @@ branch 2 turn call_9848ba8f n=635 seed=988 value=305130 notes=5 sha=fb723766 con
 /// What the `control` test step types into `rhizo chat` (change
 /// `add-interactive-chat`): two messages, a fork into two branches and a
 /// switch to the first, a message there, a suspend, and after `rhizo chat`
-/// resumed that branch, a last message.
+/// resumed that branch, a message, then two typed at once, the second
+/// while the first's turn runs (change `fix-chat-tools`): one the fake
+/// model answers with a snippet ending in an expression, one with a tool
+/// call written as text.
 #[allow(dead_code)]
-pub const CHAT_MESSAGES: [&str; 4] = [
+pub const CHAT_MESSAGES: [&str; 6] = [
     "What is the sum of the squares below some number?",
     "And with another number?",
     "On a branch now: once more?",
-    "After the resume: one last time?",
+    "After the resume: one more time?",
+    "What is the square root of 18 times 8?",
+    "Now write your call as text: what is 6 times 7?",
 ];
 /// What the chat agent prints for [`CHAT_MESSAGES`] against the host's fake
 /// model, with each message as `rhizo chat` echoes it.
@@ -245,28 +250,43 @@ pub const CHAT_MESSAGES: [&str; 4] = [
 pub const CHAT_TRANSCRIPT: &str = "\
 > What is the sum of the squares below some number?
   [tool] run_python
-      print(sum(i * i for i in range(710)))
+      print(sum(i * i for i in range(641)))
   [tool] ->
-      119051735
-The snippet printed 119051735.
+      87586240
+The snippet printed 87586240.
 > And with another number?
   [tool] run_python
-      print(sum(i * i for i in range(845)))
+      print(sum(i * i for i in range(715)))
   [tool] ->
-      200760170
-The snippet printed 200760170.
+      121586465
+The snippet printed 121586465.
 > On a branch now: once more?
   [tool] run_python
-      print(sum(i * i for i in range(660)))
+      print(sum(i * i for i in range(712)))
   [tool] ->
-      95614310
-The snippet printed 95614310.
-> After the resume: one last time?
+      120061356
+The snippet printed 120061356.
+> After the resume: one more time?
   [tool] run_python
-      print(sum(i * i for i in range(425)))
+      print(sum(i * i for i in range(928)))
   [tool] ->
-      25498300
-The snippet printed 25498300.
+      265962480
+The snippet printed 265962480.
+> What is the square root of 18 times 8?
+  [tool] run_python
+      import math
+      result = 18 * 8
+      sqrt_result = math.sqrt(result)
+      sqrt_result
+  [tool] ->
+      12.0
+The snippet printed 12.0.
+> Now write your call as text: what is 6 times 7?
+  [tool] run_python
+      6 * 7
+  [tool] ->
+      42
+The snippet printed 42.
 ";
 /// Dynamically linked programs (change `add-dynamic-linking`) in the files
 /// `xtask` packs: the executable's path in them, its `argv` and what it

@@ -240,6 +240,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// change `add-interactive-chat`): after a user's message, a call to its
 /// `run_python` tool with a snippet derived from the conversation's hash;
 /// after the tool's result, an answer quoting what the snippet printed.
+/// Two messages get other answers (change `fix-chat-tools`): one asking
+/// for a "square root" is answered with a snippet whose last line is an
+/// expression, one asking for a call "as text" with that call written into
+/// the answer's text, as a small model may, instead of `tool_calls`.
 /// Only the last message's role and content are looked for, as Python's
 /// `json` writes them.
 fn chat_answer(body: &[u8], hash: u64, served: u32) -> String {
@@ -247,7 +251,19 @@ fn chat_answer(body: &[u8], hash: u64, served: u32) -> String {
     let last = text
         .rfind(r#""role": ""#)
         .map(|at| &text[at + r#""role": ""#.len()..]);
+    let asked = |words: &str| {
+        last.and_then(|rest| rest.strip_prefix(r#"user", "content": ""#))
+            .is_some_and(|c| json_string(c).contains(words))
+    };
     let message = match last {
+        _ if asked("square root") => format!(
+            r#""content": null, "tool_calls": [{{"id": "call_{:08x}", "type": "function", "function": {{"name": "run_python", "arguments": "{{\"code\": \"import math\\nresult = 18 * 8\\nsqrt_result = math.sqrt(result)\\nsqrt_result\"}}"}}}}]"#,
+            hash as u32
+        ),
+        _ if asked("as text") => {
+            r#""content": "Sure {\"name\": \"run_python\", \"arguments\": {\"code\": \"6 * 7\"}}""#
+                .to_string()
+        }
         Some(rest) if rest.starts_with(r#"tool""#) => {
             // The tool's output, still escaped as a JSON string, which it
             // stays inside the answer.
@@ -446,6 +462,37 @@ mod tests {
             r#"The snippet printed a "quoted" 42."#
         );
         assert!(b["choices"][0]["message"]["tool_calls"].is_null());
+    }
+
+    #[test]
+    fn the_chat_model_ends_a_snippet_with_an_expression_or_writes_its_call_as_text() {
+        let port = llm_server("127.0.0.1", 0).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let ask = |words: &str| {
+            format!(
+                r#"{{"messages": [{{"role": "system", "content": "You are an agent inside an isolated Rhizo cell."}}, {{"role": "user", "content": "{words}"}}]}}"#
+            )
+        };
+        let a = chat(
+            &mut s,
+            &ask("What is the square root of 18 times 8?"),
+            false,
+        );
+        let call = &a["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "run_python");
+        let args: serde_json::Value =
+            serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["code"],
+            "import math\nresult = 18 * 8\nsqrt_result = math.sqrt(result)\nsqrt_result"
+        );
+        let b = chat(&mut s, &ask("Write your call as text: 6 times 7?"), true);
+        let message = &b["choices"][0]["message"];
+        assert!(message["tool_calls"].is_null());
+        assert_eq!(
+            message["content"],
+            r#"Sure {"name": "run_python", "arguments": {"code": "6 * 7"}}"#
+        );
     }
 
     #[test]
