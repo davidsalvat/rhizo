@@ -424,6 +424,329 @@ proptest! {
     }
 }
 
+// The gate: connections admitted by a secret (change
+// `authenticate-control-channel`).
+
+const SECRET: [u8; SECRET_LEN] = *b"0123456789abcdef-the-host-secret";
+
+fn gate() -> Gate {
+    Gate::new(Stream::new(CID, PORT), SECRET)
+}
+
+/// A packet from the host's port `port`, carrying `data`.
+fn from(port: u32, op: u16, data: &[u8]) -> Header {
+    Header {
+        src_port: port,
+        ..from_host(op, data.len() as u32)
+    }
+}
+
+/// Every packet the gate has to send.
+fn drain_gate(g: &mut Gate) -> Vec<(Header, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut payload = Vec::new();
+    while let Some(h) = g.next_packet(PAYLOAD_MAX, &mut payload) {
+        out.push((h, payload.clone()));
+    }
+    out
+}
+
+/// What the admitted connection received.
+fn read_gate(g: &mut Gate) -> Vec<u8> {
+    let Some(c) = g.connection() else {
+        return Vec::new();
+    };
+    core::iter::from_fn(|| g.read(c)).collect()
+}
+
+/// The operations of the packets sent to port `port`.
+fn ops_to(sent: &[(Header, Vec<u8>)], port: u32) -> Vec<u16> {
+    sent.iter()
+        .filter(|(h, _)| h.dst_port == port)
+        .map(|(h, _)| h.op)
+        .collect()
+}
+
+/// A connection from port `port` that the gate answered, not yet admitted.
+fn request(g: &mut Gate, port: u32) {
+    assert_eq!(g.take(&from(port, op::REQUEST, &[]), &[]), None);
+    assert_eq!(g.connection(), None, "not admitted before the secret");
+    assert_eq!(ops_to(&drain_gate(g), port), [op::RESPONSE]);
+}
+
+#[test]
+fn a_connection_is_admitted_only_with_the_secret() {
+    let mut g = gate();
+    request(&mut g, HOST_PORT);
+    assert!(
+        !g.write(b"hello"),
+        "nothing goes to a connection not admitted"
+    );
+    assert!(!g.has_input());
+    let mut first = SECRET.to_vec();
+    first.extend_from_slice(b"\x01Zframe");
+    assert_eq!(
+        g.take(&from(HOST_PORT, op::RW, &first), &first),
+        Some(Change::Connected)
+    );
+    assert!(g.has_input());
+    assert_eq!(
+        read_gate(&mut g),
+        b"\x01Zframe",
+        "the bytes after the secret are the connection's"
+    );
+    assert!(g.write(b"hello"));
+    let sent = drain_gate(&mut g);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (sent[0].0.op, sent[0].1.as_slice(), sent[0].0.fwd_cnt),
+        (op::RW, &b"hello"[..], first.len() as u32),
+        "the secret's bytes count as read"
+    );
+    assert_eq!(g.refused(), 0);
+}
+
+#[test]
+fn a_wrong_secret_is_refused_and_the_gate_keeps_listening() {
+    let mut g = gate();
+    for wrong in 0..SECRET_LEN {
+        request(&mut g, HOST_PORT);
+        let mut bad = SECRET;
+        bad[wrong] ^= 0x80;
+        assert_eq!(g.take(&from(HOST_PORT, op::RW, &bad), &bad), None);
+        assert_eq!(g.connection(), None);
+        assert_eq!(ops_to(&drain_gate(&mut g), HOST_PORT), [op::RST]);
+        assert_eq!(g.refused(), wrong as u32 + 1, "every refusal counts");
+    }
+    request(&mut g, HOST_PORT);
+    assert_eq!(
+        g.take(&from(HOST_PORT, op::RW, &SECRET), &SECRET),
+        Some(Change::Connected)
+    );
+}
+
+/// Frames sent without the secret are taken as a wrong one: none is ever
+/// read, and nothing is sent back but the reset.
+#[test]
+fn requests_without_the_secret_never_reach_the_reader() {
+    let mut g = gate();
+    request(&mut g, HOST_PORT);
+    // Empty frames of 12 bytes (a power off): the first 32 bytes decide.
+    let frame = *b"\x01Z\x03\x0a\x01\x00\x00\x00\x00\x00\x00\x00";
+    for _ in 0..2 {
+        assert_eq!(g.take(&from(HOST_PORT, op::RW, &frame), &frame), None);
+        assert_eq!(g.connection(), None);
+        assert!(drain_gate(&mut g).is_empty(), "not decided before 32 bytes");
+    }
+    assert_eq!(g.take(&from(HOST_PORT, op::RW, &frame), &frame), None);
+    assert_eq!(ops_to(&drain_gate(&mut g), HOST_PORT), [op::RST]);
+    assert_eq!(g.refused(), 1);
+    assert!(!g.has_input());
+    assert_eq!(read_gate(&mut g), b"");
+    // Nothing more of it is read: its bytes now come from a stranger.
+    assert_eq!(g.take(&from(HOST_PORT, op::RW, &frame), &frame), None);
+    assert_eq!(ops_to(&drain_gate(&mut g), HOST_PORT), [op::RST]);
+    assert_eq!(g.connection(), None);
+}
+
+#[test]
+fn a_slow_prover_is_reset() {
+    let mut g = gate();
+    request(&mut g, HOST_PORT);
+    g.expire(1_000);
+    let part = &SECRET[..SECRET_LEN - 1];
+    assert_eq!(g.take(&from(HOST_PORT, op::RW, part), part), None);
+    g.expire(1_000 + PROVE_WITHIN_NS - 1);
+    assert!(drain_gate(&mut g).is_empty(), "still within its time");
+    g.expire(1_000 + PROVE_WITHIN_NS);
+    assert_eq!(ops_to(&drain_gate(&mut g), HOST_PORT), [op::RST]);
+    assert_eq!(g.refused(), 1);
+    // Its last byte comes too late: the connection is gone.
+    let last = &SECRET[SECRET_LEN - 1..];
+    assert_eq!(g.take(&from(HOST_PORT, op::RW, last), last), None);
+    assert_eq!(g.connection(), None);
+    // A silent connection is reset the same way, and the next one is timed
+    // afresh.
+    request(&mut g, HOST_PORT + 1);
+    g.expire(5 * PROVE_WITHIN_NS);
+    g.expire(6 * PROVE_WITHIN_NS);
+    assert_eq!(ops_to(&drain_gate(&mut g), HOST_PORT + 1), [op::RST]);
+    request(&mut g, HOST_PORT + 2);
+    g.expire(7 * PROVE_WITHIN_NS);
+    assert_eq!(
+        g.take(&from(HOST_PORT + 2, op::RW, &SECRET), &SECRET),
+        Some(Change::Connected)
+    );
+    g.expire(100 * PROVE_WITHIN_NS);
+    assert!(
+        g.connection().is_some(),
+        "an admitted connection has no limit"
+    );
+    assert_eq!(g.refused(), 2);
+}
+
+#[test]
+fn a_secret_split_over_many_packets_is_admitted() {
+    let mut g = gate();
+    request(&mut g, HOST_PORT);
+    for (i, byte) in SECRET.iter().enumerate() {
+        assert_eq!(g.connection(), None, "not admitted after {i} bytes");
+        let change = g.take(&from(HOST_PORT, op::RW, &[*byte]), &[*byte]);
+        assert_eq!(change.is_some(), i == SECRET_LEN - 1);
+    }
+    assert!(g.connection().is_some());
+    // Uneven pieces, the last one carrying the first request's bytes.
+    let mut g = gate();
+    request(&mut g, HOST_PORT);
+    let mut bytes = SECRET.to_vec();
+    bytes.extend_from_slice(b"req");
+    for piece in [&bytes[..3], &bytes[3..20], &bytes[20..31], &bytes[31..]] {
+        g.take(&from(HOST_PORT, op::RW, piece), piece);
+    }
+    assert_eq!(read_gate(&mut g), b"req");
+}
+
+#[test]
+fn a_reconnect_after_a_drop_must_present_the_secret_again() {
+    let mut g = gate();
+    request(&mut g, HOST_PORT);
+    g.take(&from(HOST_PORT, op::RW, &SECRET), &SECRET);
+    let old = g.connection().expect("admitted");
+    assert_eq!(
+        g.take(&from(HOST_PORT, op::RST, &[]), &[]),
+        Some(Change::Closed)
+    );
+    assert_eq!(g.connection(), None);
+    // The same peer again: it starts from nothing.
+    request(&mut g, HOST_PORT);
+    assert_eq!(g.read(old), None);
+    assert!(!g.write(b"x"));
+    let frame = [7u8; SECRET_LEN];
+    assert_eq!(g.take(&from(HOST_PORT, op::RW, &frame), &frame), None);
+    assert_eq!(
+        g.connection(),
+        None,
+        "the old admission does not carry over"
+    );
+    assert_eq!(g.refused(), 1);
+    assert_eq!(ops_to(&drain_gate(&mut g), HOST_PORT), [op::RST]);
+    request(&mut g, HOST_PORT);
+    assert_eq!(
+        g.take(&from(HOST_PORT, op::RW, &SECRET), &SECRET),
+        Some(Change::Connected)
+    );
+    assert_ne!(g.connection(), Some(old));
+}
+
+/// A stranger that connects first cannot keep the host out: the host's
+/// request replaces it. Once the host is admitted, a stranger's request
+/// is reset as before and the host's connection is untouched.
+#[test]
+fn a_stranger_cannot_hold_the_only_connection() {
+    let stranger = HOST_PORT + 9;
+    let mut g = gate();
+    request(&mut g, stranger);
+    let half = &SECRET[..16];
+    g.take(&from(stranger, op::RW, half), half);
+    assert_eq!(g.take(&from(HOST_PORT, op::REQUEST, &[]), &[]), None);
+    let sent = drain_gate(&mut g);
+    assert_eq!(ops_to(&sent, stranger), [op::RST]);
+    assert_eq!(ops_to(&sent, HOST_PORT), [op::RESPONSE]);
+    assert_eq!(g.refused(), 1);
+    // The stranger's bytes are not the host's.
+    let rest = &SECRET[16..];
+    assert_eq!(g.take(&from(stranger, op::RW, rest), rest), None);
+    assert_eq!(g.connection(), None);
+    assert_eq!(
+        g.take(&from(HOST_PORT, op::RW, &SECRET), &SECRET),
+        Some(Change::Connected)
+    );
+    drain_gate(&mut g);
+    assert_eq!(g.take(&from(stranger, op::REQUEST, &[]), &[]), None);
+    assert_eq!(ops_to(&drain_gate(&mut g), stranger), [op::RST]);
+    assert!(g.connection().is_some(), "the host's connection stays");
+    assert_eq!(g.refused(), 1, "a stranger turned away is not a refusal");
+}
+
+/// First bytes: the secret, the secret with one byte changed, or any
+/// bytes, each followed by anything.
+fn first_bytes() -> impl Strategy<Value = Vec<u8>> {
+    let tail = proptest::collection::vec(any::<u8>(), 0..64);
+    prop_oneof![
+        proptest::collection::vec(any::<u8>(), 0..80),
+        tail.clone().prop_map(|t| [SECRET.to_vec(), t].concat()),
+        (0..SECRET_LEN, 1..=255u8, tail).prop_map(|(at, x, t)| {
+            let mut b = SECRET.to_vec();
+            b[at] ^= x;
+            [b, t].concat()
+        }),
+    ]
+}
+
+proptest! {
+    /// Whatever the first bytes, split into any packets: the connection is
+    /// admitted exactly when they start with the secret, and the rest is
+    /// then read as its bytes; with a wrong start it is refused and
+    /// nothing of it is read; with too few bytes it waits, and nothing is
+    /// read either. No byte is ever sent before the admission.
+    #[test]
+    fn only_the_secret_admits(
+        bytes in first_bytes(),
+        cuts in proptest::collection::vec(1..40usize, 0..20),
+    ) {
+        let mut g = gate();
+        request(&mut g, HOST_PORT);
+        let mut at = 0usize;
+        for cut in cuts.into_iter().chain([usize::MAX]) {
+            let end = at.saturating_add(cut).min(bytes.len());
+            let piece = &bytes[at..end];
+            if !piece.is_empty() {
+                g.take(&from(HOST_PORT, op::RW, piece), piece);
+            }
+            at = end;
+        }
+        let right = bytes.len() >= SECRET_LEN && bytes[..SECRET_LEN] == SECRET;
+        let sent = drain_gate(&mut g);
+        prop_assert!(sent.iter().all(|(h, _)| h.op != op::RW), "no bytes went out");
+        if right {
+            prop_assert!(g.connection().is_some());
+            prop_assert_eq!(read_gate(&mut g), bytes[SECRET_LEN..].to_vec());
+            prop_assert_eq!(g.refused(), 0);
+        } else {
+            prop_assert_eq!(g.connection(), None);
+            prop_assert!(!g.has_input());
+            prop_assert!(!g.write(b"x"));
+            let refused = bytes.len() >= SECRET_LEN;
+            prop_assert_eq!(g.refused(), u32::from(refused));
+            // A reset, and another for each packet sent after it.
+            let ops = ops_to(&sent, HOST_PORT);
+            prop_assert_eq!(!ops.is_empty(), refused);
+            prop_assert!(ops.iter().all(|&o| o == op::RST));
+        }
+    }
+
+    /// Arbitrary packets and times never admit a connection without the
+    /// secret: nothing is read or written through the gate.
+    #[test]
+    fn hostile_packets_are_never_admitted(
+        steps in proptest::collection::vec(
+            (any_header(), proptest::collection::vec(any::<u8>(), 0..300), any::<u64>()),
+            1..60,
+        )
+    ) {
+        let mut g = gate();
+        for (h, data, now) in steps {
+            let data = &data[..data.len().min(h.len as usize)];
+            g.take(&h, data);
+            g.expire(now);
+            prop_assert_eq!(g.connection(), None);
+            prop_assert!(!g.has_input());
+            prop_assert!(!g.write(b"x"));
+            prop_assert!(drain_gate(&mut g).iter().all(|(h, _)| h.op != op::RW));
+        }
+    }
+}
+
 // The driver against a simulated device.
 
 #[derive(Debug, Default, Clone, Copy)]

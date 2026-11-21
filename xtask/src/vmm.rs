@@ -175,7 +175,7 @@ impl Accel {
         }
     }
 
-    fn uses_kvm(self) -> bool {
+    pub fn uses_kvm(self) -> bool {
         match self {
             Accel::Auto => kvm_available(),
             Accel::Kvm => true,
@@ -392,8 +392,9 @@ impl Vsock {
 
 /// Whether `/dev/vhost-vsock` opens for reading and writing. On a CI runner
 /// (`CI` set), which is thrown away after the job, it is made so with
-/// `sudo -n chmod 0666` if it exists and does not (runners leave it to
-/// `root:kvm`); the module is loaded first, since loading it on the first
+/// `sudo -n chmod 0666` if it does not (runners leave it to `root:kvm`);
+/// the module is loaded first, since the device exists only once it is
+/// (change `authenticate-control-channel`), and loading it on the first
 /// open has udev set the old mode back. Elsewhere the host's permissions are
 /// never widened: any local user could then reach the guests, so the control
 /// line stays on serial until the user grants access (for example, by adding
@@ -418,9 +419,9 @@ fn vhost_vsock_usable() -> bool {
     };
     opens()
         || (std::env::var_os("CI").is_some()
-            && Path::new(DEVICE).exists()
             && sudo(&["modprobe", "vhost_vsock"])
             && sudo(&["udevadm", "settle"])
+            && Path::new(DEVICE).exists()
             && sudo(&["chmod", "0666", DEVICE])
             && opens())
 }

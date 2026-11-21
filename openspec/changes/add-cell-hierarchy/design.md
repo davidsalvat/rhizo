@@ -1121,6 +1121,67 @@ channel.
 administrator from deleting the whole log, which is why forwarding is
 recommended for production.
 
+**As built in phase 1 (task 1.9b).**
+
+- The record and its ring are in `rhizo-control` (`audit`), so the host
+  tests them: a record is its sequence number, the kernel's time, a kind,
+  the cell and the root of its domain, a count, the records dropped
+  before it and a detail for people (at most 200 bytes). The ring is one
+  `VecDeque` of 64 KiB of encoded records, allocated at the first record
+  and never grown; time is passed in. The kernel keeps one ring for all
+  CPUs behind a `Global` (`kernel/src/audit.rs`), and records cells by
+  kernel identifier; the control kernel gives the host's identifiers, and
+  the domain's root where the record did not name it, when it sends.
+- Records leave as `audit` frames of version 4 (kind `0x85`, identifier
+  0), which D14 lists; no request was needed: the control kernel sends
+  what the ring holds after each turn of its loop, and its idle loop wakes
+  for it. A frame of version 3 of that kind is refused.
+- Every record takes a sequence number, dropped ones too, so the host sees
+  a gap as well as the next record's drop count. Denials (egress, scope,
+  tree, load narrowed, publish refused) fold per cell, kind and second:
+  the first goes in at once, and once that second is over one more record
+  carries the count of the others and the first one's detail; so the
+  counts of a cell's records add up to its denials. At most 8 cells fold
+  at once; a ninth flushes the oldest early.
+- Recorded in phase 1: cells the host made (`run`, `fork`, `load`, with
+  their placement) and their ends; moves, policies and limits; requests of
+  scoped clients, let through or refused, with the scope; tree refusals
+  (`Denied`, `Invalid`); a load whose quota was cut; a publication refused
+  or made on the host's attestation (`Host::may_publish`); a vsock
+  connection to the control channel refused for want of the secret
+  (`auth-refused`, change `authenticate-control-channel`). Egress denials
+  come with task 1.6 through `audit::deny(Kind::Egress, cell, domain,
+  detail)`; grants with phase 2.
+- On the host the files are `audit/audit-<n>.jsonl` (`n` counting up from
+  0, so names sort in order), a new one at each `rhizo up` and at 64 MiB.
+  Each file's first line names its boot and the file before; each line's
+  `prev` is the SHA-256 of the line before, the first file's first line
+  after 32 zero bytes. `audit/head` holds the last line's file and hash,
+  so a cut end or an edited last line shows as well. `rhizo down` keeps
+  `audit/` (spec `control-plane`, state after down).
+- SHA-256 is written out in `rhizo` (about 60 lines) rather than taken
+  from a crate, which would add seven crates to the binary for one
+  function. Tests check it against the FIPS 180-4 vectors, and against
+  RustCrypto's `sha2` (MIT OR Apache-2.0, a dev-dependency only) at every
+  padding boundary (0, 55, 56, 63, 64, 65, 119, 120, 128 bytes) and on
+  arbitrary inputs up to 1,000 bytes. The JSON lines use `serde_json`,
+  already in the workspace through `xtask`.
+- What `verify` proves, and what it does not. The chain is unkeyed: it
+  detects an edit, removal or reordering of part of the log by someone
+  who does not rewrite everything after it. Anyone with write access to
+  the state directory can rewrite the whole chain from the edited line
+  on, and `audit/head`, and `verify` then passes. What it cannot hide
+  while a VM runs: the kernel's sequence numbers and drop counts, so
+  records missing from a live session show as a gap unless the rest of
+  that session is rewritten too. A possible later mitigation, not built:
+  export `head` (or each file's last hash) to a sink outside the host's
+  reach, or sign it with a key kept outside the state directory.
+  `docs/security.md` (audit log) says the same.
+- `rhizo audit tail [--cell N] [--domain N] [--kind K] [--follow]` shows
+  records, `--follow` then polls for new lines; `rhizo audit verify`
+  names each edited, removed or reordered line, each gap in sequence
+  numbers, and the kernel's drop counts, and fails on any break.
+
 Alternative: keep the log in the kernel and let the host read it.
 Rejected: kernel memory is bounded, and the log must outlive the VM.
 
@@ -1584,6 +1645,103 @@ the test above, reported), and no regression of `cell.switch_ns`,
 **Snapshots and protocol.** Weight and cap are limits: they go into the
 tree section (format version 11) and into `run`, `load`, `limits` and
 template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
+
+**As built in phase 1 (task 1.9c, kernel wiring).**
+
+- **When the host shares by weight.** Round robin per cell already gives
+  each domain exactly its weight's part while every node is a root (alone
+  in its domain) of the default weight without a cap, which is every cell
+  until the tree says otherwise. So the host stays round robin then, and
+  shares by weight as soon as one node is not plain (a child, a weight
+  other than 100, a cap), and goes back to round robin when none is left.
+  The scheduler's policy is `Option<Fair>`: round robin while `None`.
+- **Cost of the choice.** Each locked section of the scheduler tests the
+  policy once: taking a cell (`next`), and putting it back (charging and
+  requeueing in one call, `requeue_charged`; a filed cell is charged
+  apart). A copy of a plain cell, a root of default weight and a resumed
+  cell keep the host round robin, so spawn, fork and resume test the policy
+  without computing anything: the host keeps it in a field of its own
+  (`Host::by_weight`), so a tree change on round robin tests that field,
+  takes no lock and calls nothing, and the scheduler's `place`, `requeue`
+  and `push` stay inlined into their callers with the by-weight path out
+  of line. Measured with `--icount-only` against `main` (e655beb):
+  `cell.switch_insns` 875, unchanged (x86_64), and 817 to 819 (AArch64);
+  `cell.resume_insns` +5 and -1; `cell.spawn_insns` +78 (x86_64, +0.28 %:
+  code generation around the spawn path, whose helpers the tests' and
+  benchmarks' placements now also call) and +2; `cell.fork_insns` +22 and
+  +16; every other figure within +0.53 %.
+- **No search, no allocation per switch.** While the host shares by
+  weight, the scheduler tells `Fair` each entry it queues and each it
+  takes out other than by a pick, so a pick never reads the queue:
+  - each CPU keeps the list of domains with work in its queue, and each
+    domain one binary heap of its queued cells per CPU, least finishing
+    virtual time first; a pick scans the CPU's domains (WF2Q+, linear in
+    the domains with work there, which a CPU's queue rarely holds many
+    of), pops the chosen domain's heap (O(log k) in its cells there), and
+    finds the entry in the queue by its arrival number (the first, or a
+    binary search: a queue is in arrival order);
+  - cells, domains and caps are vectors sorted by identifier (binary
+    search on a tree change or a lookup by key); the cell just picked is
+    remembered, so its charge and requeue look nothing up;
+  - a charge multiplies by each weight's reciprocal, computed when the
+    weight is set (the CPU's weight sum: when it changes), never divides;
+  - a domain's virtual time is 64 bits (2^-16 ns per unit of weight,
+    compared by wrapping difference: unambiguous while the compared times
+    are within 2^63 units, 39 hours of one CPU's time at weight 1); a
+    cell's stays 128 bits, in the heaps only;
+  - a domain leaves a CPU's list when a pick finds its heap there empty,
+    not when its last cell is taken: a domain whose cell runs and comes
+    back neither leaves nor joins;
+  - every change of the tables marks them dirty, and the next locked
+    section learns the queues again (O(entries), on tree changes only).
+- **Cost of sharing by weight.** `cell.switch_domains_insns` (gated with
+  `-icount`, ±2 %) is the switch with the two cells in two domains and a
+  third, waiting cell placed under the first: 1,374 instructions on
+  x86_64 and 1,285 on AArch64. The same three cells in round robin take
+  887 and 829, so sharing by weight costs 487 and 456 instructions per
+  switch (it was 1,250 and 1,070 with ordered maps, a list built at each
+  pick and 64-bit divisions). Of those, measured with callgrind on the
+  library alone (x86_64, `lto = "fat"` as the kernel builds, 105
+  instructions per switch in round robin, 415 by weight):
+  - taking a cell, about 150: the pick scans the two domains with work
+    (about 24 each, with bounds checks), pops a heap, and the queue is
+    searched by arrival;
+  - putting it back, about 160: three charges (the cell's, its domain's
+    and the CPU's virtual time: a 64-by-64 multiplication each), the cap
+    check, the heap push and the list check, and the tests of the dirty
+    mark and of a cap holding the cell.
+  The kernel adds about 150: the clock read that measures the slice
+  (`now_ns`, a 128-bit scaling of the cycle counter) and its own code
+  generation of the same path. That is over the 200 instructions aimed
+  at. The floor of this design is the work above: a domain choice, a
+  heap per domain and three charges per switch, kept in step with a
+  queue the round robin path also uses. Going lower would store the
+  entries in the heaps themselves while sharing by weight (no parallel
+  queue to search) and keep a heap of one cell inline; both change every
+  operation of the scheduler, not only the pick, and are left as the
+  next step if the figure matters more than the change's size.
+- **Shares are computed when the tree changes.** The host recomputes every
+  cell's domain, flattened share and capped nodes (`fair::flatten`) after
+  a spawn, a copy, a resume, a placement and each settled end, only while
+  it shares by weight; virtual times and cap use carry over. That is
+  O(cells) per tree change in that mode.
+- **Slices and caps.** The kernel charges the time from taking a cell to
+  giving it back (a gang: from the last CPU that joined it, so a gang's
+  slice counts once, not once per CPU). A cap is checked at the end of a
+  slice, and a slice lasts up to two timer ticks (a cell is preempted at
+  its second): a capped subtree overshoots by up to one such slice per
+  period for each CPU running it.
+- **Tree operations.** `Host::place` (protocol version 4: `run`, `fork`
+  and `load` with `--cpu-weight` and `--cpu-max`, and `adopt`) and a root
+  loaded from a snapshot share the CPUs again when the placed node is not
+  plain or cells already share by weight: placing a plain root tests one
+  field. `reparent` always does, and `set_limits_from` when cells share by
+  weight. In-kernel tests and benchmarks place cells with `set_limits`,
+  `adopt` and `place`, the weight or cap in the `Spec`
+  (`root_weights_share_a_cpu`: roots of weights 300 and 100 get three
+  quarters and a quarter of a CPU). `--cpus` (exclusive CPU sets) is
+  recorded and not yet enforced.
+- `sched.domain_share_pct`: 49 under `-icount` on AArch64.
 
 Alternatives:
 

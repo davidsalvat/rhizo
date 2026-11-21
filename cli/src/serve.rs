@@ -7,8 +7,11 @@
 //! that asked. The kernel's console text goes to the console log. Frames
 //! keep the protocol version they came in, so a kernel of the version
 //! before is relayed as it speaks (design D20 of `add-cell-hierarchy`).
+//! The kernel's audit records go to the audit log, synced every second and
+//! when the VM ends (design D18).
 
 use crate::args::Up;
+use crate::audit::Log;
 use crate::state::{Dir, Info};
 use rhizo_control::{Body, Decoder, Item, Message, PREVIOUS, Request, VERSION, encode_frame_as};
 use std::collections::HashMap;
@@ -74,9 +77,21 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
         return Err(crate::client::upgrade(vm.protocol)); // dropping the VM ends it
     }
     let _ = console.write_all(&std::mem::take(&mut vm.console));
+    let boot = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut audit = Log::open(&crate::audit::dir(&dir.0), boot)?;
+    let _ = writeln!(console, "[rhizo] control frames over {}", vm.channel);
     let _ = fs::remove_file(dir.socket());
     let listener = UnixListener::bind(dir.socket())
         .map_err(|e| format!("cannot listen on {}: {e}", dir.socket().display()))?;
+    // It may be outside the state directory (a long path): its user alone
+    // connects, whatever the umask.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.socket(), fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot restrict {}: {e}", dir.socket().display()))?;
+    }
     Info {
         pid: std::process::id(),
         vmm_pid: vm.pid(),
@@ -102,9 +117,18 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
         });
     }
     loop {
-        match vm.next(Duration::from_secs(3600)) {
+        let wait = if audit.unsynced() { 1 } else { 3600 };
+        match vm.next(Duration::from_secs(wait)) {
             Some(Event::Text(text)) => {
                 let _ = console.write_all(&text);
+            }
+            // Identifier 0: the kernel's own (an audit record).
+            Some(Event::Frame(frame)) if frame.id == 0 => {
+                if let Ok(Message::Audit(record)) = Message::decode(&frame)
+                    && let Err(e) = audit.append(&record)
+                {
+                    let _ = writeln!(console, "[rhizo] audit record {}: {e}", record.seq);
+                }
             }
             Some(Event::Frame(frame)) => relay.back(&frame),
             Some(Event::Bad { id, error }) => {
@@ -113,7 +137,9 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
             Some(Event::Exited) => break,
             None => {}
         }
+        audit.sync_due();
     }
+    audit.sync();
     dir.clean();
     Ok(())
 }

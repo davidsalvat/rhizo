@@ -4,6 +4,11 @@
 //! instead of the serial line. A frame costs a notification of the device,
 //! not two trapped register accesses per byte. The device is polled (from
 //! the control loop), like the network card.
+//!
+//! Any local user of the host may connect to a guest's vsock port on QEMU,
+//! so a connection is served only once it presents a secret the kernel
+//! drew at boot and gave on the serial line alone, which only the process
+//! that started the VMM reads (change `authenticate-control-channel`).
 
 use crate::arch::console::BootConsole;
 use crate::arch::platform::{self, Mmio};
@@ -13,19 +18,23 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use rhizo_control::VSOCK_PORT;
+use rhizo_control::{SECRET_LEN, SECRET_LINE, VSOCK_PORT};
 use rhizo_hal::ConsoleWriter;
-use rhizo_virtio::vsock::{self, PAYLOAD_MAX, Stream, VirtioVsock};
+use rhizo_virtio::vsock::{self, Gate, PAYLOAD_MAX, Stream, VirtioVsock};
 use rhizo_virtio::{ProbeError, VSOCK_DEVICE, pci};
 
 type Device = VirtioVsock<Mmio, DirectMap>;
 
 struct Channel {
     dev: Device,
-    stream: Stream,
+    stream: Gate,
     /// A packet's payload on its way out.
     out: Vec<u8>,
+    /// Refused connections already reported on the console.
+    reported: u32,
 }
+
+const _: () = assert!(SECRET_LEN == vsock::SECRET_LEN);
 
 static CHANNEL: Global<Option<Channel>> = Global::new(None);
 
@@ -33,18 +42,35 @@ fn report(what: core::fmt::Arguments) {
     let _ = writeln!(ConsoleWriter(&mut BootConsole), "vsock: {what}");
 }
 
-/// Brings up the first virtio socket device, if any, and listens on it.
+/// Brings up the first virtio socket device, if any, and listens on it,
+/// after giving the secret its connections present on the console (the
+/// serial line). Without a hardware random source the secret could be
+/// guessed: the device is left alone, and the frames stay on the serial
+/// line.
 pub fn init() {
     let Some((at, dev)) = find() else {
         return;
     };
+    let mut secret = [0; SECRET_LEN];
+    if !crate::cell::random_bytes(&mut secret) {
+        report(format_args!(
+            "no hardware random source: control stays on the serial line"
+        ));
+        return;
+    }
     let cid = dev.cid();
     report(format_args!("cid {cid} port {VSOCK_PORT} at {at}"));
+    let mut line = String::from(SECRET_LINE);
+    for b in secret {
+        let _ = write!(line, "{b:02x}");
+    }
+    let _ = writeln!(ConsoleWriter(&mut BootConsole), "{line}");
     CHANNEL.with(|c| {
         *c = Some(Channel {
             dev,
-            stream: Stream::new(cid, VSOCK_PORT),
+            stream: Gate::new(Stream::new(cid, VSOCK_PORT), secret),
             out: Vec::new(),
+            reported: 0,
         });
     });
 }
@@ -117,13 +143,36 @@ fn pci_device(alloc: &mut dyn FnMut() -> Option<u64>) -> Option<(String, Device)
     None
 }
 
-/// Moves the packets the device received into the stream, and what the
+/// Moves the packets the device received into the stream, resets a
+/// connection that took too long to present the secret, and moves what the
 /// stream has to send into the device while it has room.
 fn pump(c: &mut Channel) {
-    let Channel { dev, stream, out } = c;
+    let Channel {
+        dev,
+        stream,
+        out,
+        reported,
+    } = c;
     while dev.recv(&mut |h, data| {
         stream.take(h, data);
     }) {}
+    stream.expire(crate::cell::now_ns());
+    if stream.refused() != *reported {
+        // Each refused connection is audited; repeats fold per second.
+        for _ in 0..stream.refused().wrapping_sub(*reported) {
+            crate::audit::deny(
+                crate::audit::Kind::Auth,
+                0,
+                0,
+                b"a vsock connection to the control channel without the secret",
+            );
+        }
+        *reported = stream.refused();
+        report(format_args!(
+            "refused a connection without the secret ({} so far)",
+            *reported
+        ));
+    }
     while dev.can_send()
         && let Some(h) = stream.next_packet(PAYLOAD_MAX, out)
     {
@@ -132,7 +181,8 @@ fn pump(c: &mut Channel) {
 }
 
 /// Polls the device when nothing received is left to read; the number of
-/// the host's connection, if it is connected (`Stream::connection`).
+/// the host's connection, if it is connected and presented the secret
+/// (`Gate::connection`).
 pub fn poll() -> Option<u32> {
     CHANNEL.with(|c| {
         let c = c.as_mut()?;

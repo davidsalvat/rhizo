@@ -1,7 +1,8 @@
 //! The small local state that lets later commands find the VM `rhizo up`
 //! started: a directory with the state file, the control socket and logs.
 //! Once the VM is down only the console log stays, the last VM's, until the
-//! next `rhizo up` replaces it.
+//! next `rhizo up` replaces it, and the audit log (`audit/`), which stays
+//! for good.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,19 @@ impl Dir {
             .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".rhizo")))
             .unwrap_or_else(|| PathBuf::from("/tmp/rhizo"));
         Dir(dir)
+    }
+
+    /// Creates the directory if it is missing, and makes it reachable by
+    /// its user alone (mode `0700`), as it holds the control socket, which
+    /// controls every cell (change `authenticate-control-channel`).
+    pub fn create(&self) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.0)
+            .and_then(|()| fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)))
+            .map_err(|e| format!("cannot create {}: {e}", self.0.display()))
     }
 
     pub fn state(&self) -> PathBuf {
@@ -165,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn cleaning_leaves_only_the_console_log() {
+    fn cleaning_leaves_only_the_console_and_audit_logs() {
         let dir = Dir(std::env::temp_dir().join(format!("rhizo-clean-{}", std::process::id())));
         let _ = fs::remove_dir_all(&dir.0);
         fs::create_dir_all(&dir.0).unwrap();
@@ -179,15 +193,39 @@ mod tests {
         ] {
             fs::write(file, b"x").unwrap();
         }
+        let audit = crate::audit::dir(&dir.0);
+        fs::create_dir_all(&audit).unwrap();
+        fs::write(audit.join("audit-000000.jsonl"), b"x").unwrap();
         dir.clean();
-        let left: Vec<_> = fs::read_dir(&dir.0)
+        let mut left: Vec<_> = fs::read_dir(&dir.0)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(left, ["console.log"]);
+        left.sort();
+        assert_eq!(left, ["audit", "console.log"]);
         dir.clean();
         assert!(dir.console().exists());
+        assert!(audit.join("audit-000000.jsonl").exists());
         fs::remove_dir_all(&dir.0).unwrap();
+    }
+
+    /// A new state directory, and one that already existed open to
+    /// everyone, are both left to their user alone.
+    #[test]
+    fn the_state_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = std::env::temp_dir().join(format!("rhizo-private-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let new = Dir(root.join("a").join("state"));
+        new.create().unwrap();
+        assert_eq!(mode(&new.0), 0o700);
+        let old = Dir(root.join("old"));
+        fs::create_dir_all(&old.0).unwrap();
+        fs::set_permissions(&old.0, fs::Permissions::from_mode(0o777)).unwrap();
+        old.create().unwrap();
+        assert_eq!(mode(&old.0), 0o700);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
