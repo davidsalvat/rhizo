@@ -2292,7 +2292,7 @@ fn a_cell_that_imported_numpy_suspends_resumes_and_forks() {
         id
     };
     let id = ready(&mut host);
-    let bytes = host.suspend(id).expect("live").into_bytes();
+    let bytes = host.suspend(id).expect("live").export(&DirectMap);
     let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE).expect("valid");
     let resumed = host
         .resume(snapshot, Resume::Lazy, true, true)
