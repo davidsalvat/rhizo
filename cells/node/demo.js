@@ -5,8 +5,12 @@
 // its text, fold it through closures, and reply in JSON. Given a model
 // server's URL, it then asks the model over HTTP (`node:http`) and prints
 // the tool call it got back. Deterministic: the same output on Linux and in
-// a cell.
+// a cell. A copy of the frozen cell replaces `Math.random` first (design D22
+// of `add-cell-hierarchy`); with the argument `random`, it then prints
+// `Math.random()` and `crypto.randomUUID()`, which every copy draws anew.
 "use strict";
+const crypto = require("node:crypto");
+const fs = require("node:fs");
 const http = require("node:http");
 
 const WORDS = /[a-z]+/g;
@@ -122,16 +126,52 @@ function ask(url, reply) {
   });
 }
 
+// The cell's copy generation, which changes in every copy of it (a fork, a
+// cell from a template, a resume); null outside Rhizo.
+function generation() {
+  try {
+    return fs.readFileSync("/run/rhizo/generation").toString("hex");
+  } catch {
+    return null;
+  }
+}
+
+// V8 cannot reseed `Math.random`: a copy replaces it with xorshift128+
+// (V8's own algorithm) seeded from its own random bytes. `crypto` reseeds
+// by itself, as OpenSSL sees `getpid` change.
+function reseedMathRandom() {
+  const mask = (1n << 64n) - 1n;
+  let [s0, s1] = crypto.getRandomValues(new BigUint64Array(2));
+  s1 |= s0 === 0n ? 1n : 0n;
+  Math.random = () => {
+    let x = s0;
+    const y = s1;
+    s0 = y;
+    x ^= (x << 23n) & mask;
+    x ^= x >> 17n;
+    x ^= y ^ (y >> 26n);
+    s1 = x;
+    return Number(s0 >> 11n) / 2 ** 53;
+  };
+}
+
 async function main() {
   answer(toolCall(1)); // warm-up: every path once (what a template keeps)
   const request = toolCall(42);
+  const seen = generation();
   console.log("warm");
   const args = process.argv.slice(2);
   if (args.includes("wait")) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  if (generation() !== seen) {
+    reseedMathRandom();
+  }
   const reply = answer(request);
   console.log(reply);
+  if (args.includes("random")) {
+    console.log(`${Math.random()} ${crypto.randomUUID()}`);
+  }
   const url = args.find((a) => a.startsWith("http://"));
   if (url) {
     console.log(`model: ${await ask(url, reply)}`);

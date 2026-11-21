@@ -9,6 +9,10 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(forks_of_forks),
     ktest_case!(fork_allocates_only_a_root),
     ktest_case!(spawn_from_template_runs_like_the_program),
+    ktest_case!(wipeonfork_reads_zero_in_copies),
+    ktest_case!(generation_changes_only_in_copies),
+    ktest_case!(copy_pid_differs),
+    ktest_case!(tainted_template_not_published),
 ];
 
 /// Spawns `forkme` and runs it until it is ready to be forked.
@@ -104,4 +108,131 @@ fn spawn_from_template_runs_like_the_program() {
         );
     }
     assert!(host.finished(template).is_none(), "a template never runs");
+}
+
+/// What `copies` printed at its end (`page P generation G0 G1 pid W`) in
+/// the source of a fork, then in each kind of copy (design D22 of
+/// `add-cell-hierarchy`): the fork's child, a cell from a template of it,
+/// an eager and a lazy resume, and a load of its snapshot's bytes.
+fn copies_report() -> (alloc::string::String, Vec<alloc::string::String>) {
+    let ready = |host: &mut Host| {
+        let id = spawn(host, "copies", &[]);
+        while host.output(id) != Some(b"ready\n") {
+            assert!(host.finished(id).is_none(), "{:?}", ended(host, id));
+            host.step();
+        }
+        id
+    };
+    let mut host = Host::new();
+    let source = ready(&mut host);
+    let mut copies = host.fork(source, 1).expect("fork");
+    let template = ready(&mut host);
+    assert!(host.freeze(template));
+    copies.push(
+        host.spawn_from_template(template, true, false)
+            .expect("copy"),
+    );
+    for mode in [Resume::Eager, Resume::Lazy] {
+        let id = ready(&mut host);
+        let snapshot = host.suspend(id).expect("live");
+        copies.push(host.resume(snapshot, mode, true, false).expect("resume"));
+    }
+    let id = ready(&mut host);
+    let crc = crate::arch::mem::crc32c;
+    let bytes = host.suspend(id).expect("live").export(&DirectMap, crc);
+    let snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crc).expect("valid");
+    copies.push(
+        host.resume(snapshot, Resume::Eager, true, false)
+            .expect("load"),
+    );
+    host.run(|_| false);
+    let last = |id| {
+        let (ending, out) = ended(&host, id);
+        assert_eq!(ending, Ending::Exit(0), "{out}");
+        out.lines().last().unwrap_or_default().into()
+    };
+    (last(source), copies.into_iter().map(last).collect())
+}
+
+/// The words of `copies`' report after `key`, up to the next word that is
+/// not a number or `same`/`changed`.
+fn reported(line: &str, key: &str) -> alloc::string::String {
+    let mut words = line.split(' ').skip_while(|&w| w != key).skip(1);
+    let first = words.next().unwrap_or_default();
+    match words.next() {
+        Some(w) if w.bytes().all(|b| b.is_ascii_digit()) => alloc::format!("{first} {w}"),
+        _ => first.into(),
+    }
+}
+
+/// A page marked `MADV_WIPEONFORK` in which the cell wrote 1 reads 0 in
+/// its fork, in a copy of its template, after a resume and after a load
+/// of its snapshot; the source of the fork still reads 1 (spec
+/// `linux-abi`, design D22 of `add-cell-hierarchy`).
+fn wipeonfork_reads_zero_in_copies() {
+    let (source, copies) = copies_report();
+    assert_eq!(reported(&source, "page"), "1", "{source}");
+    for copy in copies {
+        assert_eq!(reported(&copy, "page"), "0", "{copy}");
+    }
+}
+
+/// `/run/rhizo/generation` keeps its value in the source of a fork, and
+/// reads another one in every copy (design D22 of `add-cell-hierarchy`).
+fn generation_changes_only_in_copies() {
+    let (source, copies) = copies_report();
+    assert_eq!(reported(&source, "generation"), "0 0", "{source}");
+    for copy in copies {
+        assert_eq!(reported(&copy, "generation"), "0 1", "{copy}");
+    }
+}
+
+/// A copy's `getpid` is never its source's (design D22 of
+/// `add-cell-hierarchy`).
+fn copy_pid_differs() {
+    let (source, copies) = copies_report();
+    assert_eq!(reported(&source, "pid"), "same", "{source}");
+    for copy in copies {
+        assert_eq!(reported(&copy, "pid"), "changed", "{copy}");
+    }
+}
+
+/// A template of a cell that connected to the host's echo server, or of
+/// its fork, may be published only on the host's word that it holds no
+/// secret; one of a cell that never reached the network card may be
+/// (design D22 of `add-cell-hierarchy`). Not run without a card.
+fn tainted_template_not_published() {
+    let mut host = Host::new();
+    let quiet = spawn(&mut host, "copies", &[]);
+    while host.output(quiet) != Some(b"ready\n") {
+        host.step();
+    }
+    assert!(host.freeze(quiet));
+    assert_eq!(host.may_publish(quiet, false), Some(true));
+    assert_eq!(host.may_publish(quiet + 1000, true), None, "no template");
+    let Some((ip, port)) = crate::wire::options().echo else {
+        arch::console::BootConsole.write_bytes(b"(no network card and echo server: not run) ");
+        return;
+    };
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card gets an address"
+    );
+    let ip = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let port = alloc::format!("{port}");
+    let id = spawn(
+        &mut host,
+        "copies",
+        &[b"connect", port.as_bytes(), ip.as_bytes()],
+    );
+    while host.output(id) != Some(b"connected\n") {
+        assert!(host.finished(id).is_none(), "{:?}", ended(&host, id));
+        host.step();
+    }
+    let child = host.fork(id, 1).expect("fork")[0];
+    for template in [id, child] {
+        assert!(host.freeze(template));
+        assert_eq!(host.may_publish(template, false), Some(false), "refused");
+        assert_eq!(host.may_publish(template, true), Some(true), "attested");
+    }
 }

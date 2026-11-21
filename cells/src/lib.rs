@@ -41,6 +41,7 @@ pub mod nr {
     pub const EPOLL_PWAIT: usize = 22;
     pub const SHUTDOWN: usize = 210;
     pub const SYSINFO: usize = 179;
+    pub const MADVISE: usize = 233;
 }
 
 /// Linux system-call numbers for the target architecture.
@@ -81,6 +82,7 @@ pub mod nr {
     pub const EPOLL_PWAIT: usize = 281;
     pub const SHUTDOWN: usize = 48;
     pub const SYSINFO: usize = 99;
+    pub const MADVISE: usize = 28;
 }
 
 /// Raw system call with up to six arguments; returns the kernel's value
