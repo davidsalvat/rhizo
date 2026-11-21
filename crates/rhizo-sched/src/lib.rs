@@ -2,7 +2,9 @@
 //! D1 of `add-scheduler`, D2 of `add-smp-scheduling`) and a waiting set
 //! (design D3 of `add-sockets-and-poll`); and the cells running on several
 //! CPUs at once ([`Gangs`], design D1 of `add-parallel-threads`); and which
-//! idle CPU keeps a timer ([`IdleTimer`], design D1 of `add-tickless-idle`).
+//! idle CPU keeps a timer ([`IdleTimer`], design D1 of `add-tickless-idle`);
+//! and how domains and cells share the CPUs by weight, within caps
+//! ([`fair`], design D23 of `add-cell-hierarchy`).
 //!
 //! The scheduler never reads a clock and never asks which CPU runs it:
 //! every operation that depends on time takes `now` in nanoseconds, and
@@ -17,6 +19,7 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
+pub mod fair;
 mod gangs;
 mod idle;
 pub use gangs::Gangs;
@@ -45,6 +48,11 @@ pub trait Keyed {
 ///
 /// With one CPU there is one queue and both are the round robin of a single
 /// run queue.
+///
+/// Once cells are shared by weight ([`set_cell`](Self::set_cell)), a CPU
+/// takes from the queue it chose the cell that is owed the most CPU time
+/// instead of the first ([`fair`]); and a cell whose subtree used its CPU
+/// cap sleeps until the cap's period ends.
 #[derive(Debug, Clone)]
 pub struct Scheduler<T> {
     /// Per CPU: entries in arrival order, with their arrival number and key.
@@ -70,6 +78,8 @@ pub struct Scheduler<T> {
     waiting: BTreeMap<u32, (Option<u64>, T)>,
     /// The deadlines of waiting entries, earliest first, with their key.
     deadlines: BTreeSet<(u64, u32)>,
+    /// Weights, virtual times and caps (design D23 of `add-cell-hierarchy`).
+    fair: fair::Fair,
 }
 
 impl<T: Keyed> Scheduler<T> {
@@ -82,12 +92,119 @@ impl<T: Keyed> Scheduler<T> {
             hints: Vec::new(),
             waiting: BTreeMap::new(),
             deadlines: BTreeSet::new(),
+            fair: fair::Fair::new(cpus.max(1)),
         }
     }
 
     fn push(&mut self, cpu: usize, entry: T) {
-        self.queues[cpu].push_back((self.arrivals, entry.key(), entry));
+        let key = entry.key();
+        self.enqueue(cpu, key, entry);
+    }
+
+    /// Puts `entry` at the end of `cpu`'s queue, or to sleep until its cap's
+    /// period ends.
+    fn enqueue(&mut self, cpu: usize, key: u32, entry: T) {
+        if let Some(until) = self.fair.held(key) {
+            return self.sleep(entry, until);
+        }
+        self.queues[cpu].push_back((self.arrivals, key, entry));
         self.arrivals += 1;
+    }
+
+    /// The entry known by `key` becomes runnable on `cpu` (it did not just
+    /// run): what it did not use while idle is not owed back.
+    fn arrive(&mut self, cpu: usize, key: u32) {
+        if self.fair.on() {
+            self.fair
+                .arrive(cpu, key, self.queues[cpu].iter().map(|e| e.1));
+        }
+    }
+
+    /// Sets the CPU weight of `domain` (1 to 10,000): domains share each
+    /// CPU in proportion to their weights.
+    pub fn set_domain(&mut self, domain: u32, weight: u32) {
+        self.fair.set_domain(domain, weight);
+    }
+
+    /// Forgets `domain`'s weight and virtual time (its last cell ended).
+    pub fn forget_domain(&mut self, domain: u32) {
+        self.fair.forget_domain(domain);
+    }
+
+    /// Shares the entry known by `key` by weight: it belongs to `domain`,
+    /// runs `share` of its domain's time (out of [`fair::WHOLE`], as
+    /// [`fair::flatten`] gives it) and counts against the caps of the
+    /// `capped` nodes. Called when the tree changes, never when it runs.
+    pub fn set_cell(&mut self, key: u32, domain: u32, share: u64, capped: Vec<u32>) {
+        self.fair.set_cell(key, domain, share, capped);
+    }
+
+    /// Forgets the share of the entry known by `key` (it ended).
+    pub fn forget_cell(&mut self, key: u32) {
+        self.fair.forget_cell(key);
+    }
+
+    /// Sets or removes the CPU cap of `node`: at most `cap_ns` of CPU time
+    /// per [`fair::PERIOD_NS`] for the entries that name it.
+    pub fn set_cap(&mut self, node: u32, cap_ns: Option<u64>) {
+        self.fair.set_cap(node, cap_ns);
+    }
+
+    /// Charges `ns` of CPU time on `cpu`, ending at `now`, to the entry
+    /// known by `key`, which just ran there: to call before it is put
+    /// back. Entries of a subtree that used its cap sleep until the cap's
+    /// period ends, the ones in queues at once and this one when it is put
+    /// back. Nothing for an entry not shared by weight.
+    pub fn charge(&mut self, cpu: usize, key: u32, ns: u64, now: u64) {
+        if !self.fair.on() {
+            return;
+        }
+        for node in self.fair.charge(cpu, key, ns, now) {
+            self.hold(node);
+        }
+    }
+
+    /// Moves the queued entries under `node`'s used-up cap to sleep.
+    #[cold]
+    fn hold(&mut self, node: u32) {
+        let mut held = Vec::new();
+        for queue in &mut self.queues {
+            let mut i = 0;
+            while i < queue.len() {
+                if self.fair.under(queue[i].1, node) {
+                    held.extend(queue.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for (_, key, entry) in held {
+            let until = self.fair.held(key).unwrap_or(0);
+            self.sleep(entry, until);
+        }
+    }
+
+    /// Takes the entry at position `at` of `cpu`'s queue.
+    fn take_at(&mut self, cpu: usize, at: usize) -> Option<T> {
+        let queue = &mut self.queues[cpu];
+        let taken = if at == 0 {
+            queue.pop_front()
+        } else {
+            queue.remove(at)
+        };
+        taken.map(|(_, _, e)| e)
+    }
+
+    /// The position in `from`'s queue of the entry for `cpu` to run: the
+    /// first, or the one owed the most CPU time when entries are shared by
+    /// weight.
+    fn pick(&mut self, cpu: usize, from: usize) -> usize {
+        let queue = &self.queues[from];
+        if queue.len() > 1 && self.fair.on() {
+            self.fair.pick(cpu, queue.iter().map(|e| e.1))
+        } else {
+            0
+        }
     }
 
     /// The CPU with the shortest queue (the lowest number on ties).
@@ -101,7 +218,9 @@ impl<T: Keyed> Scheduler<T> {
     /// returns that CPU.
     pub fn place(&mut self, entry: T) -> usize {
         let cpu = self.shortest();
-        self.push(cpu, entry);
+        let key = entry.key();
+        self.arrive(cpu, key);
+        self.enqueue(cpu, key, entry);
         cpu
     }
 
@@ -173,7 +292,8 @@ impl<T: Keyed> Scheduler<T> {
             return false;
         };
         f(&mut entry);
-        self.push(cpu, entry);
+        self.arrive(cpu, key);
+        self.enqueue(cpu, key, entry);
         true
     }
 
@@ -197,18 +317,23 @@ impl<T: Keyed> Scheduler<T> {
     /// [`next`](Self::next) does first, for a caller that wants to know
     /// when an entry became runnable.
     pub fn wake_due(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
-        // The due ones are at the front: no search, nothing else moves.
+        if self.fair.capping() {
+            self.fair.release(now);
+        }
+        // The due ones are at the front: no search, nothing else moves (an
+        // entry a cap still holds goes back to sleep later than `now`).
         while let Some((_, key, mut entry)) = self.sleeping.pop_front_if(|e| e.0 <= now) {
             f(&mut entry);
-            self.queues[cpu].push_back((self.arrivals, key, entry));
-            self.arrivals += 1;
+            self.arrive(cpu, key);
+            self.enqueue(cpu, key, entry);
         }
         while let Some(&(d, key)) = self.deadlines.first()
             && d <= now
         {
             if let Some(mut entry) = self.take_waiting(key) {
                 f(&mut entry);
-                self.push(cpu, entry);
+                self.arrive(cpu, key);
+                self.enqueue(cpu, key, entry);
             }
         }
     }
@@ -224,8 +349,9 @@ impl<T: Keyed> Scheduler<T> {
     }
 
     /// Wakes the sleepers whose time has come (onto `cpu`'s queue) and
-    /// returns the next entry for `cpu` to run: the first of its queue, or
-    /// else the one that has waited longest in another CPU's queue.
+    /// returns the next entry for `cpu` to run: the first of its queue (or
+    /// the one owed the most CPU time), or else the one that has waited
+    /// longest in another CPU's queue.
     pub fn next(&mut self, cpu: usize, now: u64) -> Option<T> {
         self.wake_due(cpu, now, |_| {});
         let from = if self.queues[cpu].is_empty() {
@@ -233,15 +359,27 @@ impl<T: Keyed> Scheduler<T> {
         } else {
             cpu
         };
-        self.queues[from].pop_front().map(|(_, _, e)| e)
+        let at = self.pick(cpu, from);
+        self.take_at(from, at)
     }
 
     /// Wakes the sleepers whose time has come (onto CPU 0's queue) and
-    /// returns the entry that has waited longest in any queue.
+    /// returns the entry that has waited longest in any queue (or the one
+    /// owed the most CPU time in all of them).
     pub fn next_oldest(&mut self, now: u64) -> Option<T> {
         self.wake_due(0, now, |_| {});
-        let from = self.oldest(None)?;
-        self.queues[from].pop_front().map(|(_, _, e)| e)
+        let mut from = self.oldest(None)?;
+        let mut at = 0;
+        if self.fair.on() {
+            let keys = self.queues.iter().flat_map(|q| q.iter().map(|e| e.1));
+            at = self.fair.pick(0, keys);
+            from = 0;
+            while at >= self.queues[from].len() {
+                at -= self.queues[from].len();
+                from += 1;
+            }
+        }
+        self.take_at(from, at)
     }
 
     /// Earliest wake-up time among sleepers and waiters with a deadline.
