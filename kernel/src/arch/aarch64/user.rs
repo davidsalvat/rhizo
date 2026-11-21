@@ -32,6 +32,9 @@ pub enum Trap {
     Syscall,
     /// An interrupt (the end of its time slice): the cell can be resumed.
     Interrupt,
+    /// The sampling interrupt of the performance counters (spec
+    /// `profiling`): `pc` of the saved registers is the sample; resume.
+    Sample,
     /// A first FP/SIMD instruction while the registers belong to another
     /// cell (see [`fp_trap`]): swap the state and resume.
     FpUnavailable,
@@ -324,7 +327,10 @@ pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Tra
         return Trap::FpUnavailable;
     }
     if vector == 9 {
-        super::irq::acknowledge();
+        if super::pmu::is_sample(super::irq::acknowledge()) {
+            super::pmu::rearm();
+            return Trap::Sample;
+        }
         return Trap::Interrupt;
     }
     Trap::Fault(UserFault(Aarch64Exception {

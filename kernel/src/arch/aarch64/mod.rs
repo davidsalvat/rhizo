@@ -6,7 +6,11 @@ pub mod cpu;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub mod irq;
 pub mod platform;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod pmu;
 pub mod power;
+#[cfg(any(feature = "ktest", feature = "bench-cell"))]
+pub mod random;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub mod smp;
 #[cfg(feature = "ktest")]

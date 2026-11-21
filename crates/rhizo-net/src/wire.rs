@@ -277,6 +277,15 @@ impl Net {
             .map(|d| d.total_micros() * 1000)
     }
 
+    /// Turns Nagle's algorithm off (`no_delay`) or on for wire socket `handle`.
+    pub(crate) fn wire_no_delay(&mut self, handle: SocketHandle, no_delay: bool) {
+        if let Some(wire) = self.wire.as_mut() {
+            wire.sockets
+                .get_mut::<tcp::Socket>(handle)
+                .set_nagle_enabled(!no_delay);
+        }
+    }
+
     /// Starts a TCP connection from `h` to `ip:port` outside: `InProgress`.
     pub(crate) fn wire_connect(&mut self, h: Handle, ip: [u8; 4], port: u16) -> Result<()> {
         let Some(mine) = self.wire_addr() else {
