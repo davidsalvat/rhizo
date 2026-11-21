@@ -9,6 +9,14 @@ bytes become the next key, its last 32 the first output bytes; blocks 1,
 so reading the kernel's memory later does not reveal bytes already handed
 out (backtracking resistance), and nothing but the key is kept.
 
+The kernel's own generator draws 192 bytes at a time (four blocks) and
+hands out its small requests from them (`Batched`): a spawn needs 16 bytes
+(`AT_RANDOM`), and one block per spawn cost 976 instructions, 3.4 % of
+`cell.spawn_insns`. Bytes are zeroed as they are handed out, so the state
+still holds nothing given to anyone; a request larger than a batch goes
+straight to the generator. Linux batches the same way. A cell's generator
+does not batch: it would cost three more blocks on its first request.
+
 About seventy lines, tested on the host against the RFC's vectors
 (section 2.3.2 and appendix A.1), no `unsafe`, no dependency. `rhizo-core`
 is compiled optimized in test builds too (`[profile.dev.package]`): the

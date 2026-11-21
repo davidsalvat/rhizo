@@ -24,7 +24,7 @@ use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
 use rhizo_cell::{Cell, FpState, Registers};
-use rhizo_core::random::{self, Generator};
+use rhizo_core::random::{self, Batched, Generator};
 use rhizo_core::smp::MAX_CPUS;
 use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
@@ -461,7 +461,7 @@ impl Services for KernelServices<'_> {
 
     fn random(&mut self, out: &mut [u8]) {
         self.random
-            .get_or_insert_with(|| RANDOM.with(Generator::split))
+            .get_or_insert_with(|| RANDOM.with(Batched::split))
             .fill(out);
     }
 }
@@ -485,7 +485,7 @@ impl Tlb for NewSpace {
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// The kernel's generator, seeded from the hardware by [`init`]: each cell
 /// splits its own off it (design D2 of `add-crypto-random`).
-static RANDOM: Global<Generator> = Global::new(Generator::from_key([0; 32]));
+static RANDOM: Global<Batched> = Global::new(Batched::new(Generator::from_key([0; 32])));
 /// The network card's address last reported on the console (0: none).
 static WIRE_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Shortest time between two polls of the network card while cells run.
@@ -500,7 +500,7 @@ pub fn init(smp: Option<u16>) -> usize {
     crate::heap::window::init();
     let (generator, strong) =
         random::seeded(&mut crate::arch::random::HardwareEntropy, Counter.cycles());
-    RANDOM.with(|g| *g = generator);
+    RANDOM.with(|g| *g = Batched::new(generator));
     if !strong {
         use core::fmt::Write;
         let _ = writeln!(

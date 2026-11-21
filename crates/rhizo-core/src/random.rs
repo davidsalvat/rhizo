@@ -107,6 +107,62 @@ impl Generator {
     }
 }
 
+/// Bytes a [`Batched`] keeps ready: drawn at once, four ChaCha20 blocks (one
+/// gives the next key).
+const BATCH: usize = 192;
+
+/// A [`Generator`] that draws [`BATCH`] bytes at a time and hands out small
+/// requests from them (design D1): the kernel's own generator, whose
+/// requests are 16 or 32 bytes (`AT_RANDOM`, a cell's generator), so a
+/// spawn does not pay a whole ChaCha20 block. A byte is erased as it is
+/// handed out, so what the state holds was never given to anyone.
+pub struct Batched {
+    generator: Generator,
+    ready: [u8; BATCH],
+    /// Bytes of `ready` already handed out (and zeroed), from the start.
+    used: usize,
+}
+
+impl fmt::Debug for Batched {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Batched { .. }") // never print the key or the bytes
+    }
+}
+
+impl Batched {
+    /// A pool drawing from `generator`.
+    pub const fn new(generator: Generator) -> Self {
+        Self {
+            generator,
+            ready: [0; BATCH],
+            used: BATCH,
+        }
+    }
+
+    /// Fills `out`: from the bytes kept ready when it fits in a batch,
+    /// straight from the generator otherwise.
+    pub fn fill(&mut self, out: &mut [u8]) {
+        if out.len() > BATCH {
+            return self.generator.fill(out);
+        }
+        if BATCH - self.used < out.len() {
+            self.generator.fill(&mut self.ready);
+            self.used = 0;
+        }
+        let taken = &mut self.ready[self.used..self.used + out.len()];
+        out.copy_from_slice(taken);
+        taken.fill(0);
+        self.used += out.len();
+    }
+
+    /// A new generator keyed with 32 bytes of this pool's output.
+    pub fn split(&mut self) -> Generator {
+        let mut key = [0; 32];
+        self.fill(&mut key);
+        Generator::from_key(key)
+    }
+}
+
 /// A generator seeded from `entropy`, and whether the source gave
 /// anything. Without it, the seed is `fallback` (a cycle count, say):
 /// predictable, so the caller must say so.
@@ -222,7 +278,60 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_hands_out_the_generator_output_once() {
+        let mut pool = Batched::new(Generator::from_key([9; 32]));
+        let mut stream = Generator::from_key([9; 32]);
+        let mut expected = [0; BATCH];
+        stream.fill(&mut expected);
+        let mut got = [0; BATCH];
+        for chunk in got.chunks_mut(16) {
+            pool.fill(chunk);
+        }
+        assert_eq!(got, expected, "the batch, in order, without repeats");
+        assert!(
+            pool.ready.iter().all(|&b| b == 0),
+            "handed-out bytes are erased"
+        );
+        let mut next = [0; 16];
+        pool.fill(&mut next);
+        let mut again = [0; BATCH];
+        stream.fill(&mut again);
+        assert_eq!(next[..], again[..16], "a new batch under the next key");
+    }
+
+    #[test]
+    fn a_request_that_does_not_fit_is_not_split_across_batches() {
+        let mut pool = Batched::new(Generator::from_key([4; 32]));
+        let mut a = [0; 180];
+        pool.fill(&mut a);
+        let mut b = [0; 32]; // 12 bytes left: a new batch
+        pool.fill(&mut b);
+        assert!(!a.windows(32).any(|w| w == b));
+        let mut big = [0; BATCH + 1];
+        pool.fill(&mut big); // straight from the generator
+        assert_eq!(pool.used, 32, "the batch kept ready is left alone");
+        assert!(!big.windows(32).any(|w| w == b));
+    }
+
+    #[test]
+    fn pools_split_generators_that_share_no_output() {
+        let mut pool = Batched::new(Generator::from_key([5; 32]));
+        let (mut a, mut b) = (pool.split(), pool.split());
+        let (mut x, mut y, mut z) = ([0; 32], [0; 32], [0; 32]);
+        a.fill(&mut x);
+        b.fill(&mut y);
+        pool.fill(&mut z);
+        assert_ne!(x, y);
+        assert_ne!(x, z);
+        assert_ne!(y, z);
+    }
+
+    #[test]
     fn debug_never_shows_the_key() {
+        assert_eq!(
+            format!("{:?}", Batched::new(Generator::from_key([0xab; 32]))),
+            "Batched { .. }"
+        );
         assert_eq!(
             format!("{:?}", Generator::from_key([0xab; 32])),
             "Generator { .. }"
