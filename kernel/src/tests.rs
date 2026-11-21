@@ -164,6 +164,8 @@ macro_rules! suite {
             ktest_case!(cells_in_parallel_stay_isolated),
             ktest_case!(unmapped_page_is_gone_on_every_cpu),
             ktest_case!(a_cell_on_several_cpus_survives_suspend_and_fork),
+            ktest_case!(host_operations_leave_other_cells_running),
+            ktest_case!(mixed_host_operations_during_a_run_are_invisible),
             ktest_case!(threads_of_a_cell_run_on_several_cpus_at_once),
             ktest_case!(performance_counters_count_where_present),
             ktest_case!(cost_accounting_adds_up_over_a_cell),
@@ -3601,6 +3603,147 @@ fn a_cell_on_several_cpus_survives_suspend_and_fork() {
             "child {id}"
         );
     }
+    assert_eq!(host.live(), 0);
+}
+
+/// Starts `progress` and watches its two words ([`Host::watch`]): rounds
+/// made and longest gap.
+fn watched_progress(host: &mut Host) -> (u32, crate::cell::Watched) {
+    // The boot CPU looks often even while the other CPUs run every cell.
+    host.look_every(Some(1_000_000));
+    let id = spawn(host, "progress", &[]);
+    host.run(|h| h.output(id).is_some_and(|o| o.ends_with(b"\n")));
+    let line = alloc::string::String::from_utf8_lossy(host.output(id).expect("live")).into_owned();
+    let hex = line.trim().strip_prefix("at 0x").expect("its address");
+    let addr = u64::from_str_radix(hex, 16).expect("hexadecimal");
+    (id, host.watch(id, addr, 2).expect("its own page"))
+}
+
+/// `progress` next to a spinning cell on every CPU, while the host forks
+/// the spinner, kills the child, suspends the spinner and resumes it, over
+/// and over from the run's stop condition, never ending the run:
+/// `progress` keeps counting through every batch of these operations (spec
+/// `multi-core`, a host operation stops only the CPUs running its cell).
+/// With one or two CPUs nothing else can run while the boot CPU works for
+/// the host; the operations still work.
+fn host_operations_leave_other_cells_running() {
+    use core::sync::atomic::Ordering;
+    let mut host = Host::new();
+    let (watcher, watched) = watched_progress(&mut host);
+    let mut spinner = spawn(&mut host, "spin", &[]);
+    let mut progress = Vec::new();
+    let mut started = false;
+    host.run(|h| {
+        // Asked once before the other CPUs start.
+        if !core::mem::replace(&mut started, true) {
+            return false;
+        }
+        let before = watched.word(0).load(Ordering::Relaxed);
+        let t0 = crate::cell::now_ns();
+        let mut rounds = 0;
+        while rounds < 4 || crate::cell::now_ns() - t0 < 50_000_000 {
+            let children = h.fork(spinner, 1).expect("fork the spinner");
+            assert!(h.kill(children[0]));
+            let snapshot = h.suspend(spinner).expect("suspend the spinner");
+            spinner = h
+                .resume(snapshot, Resume::Lazy, false, false)
+                .expect("resume the spinner");
+            rounds += 1;
+        }
+        progress.push(watched.word(0).load(Ordering::Relaxed) - before);
+        progress.len() == 5
+    });
+    if crate::smp::count() >= 3 {
+        assert!(
+            progress.iter().all(|&rounds| rounds > 0),
+            "progress stood still during host operations: {progress:?}"
+        );
+    }
+    assert!(host.kill(spinner));
+    assert!(host.kill(watcher));
+    assert_eq!(host.live(), 0);
+}
+
+/// Host operations mixed from the run's stop condition while cells run on
+/// every CPU, each at its own pace: `counter` suspended and resumed from
+/// its snapshot's bytes every fourth slice of the boot CPU, `parsum`
+/// computing with 4 threads (on several CPUs at once) suspended and
+/// resumed lazily then forked, then suspended and resumed eagerly from
+/// its snapshot's bytes, and a spinner killed and replaced, until
+/// `counter`, `parsum` and the fork end: every output is the uninterrupted
+/// one, and no cell is lost (spec `multi-core`, cells stopped before host
+/// operations). A resumed cell joins the back of the queue: with one CPU
+/// and at most four cells queued, moving a cell there at most every fourth
+/// slice lets it reach the front in between, so every cell gets to run.
+fn mixed_host_operations_during_a_run_are_invisible() {
+    const SUM: &str = "sum c75f7d3df19f452d\n";
+    let mut host = Host::new();
+    host.look_every(Some(1_000_000));
+    let mut counter = spawn(&mut host, "counter", &[]);
+    let mut parsum = spawn(&mut host, "parsum", &[b"4", b"96"]);
+    let mut spinner = spawn(&mut host, "spin", &[]);
+    let (mut counted, mut summed) = (Vec::new(), Vec::new());
+    let mut child = None;
+    let mut calls = 0u32;
+    let through_bytes = |snapshot: Snapshot| {
+        Snapshot::from_bytes(snapshot.export(&DirectMap), crate::arch::user::MACHINE)
+            .expect("valid")
+    };
+    host.run(|h| {
+        calls += 1;
+        // A cell may end on another CPU just before the host acts on it:
+        // its record is there then.
+        if calls % 4 == 1 && h.finished(counter).is_none() {
+            match h.suspend(counter) {
+                Some(snapshot) => {
+                    counted.extend_from_slice(&h.finished(counter).expect("suspended").output);
+                    counter = h
+                        .resume(through_bytes(snapshot), Resume::Lazy, true, false)
+                        .expect("resume counter");
+                }
+                None => assert!(h.finished(counter).is_some(), "counter not suspended"),
+            }
+        }
+        // Forked once the other CPUs run, then every fourth time.
+        if (calls == 2 || calls % 4 == 3) && h.finished(parsum).is_none() {
+            match (child, h.suspend(parsum)) {
+                (_, None) => assert!(h.finished(parsum).is_some(), "parsum not suspended"),
+                (None, Some(snapshot)) => {
+                    // Its fork comes from the resumed cell.
+                    summed.extend_from_slice(&h.finished(parsum).expect("suspended").output);
+                    parsum = h
+                        .resume(snapshot, Resume::Lazy, true, false)
+                        .expect("resume parsum");
+                    child = h.fork(parsum, 1).map(|ids| ids[0]);
+                }
+                (Some(_), Some(snapshot)) => {
+                    summed.extend_from_slice(&h.finished(parsum).expect("suspended").output);
+                    parsum = h
+                        .resume(through_bytes(snapshot), Resume::Eager, true, false)
+                        .expect("resume parsum");
+                }
+            }
+        }
+        if calls.is_multiple_of(5) {
+            assert!(h.kill(spinner));
+            spinner = spawn(h, "spin", &[]);
+        }
+        let ended = |id: Option<u32>| id.is_some_and(|id| h.finished(id).is_some());
+        ended(Some(counter)) && ended(Some(parsum)) && (child.is_none() || ended(child))
+    });
+    for (id, output, expected) in [
+        (counter, &mut counted, expected_output("counter")),
+        (parsum, &mut summed, SUM),
+    ] {
+        let (ending, last) = ended(&host, id);
+        assert_eq!(ending, Ending::Exit(0));
+        output.extend_from_slice(last.as_bytes());
+        assert_eq!(alloc::string::String::from_utf8_lossy(output), expected);
+    }
+    let child = child.expect("parsum was forked");
+    assert_eq!(ended(&host, child), (Ending::Exit(0), SUM.into()));
+    assert!(calls > 3, "only {calls} rounds of operations");
+    assert!(host.kill(spinner));
     assert_eq!(host.live(), 0);
 }
 
