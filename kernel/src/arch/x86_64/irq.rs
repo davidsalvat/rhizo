@@ -33,13 +33,13 @@ const ASSERT: u32 = 1 << 14;
 const INIT: u32 = 0b101 << 8;
 const STARTUP: u32 = 0b110 << 8;
 const EOI: u32 = 0xb0;
-const LVT_TIMER: u32 = 0x320;
+pub(super) const LVT_TIMER: u32 = 0x320;
 const LVT_PERF: u32 = 0x340;
-const INITIAL_COUNT: u32 = 0x380;
+pub(super) const INITIAL_COUNT: u32 = 0x380;
 const CURRENT_COUNT: u32 = 0x390;
 const DIVIDE: u32 = 0x3e0;
 const NS_PER_COUNT: u64 = 16;
-const PERIODIC: u32 = 1 << 17;
+pub(super) const PERIODIC: u32 = 1 << 17;
 
 /// Initial count of the periodic tick (0 before `init`).
 static TICK: AtomicU64 = AtomicU64::new(0);
@@ -94,9 +94,34 @@ pub fn tsc_hz() -> Option<u64> {
 
 /// (Re)starts the periodic tick.
 fn tick() {
-    let count = TICK.load(Ordering::Relaxed) as u32;
-    write(LVT_TIMER, PERIODIC | TIMER_VECTOR as u32);
-    write(INITIAL_COUNT, count);
+    for (reg, value) in tick_writes(TICK.load(Ordering::Relaxed) as u32) {
+        write(reg, value);
+    }
+}
+
+/// The register writes that restart the periodic tick with `count`, in
+/// order: the count first, while the timer is still one-shot (or masked),
+/// then the periodic mode. The other order leaves the timer periodic with
+/// the count of the last [`wait_ns`] (as little as one count, 16 ns) until
+/// the second write; a VMM that emulates the timer can then fire it back to
+/// back for ever, holding the lock the second write needs (design D1 of
+/// `fix-apic-tick-restart`).
+pub(super) fn tick_writes(count: u32) -> [(u32, u32); 2] {
+    [
+        (INITIAL_COUNT, count),
+        (LVT_TIMER, PERIODIC | TIMER_VECTOR as u32),
+    ]
+}
+
+/// The register writes that make the timer fire once after `ns`, in order.
+pub(super) fn wait_writes(ns: u64) -> [(u32, u32); 2] {
+    [
+        (LVT_TIMER, TIMER_VECTOR as u32),
+        (
+            INITIAL_COUNT,
+            (ns / NS_PER_COUNT).clamp(1, u32::MAX as u64) as u32,
+        ),
+    ]
 }
 
 /// Enables this CPU's local APIC, in x2APIC mode when `x2apic`.
@@ -251,11 +276,9 @@ pub fn acknowledge() {
 /// enabled for the length of `hlt` only, then goes back to the periodic
 /// tick. The IDT stub returns at once for an interrupt taken in ring 0.
 pub fn wait_ns(ns: u64) {
-    write(LVT_TIMER, TIMER_VECTOR as u32); // one-shot for the wait
-    write(
-        INITIAL_COUNT,
-        (ns / NS_PER_COUNT).clamp(1, u32::MAX as u64) as u32,
-    );
+    for (reg, value) in wait_writes(ns) {
+        write(reg, value); // one-shot for the wait
+    }
     // SAFETY: `sti; hlt` enables interrupts only for the halt (the
     // instruction after `sti` runs before any interrupt), and the stub for
     // vectors 32 and 255 in ring 0 just returns.
