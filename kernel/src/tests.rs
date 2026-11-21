@@ -99,6 +99,7 @@ macro_rules! suite {
             ktest_case!(memory_full_of_cells_is_refused_cleanly),
             ktest_case!(a_woken_cell_runs_at_once),
             ktest_case!(a_wake_before_the_sleep_is_kept),
+            ktest_case!(a_wait_on_descriptors_keeps_no_time),
             ktest_case!(hostile_pointers_get_efault),
             ktest_case!(cell_cannot_write_kernel_memory),
             ktest_case!(syscall_fuzzer_cannot_hurt_the_kernel),
@@ -1466,6 +1467,42 @@ fn a_wake_before_the_sleep_is_kept() {
         }
     }
     assert_eq!(ended(&host, id), (Ending::Exit(0), "ready\nwoken\n".into()));
+}
+
+/// A wait on descriptors with a timeout (an hour in `epoll_pwait`, as
+/// libuv waits for its next timer) is timed out in a cell spawned from a
+/// template frozen during it, and by a wake from the host: the call, made
+/// again, returns at once instead of waiting its whole timeout again
+/// (design D1 of `fast-node-template`; every fork of the Node.js template
+/// waited its 50 ms pause again).
+fn a_wait_on_descriptors_keeps_no_time() {
+    let mut host = Host::new();
+    let waiting = |host: &mut Host| {
+        let id = spawn(host, "sleeper", &[b"3600000", b"epoll"]);
+        while !(host.output(id) == Some(b"ready\n") && host.waits(id)) {
+            host.step();
+        }
+        id
+    };
+    let template = waiting(&mut host);
+    assert!(host.freeze(template));
+    let child = host
+        .spawn_from_template(template, true, false)
+        .expect("fork");
+    let woken = waiting(&mut host);
+    assert!(host.wake(woken));
+    // A slice each: the call made again, `timed out`, the exit.
+    for _ in 0..4 {
+        if host.finished(child).is_none() || host.finished(woken).is_none() {
+            host.step();
+        }
+    }
+    // The fork's output starts after the template's `ready`.
+    assert_eq!(ended(&host, child), (Ending::Exit(0), "timed out\n".into()));
+    assert_eq!(
+        ended(&host, woken),
+        (Ending::Exit(0), "ready\ntimed out\n".into())
+    );
 }
 
 // --- H13: isolation under attack (spec `isolation`) -------------------------

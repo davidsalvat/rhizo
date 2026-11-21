@@ -37,6 +37,8 @@ pub mod nr {
     pub const EXIT: usize = 93;
     pub const FUTEX: usize = 98;
     pub const GETTID: usize = 178;
+    pub const EPOLL_CREATE1: usize = 20;
+    pub const EPOLL_PWAIT: usize = 22;
 }
 
 /// Linux system-call numbers for the target architecture.
@@ -73,6 +75,8 @@ pub mod nr {
     pub const FUTEX: usize = 202;
     pub const GETTID: usize = 186;
     pub const ARCH_PRCTL: usize = 158;
+    pub const EPOLL_CREATE1: usize = 291;
+    pub const EPOLL_PWAIT: usize = 281;
 }
 
 /// Raw system call with up to six arguments; returns the kernel's value
