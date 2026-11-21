@@ -182,10 +182,10 @@ attacker code by definition and out of scope.
 
 Both are written up in [`security.md`](security.md), with the threat
 model, a per-call table of checks, each finding's reproduction and fix,
-and the tests that keep it fixed. Note that its per-call table describes
-the calls of the first review; the calls added since (threads, sockets,
-`poll`/`select`/`epoll`, file `mmap`) are covered by the second review's
-area table instead.
+and the tests that keep it fixed. Its per-call table covers every call
+the kernel decodes, those added since the first review (threads,
+sockets, `poll`/`select`/`epoll`, file `mmap`) included; the second
+review's area table says how each area was reviewed.
 
 ### Findings
 

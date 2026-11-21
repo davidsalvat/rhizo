@@ -19,6 +19,7 @@ mod deps;
 mod differential;
 mod dynamic;
 pub mod hostnet;
+mod packages;
 mod profile;
 mod refguest;
 pub mod report;
@@ -360,6 +361,7 @@ fn test_steps() -> Vec<&'static str> {
         "ktest",
         "ktest-smp",
         "ktest-node",
+        "ktest-packages",
         "control",
     ];
     steps.extend(SELF_CHECKS.iter().map(|c| c.feature));
@@ -478,6 +480,28 @@ fn cmd_test(args: &RunArgs) -> Result {
             )),
         }
     }
+    if args.wants("ktest-packages") {
+        match packages_unavailable_reason() {
+            Some(why) => report::text(&format!("[xtask] package tests not run: {why}")),
+            None => jobs.push(Job::vm(
+                format!("PyPI packages in cells on {} CPUs", PACKAGES_CPUS),
+                keep_kernel(
+                    "ktest-packages",
+                    &build_kernel(Profile::Debug, &["ktest", "packages"])?,
+                )?,
+                RunOptions {
+                    network: true,
+                    cpus: PACKAGES_CPUS,
+                    memory_mib: PACKAGES_MEMORY_MIB,
+                    ..opts
+                },
+                Check::Ktest {
+                    cpus: PACKAGES_CPUS,
+                },
+                args.reproduce("ktest-packages"),
+            )),
+        }
+    }
     if args.wants("control") {
         let kernel = keep_kernel("control", &build_kernel(Profile::Debug, &["control"])?)?;
         check_kernel_reused(Profile::Debug, &["control"])?;
@@ -529,13 +553,32 @@ pub(crate) fn node_unavailable_reason() -> Option<String> {
         .then(|| "RHIZO_NODE is not set".into())
 }
 
+/// Memory of the VMs that run the packages' CPython (design D4 of
+/// `add-pip-packages`): its 65 MiB of files embedded in the kernel and
+/// decoded, the file pages numpy maps, and a snapshot of a cell that
+/// imported numpy, which holds both.
+pub(crate) const PACKAGES_MEMORY_MIB: u32 = 1024;
+/// CPUs of the packages test VM: OpenBLAS runs threads on several, and a
+/// cell's faults then go through the gang path.
+const PACKAGES_CPUS: u32 = 2;
+
+/// Why the packages' kernels are not built, if they are not: the packages
+/// come with CPython (`RHIZO_CPYTHON_SRC`), natively only.
+pub(crate) fn packages_unavailable_reason() -> Option<String> {
+    if env::var_os("RHIZO_CPYTHON_SRC").is_none() {
+        return Some("RHIZO_CPYTHON_SRC is not set".into());
+    }
+    differential::unavailable_reason().map(|why| format!("built natively only ({why})"))
+}
+
 /// Most in-kernel test VMs one step is split into.
 const MAX_SHARDS: usize = 4;
 
 /// How many VMs share the in-kernel tests of one step: `RHIZO_SHARDS`
 /// (at most [`MAX_SHARDS`] and `parallel`), 1 by default. Splitting runs
 /// tests without the ones before them, which still exposes tests that
-/// depend on their order (`openspec/changes/speed-up-feedback-loop`), so it
+/// depend on their order (change `speed-up-feedback-loop`, archived in
+/// `openspec/changes/archive/2026-11-21-speed-up-feedback-loop`), so it
 /// is opt-in until they are fixed.
 fn shards(parallel: usize) -> usize {
     env::var("RHIZO_SHARDS")
@@ -1001,7 +1044,14 @@ fn cmd_ci() -> Result {
 
     let features = [""]
         .into_iter()
-        .chain(["ktest", "bench-cell", "bench-cell,profile", "control"])
+        .chain([
+            "ktest",
+            "bench-cell",
+            "bench-cell,profile",
+            "control",
+            "ktest,packages",
+            "bench-cell,packages",
+        ])
         .chain(SELF_CHECKS.iter().map(|c| c.feature));
     step("clippy (cells)");
     cargo(&[
@@ -1287,6 +1337,7 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
     build_micropython(&out)?;
     cpython::build(&out)?;
     dynamic::build(&out)?;
+    packages::build(&out)?;
     Ok(out)
 }
 

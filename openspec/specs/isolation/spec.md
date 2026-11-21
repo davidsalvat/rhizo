@@ -29,18 +29,25 @@ call SHALL change an entry for an address past it.
 Whatever call number and arguments a cell passes, the kernel SHALL answer
 with a value or a negated Linux `errno`, SHALL NOT panic, and SHALL leave
 kernel memory unchanged; once the cell ends, every frame it held SHALL be
-free again.
+free again. No count of references to a frame that a cell can grow
+(mapping one file page again and again) SHALL overflow or panic: past its
+bound, the cell gets a copy of the page instead.
 
 #### Scenario: Random calls
 - **WHEN** a cell makes 20000 system calls with numbers and arguments from a fixed-seed generator, next to another cell
 - **THEN** every result is a value or an errno, both cells finish, and running it again leaves memory as it was
 
+#### Scenario: One page mapped without end
+- **WHEN** a cell maps the first page of a file of its own 70000 times, next to another cell
+- **THEN** every mapping reads the file's bytes, both cells finish, the kernel keeps running, and every frame comes back
+
 ### Requirement: State the kernel loads stays the cell's
 The kernel SHALL refuse values that would fault in the kernel itself when
 it enters the cell: a thread pointer past `USER_END` (`arch_prctl` answers
-`-EPERM`), an executable segment past `USER_END`, and a snapshot whose
-program counter (or, on x86_64, thread pointer) is past `USER_END` or whose
-`MXCSR` has reserved bits set.
+`-EPERM`), an executable segment past `USER_END`, a first instruction (an
+executable's entry point, or its interpreter's at its load address) at or
+past `USER_END`, and a snapshot whose program counter (or, on x86_64,
+thread pointer) is past `USER_END` or whose `MXCSR` has reserved bits set.
 
 #### Scenario: Kernel thread pointer
 - **WHEN** a cell on x86_64 calls `arch_prctl(ARCH_SET_FS)` with a kernel or non-canonical address
@@ -49,6 +56,10 @@ program counter (or, on x86_64, thread pointer) is past `USER_END` or whose
 #### Scenario: Tampered snapshot
 - **WHEN** the bytes of a snapshot hold a kernel program counter
 - **THEN** reading them fails with a format error and nothing is resumed
+
+#### Scenario: Entry point past the cell
+- **WHEN** a program, or the interpreter it names, has an entry point that lands at or past `USER_END`
+- **THEN** starting it fails with `BadEntry` and every frame taken is given back
 
 ### Requirement: Bounded kernel work per call
 The kernel runs a system call to its end without preemption, so no call
@@ -66,7 +77,8 @@ The kernel memory a cell's actions take SHALL be bounded or counted like
 its pages: at most 4096 files and directories per cell, each created only
 when memory for it can be had (`-ENOSPC` otherwise); a `getdents64` answer
 of at most 64 KiB; at most 1 MiB of captured output; and one console
-report per unknown call number.
+report per unknown call number below 1023, and a single one for all larger
+numbers.
 
 #### Scenario: Endless names
 - **WHEN** cells make directories with the longest names until refused, while another cell takes all memory it can
@@ -88,3 +100,86 @@ and what an ended cell mapped SHALL be mapped for no other cell.
 #### Scenario: After the end
 - **WHEN** a cell reads the address where an ended cell had a mapping
 - **THEN** it is killed with a fault report
+
+### Requirement: Random bytes are unpredictable
+The bytes the kernel gives a cell (`getrandom` and `AT_RANDOM`) SHALL come
+from a ChaCha20 generator with fast key erasure, seeded from the CPU's
+hardware random source, which enters the kernel only through
+`rhizo_hal::Entropy`. When the CPU has no hardware source the kernel SHALL
+say at start that `getrandom` is predictable.
+
+#### Scenario: Generator checked against the standard
+- **WHEN** the ChaCha20 block function is run on the test vectors of RFC 8439
+- **THEN** it produces the RFC's key stream
+
+#### Scenario: Earlier output stays secret
+- **WHEN** the state of a generator is read after it answered a request
+- **THEN** that state does not produce the bytes already answered
+
+### Requirement: Random streams are private to each cell
+Each cell SHALL draw from its own generator. A fork, a copy of a template
+and a resumed snapshot SHALL NOT draw what any other cell draws: no
+generator state is copied into a child or kept in a snapshot.
+
+#### Scenario: Copies of one cell
+- **WHEN** a cell that drew random bytes is forked twice, frozen into a template copied twice, and suspended into a snapshot resumed twice (eagerly and lazily), and each copy then calls `getrandom`
+- **THEN** every copy, and every independent cell, draws different bytes
+
+### Requirement: The CPU refuses kernel accesses to cell pages
+On CPUs that have them, the kernel SHALL run with SMEP and SMAP (x86_64)
+or PAN (AArch64) on, so a kernel load, store or instruction fetch at a
+cell's address faults. The kernel SHALL reach cell memory only through
+the user-memory copies of `rhizo_cell::memory`, which use the direct map.
+
+#### Scenario: Stray kernel read of a user page
+- **WHEN** kernel code reads a page mapped for a cell, by its user address
+- **THEN** the CPU raises a permission fault in kernel mode instead of returning the data
+
+#### Scenario: Stray kernel jump into a user page
+- **WHEN** kernel code calls a page mapped for a cell
+- **THEN** the CPU raises a permission fault on the instruction fetch
+
+### Requirement: A cell's flags never reach kernel code
+Flags a cell sets for itself that change how the kernel's code runs
+(x86_64 `RFLAGS.DF` and `RFLAGS.AC`) SHALL be cleared on every entry to
+the kernel from the cell, by system call, exception or interrupt, and
+SHALL be the cell's again when it resumes.
+
+#### Scenario: Interrupted with the direction flag set
+- **WHEN** a cell spins with the direction and alignment-check flags set and is interrupted many times, next to other cells
+- **THEN** the kernel runs with both clear after every interruption, the cell finds its direction flag as it set it, and the other cells finish with their expected output
+
+### Requirement: Snapshots from outside are contained
+Snapshot bytes SHALL be treated as written by anyone: any bytes SHALL be
+refused with a format error, or resume into a cell that changes no kernel
+memory or kernel page-table entry, maps only user pages below `USER_END`
+and never writable and executable at once, starts every thread below
+`USER_END`, has files whose every operation answers instead of panicking,
+and gives every frame back when it ends.
+
+#### Scenario: Tampered or random snapshot
+- **WHEN** a valid snapshot with bytes changed or cut, or random bytes behind a valid header, are read and resumed
+- **THEN** they are refused, or the resumed cell holds the properties above
+
+### Requirement: A broken device cannot widen what the kernel maps
+The kernel SHALL map a virtio-pci structure only inside a memory BAR whose
+size is a power of two and whose end does not wrap past the top of the
+address space; a function that reports otherwise SHALL be refused, not
+followed.
+
+#### Scenario: Changed configuration space
+- **WHEN** a virtio network function's configuration space has any dwords changed and any BAR sizes
+- **THEN** setting it up does not panic, and every structure it reports lies inside one of its BARs
+
+### Requirement: Counters a cell may read
+A cell SHALL be able to read the CPU's counter directly, without a system
+call, on every CPU it runs on: the virtual counter and its frequency
+(`CNTVCT_EL0`, `CNTFRQ_EL0`) on AArch64 and the time-stamp counter
+(`rdtsc`) on x86_64, as on Linux. The physical counter and the timers on
+AArch64 SHALL stay the kernel's. The counter is not cell state: it keeps
+running while a cell is suspended, as `CLOCK_MONOTONIC` does, and a
+resumed or forked cell reads the machine's counter.
+
+#### Scenario: Reading the counter
+- **WHEN** a cell reads the counter twice
+- **THEN** both readings are nonzero, the second is not smaller, and the cell keeps running
