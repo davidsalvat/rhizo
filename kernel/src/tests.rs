@@ -3422,13 +3422,15 @@ fn host_operations_leave_other_cells_running() {
 
 /// Host operations mixed from the run's stop condition while cells run on
 /// every CPU, each at its own pace: `counter` suspended and resumed from
-/// its snapshot's bytes after every slice of the boot CPU, `parsum`
+/// its snapshot's bytes every fourth slice of the boot CPU, `parsum`
 /// computing with 4 threads (on several CPUs at once) suspended and
 /// resumed lazily then forked, then suspended and resumed eagerly from
 /// its snapshot's bytes, and a spinner killed and replaced, until
 /// `counter`, `parsum` and the fork end: every output is the uninterrupted
 /// one, and no cell is lost (spec `multi-core`, cells stopped before host
-/// operations).
+/// operations). A resumed cell joins the back of the queue: with one CPU
+/// and at most four cells queued, moving a cell there at most every fourth
+/// slice lets it reach the front in between, so every cell gets to run.
 fn mixed_host_operations_during_a_run_are_invisible() {
     const SUM: &str = "sum c75f7d3df19f452d\n";
     let mut host = Host::new();
@@ -3447,7 +3449,7 @@ fn mixed_host_operations_during_a_run_are_invisible() {
         calls += 1;
         // A cell may end on another CPU just before the host acts on it:
         // its record is there then.
-        if h.finished(counter).is_none() {
+        if calls % 4 == 1 && h.finished(counter).is_none() {
             match h.suspend(counter) {
                 Some(snapshot) => {
                     counted.extend_from_slice(&h.finished(counter).expect("suspended").output);
@@ -3458,8 +3460,8 @@ fn mixed_host_operations_during_a_run_are_invisible() {
                 None => assert!(h.finished(counter).is_some(), "counter not suspended"),
             }
         }
-        // Forked once the other CPUs run, then every third time.
-        if (calls == 2 || calls.is_multiple_of(3)) && h.finished(parsum).is_none() {
+        // Forked once the other CPUs run, then every fourth time.
+        if (calls == 2 || calls % 4 == 3) && h.finished(parsum).is_none() {
             match (child, h.suspend(parsum)) {
                 (_, None) => assert!(h.finished(parsum).is_some(), "parsum not suspended"),
                 (None, Some(snapshot)) => {
