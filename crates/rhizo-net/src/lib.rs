@@ -366,21 +366,27 @@ impl Net {
         self.looked.borrow_mut().push(h);
     }
 
-    /// The end of a call: if it blocks, `waiter` joins the wait queue of
+    /// The end of a call: if it blocks (`waiter` says who waits, asked only
+    /// when the call looked at sockets), the waiter joins the wait queue of
     /// each socket the call looked at (once), and is woken by the next
-    /// change to one of them.
-    pub fn end_call(&mut self, waiter: Option<u32>) {
+    /// change to one of them. Returns whether waiters were woken since the
+    /// last [`drain_woken`](Self::drain_woken), as
+    /// [`has_woken`](Self::has_woken) does.
+    pub fn end_call(&mut self, waiter: impl FnOnce() -> Option<u32>) -> bool {
         let looked = self.looked.get_mut();
-        if let Some(key) = waiter {
-            for &h in looked.iter() {
-                if let Some(Some(s)) = self.sockets.get_mut(h as usize)
-                    && !s.waiters.contains(&key)
-                {
-                    s.waiters.push(key);
+        if !looked.is_empty() {
+            if let Some(key) = waiter() {
+                for &h in looked.iter() {
+                    if let Some(Some(s)) = self.sockets.get_mut(h as usize)
+                        && !s.waiters.contains(&key)
+                    {
+                        s.waiters.push(key);
+                    }
                 }
             }
+            looked.clear();
         }
-        looked.clear();
+        !self.woken.is_empty()
     }
 
     /// Takes `waiter` off the wait queue of `h` (it is gone).

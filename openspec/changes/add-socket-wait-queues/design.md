@@ -58,7 +58,15 @@ and the due waiters are found without a scan. The wake-all
 (`wake_waiting`) is gone.
 
 The CPUs drain `Net::woken` under the host's lock whenever they take a
-cell or give one back (`wake_woken`): a key in the waiting set wakes that
+cell or file one (`wake_woken`), and only when the `WOKEN` flag says there
+is something to drain: whoever holds the sockets lock sets it when a change
+woke waiters (a system call as it ends, and the kernel's other uses of the
+sockets through `with_net`). A change after the drain cleared the flag sets
+it again, before its lock is released, so the next drain finds it; a cell
+given back to its queue (yield, preemption) leaves the drain and its nudge
+to the take that follows. Without the flag every switch between cells took
+the sockets lock (a `yield` round trip went from 854 to 973 instructions).
+A key in the waiting set wakes that
 cell (its threads waiting on descriptors become runnable and make their
 calls again); any other key goes to `Shared::nudged`. A cell whose key is
 nudged has its waiting threads woken the next time a CPU takes it from a

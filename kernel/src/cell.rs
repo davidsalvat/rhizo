@@ -86,12 +86,29 @@ fn files_of(snapshot: &Snapshot) -> Fs {
 /// over its loopback network.
 static NET: Global<Net> = Global::new(Net::new());
 
+/// Set, under the sockets' lock, when a change woke waiters that nobody
+/// drained yet: the scheduler takes the lock to drain them only then, not
+/// at every take and give-back of a cell (design D2 of
+/// `add-socket-wait-queues`).
+static WOKEN: AtomicBool = AtomicBool::new(false);
+
+/// Runs `f` on the sockets, noting woken waiters for [`wake_woken`].
+fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
+    NET.with(|net| {
+        let r = f(net);
+        if net.has_woken() {
+            WOKEN.store(true, Ordering::Release);
+        }
+        r
+    })
+}
+
 /// The files of a fork of a cell with `fs`: its sockets as design D4 of
 /// `add-sockets-and-poll` says (listeners shared, connections reset).
 fn fork_files(fs: &Fs) -> Fs {
     let mut child = fs.clone();
     if fs.sockets().next().is_some() {
-        NET.with(|net| child.map_sockets(|h| net.fork(h).unwrap_or(h)));
+        with_net(|net| child.map_sockets(|h| net.fork(h).unwrap_or(h)));
     }
     child
 }
@@ -102,7 +119,7 @@ fn fork_files(fs: &Fs) -> Fs {
     allow(dead_code, reason = "used by in-kernel tests")
 )]
 pub fn open_sockets() -> usize {
-    NET.with(|net| net.open())
+    with_net(|net| net.open())
 }
 
 /// Whether connections through the network card are still open or
@@ -113,7 +130,7 @@ pub fn open_sockets() -> usize {
     allow(dead_code, reason = "used by in-kernel tests")
 )]
 pub fn wire_busy() -> bool {
-    NET.with(|net| net.wire_busy())
+    with_net(|net| net.wire_busy())
 }
 
 /// Closes the connections parked for `snapshot`, which the host drops
@@ -126,7 +143,7 @@ pub fn wire_busy() -> bool {
 pub fn close_parked(snapshot: &Snapshot) {
     let records = snapshot.sockets();
     if !records.is_empty() {
-        NET.with(|net| records.iter().for_each(|r| net.unpark(r)));
+        with_net(|net| records.iter().for_each(|r| net.unpark(r)));
     }
 }
 
@@ -134,7 +151,7 @@ pub fn close_parked(snapshot: &Snapshot) {
 /// suspended), leaving their wait queues first.
 fn release_sockets(fs: &Fs, id: u32) {
     if fs.sockets().next().is_some() {
-        NET.with(|net| {
+        with_net(|net| {
             fs.sockets().for_each(|h| {
                 net.forget(h, id);
                 net.release(h);
@@ -152,7 +169,7 @@ fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
         return (fs.clone(), records);
     }
     let mut out = fs.clone();
-    NET.with(|net| {
+    with_net(|net| {
         out.map_sockets(|h| {
             let record = net.export(h).unwrap_or(rhizo_net::Record {
                 family: rhizo_net::Family::Inet,
@@ -179,7 +196,7 @@ fn import_sockets(fs: &mut Fs, records: &[rhizo_net::Record]) {
     }
     let mut handles = Vec::with_capacity(records.len());
     let mut renamed = Vec::new();
-    NET.with(|net| {
+    with_net(|net| {
         for r in records {
             let reset = rhizo_net::Record {
                 state: rhizo_net::Saved::Reset,
@@ -521,7 +538,7 @@ pub fn init(smp: Option<u16>) -> usize {
     // host: what it allocates is never charged to a cell or a test.
     let mut seed = [0; 8];
     RANDOM.with(|g| g.fill(&mut seed));
-    NET.with(|net| {
+    with_net(|net| {
         // Parked connections re-attach only in this boot (design D2 of
         // `keep-tcp-across-suspend`).
         net.set_boot(Counter.cycles());
@@ -874,7 +891,7 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
             return Take::Stop;
         }
         let now = now_ns();
-        wake_woken(s, cpu, now);
+        wake_woken(s, cpu, || now);
         if prof::on() {
             // When each due cell joins a queue, for its latency.
             let q = if oldest { 0 } else { cpu };
@@ -921,14 +938,21 @@ fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
 /// `add-socket-wait-queues`): a waiting one joins `cpu`'s queue and makes
 /// its calls again; any other is nudged ([`Shared::nudged`]). Called under
 /// the host's lock, so a cell filed to wait cannot miss its wake-up.
-fn wake_woken(s: &mut Shared, cpu: usize, now: u64) {
+fn wake_woken(s: &mut Shared, cpu: usize, now: impl FnOnce() -> u64) {
+    // Set under the sockets' lock after a change woke waiters: clear, it
+    // means nothing waits to be drained (a change after this load sets it
+    // again, for the next drain, which comes before its cell is filed).
+    if !WOKEN.swap(false, Ordering::Acquire) {
+        return;
+    }
+    let now = now();
     // Lock order: the host's, then the sockets.
     NET.with(|net| {
         net.drain_woken(|id| {
             let waited = s.sched.wake(cpu, id, |live| {
                 live.cell.threads.wake_io();
                 live.ready = live.ready.net_change(now);
-                live.io_woken = true;
+                live.io_woken = prof::on();
             });
             if !waited {
                 s.nudged.insert(id);
@@ -971,16 +995,13 @@ fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, how: Back
         }
         Back::Requeue => {
             live.ready = ready_now();
-            shared.with(|s| {
-                wake_woken(s, cpu, now_ns());
-                nudge(s, &mut live);
-                s.sched.requeue(cpu, live)
-            });
+            // Woken cells and its nudge wait for the next take.
+            shared.with(|s| s.sched.requeue(cpu, live));
             None
         }
         Back::File | Back::Share => {
             shared.with(|s| {
-                wake_woken(s, cpu, now_ns());
+                wake_woken(s, cpu, now_ns);
                 file(s, Some(cpu), live)
             });
             None
@@ -1144,7 +1165,6 @@ fn syscall(
     };
     let (mut tlb, mut pager_tlb) = (CellTlb::new(gang), CellTlb::new(gang));
     let t0 = prof::syscall_start();
-    let woken = core::mem::take(&mut live.io_woken);
     // Lock order: the cell's (when shared), `SHARING`, then the sockets.
     let (outcome, deadline) = sharing(live.shares, || {
         NET.with(|net| {
@@ -1166,13 +1186,15 @@ fn syscall(
             let deadline = cx.deadline;
             // A call that waits on descriptors joins the wait queues of the
             // sockets it looked at (design D1 of `add-socket-wait-queues`).
-            let waits = matches!(live.cell.threads.current().wait, Wait::Io { .. });
-            net.end_call(waits.then_some(live.cell.id));
+            let waits = || matches!(live.cell.threads.current().wait, Wait::Io { .. });
+            if net.end_call(|| waits().then_some(live.cell.id)) {
+                WOKEN.store(true, Ordering::Release);
+            }
             if prof::on() {
                 if net.changes() != changes {
                     prof::net_changed(now_ns());
                 }
-                if woken && waits {
+                if core::mem::take(&mut live.io_woken) && waits() {
                     prof::add(Count::IoWasted, 1);
                 }
             }
@@ -1180,9 +1202,10 @@ fn syscall(
         })
     });
     prof::syscall_end(t0);
-    if live.host_wake && live.cell.threads.wake_at().is_some() {
-        live.host_wake = false;
-        live.cell.threads.expire_timers();
+    // Only a call that blocked can have started the wait the wake-up is
+    // kept for.
+    if matches!(outcome, Outcome::Block) && live.host_wake {
+        live.keep_host_wake();
     }
     // A call waiting on descriptors keeps its deadline for when it is made
     // again (design D3 of `add-sockets-and-poll`).
@@ -1192,6 +1215,20 @@ fn syscall(
         live.deadlines.push((tid, at));
     }
     (outcome, tlb.shrank || pager_tlb.shrank)
+}
+
+impl Live {
+    /// A [`Host::wake`] came before any thread waited with a deadline: the
+    /// first wait with one ends at once (design D5 of
+    /// `add-socket-wait-queues`).
+    #[cold]
+    #[inline(never)]
+    fn keep_host_wake(&mut self) {
+        if self.cell.threads.wake_at().is_some() {
+            self.host_wake = false;
+            self.cell.threads.expire_timers();
+        }
+    }
 }
 
 /// Runs `live`'s threads on `cpu` until the cell ends, yields, has no
@@ -2197,7 +2234,7 @@ impl Host {
         if waiting && self.wire_delay.is_some() {
             self.wire_due = 0;
             self.poll_wire(now);
-            if NET.with(|net| net.has_woken()) {
+            if WOKEN.load(Ordering::Acquire) {
                 return true; // the next take wakes them
             }
             if let Some(delay) = self.wire_delay.filter(|&d| d != u64::MAX) {
@@ -2225,7 +2262,7 @@ impl Host {
             return;
         }
         let _p = cost::scope(Part::Net);
-        let (delay, addr) = NET.with(|net| (crate::wire::poll(net, now), net.wire_addr()));
+        let (delay, addr) = with_net(|net| (crate::wire::poll(net, now), net.wire_addr()));
         // As often as the wire needs, but not more than once per period,
         // and at least every millisecond for frames nobody waits for yet.
         self.wire_due = now + delay.unwrap_or(u64::MAX).clamp(WIRE_PERIOD_NS, 1_000_000);
