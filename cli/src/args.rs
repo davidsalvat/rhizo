@@ -75,6 +75,14 @@ Commands:
                              Narrow or set a cell's egress and limits
   scope <id> --socket <path> Serve on <path> requests limited to the cell's
                              subtree, until interrupted
+  audit tail [--cell <id>] [--domain <id>] [--kind <k>] [--follow]
+                             Show the audit log: what the kernel refused and
+                             what was administered (kinds: egress-denied,
+                             scope-denied, tree-denied, load-narrowed,
+                             publish-refused, created, ended, moved, policy,
+                             limits, publish-attested, scoped)
+  audit verify               Check the audit log's hash chain: edited,
+                             removed, reordered and missing records
   down                       Power the VM off
   snapshot upgrade <in> <out>
                              Convert a file saved by an older kernel (one
@@ -82,7 +90,8 @@ Commands:
 
 Every command prints the time the kernel took and the round trip from the
 host. The state (VM, control socket, console log) lives in --state, or
-$RHIZO_STATE, or ~/.rhizo; after `down` only the last console log stays.
+$RHIZO_STATE, or ~/.rhizo; after `down` only the last console log and the
+audit log (audit/) stay.
 ";
 
 /// Options of `up` (and of the background server it starts).
@@ -178,6 +187,14 @@ pub enum Command {
         socket: PathBuf,
     },
     Down,
+    /// `audit tail`: shows the records `filter` keeps, then, with
+    /// `follow`, new ones as they come.
+    AuditTail {
+        filter: crate::audit::Filter,
+        follow: bool,
+    },
+    /// `audit verify`: walks the log's hash chain.
+    AuditVerify,
     /// `snapshot upgrade IN OUT`: converts a saved file to the current
     /// format version (no VM needed).
     SnapshotUpgrade {
@@ -374,6 +391,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             _ => return Err("usage: rhizo scope <id> --socket <path>".into()),
         },
         "down" => Command::Down,
+        "audit" => parse_audit(args)?,
         "snapshot" => match args {
             [sub, input, output] if sub == "upgrade" => Command::SnapshotUpgrade {
                 input: PathBuf::from(input),
@@ -385,6 +403,38 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         other => return Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     Ok(Args { state, command })
+}
+
+fn parse_audit(args: &[String]) -> Result<Command, String> {
+    const USAGE: &str = "usage: rhizo audit tail [--cell <id>] [--domain <id>] [--kind <k>] \
+                         [--follow], or rhizo audit verify";
+    match args.split_first() {
+        Some((sub, [])) if sub == "verify" => Ok(Command::AuditVerify),
+        Some((sub, rest)) if sub == "tail" => {
+            let (mut filter, mut follow) = (crate::audit::Filter::default(), false);
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                if flag == "--follow" || flag == "-f" {
+                    follow = true;
+                    continue;
+                }
+                let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                match flag.as_str() {
+                    "--cell" => filter.cell = Some(number("--cell", value)?),
+                    "--domain" => filter.domain = Some(number("--domain", value)?),
+                    "--kind" => {
+                        filter.kind = Some(
+                            rhizo_control::audit::Kind::parse(value)
+                                .ok_or_else(|| format!("--kind: no kind `{value}`"))?,
+                        );
+                    }
+                    other => return Err(format!("unknown option `{other}`; {USAGE}")),
+                }
+            }
+            Ok(Command::AuditTail { filter, follow })
+        }
+        _ => Err(USAGE.into()),
+    }
 }
 
 fn parse_up(args: &[String]) -> Result<Up, String> {
@@ -550,6 +600,26 @@ mod tests {
         assert!(parse_words("up --memory lots").is_err());
         assert!(parse_words("up --vmm").is_err());
         assert!(parse_words("up --frobnicate 1").is_err());
+    }
+
+    #[test]
+    fn audit_takes_its_filters() {
+        assert_eq!(command("audit verify"), Command::AuditVerify);
+        assert_eq!(
+            command("audit tail --cell 3 --kind scope-denied -f"),
+            Command::AuditTail {
+                filter: crate::audit::Filter {
+                    cell: Some(3),
+                    domain: None,
+                    kind: Some(rhizo_control::audit::Kind::Scope),
+                },
+                follow: true,
+            }
+        );
+        assert!(parse_words("audit tail --kind nothing").is_err());
+        assert!(parse_words("audit tail --cell").is_err());
+        assert!(parse_words("audit verify now").is_err());
+        assert!(parse_words("audit").is_err());
     }
 
     #[test]

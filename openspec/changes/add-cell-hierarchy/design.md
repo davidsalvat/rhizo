@@ -1121,6 +1121,51 @@ channel.
 administrator from deleting the whole log, which is why forwarding is
 recommended for production.
 
+**As built in phase 1 (task 1.9b).**
+
+- The record and its ring are in `rhizo-control` (`audit`), so the host
+  tests them: a record is its sequence number, the kernel's time, a kind,
+  the cell and the root of its domain, a count, the records dropped
+  before it and a detail for people (at most 200 bytes). The ring is one
+  `VecDeque` of 64 KiB of encoded records, allocated at the first record
+  and never grown; time is passed in. The kernel keeps one ring for all
+  CPUs behind a `Global` (`kernel/src/audit.rs`), and records cells by
+  kernel identifier; the control kernel gives the host's identifiers, and
+  the domain's root where the record did not name it, when it sends.
+- Records leave as `audit` frames of version 4 (kind `0x85`, identifier
+  0), which D14 lists; no request was needed: the control kernel sends
+  what the ring holds after each turn of its loop, and its idle loop wakes
+  for it. A frame of version 3 of that kind is refused.
+- Every record takes a sequence number, dropped ones too, so the host sees
+  a gap as well as the next record's drop count. Denials (egress, scope,
+  tree, load narrowed, publish refused) fold per cell, kind and second:
+  the first goes in at once, and once that second is over one more record
+  carries the count of the others and the first one's detail; so the
+  counts of a cell's records add up to its denials. At most 8 cells fold
+  at once; a ninth flushes the oldest early.
+- Recorded in phase 1: cells the host made (`run`, `fork`, `load`, with
+  their placement) and their ends; moves, policies and limits; requests of
+  scoped clients, let through or refused, with the scope; tree refusals
+  (`Denied`, `Invalid`); a load whose quota was cut; a publication refused
+  or made on the host's attestation (`Host::may_publish`). Egress denials
+  come with task 1.6 through `audit::deny(Kind::Egress, cell, domain,
+  detail)`; grants with phase 2.
+- On the host the files are `audit/audit-<n>.jsonl` (`n` counting up from
+  0, so names sort in order), a new one at each `rhizo up` and at 64 MiB.
+  Each file's first line names its boot and the file before; each line's
+  `prev` is the SHA-256 of the line before, the first file's first line
+  after 32 zero bytes. `audit/head` holds the last line's file and hash,
+  so a cut end or an edited last line shows as well. `rhizo down` keeps
+  `audit/` (spec `control-plane`, state after down).
+- SHA-256 is written out in `rhizo` (about 60 lines, checked against the
+  FIPS 180-4 vectors) rather than taken from a crate, which would add
+  seven crates to the build for one function. The JSON lines use
+  `serde_json`, already in the workspace through `xtask`.
+- `rhizo audit tail [--cell N] [--domain N] [--kind K] [--follow]` shows
+  records, `--follow` then polls for new lines; `rhizo audit verify`
+  names each edited, removed or reordered line, each gap in sequence
+  numbers, and the kernel's drop counts, and fails on any break.
+
 Alternative: keep the log in the kernel and let the host read it.
 Rejected: kernel memory is bounded, and the log must outlive the VM.
 

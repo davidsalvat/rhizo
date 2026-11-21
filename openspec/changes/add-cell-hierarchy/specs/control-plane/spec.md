@@ -19,6 +19,16 @@ request, SHALL never panic nor allocate more than the frame's bytes.
 - **WHEN** the kernel receives a `run` naming an unknown parent, an egress rule with a prefix over 32, or a `grant` with unknown rights
 - **THEN** it refuses it with the reason and keeps serving
 
+### Requirement: State after down
+After `rhizo down` the state directory SHALL hold only `console.log`, the
+last VM's console, and `audit/`, the audit log, which outlives every VM;
+`rhizo up` SHALL first remove what an earlier server left there but those
+two.
+
+#### Scenario: Down
+- **WHEN** the `control` test step runs `rhizo down`
+- **THEN** the state directory holds only `console.log` and `audit`
+
 ## ADDED Requirements
 
 ### Requirement: Protocol versions on both sides

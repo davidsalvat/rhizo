@@ -1560,6 +1560,50 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             &format!("scoped to {agent}: kill {tools}, kill {other}, a rule /33: {replies:?}"),
             "the first done, the second refused as outside, the third with `prefix 33`",
         )?;
+        // Both refusals are in the audit log, which `rhizo audit tail`
+        // shows, and its chain holds (design D18 of `add-cell-hierarchy`).
+        // The kernel sends records unasked, right after the reply.
+        let scope_denial = format!("kill cell {other}, scoped to cell {agent}");
+        let widening = format!("policy cell {tools}: it widens");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let out = loop {
+            let out = ok(&["audit", "tail"])?;
+            let seen = out.lines().any(|l| {
+                l.contains("scope-denied")
+                    && l.contains(&format!("cell {agent} "))
+                    && l.contains(&scope_denial)
+            }) && out
+                .lines()
+                .any(|l| l.contains("tree-denied") && l.contains(&widening));
+            if seen || Instant::now() > deadline {
+                break out;
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        must(
+            out.lines()
+                .any(|l| l.contains("scope-denied") && l.contains(&scope_denial)),
+            "`rhizo audit tail` shows the scoped kill refused, naming the scope's cell",
+            &format!("a `scope-denied` line for cell {agent} with `{scope_denial}`"),
+        )?;
+        must(
+            out.lines()
+                .any(|l| l.contains("tree-denied") && l.contains(&widening)),
+            "`rhizo audit tail` shows the widening policy refused",
+            &format!("a `tree-denied` line with `{widening}`"),
+        )?;
+        let out = ok(&["audit", "tail", "--kind", "scope-denied"])?;
+        must(
+            !out.is_empty() && out.lines().all(|l| l.contains("scope-denied")),
+            "`rhizo audit tail --kind scope-denied` shows only those",
+            "only `scope-denied` lines",
+        )?;
+        let out = ok(&["audit", "verify"])?;
+        must(
+            out.contains("chain intact"),
+            "`rhizo audit verify` finds the chain intact",
+            "`chain intact`",
+        )?;
         let out = ok(&["ps"])?;
         must(
             line_of(&out, &tools, "killed") && line_of(&out, &other, "running"),
@@ -1882,10 +1926,11 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
         .collect();
     left.sort();
+    // The audit log outlives every VM (design D18 of `add-cell-hierarchy`).
     must(
-        left == ["console.log"],
-        &format!("`rhizo down` leaves only the console log, not {left:?}"),
-        "[\"console.log\"]",
+        left == ["audit", "console.log"],
+        &format!("`rhizo down` leaves only the console and audit logs, not {left:?}"),
+        "[\"audit\", \"console.log\"]",
     )?;
     let _ = std::fs::remove_dir_all(&state);
     let _ = std::fs::remove_dir_all(&files);
