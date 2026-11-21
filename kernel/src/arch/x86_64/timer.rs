@@ -59,9 +59,9 @@ fn calibrate() -> Option<(u32, i8)> {
 /// In builds that run cells, the local APIC timer is set up and can serve as
 /// a reference.
 fn apic_frequency() -> Option<u64> {
-    #[cfg(any(feature = "ktest", feature = "bench-cell"))]
+    #[cfg(feature = "cells")]
     return super::irq::tsc_hz();
-    #[cfg(not(any(feature = "ktest", feature = "bench-cell")))]
+    #[cfg(not(feature = "cells"))]
     None
 }
 

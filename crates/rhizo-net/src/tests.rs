@@ -845,3 +845,48 @@ fn closing_wakes_the_waiters_of_the_socket_and_its_peer() {
     woken.sort_unstable();
     assert_eq!(woken, [7, 8]);
 }
+
+/// The reference test vector of SipHash-2-4 for an 8-byte message: key
+/// bytes 00..0f, message bytes 00..07.
+#[test]
+fn park_keys_use_siphash_2_4() {
+    let key = [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908];
+    assert_eq!(
+        super::siphash24(key, 0x0706_0504_0302_0100),
+        0x93f5_f579_9a93_2462
+    );
+}
+
+/// Finding S15: a forged record that guesses a parked socket's key (the
+/// counter they used to be, or a neighbour of a key it saw) does not take
+/// the socket; only the record that parked it does.
+#[test]
+fn a_parked_socket_answers_only_its_own_key() {
+    let mut net = Net::new();
+    net.set_secret([0x1234_5678, 0x9abc_def0]);
+    let (_, s, _) = connection(&mut net, 14);
+    let (_, s2, _) = connection(&mut net, 15);
+    let (r, r2) = (net.export(s).unwrap(), net.export(s2).unwrap());
+    net.release(s);
+    net.release(s2);
+    let (park, park2) = (r.parked.unwrap(), r2.parked.unwrap());
+    let mut guesses: Vec<u64> = (0..64).collect();
+    guesses.extend([
+        park.key ^ 1,
+        park.key.wrapping_add(1),
+        park2.key.wrapping_sub(1),
+    ]);
+    guesses.retain(|&g| g != park.key && g != park2.key);
+    for key in guesses {
+        let forged = Record {
+            parked: Some(Park { key, ..park }),
+            ..r.clone()
+        };
+        let (h, _) = net.import(&forged).unwrap();
+        assert_ne!(h, s, "key {key} took the parked socket");
+        assert_ne!(h, s2, "key {key} took the parked socket");
+        net.release(h);
+    }
+    assert_eq!(net.import(&r).unwrap().0, s, "its own record");
+    assert_eq!(net.import(&r2).unwrap().0, s2);
+}

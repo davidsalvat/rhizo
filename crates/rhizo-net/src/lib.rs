@@ -293,6 +293,10 @@ pub struct Net {
     /// `keep-tcp-across-suspend`).
     boot: u64,
     next_key: u64,
+    /// The secret that turns `next_key` into a parked record's key (finding
+    /// S15 of `docs/security.md`): a forged snapshot cannot name another
+    /// cell's parked connection by guessing it.
+    secret: [u64; 2],
     /// Listeners and connections of suspended cells, by key, each holding
     /// one reference.
     parked: Vec<(u64, Handle)>,
@@ -335,6 +339,7 @@ impl Net {
             wire: None,
             boot: 0,
             next_key: 1,
+            secret: [0; 2],
             parked: Vec::new(),
             woken: Vec::new(),
             looked: RefCell::new(Vec::new()),
@@ -345,6 +350,12 @@ impl Net {
     /// here): sockets parked in another boot do not re-attach.
     pub fn set_boot(&mut self, boot: u64) {
         self.boot = boot;
+    }
+
+    /// Sets the secret parked records' keys are derived from (the caller's
+    /// randomness, never read here; design D1 of `fix-parked-keys`).
+    pub fn set_secret(&mut self, secret: [u64; 2]) {
+        self.secret = secret;
     }
 
     /// Counts every change a waiter may wait for (data, connections,
@@ -1237,8 +1248,15 @@ impl Net {
             s.state,
             State::Listening { .. } | State::Connected { .. } | State::Wire { .. }
         ) {
-            let key = self.next_key;
-            self.next_key += 1;
+            // A key no other parked socket has, unpredictable without the
+            // secret.
+            let key = loop {
+                let key = siphash24(self.secret, self.next_key);
+                self.next_key += 1;
+                if self.parked.iter().all(|p| p.0 != key) {
+                    break key;
+                }
+            };
             self.parked.push((key, h));
             self.retain(h);
             record.parked = Some(Park {
@@ -1309,6 +1327,43 @@ impl Net {
             self.release(h);
         }
     }
+}
+
+/// SipHash-2-4 of one 64-bit word (little endian) under `key` (Aumasson
+/// and Bernstein, "SipHash: a fast short-input PRF", 2012): a pseudorandom
+/// function, so keys made from consecutive counters say nothing about each
+/// other or about `key`.
+fn siphash24(key: [u64; 2], m: u64) -> u64 {
+    let mut v = [
+        key[0] ^ 0x736f_6d65_7073_6575,
+        key[1] ^ 0x646f_7261_6e64_6f6d,
+        key[0] ^ 0x6c79_6765_6e65_7261,
+        key[1] ^ 0x7465_6462_7974_6573,
+    ];
+    fn round(v: &mut [u64; 4]) {
+        v[0] = v[0].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(13) ^ v[0];
+        v[0] = v[0].rotate_left(32);
+        v[2] = v[2].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(16) ^ v[2];
+        v[0] = v[0].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(21) ^ v[0];
+        v[2] = v[2].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(17) ^ v[2];
+        v[2] = v[2].rotate_left(32);
+    }
+    // One message block, then the final block: no bytes left, length 8.
+    for block in [m, 8 << 56] {
+        v[3] ^= block;
+        round(&mut v);
+        round(&mut v);
+        v[0] ^= block;
+    }
+    v[2] ^= 0xff;
+    for _ in 0..4 {
+        round(&mut v);
+    }
+    v[0] ^ v[1] ^ v[2] ^ v[3]
 }
 
 #[cfg(test)]
