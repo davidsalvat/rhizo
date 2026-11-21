@@ -519,6 +519,7 @@ fn measure_cells(
         memory_mib: CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        selfcheck: None,
         control: false,
     };
     let mut pt_frames = None;
@@ -916,6 +917,7 @@ fn measure_runtime(
         memory_mib: rt.memory_mib,
         bench: None,
         shard: None,
+        selfcheck: None,
         control: false,
     };
     for &vmm in &opts.vmms {
@@ -1348,6 +1350,7 @@ fn sample(vmm: Vmm, guest: &Guest, runs: usize, accel: Accel) -> Result<Samples>
         memory_mib: vmm::DEFAULT_MEMORY_MIB,
         bench: None,
         shard: None,
+        selfcheck: None,
         control: false,
     };
     let mut samples = Samples {

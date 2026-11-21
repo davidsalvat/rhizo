@@ -165,6 +165,7 @@ pub fn measure(
         memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        selfcheck: None,
         control: false,
     };
     for &vmm in &opts.vmms {
@@ -253,6 +254,7 @@ fn icount(
         memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        selfcheck: None,
         control: false,
     };
     let mut samples = Samples::default();
@@ -532,6 +534,7 @@ pub fn cmd(args: &ProfileArgs) -> Result {
         memory_mib: crate::bench::CELL_BENCH_MEMORY_MIB,
         bench: None,
         shard: None,
+        selfcheck: None,
         control: false,
     };
     let run = vmm::run(args.vmm, &Guest::Rhizo(kernel), opts)?;

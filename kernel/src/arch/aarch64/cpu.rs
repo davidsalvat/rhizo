@@ -280,7 +280,7 @@ pub fn flush_all() {
 }
 
 /// Executes an undefined instruction (self-check `ktest-invalid-opcode`).
-#[cfg(feature = "ktest-invalid-opcode")]
+#[cfg(feature = "ktest")]
 pub fn execute_invalid_instruction() {
     // SAFETY: deliberately undefined; the exception ends the run.
     unsafe { asm!("udf #0") };

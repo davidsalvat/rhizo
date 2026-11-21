@@ -779,7 +779,7 @@ pub fn supports_1gib_pages() -> bool {
 }
 
 /// Executes an undefined instruction (self-check `ktest-invalid-opcode`).
-#[cfg(feature = "ktest-invalid-opcode")]
+#[cfg(feature = "ktest")]
 pub fn execute_invalid_instruction() {
     // SAFETY: deliberately invalid; the exception ends the run.
     unsafe { asm!("ud2") };

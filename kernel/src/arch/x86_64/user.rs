@@ -624,7 +624,7 @@ pub fn sync_code(_virt: u64, _len: u64) {}
 
 /// Loads the tables rooted at `root` (sharing the kernel half), untagged:
 /// for the self-checks that touch a user page from the kernel.
-#[cfg(any(feature = "ktest-user-read", feature = "ktest-user-exec"))]
+#[cfg(feature = "ktest")]
 pub fn load_tables(root: u64) {
     USER_CR3[index()].store(root, Ordering::Relaxed);
     load_cr3(root);
