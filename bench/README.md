@@ -424,7 +424,9 @@ When the gate fails on main, the timing-gate issue names the runner, its
 class and that line.
 
 The default `ci` baseline was measured on the class with the guest PMU
-(about 6.5 M boot cycles on `microvm`, `cell.syscall_ns` 68).
+(about 6.5 M boot cycles on `microvm`, `cell.syscall_ns` 68). The first
+run that recorded its runner landed on it, an `Intel(R) Xeon(R) 6975P-C`
+(class `intel-xeon-6975p-c`).
 
 ## Where the gates run (change `faster-ci`)
 

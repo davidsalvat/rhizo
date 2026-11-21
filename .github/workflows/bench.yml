@@ -95,7 +95,6 @@ jobs:
         if: always()
         run: |
           if [ -f bench-results.json ]; then
-            echo "::notice title=bench-runner::$(jq -c '.runner' bench-results.json)"
             echo "::notice title=bench-medians::$(jq -r '.metrics[] | "\(.name)/\(.guest)/\(.vmm // "-")=\(.median)"' bench-results.json | tr '\n' ' ')"
             jq -c . bench-results.json | tr -d '\n' | fold -w 3000 | nl -nln -w1 -s' ' > bench-pieces.txt
             sed -n '1,9p' bench-pieces.txt | while IFS= read -r line; do
@@ -125,7 +124,25 @@ jobs:
             sed -n '30,39p' bench-pieces.txt | while IFS= read -r line; do
               echo "::notice title=bench-results-${line%% *}::${line#* }"
             done
-            [ "$(wc -l < bench-pieces.txt)" -le 39 ] || echo "::warning title=bench-results::more than 39 pieces; add a publishing step"
+          fi
+      - name: Publish results (pieces 40 to 49)
+        # The `runner` object comes after `metrics` in the compact JSON,
+        # and main's results already reached 40 pieces.
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '40,49p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+            [ "$(wc -l < bench-pieces.txt)" -le 49 ] || echo "::warning title=bench-results::more than 49 pieces; add a publishing step"
+          fi
+      - name: Publish the runner
+        # A step of its own: GitHub keeps 10 annotations per step, and the
+        # first publishing step already has ten.
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            echo "::notice title=bench-runner::$(jq -c '.runner' bench-results.json)"
           fi
 
   report:

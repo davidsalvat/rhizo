@@ -32,7 +32,10 @@ figures changed with `008a4c5`, and the density p99s regressed for real on
 The logs name no CPU model. GitHub prints the runner image but not the
 machine, and nothing in the workflow printed `/proc/cpuinfo`. So the
 model strings of X, Y and Z cannot be checked against history. This
-change starts recording them.
+change starts recording them. Its first run (`bench.yml` on this branch, run 44962453021)
+landed on an `Intel(R) Xeon(R) 6975P-C` (family 6, model 173, stepping 1,
+TSC 2700 MHz, 4 CPUs, guest PMU) with 6.65 M boot cycles and 68 ns per
+system call: class Y is `intel-xeon-6975p-c`.
 
 ## D1. The class key is the CPU model name
 
@@ -138,8 +141,11 @@ entries), `kvm`, `guest_pmu` and `tsc_mhz`.
   frequency, so this is also the frequency of the boot cycles Rhizo
   reports. Recording it needs no kernel change.
 
-`bench.yml` publishes `runner` as a `bench-runner` annotation. The full
-results in the `bench-results-N` pieces carry it too. On a failing gate,
+`bench.yml` publishes `runner` as a `bench-runner` annotation, in a step
+of its own (GitHub keeps 10 annotations per step). The full results in
+the `bench-results-N` pieces carry it too; they already took 40 pieces on
+main, one more than the steps published, and `runner` sorts after
+`metrics`, so a step publishes pieces 40 to 49. On a failing gate,
 the step that names the metrics also builds a runner line, the class and
 identity from `bench-results.json` plus the gate's class line from the
 log. The read-only report job puts it in the issue as `Runner: …`. It

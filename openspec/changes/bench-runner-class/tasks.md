@@ -17,8 +17,8 @@
 
 ## 4. CI and documentation
 
-- [x] 4.1 `bench.yml`: `bench-runner` annotation; the failing gate's runner line in the timing-gate issue (D5); verify `actionlint`
+- [x] 4.1 `bench.yml`: `bench-runner` annotation in a step of its own, a publishing step for pieces 40 to 49 (main's results already took 40, and `runner` comes after `metrics`); the failing gate's runner line in the timing-gate issue (D5); verify `actionlint`
 - [x] 4.2 `bench/README.md`: runner identity, classes, adding a class needs the owner's approval; verify `openspec validate bench-runner-class --strict`
 - [x] 4.3 Verify `cargo xtask check`
-- [ ] 4.4 Dispatch `bench.yml` on the branch; verify the run records its runner (annotation `bench-runner`) and the gate prints its class line
+- [x] 4.4 Dispatch `bench.yml` on the branch; verify the run records its runner (annotation `bench-runner`) and the gate prints its class line (run 44962453021: `intel-xeon-6975p-c`, class Y by its figures, unknown to the baseline, gate green)
 - [ ] 4.5 After merge, the owner adds the class baselines proposed in the pull request (a reviewed baseline change, not part of this change)
