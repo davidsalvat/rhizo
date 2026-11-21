@@ -30,8 +30,11 @@ pub enum Count {
     IdleCycles,
     /// Interrupts taken while cell code ran (preemption ticks, wake-ups).
     Interrupts,
-    /// Cells made runnable because a socket changed (all waiters wake).
+    /// Cells made runnable because a socket they waited on changed.
     IoWoken,
+    /// Of those, the ones whose first system call waited on descriptors
+    /// again: a wake-up that found nothing.
+    IoWasted,
     /// Socket changes made by system calls.
     NetChanges,
     /// Writes to copy-on-write pages resolved.
@@ -45,10 +48,14 @@ pub enum Count {
     Untagged,
 }
 
-const COUNTS: usize = 9;
+const COUNTS: usize = 10;
 static COUNTERS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 /// When a system call last changed a socket (nanoseconds since boot).
 static NET_CHANGED_AT: AtomicU64 = AtomicU64::new(0);
+/// When counting started (nanoseconds since boot): a cell queued or woken
+/// before then is not a latency of the window counted (cells made before a
+/// workload's load starts all run at its start).
+static STARTED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether counting is on.
 #[inline]
@@ -74,6 +81,8 @@ pub fn start() {
     }
     COUNTERS.iter().for_each(|c| c.store(0, Ordering::Relaxed));
     NET_CHANGED_AT.store(0, Ordering::Relaxed);
+    let now = crate::arch::timer::cycles_to_ns(Counter.cycles()).unwrap_or(0);
+    STARTED_AT.store(now, Ordering::Relaxed);
     ON.store(true, Ordering::Release);
 }
 
@@ -207,12 +216,13 @@ impl Ready {
         if !on() {
             return;
         }
+        let start = STARTED_AT.load(Ordering::Relaxed);
         LATENCY.with(|l| {
             if let Some([sched, wake]) = l.as_deref_mut() {
-                if self.queued != 0 && self.queued <= now {
+                if self.queued >= start.max(1) && self.queued <= now {
                     sched.record(now - self.queued);
                 }
-                if self.event != 0 && self.event <= now {
+                if self.event >= start.max(1) && self.event <= now {
                     wake.record(now - self.event);
                 }
             }
