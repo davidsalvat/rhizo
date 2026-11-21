@@ -203,6 +203,31 @@ The kernel also prints the scopes entered per part
 (`rhizo-breakdown-calls`, `name=count/ns`). Without `profile` the hooks
 compile to nothing, so no other figure is measured with them.
 
+### Sampling: `cargo xtask profile`
+
+```bash
+cargo xtask --arch x86_64 profile [--vmm <name>] [--accel <a>] [--out <dir>] [--per-cell]
+```
+
+runs a kernel built with `sampling` (which includes `profile`): the same
+workloads (five rounds each, CPython where built), accounted as above and
+sampled. The PMU counts cycles of cell code only and interrupts every
+100,000 (x86_64 counter 2 on vector 34; AArch64 event counter 1 on the PMU's
+PPI); without a PMU the timer samples every 100 µs instead. Each sample is
+the cell and its program counter; kernel addresses are not sampled (the
+kernel runs with interrupts masked), its time is the accounted parts. It
+writes to `target/profile` (or `--out`):
+
+- `<workload>.folded`: `<workload>;<image>[;cell <id>];<function> <ns>`,
+  the samples sharing the workload's `user` time by count, and
+  `<workload>;kernel;<part> <ns>`;
+- `<workload>.calls.folded`: `<workload>;<system call> <ns>` (each call's
+  own time, nested parts included).
+
+Functions come from `nm` on the image (CPython: the interpreter before it
+was stripped); the Rust test cells are stripped, so their addresses fold by
+4 KiB page. Render with `flamegraph.pl`, `inferno-flamegraph` or speedscope.
+
 ### Instructions and cycles
 
 Where the guest has performance counters (`rhizo-pmu` in the output), the
