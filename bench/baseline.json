@@ -295,7 +295,7 @@
       "cell.run_insns/rhizo/qemu-virt-icount": 123056.0,
       "cell.spawn_from_template_insns/rhizo/qemu-virt-icount": 7376.0,
       "cell.spawn_insns/rhizo/qemu-virt-icount": 50768.0,
-      "cell.switch_fp_insns/rhizo/qemu-virt-icount": 2061.0,
+      "cell.switch_fp_insns/rhizo/qemu-virt-icount": 2066.0,
       "cell.switch_insns/rhizo/qemu-virt-icount": 832.0,
       "cell.switch_untagged_insns/rhizo/qemu-virt-icount": 835.0,
       "workload.cold_insns/rhizo/qemu-virt-icount": 39872528.0,
