@@ -9,7 +9,12 @@ up to date with the code; the requirements are in
 the end.
 
 Review of the code as of the `add-security-review` change (milestone H13),
-on both architectures (AArch64 and x86_64).
+on both architectures (AArch64 and x86_64), extended by a second review
+(D.2, change `add-security-review-2`) to everything added since: several
+CPUs, sockets and the network card, virtio-pci, dynamically linked
+programs and file mappings, the image cache and 2 MiB image pages, the
+agent workload's host calls, and snapshots as untrusted input (findings
+S14 to S21, section [Second review](#second-review-d2)).
 
 ## Threat model
 
@@ -29,12 +34,22 @@ secrecy is assumed: there is no KASLR).
 5. Learn another cell's data through recycled frames, a fork, a snapshot
    or a resume.
 
+**Second attacker: a hostile snapshot** (from the second review on).
+Templates will be downloaded as snapshots (`docs/vision.md`), so the bytes
+`Snapshot::from_bytes` reads may be written by anyone: they must be
+refused, or resume into a cell that reaches nothing beyond its own memory,
+files and sockets, and takes nothing from another cell (memory, files,
+parked connections). The same holds for the files a cell writes and the
+host later starts as a program (`Host::spawn_file`: the executable and
+the interpreter it names come from those files).
+
 **Trusted.** The host code that drives the kernel (`Host::spawn`, `fork`,
-`suspend`, `resume`, `kill`): it chooses which executables run and where
-snapshots come from. Executables and snapshot bytes are still validated
-(they may be stored or moved outside the kernel), and findings in those
-paths are rated lower. The hardware, firmware and VMM (QEMU, Firecracker,
-Cloud Hypervisor) are trusted.
+`suspend`, `resume`, `kill`, `write_file`): it chooses which executables
+run and which snapshots to resume. Executables and snapshot bytes are
+still validated. The hardware, firmware and VMM (QEMU, Firecracker, Cloud
+Hypervisor) are trusted, and so is the network card they emulate: the
+virtio drivers are reviewed for robustness only (a broken device must not
+crash the kernel), not against a malicious device.
 
 ## Trust boundary
 
@@ -122,11 +137,13 @@ What makes the boundary hold:
 ## Quotas
 
 `add-cell-quotas` closed O1. The host sets a cell's quotas with
-`Host::set_quota`; without one a cell has the kernel's limits, as before.
+`Host::set_quota`; without one a cell has the kernel's limits, as before,
+and at most 256 sockets (S21).
 
 - **Memory** (bytes of pages and page tables): every frame the kernel takes
   for the cell goes through `rhizo_cell::quota::Metered`: system calls,
-  copy-on-write copies, lazy pages, stack growth, spawn and resume. Past
+  copy-on-write copies, lazy pages, stack growth, holes and pages past the
+  end of mapped files (S20), spawn and resume. Past
   the quota, `mmap` and `brk` answer `ENOMEM`; a fault that needs a frame
   kills the cell, as when memory runs out. Frames given back are credited
   (never below zero), so a forked cell holds at most its quota plus what it
@@ -137,7 +154,7 @@ What makes the boundary hold:
   `cell N killed: CPU time quota used up`) at the end of that slice, at
   most 10 ms and one call late.
 - **Descriptors** (at most 1024): `EMFILE` past the quota. **Sockets**:
-  `ENFILE` past the quota.
+  `ENFILE` past the quota, 256 by default (S21).
 - **Cell state.** Quotas live in the `Cell`: forks and template copies keep
   them (with no usage), snapshots (format version 7) keep them and the CPU
   time used, so a suspend and resume buys no time. `getrlimit` reports
@@ -251,6 +268,14 @@ the threat model above.
 | S10 | Low | both | ELF program-header arithmetic could overflow (a panic in debug builds) | Fixed |
 | S11 | Low | both | `mmap` / `brk` beyond free memory zeroed frames until running out before refusing | Fixed |
 | S13 | Medium | x86_64 | An exception or interrupt from ring 3 kept the cell's direction and alignment-check flags in the kernel (Rust code ran with DF set; AC would lift SMAP) | Fixed |
+| S14 | High | both | Mapping one file page 65536 times overflowed the frame's 16-bit reference count: a cell panicked the kernel | Fixed (`fix-shared-frame-count`) |
+| S15 | Medium | both | Parked sockets' keys counted up from 1: a forged snapshot could take another suspended cell's TCP connection | Fixed (`fix-parked-keys`) |
+| S16 | Medium | both | `sendmsg` / `recvmsg` summed buffer lengths with overflow: a cell panicked a kernel built with overflow checks (debug, the tests' build) | Fixed |
+| S18 | Medium | x86_64 | An executable's or interpreter's entry point past `USER_END` was accepted; entering the cell there faults in the kernel | Fixed |
+| S17 | Low | both | virtio-pci accepted BAR size masks that are not a power of two, or that wrap past the top of memory: a broken device could have the kernel map memory outside its BAR | Fixed |
+| S19 | Low | both | `dup2(fd, fd)` returned its 64-bit argument as given, not the descriptor (neither a value nor an `errno` for a large one) | Fixed |
+| S20 | Low | both | `mmap` of a file maps holes and pages past its end with fresh zeroed frames without asking memory first (as S11 did for anonymous memory) | Fixed (`add-cell-quotas`) |
+| S21 | Medium | both | Sockets are bounded kernel-wide (4096): one cell can hold about half, two all, and every other cell gets `ENFILE` | Fixed (`add-cell-quotas`) |
 
 **S1. `mprotect` reached the kernel half (Critical, x86_64).** On x86_64 a
 cell's root table shares the kernel's upper-half entries, and those
@@ -374,6 +399,137 @@ the entry code for `add-user-access-guards`, confirmed by a debug
 assertion after every return from a cell (`flags` cell: RFLAGS `0x40400`
 in the kernel). *Fix:* `push 2; popfq` right after `SWAPGS` in
 `rhizo_user_trap`. *Test:* `flags_a_cell_sets_stay_in_the_cell`.
+## Second review (D.2)
+
+Method, as for the first review: a threat model per area, reading the
+code, then property tests (fixed seeds, in `cargo xtask check` on every
+pull request; random seeds and 4096 cases weekly) and hostile cells in the
+kernel; every finding reproduced before its fix and kept fixed by a test.
+
+### Threat model of the new surface
+
+| Area | What a hostile cell (or snapshot) can try | What holds it |
+|---|---|---|
+| **Several CPUs** (`add-smp-boot`, `add-smp-scheduling`, `add-parallel-threads`) | Threads of one cell on several CPUs racing a system call against `munmap`, `mprotect`, `exit_group` or a futex on memory that goes away; a stale translation on another CPU after a frame is freed | A cell's calls and the faults that change its tables take its lock, one at a time; on x86_64 a shrinking change interrupts the cell's other CPUs and keeps them out until it is done (the clean-CPU set makes others drop the PCID); AArch64 invalidations are broadcast and a copy-on-write replacement is break-before-make (`resolve_write` clears the entry and flushes before writing the new one); the cell is freed by the last CPU to leave it. Per-CPU data is `TPIDR_EL1` / the kernel GS base, out of a cell's reach. Exercised by `racer` (below); no finding. |
+| **Sockets** (`rhizo-net`, loopback, Unix, UDP, `smoltcp` on the card) | Exhausting sockets, ports, backlogs and buffers shared by every cell; long or malformed addresses, `msghdr` and `iovec`; `ioctl` | Buffers are bounded (256 KiB per stream, `DGRAM_MAX`) and asked from memory before they grow; paths ≤ 107 bytes; `iovec` counts ≤ 1024 and lengths ≤ `SSIZE_MAX`, their sum saturates (S16); `ioctl` takes `FIONBIO`, `FIOCLEX`, `FIONCLEX` only, on the caller's own descriptor. Ephemeral ports and sockets are a kernel-wide pool (S21). A Unix name is a number in the cell's own tree: a cell reaches another's Unix socket only if its files hold the name. |
+| **Parked connections** (`keep-tcp-across-suspend`, snapshot v6) | A forged snapshot naming another suspended cell's parked connection | Since S15, keys are SipHash-2-4 of a counter under a boot secret no snapshot holds; a key that matches nothing comes back reset or bound again; each key re-attaches once. |
+| **virtio** (mmio, pci) | — (the device is trusted, above) | Robustness only: configuration-space parsing bounded (48 capabilities, offsets inside the 4 KiB function), BARs naturally aligned powers of two below the top of memory (S17), structures inside their BAR. Fuzzed (`any_configuration_space_is_set_up_or_refused`). |
+| **Dynamic linking** (`PT_INTERP`, file `mmap`, `MAP_FIXED`, the page cache) | Mapping file pages without end; writing through a private mapping of a page other cells share; `MAP_FIXED` over its own or the kernel's memory; a planted interpreter with hostile headers | The cache holds each page it keeps, so a block's bytes cannot change while a frame shows them (a write gives the file a new block, hence a new key); file frames are mapped read-only, writable mappings copy-on-write (S12 rule); a count that cannot grow gives a private copy (S14); `MAP_FIXED` ends at or below `USER_END` and not on page 0; interpreters must be position independent with no interpreter of their own, and every entry point is checked (S18). Mapped holes and pages past the end are not asked for first (S20). |
+| **Image cache and 2 MiB pages** (`add-image-cache`, `add-large-image-pages`) | Writing a read-only page or 2 MiB page shared with every spawn of the image | Copies share read-only pages and copy writable ones; `mprotect` of a shared page (2 MiB included) adds copy-on-write; `mprotect` of part of a 2 MiB page is refused; a 2 MiB copy-on-write fault copies into a 2 MiB frame or, without one, into 512 small pages. |
+| **Agent workload host calls** (`Host::write_file`, `Host::asleep`, `ioctl`) | — (host calls) | `write_file` reaches a cell only while no CPU runs it (a running cell is out of the scheduler's lists), and goes through the cell's own file limits; `asleep` only reads. |
+| **Snapshots** (format v6) | Any bytes as a snapshot | `from_bytes` checks header, version, machine, every page record (size, user-only flags, W^X, alignment, order, inside the user half, data in bounds), every thread (identifier, wait, futex address, program counter and on x86_64 thread pointer and `MXCSR`), the file system (`Fs::decode`: every index, link count, tree shape and bound) and the sockets (each record held by exactly one description). The heap and mapping cursors are not checked: they only steer where the cell's own later calls map, and every mapping call refuses ranges past `USER_END`. Fuzzed with tampered and random snapshots restored into a cell that shares a kernel half (below); no finding. |
+| **Cost accounting and sampling** (`add-cost-accounting`, `add-sampling-profiler`) | — | Compiled in only with the `profile` / `sampling` features (benchmark and test builds); the kernel does not grant cells access to the performance counters. Not reviewed further. |
+
+### Findings
+
+**S14. One page shared without end (High, both).** Every mapping of a file
+page takes one more reference to the page cache's frame, and the kernel
+counts a frame's references in 16 bits with a panic past 65535. O7 rated
+that limit low because only the host could reach it; file mappings made it
+a cell's: write one byte to a file, map its first page 70000 times.
+Reproduced in the kernel under QEMU (`PANIC ... more than 65535 cells
+share a frame`). *Fix:* `Frames::try_share` adds a reference only if the
+count can hold it; the cache gives the caller a private copy when it
+cannot. *Tests:* `a_page_shared_without_end_gets_copies`,
+`one_page_mapped_without_end_cannot_stop_the_kernel` (`sharer`).
+
+**S15. Guessable parked keys (Medium, both).** A parked connection was
+re-attached by a key counting up from 1 in each boot. A forged snapshot
+resumed in the same boot could carry one record per guess and take other
+suspended cells' connections: read their peers' bytes and write in their
+name. Found by reading the code (design D2 of `keep-tcp-across-suspend`
+had accepted it while the host was the only source of snapshots).
+*Fix:* keys are SipHash-2-4 of the counter under a 128-bit boot secret
+(as strong as the kernel's randomness: O4 until `add-crypto-random`).
+*Tests:* `a_parked_socket_answers_only_its_own_key`,
+`park_keys_use_siphash_2_4`.
+
+**S16. Buffer lengths that overflow (Medium, both).** `sendmsg` and
+`recvmsg` summed up to 1024 lengths of up to `SSIZE_MAX` each with `sum()`,
+which panics on overflow when overflow checks are on: debug builds, which
+`cargo xtask run` and every in-kernel test use (a release build wrapped,
+harmlessly). Confirmed by a host test that panicked. *Fix:* the sum
+saturates. *Test:* `buffer_lengths_that_overflow_their_sum_are_harmless`.
+
+**S17. Broken BAR masks (Low, both).** virtio-pci took any value read back
+from a BAR as its size mask; one that is not a power of two (or a BAR
+whose address plus size wraps) gave sizes that let a structure lie outside
+what the device decodes, and an address that could wrap. Out of the threat
+model (the device is trusted); found by the configuration-space fuzzer.
+*Fix:* such a BAR is left out. *Test:*
+`any_configuration_space_is_set_up_or_refused`.
+
+**S18. Entry points past the cell (Medium, x86_64).** S7 kept segments
+below `USER_END` and S8 kept a snapshot's program counter there, but an
+executable's entry point (`e_entry`), and its interpreter's plus its load
+address, were not checked: on x86_64 the first return to the cell would
+fault in the kernel for a non-canonical address (as S7). The interpreter
+comes from the cell's files, which the cell may have written. Found by the
+`exec` fuzzer. *Fix:* `start_at` refuses a first instruction at or past
+`USER_END` (`ElfError::BadEntry`), and the executable's bias is added
+without overflow. *Tests:* `entry_points_outside_the_cell_are_refused`,
+`tampered_programs_start_safely_or_not_at_all`.
+
+**S19. `dup2` to itself (Low, both).** `dup2(fd, fd)` compared and returned
+the 64-bit arguments, where Linux takes `unsigned int`: for a valid low
+half and a high half set, it returned a value that is neither a
+descriptor nor an `errno`. Found by the decoded-files fuzzer. *Fix:* both
+truncated to 32 bits, as Linux.
+
+**S20. File holes mapped without asking (Low, both).** A file mapping
+gave each hole, and each page past the file's end, a fresh zeroed frame
+without asking memory for the whole length first, as S11 made anonymous
+mappings do: a call over terabytes zeroed all free memory down to the
+kernel's reserve (kept by the frame allocator) before it was refused and
+gave everything back. The frames came from the page cache's pool, outside
+the cell's metering. *Fix* (`add-cell-quotas`): such a page is the cell's
+alone and never kept, so it comes from the cell's frames and counts in its
+memory quota like anonymous memory. *Test:* `hog file` in
+`memory_quota_refuses_the_cell_not_the_others`. A cell without a memory
+quota is still bounded only by the reserve, as for anonymous memory.
+
+**S21. One pool of sockets (Medium, both).** At most 4096 sockets are
+open in the kernel. A cell with 1024 descriptors could open as many
+connections to its own listener (each also holding the accepted end), so
+one cell held about half the pool and two held all of it; parked sockets
+count too. Others then got `ENFILE`; the kernel survived. *Fix*
+(`add-cell-quotas`): every cell has a socket quota, 256 unless the host
+sets another (`Quota::DEFAULT`), so with the server ends of its own
+connections a cell holds at most 512 sockets, an eighth of the pool (a
+compile-time check keeps the default there). *Test:*
+`a_cell_holds_a_bounded_share_of_sockets` (`limits` and its fork, without
+a quota from the host). A host that lifts the quota (`Quota::NONE`) or
+runs many cells can still fill the pool, as with memory.
+
+### Fuzzers and hostile cells
+
+| Fuzzer | Input | Checks |
+|---|---|---|
+| `x86_64_cells_cannot_hurt_the_kernel`, `aarch64_...` (first review) | Up to 40 calls of any number and arguments | Values or errnos, kernel memory and tables unchanged, bounded reports, every frame back |
+| `decoded_files_cannot_hurt_the_kernel` | A file system with every kind of object, encoded, up to 3 bytes changed and maybe cut, then up to 30 calls on descriptors and paths | Refused, or the same as above with the decoded files |
+| `random_bytes_are_refused_or_work` | Random bytes as an encoded file system, then calls | As above |
+| `tampered_snapshots_are_refused_or_contained` | A snapshot with threads, pages, files, a pipe and two sockets, up to 3 bytes changed (mostly in headers and records) and maybe cut | Refused, or restored into a cell sharing a kernel half: kernel memory and entries unchanged, every page in the user half with user flags and W^X, registers below `USER_END`, every descriptor answers, sockets import, every frame back |
+| `random_bytes_are_refused_or_contained` | Random bytes behind a valid header | As above |
+| `tampered_programs_start_safely_or_not_at_all` | A dynamically linked program and its interpreter with up to 3 bytes each changed in their headers | Refused with every frame back, or started with every page in the user half, W^X, a first instruction below `USER_END`, every frame back |
+| `any_configuration_space_is_set_up_or_refused` | A QEMU virtio-net function with up to 5 dwords changed, any BAR sizes, any window | No panic; structures inside a BAR, no wrap |
+| `hostile_headers_never_panic` (first review) | ELF headers | No panic |
+
+In the kernel, on both architectures and with 4 CPUs (`ktest-smp`):
+`one_page_mapped_without_end_cannot_stop_the_kernel` (`sharer`) and
+`threads_racing_on_several_cpus_cannot_hurt_the_kernel` (`racer`: copies
+through the kernel racing `munmap` and `MAP_FIXED` 2000 times, a futex
+wait on a word unmapped under it, `exit_group` while three threads are in
+system calls, `mprotect` flipping a page under a writer); each ends as its
+race allows, a neighbour finishes, every frame comes back.
+
+Limitations of this review: fuzzing is by property tests on the host
+libraries with test doubles, not coverage-guided; the kernel's own wiring
+(`kernel/src/cell.rs`, the scheduler loop, the entry code, the TLB
+shootdown protocol) was read, and exercised by hostile cells, not
+fuzzed or proven; races are tested by running them, which shows a bug only
+when the interleaving happens; the in-kernel tests run under QEMU with
+software emulation in CI (and KVM where available), whose memory ordering
+is stronger than some hardware's.
 
 ## Known limitations and open findings
 
@@ -387,12 +543,15 @@ These are not fixed by this change; each needs its own design.
 | O4 | — | **Closed by `add-crypto-random`** (see *Randomness*). What remains: a CPU without a hardware random source (an AArch64 host without FEAT_RNG under KVM) falls back to the cycle counter, and the boot says `getrandom is predictable`; there is no virtio-rng driver yet. |
 | O5 | Low | **SMEP, SMAP and PAN closed by `add-user-access-guards`.** Left: SMAP and PAN cannot see accesses through the direct map (software checks guard it); on x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
 | O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. |
-| O7 | Low | **Host paths may panic.** Forking one cell more than 65535 times panics (frame reference counts are 16 bits); a frame lost when loading an executable fails half way. Only the host can do either. |
-| — | — | **Single CPU.** Concurrency between CPUs was not reviewed (there is one). |
+| O7 | Low | **Host paths may panic.** Forking one cell, or spawning one kept image, more than 65535 times while every copy lives panics (frame reference counts are 16 bits; a cell's own path, mapping file pages, gives copies instead since S14); a frame lost when loading an executable fails half way. Only the host can do either. |
+| — | — | **Concurrency between CPUs** was reviewed by reading and by hostile cells (second review), not by a model checker or a proof. |
 | — | — | **No hardware, firmware or VMM audit.** Device emulation, the boot path and the VMMs are trusted. |
 | — | — | **No formal proof.** This is a review with tests, not a verification. |
 
 ## Tests that keep it fixed
+
+The second review's fuzzers and hostile cells are listed in its own
+section above. From the first review:
 
 - Host, `crates/rhizo-abi/src/hostile.rs`: `x86_64_cells_cannot_hurt_the_kernel`
   and `aarch64_cells_cannot_hurt_the_kernel` (properties: up to 40 calls of
@@ -428,7 +587,8 @@ These are not fixed by this change; each needs its own design.
   - Quotas: `memory_quota_refuses_the_cell_not_the_others` (`hog` with a
     quota next to `ballast`), `cpu_quota_ends_the_cell` (`spin`),
     `file_and_socket_quotas_travel_with_the_cell` (`limits`, forked,
-    copied from a template, resumed); host tests in `rhizo_cell::quota`,
+    copied from a template, resumed), `a_cell_holds_a_bounded_share_of_sockets`
+    (S21); `hog file` for S20; host tests in `rhizo_cell::quota`,
     `quotas_limit_descriptors_and_sockets` (`rhizo-fs`),
     `rlimits_report_the_cells_quotas` (`rhizo-abi`).
   - `flags_a_cell_sets_stay_in_the_cell`: `flags`; `user_guards_are_on`

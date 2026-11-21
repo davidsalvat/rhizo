@@ -361,6 +361,7 @@ impl Tables {
             released: Vec::new(),
             fd_limit: FD_MAX,
             socket_limit: crate::SOCKETS_DEFAULT,
+            changes: 0,
         })
     }
 

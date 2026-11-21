@@ -279,3 +279,32 @@ fn quotas_limit_descriptors_and_sockets() {
     assert!(fs.socket_fd(12, false, false).is_ok());
     assert!(fs.dup(4, FD_MAX as Fd, true, false).is_err());
 }
+
+#[test]
+fn what_a_waiting_thread_may_wait_for_is_counted() {
+    let mut fs = Fs::new();
+    let (r, w) = fs.pipe(false, false).unwrap();
+    let e = fs.eventfd(0, false, false, false).unwrap();
+    let before = fs.changes();
+    assert_eq!(read_pipe_all(&mut fs, r), Err(Error::Again));
+    assert_eq!(fs.read_event(e), Err(Error::Again));
+    assert_eq!(fs.changes(), before, "nothing happened");
+    let mut seen = fs.changes();
+    let mut changed = |fs: &Fs, what: &str| {
+        assert!(fs.changes() > seen, "{what}");
+        seen = fs.changes();
+    };
+    fs.write_pipe(w, b"x").unwrap();
+    changed(&fs, "data in");
+    read_pipe_all(&mut fs, r).unwrap();
+    changed(&fs, "room for a writer");
+    fs.write_event(e, 1).unwrap();
+    changed(&fs, "a count");
+    fs.read_event(e).unwrap();
+    changed(&fs, "room for a count");
+    let ep = fs.epoll_create(false).unwrap();
+    fs.epoll_ctl(ep, EpollOp::Add, r, IN, 0).unwrap();
+    changed(&fs, "an interest");
+    fs.close(w).unwrap();
+    changed(&fs, "the end of the pipe");
+}

@@ -13,7 +13,7 @@
 
 extern crate alloc;
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 mod gangs;
@@ -42,8 +42,11 @@ pub struct Scheduler<T> {
     arrivals: u64,
     /// Sorted by wake time; equal times keep the order they were added in.
     sleeping: Vec<(u64, T)>,
-    /// In the order they started waiting, with their deadline if any.
-    waiting: Vec<(Option<u64>, T)>,
+    /// By key (design D2 of `add-socket-wait-queues`), with their deadline
+    /// if any.
+    waiting: BTreeMap<u32, (Option<u64>, T)>,
+    /// The deadlines of waiting entries, earliest first, with their key.
+    deadlines: BTreeSet<(u64, u32)>,
 }
 
 impl<T> Scheduler<T> {
@@ -53,7 +56,8 @@ impl<T> Scheduler<T> {
             queues: (0..cpus.max(1)).map(|_| VecDeque::new()).collect(),
             arrivals: 0,
             sleeping: Vec::new(),
-            waiting: Vec::new(),
+            waiting: BTreeMap::new(),
+            deadlines: BTreeSet::new(),
         }
     }
 
@@ -99,20 +103,36 @@ impl<T> Scheduler<T> {
         self.sleeping.insert(at, (wake_at, entry));
     }
 
-    /// Makes `entry` wait until [`wake_waiting`](Self::wake_waiting) or, if
-    /// given, `deadline` (nanoseconds, same clock as `now`).
-    pub fn wait(&mut self, entry: T, deadline: Option<u64>) {
-        self.waiting.push((deadline, entry));
+    /// Makes `entry`, known by `key` (unique among waiting entries), wait
+    /// until [`wake`](Self::wake) names it or, if given, `deadline`
+    /// (nanoseconds, same clock as `now`).
+    pub fn wait(&mut self, key: u32, entry: T, deadline: Option<u64>) {
+        if let Some(d) = deadline {
+            self.deadlines.insert((d, key));
+        }
+        let old = self.waiting.insert(key, (deadline, entry));
+        debug_assert!(old.is_none(), "key {key} already waits");
     }
 
-    /// Makes every waiting entry runnable on `cpu`'s queue, in the order
-    /// they started waiting, after `f` has seen it: something they may wait
-    /// for happened.
-    pub fn wake_waiting(&mut self, cpu: usize, mut f: impl FnMut(&mut T)) {
-        for (_, mut entry) in core::mem::take(&mut self.waiting) {
-            f(&mut entry);
-            self.push(cpu, entry);
+    /// Makes the waiting entry known by `key` runnable on `cpu`'s queue,
+    /// after `f` has seen it: something it may wait for happened. Returns
+    /// whether such an entry waited.
+    pub fn wake(&mut self, cpu: usize, key: u32, f: impl FnOnce(&mut T)) -> bool {
+        let Some(mut entry) = self.take_waiting(key) else {
+            return false;
+        };
+        f(&mut entry);
+        self.push(cpu, entry);
+        true
+    }
+
+    /// Removes the waiting entry known by `key`.
+    fn take_waiting(&mut self, key: u32) -> Option<T> {
+        let (deadline, entry) = self.waiting.remove(&key)?;
+        if let Some(d) = deadline {
+            self.deadlines.remove(&(d, key));
         }
+        Some(entry)
     }
 
     /// Number of waiting entries.
@@ -121,32 +141,31 @@ impl<T> Scheduler<T> {
     }
 
     /// Moves the sleepers and waiters whose time has come to the end of
-    /// `cpu`'s queue (sleepers in wake-time order, then waiters in the order
-    /// they started waiting), after `f` has seen each: what
+    /// `cpu`'s queue (sleepers, then waiters, each in time order), after `f`
+    /// has seen each: what
     /// [`next`](Self::next) does first, for a caller that wants to know
     /// when an entry became runnable.
     pub fn wake_due(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
         let due = self.sleeping.partition_point(|&(t, _)| t <= now);
-        let Self {
-            queues,
-            arrivals,
-            sleeping,
-            waiting,
-        } = self;
-        for (_, mut entry) in sleeping.drain(..due) {
-            f(&mut entry);
-            queues[cpu].push_back((*arrivals, entry));
-            *arrivals += 1;
-        }
-        if waiting.iter().any(|&(d, _)| d.is_some_and(|d| d <= now)) {
-            let (due, rest): (Vec<_>, Vec<_>) = core::mem::take(waiting)
-                .into_iter()
-                .partition(|&(d, _)| d.is_some_and(|d| d <= now));
-            *waiting = rest;
-            for (_, mut entry) in due {
+        if due > 0 {
+            let Self {
+                queues,
+                arrivals,
+                sleeping,
+                ..
+            } = self;
+            for (_, mut entry) in sleeping.drain(..due) {
                 f(&mut entry);
                 queues[cpu].push_back((*arrivals, entry));
                 *arrivals += 1;
+            }
+        }
+        while let Some(&(d, key)) = self.deadlines.first()
+            && d <= now
+        {
+            if let Some(mut entry) = self.take_waiting(key) {
+                f(&mut entry);
+                self.push(cpu, entry);
             }
         }
     }
@@ -184,7 +203,7 @@ impl<T> Scheduler<T> {
 
     /// Earliest wake-up time among sleepers and waiters with a deadline.
     pub fn next_wake(&self) -> Option<u64> {
-        let waiter = self.waiting.iter().filter_map(|&(d, _)| d).min();
+        let waiter = self.deadlines.first().map(|&(d, _)| d);
         match (self.sleeping.first().map(|&(t, _)| t), waiter) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -214,8 +233,13 @@ impl<T> Scheduler<T> {
                 return queue.remove(i).map(|(_, e)| (e, None));
             }
         }
-        if let Some(i) = self.waiting.iter().position(|(_, e)| pred(e)) {
-            return Some((self.waiting.remove(i).1, None));
+        if let Some(key) = self
+            .waiting
+            .iter()
+            .find(|(_, (_, e))| pred(e))
+            .map(|(&k, _)| k)
+        {
+            return self.take_waiting(key).map(|e| (e, None));
         }
         let i = self.sleeping.iter().position(|(_, e)| pred(e))?;
         let (wake, entry) = self.sleeping.remove(i);
@@ -228,7 +252,7 @@ impl<T> Scheduler<T> {
             .iter()
             .flatten()
             .map(|(_, e)| e)
-            .chain(self.waiting.iter().map(|(_, e)| e))
+            .chain(self.waiting.values().map(|(_, e)| e))
             .chain(self.sleeping.iter().map(|(_, e)| e))
             .find(|e| pred(e))
     }
@@ -240,7 +264,7 @@ impl<T> Scheduler<T> {
             .iter_mut()
             .flatten()
             .map(|(_, e)| e)
-            .chain(self.waiting.iter_mut().map(|(_, e)| e))
+            .chain(self.waiting.values_mut().map(|(_, e)| e))
             .chain(self.sleeping.iter_mut().map(|(_, e)| e))
             .find(|e| pred(e))
     }
@@ -571,8 +595,8 @@ mod tests {
     #[test]
     fn waiters_wake_together_or_at_their_deadline() {
         let mut s = Scheduler::new(1);
-        s.wait('a', None);
-        s.wait('b', Some(100));
+        s.wait(1, 'a', None);
+        s.wait(2, 'b', Some(100));
         s.sleep('c', 50);
         assert_eq!(s.len(), 3);
         assert_eq!(s.waiting(), 2);
@@ -584,7 +608,8 @@ mod tests {
         assert_eq!(s.next(0, 1_000), None, "no deadline: waits for a wake");
         assert_eq!(s.next_wake(), None);
         assert_eq!(s.find(|&e| e == 'a'), Some(&'a'));
-        s.wake_waiting(0, |_| {});
+        assert!(!s.wake(0, 2, |_| {}), "no longer waits");
+        assert!(s.wake(0, 1, |_| {}));
         assert_eq!(s.waiting(), 0);
         assert_eq!(s.next(0, 0), Some('a'));
     }
@@ -592,10 +617,11 @@ mod tests {
     #[test]
     fn a_removed_waiter_comes_back_runnable() {
         let mut s = Scheduler::new(1);
-        s.wait(1, Some(10));
+        s.wait(7, 1, Some(10));
         *s.find_mut(|&e| e == 1).unwrap() = 2;
         assert_eq!(s.remove_with_wake(|&e| e == 2), Some((2, None)));
         assert!(s.is_empty());
+        assert_eq!(s.next_wake(), None, "its deadline went with it");
     }
 
     #[test]
@@ -603,8 +629,8 @@ mod tests {
         let mut s = Scheduler::new(2);
         s.sleep(1, 50);
         s.sleep(2, 70);
-        s.wait(3, Some(60));
-        s.wait(4, None);
+        s.wait(3, 3, Some(60));
+        s.wait(4, 4, None);
         let mut seen = Vec::new();
         s.wake_due(1, 65, |&mut e| seen.push(e));
         assert_eq!(seen, [1, 3], "the sleeper, then the waiter, both due");
@@ -617,9 +643,26 @@ mod tests {
     #[test]
     fn woken_waiters_join_the_waking_cpu() {
         let mut s = Scheduler::new(2);
-        s.wait('w', None);
-        s.wake_waiting(1, |_| {});
+        s.wait(1, 'w', None);
+        s.wake(1, 1, |_| {});
         assert_eq!(s.next(1, 0), Some('w'));
+    }
+
+    #[test]
+    fn only_the_named_waiters_wake() {
+        let mut s = Scheduler::new(1);
+        for key in 1..=4 {
+            s.wait(key, key, None);
+        }
+        let mut seen = Vec::new();
+        for key in [3, 1, 9] {
+            s.wake(0, key, |&mut e| seen.push(e));
+        }
+        assert_eq!(seen, [3, 1], "a key that does not wait wakes nobody");
+        assert_eq!(s.waiting(), 2);
+        assert_eq!(s.next(0, 0), Some(3), "in the order they were woken");
+        assert_eq!(s.next(0, 0), Some(1));
+        assert_eq!(s.next(0, 0), None);
     }
 
     #[test]
@@ -680,14 +723,16 @@ mod tests {
         ) {
             let mut s = Scheduler::new(1);
             for (id, &(deadline, _)) in ops.iter().enumerate() {
-                s.wait(id, deadline);
+                s.wait(id as u32, id, deadline);
             }
             let mut seen = vec![false; ops.len()];
             for now in 0..=50u64 {
-                if ops[now as usize % ops.len()].1 && now % 7 == 0 {
-                    s.wake_waiting(0, |_| {});
+                let woken = now as usize % ops.len();
+                if ops[woken].1 && now % 7 == 0 {
+                    s.wake(0, woken as u32, |_| {});
                     while let Some(id) = s.next(0, now) {
                         prop_assert!(!seen[id]);
+                        prop_assert!(id == woken || ops[id].0.is_some_and(|d| d <= now));
                         seen[id] = true;
                     }
                 }
@@ -697,7 +742,9 @@ mod tests {
                     seen[id] = true;
                 }
             }
-            s.wake_waiting(0, |_| {});
+            for id in 0..ops.len() {
+                s.wake(0, id as u32, |_| {});
+            }
             while let Some(id) = s.next(0, 50) {
                 prop_assert!(!seen[id]);
                 prop_assert!(ops[id].0.is_none());

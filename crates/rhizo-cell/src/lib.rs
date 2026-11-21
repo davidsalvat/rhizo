@@ -246,7 +246,7 @@ pub fn map_program<F: EntryFormat, M: PhysicalMemory, A: Frames>(
         PageTable::<F>::new(mem, &mut || frames.alloc()).map_err(|_| elf::ElfError::OutOfMemory)?;
     let bias = if main.relocatable { PIE_BASE } else { 0 };
     let mut layout = Layout {
-        pc: main.entry + bias,
+        pc: main.entry.wrapping_add(bias),
         aux: elf::Aux::of(main, bias),
         brk_start: main.end() + bias,
         mmap_next: MMAP_BASE,
@@ -313,6 +313,10 @@ pub fn start_at<F: EntryFormat>(
     envp: &[&[u8]],
     random: [u8; 16],
 ) -> Result<Cell, elf::ElfError> {
+    if layout.pc >= USER_END {
+        space::destroy(pt, mem, frames);
+        return Err(elf::ElfError::BadEntry(layout.pc));
+    }
     if let Some(kernel) = kernel {
         pt.share_upper_half(mem, kernel);
     }

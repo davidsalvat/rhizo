@@ -12,6 +12,10 @@ cells or the kernel.
 - **WHEN** a cell with an 8 MiB memory quota takes memory until refused, next to a cell without quota that asks for 16 MiB
 - **THEN** the first is refused with `-ENOMEM` having taken at most 8 MiB, the other gets all it asked for, and every frame comes back when both end
 
+#### Scenario: Holes of a mapped file count
+- **WHEN** a cell with an 8 MiB memory quota maps a one-byte file of its own 1 MiB at a time until refused, next to a cell without quota that asks for 16 MiB
+- **THEN** the pages past the file's end count in its quota: it is refused with `-ENOMEM` having taken at most 8 MiB, and the other gets all it asked for
+
 ### Requirement: CPU time quota per cell
 The host SHALL be able to set how much CPU time a cell may use over its
 life, its system calls included. A cell past it SHALL be ended at the end
@@ -23,10 +27,15 @@ of the time slice that used it up, with a report in its output.
 
 ### Requirement: Descriptor and socket quotas per cell
 The host SHALL be able to set how many descriptors (at most 1024) and
-sockets a cell may hold. A new descriptor past the first SHALL fail with
+sockets a cell may hold; without a quota from the host, a cell SHALL hold
+at most 256 sockets. A new descriptor past the first SHALL fail with
 `-EMFILE`, a new socket past the second with `-ENFILE`, and
 `getrlimit`/`prlimit64` SHALL report the cell's quotas on descriptors,
 memory and CPU time.
+
+#### Scenario: A bounded share of sockets by default
+- **WHEN** a cell for which the host set no quota, and its fork, make sockets until refused
+- **THEN** each gets 256 sockets then `-ENFILE`, so no cell holds more than an eighth of the kernel's 4096 sockets with the server ends of its own connections
 
 #### Scenario: Opening until refused
 - **WHEN** a cell with quotas of 16 descriptors and 3 sockets makes sockets until refused, closes them, then opens files until refused

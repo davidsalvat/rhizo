@@ -36,7 +36,10 @@ for now: 4 bytes per frame of global state for a precision the bound above
 already gives.
 
 File data stays out: it has its own bound per cell (64 MiB of data, 4096
-names), and counting it would need hooks in `rhizo-fs` on every free.
+names), and counting it would need hooks in `rhizo-fs` on every free. A
+hole or a page past the end of a mapped file is not file data: it is the
+cell's alone, never kept by the page cache, so it comes from the cell's
+frames and is counted (finding S20).
 
 ## D2. CPU time: per slice, checked at its end
 
@@ -76,3 +79,20 @@ A new socket descriptor is refused with `ENFILE` once the cell holds its
 quota of socket descriptions (a duplicate descriptor shares its socket and
 is not counted again). The kernel's network socket made for a refused
 call is released at once, as when no descriptor is free today.
+
+## D5. A default socket quota (finding S21)
+
+The kernel holds at most 4096 sockets for all cells. Without a quota a
+cell could hold about half: 1024 connections to its own listener, each
+with the server end the kernel makes at `connect`. A new cell therefore
+gets `Quota::DEFAULT`: no limit on memory or CPU time, 1024 descriptors,
+256 sockets. With the server ends of its own connections, a cell holds at
+most 512 sockets, an eighth of the pool; a compile-time check in the
+kernel keeps it so. The file tables start with the same limit, so making
+a live cell from a new `Cell` copies no tables. The host may set any
+quota, `Quota::NONE` included.
+
+Alternative: count the kernel's sockets per cell in `rhizo-net`, server
+ends included. Rejected: an owner per socket, fork and snapshot records
+to carry it, for a bound the descriptor count already gives within a
+factor of two.
