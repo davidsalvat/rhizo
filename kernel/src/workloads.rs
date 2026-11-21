@@ -306,47 +306,49 @@ fn server(console: &mut impl Console) {
     let (mut next_op, mut turn, mut child) = (t0, 0, None);
     let (mut host_cycles, mut host_ops) = (0u64, 0u64);
     let (mut suspend_ns, mut resume_ns, mut fork_ns) = (Vec::new(), Vec::new(), Vec::new());
-    loop {
-        let now = now_ns();
-        peak = peak.max(start - memory::free_bytes());
-        if now >= next_op && now < stop_ops {
-            next_op = now + HOST_PERIOD_NS;
-            let c0 = Counter.cycles();
-            if let Some(id) = child.take() {
+    // From the run's stop condition: the other CPUs, if any, keep running
+    // their cells meanwhile (design D1 of `host-ops-per-cell`).
+    let mut done = false;
+    while !done {
+        host.run(|host| {
+            let now = now_ns();
+            peak = peak.max(start - memory::free_bytes());
+            if now >= next_op && now < stop_ops {
+                next_op = now + HOST_PERIOD_NS;
+                let c0 = Counter.cycles();
+                if let Some(id) = child.take() {
+                    host.kill(id);
+                }
+                turn = (turn + 1) % workers.len();
+                let (id, kind) = workers[turn];
+                let c1 = Counter.cycles();
+                if let Some(snapshot) = host.suspend(id) {
+                    let c2 = Counter.cycles();
+                    let new = host
+                        .resume(snapshot, Resume::Lazy, true, false)
+                        .expect("resume a worker");
+                    workers[turn] = (new, kind);
+                    suspend_ns.push(c2 - c1);
+                    resume_ns.push(Counter.cycles() - c2);
+                    host_ops += 2;
+                }
+                let parent = workers[turn - turn % MIX.len()].0; // computes
+                let c3 = Counter.cycles();
+                if let Some(ids) = host.fork(parent, 1) {
+                    fork_ns.push(Counter.cycles() - c3);
+                    child = ids.first().copied();
+                    host_ops += 1;
+                }
+                host_cycles += Counter.cycles() - c0;
+            }
+            if now >= stop_ops
+                && let Some(id) = child.take()
+            {
                 host.kill(id);
             }
-            turn = (turn + 1) % workers.len();
-            let (id, kind) = workers[turn];
-            let c1 = Counter.cycles();
-            if let Some(snapshot) = host.suspend(id) {
-                let c2 = Counter.cycles();
-                let new = host
-                    .resume(snapshot, Resume::Lazy, true, false)
-                    .expect("resume a worker");
-                workers[turn] = (new, kind);
-                suspend_ns.push(c2 - c1);
-                resume_ns.push(Counter.cycles() - c2);
-                host_ops += 2;
-            }
-            let parent = workers[turn - turn % MIX.len()].0; // computes
-            let c3 = Counter.cycles();
-            if let Some(ids) = host.fork(parent, 1) {
-                fork_ns.push(Counter.cycles() - c3);
-                child = ids.first().copied();
-                host_ops += 1;
-            }
-            host_cycles += Counter.cycles() - c0;
-        }
-        if now >= stop_ops
-            && let Some(id) = child.take()
-        {
-            host.kill(id);
-        }
-        if host.live() == child.is_some() as usize || now >= deadline {
-            break;
-        }
-        let until = if now < stop_ops { next_op } else { deadline };
-        host.run(|_| now_ns() >= until);
+            done = host.live() == child.is_some() as usize || now >= deadline;
+            done
+        });
     }
     let elapsed = now_ns() - t0;
     // What each cell holds at the busiest point: its pages, tables, files,

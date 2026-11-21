@@ -25,6 +25,14 @@ pub use idle::IdleTimer;
 /// Length of a time slice: how long a cell runs before it is preempted.
 pub const SLICE_NS: u64 = 10_000_000;
 
+/// What the scheduler knows an entry by: a key unique among its entries
+/// (a cell's identifier), read once as the entry is added and kept next to
+/// it, so finding an entry compares keys and never reads an entry (design
+/// D4 of `host-ops-per-cell`).
+pub trait Keyed {
+    fn key(&self) -> u32;
+}
+
 /// Runnable entries in one queue per CPU, and sleeping ones by wake time.
 ///
 /// Every runnable entry carries the order in which it became runnable, so
@@ -39,12 +47,13 @@ pub const SLICE_NS: u64 = 10_000_000;
 /// run queue.
 #[derive(Debug, Clone)]
 pub struct Scheduler<T> {
-    /// Per CPU: entries in arrival order, with their arrival number.
-    queues: Vec<VecDeque<(u64, T)>>,
+    /// Per CPU: entries in arrival order, with their arrival number and key.
+    queues: Vec<VecDeque<(u64, u32, T)>>,
     /// Arrival number of the next entry made runnable.
     arrivals: u64,
-    /// Sorted by wake time; equal times keep the order they were added in.
-    sleeping: Vec<(u64, T)>,
+    /// Sorted by wake time, with their key; equal times keep the order they
+    /// were added in.
+    sleeping: Vec<(u64, u32, T)>,
     /// By key (design D2 of `add-socket-wait-queues`), with their deadline
     /// if any.
     waiting: BTreeMap<u32, (Option<u64>, T)>,
@@ -52,7 +61,7 @@ pub struct Scheduler<T> {
     deadlines: BTreeSet<(u64, u32)>,
 }
 
-impl<T> Scheduler<T> {
+impl<T: Keyed> Scheduler<T> {
     /// An empty scheduler for `cpus` CPUs (at least one).
     pub fn new(cpus: usize) -> Self {
         Self {
@@ -65,7 +74,7 @@ impl<T> Scheduler<T> {
     }
 
     fn push(&mut self, cpu: usize, entry: T) {
-        self.queues[cpu].push_back((self.arrivals, entry));
+        self.queues[cpu].push_back((self.arrivals, entry.key(), entry));
         self.arrivals += 1;
     }
 
@@ -102,8 +111,8 @@ impl<T> Scheduler<T> {
     /// Puts `entry` to sleep until `wake_at` (nanoseconds, same clock as
     /// `now`).
     pub fn sleep(&mut self, entry: T, wake_at: u64) {
-        let at = self.sleeping.partition_point(|&(t, _)| t <= wake_at);
-        self.sleeping.insert(at, (wake_at, entry));
+        let at = self.sleeping.partition_point(|&(t, _, _)| t <= wake_at);
+        self.sleeping.insert(at, (wake_at, entry.key(), entry));
     }
 
     /// Makes `entry`, known by `key` (unique among waiting entries), wait
@@ -149,7 +158,7 @@ impl<T> Scheduler<T> {
     /// [`next`](Self::next) does first, for a caller that wants to know
     /// when an entry became runnable.
     pub fn wake_due(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
-        let due = self.sleeping.partition_point(|&(t, _)| t <= now);
+        let due = self.sleeping.partition_point(|&(t, _, _)| t <= now);
         if due > 0 {
             let Self {
                 queues,
@@ -157,9 +166,9 @@ impl<T> Scheduler<T> {
                 sleeping,
                 ..
             } = self;
-            for (_, mut entry) in sleeping.drain(..due) {
+            for (_, key, mut entry) in sleeping.drain(..due) {
                 f(&mut entry);
-                queues[cpu].push_back((*arrivals, entry));
+                queues[cpu].push_back((*arrivals, key, entry));
                 *arrivals += 1;
             }
         }
@@ -178,7 +187,7 @@ impl<T> Scheduler<T> {
     fn oldest(&self, except: Option<usize>) -> Option<usize> {
         (0..self.queues.len())
             .filter(|&c| Some(c) != except)
-            .filter_map(|c| self.queues[c].front().map(|&(seq, _)| (seq, c)))
+            .filter_map(|c| self.queues[c].front().map(|&(seq, _, _)| (seq, c)))
             .min()
             .map(|(_, c)| c)
     }
@@ -193,7 +202,7 @@ impl<T> Scheduler<T> {
         } else {
             cpu
         };
-        self.queues[from].pop_front().map(|(_, e)| e)
+        self.queues[from].pop_front().map(|(_, _, e)| e)
     }
 
     /// Wakes the sleepers whose time has come (onto CPU 0's queue) and
@@ -201,13 +210,13 @@ impl<T> Scheduler<T> {
     pub fn next_oldest(&mut self, now: u64) -> Option<T> {
         self.wake_due(0, now, |_| {});
         let from = self.oldest(None)?;
-        self.queues[from].pop_front().map(|(_, e)| e)
+        self.queues[from].pop_front().map(|(_, _, e)| e)
     }
 
     /// Earliest wake-up time among sleepers and waiters with a deadline.
     pub fn next_wake(&self) -> Option<u64> {
         let waiter = self.deadlines.first().map(|&(d, _)| d);
-        match (self.sleeping.first().map(|&(t, _)| t), waiter) {
+        match (self.sleeping.first().map(|&(t, _, _)| t), waiter) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -218,58 +227,56 @@ impl<T> Scheduler<T> {
         self.queues.iter().map(VecDeque::len).sum()
     }
 
-    /// Removes and returns the first entry (runnable or sleeping) matching
-    /// `pred`.
-    pub fn remove(&mut self, pred: impl FnMut(&T) -> bool) -> Option<T> {
-        self.remove_with_wake(pred).map(|(entry, _)| entry)
-    }
-
-    /// Like [`remove`](Self::remove), also returning the wake time if the
-    /// entry was sleeping (a waiting entry is returned as runnable: what it
-    /// waits for is checked again when it runs).
-    pub fn remove_with_wake(
-        &mut self,
-        mut pred: impl FnMut(&T) -> bool,
-    ) -> Option<(T, Option<u64>)> {
+    /// Removes the entry known by `key` (runnable, waiting or sleeping),
+    /// with its wake time if it was sleeping (a waiting entry is returned
+    /// as runnable: what it waits for is checked again when it runs).
+    pub fn remove(&mut self, key: u32) -> Option<(T, Option<u64>)> {
         for queue in &mut self.queues {
-            if let Some(i) = queue.iter().position(|(_, e)| pred(e)) {
-                return queue.remove(i).map(|(_, e)| (e, None));
+            if let Some(i) = queue.iter().position(|e| e.1 == key) {
+                return queue.remove(i).map(|(_, _, e)| (e, None));
             }
         }
-        if let Some(key) = self
-            .waiting
-            .iter()
-            .find(|(_, (_, e))| pred(e))
-            .map(|(&k, _)| k)
-        {
-            return self.take_waiting(key).map(|e| (e, None));
+        if let Some(entry) = self.take_waiting(key) {
+            return Some((entry, None));
         }
-        let i = self.sleeping.iter().position(|(_, e)| pred(e))?;
-        let (wake, entry) = self.sleeping.remove(i);
+        let i = self.sleeping.iter().position(|e| e.1 == key)?;
+        let (wake, _, entry) = self.sleeping.remove(i);
         Some((entry, Some(wake)))
     }
 
-    /// The first entry (runnable, waiting or sleeping) matching `pred`.
-    pub fn find(&self, mut pred: impl FnMut(&T) -> bool) -> Option<&T> {
+    /// Removes some entry, if there is one (to empty the scheduler).
+    pub fn pop(&mut self) -> Option<T> {
+        if let Some(&key) = self.waiting.keys().next() {
+            return self.take_waiting(key);
+        }
+        let queued = self.queues.iter_mut().find_map(VecDeque::pop_front);
+        queued.or_else(|| self.sleeping.pop()).map(|(_, _, e)| e)
+    }
+
+    /// The entry known by `key` (runnable, waiting or sleeping).
+    pub fn find(&self, key: u32) -> Option<&T> {
+        if let Some((_, e)) = self.waiting.get(&key) {
+            return Some(e);
+        }
         self.queues
             .iter()
             .flatten()
-            .map(|(_, e)| e)
-            .chain(self.waiting.values().map(|(_, e)| e))
-            .chain(self.sleeping.iter().map(|(_, e)| e))
-            .find(|e| pred(e))
+            .chain(self.sleeping.iter())
+            .find(|e| e.1 == key)
+            .map(|(_, _, e)| e)
     }
 
-    /// The first entry (runnable, waiting or sleeping) matching `pred`,
-    /// mutably.
-    pub fn find_mut(&mut self, mut pred: impl FnMut(&T) -> bool) -> Option<&mut T> {
+    /// The entry known by `key` (runnable, waiting or sleeping), mutably.
+    pub fn find_mut(&mut self, key: u32) -> Option<&mut T> {
+        if let Some((_, e)) = self.waiting.get_mut(&key) {
+            return Some(e);
+        }
         self.queues
             .iter_mut()
             .flatten()
-            .map(|(_, e)| e)
-            .chain(self.waiting.values_mut().map(|(_, e)| e))
-            .chain(self.sleeping.iter_mut().map(|(_, e)| e))
-            .find(|e| pred(e))
+            .chain(self.sleeping.iter_mut())
+            .find(|e| e.1 == key)
+            .map(|(_, _, e)| e)
     }
 
     /// Number of entries, runnable, waiting and sleeping.
@@ -341,6 +348,30 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    impl Keyed for usize {
+        fn key(&self) -> u32 {
+            *self as u32
+        }
+    }
+
+    impl Keyed for u32 {
+        fn key(&self) -> u32 {
+            *self
+        }
+    }
+
+    impl Keyed for i32 {
+        fn key(&self) -> u32 {
+            *self as u32
+        }
+    }
+
+    impl Keyed for char {
+        fn key(&self) -> u32 {
+            *self as u32
+        }
+    }
+
     #[test]
     fn round_robin_in_arrival_order() {
         let mut s = Scheduler::new(1);
@@ -383,19 +414,35 @@ mod tests {
     }
 
     #[test]
-    fn remove_finds_runnable_and_sleeping_entries() {
+    fn remove_finds_runnable_and_sleeping_entries_by_key() {
         let mut s = Scheduler::new(1);
         s.place(1);
         s.sleep(2, 10);
         assert_eq!(s.len(), 2);
-        assert_eq!(s.find(|&e| e == 2), Some(&2));
-        *s.find_mut(|&e| e == 1).unwrap() = 3;
-        assert_eq!(s.find(|&e| e == 3), Some(&3));
-        *s.find_mut(|&e| e == 3).unwrap() = 1;
-        assert_eq!(s.remove_with_wake(|&e| e == 2), Some((2, Some(10))));
-        assert_eq!(s.remove(|&e| e == 9), None);
-        assert_eq!(s.remove(|&e| e == 1), Some(1));
+        assert_eq!(s.find(2), Some(&2));
+        // The key is the one the entry had when it was added.
+        *s.find_mut(1).unwrap() = 3;
+        assert_eq!(s.find(1), Some(&3));
+        assert_eq!(s.find(3), None);
+        *s.find_mut(1).unwrap() = 1;
+        assert_eq!(s.remove(2), Some((2, Some(10))));
+        assert_eq!(s.remove(9), None);
+        assert_eq!(s.remove(1), Some((1, None)));
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn pop_empties_every_place() {
+        let mut s = Scheduler::new(2);
+        s.place(1);
+        s.place(2);
+        s.sleep(3, 10);
+        s.wait(4, 4, Some(5));
+        let mut seen: Vec<i32> = core::iter::from_fn(|| s.pop()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [1, 2, 3, 4]);
+        assert!(s.is_empty());
+        assert_eq!(s.next_wake(), None);
     }
 
     #[test]
@@ -466,6 +513,9 @@ mod tests {
         Sleep(usize, u64),
         /// Time passes.
         Tick(u64),
+        /// The host takes this entry out by its key, if no CPU runs it, and
+        /// puts it back where it was (asleep, or runnable).
+        Host(usize),
     }
 
     fn op(cpus: usize) -> impl Strategy<Value = Op> {
@@ -474,11 +524,13 @@ mod tests {
             (0..cpus).prop_map(Op::Preempt),
             (0..cpus, 1u64..20).prop_map(|(c, d)| Op::Sleep(c, d)),
             (1u64..10).prop_map(Op::Tick),
+            (0usize..12).prop_map(Op::Host),
         ]
     }
 
     proptest! {
-        /// Several CPUs taking, preempting and putting to sleep entries in
+        /// Several CPUs taking, preempting and putting to sleep entries, and
+        /// the host taking entries out by key and putting them back, in
         /// any interleaving: no entry is lost or held twice, none runs
         /// before its wake time, and a CPU finds nothing only when no queue
         /// holds anything and no sleeper is due.
@@ -518,6 +570,21 @@ mod tests {
                         }
                     }
                     Op::Tick(d) => now += d,
+                    Op::Host(e) if e < entries => {
+                        let taken = s.remove(e as u32);
+                        if running.contains(&Some(e)) {
+                            prop_assert!(taken.is_none(), "{} is running", e);
+                        } else {
+                            let (got, wake_at) = taken.expect("not running: in the scheduler");
+                            prop_assert_eq!(got, e);
+                            match wake_at {
+                                Some(t) => s.sleep(e, t),
+                                None => {
+                                    s.place(e);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 // Every entry is in exactly one place.
@@ -526,7 +593,7 @@ mod tests {
                     seen[*e] += 1;
                 }
                 for (e, n) in seen.iter_mut().enumerate() {
-                    if s.find(|&x| x == e).is_some() {
+                    if s.find(e as u32).is_some() {
                         *n += 1;
                     }
                 }
@@ -610,7 +677,7 @@ mod tests {
         assert_eq!(s.next(0, 100), Some('b'));
         assert_eq!(s.next(0, 1_000), None, "no deadline: waits for a wake");
         assert_eq!(s.next_wake(), None);
-        assert_eq!(s.find(|&e| e == 'a'), Some(&'a'));
+        assert_eq!(s.find(1), Some(&'a'), "by the key it waits with");
         assert!(!s.wake(0, 2, |_| {}), "no longer waits");
         assert!(s.wake(0, 1, |_| {}));
         assert_eq!(s.waiting(), 0);
@@ -621,8 +688,8 @@ mod tests {
     fn a_removed_waiter_comes_back_runnable() {
         let mut s = Scheduler::new(1);
         s.wait(7, 1, Some(10));
-        *s.find_mut(|&e| e == 1).unwrap() = 2;
-        assert_eq!(s.remove_with_wake(|&e| e == 2), Some((2, None)));
+        *s.find_mut(7).unwrap() = 2;
+        assert_eq!(s.remove(7), Some((2, None)));
         assert!(s.is_empty());
         assert_eq!(s.next_wake(), None, "its deadline went with it");
     }

@@ -648,6 +648,7 @@ fn measure_cells(
         let (mut thread_scaling, mut shootdown, mut timer_error) =
             (Vec::new(), Vec::new(), Vec::new());
         let mut syscall_scaling = Vec::new();
+        let (mut host_op_stall, mut host_op_stall_stopped) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 3) {
             let smp = RunOptions {
                 cpus: crate::SMP_CPUS,
@@ -666,6 +667,8 @@ fn measure_cells(
                     }
                     shootdown.push(s.shootdown_ns as f64 / 1000.0);
                     timer_error.push(s.timer_error_ns as f64 / 1000.0);
+                    host_op_stall.push(s.host_op_stall_ns as f64 / 1000.0);
+                    host_op_stall_stopped.push(s.host_op_stall_stopped_ns as f64 / 1000.0);
                     if s.syscalls_serial_ns > 0 {
                         syscall_scaling.push(
                             100.0 * s.syscalls_parallel_ns as f64 * s.cpus as f64
@@ -732,6 +735,12 @@ fn measure_cells(
             ("cell.switch_kpti_ns", "ns", &mut switch_kpti),
             ("cell.run_kpti_us", "us", &mut run_kpti),
             ("cell.syscall_scaling_pct", "%", &mut syscall_scaling),
+            ("cell.host_op_stall_us", "us", &mut host_op_stall),
+            (
+                "cell.host_op_stall_stopped_us",
+                "us",
+                &mut host_op_stall_stopped,
+            ),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
                 let why = match crate::hostnet::for_vmm(vmm) {
@@ -1050,6 +1059,11 @@ struct SmpLine {
     /// and on every CPU (design D3 of `split-sockets-lock`).
     syscalls_serial_ns: u64,
     syscalls_parallel_ns: u64,
+    /// The median longest stall of a running cell while the host operates
+    /// on another from the run's stop condition, and between runs (design
+    /// D6 of `host-ops-per-cell`).
+    host_op_stall_ns: u64,
+    host_op_stall_stopped_ns: u64,
 }
 
 fn parse_smp_line(output: &str) -> Option<SmpLine> {
@@ -1071,6 +1085,8 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         timer_error_ns: field("timer_error_ns")?,
         syscalls_serial_ns: field("syscalls_serial_ns")?,
         syscalls_parallel_ns: field("syscalls_parallel_ns")?,
+        host_op_stall_ns: field("host_op_stall_ns")?,
+        host_op_stall_stopped_ns: field("host_op_stall_stopped_ns")?,
     })
 }
 
@@ -2650,7 +2666,8 @@ mod tests {
             parse_smp_line(
                 "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000 \
                  threads1_ns=400 threads4_ns=110 shootdown_ns=3000 timer_error_ns=40000 \
-                 syscalls_serial_ns=900 syscalls_parallel_ns=250\n"
+                 syscalls_serial_ns=900 syscalls_parallel_ns=250 host_op_stall_ns=20000 \
+                 host_op_stall_stopped_ns=900000\n"
             ),
             Some(SmpLine {
                 cpus: 4,
@@ -2663,6 +2680,8 @@ mod tests {
                 timer_error_ns: 40000,
                 syscalls_serial_ns: 900,
                 syscalls_parallel_ns: 250,
+                host_op_stall_ns: 20000,
+                host_op_stall_stopped_ns: 900000,
             })
         );
         assert_eq!(parse_smp_line("rhizo-smp cpus=4 serial_ns=1\n"), None);
