@@ -22,4 +22,4 @@
 ## 5. Benchmarks and CI
 
 - [x] 5.1 Every `-icount` gate (D6); verify `cargo xtask bench --icount-only --env ci --check` on x86_64 and `--env ci-arm` on AArch64
-- [ ] 5.2 Everything CI runs; verify `cargo xtask check`, `openspec validate close-cross-cell-leaks --strict` and CI
+- [x] 5.2 Everything CI runs; verify `cargo xtask check`, `openspec validate close-cross-cell-leaks --strict` and CI (pull request #113, run 44920168317, green)

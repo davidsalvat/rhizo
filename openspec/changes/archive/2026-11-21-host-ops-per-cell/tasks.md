@@ -19,4 +19,4 @@
 
 ## 4. CI
 
-- [ ] 4.1 Everything CI runs; verify `cargo xtask check` and CI
+- [x] 4.1 Everything CI runs; verify `cargo xtask check` and CI (pull request #101, run 44911472691, green)

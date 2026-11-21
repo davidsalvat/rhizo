@@ -218,5 +218,36 @@ before work starts, and semantic conflicts fixed by a small patch.
 
 ## Result
 
-Measured on this pull request's own CI runs; see `tasks.md` 4.1 and the
-pull request description.
+Measured after the merge, from `gh api
+repos/davidsalvat/rhizo/actions/runs/<id>/jobs` (job start to completion;
+wall clock from the first job's start to the last job's end): the pull
+request's own run 44926262096 (#116, classified code: 16 changed paths), the
+push to main it made (44927008389 and `bench.yml` 44927008397), and the
+two docs-only pull requests merged next (#117 run 44929217278, #118 run
+44929592808).
+
+| Job | Baseline PR median | #116 (code) | main push |
+|---|---|---|---|
+| `changes` (classify) | — | 0.1 min | 0.2 min |
+| `quick` (`xtask check`) | — | 1.6 min | 1.7 min |
+| `policy` | 2.0 min | 1.6 min | 1.7 min |
+| `docs` | — | 0.2 min | 0.1 min |
+| `ci-arm64` (AArch64 tests) | 8.3 min (with counts) | 6.1 min | 5.7 min |
+| `icount-aarch64` | (in the job above) | 3.5 min | 3.5 min |
+| `ci` (x86_64 tests) | 4.5 min | 4.1 min | 4.8 min |
+| `vmm` (Firecracker, Cloud Hypervisor) | 9.0 min (with timings) | 2.6 min | 2.6 min |
+| `icount-x86_64` | (in the job above) | 1.8 min | skipped (in `bench.yml`) |
+| `miri` | 3.6 min | 3.7 min | 3.7 min |
+| **Wall clock** | **9.0 min** | **8.0 min** | **7.7 min** |
+| `bench.yml` (timings and gate) | — | — | 7.0 min, in parallel |
+
+The critical path is as D4 predicted: `changes` + `quick` (1.8 min before
+the heavy jobs start) + `ci-arm64` (6.1 min), 8.0 minutes against a 9.0
+minute median, about 11 % less. The longest job is no longer the timing
+benchmark but the AArch64 tests, now without the instruction counts.
+Docs-only pull requests, which took 9.4 minutes before, ran only
+`changes`, `docs` and `ci-ok`: 0.5 and 0.6 minutes. The classifier's
+verdict on #116 was `code` (it changes `.github/**` and `xtask`), as D1
+specifies; #117 and #118 were `docs`. On main, the run is 7.7 minutes and
+the timing gate runs beside it in `bench.yml` (7.0 minutes) without
+blocking any pull request.

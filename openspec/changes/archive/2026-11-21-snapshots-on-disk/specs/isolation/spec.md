@@ -6,7 +6,8 @@
 Snapshot bytes SHALL be treated as written by anyone: any bytes SHALL be
 refused with a format error, or resume into a cell that changes no kernel
 memory or kernel page-table entry, maps only user pages below `USER_END`
-and never writable and executable at once, starts every thread below
+and never writable and executable at once, keeps only write-or-execute
+ranges below `USER_END` and at most 64 of them, starts every thread below
 `USER_END`, has files whose every operation answers instead of panicking,
 and gives every frame back when it ends.
 

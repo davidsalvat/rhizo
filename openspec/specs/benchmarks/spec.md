@@ -62,12 +62,15 @@ with KVM SHALL use tight timing thresholds.
 - **THEN** timing metrics use the wide thresholds stored for `ci`
 
 ### Requirement: Benchmark gate in CI
-Every pull request SHALL run the benchmark gate in the `ci` environment, and a
-failing gate SHALL fail the pull request.
+Every pull request that changes code SHALL run the benchmark gate on the
+instruction counts under QEMU with `-icount` only, on both architectures
+(`cargo xtask bench --icount-only --check`), each count measured once, and
+a failing gate SHALL fail the pull request. Timings SHALL NOT gate pull
+requests.
 
 #### Scenario: Slow pull request
-- **WHEN** a pull request regresses a metric beyond its `ci` threshold
-- **THEN** the CI run for that pull request fails
+- **WHEN** a pull request adds more instructions to a gated operation than its threshold allows
+- **THEN** the CI run for that pull request fails naming the `-icount` metric
 
 ### Requirement: Comparison chart in the README
 `cargo xtask bench --readme` SHALL regenerate a chart in the README comparing
@@ -117,8 +120,8 @@ to the Firecracker and Linux-process measurements of the same run, showing
 - **THEN** the Firecracker column of the resume row shows "—"
 
 ### Requirement: Complete results from CI
-The CI benchmark job SHALL publish its complete results, so the README can
-be regenerated from them exactly.
+The benchmark run on main SHALL publish its complete results, so the
+README can be regenerated from them exactly.
 
 #### Scenario: Large results
 - **WHEN** the results JSON is larger than one annotation
@@ -143,8 +146,9 @@ rounds, of the median of each round.
 
 ### Requirement: File metrics are gated
 The `ci` baseline SHALL include `cell.file_write_read_us` and
-`cell.fork_with_files_us` for every VMM that measures cells, so the bench
-gate fails a pull request that makes them slower beyond the threshold.
+`cell.fork_with_files_us` for every VMM that measures cells, so the
+benchmark run on main fails when a change makes them slower beyond the
+threshold.
 
 #### Scenario: Slower file input and output
 - **WHEN** a change makes `cell.file_write_read_us` slower than its `ci` baseline by more than the timing threshold
@@ -421,16 +425,17 @@ listed as skipped with the reason.
 - **THEN** the results contain `control.roundtrip_us` and the five operation times for guest `rhizo` on `qemu-microvm`
 
 ### Requirement: AArch64 instruction gate in CI
-Every pull request SHALL count the AArch64 kernel's benchmarks in retired
-instructions under QEMU with `-icount` (`cargo xtask bench --icount-only`)
-on a GitHub-hosted ARM64 runner, and SHALL fail when a gated count is
-worse than its baseline in the `ci-arm` environment by more than the
-instructions threshold. The results SHALL be published under annotation
-titles distinct from the x86_64 job's.
+Every pull request that changes code, and every push to main, SHALL count
+the AArch64 kernel's benchmarks in retired instructions under QEMU with
+`-icount` (`cargo xtask bench --icount-only`) on a GitHub-hosted ARM64
+runner, and SHALL fail when a gated count is worse than its baseline in
+the `ci-arm` environment by more than the instructions threshold. The
+results SHALL be published under annotation titles distinct from the
+x86_64 job's.
 
 #### Scenario: AArch64-only regression
 - **WHEN** a pull request adds more than 2 % of instructions to a gated operation on AArch64 only
-- **THEN** the AArch64 CI job fails naming the `qemu-virt-icount` metric
+- **THEN** the AArch64 instruction-count CI job fails naming the `qemu-virt-icount` metric
 
 #### Scenario: Same operations on both architectures
 - **WHEN** the AArch64 kernel runs under `-icount` with performance counters in the guest
@@ -523,8 +528,8 @@ start. The breakdown line SHALL report when that moment came as
 ### Requirement: Server tail latencies are gated
 The `ci` baseline SHALL include `density.sched_p99_us` and
 `density.wake_p99_us` for every VMM that runs the server workload, so the
-bench gate fails a pull request that makes them slower beyond the timing
-threshold.
+benchmark run on main fails when a change makes them slower beyond the
+timing threshold.
 
 #### Scenario: A longer wake-up tail
 - **WHEN** a change makes `density.wake_p99_us` slower than its `ci` baseline by more than the timing threshold
@@ -562,3 +567,116 @@ fork.
 #### Scenario: Forks do not wait for the pause
 - **WHEN** `workload.node_warm_us` is measured
 - **THEN** no fork waits for the script's 50 ms pause after `warm`, and the figure is below `workload.node_cold_us`
+
+### Requirement: Node.js JIT metrics
+Where Node.js is packed, `cargo xtask bench` SHALL report the times of
+`workload.node_cold_us` and `workload.node_warm_us` measured the same way
+with V8's JIT (`workload.node_jit_cold_us`, `workload.node_jit_warm_us`),
+and the write-or-execute pages made running by a fault in
+one cold run with the JIT (`workload.node_jit_flips`), from the same
+kernel; where it is not packed, they SHALL be listed as skipped with the
+reason.
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench --workload node` runs with `RHIZO_NODE` set
+- **THEN** the results contain `workload.node_jit_cold_us`, `workload.node_jit_warm_us` and `workload.node_jit_flips` for guest `rhizo`, next to the `--jitless` figures
+
+#### Scenario: Not packed
+- **WHEN** `cargo xtask bench` runs without `RHIZO_NODE`
+- **THEN** `workload.node_jit_*` is listed as skipped with the reason
+
+### Requirement: Server templates frozen asleep
+The server workload SHALL freeze each `worker` template only once it
+sleeps, so that every worker forked from it starts its operations at once.
+
+#### Scenario: Four CPUs
+- **WHEN** `cargo xtask --arch x86_64 bench --workload server --cpus 4` runs on QEMU `microvm`
+- **THEN** 10,000 workers run on 4 vCPUs, each exits with 0, and the load ends on time
+
+### Requirement: Server workload on several CPUs
+The server VM SHALL have 1 virtual CPU, or the number `--cpus` gives (1 to
+4) for a run that neither checks nor updates the baseline.
+
+#### Scenario: Several CPUs against the baseline
+- **WHEN** `cargo xtask bench --cpus 4 --check` runs
+- **THEN** it is refused before anything runs
+
+### Requirement: Snapshot file metrics
+`cargo xtask bench` SHALL report on QEMU, with CPython built, for the chat
+agent frozen into a template after one turn: the time to save it
+(`snapshot.save_us`), its size (`snapshot.file_bytes`), the time to load it
+as a template into a fresh VM (`snapshot.load_us`), and there the time
+from a `fork` of it to its first answer (`snapshot.loaded_answer_us`) next
+to that from a `run` of a new agent (`snapshot.cold_answer_us`).
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench` runs on QEMU `microvm` with CPython built
+- **THEN** the results contain the five snapshot file metrics for guest `rhizo` on `qemu-microvm`
+
+### Requirement: Host operation stall metrics
+The 4-vCPU `bench-cell` boot of `cargo xtask bench` SHALL report
+`cell.host_op_stall_us`: the median, over rounds in which the host forks a
+spinning cell, kills the child, and suspends and resumes the spinner from
+the run's stop condition, of the longest time a running `progress` cell
+went without running. It SHALL also report `cell.host_op_stall_stopped_us`,
+the same with each round made between runs, for comparison.
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench` runs on a VMM where the counter frequency is known
+- **THEN** the results contain `cell.host_op_stall_us` and `cell.host_op_stall_stopped_us`
+
+### Requirement: Host operations at the server's target
+The server workload SHALL report the median time of the host's
+operations made during its load, with every worker live:
+`density.suspend_us` (suspending a worker), `density.fork_us` (forking a
+computing worker) and `density.kill_us` (killing the previous fork).
+
+#### Scenario: Metrics present
+- **WHEN** the server workload runs
+- **THEN** the results contain `density.suspend_us`, `density.fork_us` and `density.kill_us` for that VMM, from its breakdown line
+
+### Requirement: Snapshot export and import metrics
+`cargo xtask bench` SHALL report, from the cell benchmark, the time to
+export the 8 MiB `ballast` snapshot to bytes with its checksum
+(`cell.snapshot_export_us`) and the time to check and decode those bytes
+(`cell.snapshot_import_us`), each the median of 7 rounds, on every VMM,
+and counted in instructions under QEMU `-icount`.
+
+#### Scenario: Metrics present
+- **WHEN** `cargo xtask bench` runs on any VMM
+- **THEN** the results contain `cell.snapshot_export_us` and `cell.snapshot_import_us` for guest `rhizo` on that VMM
+
+#### Scenario: Counted under icount
+- **WHEN** `cargo xtask bench --icount-only` runs
+- **THEN** the results contain `cell.snapshot_export_insns` and `cell.snapshot_import_insns`
+
+### Requirement: Full benchmark gate on main
+Every push to main, and a nightly scheduled run, SHALL run every benchmark
+with the full gate in the `ci` environment: timings, and the metrics that
+have no instruction count.
+
+#### Scenario: Timing regression
+- **WHEN** a change merged into main makes a timing metric worse than its `ci` threshold
+- **THEN** the benchmark run on main fails naming the metric
+
+### Requirement: Failing timing gate reported
+When the benchmark gate fails on main or in the scheduled run, CI SHALL
+open an issue, or comment on the open one, naming each failing metric, the
+run, and the commits since the last successful benchmark run on main. Only
+that reporting step SHALL have write access to issues.
+
+#### Scenario: Regression on main
+- **WHEN** the gate on main fails on `cell.fork_us/rhizo/firecracker`
+- **THEN** the timing-gate issue names that metric, links the run, and lists the commits since the last green benchmark run
+
+### Requirement: FP switch metric
+`cargo xtask bench` SHALL report `cell.switch_fp_ns`: the time per switch
+between two cells that yield to each other while holding values in every
+FP/SIMD register (`fp_regs`), the run of both to their exit minus the same
+run without yields, over the switches. Like every figure the kernel
+times, it SHALL also be counted in instructions under `-icount`
+(`cell.switch_fp_insns`) and by the guest's PMU where there is one.
+
+#### Scenario: Metric present
+- **WHEN** `cargo xtask bench` runs
+- **THEN** the results contain `cell.switch_fp_ns` for guest `rhizo` on each VMM, and `cell.switch_fp_insns` on the `-icount` VMM

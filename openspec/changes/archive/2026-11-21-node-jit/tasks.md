@@ -28,6 +28,6 @@
 
 ## 6. Gates and documents
 
-- [ ] 6.1 Hot paths unchanged: `-icount` gates; verify `cargo xtask bench --env ci --check` in CI
+- [x] 6.1 Hot paths unchanged: `-icount` gates; verify `cargo xtask bench --env ci --check` in CI (pull request #102, run 44887258059, gate green)
 - [x] 6.2 `bench/README.md`, `docs/security.md` (mmap, mprotect, snapshot format), figures in the pull request; verify by reading
-- [ ] 6.3 Everything CI runs; verify `cargo xtask check` and CI
+- [x] 6.3 Everything CI runs; verify `cargo xtask check` and CI (pull request #102, run 44887258059, green)
