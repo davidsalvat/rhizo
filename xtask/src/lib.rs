@@ -459,6 +459,7 @@ fn cmd_test(args: &RunArgs) -> Result {
     }
     if args.wants("control") {
         let kernel = keep_kernel("control", &build_kernel(Profile::Debug, &["control"])?)?;
+        check_kernel_reused(Profile::Debug, &["control"])?;
         jobs.push(Job {
             name: format!("control plane through `rhizo` on {}", args.vmm.id()),
             work: JobWork::Control {
@@ -1165,18 +1166,67 @@ const SELF_CHECKS: &[SelfCheck] = &[
 /// Builds the kernel for the selected architecture and returns the image the
 /// VMMs boot (the ELF on x86_64, a flat arm64 Image on AArch64).
 pub fn build_kernel(profile: Profile, features: &[&str]) -> Result<PathBuf> {
-    let target = arch::current().target();
     let cells = build_cells()?;
-    let mut args = vec!["build", "-p", KERNEL_PACKAGE, "--target", target];
-    if profile == Profile::Release {
-        args.push("--release");
-    }
-    let joined = features.join(",");
-    if !features.is_empty() {
-        args.extend(["--features", &joined]);
-    }
+    let args = kernel_build_args(profile, features);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     cargo_env(&args, &[("RHIZO_CELLS_DIR", cells.as_os_str())])?;
     arch::current().bootable_image(&kernel_elf(profile))
+}
+
+/// The `cargo` arguments that build the kernel.
+fn kernel_build_args(profile: Profile, features: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["build", "-p", KERNEL_PACKAGE, "--target"]
+        .map(String::from)
+        .into();
+    args.push(arch::current().target().into());
+    if profile == Profile::Release {
+        args.push("--release".into());
+    }
+    if !features.is_empty() {
+        args.extend(["--features".into(), features.join(",")]);
+    }
+    args
+}
+
+/// Fails unless building the kernel [`build_kernel`] just built again, with
+/// nothing changed, compiles nothing: an unchanged `rhizo up` reuses its
+/// build (spec `control-plane`, change `fix-cli-nits`).
+fn check_kernel_reused(profile: Profile, features: &[&str]) -> Result {
+    let mut args = kernel_build_args(profile, features);
+    args.push("--message-format=json".into());
+    let out = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(&args)
+        .env("RHIZO_CELLS_DIR", cells_dir())
+        .current_dir(workspace_root())
+        .output()
+        .map_err(|e| format!("failed to run cargo: {e}"))?;
+    let messages = String::from_utf8_lossy(&out.stdout);
+    match (out.status.success(), kernel_fresh(&messages)) {
+        (true, Some(true)) => Ok(()),
+        (_, fresh) => Err(Failure::new("build", "an unchanged kernel is built again")
+            .location(format!("cargo {}", args.join(" ")))
+            .expected("the kernel reported fresh")
+            .actual(match fresh {
+                Some(false) => "compiled again".into(),
+                _ => format!("no kernel artifact ({})", out.status),
+            })
+            .hint(
+                "a build script watches something that changes or is missing on every \
+                 build: run the command with CARGO_LOG=cargo::core::compiler::fingerprint=info",
+            )
+            .reproduce(format!("cargo {}", args.join(" ")))
+            .into_error()),
+    }
+}
+
+/// Whether cargo's JSON `messages` report the kernel executable fresh
+/// (`None`: they do not name it).
+fn kernel_fresh(messages: &str) -> Option<bool> {
+    messages
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == KERNEL_PACKAGE)
+        .find_map(|m| m["fresh"].as_bool())
 }
 
 /// Builds the test cells (`cells/`, static Linux executables for the selected
@@ -1196,12 +1246,20 @@ pub(crate) fn build_cells() -> Result<PathBuf> {
         "--target-dir",
         &dir_str,
     ])?;
-    let out = dir.join(target).join("release");
+    let out = cells_dir();
     build_c_cells(&out)?;
     build_micropython(&out)?;
     cpython::build(&out)?;
     dynamic::build(&out)?;
     Ok(out)
+}
+
+/// Where [`build_cells`] puts the cells.
+fn cells_dir() -> PathBuf {
+    target_dir()
+        .join("cells")
+        .join(arch::current().target())
+        .join("release")
 }
 
 /// MicroPython's commit, pinned (v1.24.1, MIT license).
@@ -1475,6 +1533,37 @@ fn check_vm(ok: bool, check: VmCheck, run: &VmRun) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kernel_s_freshness_is_read_from_cargo_messages() {
+        let artifact = |name: &str, fresh: bool| {
+            format!(
+                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\"}},\"fresh\":{fresh}}}"
+            )
+        };
+        let script = "{\"reason\":\"build-script-executed\",\"package_id\":\"rhizo-kernel\"}";
+        let messages = |lines: &[&str]| lines.join("\n");
+        assert_eq!(
+            kernel_fresh(&messages(&[
+                &artifact("rhizo-mm", false),
+                script,
+                &artifact("rhizo-kernel", true),
+                "{\"reason\":\"build-finished\",\"success\":true}",
+            ])),
+            Some(true)
+        );
+        assert_eq!(
+            kernel_fresh(&messages(&[
+                &artifact("rhizo-mm", true),
+                &artifact("rhizo-kernel", false)
+            ])),
+            Some(false)
+        );
+        assert_eq!(
+            kernel_fresh(&messages(&[&artifact("rhizo-mm", true), script, "garbage"])),
+            None
+        );
+    }
 
     #[test]
     fn run_args_parse_vmm_machine_and_accel() {
