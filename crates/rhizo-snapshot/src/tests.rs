@@ -68,6 +68,7 @@ fn round_trip<F: EntryFormat>() {
     let snap = Snapshot::capture::<F>(
         Machine::Aarch64,
         &original,
+        &WxRanges::default(),
         &Fs::new(),
         &[],
         1000,
@@ -80,6 +81,7 @@ fn round_trip<F: EntryFormat>() {
         Snapshot::capture::<F>(
             Machine::Aarch64,
             &original,
+            &WxRanges::default(),
             &Fs::new(),
             &[],
             1000,
@@ -133,6 +135,7 @@ fn round_trip<F: EntryFormat>() {
     let again = Snapshot::capture::<F>(
         Machine::Aarch64,
         &Cell { id: 9, ..restored },
+        &WxRanges::default(),
         &Fs::new(),
         &[],
         1000,
@@ -146,6 +149,117 @@ fn round_trip<F: EntryFormat>() {
 #[test]
 fn round_trip_aarch64() {
     round_trip::<Aarch64>();
+}
+
+/// A write-or-execute page, writing and running.
+const WX: PageFlags = space::WX_WRITING;
+const WX_RUNNING: PageFlags = PageFlags::USER.union(PageFlags::WRITE_OR_EXEC);
+
+/// Write-or-execute pages keep their state and contents, and the cell its
+/// write-or-execute ranges, through a snapshot (spec `snapshots`, design D7
+/// of `node-jit`).
+fn wx_pages_and_ranges_travel<F: EntryFormat>() {
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let mut tlb = RecordingTlb::default();
+    let c = cell::<F>(&mut mem, &mut frames);
+    let pt = PageTable::<F>::from_root(c.root);
+    for at in [0x70_0000, 0x70_1000] {
+        space::map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, at, 0x1000, WX).unwrap();
+        rhizo_cell::memory::copy_to(&pt, &mut mem, at, &at.to_le_bytes()).unwrap();
+    }
+    assert_eq!(pt.resolve_exec(&mut mem, &mut frames, 0x70_1000), Ok(true));
+    let mut wx = WxRanges::default();
+    wx.add(0x70_0000, 0x80_0000).unwrap();
+    wx.add(0x90_0000, 0x90_2000).unwrap();
+    let snap = Snapshot::capture::<F>(
+        Machine::Aarch64,
+        &c,
+        &wx,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
+    let snap = Snapshot::from_bytes(snap.export(&mem), Machine::Aarch64).unwrap();
+    assert_eq!(snap.wx(), wx);
+    let pt = PageTable::<F>::new(&mut mem, &mut || frames.alloc()).unwrap();
+    for i in 0..snap.pages() {
+        snap.restore_page(i, &pt, &mut mem, &mut frames).unwrap();
+    }
+    for (at, flags) in [(0x70_0000, WX), (0x70_1000, WX_RUNNING)] {
+        assert_eq!(pt.translate(&mem, at).unwrap().flags, flags, "{at:#x}");
+        let mut word = [0; 8];
+        rhizo_cell::memory::copy_from(&pt, &mem, at, &mut word).unwrap();
+        assert_eq!(u64::from_le_bytes(word), at);
+    }
+}
+
+#[test]
+fn wx_pages_and_ranges_travel_aarch64() {
+    wx_pages_and_ranges_travel::<Aarch64>();
+}
+
+#[test]
+fn wx_pages_and_ranges_travel_x86_64() {
+    wx_pages_and_ranges_travel::<X86_64>();
+}
+
+/// A write-or-execute record writable and executable, or neither, and
+/// ranges that break their rules are refused (spec `snapshots`).
+#[test]
+fn rejects_bad_wx_records_and_ranges() {
+    let good = sample();
+    let check =
+        |bytes: Vec<u8>, err| assert_eq!(Snapshot::from_bytes(bytes, Machine::Aarch64), Err(err));
+    let rec0 = HEADER + STATE + THREAD;
+    for (flags, ok) in [
+        (0b1011, false),
+        (0b1110, false),
+        (0b1111, true),
+        (0b1010, true),
+    ] {
+        let mut b = good.clone();
+        b[rec0 + 17] = flags; // the code page
+        match ok {
+            true => assert!(
+                Snapshot::from_bytes(b, Machine::Aarch64).is_ok(),
+                "{flags:#b}"
+            ),
+            false => check(b, FormatError::BadPage { index: 0 }),
+        }
+    }
+    // Ranges after the threads, counted in the header.
+    let with = |ranges: &[(u64, u64)]| {
+        let mut b = good[..rec0].to_vec();
+        b[14..16].copy_from_slice(&(ranges.len() as u16).to_le_bytes());
+        for &(s, e) in ranges {
+            b.extend_from_slice(&s.to_le_bytes());
+            b.extend_from_slice(&e.to_le_bytes());
+        }
+        b.extend_from_slice(&good[rec0..]);
+        b
+    };
+    let snap = Snapshot::from_bytes(with(&[(0x1000, 0x3000)]), Machine::Aarch64).unwrap();
+    assert_eq!(snap.wx().ranges(), &[(0x1000, 0x3000)]);
+    assert_eq!(snap.find(0x60_0000), Some(1), "records after the ranges");
+    for bad in [
+        &[(0x1000, 0x1000)][..],
+        &[(0x1001, 0x2000)],
+        &[(0x3000, 0x4000), (0x1000, 0x2000)],
+        &[(0x1000, 0x2000), (0x2000, 0x3000)],
+        &[(0x1000, USER_END + 0x1000)],
+    ] {
+        check(with(bad), FormatError::BadRanges);
+    }
+    let many: Vec<_> = (0..=space::MAX_WX_RANGES as u64)
+        .map(|i| (0x2000 * (i + 1), 0x2000 * (i + 1) + 0x1000))
+        .collect();
+    check(with(&many), FormatError::BadRanges);
+    let mut cut = with(&[(0x1000, 0x3000)]);
+    cut[14] = 200; // the records read as ranges
+    assert!(Snapshot::from_bytes(cut, Machine::Aarch64).is_err());
 }
 
 #[test]
@@ -163,6 +277,7 @@ fn files_travel_with_the_snapshot() {
     let snap = Snapshot::capture::<Aarch64>(
         Machine::Aarch64,
         &c,
+        &WxRanges::default(),
         &fs,
         &[],
         0,
@@ -206,6 +321,7 @@ fn socket_records_travel_one_per_descriptor() {
     let snap = Snapshot::capture::<Aarch64>(
         Machine::Aarch64,
         &c,
+        &WxRanges::default(),
         &fs,
         std::slice::from_ref(&listener),
         0,
@@ -220,6 +336,7 @@ fn socket_records_travel_one_per_descriptor() {
         let snap = Snapshot::capture::<Aarch64>(
             Machine::Aarch64,
             &c,
+            &WxRanges::default(),
             fs,
             records,
             0,
@@ -272,6 +389,7 @@ fn parked_connections_travel_as_their_key() {
     let snap = Snapshot::capture::<Aarch64>(
         Machine::Aarch64,
         &c,
+        &WxRanges::default(),
         &fs,
         std::slice::from_ref(&parked),
         0,
@@ -294,6 +412,7 @@ fn sample() -> Vec<u8> {
     Snapshot::capture::<Aarch64>(
         Machine::Aarch64,
         &c,
+        &WxRanges::default(),
         &Fs::new(),
         &[],
         0,
@@ -358,6 +477,7 @@ fn x86_64_state_that_would_fault_in_the_kernel_is_refused() {
     let good = Snapshot::capture::<X86_64>(
         Machine::X86_64,
         &c,
+        &WxRanges::default(),
         &Fs::new(),
         &[],
         0,
@@ -416,6 +536,7 @@ fn a_large_page_comes_back_in_small_pages_without_a_large_frame() {
     let snap = Snapshot::capture::<X86_64>(
         Machine::Aarch64,
         &original,
+        &WxRanges::default(),
         &Fs::new(),
         &[],
         0,
@@ -458,6 +579,7 @@ fn rejects_malformed_threads() {
     let good = Snapshot::capture::<Aarch64>(
         Machine::Aarch64,
         &c,
+        &WxRanges::default(),
         &Fs::new(),
         &[],
         0,
@@ -530,9 +652,18 @@ mod hostile {
         let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
         let mut tlb = RecordingTlb::default();
         let pt = PageTable::<X86_64>::new(&mut mem, &mut || frames.alloc()).unwrap();
-        for (at, flags) in [(0x40_0000, RX), (0x60_0000, RW), (0x60_1000, RW)] {
+        for (at, flags) in [
+            (0x40_0000, RX),
+            (0x60_0000, RW),
+            (0x60_1000, RW),
+            (0x70_0000, space::WX_WRITING),
+            (0x70_1000, space::WX_WRITING),
+        ] {
             space::map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, at, 0x1000, flags).unwrap();
         }
+        assert_eq!(pt.resolve_exec(&mut mem, &mut frames, 0x70_1000), Ok(true));
+        let mut wx = WxRanges::default();
+        wx.add(0x70_0000, 0x80_0000).unwrap();
         rhizo_cell::memory::copy_to(&pt, &mut mem, 0x60_0ffc, b"data").unwrap();
         let mut c = Cell::new(9, pt.root(), 0x40_0123, 0x7fff_0000, 0x61_0000);
         let regs = *c.regs();
@@ -575,6 +706,7 @@ mod hostile {
         Snapshot::capture::<X86_64>(
             Machine::X86_64,
             &c,
+            &wx,
             &fs,
             &records,
             0,
@@ -610,6 +742,12 @@ mod hostile {
             }
         }
         let cell = snap.cell(5, pt.root(), 1_000);
+        let wx = snap.wx();
+        assert!(wx.ranges().len() <= space::MAX_WX_RANGES);
+        assert!(
+            wx.ranges().iter().all(|&(_, end)| end <= USER_END),
+            "{wx:?}"
+        );
         for t in cell.threads.iter() {
             assert!(t.regs.pc < USER_END && t.regs.tls < USER_END, "{t:?}");
         }
@@ -655,7 +793,7 @@ mod hostile {
     /// records (where a byte changes the most), and sometimes a cut.
     fn tampered() -> impl Strategy<Value = Vec<u8>> {
         let good = rich();
-        let head = HEADER + STATE + 2 * THREAD + 3 * RECORD;
+        let head = HEADER + STATE + 2 * THREAD + RANGE + 5 * RECORD;
         let at = prop_oneof![3 => 0..head, 1 => 0..good.len()];
         (
             prop::collection::vec((at, any::<u8>()), 1..4),
@@ -739,6 +877,7 @@ fn shared<F: EntryFormat>() {
     let snap = Snapshot::capture::<F>(
         Machine::Aarch64,
         &child,
+        &WxRanges::default(),
         &Fs::new(),
         &[],
         0,

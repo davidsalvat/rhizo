@@ -2,6 +2,7 @@
 //! region allows it), unmapping, and teardown that returns every frame.
 
 use crate::{STACK_LIMIT, STACK_TOP, USER_END};
+use alloc::vec::Vec;
 use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
 use rhizo_mm::{FRAME_SIZE, LARGE_PAGE_SIZE};
@@ -166,6 +167,117 @@ pub fn grow_stack<F: EntryFormat>(
             addr & !(FRAME_SIZE - 1),
             FRAME_SIZE,
             rw,
+        )
+        .is_ok()
+}
+
+/// The permissions of a write-or-execute page as it starts: writing
+/// (change `node-jit`).
+pub const WX_WRITING: PageFlags = PageFlags::USER
+    .union(PageFlags::WRITABLE)
+    .union(PageFlags::NO_EXECUTE)
+    .union(PageFlags::WRITE_OR_EXEC);
+
+/// Most write-or-execute ranges a cell may have (spec `isolation`).
+pub const MAX_WX_RANGES: usize = 64;
+
+/// A cell's write-or-execute ranges (design D5 of `node-jit`): addresses it
+/// asked writable and executable with no memory behind them yet, whose
+/// pages come zeroed, writing, the first time they are touched. Sorted,
+/// page aligned, never empty, never touching, at most [`MAX_WX_RANGES`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WxRanges(Vec<(u64, u64)>);
+
+/// More write-or-execute ranges than [`MAX_WX_RANGES`] would be needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyRanges;
+
+impl WxRanges {
+    /// The ranges `ranges` (`(start, end)` pairs), if they keep the rules
+    /// above and lie within the cell's addresses.
+    pub fn from_ranges(ranges: Vec<(u64, u64)>) -> Option<Self> {
+        let aligned = |a: u64| a.is_multiple_of(FRAME_SIZE);
+        let valid = ranges.len() <= MAX_WX_RANGES
+            && ranges
+                .iter()
+                .all(|&(s, e)| aligned(s) && aligned(e) && s < e && e <= USER_END)
+            && ranges.windows(2).all(|w| w[0].1 < w[1].0);
+        valid.then_some(Self(ranges))
+    }
+
+    /// The ranges, in address order.
+    pub fn ranges(&self) -> &[(u64, u64)] {
+        &self.0
+    }
+
+    /// Whether `addr` lies in a range.
+    pub fn contains(&self, addr: u64) -> bool {
+        self.0.iter().any(|&(s, e)| (s..e).contains(&addr))
+    }
+
+    /// Adds `start..end` (page aligned), merged with the ranges it overlaps
+    /// or touches. Changes nothing if that would make too many.
+    pub fn add(&mut self, start: u64, end: u64) -> Result<(), TooManyRanges> {
+        if start >= end {
+            return Ok(());
+        }
+        let first = self.0.partition_point(|&(_, e)| e < start);
+        let last = self.0.partition_point(|&(s, _)| s <= end);
+        if first == last && self.0.len() == MAX_WX_RANGES {
+            return Err(TooManyRanges);
+        }
+        let merged = self.0[first..last]
+            .iter()
+            .fold((start, end), |(s, e), &(rs, re)| (s.min(rs), e.max(re)));
+        self.0.splice(first..last, [merged]);
+        Ok(())
+    }
+
+    /// Removes `start..end` from the ranges. Changes nothing if splitting a
+    /// range in two would make too many.
+    pub fn remove(&mut self, start: u64, end: u64) -> Result<(), TooManyRanges> {
+        let first = self.0.partition_point(|&(_, e)| e <= start);
+        let last = self.0.partition_point(|&(s, _)| s < end);
+        if first == last {
+            return Ok(());
+        }
+        let left = (self.0[first].0 < start).then(|| (self.0[first].0, start));
+        let right = (self.0[last - 1].1 > end).then(|| (end, self.0[last - 1].1));
+        let kept = left.iter().chain(right.iter()).count();
+        if self.0.len() - (last - first) + kept > MAX_WX_RANGES {
+            return Err(TooManyRanges);
+        }
+        self.0.splice(first..last, left.into_iter().chain(right));
+        Ok(())
+    }
+
+    /// Removes every range (`execve`).
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Backs the page containing `addr` with a zeroed write-or-execute page,
+/// writing, if it lies in one of `wx` and is not mapped (design D5 of
+/// `node-jit`). Returns whether it did (`false` also when no frame is left).
+pub fn back_wx<F: EntryFormat>(
+    pt: &PageTable<F>,
+    mem: &mut impl PhysicalMemory,
+    tlb: &mut impl Tlb,
+    frames: &mut impl Frames,
+    wx: &WxRanges,
+    addr: u64,
+) -> bool {
+    wx.contains(addr)
+        && pt.translate(mem, addr).is_none()
+        && map_anonymous(
+            pt,
+            mem,
+            tlb,
+            frames,
+            addr & !(FRAME_SIZE - 1),
+            FRAME_SIZE,
+            WX_WRITING,
         )
         .is_ok()
 }
@@ -537,6 +649,53 @@ mod tests {
         assert!(!pt.translate(&mem, 0x3fff).unwrap().flags.is_writable());
     }
 
+    /// A page of a write-or-execute range comes zeroed, writing, in 4 KiB,
+    /// once; a page outside comes from nowhere (design D5 of `node-jit`).
+    fn wx_pages_come_on_first_touch<F: EntryFormat>() {
+        let (pt, mut mem, mut tlb, mut frames) = setup::<F>();
+        let mut wx = WxRanges::default();
+        wx.add(0x40_0000, 0x40_0000 + (4 << 20)).unwrap();
+        let before = frames.outstanding();
+        assert!(back_wx(
+            &pt,
+            &mut mem,
+            &mut tlb,
+            &mut frames,
+            &wx,
+            0x60_0123
+        ));
+        let t = pt.translate(&mem, 0x60_0123).unwrap();
+        assert_eq!(t.size, PageSize::Small);
+        assert_eq!(t.flags, WX_WRITING);
+        assert_eq!(mem.read_u64(t.phys & !0xfff), 0);
+        assert!(
+            !back_wx(&pt, &mut mem, &mut tlb, &mut frames, &wx, 0x60_0000),
+            "mapped already"
+        );
+        assert!(!back_wx(
+            &pt,
+            &mut mem,
+            &mut tlb,
+            &mut frames,
+            &wx,
+            0x80_0000
+        ));
+        assert!(pt.translate(&mem, 0x80_0000).is_none());
+        frames.limit = frames.outstanding();
+        assert!(!back_wx(
+            &pt,
+            &mut mem,
+            &mut tlb,
+            &mut frames,
+            &wx,
+            0x40_0000
+        ));
+        frames.limit = usize::MAX;
+        assert!(frames.outstanding() > before);
+        destroy(pt, &mut mem, &mut frames);
+        assert_eq!(frames.outstanding(), 0);
+    }
+
     both_formats!(
         the_kernel_half_is_out_of_reach,
         protect_never_hands_out_a_shared_page,
@@ -544,6 +703,68 @@ mod tests {
         large_regions_use_large_pages,
         teardown_returns_every_frame,
         memory_starts_zeroed_and_unmap_refuses_to_split,
-        out_of_memory_rolls_back
+        out_of_memory_rolls_back,
+        wx_pages_come_on_first_touch
     );
+
+    #[test]
+    fn wx_ranges_merge_split_and_stay_bounded() {
+        const P: u64 = FRAME_SIZE;
+        let mut wx = WxRanges::default();
+        wx.add(10 * P, 20 * P).unwrap();
+        wx.add(30 * P, 40 * P).unwrap();
+        wx.add(20 * P, 25 * P).unwrap(); // touching: merged
+        assert_eq!(wx.ranges(), &[(10 * P, 25 * P), (30 * P, 40 * P)]);
+        wx.add(24 * P, 31 * P).unwrap(); // overlapping both
+        assert_eq!(wx.ranges(), &[(10 * P, 40 * P)]);
+        wx.remove(15 * P, 16 * P).unwrap(); // a hole in the middle
+        assert_eq!(wx.ranges(), &[(10 * P, 15 * P), (16 * P, 40 * P)]);
+        assert!(wx.contains(15 * P - 1) && !wx.contains(15 * P) && wx.contains(16 * P));
+        wx.remove(0, 12 * P).unwrap();
+        wx.remove(39 * P, 50 * P).unwrap();
+        assert_eq!(wx.ranges(), &[(12 * P, 15 * P), (16 * P, 39 * P)]);
+        wx.remove(0, 100 * P).unwrap();
+        assert_eq!(wx, WxRanges::default());
+        // At the bound: one more range, or a split, is refused unchanged.
+        for i in 0..MAX_WX_RANGES as u64 {
+            wx.add(4 * i * P, (4 * i + 2) * P).unwrap();
+        }
+        let full = wx.clone();
+        assert_eq!(wx.add(1000 * P, 1001 * P), Err(TooManyRanges));
+        assert_eq!(wx, full, "unchanged");
+        wx.add(4 * P, 6 * P).unwrap(); // already there: no new range
+        wx.add(2 * P, 4 * P).unwrap(); // joins two: one fewer
+        assert_eq!(wx.ranges().len(), MAX_WX_RANGES - 1);
+        let mut trimmed = full.clone();
+        trimmed.remove(0, P).unwrap(); // trims a range: as many
+        assert_eq!(trimmed.ranges().len(), MAX_WX_RANGES);
+        // Splitting one range in two at the bound is refused unchanged.
+        let mut wide = WxRanges::default();
+        wide.add(0, 8 * P).unwrap();
+        for i in 1..MAX_WX_RANGES as u64 {
+            wide.add(100 * P + 4 * i * P, 100 * P + (4 * i + 2) * P)
+                .unwrap();
+        }
+        let before = wide.clone();
+        assert_eq!(wide.remove(2 * P, 3 * P), Err(TooManyRanges));
+        assert_eq!(wide, before);
+        assert!(wide.add(0, 0).is_ok() && wide == before, "empty");
+    }
+
+    #[test]
+    fn wx_ranges_from_outside_are_checked() {
+        const P: u64 = FRAME_SIZE;
+        let ok = |r: &[(u64, u64)]| WxRanges::from_ranges(r.to_vec()).is_some();
+        assert!(ok(&[]) && ok(&[(P, 2 * P), (3 * P, 4 * P)]));
+        assert!(!ok(&[(P, P)]), "empty");
+        assert!(!ok(&[(1, P)]), "unaligned");
+        assert!(!ok(&[(P, 2 * P), (2 * P, 3 * P)]), "touching");
+        assert!(!ok(&[(3 * P, 4 * P), (P, 2 * P)]), "out of order");
+        assert!(!ok(&[(P, USER_END + P)]), "past the cell");
+        let many: Vec<_> = (0..=MAX_WX_RANGES as u64)
+            .map(|i| (2 * i * P, (2 * i + 1) * P))
+            .collect();
+        assert!(!ok(&many), "too many");
+        assert!(ok(&many[..MAX_WX_RANGES]));
+    }
 }

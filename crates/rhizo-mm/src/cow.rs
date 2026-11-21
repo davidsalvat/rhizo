@@ -208,6 +208,10 @@ impl<F: EntryFormat> PageTable<F> {
     /// write is refused for a real reason (no page, or a read-only one). The
     /// caller flushes the TLB entry for `virt`.
     ///
+    /// A write-or-execute page may always be written (change `node-jit`):
+    /// running, it becomes writing the same way, writable and no longer
+    /// executable, copied first if its frame is still shared.
+    ///
     /// A copied page replaces the old one break-before-make: the entry is
     /// cleared and flushed through `tlb` before it points at the copy, so
     /// no CPU running the same tables holds both (AArch64 requires it when
@@ -227,7 +231,8 @@ impl<F: EntryFormat> PageTable<F> {
         if flags.is_writable() {
             return Ok(true); // already resolved (a stale TLB entry faulted)
         }
-        if !flags.contains(crate::paging::PageFlags::COPY_ON_WRITE) {
+        let wx = flags.contains(PageFlags::WRITE_OR_EXEC);
+        if !flags.contains(PageFlags::COPY_ON_WRITE) && !wx {
             return Ok(false);
         }
         let size = match level {
@@ -236,7 +241,10 @@ impl<F: EntryFormat> PageTable<F> {
             _ => PageSize::Huge,
         };
         let page = F::address(entry) & !(size.bytes() - 1);
-        let writable = F::with_cow(F::with_leaf_writable(entry, true), false);
+        let mut writable = F::with_cow(F::with_leaf_writable(entry, true), false);
+        if wx {
+            writable = F::with_leaf_executable(writable, false);
+        }
         if frames.is_shared(page) {
             let copy = match size {
                 PageSize::Small => frames.alloc(),
@@ -259,6 +267,38 @@ impl<F: EntryFormat> PageTable<F> {
         } else {
             mem.write_u64(slot, writable);
         }
+        Ok(true)
+    }
+
+    /// Resolves an instruction fetch from `virt` refused because its page is
+    /// a write-or-execute page that is writing (change `node-jit`): makes
+    /// the tables on the path private, then the page read-only and
+    /// executable (running), its copy-on-write mark cleared: a frame still
+    /// shared is copied when the page is written next ([`resolve_write`]).
+    /// Returns `false` for any other page. The caller flushes the TLB entry
+    /// for `virt` on every CPU and makes the page's contents visible to
+    /// instruction fetches before the cell runs it.
+    ///
+    /// [`resolve_write`]: Self::resolve_write
+    pub fn resolve_exec(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        frames: &mut impl Frames,
+        virt: u64,
+    ) -> Result<bool, MapError> {
+        let Some((slot, _)) = self.walk_private(mem, frames, virt)? else {
+            return Ok(false);
+        };
+        let entry = mem.read_u64(slot);
+        let flags = F::flags(entry);
+        if !flags.contains(PageFlags::WRITE_OR_EXEC) {
+            return Ok(false);
+        }
+        if flags.is_executable() {
+            return Ok(true); // already running (a stale TLB entry faulted)
+        }
+        let read_only = F::with_cow(F::with_leaf_writable(entry, false), false);
+        mem.write_u64(slot, F::with_leaf_executable(read_only, true));
         Ok(true)
     }
 

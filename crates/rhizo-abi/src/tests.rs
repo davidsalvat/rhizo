@@ -66,6 +66,9 @@ pub(crate) struct World {
     pub(crate) fs: rhizo_fs::Fs,
     pub(crate) net: rhizo_net::Net,
     pub(crate) pages: PageCache,
+    pub(crate) wx: WxRanges,
+    /// Backs write-or-execute pages for system calls, as the kernel does.
+    backing: Option<Backing>,
     /// Deadline of the last blocked call (kept, as the kernel does).
     pub(crate) deadline: Option<u64>,
     /// The last call waits on descriptors: with this deadline.
@@ -108,6 +111,8 @@ impl World {
             fs: rhizo_fs::Fs::new(),
             net: rhizo_net::Net::new(),
             pages: PageCache::new(64),
+            wx: WxRanges::default(),
+            backing: None,
             deadline: None,
             io: None,
             used_net: false,
@@ -142,8 +147,12 @@ impl World {
             fs: &mut self.fs,
             net: &mut Noting(&mut self.net, &mut self.used_net),
             deadline: self.deadline.take(),
-            pager: &mut NoPager,
+            pager: match &mut self.backing {
+                Some(b) => b,
+                None => &mut NoPager,
+            },
             pages: &mut self.pages,
+            wx: &mut self.wx,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
         // A thread waiting on descriptors keeps its deadline and makes its
@@ -187,6 +196,50 @@ const WRITEV: u64 = 66;
 const EXIT_GROUP: u64 = 94;
 const BRK: u64 = 214;
 const MUNMAP: u64 = 215;
+
+/// A pager that backs write-or-execute pages from frames of its own (far
+/// from the world's, never given back), as the kernel's does from its
+/// allocator (design D5 of `node-jit`).
+#[derive(Default)]
+struct Backing(u64);
+
+impl Frames for Backing {
+    fn alloc(&mut self) -> Option<u64> {
+        self.0 += FRAME_SIZE;
+        Some((1 << 40) + self.0)
+    }
+    fn alloc_large(&mut self) -> Option<u64> {
+        None
+    }
+    fn free(&mut self, _: u64, _: PageSize) {}
+    fn share(&mut self, _: u64) {}
+    fn is_shared(&self, _: u64) -> bool {
+        false
+    }
+}
+
+impl Pager<Aarch64, FakePhysicalMemory> for Backing {
+    fn page_in(
+        &mut self,
+        _: &PageTable<Aarch64>,
+        _: &mut FakePhysicalMemory,
+        _: u64,
+        _: bool,
+    ) -> bool {
+        false
+    }
+
+    fn back_wx(
+        &mut self,
+        pt: &PageTable<Aarch64>,
+        mem: &mut FakePhysicalMemory,
+        addr: u64,
+    ) -> bool {
+        let page = addr & !(FRAME_SIZE - 1);
+        let tlb = &mut RecordingTlb::default();
+        space::map_anonymous(pt, mem, tlb, self, page, FRAME_SIZE, space::WX_WRITING).is_ok()
+    }
+}
 const MMAP: u64 = 222;
 
 #[test]
@@ -274,11 +327,13 @@ fn mmap_places_large_regions_on_large_pages_and_munmap_frees_them() {
         -EBADF,
         "files"
     );
-    assert_eq!(
-        w.call(MMAP, &[0, 4096, 6, anon, u64::MAX, 0]).0,
-        -EACCES,
-        "W^X"
-    );
+    // Writable and executable anonymous memory is a write-or-execute range
+    // now, without memory until touched (change `node-jit`).
+    let before = w.frames.outstanding();
+    let wx = w.call(MMAP, &[0, 4096, 6, anon, u64::MAX, 0]).0 as u64;
+    assert!(wx >= MMAP_BASE, "W+X mapped");
+    assert!(w.pt().translate(&w.mem, wx).is_none());
+    assert_eq!(w.frames.outstanding(), before);
     assert_eq!(
         w.call(MMAP, &[0, u64::MAX - 10, 3, anon, u64::MAX, 0]).0,
         -ENOMEM
@@ -615,10 +670,13 @@ fn yield_and_sleep_become_scheduling_outcomes() {
 #[test]
 fn libc_startup_calls() {
     let mut w = World::new(Arch::Aarch64);
-    // mprotect: read-only, then W+X refused, unmapped range refused.
+    // mprotect: read-only, then W+X (a write-or-execute page, writing,
+    // since `node-jit`), unmapped range refused.
     assert_eq!(w.call(226, &[DATA, 4096, 1]).0, 0);
     assert!(!w.pt().translate(&w.mem, DATA).unwrap().flags.is_writable());
-    assert_eq!(w.call(226, &[DATA, 4096, 7]).0, -EACCES);
+    assert_eq!(w.call(226, &[DATA, 4096, 7]).0, 0);
+    let flags = w.pt().translate(&w.mem, DATA).unwrap().flags;
+    assert_eq!(flags, space::WX_WRITING);
     assert_eq!(w.call(226, &[0x7000_0000, 4096, 1]).0, -ENOMEM);
     assert_eq!(w.call(226, &[DATA + 1, 4096, 1]).0, -EINVAL);
     assert_eq!(w.call(226, &[DATA, 4096, 3]).0, 0, "writable again");
@@ -1438,4 +1496,102 @@ fn time_does_not_exist_on_aarch64() {
         -errno::ENOTSOCK,
         "201 is not `time` on AArch64"
     );
+}
+
+/// Writable and executable anonymous memory (spec `linux-abi`, design D5 of
+/// `node-jit`): a range without memory, whose pages a system call backs on
+/// first touch, writing; `mprotect` turns reserved addresses into ranges
+/// and mapped pages into write-or-execute pages; other protections,
+/// `munmap` and `MAP_FIXED` take their part out; file mappings still refuse
+/// both rights.
+#[test]
+fn wx_memory_comes_on_first_touch() {
+    let mut w = World::new(Arch::Aarch64);
+    let anon = MAP_ANONYMOUS | MAP_PRIVATE;
+    let before = w.frames.outstanding();
+    // A JIT's code range: reserved, then made writable and executable.
+    let code = w.call(MMAP, &[0, 512 << 20, 0, anon, u64::MAX, 0]).0 as u64;
+    assert_eq!(w.call(226, &[code, 512 << 20, 7]).0, 0);
+    assert_eq!(w.frames.outstanding(), before, "no memory yet");
+    assert_eq!(w.wx.ranges(), &[(code, code + (512 << 20))]);
+    // A system call writing there gets a zeroed page, writing.
+    w.backing = Some(Backing::default());
+    let at = code + (100 << 20) + 8;
+    assert_eq!(w.call(261, &[0, 3, 0, at]).0, 0, "prlimit64 into it");
+    assert_eq!(w.peek(at, 8), (8u64 << 20).to_le_bytes());
+    assert_eq!(w.peek(at - 8, 8), [0; 8]);
+    let t = w.pt().translate(&w.mem, at).unwrap();
+    assert_eq!((t.size, t.flags), (PageSize::Small, space::WX_WRITING));
+    assert!(
+        w.pt().translate(&w.mem, at + FRAME_SIZE).is_none(),
+        "one page"
+    );
+    // Another protection takes its part out (and backs it, as reserved
+    // addresses are); so does munmap.
+    let ro = code + (200 << 20);
+    assert_eq!(w.call(226, &[ro, FRAME_SIZE, 1]).0, 0);
+    let t = w.pt().translate(&w.mem, ro).unwrap();
+    assert!(!t.flags.is_writable() && !t.flags.contains(PageFlags::WRITE_OR_EXEC));
+    assert_eq!(w.call(MUNMAP, &[code, 1 << 20]).0, 0);
+    let end = code + (512 << 20);
+    assert_eq!(
+        w.wx.ranges(),
+        &[(code + (1 << 20), ro), (ro + FRAME_SIZE, end)]
+    );
+    // A mapped page made writable and executable keeps its frame.
+    let frame = w.pt().translate(&w.mem, DATA).unwrap().phys;
+    w.poke(DATA, b"code");
+    assert_eq!(w.call(226, &[DATA, FRAME_SIZE, 7]).0, 0);
+    let t = w.pt().translate(&w.mem, DATA).unwrap();
+    assert_eq!((t.phys, t.flags), (frame, space::WX_WRITING));
+    assert_eq!(w.peek(DATA, 4), b"code");
+    // Both rights over a hole that is not reserved, or over part of a
+    // 2 MiB page: refused, nothing changed.
+    let big = w.call(MMAP, &[0, 2 << 20, 3, anon, u64::MAX, 0]).0 as u64;
+    let ranges = w.wx.clone();
+    assert_eq!(w.call(226, &[0x7000_0000, FRAME_SIZE, 7]).0, -ENOMEM);
+    assert_eq!(w.call(226, &[big, FRAME_SIZE, 7]).0, -EINVAL);
+    assert_eq!(w.wx, ranges);
+    // MAP_FIXED over a range replaces it.
+    let fixed = code + (300 << 20);
+    let got = w.call(MMAP, &[fixed, FRAME_SIZE, 3, anon | MAP_FIXED, u64::MAX, 0]);
+    assert_eq!(got.0 as u64, fixed);
+    assert!(!w.wx.contains(fixed) && w.wx.contains(fixed + FRAME_SIZE));
+    // Files: still never both.
+    w.fs.put_file(b"/f", &[1; 4096]).unwrap();
+    let read = rhizo_fs::OpenFlags {
+        read: true,
+        ..Default::default()
+    };
+    let fd = u64::from(w.fs.open(None, b"/f", read, 0).unwrap());
+    assert_eq!(w.call(MMAP, &[0, 4096, 7, MAP_PRIVATE, fd, 0]).0, -EACCES);
+}
+
+/// At most 64 write-or-execute ranges (spec `linux-abi`): the call that
+/// would need one more, a new range or a split, fails with `ENOMEM` and
+/// changes nothing.
+#[test]
+fn wx_ranges_are_bounded() {
+    let mut w = World::new(Arch::Aarch64);
+    let anon = MAP_ANONYMOUS | MAP_PRIVATE;
+    let mut first = 0;
+    for i in 0..space::MAX_WX_RANGES {
+        let at = w.call(MMAP, &[0, 3 * FRAME_SIZE, 7, anon, u64::MAX, 0]).0 as u64;
+        if i == 0 {
+            first = at;
+        }
+        // A reserved gap keeps the next range apart.
+        assert!(w.call(MMAP, &[0, FRAME_SIZE, 0, anon, u64::MAX, 0]).0 > 0);
+    }
+    let full = w.wx.clone();
+    assert_eq!(full.ranges().len(), space::MAX_WX_RANGES);
+    let more = w.call(MMAP, &[0, FRAME_SIZE, 7, anon, u64::MAX, 0]).0;
+    assert_eq!(more, -ENOMEM);
+    let middle = first + FRAME_SIZE;
+    assert_eq!(w.call(MUNMAP, &[middle, FRAME_SIZE]).0, -ENOMEM, "a split");
+    assert_eq!(w.call(226, &[middle, FRAME_SIZE, 1]).0, -ENOMEM, "a split");
+    assert_eq!(w.wx, full);
+    assert_eq!(w.call(MUNMAP, &[first, FRAME_SIZE]).0, 0, "a trim");
+    assert_eq!(w.wx.ranges().len(), space::MAX_WX_RANGES);
+    assert_eq!(w.wx.ranges()[0], (middle, first + 3 * FRAME_SIZE));
 }

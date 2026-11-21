@@ -111,6 +111,19 @@ pub trait Pager<F: EntryFormat, M: PhysicalMemory> {
     /// Forgets pages in `addr..addr + len` that are not in memory yet: the
     /// cell unmapped them, so they must not come back.
     fn discard(&mut self, _addr: u64, _len: u64) {}
+
+    /// Whether some pages are not in memory yet (a lazily resumed cell's):
+    /// a hole in the tables may then hold one of them.
+    fn has_pending(&self) -> bool {
+        false
+    }
+
+    /// Maps a zeroed write-or-execute page, writing, at the page holding
+    /// `addr` (a page of a write-or-execute range, design D5 of `node-jit`)
+    /// if memory allows; returns whether it did.
+    fn back_wx(&mut self, _pt: &PageTable<F>, _mem: &mut M, _addr: u64) -> bool {
+        false
+    }
 }
 
 /// No paging: what is not mapped stays a fault.
