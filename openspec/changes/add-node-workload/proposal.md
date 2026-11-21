@@ -27,7 +27,9 @@ the network card exist. What Node.js still lacks is unknown until it runs.
   `epoll`) without being reported as missing. A cell may hold 256 MiB of
   file data instead of 64 MiB (the `node` executable alone is 121 MiB),
   and the kernel keeps up to 256 MiB of mapped file pages so a second
-  Node.js cell maps the first one's frames.
+  Node.js cell maps the first one's frames. On AArch64 cells may read the virtual
+  counter directly (`CNTKCTL_EL1.EL0VCTEN` on every CPU), as Node.js's
+  abseil does.
 - **Kernels with Node.js**: a `node` kernel feature embeds `node-files`
   (over 100 MiB) only where asked: with `ktest`, a test kernel that runs
   the Node.js tests (`cargo xtask test --only ktest-node`, part of
@@ -59,6 +61,7 @@ None.
 
 - `linux-abi`: the calls Node.js makes.
 - `files`: 256 MiB of file data per cell.
+- `isolation`: the counters a cell may read.
 - `workloads`: Node.js in a cell.
 - `benchmarks`: Node.js workload metrics.
 - `comparisons`: Node.js as a Linux process in the same VM.

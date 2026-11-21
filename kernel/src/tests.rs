@@ -541,7 +541,7 @@ mod expected {
 
 /// Runs test cell `name` and checks its output and ending against
 /// `cells/expected.rs`; returns everything it printed.
-fn run_expected(name: &str) -> alloc::string::String {
+pub(crate) fn run_expected(name: &str) -> alloc::string::String {
     let &(_, stdout, ending) = expected::PROGRAMS
         .iter()
         .chain(expected::KERNEL_ONLY)

@@ -7,6 +7,7 @@ use rhizo_core::ktest_case;
 pub static ALL: &[TestCase] = &[
     ktest_case!(pvh_start_info_is_valid),
     ktest_case!(user_guards_are_on),
+    ktest_case!(a_cell_reads_the_counter),
 ];
 
 /// SMEP and SMAP are on wherever the CPU has them (QEMU's `max` CPU has
@@ -23,4 +24,11 @@ fn user_guards_are_on() {
 
 fn pvh_start_info_is_valid() {
     super::boot::assert_boot_info_is_valid();
+}
+
+/// A cell reads the CPU's counter directly (`ticks`: `CNTVCT_EL0` and
+/// `CNTFRQ_EL0` on AArch64, `rdtsc` on x86_64), without a trap killing it,
+/// on whichever CPU it runs (change `add-node-workload`).
+fn a_cell_reads_the_counter() {
+    crate::tests::run_expected("ticks");
 }

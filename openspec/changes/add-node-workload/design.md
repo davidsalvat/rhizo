@@ -167,6 +167,30 @@ syndromes, the software bit in `EntryFormat`, the toggle in
 is larger than everything this change needed, and touches the snapshot
 format; it is its own change.
 
+## D8. Cells read the counter
+
+Node.js's abseil reads the virtual counter (`MRS CNTVCT_EL0`) directly
+for its cycle clock, on some paths only (mutexes under contention). The
+kernel never set `CNTKCTL_EL1`, whose reset value is UNKNOWN: on QEMU it
+leaves EL0 access off, so the read trapped and the cell was killed
+(`system register trap`, class 0x18), and only now and then, which is why
+the first runs passed. Every CPU now sets `CNTKCTL_EL1` to `EL0VCTEN`
+alone in `user::init_cpu` (the boot CPU through `init_tags`, the others
+at bring-up), as Linux does: cells may read `CNTVCT_EL0` and
+`CNTFRQ_EL0`; the physical counter (`EL0PCTEN`) and both timers
+(`EL0VTEN`, `EL0PTEN`) stay the kernel's. x86_64 already lets cells use
+`rdtsc` (`CR4.TSD` clear). The test cell `ticks` reads the counter on
+both architectures, in each architecture's tests and natively.
+
+The counter tells a cell nothing `clock_gettime(CLOCK_MONOTONIC)` does not
+already tell it, in finer steps. It is not cell state: a suspended cell's
+counter keeps running, a resumed or forked cell reads the machine's, and a
+snapshot resumed on another machine sees that machine's count, as
+`CLOCK_MONOTONIC` does. Emulating the read in the trap handler would keep
+the counter's value under the kernel's control (a per-cell offset across
+suspend), but costs a trap per read on a path libraries use because it is
+cheap, and nothing needs that offset.
+
 ## D7. Known limits
 
 Every thread stack Node.js creates (six of 8 MiB, reserved with
