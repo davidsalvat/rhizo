@@ -251,6 +251,36 @@ fn objects_round_trip_and_corruption_is_refused() {
 }
 
 #[test]
+fn quotas_limit_descriptors_and_sockets() {
+    let mut fs = Fs::new();
+    fs.set_limits(6, 2);
+    // 0-2 are the console: three more descriptors, then EMFILE.
+    let (_r, w) = fs.pipe(false, false).unwrap();
+    assert_eq!(fs.eventfd(0, false, false, false), Ok(5));
+    assert_eq!(fs.epoll_create(false), Err(Error::TooManyFiles));
+    assert_eq!(
+        fs.dup(w, 6, true, false),
+        Err(Error::BadFd),
+        "dup2 past the limit"
+    );
+    assert_eq!(Error::TooManyFiles.errno(), 24);
+    fs.close(5).unwrap();
+    assert_eq!(fs.socket_fd(10, false, false), Ok(5));
+    fs.close(w).unwrap();
+    assert_eq!(fs.socket_fd(11, false, false), Ok(4));
+    // Two sockets held: a third is refused even with descriptors free.
+    fs.close(3).unwrap();
+    assert_eq!(fs.socket_fd(12, false, false), Err(Error::TooManySockets));
+    assert_eq!(Error::TooManySockets.errno(), 23);
+    // A duplicate shares its socket: allowed.
+    assert_eq!(fs.dup(4, 0, false, false), Ok(3));
+    // Never past FD_MAX, whatever the quota.
+    fs.set_limits(usize::MAX, usize::MAX);
+    assert!(fs.socket_fd(12, false, false).is_ok());
+    assert!(fs.dup(4, FD_MAX as Fd, true, false).is_err());
+}
+
+#[test]
 fn the_host_writes_standard_input() {
     let mut fs = Fs::new();
     assert!(!fs.has_input());

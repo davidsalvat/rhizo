@@ -146,8 +146,8 @@ its room (`Net::drain_woken`).
 
 `density.sched_p99_us` and `density.wake_p99_us` were ungated because
 every socket change woke every waiting cell, which made their tails move
-up to 5x between runners. Once two CI runs of this change agree, they are
-gated, with the values of those runs in the `ci` baseline.
+up to 5x between runners. They are gated once their tail measures the
+load (D6), with the values of this change's CI runs in the `ci` baseline.
 
 ## D5. A wake from the host is not lost
 
@@ -173,3 +173,84 @@ the wake itself.
 Lost: telling the caller the wake found nothing, so that it retries.
 Every caller would need a retry loop, and the race is the kernel's to
 close.
+
+## D6. The latencies count once the start of the load has drained
+
+With the wait queues merged, the tails still did not settle. Six runs of
+`main` in CI (2026-11-21) read `density.wake_p99_us` from 13.6 to 28.3 ms
+on QEMU and 243 to 403 ms on Firecracker, against a median of 35 to 65 µs,
+while the guest's CPU was idle 70 % of the load (`idle_ns` 2.28 s of
+3.29 s). No queue holds a cell 14 ms on a CPU that idle in steady state.
+
+Where it came from: the workers are forked before the load starts, and
+each runs for the first time when it does, all 10,000 at once (opening its
+file, connecting, its first copy-on-write faults). That takes 85 ms on
+QEMU and 560 ms on Firecracker (`sched_max_ns`; Firecracker faults in its
+guest's memory on first touch, `fill_ns` is 210 ms there against 48 ms).
+Every deadline and socket change that comes meanwhile waits behind them:
+the first sleeps are spread over one 200 ms period, so on QEMU those of
+about 3,400 of the 8,000 sleeping workers end in that window, 1.8 % of the
+190,000 samples. So the p99
+and the p99.9 read the length of that start, not a wake-up of the load:
+how fast the runner faults in fresh memory, which is why they moved
+between runners and why Firecracker read 400 ms. A histogram of the
+samples by the time of their event, under QEMU's `-icount` (no host
+noise, 1,000 cells), showed it: every latency above 1 ms came from the
+first 110 ms of the load; after it, the longest in each 50 ms was 190 to
+250 µs, the host's own suspend, resume and fork every 10 ms (the load runs
+on one vCPU), which every cell then waits for.
+
+It is not a defect of the scheduler: queuing a cell woken while 10,000
+cells are runnable behind them is first come, first served on a CPU
+that is 100 % busy, the load the benchmark itself made.
+
+So the server workload counts its latencies from the first moment, after
+its load starts, at which no cell runs and none waits for a CPU
+(`prof::settle`): the workers made beforehand have all run once by then,
+and so has whatever queued behind them. The scheduler decides it under the
+host's lock, in `take`, where a CPU finds nothing to run and `running` is
+0: on any number of CPUs it is exact (an idle CPU's halt alone is not:
+with several CPUs one halts while another still drains a queue, and all of
+them halting at the same instant depends on timing). The histograms are
+cleared there, and the window starts again. A load that never gets there
+(more work than the CPU can do) keeps every latency since its start, so a
+saturated run still reads as slow. The breakdown line prints how long the
+start took (`settle_ns`).
+
+Under `-icount` with 1,000 cells (three runs each, before and after):
+`density.wake_p99_us` 205 to 221 µs before, 197 to 205 after;
+`density.wake_p999_us` 7.6 to 12.6 ms before, 229 µs after in all three;
+the longest wake-up 236 to 241 µs. With 10,000 cells the start holds more
+than 1 % of the samples, so the p99 itself was the start. In CI (10,000
+cells, three runs per VMM, the same base as `main` at bd51b7e):
+
+| VMM | `wake_p99_us` before | after | `wake_p999_us` before | after | start (`settle_ns`) |
+|---|---|---|---|---|---|
+| QEMU `microvm` | 18.9 to 21.0 ms | 3.3 to 3.4 ms | 71 to 75 ms | 4.1 to 4.5 ms | 122 to 124 ms |
+| QEMU `q35` | 16.8 to 18.9 ms | 2.9 to 3.3 ms | 71 ms | 4.2 to 4.4 ms | 118 to 121 ms |
+| Firecracker | 352 to 369 ms | 7.1 to 8.4 ms | 470 ms | 7.6 to 11.2 ms | 746 to 755 ms |
+| Cloud Hypervisor | 17.8 to 23.1 ms | 3.1 to 3.3 ms | 75 to 80 ms | 4.0 to 4.5 ms | 121 to 124 ms |
+
+The medians (37 to 43 µs; 53 to 70 µs in that run of `main`, on a slower
+runner) and the throughput are not what changed: only where the counting
+starts. What is left
+of the tail with 10,000 cells, about 3 ms (7 ms on Firecracker), is more
+than the host's operations; the likely cause, not measured further, is the
+same start: the workers whose first sleep ended during it ran back to back
+at its end, and since each sleeps a fixed period after it runs, they come
+back bunched in the next periods, with their partners on loopback queued
+behind them. It is stable between runs (within 19 %), so the p99s are
+gated at the `ci` timing threshold (+100 %) with this run's values: the
+runs of `main` before this change fail that gate, as would the wake-all of
+before the wait queues (p50 2.8 ms).
+
+Lost: making the start itself shorter, for example preferring woken cells
+to new ones in the run queues. It would hide the same start behind a
+policy that favours sleepers, a change of the scheduler that needs its own
+proposal; and running the workers to their first sleep while they are made
+would set their 3 s deadlines during the fill, so their ends would bunch
+in the same way. An instruction count of the wake-up path under `-icount`
+as the gated figure: the timing gate catches a tail that doubles, and the
+emulated CPU of `-icount` (one instruction per nanosecond; 1,000 cells
+keep it 11 % busy) cannot carry 10,000 cells.
+

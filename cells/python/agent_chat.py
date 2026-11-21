@@ -10,7 +10,9 @@
 #
 # What it prints, for `rhizo chat` (cli/src/chat.rs) to show:
 # - the model's answers, whole; each tool call as `  [tool] NAME`, its
-#   arguments and its result indented below;
+#   arguments and its result indented below (a call the model wrote into
+#   its text instead, as a small model may, runs as one: change
+#   `fix-chat-tools`);
 # - `\x1eready` once it reads its input, and after each answer
 #   `\x1eturn model_ns=M agent_ns=A`: the time spent waiting for the model
 #   (each request sent until its answer is read) and the whole turn here,
@@ -21,6 +23,7 @@
 # arguments it checks its tools' limits and runs each tool once offline
 # (how its standard library is packed, cells/python/pack_stdlib.py: what
 # they import is packed with it).
+import ast
 import contextlib
 import io
 import json
@@ -75,7 +78,7 @@ TOOLS = [
         "run_python",
         "Run a short Python 3 snippet in the cell and return what it prints "
         "(%d characters at most, %d seconds at most)." % (OUTPUT_CAP, SNIPPET_SECONDS),
-        code="The Python code; print() what you need back.",
+        code="The Python code; print() what you need back (as in the REPL, a last expression's value is shown).",
     ),
     tool("read_file", "Read a text file of the cell.", path="Its path."),
     tool("write_file", "Create or replace a text file of the cell.", path="Its path.", content="Its text."),
@@ -118,7 +121,9 @@ def run_python(code):
 def snippet(code, seconds):
     """Runs `code` in a namespace of its own, its output captured and
     capped, stopped at the first line it runs after `seconds` (a
-    line-by-line trace: one long call into C is not interrupted)."""
+    line-by-line trace: one long call into C is not interrupted). As in
+    the REPL, a last statement that is an expression prints its value's
+    `repr` unless it is None."""
     out = Capped()
     deadline = time.monotonic() + seconds
 
@@ -128,13 +133,21 @@ def snippet(code, seconds):
         return trace
 
     try:
-        compiled = compile(code, "<snippet>", "exec")
+        tree = ast.parse(code, "<snippet>")
+        last = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last = compile(ast.Expression(tree.body.pop().value), "<snippet>", "eval")
+        body = compile(tree, "<snippet>", "exec")
+        namespace = {"__name__": "__snippet__"}
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             sys.settrace(trace)
             try:
-                exec(compiled, {"__name__": "__snippet__"})
+                exec(body, namespace)
+                value = None if last is None else eval(last, namespace)
             finally:
                 sys.settrace(None)
+            if value is not None:
+                print(repr(value))
     except TimeUp:
         out.write("%s[stopped after %g seconds]" % ("\n" if out.size else "", seconds))
     except BaseException:
@@ -190,6 +203,25 @@ def call_tool(call):
         return name, args, "error: %s" % e
 
 
+def text_call(text):
+    """The tool call a model wrote into its text instead of `tool_calls`
+    (`... {"name": "run_python", "arguments": {...}}`, as Qwen models may):
+    the first JSON object in `text` that parses, names a tool and has an
+    object for arguments; None if there is none."""
+    decoder = json.JSONDecoder()
+    at = text.find("{")
+    while at >= 0:
+        try:
+            found, _ = decoder.raw_decode(text, at)
+        except ValueError:
+            found = None
+        if isinstance(found, dict) and found.get("name") in RUN and isinstance(found.get("arguments"), dict):
+            function = {"name": found["name"], "arguments": json.dumps(found["arguments"])}
+            return {"id": "call_text", "type": "function", "function": function}
+        at = text.find("{", at + 1)
+    return None
+
+
 def indented(text, prefix="      "):
     return "\n".join(prefix + line for line in str(text).splitlines() or [""])
 
@@ -214,8 +246,12 @@ def answer(model, messages):
     for _ in range(STEPS):
         message = ask(model, messages)["choices"][0]["message"]
         calls = message.get("tool_calls") or []
+        text = message.get("content") or ""
+        if not calls and (call := text_call(text)):
+            # Kept as a real call, which its result answers; the text is
+            # not an answer.
+            message, calls = {"content": None}, [call]
         if not calls:
-            text = message.get("content") or ""
             messages.append({"role": "assistant", "content": text})
             print(text.replace("\x1e", "").strip() or "(no answer)")
             return
@@ -258,6 +294,18 @@ def main():
         assert snippet("print(1)\nwhile True: pass", 0.05) == "1\n\n[stopped after 0.05 seconds]"
         assert snippet("print('x' * 5000)", 1).endswith("x\n[1001 more characters dropped]")
         assert "ZeroDivisionError" in snippet("1 / 0", 1)
+        # A last expression shows its value, as in the REPL.
+        assert snippet("import math\nx = 18 * 8\nmath.sqrt(x)", 1) == "12.0\n"
+        assert snippet("print('a')\n'b'", 1) == "a\n'b'\n"
+        assert snippet("x = None\nx", 1) == "(no output)"
+        assert snippet("for i in range(2):\n    i", 1) == "(no output)"
+        # A call written as text runs; nothing else is taken for one.
+        call = text_call('Ronaldo {"name": "run_python", "arguments": {"code": "6 * 7"}} ok')
+        assert call_tool(call) == ("run_python", {"code": "6 * 7"}, "42\n")
+        assert text_call('{"name": "rm", "arguments": {}}') is None
+        assert text_call('{"name": "run_python", "arguments": "6 * 7"}') is None
+        assert text_call('{"name": "run_python", "arguments": {"code": "1"}') is None
+        assert text_call("The answer is {12}.") is None
         for call in (
             {"function": {"name": "run_python", "arguments": '{"code": "print(6 * 7)"}'}},
             {"function": {"name": "write_file", "arguments": '{"path": "chat-check.txt", "content": "x"}'}},

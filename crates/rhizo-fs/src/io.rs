@@ -85,7 +85,7 @@ impl Tables {
 
     /// Whether `n` descriptors are free.
     fn fds_free(&self, n: usize) -> bool {
-        (0..FD_MAX)
+        (0..self.fd_limit)
             .filter(|&i| self.fds.get(i).is_none_or(Option::is_none))
             .take(n)
             .count()
@@ -210,6 +210,9 @@ impl Tables {
     /// A descriptor for kernel socket `handle`. On failure the caller still
     /// holds the handle.
     pub fn socket_fd(&mut self, handle: u32, nonblock: bool, cloexec: bool) -> Result<Fd> {
+        if self.sockets().count() >= self.socket_limit {
+            return Err(Error::TooManySockets);
+        }
         self.open_target(Target::Socket(handle), Self::status(nonblock, 2), cloexec)
     }
 

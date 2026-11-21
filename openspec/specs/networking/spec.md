@@ -136,11 +136,16 @@ no signal: as with `SIGPIPE` ignored), `getpeername` fails with
 
 ### Requirement: Waiting cells use no CPU
 A cell waiting on descriptors SHALL not run until one of them may be ready
-or its timeout ends; other cells run meanwhile.
+or its timeout ends; other cells run meanwhile. A change to a socket SHALL
+wake only the cells waiting on that socket.
 
 #### Scenario: Server waits for its client
 - **WHEN** a server cell blocks in `accept` and a client cell is spawned later
 - **THEN** the server does not run until the client connects, then both finish
+
+#### Scenario: A change wakes the waiters of its socket only
+- **WHEN** a waiter blocked after looking at one connection and bytes are sent on another connection
+- **THEN** the waiter is not woken; bytes sent on its own connection wake it once
 
 ### Requirement: Network card
 The kernel SHALL drive a virtio network device attached through virtio-mmio
@@ -237,3 +242,19 @@ boot's first connections, which a peer may still keep after closing them.
 #### Scenario: A host that keeps closed connections
 - **WHEN** the laptop workload runs several times in a row on Firecracker or Cloud Hypervisor against one fake model server
 - **THEN** every run's agent turns take about as long as on QEMU, not the 1 s of a connection retried after a refused first SYN
+
+### Requirement: Wait queues per socket
+Each socket SHALL keep a wait queue of the cells whose waiting calls looked
+at it. These changes SHALL wake the waiters on its queue: bytes or a
+datagram queued, room for a writer whose peer's queue was full, a
+connection to accept, a shutdown, a close, a reset, and a change of a
+connection through the network card. The queues SHALL NOT be part of a
+cell's snapshot: a resumed or forked cell makes its waiting calls again.
+
+#### Scenario: A writer waits for room
+- **WHEN** a writer blocked on a full connection and the reader reads from it
+- **THEN** the writer is woken; a later read from a queue that is no longer full wakes nobody
+
+#### Scenario: A frame from the wire
+- **WHEN** a waiter blocked on a connection through the network card and the answer arrives
+- **THEN** the waiter is woken, and a waiter on a loopback socket is not
