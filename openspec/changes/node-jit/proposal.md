@@ -84,7 +84,7 @@ effect.
 `crates/rhizo-mm` (`PageFlags::WRITE_OR_EXEC`, both entry formats,
 `resolve_write`, `resolve_exec`), `crates/rhizo-cell` (`space::WxRanges`,
 mapping and protecting write-or-execute memory), `crates/rhizo-abi`
-(`mmap`, `mprotect`, `munmap`, `exec`, user-memory access, `Context::wx`),
+(`mmap`, `mprotect`, `munmap`, `Pager::wx`),
 `crates/rhizo-snapshot` (version 9), `kernel/src/cell.rs` (fault path,
 ranges in `Live`, fork, templates, suspend and resume, benchmark),
 `kernel/src/arch/*/user.rs` (`exec_denied`, `SCTLR_EL1`),

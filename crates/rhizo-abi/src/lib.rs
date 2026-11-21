@@ -457,30 +457,6 @@ pub struct Context<'a, F, M, T, A, S> {
     pub pager: &'a mut dyn Pager<F, M>,
     /// The frames of mapped file pages.
     pub pages: &'a mut dyn FilePages<M, A>,
-    /// The cell's write-or-execute ranges (design D5 of `node-jit`).
-    pub wx: &'a mut WxRanges,
-}
-
-/// A pager that also backs the pages of the write-or-execute ranges `wx`
-/// that are not mapped yet, through `pager` (design D5 of `node-jit`).
-pub(crate) struct WxPager<'a, F, M> {
-    pager: &'a mut dyn Pager<F, M>,
-    wx: &'a WxRanges,
-}
-
-impl<'a, F, M> WxPager<'a, F, M> {
-    pub(crate) fn new(pager: &'a mut dyn Pager<F, M>, wx: &'a WxRanges) -> Self {
-        Self { pager, wx }
-    }
-}
-
-impl<F: EntryFormat, M: PhysicalMemory> Pager<F, M> for WxPager<'_, F, M> {
-    fn page_in(&mut self, pt: &PageTable<F>, mem: &mut M, addr: u64, write: bool) -> bool {
-        self.pager.page_in(pt, mem, addr, write)
-            || (self.wx.contains(addr)
-                && pt.translate(mem, addr).is_none()
-                && self.pager.back_wx(pt, mem, addr))
-    }
 }
 
 impl<F, M, T, A, S> fmt::Debug for Context<'_, F, M, T, A, S> {
@@ -492,48 +468,12 @@ impl<F, M, T, A, S> fmt::Debug for Context<'_, F, M, T, A, S> {
 impl<F: EntryFormat, M: PhysicalMemory, T, A, S> Context<'_, F, M, T, A, S> {
     /// Copies cell memory at `addr` into `out`.
     fn read(&mut self, addr: u64, out: &mut [u8]) -> Result<(), memory::Fault> {
-        user_read(&self.pt, self.mem, self.pager, self.wx, addr, out)
+        memory::read(&self.pt, self.mem, self.pager, addr, out)
     }
 
     /// Copies `data` to cell memory at `addr`.
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), memory::Fault> {
-        user_write(&self.pt, self.mem, self.pager, self.wx, addr, data)
-    }
-}
-
-/// Copies cell memory at `addr` into `out` through `pager`, which also
-/// backs the pages of the write-or-execute ranges `wx` not mapped yet
-/// (design D5 of `node-jit`); a cell without ranges copies as before.
-#[inline(always)]
-pub(crate) fn user_read<F: EntryFormat, M: PhysicalMemory>(
-    pt: &PageTable<F>,
-    mem: &mut M,
-    pager: &mut dyn Pager<F, M>,
-    wx: &WxRanges,
-    addr: u64,
-    out: &mut [u8],
-) -> Result<(), memory::Fault> {
-    if wx.ranges().is_empty() {
-        memory::read(pt, mem, pager, addr, out)
-    } else {
-        memory::read(pt, mem, &mut WxPager::new(pager, wx), addr, out)
-    }
-}
-
-/// Copies `data` to cell memory at `addr` as [`user_read`] reads it.
-#[inline(always)]
-pub(crate) fn user_write<F: EntryFormat, M: PhysicalMemory>(
-    pt: &PageTable<F>,
-    mem: &mut M,
-    pager: &mut dyn Pager<F, M>,
-    wx: &WxRanges,
-    addr: u64,
-    data: &[u8],
-) -> Result<(), memory::Fault> {
-    if wx.ranges().is_empty() {
-        memory::write(pt, mem, pager, addr, data)
-    } else {
-        memory::write(pt, mem, &mut WxPager::new(pager, wx), addr, data)
+        memory::write(&self.pt, self.mem, self.pager, addr, data)
     }
 }
 
@@ -926,13 +866,17 @@ fn page_flags(prot: u64) -> PageFlags {
 
 /// The write-or-execute ranges `wx` once `addr..end` is taken out of them,
 /// and added back when `add`, or `None` when nothing changes; checked
-/// before anything else changes (design D5 of `node-jit`).
+/// before anything else changes (design D5 of `node-jit`). A cell whose
+/// pager keeps no ranges (`None`) can have none.
 fn wx_after(
-    wx: &WxRanges,
+    wx: Option<&mut WxRanges>,
     addr: u64,
     end: u64,
     add: bool,
 ) -> Result<Option<WxRanges>, TooManyRanges> {
+    let Some(wx) = wx else {
+        return if add { Err(TooManyRanges) } else { Ok(None) };
+    };
     if wx.ranges().is_empty() && !add {
         return Ok(None);
     }
@@ -942,6 +886,16 @@ fn wx_after(
         after.add(addr, end)?;
     }
     Ok(Some(after))
+}
+
+/// Makes `ranges` (from [`wx_after`]) the cell's write-or-execute ranges.
+fn set_wx<F: EntryFormat, M: PhysicalMemory>(
+    pager: &mut dyn Pager<F, M>,
+    ranges: Option<WxRanges>,
+) {
+    if let (Some(ranges), Some(wx)) = (ranges, pager.wx()) {
+        *wx = ranges;
+    }
 }
 
 /// `mmap`: anonymous private memory, or a private mapping of a file's
@@ -1015,7 +969,7 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     if prot != 0 && !wx && anonymous && !cx.services.can_store(len) {
         return -ENOMEM; // refused before any of it is zeroed
     }
-    let Ok(ranges) = wx_after(cx.wx, addr, addr + len, wx) else {
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, addr + len, wx) else {
         return -ENOMEM;
     };
     if fixed {
@@ -1025,9 +979,7 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
         }
         cx.pager.discard(addr, len);
     }
-    if let Some(ranges) = ranges {
-        *cx.wx = ranges;
-    }
+    set_wx(cx.pager, ranges);
     let pf = page_flags(prot);
     let mapped = match file {
         // Reserved (spec `linux-abi`), or a write-or-execute range.
@@ -1065,15 +1017,13 @@ fn munmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     if len == 0 || !addr.is_multiple_of(FRAME_SIZE) || end > STACK_TOP {
         return -EINVAL;
     }
-    let Ok(ranges) = wx_after(cx.wx, addr, end, false) else {
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, false) else {
         return -ENOMEM; // as Linux, when a split needs one area too many
     };
     match space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr) {
         Ok(()) => {
             cx.pager.discard(addr, end - addr);
-            if let Some(ranges) = ranges {
-                *cx.wx = ranges;
-            }
+            set_wx(cx.pager, ranges);
             0
         }
         Err(_) => -EINVAL,
@@ -1378,13 +1328,13 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
     };
     // Write-or-execute ranges lose what this call covers, or take it all
     // (design D5 of `node-jit`); checked before anything changes.
-    let Ok(ranges) = wx_after(cx.wx, addr, end, is_wx(prot)) else {
+    let Ok(ranges) = wx_after(cx.pager.wx(), addr, end, is_wx(prot)) else {
         return -ENOMEM;
     };
     if is_wx(prot) {
         return match protect_wx(cell, cx, addr, end) {
             Ok(()) => {
-                *cx.wx = ranges.unwrap_or_default();
+                set_wx(cx.pager, Some(ranges.unwrap_or_default()));
                 0
             }
             Err(e) => e,
@@ -1397,17 +1347,13 @@ fn mprotect<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S>(
         return match space::unmap(&cx.pt, cx.mem, cx.tlb, cx.frames, addr, end - addr) {
             Ok(()) => {
                 cx.pager.discard(addr, end - addr);
-                if let Some(ranges) = ranges {
-                    *cx.wx = ranges;
-                }
+                set_wx(cx.pager, ranges);
                 0
             }
             Err(_) => -ENOMEM,
         };
     }
-    if let Some(ranges) = ranges {
-        *cx.wx = ranges;
-    }
+    set_wx(cx.pager, ranges);
     let flags = page_flags(prot);
     // Pages not in memory yet (lazy resume) are brought in first; holes
     // below the mapping cursor are reserved (`PROT_NONE`) addresses, backed

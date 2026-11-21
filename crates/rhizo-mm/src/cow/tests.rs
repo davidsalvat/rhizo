@@ -130,7 +130,7 @@ impl<F: EntryFormat> World<F> {
         let t = pt.translate(&self.mem, virt).unwrap();
         if !t.flags.is_writable()
             && !pt
-                .resolve_write(
+                .resolve_write_wx(
                     &mut self.mem,
                     &mut self.frames,
                     &mut RecordingTlb::default(),
@@ -227,6 +227,14 @@ fn wx_page_flips_on_faults<F: EntryFormat>() {
         );
         assert_never_wx(&w, &pt);
     }
+    assert!(w.fetch(&pt, 0x1000));
+    let mut tlb = RecordingTlb::default();
+    assert_eq!(
+        pt.resolve_write(&mut w.mem, &mut w.frames, &mut tlb, 0x1000),
+        Ok(false),
+        "copy-on-write resolution leaves running pages to resolve_write_wx"
+    );
+    assert!(w.flags(&pt, 0x1000).is_executable());
     assert!(!w.fetch(&pt, 0x2000), "an ordinary page never runs");
     assert!(w.flags(&pt, 0x2000).is_writable());
     assert_eq!(

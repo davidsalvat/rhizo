@@ -2,6 +2,7 @@
 //! region allows it), unmapping, and teardown that returns every frame.
 
 use crate::{STACK_LIMIT, STACK_TOP, USER_END};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use rhizo_hal::{PhysicalMemory, Tlb};
 use rhizo_mm::paging::{EntryFormat, MapError, PageFlags, PageSize, PageTable};
@@ -185,8 +186,14 @@ pub const MAX_WX_RANGES: usize = 64;
 /// asked writable and executable with no memory behind them yet, whose
 /// pages come zeroed, writing, the first time they are touched. Sorted,
 /// page aligned, never empty, never touching, at most [`MAX_WX_RANGES`].
+/// One word while there are none, as for nearly every cell: making,
+/// forking and dropping a cell costs nothing more.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WxRanges(Vec<(u64, u64)>);
+#[allow(
+    clippy::box_collection,
+    reason = "one word in every live cell, not three: the extra allocation is only for cells with ranges"
+)]
+pub struct WxRanges(Option<Box<Vec<(u64, u64)>>>);
 
 /// More write-or-execute ranges than [`MAX_WX_RANGES`] would be needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,17 +209,21 @@ impl WxRanges {
                 .iter()
                 .all(|&(s, e)| aligned(s) && aligned(e) && s < e && e <= USER_END)
             && ranges.windows(2).all(|w| w[0].1 < w[1].0);
-        valid.then_some(Self(ranges))
+        valid.then(|| Self::of(ranges))
+    }
+
+    fn of(ranges: Vec<(u64, u64)>) -> Self {
+        Self((!ranges.is_empty()).then(|| Box::new(ranges)))
     }
 
     /// The ranges, in address order.
     pub fn ranges(&self) -> &[(u64, u64)] {
-        &self.0
+        self.0.as_deref().map_or(&[], Vec::as_slice)
     }
 
     /// Whether `addr` lies in a range.
     pub fn contains(&self, addr: u64) -> bool {
-        self.0.iter().any(|&(s, e)| (s..e).contains(&addr))
+        self.ranges().iter().any(|&(s, e)| (s..e).contains(&addr))
     }
 
     /// Adds `start..end` (page aligned), merged with the ranges it overlaps
@@ -221,39 +232,38 @@ impl WxRanges {
         if start >= end {
             return Ok(());
         }
-        let first = self.0.partition_point(|&(_, e)| e < start);
-        let last = self.0.partition_point(|&(s, _)| s <= end);
-        if first == last && self.0.len() == MAX_WX_RANGES {
+        let list = self.ranges();
+        let first = list.partition_point(|&(_, e)| e < start);
+        let last = list.partition_point(|&(s, _)| s <= end);
+        if first == last && list.len() == MAX_WX_RANGES {
             return Err(TooManyRanges);
         }
-        let merged = self.0[first..last]
+        let merged = list[first..last]
             .iter()
             .fold((start, end), |(s, e), &(rs, re)| (s.min(rs), e.max(re)));
-        self.0.splice(first..last, [merged]);
+        self.0.get_or_insert_default().splice(first..last, [merged]);
         Ok(())
     }
 
     /// Removes `start..end` from the ranges. Changes nothing if splitting a
     /// range in two would make too many.
     pub fn remove(&mut self, start: u64, end: u64) -> Result<(), TooManyRanges> {
-        let first = self.0.partition_point(|&(_, e)| e <= start);
-        let last = self.0.partition_point(|&(s, _)| s < end);
+        let list = self.ranges();
+        let first = list.partition_point(|&(_, e)| e <= start);
+        let last = list.partition_point(|&(s, _)| s < end);
         if first == last {
             return Ok(());
         }
-        let left = (self.0[first].0 < start).then(|| (self.0[first].0, start));
-        let right = (self.0[last - 1].1 > end).then(|| (end, self.0[last - 1].1));
+        let left = (list[first].0 < start).then(|| (list[first].0, start));
+        let right = (list[last - 1].1 > end).then(|| (end, list[last - 1].1));
         let kept = left.iter().chain(right.iter()).count();
-        if self.0.len() - (last - first) + kept > MAX_WX_RANGES {
+        if list.len() - (last - first) + kept > MAX_WX_RANGES {
             return Err(TooManyRanges);
         }
-        self.0.splice(first..last, left.into_iter().chain(right));
+        let mut list = core::mem::take(self).0.map_or_else(Vec::new, |b| *b);
+        list.splice(first..last, left.into_iter().chain(right));
+        *self = Self::of(list);
         Ok(())
-    }
-
-    /// Removes every range (`execve`).
-    pub fn clear(&mut self) {
-        self.0.clear();
     }
 }
 

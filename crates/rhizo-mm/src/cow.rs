@@ -206,17 +206,42 @@ impl<F: EntryFormat> PageTable<F> {
     /// shared tables on the path and the page if it still has other
     /// references, or makes it writable again if not. Returns `false` if the
     /// write is refused for a real reason (no page, or a read-only one). The
-    /// caller flushes the TLB entry for `virt`.
-    ///
-    /// A write-or-execute page may always be written (change `node-jit`):
-    /// running, it becomes writing the same way, writable and no longer
-    /// executable, copied first if its frame is still shared.
+    /// caller flushes the TLB entry for `virt`. A write-or-execute page that
+    /// is running is refused here: [`resolve_write_wx`] changes it.
     ///
     /// A copied page replaces the old one break-before-make: the entry is
     /// cleared and flushed through `tlb` before it points at the copy, so
     /// no CPU running the same tables holds both (AArch64 requires it when
     /// the output address changes; design D7 of `add-parallel-threads`).
+    ///
+    /// [`resolve_write_wx`]: Self::resolve_write_wx
     pub fn resolve_write(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        frames: &mut impl Frames,
+        tlb: &mut impl Tlb,
+        virt: u64,
+    ) -> Result<bool, MapError> {
+        self.resolve_write_as::<false>(mem, frames, tlb, virt)
+    }
+
+    /// [`resolve_write`](Self::resolve_write), and a write-or-execute page
+    /// that is running may be written too (change `node-jit`): it becomes
+    /// writing, writable and no longer executable, copied first if its frame
+    /// is still shared. Off the copy-on-write fault path, whose code stays
+    /// as it was.
+    pub fn resolve_write_wx(
+        &self,
+        mem: &mut impl PhysicalMemory,
+        frames: &mut impl Frames,
+        tlb: &mut impl Tlb,
+        virt: u64,
+    ) -> Result<bool, MapError> {
+        self.resolve_write_as::<true>(mem, frames, tlb, virt)
+    }
+
+    #[inline(always)]
+    fn resolve_write_as<const WX: bool>(
         &self,
         mem: &mut impl PhysicalMemory,
         frames: &mut impl Frames,
@@ -231,7 +256,7 @@ impl<F: EntryFormat> PageTable<F> {
         if flags.is_writable() {
             return Ok(true); // already resolved (a stale TLB entry faulted)
         }
-        let wx = flags.contains(PageFlags::WRITE_OR_EXEC);
+        let wx = WX && flags.contains(PageFlags::WRITE_OR_EXEC);
         if !flags.contains(PageFlags::COPY_ON_WRITE) && !wx {
             return Ok(false);
         }

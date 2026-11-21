@@ -90,7 +90,9 @@ struct Machine<F> {
     fs: rhizo_fs::Fs,
     net: rhizo_net::Net,
     pages: PageCache,
-    wx: WxRanges,
+    /// Keeps write-or-execute ranges; never backs a page (the frames
+    /// here are counted).
+    pager: Ranges,
     /// Every kernel frame: its tables, data, code and both ends of its
     /// 2 MiB page.
     kernel: Vec<u64>,
@@ -190,7 +192,7 @@ impl<F: EntryFormat> Machine<F> {
             fs,
             net: rhizo_net::Net::new(),
             pages: PageCache::new(16),
-            wx: WxRanges::default(),
+            pager: Ranges::default(),
             kernel: kernel_frames,
             format: core::marker::PhantomData,
         }
@@ -230,9 +232,8 @@ impl<F: EntryFormat> Machine<F> {
             fs: &mut self.fs,
             net: &mut self.net,
             deadline: None,
-            pager: &mut NoPager,
+            pager: &mut self.pager,
             pages: &mut self.pages,
-            wx: &mut self.wx,
         };
         let outcome = self.abi.handle(&mut self.cell, &mut cx);
         // A call waiting on descriptors runs again as the next one.
@@ -666,4 +667,18 @@ fn buffer_lengths_that_overflow_their_sum_are_harmless() {
         "recvmsg: {got}"
     );
     m.end();
+}
+
+/// A pager that keeps write-or-execute ranges and pages nothing in.
+#[derive(Default)]
+struct Ranges(WxRanges);
+
+impl<F: EntryFormat> Pager<F, FakePhysicalMemory> for Ranges {
+    fn page_in(&mut self, _: &PageTable<F>, _: &mut FakePhysicalMemory, _: u64, _: bool) -> bool {
+        false
+    }
+
+    fn wx(&mut self) -> Option<&mut WxRanges> {
+        Some(&mut self.0)
+    }
 }

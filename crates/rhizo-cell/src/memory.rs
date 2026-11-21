@@ -118,11 +118,12 @@ pub trait Pager<F: EntryFormat, M: PhysicalMemory> {
         false
     }
 
-    /// Maps a zeroed write-or-execute page, writing, at the page holding
-    /// `addr` (a page of a write-or-execute range, design D5 of `node-jit`)
-    /// if memory allows; returns whether it did.
-    fn back_wx(&mut self, _pt: &PageTable<F>, _mem: &mut M, _addr: u64) -> bool {
-        false
+    /// The cell's write-or-execute ranges (design D5 of `node-jit`), whose
+    /// missing pages [`page_in`](Self::page_in) backs; `None` where the cell
+    /// may have none. Kept by the pager, which reaches them only on a fault,
+    /// so copies of cells without such memory pay nothing for them.
+    fn wx(&mut self) -> Option<&mut crate::space::WxRanges> {
+        None
     }
 }
 

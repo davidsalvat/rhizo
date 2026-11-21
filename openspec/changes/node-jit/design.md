@@ -142,14 +142,20 @@ with both rights checks every page before it changes one, and skips a hole
 one empty table entry at a time (V8's 512 MiB at once), unless a lazily
 resumed cell still has pages pending, which may sit in a hole.
 
-They live where the cell's files live, in the kernel's record of a live
-cell, and system calls reach them through `Context::wx` as they reach the
-files: user-memory access (`Context::read`, `Context::write`, and the
-piecewise copies of files, pipes and sockets) goes through a pager that
-backs a page of a range it faults on (`Pager::back_wx`, the kernel's
-allocator behind it) and retries. Alternatives: in `Cell` (system calls
-get `&mut Cell` and the `Context` separately, so user-memory access, which
-only has the `Context`, could not see them); markers in invalid page-table
+They are kept by the pager, next to the pages of a lazy resume (both
+are pages a cell gets on demand: `OnDemand` in the kernel's record of a
+live cell, reached through the one pointer the pager of system calls
+already held). `mmap`, `mprotect` and `munmap` reach them through
+`Pager::wx`; user-memory access reaches them only when a copy faults, in
+the pager's `page_in`, which backs a page of a range (or makes a running
+page writing for a write) out of line and retries. A cell without such
+memory pays nothing for them: no field in `Context`, no check on a copy
+that does not fault, one word (`WxRanges` is `None` while empty) in its
+record. Alternatives: a field of `Context` and a pager wrapping every
+copy (measured: +7 instructions per system call and +2.6% per pipe round
+trip on x86_64, every cell paying for a feature few use); in `Cell`
+(system calls get `&mut Cell` and the `Context` separately, so
+user-memory access could not see them); markers in invalid page-table
 entries (every walk that skips invalid entries, clone, snapshot, unmap,
 `hole_end`, would have to learn them); backing every reserved address on
 first touch (changes the rule glibc's guard pages rely on).
@@ -235,12 +241,16 @@ against 369 ms with `--jitless`, 124 ms warm against 133 ms, with 33
 changes (both directions) per cold run: under TCG the JIT's code is
 emulated like the interpreter, so only KVM figures say what it buys.
 
-The fault paths add nothing to the hot paths but where the compiler's
-register allocation moved: against `origin/main` under `-icount`,
-x86_64 `cell.syscall_insns` +7 instructions (+2.1%), `cell.pipe_rtt_insns`
-+2.6%, `cell.loopback_rtt_insns` +1.3%, `cell.fork_insns` and
-`cell.spawn_from_template_insns` +0.5% (a range list per cell);
-`cell.cow_fault_insns` -2.4% and `cell.resume_insns` -1.9% (the record
-offset read once). AArch64 stays within its gate. The six x86_64 metrics
-that crossed their 2% gate (main sits up to 1.6% above its baseline)
-have their baseline moved by the ratio measured against main.
+Hot paths stay as they were for cells without write-or-execute memory.
+The copy-on-write fault arm of the cell loop is main's: `resolve_write`
+leaves running pages to `resolve_write_wx`, and everything else of this
+change (backing a page, both changes of state, the self-writing check)
+sits in `#[cold]` out-of-line functions reached only by faults no other
+path resolved. Against `origin/main` under `-icount` on x86_64:
+`cell.syscall_insns`, `cell.switch_insns` unchanged, `cell.pipe_rtt_insns`
+-2 instructions, `cell.loopback_rtt_insns` -4, `cell.cow_fault_insns`
+-3.2% (`walk_private` kept inlined), `cell.resume_insns` -2.0% (the
+snapshot's record offset read once), `cell.fork_insns`,
+`cell.fork_with_files_insns` and `cell.spawn_from_template_insns` +25
+instructions (+0.4%: the range word in every live cell's record, set and
+copied). No baseline changes.

@@ -9,7 +9,7 @@
 ## 2. Cell memory and system calls
 
 - [x] 2.1 `space::WxRanges` and backing a page of a range (D5); verify `cargo test -p rhizo-cell wx`
-- [x] 2.2 `mmap`, `mprotect`, `munmap` and user-memory access with write-or-execute memory, `Context::wx`, `Pager::back_wx` (D5); verify `cargo test -p rhizo-abi wx` and `cargo test -p rhizo-abi hostile`
+- [x] 2.2 `mmap`, `mprotect`, `munmap` and user-memory access with write-or-execute memory, ranges kept by the pager (`Pager::wx`) (D5); verify `cargo test -p rhizo-abi wx` and `cargo test -p rhizo-abi hostile`
 
 ## 3. Snapshots
 

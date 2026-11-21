@@ -66,9 +66,9 @@ pub(crate) struct World {
     pub(crate) fs: rhizo_fs::Fs,
     pub(crate) net: rhizo_net::Net,
     pub(crate) pages: PageCache,
-    pub(crate) wx: WxRanges,
-    /// Backs write-or-execute pages for system calls, as the kernel does.
-    backing: Option<Backing>,
+    /// Keeps the cell's write-or-execute ranges, and backs their pages
+    /// for system calls when told to, as the kernel's pager does.
+    pub(crate) pager: Ranges,
     /// Deadline of the last blocked call (kept, as the kernel does).
     pub(crate) deadline: Option<u64>,
     /// The last call waits on descriptors: with this deadline.
@@ -111,8 +111,7 @@ impl World {
             fs: rhizo_fs::Fs::new(),
             net: rhizo_net::Net::new(),
             pages: PageCache::new(64),
-            wx: WxRanges::default(),
-            backing: None,
+            pager: Ranges::default(),
             deadline: None,
             io: None,
             used_net: false,
@@ -147,12 +146,8 @@ impl World {
             fs: &mut self.fs,
             net: &mut Noting(&mut self.net, &mut self.used_net),
             deadline: self.deadline.take(),
-            pager: match &mut self.backing {
-                Some(b) => b,
-                None => &mut NoPager,
-            },
+            pager: &mut self.pager,
             pages: &mut self.pages,
-            wx: &mut self.wx,
         };
         let out = self.abi.handle(&mut self.cell, &mut cx);
         // A thread waiting on descriptors keeps its deadline and makes its
@@ -197,16 +192,20 @@ const EXIT_GROUP: u64 = 94;
 const BRK: u64 = 214;
 const MUNMAP: u64 = 215;
 
-/// A pager that backs write-or-execute pages from frames of its own (far
-/// from the world's, never given back), as the kernel's does from its
-/// allocator (design D5 of `node-jit`).
+/// A pager keeping write-or-execute ranges (design D5 of `node-jit`); with
+/// `backing`, it backs their missing pages from frames of its own (far from
+/// the world's, never given back), as the kernel's does from its allocator.
 #[derive(Default)]
-struct Backing(u64);
+pub(crate) struct Ranges {
+    pub(crate) wx: WxRanges,
+    backing: bool,
+    next: u64,
+}
 
-impl Frames for Backing {
+impl Frames for Ranges {
     fn alloc(&mut self) -> Option<u64> {
-        self.0 += FRAME_SIZE;
-        Some((1 << 40) + self.0)
+        self.next += FRAME_SIZE;
+        Some((1 << 40) + self.next)
     }
     fn alloc_large(&mut self) -> Option<u64> {
         None
@@ -218,26 +217,24 @@ impl Frames for Backing {
     }
 }
 
-impl Pager<Aarch64, FakePhysicalMemory> for Backing {
+impl Pager<Aarch64, FakePhysicalMemory> for Ranges {
     fn page_in(
-        &mut self,
-        _: &PageTable<Aarch64>,
-        _: &mut FakePhysicalMemory,
-        _: u64,
-        _: bool,
-    ) -> bool {
-        false
-    }
-
-    fn back_wx(
         &mut self,
         pt: &PageTable<Aarch64>,
         mem: &mut FakePhysicalMemory,
         addr: u64,
+        _: bool,
     ) -> bool {
+        if !self.backing || !self.wx.contains(addr) || pt.translate(mem, addr).is_some() {
+            return false;
+        }
         let page = addr & !(FRAME_SIZE - 1);
         let tlb = &mut RecordingTlb::default();
         space::map_anonymous(pt, mem, tlb, self, page, FRAME_SIZE, space::WX_WRITING).is_ok()
+    }
+
+    fn wx(&mut self) -> Option<&mut WxRanges> {
+        Some(&mut self.wx)
     }
 }
 const MMAP: u64 = 222;
@@ -1533,9 +1530,9 @@ fn wx_memory_comes_on_first_touch() {
     let code = w.call(MMAP, &[0, 512 << 20, 0, anon, u64::MAX, 0]).0 as u64;
     assert_eq!(w.call(226, &[code, 512 << 20, 7]).0, 0);
     assert_eq!(w.frames.outstanding(), before, "no memory yet");
-    assert_eq!(w.wx.ranges(), &[(code, code + (512 << 20))]);
+    assert_eq!(w.pager.wx.ranges(), &[(code, code + (512 << 20))]);
     // A system call writing there gets a zeroed page, writing.
-    w.backing = Some(Backing::default());
+    w.pager.backing = true;
     let at = code + (100 << 20) + 8;
     assert_eq!(w.call(261, &[0, 3, 0, at]).0, 0, "prlimit64 into it");
     assert_eq!(w.peek(at, 8), (8u64 << 20).to_le_bytes());
@@ -1564,7 +1561,7 @@ fn wx_memory_comes_on_first_touch() {
     assert_eq!(w.call(MUNMAP, &[code, 1 << 20]).0, 0);
     let end = code + (512 << 20);
     assert_eq!(
-        w.wx.ranges(),
+        w.pager.wx.ranges(),
         &[(code + (1 << 20), ro), (ro + FRAME_SIZE, end)]
     );
     // A mapped page made writable and executable keeps its frame.
@@ -1577,15 +1574,15 @@ fn wx_memory_comes_on_first_touch() {
     // Both rights over a hole that is not reserved, or over part of a
     // 2 MiB page: refused, nothing changed.
     let big = w.call(MMAP, &[0, 2 << 20, 3, anon, u64::MAX, 0]).0 as u64;
-    let ranges = w.wx.clone();
+    let ranges = w.pager.wx.clone();
     assert_eq!(w.call(226, &[0x7000_0000, FRAME_SIZE, 7]).0, -ENOMEM);
     assert_eq!(w.call(226, &[big, FRAME_SIZE, 7]).0, -EINVAL);
-    assert_eq!(w.wx, ranges);
+    assert_eq!(w.pager.wx, ranges);
     // MAP_FIXED over a range replaces it.
     let fixed = code + (300 << 20);
     let got = w.call(MMAP, &[fixed, FRAME_SIZE, 3, anon | MAP_FIXED, u64::MAX, 0]);
     assert_eq!(got.0 as u64, fixed);
-    assert!(!w.wx.contains(fixed) && w.wx.contains(fixed + FRAME_SIZE));
+    assert!(!w.pager.wx.contains(fixed) && w.pager.wx.contains(fixed + FRAME_SIZE));
     // Files: still never both.
     w.fs.put_file(b"/f", &[1; 4096]).unwrap();
     let read = rhizo_fs::OpenFlags {
@@ -1612,15 +1609,15 @@ fn wx_ranges_are_bounded() {
         // A reserved gap keeps the next range apart.
         assert!(w.call(MMAP, &[0, FRAME_SIZE, 0, anon, u64::MAX, 0]).0 > 0);
     }
-    let full = w.wx.clone();
+    let full = w.pager.wx.clone();
     assert_eq!(full.ranges().len(), space::MAX_WX_RANGES);
     let more = w.call(MMAP, &[0, FRAME_SIZE, 7, anon, u64::MAX, 0]).0;
     assert_eq!(more, -ENOMEM);
     let middle = first + FRAME_SIZE;
     assert_eq!(w.call(MUNMAP, &[middle, FRAME_SIZE]).0, -ENOMEM, "a split");
     assert_eq!(w.call(226, &[middle, FRAME_SIZE, 1]).0, -ENOMEM, "a split");
-    assert_eq!(w.wx, full);
+    assert_eq!(w.pager.wx, full);
     assert_eq!(w.call(MUNMAP, &[first, FRAME_SIZE]).0, 0, "a trim");
-    assert_eq!(w.wx.ranges().len(), space::MAX_WX_RANGES);
-    assert_eq!(w.wx.ranges()[0], (middle, first + 3 * FRAME_SIZE));
+    assert_eq!(w.pager.wx.ranges().len(), space::MAX_WX_RANGES);
+    assert_eq!(w.pager.wx.ranges()[0], (middle, first + 3 * FRAME_SIZE));
 }
