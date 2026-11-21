@@ -73,11 +73,39 @@ change rarely.
 Test names are the function names (`ktest_case!` stringifies its path),
 so each area lists bare names, never `area::name`.
 
+### D3. What the split does to the machine code
+
+The release profile is one codegen unit with fat LTO, so moving items
+between modules changes no inlining decision. Measured on the release
+kernels (before: `main` at 693be50; after: this change; 4-CPU host, no
+KVM):
+
+- Plain kernels (no `cells`): every function the same size, the same
+  sections, on both architectures.
+- `bench-cell`, x86_64: all 647 functions the same size once the new
+  module paths are folded back (only closure names change), and all 53
+  `-icount` metrics identical to the instruction.
+- `bench-cell`, AArch64: 6 of 639 functions change size by a few
+  instructions (`Host::spawn_with_files` +2, `copy_image` +2,
+  `prof::start` -2, `prof::stop` -4, and the benchmark drivers), and
+  more change register choice or offsets. The `-icount` run on `main`,
+  repeated, gives identical figures, so these are real: LLVM's AArch64
+  global merging groups the kernel's statics by their order in the
+  module, which follows the files, and addresses some through a
+  different base register. 33 of the 53 metrics are identical; the
+  others move by at most 0.7 % except breakdown parts of a few hundred
+  instructions (`fork_touch.net` 256 to 224, `cell_loop.net` 672 to 688,
+  in units of the 16 instructions a timer tick counts under `-icount`).
+  The worst headline figure is `cell.switch_insns` 821 to 823 (+0.24 %,
+  gate +2 %); `cell.fork_touch_insns` is 8,533,488 to 8,533,504.
+
 ## Verification
 
 - The test list, by name and order, from the console of `ktest` and
-  `ktest-smp` (`RHIZO_JOBS=1`) on both architectures, before and after.
+  `ktest-smp` (`RHIZO_JOBS=1`) on both architectures, before and after:
+  identical (147 tests on AArch64, 150 on x86_64: the 142 shared ones and
+  the architecture's own).
 - The release `bench-cell` and plain kernels, function by function
   (sizes after folding the new module paths back), before and after on
-  both architectures, and the `-icount` benchmarks before and after.
+  both architectures, and the `-icount` benchmarks before and after (D3).
 - `cargo xtask ci` on both architectures.

@@ -12,6 +12,6 @@
 
 ## 3. Verify
 
-- [ ] 3.1 The same tests by name and order; verify the `ktest` and `ktest-smp` lists after the change against 1.1 on both architectures
-- [ ] 3.2 The same code; verify the release plain and `bench-cell` kernels function by function against the baseline on both architectures, and the `-icount` benchmarks against 1.1
-- [ ] 3.3 `cargo xtask ci` and `cargo xtask --arch x86_64 ci` pass; `openspec validate split-hotspot-files --strict` passes
+- [x] 3.1 The same tests by name and order; verify the `ktest` and `ktest-smp` lists after the change against 1.1 on both architectures
+- [x] 3.2 The same code; verify the release plain and `bench-cell` kernels function by function against the baseline on both architectures, and the `-icount` benchmarks against 1.1
+- [x] 3.3 `cargo xtask ci` and `cargo xtask --arch x86_64 ci` pass; `openspec validate split-hotspot-files --strict` passes
