@@ -1059,6 +1059,9 @@ pub struct Host {
     look_every: Option<u64>,
     /// The output [`output`](Self::output) copied last.
     peeked: Vec<u8>,
+    /// Whether other CPUs run cells: during a run on several CPUs (see
+    /// [`locked`](Self::locked)).
+    others: bool,
 }
 
 /// Words of a running cell's memory ([`Host::watch`]), read through the
@@ -1120,7 +1123,7 @@ enum Back {
 /// leaves runnable cells to it.
 fn idle_for_runnable(s: &Shared) -> u32 {
     let others = s.idle & !1;
-    if s.sched.runnable() > 0 {
+    if others != 0 && s.sched.runnable() > 0 {
         others & others.wrapping_neg()
     } else {
         0
@@ -1289,37 +1292,34 @@ fn wait(wake: Option<u64>) {
 fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, how: Back) {
     let _p = cost::scope(Part::Sched);
     let _timed = prof::Timed::new(Count::SchedCycles);
-    let ended = match how {
+    // The cell back, and whether it is filed (else requeued).
+    let (ended, back) = match how {
         Back::End(ending) => {
             shared.with(|s| s.nudged.remove(&live.cell.id));
-            Some(end(live, ending))
+            (Some(end(live, ending)), None)
         }
         Back::Requeue => {
             live.ready = ready_now();
-            // Woken cells and its nudge wait for the next take.
-            shared.with(|s| {
-                if claimed(live.cell.id) {
-                    s.claimed = Some(live);
-                } else {
-                    s.sched.requeue(cpu, live);
-                }
-            });
-            None
+            (None, Some((live, false)))
         }
-        Back::File | Back::Share => {
-            shared.with(|s| {
-                wake_woken(s, cpu, now_ns);
-                if claimed(live.cell.id) {
-                    s.claimed = Some(live);
-                } else {
-                    file(s, Some(cpu), live);
-                }
-            });
-            None
-        }
+        Back::File | Back::Share => (None, Some((live, true))),
     };
     let was_end = ended.is_some();
+    // One critical section puts the cell back and does the bookkeeping.
     let wake = shared.with(|s| {
+        if let Some((live, filed)) = back {
+            // A requeued cell's woken cells and nudge wait for the next take.
+            if filed {
+                wake_woken(s, cpu, now_ns);
+            }
+            if claimed(live.cell.id) {
+                s.claimed = Some(live);
+            } else if filed {
+                file(s, Some(cpu), live);
+            } else {
+                s.sched.requeue(cpu, live);
+            }
+        }
         s.running -= 1;
         s.on_cpu[cpu] = 0;
         if let Some((finished, tag)) = ended {
@@ -2302,6 +2302,7 @@ impl Host {
             wire_addr: None,
             look_every: None,
             peeked: Vec::new(),
+            others: false,
         }
     }
 
@@ -2327,6 +2328,18 @@ impl Host {
         self.shared.get_mut()
     }
 
+    /// Runs `f` on the shared state: under its lock while other CPUs run
+    /// cells, without it otherwise (nobody else reaches it then, and host
+    /// operations between runs cost what they did before change
+    /// `host-ops-per-cell`).
+    fn locked<R>(&mut self, f: impl FnOnce(&mut Shared) -> R) -> R {
+        if self.others {
+            self.shared.with(f)
+        } else {
+            f(self.shared.get_mut())
+        }
+    }
+
     /// Takes live cell `id` out of the scheduler for a host operation, with
     /// its wake time if it slept. If CPUs run it, only they are interrupted
     /// and give it back, and the host waits for that (design D2 of
@@ -2334,7 +2347,7 @@ impl Host {
     /// live: if it ended, even meanwhile on another CPU, its record is then
     /// in [`finished`](Self::finished).
     fn take_cell(&mut self, id: u32) -> Option<(Box<Live>, Option<u64>)> {
-        let (running, idle) = self.shared.with(|s| {
+        let (running, idle) = self.locked(|s| {
             let found = s.sched.remove(id);
             // This CPU works for the host now, not on the cells it left
             // runnable: an idle CPU takes them.
@@ -2359,7 +2372,7 @@ impl Host {
         }
         loop {
             core::hint::spin_loop();
-            let given = self.shared.with(|s| {
+            let given = self.locked(|s| {
                 let live = s.claimed.take();
                 // Back, or ended on its CPU.
                 let done = live.is_some() || running_on(s, id) == 0;
@@ -2387,9 +2400,7 @@ impl Host {
     /// [`take_cell`]: Self::take_cell
     fn with_live<R>(&mut self, id: u32, f: impl FnOnce(&mut Live) -> R) -> Option<R> {
         let mut f = Some(f);
-        let found = self
-            .shared
-            .with(|s| s.sched.find_mut(id).map(|l| f.take().map(|f| f(l))));
+        let found = self.locked(|s| s.sched.find_mut(id).map(|l| f.take().map(|f| f(l))));
         if let Some(r) = found {
             return r;
         }
@@ -2403,7 +2414,7 @@ impl Host {
     /// CPU to take the runnable ones (during a run; none idles between
     /// runs).
     fn admit<R>(&mut self, f: impl FnOnce(&mut Shared) -> R) -> R {
-        let (r, wake) = self.shared.with(|s| (f(s), idle_for_runnable(s)));
+        let (r, wake) = self.locked(|s| (f(s), idle_for_runnable(s)));
         wake_cpus(wake);
         r
     }
@@ -2422,7 +2433,7 @@ impl Host {
         if fs.limits() != limits {
             fs.set_limits(limits.0, limits.1);
         }
-        let tag = self.shared.with(|s| s.tags.alloc());
+        let tag = self.locked(|s| s.tags.alloc());
         if tag.is_none() {
             prof::add(Count::Untagged, 1);
         }
@@ -2749,6 +2760,7 @@ impl Host {
             for cpu in 1..cpus {
                 crate::smp::post(cpu, run_cpu, shared);
             }
+            self.others = true;
         }
         loop {
             self.poll_wire(now_ns());
@@ -2779,6 +2791,7 @@ impl Host {
             for cpu in 1..cpus {
                 crate::smp::join(cpu);
             }
+            self.others = false;
             crate::heap::reclaim_tables(); // the other CPUs can flush now
             let state = self.state();
             state.stopping = false;
@@ -2935,7 +2948,7 @@ impl Host {
     /// no trace (no [`Finished`]).
     fn discard(&mut self, live: &Live) {
         if live.tag != 0 {
-            self.shared.with(|s| s.tags.free(live.tag));
+            self.locked(|s| s.tags.free(live.tag));
         }
         release_sockets(&live.fs, live.cell.id);
         sharing(true, || {
@@ -2997,7 +3010,7 @@ impl Host {
         sync_fp(&mut live, true);
         user::release_user(live.cell.root, live.tag);
         if live.tag != 0 {
-            self.shared.with(|s| s.tags.free(live.tag));
+            self.locked(|s| s.tags.free(live.tag));
         }
         let Live { cell, fs, .. } = *live;
         self.templates.push((cell, fs));
@@ -3032,7 +3045,7 @@ impl Host {
     )]
     pub fn asleep(&mut self, id: u32) -> bool {
         // A cell a CPU runs is not asleep.
-        self.shared.with(|s| {
+        self.locked(|s| {
             s.sched.find(id).is_some_and(|l| {
                 let threads = &l.cell.threads;
                 !threads.is_runnable() && !threads.waits_on_io() && threads.wake_at().is_some()
@@ -3047,7 +3060,7 @@ impl Host {
     )]
     pub fn waits(&mut self, id: u32) -> bool {
         // A cell a CPU runs does not wait.
-        self.shared.with(|s| {
+        self.locked(|s| {
             s.sched
                 .find(id)
                 .is_some_and(|l| !l.cell.threads.is_runnable())
@@ -3214,10 +3227,10 @@ impl Host {
     /// Ends `live`, taken out of the scheduler, and keeps what remains of
     /// it.
     fn end(&mut self, live: Box<Live>, ending: Ending) {
-        self.shared.with(|s| s.nudged.remove(&live.cell.id));
+        self.locked(|s| s.nudged.remove(&live.cell.id));
         let (finished, tag) = end(live, ending);
         if tag != 0 {
-            self.shared.with(|s| s.tags.free(tag));
+            self.locked(|s| s.tags.free(tag));
         }
         self.finished.push(finished);
     }
