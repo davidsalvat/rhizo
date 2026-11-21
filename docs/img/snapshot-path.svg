@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 490" width="800" height="490" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Saving a cell to a file and loading it elsewhere</title>
+<desc>On machine A, rhizo save sends a request with a one-time token on the serial line; the kernel streams the snapshot's bytes over TCP through the VM's network card to a listener rhizo opened, which writes a file ending in a checksum. On machine B, rhizo load asks the kernel to fetch the file the same way; the kernel checks the header, the checksum and every field, caps the cell's quotas, and then resumes the cell or forks copies of the template.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#1f9d6b"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#0a5cc2"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8a6100"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b42318"/></marker><marker id="c" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#146c4a"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="489" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">A cell travels as a file</text>
+<text x="24" y="64" font-size="14" fill="#4b5c55">rhizo save on one machine, rhizo load on another.</text>
+<rect x="24" y="84" width="300" height="332" rx="16" fill="#ffffff" stroke="#858f8a" stroke-width="1.5"/>
+<text x="40" y="108" font-size="13.5" fill="#4b5c55" font-weight="700">Machine A</text>
+<rect x="40" y="120" width="268" height="44" rx="10" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="174" y="147" font-size="13" fill="#0e2a20" text-anchor="middle" font-weight="700" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">rhizo save 7 agent.snap</text>
+<rect x="40" y="214" width="268" height="186" rx="12" fill="#eafaf2" stroke="#1f9d6b" stroke-width="2"/>
+<text x="56" y="240" font-size="13.5" fill="#0e2a20" font-weight="700">Rhizo VM</text>
+<rect x="56" y="254" width="112" height="60" rx="20" fill="#e3f0ff" stroke="#3f80cf" stroke-width="1.5"/>
+<text x="112" y="289" font-size="13" fill="#0e2a20" font-weight="700" text-anchor="middle">cell 7</text>
+<rect x="192" y="254" width="100" height="60" rx="8" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<text x="242" y="279" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="middle">network</text>
+<text x="242" y="296" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="middle">card</text>
+<text x="56" y="340" font-size="12.5" fill="#4b5c55">suspend, then send the bytes;</text>
+<text x="56" y="359" font-size="12.5" fill="#4b5c55">shared pages written in full,</text>
+<text x="56" y="378" font-size="12.5" fill="#4b5c55">so the file stands alone</text>
+<line x1="144" y1="164" x2="144" y2="254" stroke="#57706a" stroke-width="1.6" marker-end="url(#a)" stroke-dasharray="4 4"/>
+<text x="136" y="184" font-size="12" fill="#4b5c55" text-anchor="end">request +</text>
+<text x="136" y="199" font-size="12" fill="#4b5c55" text-anchor="end">one-time token</text>
+<line x1="242" y1="254" x2="242" y2="164" stroke="#0a5cc2" stroke-width="2.2" marker-end="url(#b)"/>
+<text x="254" y="184" font-size="12" fill="#0a5cc2" font-weight="700">bytes</text>
+<text x="254" y="199" font-size="12" fill="#0a5cc2" font-weight="700">over TCP</text>
+<rect x="476" y="84" width="300" height="332" rx="16" fill="#ffffff" stroke="#858f8a" stroke-width="1.5"/>
+<text x="492" y="108" font-size="13.5" fill="#4b5c55" font-weight="700">Machine B</text>
+<rect x="492" y="120" width="268" height="44" rx="10" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="626" y="147" font-size="13" fill="#0e2a20" text-anchor="middle" font-weight="700" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">rhizo load agent.snap</text>
+<rect x="492" y="214" width="268" height="186" rx="12" fill="#eafaf2" stroke="#1f9d6b" stroke-width="2"/>
+<text x="508" y="240" font-size="13.5" fill="#0e2a20" font-weight="700">Rhizo VM</text>
+<rect x="508" y="254" width="112" height="60" rx="20" fill="#e3f0ff" stroke="#3f80cf" stroke-width="1.5"/>
+<text x="564" y="289" font-size="13" fill="#0e2a20" font-weight="700" text-anchor="middle">template</text>
+<rect x="644" y="254" width="100" height="60" rx="8" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<text x="694" y="279" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="middle">network</text>
+<text x="694" y="296" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="middle">card</text>
+<text x="508" y="340" font-size="12.5" fill="#4b5c55">checks: header, checksum,</text>
+<text x="508" y="359" font-size="12.5" fill="#4b5c55">every field; quotas capped;</text>
+<text x="508" y="378" font-size="12.5" fill="#4b5c55">then resume, or fork copies</text>
+<line x1="596" y1="164" x2="596" y2="254" stroke="#57706a" stroke-width="1.6" marker-end="url(#a)" stroke-dasharray="4 4"/>
+<text x="588" y="184" font-size="12" fill="#4b5c55" text-anchor="end">request +</text>
+<text x="588" y="199" font-size="12" fill="#4b5c55" text-anchor="end">one-time token</text>
+<line x1="694" y1="164" x2="694" y2="254" stroke="#0a5cc2" stroke-width="2.2" marker-end="url(#b)"/>
+<text x="706" y="184" font-size="12" fill="#0a5cc2" font-weight="700">bytes</text>
+<text x="706" y="199" font-size="12" fill="#0a5cc2" font-weight="700">over TCP</text>
+<rect x="352" y="190" width="96" height="120" rx="12" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<g transform="translate(380 208) scale(1.66667)" fill="none" stroke="#0e2a20" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4"/></g>
+<text x="400" y="272" font-size="12.5" fill="#0e2a20" font-weight="700" text-anchor="middle">agent.snap</text>
+<text x="400" y="290" font-size="12" fill="#4b5c55" text-anchor="middle">+ CRC-32C</text>
+<line x1="324" y1="250" x2="352" y2="250" stroke="#57706a" stroke-width="2" marker-end="url(#a)"/>
+<line x1="448" y1="250" x2="476" y2="250" stroke="#57706a" stroke-width="2" marker-end="url(#a)"/>
+<text x="400" y="446" font-size="14" fill="#0e2a20" font-weight="700" text-anchor="middle">Copy it, keep it, share it: the file is the cell, ready to wake up.</text>
+<text x="400" y="468" font-size="12.5" fill="#4b5c55" text-anchor="middle">Same architecture on both sides; a file from elsewhere is refused with its reason.</text>
+</svg>

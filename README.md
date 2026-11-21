@@ -5,239 +5,152 @@
   </picture>
 </p>
 
-<p align="center"><b>An operating system kernel built for AI agents.</b></p>
+<h3 align="center">A home for AI agents: they start in an instant, pause and resume like a saved game, clone themselves to try ideas in parallel, and stay sealed off.</h3>
 
-AI agents write and run code. Each one needs a safe place to do it: a sandbox
-it cannot escape, that starts instantly, costs nothing while the agent waits
-for the model, and can be paused, resumed or copied to try several ideas at
-once. Today that place is built from pieces made for something else (virtual
-machines, containers, processes), and it shows: slow to start, heavy to keep,
-expensive to copy.
-
-Rhizo is an operating system kernel built for that job. Its basic unit is the
-**agent cell**, a sealed environment that the kernel itself can create,
-suspend, resume and fork in microseconds. It is meant for two kinds of users:
-
-- **platforms that run many agents on servers**, where density, cost per agent
-  and isolation between customers matter;
-- **people running agents on their own computer**, next to a local model,
-  where an agent should cost almost nothing while idle.
-
-Underneath, Rhizo is deep: it rebuilds memory, scheduling and isolation around
-the agent. On top, the goal is that none of it shows: two clicks and your
-agents are ready, fast and safe. Rhizo is open source (MIT) and written in
-Rust.
-
-> **Status: pre-alpha proof of concept.** Nothing here is usable in production
-> yet. See [where it stands](#status).
-
-## The problem
-
-An AI agent that runs code today sits on top of a tall stack. Every layer was
-designed for something else, and what agents need most (fast suspend and
-resume, cheap clones of the whole environment, strict isolation of untrusted
-code) is bolted on from the outside.
+<p align="center">
+  <a href="#try-it">Try it</a> ·
+  <a href="#get-involved">Get involved</a> ·
+  <a href="#the-numbers-that-matter">Numbers</a> ·
+  <a href="#where-it-is-going">Roadmap</a> ·
+  <a href="docs/overview.md">In depth</a>
+</p>
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/stack-dark.svg">
-    <img src="docs/img/stack.svg" alt="Today: orchestrator, host Linux, a VMM or userspace kernel and often a guest Linux under the agent. With Rhizo: the orchestrator talks to the Rhizo kernel, which runs the agents as cells and offers create, suspend, resume and fork." width="800">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/hero-dark.svg">
+    <img src="docs/img/hero.svg" alt="The Rhizo vision. A ready-made agent is downloaded from a catalogue and starts in an instant inside a sealed area, talking to your own model (Ollama, llama.cpp or any API). It can be paused and resumed like saving a game, with save slots, and cloned into three branches that try ideas in parallel: the best branch is kept, the others are dropped." width="800">
   </picture>
 </p>
 
-Agent workloads look nothing like classic services:
+AI agents don't just chat any more: they write code, run it, install
+packages and open files. Each one needs a room of its own, a safe place to
+work that it cannot break out of. Today that room is borrowed from tools built
+for something else, so it is slow to open, heavy to keep and costly to copy.
 
-| Classic service | AI agent |
-|---|---|
-| Long-lived, always on | Short bursts, mostly idle (waiting for a model or a human) |
-| Trusted code | Untrusted, model-generated code |
-| Tens per node | Thousands per node, most of them asleep |
-| Scaling means more replicas | What matters is suspending and resuming quickly |
-| Static permissions | Per-task permissions: tools, network, secrets |
+**Rhizo is an operating system kernel built for agents from the ground up.**
+Each agent lives in a **cell**. A cell starts in microseconds and a real
+agent forked from a warm template answers within a few milliseconds; it sleeps
+for almost nothing while the agent waits for its model, can be saved and picked
+up later exactly where it was, and can be cloned in an instant so ten copies
+try ten ideas at once and you keep the best one. One day you will download
+ready-made agents in two clicks and run them with your own model, on your
+laptop or by the thousand on a server. Rhizo is open source (MIT) and written
+in Rust.
 
-Rhizo explores what happens when those needs are the design center of the
-kernel itself. The name comes from the *rhizome*: an underground stem that
-branches into independent shoots (fork), can regrow a whole plant from a
-fragment (snapshot) and lies dormant until it sprouts again (suspend/resume).
+## Who it is for
 
-## Vision
+<table>
+<tr>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/scene-dev-dark.svg"><img src="docs/img/scene-dev.svg" alt="A laptop forks one agent into ten copies; one copy succeeds and is marked with a star." width="100%"></picture>
+<b>A developer tries ten strategies at once.</b> Clone the agent at the
+moment it has to choose, let every copy try its own fix, keep the one that
+passes the tests. The copies share memory until they change it.
+</td>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/scene-company-dark.svg"><img src="docs/img/scene-company.svg" alt="One server holds a grid of a hundred small cells; most are asleep, a few are awake." width="100%"></picture>
+<b>A company runs thousands of agents on little hardware.</b> Each customer's
+agent is sealed in its own cell; sleeping ones cost a few kilobytes, so one
+machine holds ten thousand busy cells.
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/scene-hobby-dark.svg"><img src="docs/img/scene-hobby.svg" alt="At home, an assistant in a cell talks to a local model running next to it; it sleeps when idle." width="100%"></picture>
+<b>A hobbyist keeps a local assistant.</b> Your model runs on your own GPU;
+the assistant lives next to it in a cell, sleeps when you are away, and wakes
+in an instant with its files and history.
+</td>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/scene-research-dark.svg"><img src="docs/img/scene-research.svg" alt="A timeline of an experiment with a frozen point; an arrow goes back to it to replay the run." width="100%"></picture>
+<b>A researcher freezes and replays an experiment.</b> Freeze an agent run at
+any point, save it to a file, and replay it from there, on this machine or
+another, as many times as needed.
+</td>
+</tr>
+</table>
 
-Rhizo is complex underneath so that it can be simple on top. The kernel
-rebuilds the foundations of the operating system around the agent; the person
-using it sees none of that.
+## Get involved
+
+- **Try it in minutes**: `rhizo up`, then `rhizo chat` talks to an agent in a
+  cell with your own model ([Try it](#try-it)).
+- **Build it with us**: good first areas are listed [below](#contribute);
+  every change starts as a small spec, so design reviews count as much as
+  code.
+- **Use it**: running agents for a product, a lab or a hobby? Open an issue
+  with your workload; real workloads shape the roadmap.
+- **Follow it**: star the repository and watch its releases.
+
+> **Status: proof of concept, measured in CI.** Rhizo already runs CPython,
+> Node.js and numpy agents in cells, on Arm and x86, with every figure below
+> measured on each change. It is not ready for production, and its external
+> security audit is still to come.
+
+## What a cell does
+
+A container shares one kernel among everyone; a microVM gives every agent a
+whole operating system. A cell is a third way: one kernel built for agents,
+with walls between cells and their life cycle built in.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/layers-dark.svg">
-    <img src="docs/img/layers.svg" alt="Layers of Rhizo. On top, what the user sees: a two-click app and a template catalog, both planned, and their agents. A line separates what the user does not see: agent cells, created, suspended, resumed and forked in microseconds (measured), and below them the Rhizo kernel, which rebuilds memory, scheduling, isolation, networking and snapshots." width="800">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/compare-dark.svg">
+    <img src="docs/img/compare.svg" alt="Three stacks side by side. Container: agents on a host Linux kernel shared by every container; starts fast, but the walls are one shared kernel and pausing and cloning are added from outside. MicroVM: each agent on its own guest Linux and VMM over host Linux and KVM; strong walls, but a whole operating system boots per agent and pausing and cloning copy whole VMs. Rhizo cell: many cells on one Rhizo kernel, which creates, pauses, resumes and clones them, over one VMM; walls are the cells' own address spaces, starts take microseconds, and pause and clone are built in." width="800">
   </picture>
 </p>
-
-For someone running agents, it should look like this. The steps that exist
-today show their measured time; the others are planned:
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/clicks-dark.svg">
-    <img src="docs/img/clicks.svg" alt="The user's path in five steps: pick a template and download it (both planned), open an agent (a resume from memory, measured in microseconds), open ten more (ten forks, no extra memory until they write, measured), and suspend them to come back later (a few kilobytes per idle agent, measured)." width="800">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/story-dark.svg">
+    <img src="docs/img/story.svg" alt="The life of a cell in eight steps: 1 create, an unmodified Linux program becomes a cell; 2 run, with threads, files, network and every CPU; 3 suspend, its whole state frozen in memory; 4 resume where it stopped; 5 fork, copies share memory until they write; 6 freeze as a template, warmed up once to start many; 7 save to a checked file; 8 load it on another machine, where it carries on." width="800">
   </picture>
 </p>
-
-On a personal computer the model runs next to Rhizo, not inside it: any model
-and any runtime, at full GPU speed. Agents live in cells and talk to the model
-over a local socket.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/model-dark.svg">
-    <img src="docs/img/model.svg" alt="Local architecture. On the user's computer, a model runtime such as Ollama, llama.cpp or vLLM runs on the GPU or NPU with one shared copy of the weights. The Rhizo VM (on KVM today; macOS and Windows planned) runs agent cells, including a fork, each keeping its own state. Cells reach the model over a local socket, and the Rhizo app coordinates both; the app and the socket are planned." width="800">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/memory-dark.svg">
+    <img src="docs/img/memory.svg" alt="Memory shared until written. A template holds six pages once. Three forks share all of them; fork 1 has copied one page it wrote, fork 2 two pages. Fork 3 is suspended into a snapshot that keeps only its own copied page and refers to the five shared ones instead of copying them." width="800">
   </picture>
 </p>
 
-The same engine serves servers and personal computers:
+## The numbers that matter
+
+Measured on every change by `cargo xtask bench`: Rhizo and what it is
+compared with run in the same CI job, on the same machine, with the same
+clock. The cards come from one run; the text gives the range over recent
+runs.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/markets-dark.svg">
-    <img src="docs/img/markets.svg" alt="Two markets, one engine. Servers: many agents per machine, low cost per agent, an API to create, fork and resume. Personal computers: a two-click app, downloadable templates, your own local model. Both products are planned; both run on the Rhizo kernel and its agent cells, which exist today." width="800">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/highlights-dark.svg">
+    <img src="docs/img/highlights.svg" alt="Six headline figures from one benchmark run. Node.js, ready to answer, forked from a warm template: 4.48 ms (warm fork 4.48 ms, cold start 35.00 ms); with its JIT, cold is 23% faster. numpy from PyPI wheels, forked after import numpy: 14.82 ms (Rhizo cell 14.82 ms, Linux process 15.76 ms); cold: cell 65.18 ms, Linux 60.32 ms. 50 agents on a laptop, 45 of them suspended: 6.6 MB (shared snapshots 6.6 MB, full copies (before) 60 MB); snapshots point at shared pages. A template saved to a file, loaded into a fresh VM: 2.8× sooner (loaded template 15.81 ms, cold agent 43.91 ms); to its first answer (QEMU). Host operation on one cell, how long other cells stall: 17 µs (now 17 µs, every CPU stopped 112 µs); 7× shorter. 10,000 busy cells, 1 vCPU, 99th percentile wait to wake: 0.6–2.8 ms; 36k–46k operations/s." width="800">
   </picture>
 </p>
 
-The full picture, and what the kernel still needs for it, is in
-[`docs/vision.md`](docs/vision.md).
-
-## Status
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
-    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in eight stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running agent in microseconds), real programs (threads, networking, Python, every core), proven with numbers (fair comparisons with Linux, VMs and sandboxes, and a security review), a real agent (calls a model, explores branches, pauses between turns) and scale and compatibility (thousands of busy cells, dynamically linked programs, Node.js, numpy from PyPI, KPTI). Vision: the product, with downloadable agents and your own model." width="800">
-  </picture>
-</p>
-
-Each stage groups several pieces of work, and each piece ships its speed work
-with a benchmark that proves it; the details live in the archived changes
-under [`openspec/changes/archive/`](openspec/changes/archive/).
-
-Out of scope for the proof of concept: real disks, hardware other than
-virtio/QEMU, SDKs.
-
-## What a cell can do
-
-A cell runs an unmodified Linux program (Rust or C with glibc, static or
-dynamically linked, or an interpreter such as CPython or Node.js) through a
-Linux-compatible system call layer. Its whole state (memory, registers,
-files) belongs to the kernel, so the kernel can stop it, copy it and start it
-again:
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/lifecycle-dark.svg">
-    <img src="docs/img/lifecycle.svg" alt="A static Linux executable is created as a running cell. The cell can be suspended into a snapshot and resumed, forked into copy-on-write children, or frozen as a template from which new, already warmed-up cells start. Times are in the tables below." width="800">
-  </picture>
-</p>
-
-- **Suspend / resume.** A snapshot is a versioned image of the cell. Resume
-  is lazy: pages come back on first touch. A snapshot refers to the pages
-  the cell still shares with its template or its forks instead of copying
-  them, so 50 agents of one template, 45 of them suspended, take 6.6 MB
-  on x86_64 (60 MB when snapshots copied every page); a snapshot exported as bytes
-  stands alone.
-- **Fork(n).** Children share the parent's pages, and even its page tables,
-  until one of them writes.
-- **Templates.** Freeze a cell after its warm-up, then start new cells from it
-  instead of from the executable.
-- **Threads.** `pthread_create`, mutexes, condition variables and futexes;
-  snapshots, forks and templates carry every thread.
-- **Network.** Pipes, `poll`/`select`/`epoll`, Unix and TCP/UDP sockets
-  between cells, and a virtio-net card (smoltcp) to reach the outside;
-  the kernel keeps a suspended cell's connections open and hands them back
-  on resume, and a fork's copies of them are reset.
-- **Multi-core.** Cells run in parallel on up to 16 CPUs; CPUs that no
-  other cell needs run more threads of a running cell at once (TLB
-  shootdowns on x86_64); only system calls on sockets take turns.
-- **CPython and packages from PyPI.** Unmodified CPython 3.13 runs as a
-  cell, its standard library in the cell's own files; a template frozen
-  after its imports answers each request without starting the interpreter
-  again. A dynamically linked build loads packages installed from their
-  PyPI wheels, C extensions included: numpy (with OpenBLAS) and requests.
-  numpy's computation takes about as long as in a Linux process in the
-  same kind of VM, cold or forked from a warm interpreter.
-- **Node.js.** The official Node.js 24 build, dynamically linked and
-  unmodified, runs as a cell with its JIT: V8 asks for memory both
-  writable and executable, and the kernel gives it pages that are either,
-  changed on faults, never both (change `node-jit`). A cell forked from
-  Node.js frozen after its warm-up answers in about 4 ms, against about
-  35 ms from a cold start (with `--jitless`), in a cell or as a Linux
-  process (which cannot fork Node.js).
-- **Control plane.** `rhizo`, a command-line tool on the host, drives a
-  running kernel over its serial line: `rhizo up`, `run`, `ps`, `fork`,
-  `suspend`, `resume`, `attach`, `kill`, `down`; `rhizo chat` is an
-  interactive conversation with an agent in a cell, whose tools run in
-  the cell, and which can be suspended and picked up later.
-- **Quotas.** The host can cap each cell's memory, CPU time, descriptors
-  and sockets; a cell past its quota is refused or ended, not its
-  neighbours, and its quotas travel with its snapshots and forks.
-- **Isolation, reviewed.** Two adversarial reviews of the cell boundary and
-  one of frames from the network, with hostile cells, property tests and a
-  network fuzzer that keep the findings fixed. The kernel is unmapped
-  while cell code runs on x86_64 CPUs open to Meltdown (KPTI; E0PD on
-  AArch64), and kept out of cell memory (SMEP, SMAP, PAN).
-  [`docs/security.md`](docs/security.md) lists the threat model, the
-  findings and what is still open;
-  [`docs/audit-scope.md`](docs/audit-scope.md) scopes an external audit.
-
-## Thesis
-
-The proof of concept must demonstrate one measurable claim:
-
-> A kernel whose unit is the agent cell can create, suspend, resume and fork
-> cells running real Linux programs orders of magnitude faster than today's
-> microVM- and userspace-kernel-based sandboxes.
-
-A cell is born inside a kernel that is already running, so it is closer to a
-process than to a VM. The measurements below therefore come in two tiers: a
-cell against a Linux process doing the same operation in the same kind of VM
-(the like-for-like gain, and the smaller one), and whole microVMs and
-sandboxes, shown for scale. Resume is shown lazy (pages come back on first
-touch) and eager (every page restored first).
-
-The targets are hypotheses the proof of concept must validate. Where they stand:
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/scorecard-dark.svg">
-    <img src="docs/img/scorecard.svg" alt="The three thesis targets, all met: fork of a 50 MB cell under 1 ms, resume from memory under 100 µs, a few KB per idle cell. Measured values are in the tables below." width="800">
-  </picture>
-</p>
+- **Node.js** forked from a warm template answers in about **4 to 6 ms**,
+  against **34 to 46 ms** from a cold start; a Linux process cannot fork
+  Node.js at all. With its JIT (under write-or-execute pages), a cold start is
+  about **16 to 23% faster** than with `--jitless`.
+- **numpy** runs **about as fast as in a Linux process** in the same kind of
+  VM: a fork after `import numpy` takes 14 to 18 ms against 16 to 19 ms, and
+  cold starts are within about 10% of each other.
+- **On a laptop**, 50 agents of one template with 45 suspended take
+  **6.6 MB** together, down from **60 MB** before snapshots referred to the
+  pages they share.
+- **A template saved to a file** and loaded into a fresh VM answers about
+  **3 times sooner** than a cold agent (2.6 to 4.1 times over recent runs).
+- **Host operations** on one cell stall the others about **6 to 7 times
+  less**: 16 to 20 µs against 106 to 121 µs when every CPU stopped (one run
+  saw only 3 times less on Cloud Hypervisor).
+- **10,000 busy cells** on one vCPU: the 99th percentile of the wait to wake
+  stays between **0.6 and 4 ms** depending on the VMM and the run, and is
+  gated in CI like every other figure.
+- For scale: a cell starts a program and runs it to its end in **7 to
+  12 µs**, 37 to 73 times faster than a Linux process in the same VM, and
+  forks while holding 50 MiB in **1 to 2 µs**.
 
 <details>
-<summary>Targets next to the figures other sandboxes publish</summary>
-
-The comparison figures are what each project or its users have published, on
-different hardware and with different measurement methods, so they are orders
-of magnitude to aim at, not a like-for-like comparison. The like-for-like
-numbers are [below](#measured).
-
-| Metric | Rhizo target | Firecracker | Unikraft | Hyperlight |
-|---|---|---|---|---|
-| Boot: VMM launch → guest ready (KVM) | **≤ 10 ms** (kernel part ≤ 1 ms) | < 125 ms to a Linux guest accepting API calls[^fc] | < 1 ms guest boot, ~3 ms including the Firecracker VMM[^uk] | sub-millisecond partition creation, no guest OS (reported)[^hl] |
-| Resume a suspended cell / VM | **< 100 µs** (in-kernel, no VMM) | 4–28 ms snapshot restore reported[^fcr] | — | ~0.9 ms snapshot restore (hyperlight-unikraft v0.16)[^hlu] |
-| Fork a 50 MiB cell | **< 1 ms** (stretch: < 200 µs with lazy copy-on-write) | no native fork (snapshot + restore of a copy) | no native fork in the open-source core | no native fork |
-| Idle cell overhead | **a few KiB** plus its own pages | a microVM per sandbox (MiBs) | a microVM per app | a micro-VM per sandbox |
-
-</details>
-
-[^fc]: Agache et al., *Firecracker: Lightweight Virtualization for Serverless Applications*, NSDI 2020.
-[^uk]: [Unikraft performance documentation](https://unikraft.org/docs/concepts/performance).
-[^hl]: [Firecracker vs Microsoft Hyperlight](https://www.pandastack.ai/blog/firecracker-vs-microsoft-hyperlight/) (qualitative, not an official measurement).
-[^fcr]: [Benchmarking Firecracker boot and restore](https://numavm.com/blog/2026-03-10-1-second-boot/) and [Restoring uniqueness in microVM snapshots](https://arxiv.org/pdf/2102.12892).
-[^hlu]: [hyperlight-unikraft v0.16.0 release notes](https://github.com/hyperlight-dev/hyperlight-unikraft/releases/tag/v0.16.0).
-
-## Measured
-
-`cargo xtask bench` measures Rhizo and the existing mechanisms in the same run,
-on the same machine, with the same clock:
+<summary>Every measurement: charts, both architectures, boot time and the full tables</summary>
 
 <p align="center">
   <picture>
@@ -246,9 +159,6 @@ on the same machine, with the same clock:
   </picture>
 </p>
 
-The same operations on both architectures, counted in instructions (exact,
-so comparable across runs):
-
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/arches-dark.svg">
@@ -256,27 +166,9 @@ so comparable across runs):
   </picture>
 </p>
 
-The charts and the tables below come from the same run (the date is under the
-tables). Shared runners are noisy, so figures move between runs; publishable
-numbers will come from a dedicated machine. How benchmarks, environments and baselines work:
-[`bench/README.md`](bench/README.md).
-
-Two reference workloads run the kernel the way its two kinds of users
-will ([`bench/README.md`](bench/README.md#reference-workloads)), on every
-VMM of the same run:
-
-- **Laptop**: 50 agents opened from one template in a 512 MiB VM, 45 of
-  them suspended, take 6.6 MB together; opening one takes a few
-  microseconds (about 60 to 80 µs on Firecracker), and while every agent
-  waits the VM's CPUs wake about once a second.
-- **Server**: 10,000 busy cells in a 1 GiB VM with one vCPU, about 35,000
-  to 46,000 operations per second; the 99th percentile of the time a cell
-  waits for the CPU (a few milliseconds) is gated like the other figures. Pushed
-  until memory runs out (about 46,000 idle cells), the kernel refuses new
-  cells cleanly and gets every byte back, its heap included.
-
-<details>
-<summary>Boot time and the full comparison table</summary>
+How the comparisons are made fair, and the thesis targets:
+[`docs/overview.md`](docs/overview.md#thesis). Every metric, environment and
+baseline: [`bench/README.md`](bench/README.md).
 
 <!-- bench:start -->
 Time from launching the VMM to the guest being ready (median, lower is better).
@@ -288,10 +180,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 5.6 | 6.4 | 171.1 | 174.5 | 20 |
-| Cloud Hypervisor | 8.6 | 11.3 | 91.6 | 104.2 | 20 |
-| QEMU microvm | 41.9 | 42.4 | — | — | 20 |
-| QEMU q35 | 53.4 | 56.4 | 160.3 | 170.5 | 20 |
+| Firecracker | 8.2 | 9.2 | 191.1 | 194.4 | 20 |
+| Cloud Hypervisor | 6.4 | 13.7 | 94.4 | 102.7 | 20 |
+| QEMU microvm | 40.9 | 42.5 | — | — | 20 |
+| QEMU q35 | 58.9 | 61.6 | 173.4 | 176.9 | 20 |
 
 ### A cell against a Linux process, in the same kind of VM
 
@@ -299,10 +191,10 @@ Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux gue
 
 | Operation | Rhizo cell | Linux process, same VM | Linux process, host |
 |---|---:|---:|---:|
-| The `fork` call, holding 50 MiB written | 1.9 µs | 254.7 µs | 821.2 µs |
-| Fork, then the child writes all 50 MiB and exits | 3.31 ms | 30.64 ms | 28.85 ms |
-| Start a program and run it to its exit (`hello`) | 10.4 µs | 513.2 µs | 132.2 µs |
-| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 0.9 µs / 237.5 µs | — | 4.65 ms (CRIU) |
+| The `fork` call, holding 50 MiB written | 1.2 µs | 89.5 µs | 695.0 µs |
+| Fork, then the child writes all 50 MiB and exits | 3.80 ms | 21.62 ms | 19.48 ms |
+| Start a program and run it to its exit (`hello`) | 7.1 µs | 517.0 µs | 96.0 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.2 µs / 591.3 µs | — | 2.38 ms (CRIU) |
 
 ### Whole VMs and sandboxes, for scale
 
@@ -310,8 +202,8 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 10.4 µs | 171.09 ms | 75.46 ms |
-| Resume a suspended environment until it runs (eager for the cell) | 237.5 µs | 3.71 ms | 104.81 ms |
+| Start a program and run it to its exit (`hello`) | 7.1 µs | 191.07 ms | 72.63 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 591.3 µs | 3.70 ms | 94.10 ms |
 
 ### A real interpreter
 
@@ -319,29 +211,29 @@ CPython (static, 3.13.18) answering one agent tool call (`cells/python/agent_dem
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 17.85 ms | 21.37 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.65 ms (4.9× faster) | 6.03 ms |
+| Cold, from its executable (interpreter start, imports, warm-up) | 17.06 ms | 18.30 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 3.82 ms (4.5× faster) | 5.50 ms |
 
 MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 3.59 ms |
-| Forked from a template frozen after the warm-up | 442.7 µs (8.1× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 3.43 ms |
+| Forked from a template frozen after the warm-up | 468.3 µs (7.3× faster) |
 
 numpy and its OpenBLAS, installed from their PyPI wheels into a dynamically linked CPython, computing on arrays (`cells/python/numpy_demo.py`: a linear solve, a ufunc, a matrix product), in a cell and as a Linux process in the same Firecracker VM:
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold (interpreter start, `import numpy`, compute) | 67.55 ms | 70.51 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after `import numpy` | 13.89 ms (4.9× faster) | 16.07 ms |
+| Cold (interpreter start, `import numpy`, compute) | 65.18 ms | 60.32 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after `import numpy` | 14.82 ms (4.4× faster) | 15.76 ms |
 
 Node.js (the official build, dynamically linked, run unmodified with `--jitless`) answering one agent tool call (`cells/node/demo.js`), in a cell and as a Linux process in the same Firecracker VM (Node.js cannot fork itself, so the process has no warm row):
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (`ld.so`, V8 start-up, warm-up) | 34.32 ms | 40.57 ms |
-| Forked from Node.js frozen after its warm-up | 4.11 ms (8.4× faster) | — |
+| Cold, from its executable (`ld.so`, V8 start-up, warm-up) | 35.00 ms | 31.10 ms |
+| Forked from Node.js frozen after its warm-up | 4.48 ms (7.8× faster) | — |
 
 ### Both architectures, in instructions
 
@@ -349,12 +241,12 @@ Retired instructions per operation, counted under QEMU with `-icount` (the same 
 
 | Operation | x86_64 | AArch64 |
 |---|---:|---:|
-| Switch between two cells | 885 | 831 |
-| Create the `hello` cell | 28,338 | 51,488 |
-| Run `hello` from start to exit | 89,161 | 124,480 |
-| Fork a cell holding 50 MiB | 6,697 | 7,504 |
-| A static glibc program, cold | 35,444,511 | 39,887,984 |
-| The same, forked from a warm template | 77,261 | 92,736 |
+| Switch between two cells | 895 | 839 |
+| Create the `hello` cell | 27,863 | 21,552 |
+| Run `hello` from start to exit | 88,020 | 94,048 |
+| Fork a cell holding 50 MiB | 6,759 | 7,472 |
+| A static glibc program, cold | 35,245,617 | 36,518,944 |
+| The same, forked from a warm template | 76,495 | 73,536 |
 
 Environment: `ci`, KVM: yes, measured 2026-11-21. Regenerate with
 `cargo xtask bench --readme`.
@@ -364,77 +256,171 @@ Environment: `ci`, KVM: yes, measured 2026-11-21. Regenerate with
 
 ## Try it
 
-You need [rustup](https://rustup.rs) (the pinned toolchain installs itself)
-and QEMU 8.2 or later; the C test cells also need gcc with a static glibc.
-On Debian/Ubuntu:
+On a Linux machine with KVM, the shortest path to an agent in a cell talking
+to your own model. The first `rhizo up` builds the kernel and CPython for the
+cell, which takes a few minutes; after that it starts in a fraction of a
+second.
 
 ```bash
-sudo apt-get install qemu-system-arm qemu-system-x86 gcc libc6-dev
+git clone https://github.com/davidsalvat/rhizo && cd rhizo
+sudo apt-get install qemu-system-x86 qemu-system-arm gcc libc6-dev zlib1g-dev
+curl -LO https://www.python.org/ftp/python/3.13.18/Python-3.13.18.tar.xz
+export RHIZO_CPYTHON_SRC=$PWD/Python-3.13.18.tar.xz
+cargo build -p rhizo-cli && alias rhizo=$PWD/target/debug/rhizo
+
+ollama serve & ollama pull qwen2.5:1.5b      # or llama-server, any model with tools
+rhizo up
+rhizo chat --llm http://127.0.0.1:11434 --model qwen2.5:1.5b
 ```
 
-Boot the kernel, run the in-kernel tests and every cell (AArch64, the default):
+Inside the chat, `/fork 2` clones the conversation, `/switch N` moves between
+branches and `/suspend` saves the branch for later (`rhizo chat N` picks it up
+again). Everything else (the scripted agent, `rhizo run`, `fork`, `freeze`,
+`save`, `load`, other VMMs, llama.cpp) is in [`docs/demo.md`](docs/demo.md).
+Without a model, `cargo xtask test` boots the kernel and runs every test cell
+([building and testing](docs/overview.md#building-and-testing)).
 
-```bash
-cargo xtask test
-```
+## Under the hood
 
-The same on the second architecture:
+One Rhizo kernel runs in one VM; cells are unmodified Linux programs above
+it. The host drives the kernel with `rhizo` over the VM's serial line, and
+cells reach the model through its network card.
 
-```bash
-cargo xtask --arch x86_64 test
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture-dark.svg">
+    <img src="docs/img/architecture.svg" alt="Architecture. On the host machine, Linux with KVM, the rhizo command-line tool talks to the rhizo server, which owns one VM (QEMU, Firecracker or Cloud Hypervisor) and reaches the kernel's control loop over the serial line; your model runs on the host and is reached through the VM's network card by the sockets layer. In the VM, cells (an agent, a fork, a template, tools) run above the Rhizo kernel, written in Rust: control loop (rhizo-control), Linux system calls (rhizo-abi), sockets (rhizo-net), files (rhizo-fs), memory and copy-on-write (rhizo-mm), scheduler (rhizo-sched), cells, ELF and quotas (rhizo-cell) and snapshots (rhizo-snapshot), over narrow hardware interfaces (rhizo-hal, arch for AArch64 and x86_64, virtio) so the core is tested on the host." width="800">
+  </picture>
+</p>
 
-Benchmarks (Firecracker and Cloud Hypervisor need KVM; `xtask` downloads
-pinned releases on first use):
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/hostops-dark.svg">
+    <img src="docs/img/hostops.svg" alt="Four CPUs run cells A, B and X over time while the host suspends cell X. Before, every CPU stopped for the operation, so A and B waited too. Now only the two CPUs running X stop, and A and B keep running." width="800">
+  </picture>
+</p>
 
-```bash
-cargo xtask bench
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/snapshot-path-dark.svg">
+    <img src="docs/img/snapshot-path.svg" alt="A cell travels as a file. On machine A, rhizo save sends a request with a one-time token over the serial line; the kernel suspends cell 7 and sends its bytes over TCP through the VM's network card to rhizo, which writes agent.snap ending in a CRC-32C checksum. On machine B, rhizo load asks the kernel to fetch the file the same way; the kernel checks the header, the checksum and every field, caps the quotas, then resumes the cell or forks copies of the template." width="800">
+  </picture>
+</p>
 
-```bash
-cargo xtask --arch x86_64 bench
-```
+The kernel is a set of library crates tested on the host, plus a thin
+platform layer for each architecture; [`AGENTS.md`](AGENTS.md) has the code
+map and [`openspec/specs/`](openspec/specs/) how each part behaves.
 
-A CPython agent in a cell talking to your own local model (Ollama or
-llama.cpp), forked and suspended live through `rhizo`, the control plane's
-command-line tool (`rhizo up`, `rhizo run python-agent`, `rhizo ps`,
-`rhizo fork`, `rhizo down`), or a conversation with an agent whose tools
-run in its cell (`rhizo chat`): [docs/demo.md](docs/demo.md).
+## Security
 
-`cargo xtask check` is the fast loop (format, lints, host tests, crate rules)
-and `cargo xtask ci` runs everything CI runs. AArch64 is the primary
-architecture: 16-bit ASIDs and TLB invalidation broadcast in hardware suit
-cells that switch and fork all the time. x86_64 stays because GitHub's x86_64
-runners are where CI can measure with KVM; only the thin `arch/` layer exists
-twice, and every spec is tested on both
-([trade-offs](openspec/changes/archive/2026-11-19-switch-to-arm64/design.md)).
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/security-dark.svg">
+    <img src="docs/img/security.svg" alt="Everything that reaches the Rhizo kernel from cells, snapshot files and the network is untrusted: hostile cells, hostile snapshot files and hostile network frames. The host's control requests are trusted but decoded defensively; the VMM and hardware are trusted. The kernel defends with privilege levels and own address spaces, quotas, KPTI, E0PD, eager FP/SIMD switching, SMEP, SMAP and PAN, write-or-execute pages, and zeroed memory. Three internal reviews and the fixes since then dealt with 26 findings and fuzzers keep them fixed; an external audit is scoped but not done yet." width="800">
+  </picture>
+</p>
 
-## Principles
+Rhizo's isolation has been reviewed three times from the inside, and the
+reviews and the work since have dealt with 26 findings (25 fixed, one worked
+around), with fuzzers and hostile cells in CI that keep them fixed. Timing
+side channels other than Meltdown and LazyFP are not covered yet. **No external audit has been done**: its scope, ranked
+by risk and estimated at about 39 auditor-days, is ready in
+[`docs/audit-scope.md`](docs/audit-scope.md). The threat model, every finding
+and what is still open: [`docs/security.md`](docs/security.md).
 
-- **Primitives in the kernel.** Snapshot, resume, fork and capabilities are
-  native kernel operations, not features added on top.
-- **Linux ABI, not Linux code.** Cells run unmodified Linux binaries through a
-  Linux-compatible syscall layer. No GPL code is copied into this repository.
-- **Deterministic by design.** All hardware access goes through narrow
-  interfaces so the kernel core can run inside a deterministic simulator.
-- **Performance is a test.** Benchmarks run in CI with thresholds; a regression
-  fails the build.
-- **Specs first.** Every behavior is specified before it is built
-  (see [`openspec/`](openspec/)).
-- **Open for real.** MIT licensed, no proprietary core, no "open core" bait.
-- **Model-agnostic.** Contribute with any AI coding agent, or with none.
+## Where it is going
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/roadmap-dark.svg">
+    <img src="docs/img/roadmap.svg" alt="Where Rhizo stands, in nine stages. Done: the foundations (boot in milliseconds on Arm and x86), the cell (ordinary Linux programs, each sealed off), native operations (pause, resume or copy a running cell in microseconds), real programs (threads, networking, Python, every core), proven with numbers (fair comparisons with Linux, VMs and sandboxes, and reviews), a real agent (calls a model, explores branches, pauses between turns) and scale and compatibility (ten thousand busy cells, Node.js, numpy from PyPI). Designed: families and modules. Vision: the product, ready agents in two clicks with your own model." width="800">
+  </picture>
+</p>
+
+Designed and coming next ([`docs/cell-hierarchy.md`](docs/cell-hierarchy.md)):
+agents that live in families, each family walled off from the others, and
+abilities (data analysis, coding tools, a web browser, documents, your own
+tools) added to an agent as child cells from a signed catalogue, as each task
+needs them.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/hierarchy-dark.svg">
+    <img src="docs/img/hierarchy.svg" alt="Designed, not built yet: the cell hierarchy. The host is the root; each of its children roots a domain. In domain 1, agent A (egress to the model only, 1 GiB and 8 cells) has two children with no egress, tools and a python module, each reached over a channel. In domain 2, agent B (allowlist egress, 512 MiB and 4 cells) has a worker child. A wall separates the domains. Authority flows down; budgets are carved from the parent; there is no shared loopback, files or counters between domains; egress is checked on every socket and only narrowed, by default none; handles carry rights that only shrink. Timing channels on shared CPUs remain, listed and measured." width="800">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/modules-dark.svg">
+    <img src="docs/img/modules.svg" alt="Designed, not built yet. A small static chat agent starts with egress to its model only. Each task that needs an ability adds a child cell, forked from a signed, warm template and reached only over a channel: “Analyse this sheet and chart it” adds data analysis (Python, pandas, plotting), egress: none; “Fix the failing test in my repo” adds coding tools (git, Node.js, a test runner), egress: proxy only; “Check this on a website” adds web browser (headless Chromium), egress: allowlist; “Read these invoices” adds documents (PDF reader, OCR), egress: none; “Update the customer record” adds your own tools (your MCP servers: CRM, database), egress: you set it, within the agent's. The web browser is the sensitive one: the parent or the operator approves it first, and it may reach only allowed sites. Children fork in milliseconds from templates that share their base runtime (measured for CPython and Node.js). Templates are built by a builder cell through rhizo proxy from a lockfile and signed by the operator. Every child talks only to its agent, over a channel, with a budget carved from the agent's and never more egress; what the browser reads stays in that agent's tree." width="800">
+  </picture>
+</p>
+
+- **Families of cells.** A tree of cells with budgets carved from the parent,
+  so no fork bomb escapes them; capability handles whose rights only shrink;
+  channels as the only way to talk; a private loopback per cell; egress
+  policies per family (none, the model, an allowlist), checked on every
+  socket; and an inventory of the 40 shared resources that could leak
+  between families, each closed or measured.
+- **Abilities as child cells.** An agent starts as a small static chat agent
+  that can reach only its model. Each task that needs more adds a child cell,
+  forked from a signed, warm template: data analysis (Python with data and
+  plotting libraries), coding tools (git, Node.js, a test runner), a web
+  browser (headless Chromium: the sensitive one, approved first by the parent
+  or the operator and limited to an allowlist of sites), documents (PDF and
+  OCR), or your own tools as MCP servers. Each child talks to its agent only
+  over a channel, with a budget carved from the agent's and never more egress,
+  so what the browser reads cannot leak to another agent's tree. Forking from
+  a warm template takes milliseconds for CPython and Node.js today; Chromium is
+  not measured yet. Templates share their base runtime, and reach the
+  catalogue through a builder cell whose only way out is `rhizo proxy`
+  (pinned, hash-checked files) and the operator's signature.
+- **The product.** Ready agents to download, an app on your own computer
+  (macOS and Windows hosts too), your own model next to it
+  ([`docs/vision.md`](docs/vision.md)).
+
+## Contribute
+
+Rhizo is built in the open with spec-driven development: every change starts
+as a short proposal under [`openspec/changes/`](openspec/changes/), is
+reviewed, then built with its tests and a benchmark. Contributions made with
+any AI coding agent, or none, are welcome.
+
+Good first areas:
+
+- **Review the designs** of the cell hierarchy and of modules
+  ([`add-cell-hierarchy`](openspec/changes/add-cell-hierarchy/),
+  [`add-cell-modules`](openspec/changes/add-cell-modules/)) before they are
+  built.
+- **Run your own agent or program in a cell** and report what breaks: a
+  missing Linux system call is a well-scoped change.
+- **Measure on real hardware**, an ARM64 machine above all
+  ([`bench/README.md`](bench/README.md#measuring-on-real-arm64-hardware-dedicated)).
+- **Close a listed gap**: TLS for the CPython cell, a virtio-rng driver, a
+  disk to save snapshots on VMs without a network card, coverage-guided
+  fuzzing ([`docs/security.md`](docs/security.md#known-limitations-and-open-findings)).
+
+Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) (workflow, AI tools) and
+[`AGENTS.md`](AGENTS.md) (rules, code map, the feedback loop:
+`cargo xtask check` after every edit, `cargo xtask ci` before pushing).
 
 ## Learn more
 
-- [`openspec/specs/`](openspec/specs/): how the system behaves today, one spec
-  per capability.
-- [`docs/vision.md`](docs/vision.md): where Rhizo goes after the proof of
-  concept (servers and local AI, one engine) and what the kernel needs for it.
-- [`bench/README.md`](bench/README.md): every metric, environment and baseline.
-- [`AGENTS.md`](AGENTS.md): code map, rules and the feedback loop (for people
-  and AI coding agents alike).
-- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute, with or without AI
-  tools.
+- [`docs/overview.md`](docs/overview.md): the problem, the thesis and its
+  targets, everything a cell does today, how the measurements stay fair.
+- [`docs/demo.md`](docs/demo.md): agents in cells with your own model.
+- [`docs/vision.md`](docs/vision.md): servers and personal computers, one
+  engine.
+- [`docs/cell-hierarchy.md`](docs/cell-hierarchy.md): families, capabilities,
+  containment and modules (designed).
+- [`docs/security.md`](docs/security.md) and
+  [`docs/audit-scope.md`](docs/audit-scope.md): reviews, findings and the
+  external audit's scope.
+- [`openspec/specs/`](openspec/specs/): how the system behaves today, one
+  spec per capability.
+- [`bench/README.md`](bench/README.md): every metric, environment and
+  baseline.
 
 ## License
 

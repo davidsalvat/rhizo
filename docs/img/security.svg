@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 586" width="800" height="586" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title>Security: trust boundaries and defences</title>
+<desc>Everything that reaches the Rhizo kernel from cells, snapshot files and the network is untrusted: hostile cells, hostile snapshot files and hostile network frames. The host's control requests are trusted but decoded defensively; the VMM and hardware are trusted. The kernel defends with privilege levels and own address spaces, quotas, KPTI, E0PD, eager FP/SIMD switching, SMEP, SMAP and PAN, write-or-execute pages, and zeroed memory. Three internal reviews and the fixes since then dealt with 26 findings and fuzzers keep them fixed; an external audit is scoped but not done yet.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#57706a"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#1f9d6b"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#0a5cc2"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8a6100"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b42318"/></marker><marker id="c" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#146c4a"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="799" height="585" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<text x="24" y="40" font-size="20" fill="#0e2a20" font-weight="700">Who is trusted, and what stands in the way</text>
+<rect x="24" y="84" width="232" height="64" rx="12" fill="#fdecea" stroke="#d0604f" stroke-width="1.5"/>
+<g transform="translate(42 104) scale(1)" fill="none" stroke="#b42318" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="13" rx="4" fill="none"/><path d="M12 7V3.5"/><circle cx="12" cy="3" r="1.3"/><circle cx="9" cy="13" r="1.6" fill="#b42318" stroke="none"/><circle cx="15" cy="13" r="1.6" fill="#b42318" stroke="none"/><path d="M9.5 17h5"/></g>
+<text x="78" y="111" font-size="15" fill="#0e2a20" font-weight="700">Hostile cells</text>
+<text x="78" y="131" font-size="12.5" fill="#4b5c55">any code, any call</text>
+<line x1="140" y1="148" x2="140" y2="190" stroke="#b42318" stroke-width="2" marker-end="url(#r)"/>
+<rect x="284" y="84" width="232" height="64" rx="12" fill="#fdecea" stroke="#d0604f" stroke-width="1.5"/>
+<g transform="translate(302 104) scale(1)" fill="none" stroke="#b42318" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4"/></g>
+<text x="338" y="111" font-size="15" fill="#0e2a20" font-weight="700">Snapshot files</text>
+<text x="338" y="131" font-size="12.5" fill="#4b5c55">anyone may write one</text>
+<line x1="400" y1="148" x2="400" y2="190" stroke="#b42318" stroke-width="2" marker-end="url(#r)"/>
+<rect x="544" y="84" width="232" height="64" rx="12" fill="#fdecea" stroke="#d0604f" stroke-width="1.5"/>
+<g transform="translate(562 104) scale(1)" fill="none" stroke="#b42318" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"/></g>
+<text x="598" y="111" font-size="15" fill="#0e2a20" font-weight="700">Network frames</text>
+<text x="598" y="131" font-size="12.5" fill="#4b5c55">any host on the link</text>
+<line x1="660" y1="148" x2="660" y2="190" stroke="#b42318" stroke-width="2" marker-end="url(#r)"/>
+<text x="776" y="72" font-size="12.5" fill="#b42318" font-weight="700" text-anchor="end">untrusted</text>
+<rect x="24" y="190" width="752" height="206" rx="16" fill="#eafaf2" stroke="#1f9d6b" stroke-width="2.5"/>
+<circle cx="52" cy="220" r="15" fill="#1f9d6b" stroke="none" stroke-width="1.5"/>
+<g transform="translate(43.375 211.375) scale(0.71875)" fill="none" stroke="#eafaf2" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.4 9-8 11-4.6-2-8-6-8-11V5z" fill="none"/><path d="M8.5 12l2.5 2.5 4.5-5"/></g>
+<text x="76" y="226" font-size="16" fill="#0e2a20" font-weight="700">Rhizo kernel: every input checked at the boundary</text>
+<rect x="44" y="246" width="228" height="62" rx="10" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<g transform="translate(57 268) scale(0.75)" fill="none" stroke="#146c4a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="86" y="273" font-size="14" fill="#0e2a20" font-weight="700">Own address space</text>
+<text x="86" y="292" font-size="12.5" fill="#4b5c55">per cell, lower half only</text>
+<rect x="288" y="246" width="228" height="62" rx="10" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<g transform="translate(301 268) scale(0.75)" fill="none" stroke="#146c4a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="330" y="273" font-size="14" fill="#0e2a20" font-weight="700">Quotas</text>
+<text x="330" y="292" font-size="12.5" fill="#4b5c55">memory, CPU, sockets</text>
+<rect x="532" y="246" width="228" height="62" rx="10" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<g transform="translate(545 268) scale(0.75)" fill="none" stroke="#146c4a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="574" y="273" font-size="14" fill="#0e2a20" font-weight="700">KPTI · E0PD · eager FP</text>
+<text x="574" y="292" font-size="12.5" fill="#4b5c55">Meltdown, LazyFP closed</text>
+<rect x="44" y="316" width="228" height="62" rx="10" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<g transform="translate(57 338) scale(0.75)" fill="none" stroke="#146c4a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="86" y="343" font-size="14" fill="#0e2a20" font-weight="700">SMEP · SMAP · PAN</text>
+<text x="86" y="362" font-size="12.5" fill="#4b5c55">kernel stays out</text>
+<rect x="288" y="316" width="228" height="62" rx="10" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<g transform="translate(301 338) scale(0.75)" fill="none" stroke="#146c4a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="330" y="343" font-size="14" fill="#0e2a20" font-weight="700">Write or execute</text>
+<text x="330" y="362" font-size="12.5" fill="#4b5c55">never both, JIT too</text>
+<rect x="532" y="316" width="228" height="62" rx="10" fill="#ffffff" stroke="#1f9d6b" stroke-width="1.2"/>
+<g transform="translate(545 338) scale(0.75)" fill="none" stroke="#146c4a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="574" y="343" font-size="14" fill="#0e2a20" font-weight="700">Zeroed memory</text>
+<text x="574" y="362" font-size="12.5" fill="#4b5c55">nothing leaks on reuse</text>
+<line x1="209" y1="396" x2="209" y2="416" stroke="#0a5cc2" stroke-width="2"/>
+<rect x="24" y="416" width="370" height="62" rx="12" fill="#e3f0ff" stroke="#3f80cf" stroke-width="1.5"/>
+<text x="44" y="442" font-size="14" fill="#0e2a20" font-weight="700">Host control requests</text>
+<text x="44" y="462" font-size="12.5" fill="#4b5c55">trusted, but decoded defensively</text>
+<rect x="406" y="416" width="370" height="62" rx="12" fill="#f3f5f4" stroke="#858f8a" stroke-width="1.5"/>
+<text x="426" y="442" font-size="14" fill="#0e2a20" font-weight="700">VMM, firmware, hardware</text>
+<text x="426" y="462" font-size="12.5" fill="#4b5c55">trusted, out of scope</text>
+<line x1="24" y1="496" x2="776" y2="496" stroke="#858f8a" stroke-width="1"/>
+<g transform="translate(30 512) scale(0.833333)" fill="none" stroke="#146c4a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="60" y="519" font-size="14" fill="#0e2a20" font-weight="700">26 findings so far</text>
+<text x="60" y="538" font-size="12.5" fill="#4b5c55">25 fixed, 1 worked around</text>
+<g transform="translate(284 512) scale(0.833333)" fill="none" stroke="#146c4a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></g>
+<text x="314" y="519" font-size="14" fill="#0e2a20" font-weight="700">Fuzzers, hostile cells</text>
+<text x="314" y="538" font-size="12.5" fill="#4b5c55">calls, snapshots, frames</text>
+<g transform="translate(538 512) scale(0.833333)" fill="none" stroke="#875a00" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></g>
+<text x="568" y="519" font-size="14" fill="#875a00" font-weight="700">External audit</text>
+<text x="568" y="538" font-size="12.5" fill="#4b5c55">scoped, not done yet</text>
+<text x="24" y="568" font-size="12.5" fill="#4b5c55">Details: docs/security.md (threat model, findings), docs/audit-scope.md (what an auditor gets).</text>
+</svg>
