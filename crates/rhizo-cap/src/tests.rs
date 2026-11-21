@@ -378,6 +378,22 @@ fn labels_and_weights_are_checked() {
     assert_eq!(t.add_root(1, heavy, 0), Err(Error::Invalid));
     assert_eq!(t.add_root(HOST, Spec::default(), 0), Err(Error::Invalid));
     t.add_root(1, spec(limits(MIB, 1)), 0).unwrap();
+    let labelled = Spec {
+        label: Label::new(b"tools").unwrap(),
+        weight: 250,
+        egress: Egress::Full,
+        ..spec(limits(MIB, 0))
+    };
+    t.add_root(3, labelled.clone(), 0).unwrap();
+    let back = t.get(3).unwrap().spec();
+    assert_eq!(
+        back,
+        Spec {
+            ceiling: Some(Egress::Full),
+            ..labelled
+        },
+        "a node gives back its spec"
+    );
     let set = Spec {
         cpus: 0b1100,
         ..spec(limits(0, 0))

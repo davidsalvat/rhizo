@@ -224,9 +224,8 @@ fn warm_template_of_a_real_program() {
     run_expected("libc_warm");
     let mut host = Host::new();
     let warm = spawn(&mut host, "libc_warm", &[]);
-    while host.output(warm) != Some(b"warm\n") {
-        host.step();
-    }
+    host.run_to_pause(warm, b"warm", Pause::Slice)
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(warm));
     let ids: Vec<u32> = (0..3)
         .map(|_| host.spawn_from_template(warm, true, true).expect("spawn"))

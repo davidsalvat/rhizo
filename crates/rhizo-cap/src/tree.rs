@@ -269,6 +269,22 @@ impl Node {
     pub fn on_parent_end(&self) -> OnParentEnd {
         self.on_parent_end
     }
+    /// What a creator would give a cell to make it as this one: its
+    /// limits, its policy for when its parent ends and its policies (a
+    /// snapshot keeps them, and a refused move puts them back).
+    pub fn spec(&self) -> Spec {
+        let p = &self.policy;
+        Spec {
+            limits: self.limits,
+            on_parent_end: self.on_parent_end,
+            egress: p.egress.clone(),
+            ceiling: Some(p.ceiling.clone()),
+            label: p.label.clone(),
+            weight: p.weight,
+            cpu_max: p.cpu_max,
+            cpus: p.cpus,
+        }
+    }
     /// Its policies, shared and immutable.
     pub fn policy(&self) -> &Arc<Policy> {
         &self.policy
