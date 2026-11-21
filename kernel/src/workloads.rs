@@ -71,13 +71,14 @@ pub fn run(console: &mut impl Console, workload: Workload) {
             let _ = writeln!(
                 ConsoleWriter(console),
                 "rhizo-oom cells={} spawn_refused={} fork_refused={} resume_refused={} \
-                 hog_enomem={} leaked_bytes={} heap_kept_bytes={}",
+                 hog_enomem={} leaked_bytes={} heap_peak_bytes={} heap_kept_bytes={}",
                 o.cells,
                 o.spawn_refused as u8,
                 o.fork_refused as u8,
                 o.resume_refused as u8,
                 o.hog_enomem as u8,
                 o.leaked_bytes,
+                o.heap_peak_bytes,
                 o.heap_kept_bytes
             );
         }
@@ -294,8 +295,11 @@ fn server(console: &mut impl Console) {
     // Load: the workers run for `secs`; meanwhile, at a constant rate, the
     // host suspends and resumes the next worker (its connections stay), and
     // forks the next one that computes or writes files (a fork's
-    // connections are reset).
+    // connections are reset). The latencies count from the first moment no
+    // cell runs: before it, every worker runs for the first time, all at
+    // once (design D6 of `add-socket-wait-queues`).
     prof::start();
+    prof::settle();
     let t0 = now_ns();
     let stop_ops = t0 + secs * 1_000_000_000;
     let deadline = stop_ops + 5_000_000_000;
@@ -402,7 +406,7 @@ fn server(console: &mut impl Console) {
         "rhizo-server-breakdown elapsed_ns={elapsed} idle_ns={} syscall_ns={} sched_ns={} \
          host_ns={} syscalls={} runs={} wakes={} io_woken={} net_changes={} cow_faults={} \
          lazy_faults={} interrupts={} untagged={untagged} host_ops={host_ops} suspend_ns={} resume_ns={} fork_ns={} \
-         sched_max_ns={} wake_max_ns={}",
+         sched_max_ns={} wake_max_ns={} settle_ns={}",
         cyc(report.count(Count::IdleCycles)),
         cyc(sys.sum()),
         cyc(report.count(Count::SchedCycles)),
@@ -420,6 +424,7 @@ fn server(console: &mut impl Console) {
         cyc(median(&mut fork_ns)),
         report.sched.max(),
         report.wake.max(),
+        report.settled_ns,
     );
 }
 
@@ -440,8 +445,10 @@ pub struct Oom {
     pub hog_enomem: bool,
     /// Memory not back once every cell ended (0: none).
     pub leaked_bytes: u64,
-    /// Of what came back, what the kernel heap kept for itself (its free
-    /// blocks are never returned to the frame allocator).
+    /// What the kernel heap grew by while memory was full.
+    pub heap_peak_bytes: u64,
+    /// Of what came back, what the kernel heap kept for itself: free blocks
+    /// in pages it has not given back (change `add-heap-trim`).
     pub heap_kept_bytes: u64,
 }
 
@@ -477,6 +484,7 @@ pub fn fill_memory() -> Oom {
     let spawn_refused = host.spawn(idle, &[b"idle"], false, false) == Err(ElfError::OutOfMemory);
     let fork_refused = host.fork(cells[0], 1).is_none();
     let resume_refused = host.resume(snapshot, Resume::Eager, false, false).is_err();
+    let heap_peak = crate::heap::stats().pages as u64 * FRAME_SIZE;
     let count = cells.len();
     for id in cells.drain(..count / 4) {
         host.kill(id);
@@ -502,6 +510,7 @@ pub fn fill_memory() -> Oom {
         resume_refused,
         hog_enomem,
         leaked_bytes: before.saturating_sub(after),
+        heap_peak_bytes: heap_peak.saturating_sub(heap_before),
         heap_kept_bytes: (crate::heap::stats().pages as u64 * FRAME_SIZE)
             .saturating_sub(heap_before),
     }

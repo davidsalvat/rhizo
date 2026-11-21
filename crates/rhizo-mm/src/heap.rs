@@ -5,7 +5,12 @@
 //! from per-class free lists. Each class carves 4 KiB pages into equal blocks;
 //! a block of size `2^k` inside a page-aligned page is aligned to `2^k`.
 //! Larger requests take contiguous pages from the [`PageSource`] and return
-//! them on free. Every operation is O(1) except page refills.
+//! them on free. Every operation is O(1) except page refills and trims.
+//!
+//! Free blocks are given back by page (design D1 of `add-heap-trim`): a
+//! trim sorts each free list by address and returns to the page source
+//! every page whose blocks are all free. The owner asks for one at quiet
+//! moments ([`Heap::trim_if_due`]); allocating and freeing pay nothing.
 
 use core::alloc::Layout;
 use core::ptr::{self, NonNull};
@@ -18,6 +23,9 @@ pub const MIN_CLASS_SIZE: usize = 16;
 pub const MAX_CLASS_SIZE: usize = 2048;
 
 const CLASSES: usize = 8; // 16, 32, 64, 128, 256, 512, 1024, 2048
+
+/// Bytes of class pages below which [`Heap::trim_if_due`] never trims.
+pub const TRIM_AT: usize = 1 << 20;
 
 /// Supplier of page-aligned, writable memory.
 pub trait PageSource {
@@ -74,6 +82,11 @@ pub struct Heap<S: PageSource> {
     source: S,
     free: [Option<NonNull<u8>>; CLASSES],
     stats: HeapStats,
+    /// Pages carved into blocks.
+    class_pages: usize,
+    /// Most live allocations [`trim_if_due`](Self::trim_if_due) saw since
+    /// the last trim.
+    peak_live: usize,
 }
 
 // SAFETY: the heap owns every block it hands out through raw pointers; moving
@@ -87,6 +100,8 @@ impl<S: PageSource> Heap<S> {
             source,
             free: [None; CLASSES],
             stats: HeapStats { pages: 0, live: 0 },
+            class_pages: 0,
+            peak_live: 0,
         }
     }
 
@@ -158,12 +173,71 @@ impl<S: PageSource> Heap<S> {
         block.as_ptr()
     }
 
+    /// Trims ([`trim`](Self::trim)) if the class pages hold at least
+    /// [`TRIM_AT`] bytes and the live allocations fell to half the most it
+    /// saw since the last trim: what was freed since is worth sorting
+    /// (design D2). Cheap otherwise: two comparisons.
+    pub fn trim_if_due(&mut self) {
+        self.peak_live = self.peak_live.max(self.stats.live);
+        if self.class_pages * PAGE_SIZE >= TRIM_AT && 2 * self.stats.live <= self.peak_live {
+            self.trim();
+        }
+    }
+
+    /// Gives back every page whose blocks are all free.
+    pub fn trim(&mut self) {
+        for class in 0..CLASSES {
+            self.trim_class(class);
+        }
+        self.peak_live = self.stats.live;
+    }
+
+    /// Sorts the free list of `class` by address, so the free blocks of one
+    /// page are next to each other, and gives back the pages it holds whole.
+    fn trim_class(&mut self, class: usize) {
+        let size = MIN_CLASS_SIZE << class;
+        let page_of = |b: NonNull<u8>| b.as_ptr() as usize & !(PAGE_SIZE - 1);
+        let mut rest = sort(self.free[class]);
+        self.free[class] = None;
+        let mut tail: Option<NonNull<u8>> = None;
+        while let Some(first) = rest {
+            // The run of free blocks in the page of `first`.
+            let (mut last, mut blocks) = (first, 1);
+            rest = next(first);
+            while let Some(b) = rest.filter(|&b| page_of(b) == page_of(first)) {
+                (last, blocks) = (b, blocks + 1);
+                rest = next(b);
+            }
+            if blocks == PAGE_SIZE / size {
+                let page = first.as_ptr().map_addr(|a| a & !(PAGE_SIZE - 1));
+                let page = NonNull::new(page).expect("a page is never at 0");
+                // SAFETY: every block of the page is free, so nothing uses
+                // it; it came from `alloc_pages(1)` in `refill`.
+                unsafe { self.source.free_pages(page, 1) };
+                self.stats.pages -= 1;
+                self.class_pages -= 1;
+                continue;
+            }
+            match tail {
+                // SAFETY: `t` is a free block of this class, kept on the list.
+                Some(t) => unsafe { set_next(t, Some(first)) },
+                None => self.free[class] = Some(first),
+            }
+            tail = Some(last);
+        }
+        if let Some(t) = tail {
+            // SAFETY: as above.
+            unsafe { set_next(t, None) };
+        }
+    }
+
     /// Carves one fresh page into blocks of `class` and pushes them.
     fn refill(&mut self, class: usize) -> bool {
         let Some(page) = self.source.alloc_pages(1) else {
             return false;
         };
         self.stats.pages += 1;
+        self.class_pages += 1;
         let size = MIN_CLASS_SIZE << class;
         // Push in reverse so blocks are handed out in address order.
         for i in (0..PAGE_SIZE / size).rev() {
@@ -183,6 +257,81 @@ impl<S: PageSource> Heap<S> {
     }
 }
 
+/// The block after free block `b` on its list.
+fn next(b: NonNull<u8>) -> Option<NonNull<u8>> {
+    // SAFETY: only free blocks are passed, and each holds a `FreeBlock`.
+    unsafe { b.cast::<FreeBlock>().as_ref().next.map(NonNull::cast) }
+}
+
+/// Links free block `b` to `next`.
+///
+/// # Safety
+/// `b` must be a free block of the heap (it holds a `FreeBlock`).
+unsafe fn set_next(b: NonNull<u8>, next: Option<NonNull<u8>>) {
+    // SAFETY: the caller guarantees `b` is free and holds a `FreeBlock`.
+    unsafe {
+        b.cast::<FreeBlock>().as_ptr().write(FreeBlock {
+            next: next.map(NonNull::cast),
+        })
+    };
+}
+
+/// Sorts a free list by address, in place: a merge sort of the list's own
+/// links (runs of 1, 2, 4... blocks merged pairwise), O(n log n) steps and
+/// no memory.
+fn sort(mut head: Option<NonNull<u8>>) -> Option<NonNull<u8>> {
+    let mut run = 1;
+    loop {
+        let (mut p, mut merges) = (head, 0);
+        let (mut out, mut tail): (Option<NonNull<u8>>, Option<NonNull<u8>>) = (None, None);
+        while p.is_some() {
+            merges += 1;
+            // `p` takes up to `run` blocks; `q` starts after them.
+            let mut q = p;
+            let mut p_left = 0;
+            while p_left < run && q.is_some() {
+                p_left += 1;
+                q = q.and_then(next);
+            }
+            let mut q_left = run;
+            while p_left > 0 || (q_left > 0 && q.is_some()) {
+                let take_p = match (p_left > 0, q.filter(|_| q_left > 0)) {
+                    (true, Some(qb)) => p.is_some_and(|pb| pb <= qb),
+                    (true, None) => true,
+                    (false, _) => false,
+                };
+                let b = if take_p {
+                    p_left -= 1;
+                    let b = p.expect("counted in p_left");
+                    p = next(b);
+                    b
+                } else {
+                    q_left -= 1;
+                    let b = q.expect("checked above");
+                    q = next(b);
+                    b
+                };
+                match tail {
+                    // SAFETY: `t` is a free block on the list being built.
+                    Some(t) => unsafe { set_next(t, Some(b)) },
+                    None => out = Some(b),
+                }
+                tail = Some(b);
+            }
+            p = q;
+        }
+        if let Some(t) = tail {
+            // SAFETY: as above.
+            unsafe { set_next(t, None) };
+        }
+        head = out;
+        if merges <= 1 {
+            return head;
+        }
+        run *= 2;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,8 +339,8 @@ mod tests {
     use std::alloc::{alloc, dealloc};
 
     /// Page source backed by the host allocator, with an optional limit.
-    /// The heap keeps size-class pages forever (by design), so the double
-    /// returns whatever is still lent out when it is dropped.
+    /// The heap keeps size-class pages until a trim, so the double returns
+    /// whatever is still lent out when it is dropped.
     #[derive(Default)]
     struct HostPages {
         outstanding: usize,
@@ -316,7 +465,90 @@ mod tests {
         assert!(heap.alloc(layout(PAGE_SIZE, 8)).is_null());
     }
 
+    #[test]
+    fn whole_free_pages_go_back_when_due() {
+        let mut heap = Heap::new(HostPages::default());
+        let l = layout(MAX_CLASS_SIZE, 8);
+        let n = 4 * TRIM_AT / MAX_CLASS_SIZE;
+        let blocks: Vec<_> = (0..n).map(|_| heap.alloc(l)).collect();
+        heap.trim_if_due(); // sees the peak: nothing freed, no trim
+        let peak = heap.stats().pages;
+        assert_eq!(peak, 4 * TRIM_AT / PAGE_SIZE);
+        // Fewer than half freed: not due.
+        for &p in &blocks[..n / 2 - 1] {
+            free(&mut heap, p, l);
+        }
+        heap.trim_if_due();
+        assert_eq!(heap.stats().pages, peak, "not due yet");
+        for &p in &blocks[n / 2 - 1..] {
+            free(&mut heap, p, l);
+        }
+        heap.trim_if_due();
+        assert_eq!(heap.stats(), HeapStats { pages: 0, live: 0 });
+        assert_eq!(heap.source.outstanding, 0, "every page back to its source");
+    }
+
+    #[test]
+    fn a_small_heap_is_never_trimmed_when_due() {
+        let mut heap = Heap::new(HostPages::default());
+        let l = layout(64, 8);
+        let p = heap.alloc(l);
+        heap.trim_if_due();
+        free(&mut heap, p, l);
+        heap.trim_if_due();
+        assert_eq!(heap.stats().pages, 1, "kept below TRIM_AT");
+    }
+
+    #[test]
+    fn a_page_with_a_live_block_stays() {
+        let mut heap = Heap::new(HostPages::default());
+        let l = layout(1024, 8);
+        let blocks: Vec<_> = (0..12).map(|_| heap.alloc(l)).collect();
+        assert_eq!(heap.stats().pages, 3);
+        // One live block in each of the first two pages, none in the third.
+        let keep = [blocks[1], blocks[6]];
+        fill(keep[0], 0xa5, 1024);
+        fill(keep[1], 0x5a, 1024);
+        for &p in blocks.iter().filter(|p| !keep.contains(p)) {
+            free(&mut heap, p, l);
+        }
+        heap.trim();
+        assert_eq!(heap.stats().pages, 2, "the empty page went back");
+        assert!((0..1024).all(|k| byte(keep[0], k) == 0xa5 && byte(keep[1], k) == 0x5a));
+        // The six free blocks of the two pages are reused, in address order.
+        let again: Vec<_> = (0..6).map(|_| heap.alloc(l)).collect();
+        let mut sorted = again.clone();
+        sorted.sort();
+        assert_eq!(again, sorted);
+        assert_eq!(heap.stats().pages, 2, "no new page");
+        for p in again.into_iter().chain(keep) {
+            free(&mut heap, p, l);
+        }
+    }
+
     proptest! {
+        #[test]
+        fn sort_orders_a_free_list(order in Just((0..300usize).collect::<Vec<_>>()).prop_shuffle()) {
+            let mut buf = vec![0u128; 300];
+            let base = buf.as_mut_ptr().cast::<u8>();
+            // SAFETY: each block is a 16-byte slot of `buf`, which outlives
+            // the list.
+            let block = |i: usize| NonNull::new(unsafe { base.add(16 * i) }).unwrap();
+            let mut head = None;
+            for &i in &order {
+                // SAFETY: as above; the slot holds a `FreeBlock` from now on.
+                unsafe { set_next(block(i), head) };
+                head = Some(block(i));
+            }
+            let mut got = Vec::new();
+            let mut b = sort(head);
+            while let Some(x) = b {
+                got.push(x);
+                b = next(x);
+            }
+            prop_assert_eq!(got, (0..300).map(block).collect::<Vec<_>>());
+        }
+
         #[test]
         fn allocations_never_overlap(
             ops in proptest::collection::vec((1usize..6000, 0u32..13, any::<bool>()), 1..300)
@@ -324,6 +556,9 @@ mod tests {
             let mut heap = Heap::new(HostPages::default());
             let mut live: Vec<(*mut u8, Layout, u8)> = Vec::new();
             for (i, (size, align_pow, free_one)) in ops.into_iter().enumerate() {
+                if i % 16 == 15 {
+                    heap.trim();
+                }
                 if free_one && !live.is_empty() {
                     let (p, l, tag) = live.swap_remove(i % live.len());
                     // The block must still hold its pattern: nobody overlapped it.
@@ -348,6 +583,8 @@ mod tests {
                 free(&mut heap, p, l);
             }
             prop_assert_eq!(heap.stats().live, 0);
+            heap.trim();
+            prop_assert_eq!(heap.stats().pages, 0);
         }
     }
 }
