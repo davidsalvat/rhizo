@@ -709,6 +709,25 @@ impl Live {
         let i = self.deadlines.iter().position(|&(t, _)| t == tid)?;
         Some(self.deadlines.swap_remove(i).1)
     }
+
+    /// Ends its threads' sleeps and times out their timed waits, waits on
+    /// descriptors included: their calls, made again, find their deadline
+    /// passed (design D1 of `fast-node-template`). Those deadlines are kept
+    /// here, not in the cell, so a template's are gone: each of its threads
+    /// waiting on descriptors with one gets a passed one.
+    fn expire_timers(&mut self) {
+        for kept in &mut self.deadlines {
+            kept.1 = 0;
+        }
+        for t in self.cell.threads.iter() {
+            if let Wait::Io { until: Some(_) } = t.wait
+                && !self.deadlines.iter().any(|&(tid, _)| tid == t.tid)
+            {
+                self.deadlines.push((t.tid, 0));
+            }
+        }
+        self.cell.threads.expire_timers();
+    }
 }
 
 /// The snapshot of a lazily resumed cell and which of its pages are still
@@ -1384,7 +1403,7 @@ impl Live {
     fn keep_host_wake(&mut self) {
         if self.cell.threads.wake_at().is_some() {
             self.host_wake = false;
-            self.cell.threads.expire_timers();
+            self.expire_timers();
         }
     }
 }
@@ -2651,7 +2670,7 @@ impl Host {
         let (cell, fs) = &self.templates[index];
         let (cell, fs) = (cell.clone(), fs.clone());
         let mut child = self.child_of(&cell, &fs, capture, echo)?;
-        child.cell.threads.expire_timers();
+        child.expire_timers();
         let child_id = child.cell.id;
         file(self.state(), None, child);
         Some(child_id)
@@ -2672,6 +2691,18 @@ impl Host {
                 let threads = &l.cell.threads;
                 !threads.is_runnable() && !threads.waits_on_io() && threads.wake_at().is_some()
             })
+    }
+
+    /// Whether live cell `id` waits: none of its threads can run.
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn waits(&mut self, id: u32) -> bool {
+        self.state()
+            .sched
+            .find(|l| l.cell.id == id)
+            .is_some_and(|l| !l.cell.threads.is_runnable())
     }
 
     /// Creates or replaces file `path` with `data` in live cell `id`'s
@@ -2741,7 +2772,7 @@ impl Host {
             return false;
         };
         live.host_wake = live.cell.threads.wake_at().is_none();
-        live.cell.threads.expire_timers();
+        live.expire_timers();
         file(self.state(), None, live);
         true
     }
@@ -3430,13 +3461,18 @@ fn node() -> Option<(u64, u64)> {
         }
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
     }
+    // Frozen in its pause after `warm`, every thread waiting (the main one
+    // in `epoll_pwait`, for the timer), not wherever the slice that printed
+    // `warm` ended: the same state on every VMM (design D2 of
+    // `fast-node-template`).
     let template = spawn(&mut host, &ARGV);
-    while host.output(template) != Some(b"warm\n") {
+    while !(host.output(template) == Some(b"warm\n") && host.waits(template)) {
         host.step();
     }
     assert!(host.freeze(template));
-    // The script's pause after `warm` (50 ms) ends before the first fork:
-    // forks wake at once, as from a template made long before.
+    // The pause (50 ms) ends before the first fork, as for a template made
+    // long before: a fork's `epoll_pwait` has timed out, but libuv compares
+    // the timer's due time with the clock and would wait for the rest.
     let end = now_ns() + 50_000_000;
     while now_ns() < end {}
     for _ in 0..ROUNDS {
