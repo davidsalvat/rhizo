@@ -658,6 +658,18 @@ fn imported_unix_names_are_renumbered_unless_parked() {
     assert!(other.accept(l2).is_ok());
 }
 
+/// The list of a cell without sockets decodes at once, empty; anything
+/// after it, or a cut one, is still refused.
+#[test]
+fn an_empty_record_list_decodes_alone() {
+    let mut bytes = Vec::new();
+    encode_records(&[], &mut bytes);
+    assert_eq!(bytes, [0; 4]);
+    assert_eq!(decode_records(&bytes), Ok(Vec::new()));
+    assert!(decode_records(&[0, 0, 0, 0, 0]).is_err(), "trailing bytes");
+    assert!(decode_records(&[0, 0, 0]).is_err(), "cut");
+}
+
 #[test]
 fn records_round_trip_and_reject_damage() {
     let park = Some(Park {
