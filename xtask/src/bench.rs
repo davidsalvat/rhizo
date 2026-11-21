@@ -530,6 +530,8 @@ fn measure_cells(
         let (mut dyn_run, mut dyn_template) = (Vec::new(), Vec::new());
         let (mut thread_create, mut futex_wake) = (Vec::new(), Vec::new());
         let mut syscall = Vec::new();
+        let (mut syscall_kpti, mut switch_kpti, mut run_kpti) =
+            (Vec::new(), Vec::new(), Vec::new());
         // The PMU's passes, where the guest has one (spec `profiling`).
         let mut counted = crate::profile::Samples::default();
         let mut pmu = None;
@@ -602,6 +604,11 @@ fn measure_cells(
                     if let Some((c, w)) = parse_threads_line(&out.output) {
                         thread_create.push(c as f64 / 1000.0);
                         futex_wake.push(w as f64);
+                    }
+                    if let Some(k) = parse_kpti_line(&out.output) {
+                        syscall_kpti.push(k[0] as f64);
+                        switch_kpti.push(k[1] as f64);
+                        run_kpti.push(k[2] as f64 / 1000.0);
                     }
                     if let Some(ns) = crate::profile::field(&out.output, "rhizo-ops", "syscall_ns")
                     {
@@ -721,6 +728,9 @@ fn measure_cells(
             ("cell.shootdown_us", "us", &mut shootdown),
             ("cell.timer_error_us", "us", &mut timer_error),
             ("cell.syscall_ns", "ns", &mut syscall),
+            ("cell.syscall_kpti_ns", "ns", &mut syscall_kpti),
+            ("cell.switch_kpti_ns", "ns", &mut switch_kpti),
+            ("cell.run_kpti_us", "us", &mut run_kpti),
             ("cell.syscall_scaling_pct", "%", &mut syscall_scaling),
         ] {
             if values.is_empty() && name == "net.tcp_rtt_us" {
@@ -1062,6 +1072,23 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         syscalls_serial_ns: field("syscalls_serial_ns")?,
         syscalls_parallel_ns: field("syscalls_parallel_ns")?,
     })
+}
+
+/// `[syscall_kpti_ns, switch_kpti_ns, run_kpti_ns]` of the KPTI
+/// line of a `bench-cell` kernel (design D5 of `add-kpti`).
+fn parse_kpti_line(output: &str) -> Option<[u64; 3]> {
+    let line = output.lines().find(|l| l.starts_with("rhizo-kpti "))?;
+    let field = |key: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some([
+        field("syscall_kpti_ns")?,
+        field("switch_kpti_ns")?,
+        field("run_kpti_ns")?,
+    ])
 }
 
 /// `(create_ns, futex_wake_ns)` of the threads line of a `bench-cell`
@@ -2594,6 +2621,18 @@ mod tests {
             None
         );
         assert_eq!(parse_net_line("rhizo-net pipe_rtt_ns=1\n"), None);
+    }
+
+    #[test]
+    fn kpti_line_is_parsed() {
+        assert_eq!(
+            parse_kpti_line(
+                "x\nrhizo-kpti default=0 syscall_kpti_ns=300 switch_kpti_ns=700 \
+                 run_kpti_ns=9000\n"
+            ),
+            Some([300, 700, 9000])
+        );
+        assert_eq!(parse_kpti_line("rhizo-kpti syscall_ns=1\n"), None);
     }
 
     #[test]

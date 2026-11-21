@@ -166,7 +166,7 @@ tested on the host.
 The `arch` interface (`kernel/src/arch/mod.rs` lists it) is the only thing
 shared kernel code may use: `boot`, `platform`, `console`, `power`, `cpu`,
 `timer`, `tests`, and, compiled only in builds that run cells, `user`
-(entering and leaving cell code, address-space tags), `irq` (the
+(entering and leaving cell code, address-space tags, KPTI), `irq` (the
 preemption timer and the wake-up between CPUs; interrupts arrive only
 while cell code runs or a CPU idles), `random` (the CPU's hardware
 random source, as `rhizo_hal::Entropy`), `smp` (starting the other CPUs,

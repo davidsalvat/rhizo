@@ -107,6 +107,7 @@ macro_rules! suite {
             ktest_case!(fresh_memory_never_holds_another_cells_data),
             ktest_case!(names_cannot_fill_kernel_memory),
             ktest_case!(shared_read_only_pages_stay_shared_after_mprotect),
+            ktest_case!(cells_run_alike_with_and_without_kpti),
             ktest_case!(threads_racing_on_several_cpus_cannot_hurt_the_kernel),
             ktest_case!(flags_a_cell_sets_stay_in_the_cell),
             ktest_case!(one_page_mapped_without_end_cannot_stop_the_kernel),
@@ -1581,6 +1582,32 @@ fn fresh_memory_never_holds_another_cells_data() {
     let (ending, report) = ended(&host, peek);
     assert_eq!(ending, Ending::Fault, "the ended cell's mapping is gone");
     assert!(report.contains("address 0x400000000000: read"), "{report}");
+}
+
+/// Every other test runs with KPTI on (design D1 of `add-kpti`); the
+/// kernel without it, as most CPUs run it, behaves the same: system calls,
+/// faults, forks (copy-on-write flushes) and switches between cells.
+fn cells_run_alike_with_and_without_kpti() {
+    for kpti in [false, true] {
+        arch::user::set_kpti(kpti);
+        run_expected("abi");
+        run_expected("fault_kernel");
+        let mut host = Host::new();
+        let parent = spawn(&mut host, "rewrite", &[]);
+        let other = spawn(&mut host, "chatter", &[b"c"]);
+        while host.output(parent) != Some(b"ready\n") {
+            host.step();
+        }
+        let mut ids = host.fork(parent, 2).expect("fork");
+        ids.push(parent);
+        host.run(|_| false);
+        for id in ids {
+            let (ending, out) = ended(&host, id);
+            assert_eq!(ending, Ending::Exit(0), "{out}");
+            assert!(out.ends_with("own ok\n"), "{out}");
+        }
+        assert_eq!(ended(&host, other), (Ending::Exit(0), "c\nc\nc\n".into()));
+    }
 }
 
 /// After a fork, read-only pages are shared: a cell that makes one writable

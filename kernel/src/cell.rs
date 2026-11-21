@@ -570,8 +570,10 @@ const WIRE_PERIOD_NS: u64 = 20_000;
 static MAX_TAG: AtomicU16 = AtomicU16::new(0);
 
 /// Sets up preemption and address-space tags on the boot CPU, then starts
-/// the other CPUs, at most `smp` in all (spec `multi-core`); returns how
-/// many are online. Call once, before any [`Host`].
+/// the other CPUs, at most `smp` in all (spec `multi-core`), and turns KPTI
+/// on where the CPU needs it, or always in the test build so every test
+/// runs with it (spec `isolation`, design D1 of `add-kpti`); returns how
+/// many CPUs are online. Call once, before any [`Host`].
 pub fn init(smp: Option<u16>) -> usize {
     crate::heap::window::init();
     let (generator, strong) =
@@ -604,7 +606,10 @@ pub fn init(smp: Option<u16>) -> usize {
         net.set_secret([word(0), word(8)]);
         crate::wire::init(net, now_ns(), u64::from_le_bytes(seed));
     });
-    crate::smp::start(smp)
+    let cpus = crate::smp::start(smp);
+    user::init_kpti(cpus);
+    user::set_kpti(cfg!(feature = "ktest") || user::kpti_needed());
+    cpus
 }
 
 /// Monotonic time in nanoseconds since boot (0 if the counter frequency is
@@ -1285,6 +1290,18 @@ fn flushed_on(cpu: usize) -> u32 {
     }
 }
 
+/// The CPUs whose TLB holds nothing stale for a cell once the kernel,
+/// running on this CPU, flushed some of its translations: none with KPTI,
+/// where the kernel's flushes cannot reach the cell's PCID (design D3 of
+/// `add-kpti`), so each CPU flushes it on its next entry.
+fn flushed_by_kernel_on(cpu: usize) -> u32 {
+    if user::stale_everywhere() {
+        0
+    } else {
+        flushed_on(cpu)
+    }
+}
+
 /// Runs the system call of `live`'s current thread, whose FP/SIMD state is
 /// in this CPU's registers when `fp_in_cpu`, through the TLB of `gang` when
 /// other CPUs may run the cell's code. Returns what the thread does next
@@ -1408,7 +1425,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                 Trap::Syscall => {
                     let (outcome, shrank) = syscall(&mut live, pt, fp_owner() == key, None);
                     if shrank {
-                        live.clean = flushed_on(cpu);
+                        live.clean = flushed_by_kernel_on(cpu);
                     }
                     match outcome {
                         // A new thread: other CPUs may run it (design D2 of
@@ -1476,7 +1493,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     }) =>
                 {
                     prof::add(Count::CowFaults, 1);
-                    live.clean = flushed_on(cpu);
+                    live.clean = flushed_by_kernel_on(cpu);
                     continue;
                 }
                 Trap::Fault(fault)
@@ -1596,7 +1613,8 @@ impl Gang {
         if user::TLB_FLUSH_IS_BROADCAST || self.hold.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.clean.store(flushed_on(cpu), Ordering::SeqCst);
+        self.clean
+            .store(flushed_by_kernel_on(cpu), Ordering::SeqCst);
         let mut seen = [0u64; MAX_CPUS];
         for (other, word) in seen.iter_mut().enumerate().take(crate::smp::count()) {
             let now = IN_CELL[other].load(Ordering::SeqCst);
@@ -2142,7 +2160,7 @@ impl Host {
         let _p = cost::scope(Part::Spawn);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let random = start_random();
-        let kernel = memory::kernel_tables();
+        let kernel = user::cell_kernel_half();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
         let parsed = Image::parse(image, user::MACHINE)?;
         let cell = rhizo_cell::start::<Format>(
@@ -2183,7 +2201,7 @@ impl Host {
     ) -> Result<u32, ExecError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let random = start_random();
-        let kernel = memory::kernel_tables();
+        let kernel = user::cell_kernel_half();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
         let cell = rhizo_abi::exec::<Format, _, _>(
             id,
@@ -2273,7 +2291,7 @@ impl Host {
         };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         if user::CELL_ROOT_HAS_KERNEL_HALF {
-            pt.share_upper_half(&mut DirectMap, &memory::kernel_tables());
+            pt.share_upper_half(&mut DirectMap, &user::cell_kernel_half());
         }
         let cell = snapshot.cell(id, pt.root(), now_ns());
         let mut fs = files_of(&snapshot);
@@ -2539,7 +2557,7 @@ impl Host {
         // The parent lost write access to everything it shares: drop what its
         // TLB still caches (on other CPUs, when it next runs there).
         user::flush_user(parent.cell.root, parent.tag);
-        parent.clean = flushed_on(crate::arch::cpu::index());
+        parent.clean = flushed_by_kernel_on(crate::arch::cpu::index());
         parent.shares = true;
         self.requeue(parent, wake);
         if children.len() < n {
@@ -2971,36 +2989,27 @@ fn bench_ns(ticks: u64) -> Option<u64> {
 #[cfg(feature = "bench-cell")]
 fn benchmarks(console: &mut impl Console) {
     use core::fmt::Write;
-    const RUNS: usize = 101;
-    let image = test_image("hello");
-    let mut spawn_ns = Vec::with_capacity(RUNS);
-    let mut run_ns = Vec::with_capacity(RUNS);
-    let mut tables = 0;
-    let mut host = Host::new();
-    for _ in 0..RUNS {
-        host.finished.clear();
-        let t0 = bench_clock();
-        let id = host
-            .spawn(image, &[b"hello"], true, false)
-            .expect("the hello cell spawns");
-        let t1 = bench_clock();
-        tables = host.table_frames(id).unwrap_or(0);
-        host.run(|_| false);
-        let t2 = bench_clock();
-        let done = host.finished(id).expect("the hello cell ended");
-        assert_eq!(done.ending, Ending::Exit(0), "the hello cell exits with 0");
-        assert_eq!(done.output, b"hello from a cell\n");
-        spawn_ns.push(bench_ns(t1 - t0).unwrap_or(0));
-        run_ns.push(bench_ns(t2 - t0).unwrap_or(0));
-    }
+    let (spawn_ns, run_ns, tables) = hello_runs();
     let tagged = switch_ns(Host::new());
     let untagged = switch_ns(Host::new_untagged());
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
-        "rhizo-cell spawn_ns={} run_ns={} pt_frames={tables} switch_ns={tagged} \
-         switch_untagged_ns={untagged}",
-        robust(&mut spawn_ns),
-        robust(&mut run_ns)
+        "rhizo-cell spawn_ns={spawn_ns} run_ns={run_ns} pt_frames={tables} switch_ns={tagged} \
+         switch_untagged_ns={untagged}"
+    );
+    // KPTI's cost (design D5 of `add-kpti`): the same figures with it
+    // forced on (`cell.syscall_ns` itself is on the `rhizo-ops` line).
+    let default = user::kpti();
+    user::set_kpti(true);
+    let syscall_kpti = bench_ns(syscall_ticks()).unwrap_or(0);
+    let switch_kpti = switch_ns(Host::new());
+    let (_, run_kpti, _) = hello_runs();
+    user::set_kpti(default);
+    let _ = writeln!(
+        rhizo_hal::ConsoleWriter(console),
+        "rhizo-kpti default={} syscall_kpti_ns={syscall_kpti} switch_kpti_ns={switch_kpti} \
+         run_kpti_ns={run_kpti}",
+        default as u8
     );
     // The first pass only: forking 50 MiB and writing it needs most of
     // the memory, which the kernel heap grown by the first pass keeps.
@@ -4214,6 +4223,35 @@ fn suspend_resume() -> [u64; 5] {
     }
     out[4] = bytes as u64;
     out
+}
+
+/// Spawns and runs the hello cell 101 times: robust spawn and spawn-to-end
+/// times (see [`robust`]), and its page-table frames.
+#[cfg(feature = "bench-cell")]
+fn hello_runs() -> (u64, u64, usize) {
+    const RUNS: usize = 101;
+    let image = test_image("hello");
+    let mut spawn_ns = Vec::with_capacity(RUNS);
+    let mut run_ns = Vec::with_capacity(RUNS);
+    let mut tables = 0;
+    let mut host = Host::new();
+    for _ in 0..RUNS {
+        host.finished.clear();
+        let t0 = bench_clock();
+        let id = host
+            .spawn(image, &[b"hello"], true, false)
+            .expect("the hello cell spawns");
+        let t1 = bench_clock();
+        tables = host.table_frames(id).unwrap_or(0);
+        host.run(|_| false);
+        let t2 = bench_clock();
+        let done = host.finished(id).expect("the hello cell ended");
+        assert_eq!(done.ending, Ending::Exit(0), "the hello cell exits with 0");
+        assert_eq!(done.output, b"hello from a cell\n");
+        spawn_ns.push(bench_ns(t1 - t0).unwrap_or(0));
+        run_ns.push(bench_ns(t2 - t0).unwrap_or(0));
+    }
+    (robust(&mut spawn_ns), robust(&mut run_ns), tables)
 }
 
 /// Median over 5 rounds of the time per switch between two cells that
