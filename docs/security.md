@@ -125,7 +125,11 @@ What makes the boundary hold:
   fault copies only what is shared, and only in the lower half (S2).
 - **Per-cell state.** Registers, FP/SIMD state (switched lazily, trapped on
   first use), files and descriptors (`rhizo_fs::Fs`, private copy-on-write)
-  and the system-call handler (`Abi`) belong to one cell.
+  and the system-call handler (`Abi`) belong to one cell. On x86_64 CPUs
+  whose `FXRSTOR` keeps the previous x87 instruction and data pointers
+  (AMD and Hygon without `XSAVEERPTR`, and QEMU's emulation), an x87 load
+  of a kernel variable overwrites them before each FP/SIMD load
+  (`scrub-x87-pointers`).
 - **Per-CPU kernel data** (`add-smp-boot`). The entry code finds the
   kernel stack and the running cell's registers through per-CPU data that
   cell code cannot redirect: `TPIDR_EL1` on AArch64 (not accessible at

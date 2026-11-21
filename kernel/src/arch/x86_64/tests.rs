@@ -11,7 +11,98 @@ pub static ALL: &[TestCase] = &[
     ktest_case!(a_cell_reads_the_counter),
     ktest_case!(the_timer_is_never_periodic_with_a_short_count),
     ktest_case!(the_clock_runs_at_the_apic_timer_s_rate),
+    ktest_case!(the_x87_scrub_follows_the_cpu),
+    ktest_case!(x87_pointers_never_survive_a_load),
 ];
+
+/// The x87 pointers are scrubbed before each load exactly on AMD and Hygon
+/// CPUs without `XSAVEERPTR` and under QEMU's emulation (design D1 of
+/// `scrub-x87-pointers`); the test says which case ran, as only those CPUs
+/// take the scrub's path.
+fn the_x87_scrub_follows_the_cpu() {
+    use core::arch::x86_64::__cpuid;
+    use rhizo_hal::Console;
+    let v = __cpuid(0);
+    let mut vendor = [0u8; 12];
+    for (i, word) in [v.ebx, v.edx, v.ecx].into_iter().enumerate() {
+        vendor[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let amd = &vendor == b"AuthenticAMD" || &vendor == b"HygonGenuine";
+    let errptr = __cpuid(0x8000_0000).eax >= 0x8000_0008 && __cpuid(0x8000_0008).ebx & 4 != 0;
+    let h = __cpuid(0x4000_0000);
+    let mut hv = [0u8; 12];
+    for (i, word) in [h.ebx, h.ecx, h.edx].into_iter().enumerate() {
+        hv[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let tcg = __cpuid(1).ecx >> 31 == 1 && &hv == b"TCGTCGTCGTCG";
+    assert_eq!(super::user::fp_scrubs(), (amd && !errptr) || tcg);
+    let note: &[u8] = if super::user::fp_scrubs() {
+        b"(x87 scrub on) "
+    } else {
+        b"(x87 scrub off) "
+    };
+    super::console::BootConsole.write_bytes(note);
+}
+
+/// The x87 environment (`FNSTENV`, 32-bit format): the low halves of the
+/// last instruction's address (word 3) and of its operand's (word 5).
+fn x87_env() -> [u32; 7] {
+    let mut env = [0u32; 7];
+    // SAFETY: `env` is 28 writable bytes; the caller cleared CR0.TS (through
+    // `fp_save`). `FNSTENV` only masks x87 exceptions, which the caller's
+    // `fp_load` puts back.
+    unsafe { core::arch::asm!("fnstenv [{}]", in(reg) &mut env, options(nostack)) };
+    env
+}
+
+/// The x87 instruction and data pointers an x87 load leaves do not survive
+/// loading another thread's FP/SIMD state, as a cell would read them next
+/// (design D4 of `scrub-x87-pointers`). Where `FXRSTOR` restores them from
+/// the image (Intel, Zen 2 and later) this holds without the scrub; on AMD
+/// CPUs without `XSAVEERPTR` and under QEMU's emulation, which keeps them
+/// whatever the image holds, only the scrub makes it hold.
+/// A pointer the CPU does not record (FDP on Intel CPUs with
+/// `FDP_EXCPTN_ONLY`) is not checked.
+fn x87_pointers_never_survive_a_load() {
+    use rhizo_cell::FpState;
+    use rhizo_cell::elf::Machine;
+    use rhizo_hal::Console;
+    static MARK: u32 = 7;
+    let mut saved = FpState::default();
+    super::user::fp_save(&mut saved);
+    let ip: u64;
+    // SAFETY: CR0.TS is clear (`fp_save`) and the x87 stack holds what
+    // `saved` keeps; `MARK` is a kernel static. `fninit` leaves no pending
+    // exception and an empty stack, so the load cannot fault.
+    unsafe {
+        core::arch::asm!(
+            "fninit",
+            "lea {ip}, [rip + 2f]",
+            "2: fild dword ptr [{mark}]",
+            ip = out(reg) ip,
+            mark = in(reg) &MARK,
+            options(nostack, readonly)
+        )
+    };
+    let marked = x87_env();
+    let mark = &MARK as *const u32 as u64;
+    let (fip, fdp) = (marked[3] == ip as u32, marked[5] == mark as u32);
+    super::user::fp_load(&FpState::initial(Machine::X86_64));
+    let after = x87_env();
+    super::user::fp_load(&saved);
+    if !fip && !fdp {
+        super::console::BootConsole.write_bytes(b"(x87 pointers not recorded) ");
+        return;
+    }
+    assert!(
+        !fip || after[3] != ip as u32,
+        "x87 instruction pointer kept: {ip:#x}"
+    );
+    assert!(
+        !fdp || after[5] != mark as u32,
+        "x87 data pointer kept: {mark:#x}"
+    );
+}
 
 /// The TSC's conversion to time, however it was found (KVM's clock, CPUID,
 /// the PIT or 10 ms of the APIC timer), agrees within 0.05% with 50 ms of
