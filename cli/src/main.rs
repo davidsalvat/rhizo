@@ -173,7 +173,12 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
 fn cmd_down(dir: &Dir) -> Result<(), String> {
     let mut client = Client::connect(dir)?;
     let t0 = Instant::now();
-    let reply = client.call(&Request::Shutdown)?;
+    let reply = client.call(&Request::Shutdown).map_err(|e| {
+        format!(
+            "the kernel did not answer the power off ({e}); its console log is in {}",
+            dir.0.display()
+        )
+    })?;
     // The server removes the state, last, once the VMM has ended.
     let gone = |within: Duration| {
         let deadline = Instant::now() + within;

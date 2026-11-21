@@ -155,6 +155,25 @@ pub fn read_byte() -> Option<u8> {
     CHANNEL.with(|c| c.as_mut()?.stream.read())
 }
 
+/// Sends what is still queued for the host, polling the device, until the
+/// device took every packet or `deadline` (monotonic nanoseconds) passes:
+/// before the power off, so the last reply reaches the host.
+pub fn finish(deadline: u64) {
+    loop {
+        let done = CHANNEL.with(|c| {
+            let Some(c) = c.as_mut() else {
+                return true;
+            };
+            pump(c);
+            !c.stream.sending() && c.dev.sent_all()
+        });
+        if done || crate::cell::now_ns() >= deadline {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Sends `bytes` (a frame) to the host; `false` if it is not connected.
 pub fn write(bytes: &[u8]) -> bool {
     CHANNEL.with(|c| {

@@ -258,6 +258,32 @@ fn sending_waits_for_credit_and_asks_for_it_once() {
     assert_eq!(sent[0].1.len(), 100);
 }
 
+/// What is written stays "sending" until it went out as packets: with no
+/// credit, until the peer gives some (the control kernel waits for this
+/// before it powers off, so its last reply is not lost).
+#[test]
+fn written_bytes_are_sending_until_they_go_out() {
+    let mut s = connected();
+    assert!(!s.sending());
+    let no_credit = Header {
+        buf_alloc: 0,
+        ..from_host(op::CREDIT_UPDATE, 0)
+    };
+    assert_eq!(s.take(&no_credit, &[]), None);
+    assert!(s.write(b"done"));
+    assert!(s.sending());
+    drain(&mut s, PAYLOAD_MAX);
+    assert!(s.sending(), "no credit: the bytes wait");
+    let credit = Header {
+        buf_alloc: 100,
+        ..no_credit
+    };
+    assert_eq!(s.take(&credit, &[]), None);
+    let sent = drain(&mut s, PAYLOAD_MAX);
+    assert_eq!(sent.last().map(|(_, p)| p.as_slice()), Some(&b"done"[..]));
+    assert!(!s.sending());
+}
+
 #[test]
 fn credit_requests_are_answered_and_reading_returns_credit() {
     let mut s = connected();
@@ -712,10 +738,12 @@ fn slots_are_reused_and_a_full_queue_refuses() {
         assert!(dev.send(&h, b"x"));
     }
     assert!(!dev.can_send());
+    assert!(!dev.sent_all(), "packets still in the device");
     assert!(!dev.send(&h, b"x"), "every slot in flight");
     d.borrow_mut().stalled = false;
     d.borrow_mut().notify(1);
     assert!(dev.can_send(), "slots come back once the device took them");
+    assert!(dev.sent_all(), "the device took every packet");
     assert!(!dev.send(&h, &[0; PAYLOAD_MAX + 1]), "too large");
 }
 
