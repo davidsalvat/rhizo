@@ -313,6 +313,10 @@ pub struct Tables {
     /// The pipe whose write end the host holds, outside the descriptors:
     /// standard input from the host ([`Tables::host_input`]).
     input: Option<u32>,
+
+    /// Counts changes to pipes, event counters and `epoll` instances
+    /// ([`Tables::changes`]).
+    changes: u64,
 }
 
 impl Tables {
@@ -340,6 +344,8 @@ impl Tables {
             objects: Vec::new(),
             released: Vec::new(),
             input: None,
+
+            changes: 0,
         }
     }
 

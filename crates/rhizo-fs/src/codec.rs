@@ -364,6 +364,8 @@ impl Tables {
             objects,
             released: Vec::new(),
             input,
+
+            changes: 0,
         })
     }
 
