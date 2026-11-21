@@ -1242,30 +1242,35 @@ fn ready_now() -> Ready {
 
 /// Ends `live`: drops the CPU's hold on its address space and FP/SIMD
 /// state, frees its memory, and returns what the host keeps of it and the
-/// tag to free.
+/// tag to free. Then gives the kernel heap's free pages back if enough of
+/// its allocations went since its last trim (design D2 of `add-heap-trim`).
 fn end(live: Box<Live>, ending: Ending) -> (Finished, u16) {
     let _p = cost::scope(Part::Teardown);
-    let live = *live;
-    if fp_owner() >> 32 == live.cell.id as u64 {
-        set_fp_owner(0);
-    }
-    user::release_user(live.cell.root, live.tag);
-    sharing(live.shares, || {
-        space::destroy(
-            PageTable::<Format>::from_root(live.cell.root),
-            &mut DirectMap,
-            &mut KernelFrames,
-        )
-    });
-    release_sockets(&live.fs, live.cell.id);
-    let finished = Finished {
-        id: live.cell.id,
-        ending,
-        output: live.output.unwrap_or_default(),
-        cpus: live.cpus,
-        peak: live.peak,
+    let ended = {
+        let live = *live;
+        if fp_owner() >> 32 == live.cell.id as u64 {
+            set_fp_owner(0);
+        }
+        user::release_user(live.cell.root, live.tag);
+        sharing(live.shares, || {
+            space::destroy(
+                PageTable::<Format>::from_root(live.cell.root),
+                &mut DirectMap,
+                &mut KernelFrames,
+            )
+        });
+        release_sockets(&live.fs, live.cell.id);
+        let finished = Finished {
+            id: live.cell.id,
+            ending,
+            output: live.output.unwrap_or_default(),
+            cpus: live.cpus,
+            peak: live.peak,
+        };
+        (finished, live.tag)
     };
-    (finished, live.tag)
+    crate::heap::trim_if_due();
+    ended
 }
 
 /// What a secondary CPU runs during [`Host::run`]: cells from the shared
@@ -2441,6 +2446,7 @@ impl Host {
             for cpu in 1..cpus {
                 crate::smp::join(cpu);
             }
+            crate::heap::reclaim_tables(); // the other CPUs can flush now
             let state = self.state();
             state.stopping = false;
             state.idle = 0;
