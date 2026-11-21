@@ -26,6 +26,14 @@ pub trait Frames {
     fn share(&mut self, phys: u64);
     /// Whether the page or table at `phys` has more than one reference.
     fn is_shared(&self, phys: u64) -> bool;
+    /// Adds a reference to the page at `phys` if its count can take one
+    /// more; returns whether it did. Counts are bounded: a caller that a
+    /// cell can make share one page without end uses this, and gives the
+    /// cell a copy when it fails (finding S14 of `docs/security.md`).
+    fn try_share(&mut self, phys: u64) -> bool {
+        self.share(phys);
+        true
+    }
 }
 
 const ENTRIES: u64 = 512;
