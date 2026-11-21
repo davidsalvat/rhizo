@@ -1149,6 +1149,10 @@ pub struct Host {
     /// its stop condition again, even with nothing to run (a control
     /// kernel's poll of the serial line, design D4 of `add-control-plane`).
     look_every: Option<u64>,
+    /// The time limit of the current run ([`run_until`](Self::run_until)):
+    /// the boot CPU never waits past it (design D1 of
+    /// `fix-lost-wakeup-smp`).
+    until: Option<u64>,
 }
 
 /// What a CPU does next ([`take`]).
@@ -2339,6 +2343,7 @@ impl Host {
             wire_delay: None,
             wire_addr: None,
             look_every: None,
+            until: None,
         }
     }
 
@@ -2677,6 +2682,20 @@ impl Host {
         Some(live.demand.lazy.as_ref().map_or(0, |l| l.left))
     }
 
+    /// [`run`](Self::run) until monotonic time `at` at the latest: the boot
+    /// CPU's waits end by then, whatever the cells wait for and whichever
+    /// CPU's timer holds their deadlines (design D1 of
+    /// `fix-lost-wakeup-smp`).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    )]
+    pub fn run_until(&mut self, at: u64, mut stop: impl FnMut(&Self) -> bool) {
+        self.until = Some(at);
+        self.run(|h| now_ns() >= at || stop(h));
+        self.until = None;
+    }
+
     /// Runs cells on every CPU until none is left that can ever run or
     /// `stop` holds (checked on this CPU whenever it gives up a cell or a
     /// cell ends), then waits for the other CPUs to give back theirs.
@@ -2744,8 +2763,8 @@ impl Host {
     /// opened a connection) and, if that changed nothing, waits until `wake`
     /// or until the card wants polling (design D4 of `add-virtio-net`).
     /// Without `wake` it waits for a wake-up, unless `done` (no deadline
-    /// anywhere) and no CPU runs a cell. Returns `false` when nothing can
-    /// ever wake a cell.
+    /// anywhere) and no CPU runs a cell; in a run with a time limit, never
+    /// past it. Returns `false` when nothing can ever wake a cell.
     fn wait_or_poll(&mut self, wake: Option<u64>, done: bool) -> bool {
         let now = now_ns();
         let waiting = self.shared.with(|s| s.sched.waiting()) > 0;
@@ -2764,13 +2783,15 @@ impl Host {
                 wake = Some(wake.map_or(soon, |w| w.min(soon)));
             }
         }
+        // Never past the run's time limit: another CPU's timer may hold the
+        // cells' deadline, and nothing else may wake this CPU.
         match wake {
             Some(at) => {
-                wait(Some(at));
+                wait(Some(self.until.map_or(at, |until| at.min(until))));
                 true
             }
             None if !done || self.shared.with(|s| s.running) > 0 => {
-                wait(None);
+                wait(self.until);
                 true
             }
             None => false,
@@ -4127,7 +4148,7 @@ pub fn agent(
         host.step();
     }
     run.fork_ns = ns(t0, Counter.cycles());
-    host.run(|h| branches.iter().all(|&c| h.finished(c).is_some()) || now_ns() > end);
+    host.run_until(end, |h| branches.iter().all(|&c| h.finished(c).is_some()));
     for &child in &branches {
         match host.finished(child) {
             Some(f) if f.ending == Ending::Exit(0) => {
@@ -4532,7 +4553,7 @@ fn wire_rtt() -> Result<u64, alloc::string::String> {
         let id = host.spawn(image, &argv, true, false).expect("spawn");
         // A connection that never answers must not stop the benchmarks.
         let end = now_ns().saturating_add(10_000_000_000);
-        host.run(|h| h.finished(id).is_some() || now_ns() > end);
+        host.run_until(end, |h| h.finished(id).is_some());
         if host.finished(id).is_none() {
             let said = alloc::string::String::from_utf8_lossy(host.output(id).unwrap_or_default())
                 .into_owned();

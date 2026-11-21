@@ -262,6 +262,13 @@ fn server(console: &mut impl Console) {
                 .spawn(test_image("worker"), &argv, true, false)
                 .expect("spawn a worker");
             wait_for(&mut host, id, b"ready\n", 1);
+            // Frozen only once in its hour's sleep, which its forks find
+            // expired: a slice that ends between `ready` and the sleep would
+            // leave every fork to start that sleep (change
+            // `fix-lost-wakeup-smp`).
+            while !host.asleep(id) {
+                host.step();
+            }
             assert!(host.freeze(id));
             id
         })
@@ -346,7 +353,7 @@ fn server(console: &mut impl Console) {
             break;
         }
         let until = if now < stop_ops { next_op } else { deadline };
-        host.run(|_| now_ns() >= until);
+        host.run_until(until, |_| false);
     }
     let elapsed = now_ns() - t0;
     // What each cell holds at the busiest point: its pages, tables, files,

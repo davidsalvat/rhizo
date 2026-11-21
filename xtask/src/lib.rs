@@ -85,6 +85,8 @@ Commands:
                              the cell figures; Node.js with RHIZO_NODE)
       --soak                 The long versions of the workloads (weekly)
       --cells <n>            Cells of the server workload (default 10000)
+      --cpus <n>             Virtual CPUs of the server VM (default 1;
+                             local runs only, not with --check)
       --llm-delay-ms <n>     Delay of the laptop's fake model (default 0)
   profile [options]          Run the workloads (cell loop, fork_touch, CPython
                              cold) sampled and accounted; write folded stacks

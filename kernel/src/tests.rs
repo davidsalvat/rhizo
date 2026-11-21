@@ -156,6 +156,7 @@ macro_rules! suite {
             ktest_case!(kernel_globals_are_safe_across_cpus),
             ktest_case!(timed_waits_last_as_long_on_every_cpu),
             ktest_case!(idle_cpus_wake_only_for_deadlines),
+            ktest_case!(a_run_with_a_time_limit_ends_on_time),
             ktest_case!(cells_run_on_every_cpu),
             ktest_case!(busy_cpus_do_not_starve_a_cell),
             ktest_case!(cells_in_parallel_stay_isolated),
@@ -3291,6 +3292,33 @@ fn idle_cpus_wake_only_for_deadlines() {
         "{cpus} CPUs left their waits {wakeups} times in 300 ms"
     );
     assert!(took < 400_000_000, "the 300 ms sleeper took {took} ns");
+}
+
+/// Cells that sleep an hour while every CPU idles: a run limited to 50 ms
+/// ends soon after its limit (500 ms leaves room for an emulated machine on
+/// a busy host, far below the hardware's longest wait, 2 s or more), again
+/// and again, whichever CPU's timer holds the hour (spec `scheduling`, change `fix-lost-wakeup-smp`). Before,
+/// on several CPUs the boot CPU waited for a wake-up only, when another
+/// CPU's timer held the hour, and the run outlived its limit by that hour.
+fn a_run_with_a_time_limit_ends_on_time() {
+    let now = || arch::timer::cycles_to_ns(arch::timer::Counter.cycles()).unwrap_or(0);
+    let mut host = Host::new();
+    let ids: Vec<u32> = (0..crate::smp::count())
+        .map(|_| spawn(&mut host, "sleeper", &[b"3600000"]))
+        .collect();
+    for round in 0..20 {
+        let t0 = now();
+        host.run_until(t0 + 50_000_000, |_| false);
+        let took = now() - t0;
+        assert!(
+            took < 500_000_000,
+            "round {round}: a run limited to 50 ms took {took} ns"
+        );
+    }
+    for id in ids {
+        assert!(host.asleep(id), "cell {id} still sleeps its hour");
+        assert!(host.kill(id));
+    }
 }
 
 /// Every CPU online, as a mask.
