@@ -45,6 +45,8 @@ pub const PROGRAMS: &[(&str, &str, Ending)] = &[
     ),
     ("libc_alloc", "allocator checksum 154285459\n", Ending::Exit(0)),
     ("libc_float", "fp ok: 20100.0\n", Ending::Exit(0)),
+    ("fp_regs", "fp regs ok\n", Ending::Exit(0)),
+    ("fp_peek", "fp clean\n", Ending::Exit(0)),
     ("libc_hwcap", "cpu features ok\n", Ending::Exit(0)),
     (
         "libc_files",

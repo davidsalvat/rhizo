@@ -130,12 +130,14 @@ What makes the boundary hold:
 - **Copy-on-write.** Shared tables and pages are read-only for every
   sharer, even after `mprotect` asks for writes (finding S12); a write
   fault copies only what is shared, and only in the lower half (S2).
-- **Per-cell state.** Registers, FP/SIMD state (switched lazily, trapped on
-  first use), files and descriptors (`rhizo_fs::Fs`, private copy-on-write)
-  and the system-call handler (`Abi`) belong to one cell. On x86_64 CPUs
-  whose `FXRSTOR` keeps the previous x87 instruction and data pointers
-  (AMD and Hygon without `XSAVEERPTR`, and QEMU's emulation), an x87 load
-  of a kernel variable overwrites them before each FP/SIMD load
+- **Per-cell state.** Registers, FP/SIMD state (loaded as a thread that
+  uses it is switched in, trapped on first use otherwise, never left in
+  the registers for another thread: see *Speculation*), files and
+  descriptors (`rhizo_fs::Fs`, private copy-on-write) and the system-call
+  handler (`Abi`) belong to one cell. On x86_64 CPUs whose `FXRSTOR`
+  keeps the previous x87 instruction and data pointers (AMD and Hygon
+  without `XSAVEERPTR`, and QEMU's emulation), an x87 load of a kernel
+  variable overwrites them before each FP/SIMD load
   (`scrub-x87-pointers`).
 - **Per-CPU kernel data** (`add-smp-boot`). The entry code finds the
   kernel stack and the running cell's registers through per-CPU data that
@@ -195,9 +197,9 @@ and at most 256 sockets (S21).
   them; nothing in a cell can raise them, and a snapshot file cannot
   either: a loaded one gets at most a new cell's (`snapshots-on-disk`).
 
-## Speculation (Meltdown)
+## Speculation (Meltdown, LazyFP)
 
-`add-kpti` closed the Meltdown part of O3.
+`add-kpti` closed the Meltdown part of O3, `lazy-fp-switch` LazyFP.
 
 - **x86_64: KPTI.** On CPUs open to rogue data cache load (Intel CPUs
   without `IA32_ARCH_CAPABILITIES.RDCL_NO`, unknown vendors; not AMD or
@@ -222,6 +224,17 @@ and at most 256 sockets (S21).
   runners whose CPUs do not need it. On CI's KVM runners (nested
   virtualization, PCIDs): a system call 70 → 187 ns, a switch between
   cells 234 → 281 ns (+20 %), spawn to exit of `hello` 7.0 → 7.2 µs.
+- **FP/SIMD state (LazyFP, CVE-2018-3665)** (`lazy-fp-switch`). Trapping
+  FP/SIMD while another thread's values stay in the registers would let
+  an FP/SIMD instruction that runs speculatively before the trap read
+  them. The registers never hold another thread's or cell's values while
+  cell code runs: a thread's state is saved when it stops running on a
+  CPU, and the next thread either has its own loaded (it has used
+  FP/SIMD) or finds the registers cleared to the initial state, with
+  FP/SIMD trapping until its first use. Both architectures do the same,
+  whether or not the CPU is affected. The in-kernel test
+  `fp_registers_hold_nothing_of_another_cell` reads the registers after
+  a cell that never used FP/SIMD ran right after one that filled them.
 - **Left open.** Spectre v1/v2, L1TF, MDS and their mitigations; the entry
   pages themselves are readable by speculation (they hold per-CPU stack
   pointers and the cell's own saved RDI, no other cell's data).
