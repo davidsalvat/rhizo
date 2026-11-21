@@ -9,7 +9,7 @@
 
 use super::cpu::{rdmsr, wrmsr};
 use core::arch::x86_64::__cpuid;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Event select: count in ring 3 (USR) and ring 0 (OS), enabled (EN).
 const USR_OS_EN: u64 = (1 << 16) | (1 << 17) | (1 << 22);
@@ -165,4 +165,89 @@ pub fn read() -> Option<Counts> {
         instructions: Some(instructions),
         cycles,
     })
+}
+
+/// Cycles between two samples, 0 while not sampling (spec `profiling`,
+/// sampling).
+static PERIOD: AtomicU64 = AtomicU64::new(0);
+
+/// The vendor's counter registers, if [`init`] found counters.
+fn msrs() -> Option<&'static Msrs> {
+    match KIND.load(Ordering::Relaxed) {
+        2 => Some(&INTEL),
+        3 => Some(&AMD),
+        _ => None,
+    }
+}
+
+/// The global control and overflow-clear registers, where the counters
+/// have them (Intel version 2 or later, AMD `PerfMonV2`).
+fn global() -> Option<(u32, u32)> {
+    match KIND.load(Ordering::Relaxed) {
+        2 if __cpuid(0xa).eax & 0xff >= 2 => Some((0x38f, 0x390)),
+        3 if __cpuid(0x8000_0000).eax >= 0x8000_0022 && __cpuid(0x8000_0022).eax & 1 != 0 => {
+            Some((0xc000_0301, 0xc000_0303))
+        }
+        _ => None,
+    }
+}
+
+/// Starts sampling on this CPU: counter 2 counts cycles in ring 3 only and
+/// interrupts (local APIC `LVTPC`, [`super::irq::SAMPLE_VECTOR`]) when
+/// `period` of them have passed, so the interrupt comes while cell code
+/// runs. Returns whether there are counters for it ([`init`] found them).
+#[cfg(feature = "sampling")]
+pub fn start_sampling(period: u64) -> bool {
+    let Some(m) = msrs() else {
+        return false;
+    };
+    let enough = KIND.load(Ordering::Relaxed) == 3 || (__cpuid(0xa).eax >> 8) & 0xff >= 3;
+    if !enough {
+        return false;
+    }
+    PERIOD.store(period.clamp(1, i32::MAX as u64), Ordering::Relaxed);
+    let select = m.select + 2 * m.stride;
+    // SAFETY: CPUID reported counter 2; nothing else in the kernel uses it.
+    // USR, INT (bit 20) and EN: cycles in ring 3, an interrupt on overflow.
+    unsafe {
+        wrmsr(select, 0);
+        rearm();
+        wrmsr(select, (1 << 16) | (1 << 20) | (1 << 22) | m.cycles);
+        if let Some((ctrl, _)) = global() {
+            wrmsr(ctrl, rdmsr(ctrl) | 0b100);
+        }
+    }
+    super::irq::sample_interrupt(true);
+    true
+}
+
+/// Stops sampling on this CPU.
+#[cfg(feature = "sampling")]
+pub fn stop_sampling() {
+    if PERIOD.swap(0, Ordering::Relaxed) == 0 {
+        return;
+    }
+    super::irq::sample_interrupt(false);
+    if let Some(m) = msrs() {
+        // SAFETY: counter 2 is the sampling counter `start_sampling` set.
+        unsafe { wrmsr(m.select + 2 * m.stride, 0) };
+    }
+}
+
+/// Clears the overflow, starts the next period and unmasks the interrupt
+/// (Intel masks `LVTPC` when it delivers one), while sampling.
+pub fn rearm() {
+    let period = PERIOD.load(Ordering::Relaxed);
+    let Some(m) = msrs().filter(|_| period != 0) else {
+        return;
+    };
+    // SAFETY: counter 2 is the sampling counter; Intel sign-extends the
+    // 32 bits written, AMD takes 48.
+    unsafe {
+        wrmsr(m.counter + 2 * m.stride, (1u64 << 48) - period);
+        if let Some((_, clear)) = global() {
+            wrmsr(clear, 0b100);
+        }
+    }
+    super::irq::sample_interrupt(true);
 }

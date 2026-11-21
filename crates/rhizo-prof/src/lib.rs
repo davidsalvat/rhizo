@@ -12,6 +12,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 use core::fmt::{self, Write};
 
 /// Number of [`Part`]s.
@@ -334,6 +336,8 @@ impl Breakdown<'_> {
         writeln!(w)
     }
 }
+
+pub mod samples;
 
 #[cfg(test)]
 mod tests;

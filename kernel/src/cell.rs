@@ -25,6 +25,7 @@ use rhizo_cell::memory::Pager;
 use rhizo_cell::space::{self, Frames};
 use rhizo_cell::threads::Wait;
 use rhizo_cell::{Cell, FpState, Registers};
+use rhizo_core::random::{self, Batched, Generator};
 use rhizo_core::smp::MAX_CPUS;
 use rhizo_fs::Fs;
 use rhizo_hal::{Console, CycleCounter, Tlb};
@@ -411,7 +412,8 @@ const CAPTURE_MAX: usize = 1 << 20;
 struct KernelServices<'a> {
     capture: Option<&'a mut Vec<u8>>,
     echo: bool,
-    random: u64,
+    /// The cell's generator, split off the kernel's on first use.
+    random: &'a mut Option<Generator>,
     /// The calling thread's FP/SIMD state is in the CPU's registers.
     fp_in_cpu: bool,
 }
@@ -465,29 +467,18 @@ impl Services for KernelServices<'_> {
     }
 
     fn random(&mut self, out: &mut [u8]) {
-        // xorshift64*, seeded from the counter: not for cryptography (design
-        // D6); deterministic sources for snapshots come in H4.
-        for byte in out {
-            self.random ^= self.random >> 12;
-            self.random ^= self.random << 25;
-            self.random ^= self.random >> 27;
-            *byte = (self.random.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 56) as u8;
-        }
+        self.random
+            .get_or_insert_with(|| RANDOM.with(Batched::split))
+            .fill(out);
     }
 }
 
-/// The 16 random bytes of a new cell's stack (`AT_RANDOM`) and the seed of
-/// its random numbers after them.
-fn start_random() -> ([u8; 16], u64) {
-    let mut services = KernelServices {
-        capture: None,
-        echo: false,
-        random: Counter.cycles() | 1,
-        fp_in_cpu: false,
-    };
+/// The 16 random bytes of a new cell's stack (`AT_RANDOM`), from the
+/// kernel's generator.
+fn start_random() -> [u8; 16] {
     let mut random = [0u8; 16];
-    services.random(&mut random);
-    (random, services.random)
+    RANDOM.with(|g| g.fill(&mut random));
+    random
 }
 
 /// The TLB of a hierarchy no CPU has used yet: nothing to flush (its tag's
@@ -499,6 +490,9 @@ impl Tlb for NewSpace {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// The kernel's generator, seeded from the hardware by [`init`]: each cell
+/// splits its own off it (design D2 of `add-crypto-random`).
+static RANDOM: Global<Batched> = Global::new(Batched::new(Generator::from_key([0; 32])));
 /// The network card's address last reported on the console (0: none).
 static WIRE_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Shortest time between two polls of the network card while cells run.
@@ -511,15 +505,27 @@ static MAX_TAG: AtomicU16 = AtomicU16::new(0);
 /// many are online. Call once, before any [`Host`].
 pub fn init(smp: Option<u16>) -> usize {
     crate::heap::window::init();
+    let (generator, strong) =
+        random::seeded(&mut crate::arch::random::HardwareEntropy, Counter.cycles());
+    RANDOM.with(|g| *g = Batched::new(generator));
+    if !strong {
+        use core::fmt::Write;
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(&mut BootConsole),
+            "rhizo: no hardware random source: getrandom is predictable"
+        );
+    }
     irq::init(SLICE_NS);
     MAX_TAG.store(user::init_tags(), Ordering::Relaxed);
     // The network card comes up once, at boot, rather than with the first
     // host: what it allocates is never charged to a cell or a test.
+    let mut seed = [0; 8];
+    RANDOM.with(|g| g.fill(&mut seed));
     NET.with(|net| {
         // Parked connections re-attach only in this boot (design D2 of
         // `keep-tcp-across-suspend`).
         net.set_boot(Counter.cycles());
-        crate::wire::init(net, now_ns(), Counter.cycles());
+        crate::wire::init(net, now_ns(), u64::from_le_bytes(seed));
     });
     crate::smp::start(smp)
 }
@@ -572,7 +578,10 @@ struct Live {
     abi: Abi,
     output: Option<Vec<u8>>,
     echo: bool,
-    random: u64,
+    /// Its generator: none until it first asks for random bytes, never in a
+    /// snapshot, and never shared with a fork (design D2 of
+    /// `add-crypto-random`).
+    random: Option<Generator>,
     /// Pages still to restore, for a lazily resumed cell.
     lazy: Option<Lazy>,
     /// Its files and open descriptors (spec `files`).
@@ -946,6 +955,7 @@ fn wait(wake: Option<u64>) {
         Some(at) => idle_until(at),
         None => prof::idle(crate::smp::idle),
     }
+    cost::after_idle();
 }
 
 /// Puts `live`, back from a slice on `cpu`, where `how` says, and wakes an
@@ -1129,7 +1139,7 @@ fn syscall(
     let mut services = KernelServices {
         capture: live.output.as_mut(),
         echo: live.echo,
-        random: live.random,
+        random: &mut live.random,
         fp_in_cpu,
     };
     let (mut tlb, mut pager_tlb) = (CellTlb::new(gang), CellTlb::new(gang));
@@ -1170,7 +1180,6 @@ fn syscall(
         })
     });
     prof::syscall_end(t0);
-    live.random = services.random;
     if live.host_wake && live.cell.threads.wake_at().is_some() {
         live.host_wake = false;
         live.cell.threads.expire_timers();
@@ -1246,12 +1255,19 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     continue;
                 }
                 Trap::Interrupt => {
+                    if cost::timer_sampling() {
+                        cost::sample(live.cell.id, live.cell.regs().pc);
+                    }
                     prof::add(Count::Interrupts, 1);
                     ticks += 1;
-                    if ticks < 2 {
+                    if ticks < cost::ticks_per_slice() {
                         continue;
                     }
                     break 'thread Back::Requeue;
+                }
+                Trap::Sample => {
+                    cost::sample(live.cell.id, live.cell.regs().pc);
+                    continue;
                 }
                 Trap::Fault(fault)
                     if fault.missing_page().is_some_and(|addr| {
@@ -1289,7 +1305,7 @@ fn run_slice(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>, now: u64,
                     let mut services = KernelServices {
                         capture: live.output.as_mut(),
                         echo: live.echo,
-                        random: 0,
+                        random: &mut live.random,
                         fp_in_cpu: false,
                     };
                     fault.report(&mut services, live.cell.id);
@@ -1581,7 +1597,7 @@ impl GangCell {
         let mut services = KernelServices {
             capture: live.output.as_mut(),
             echo: live.echo,
-            random: 0,
+            random: &mut live.random,
             fp_in_cpu: false,
         };
         fault.report(&mut services, live.cell.id);
@@ -1726,9 +1742,13 @@ fn run_gang(
                     user::fp_trap(false);
                     set_fp_owner(key);
                 }
+                Trap::Sample => cost::sample(gang.id, regs.pc),
                 Trap::Interrupt => {
+                    if cost::timer_sampling() {
+                        cost::sample(gang.id, regs.pc);
+                    }
                     ticks += 1;
-                    if ticks >= 2 && !gang.ending.load(Ordering::Acquire) {
+                    if ticks >= cost::ticks_per_slice() && !gang.ending.load(Ordering::Acquire) {
                         // The end of this CPU's slice: it looks at the run
                         // queues again (a waiting cell goes first).
                         gang.locked(shared, ptr, |cell| cell.put_back(cpu, tid, Some(&regs)));
@@ -1852,7 +1872,7 @@ impl Host {
     }
 
     /// A new live cell's record: its tag, nothing flushed yet.
-    fn new_live(&mut self, cell: Cell, output: bool, echo: bool, random: u64, fs: Fs) -> Box<Live> {
+    fn new_live(&mut self, cell: Cell, output: bool, echo: bool, fs: Fs) -> Box<Live> {
         let tag = self.state().tags.alloc();
         if tag.is_none() {
             prof::add(Count::Untagged, 1);
@@ -1866,7 +1886,7 @@ impl Host {
             abi: Abi::new(user::ABI),
             output: output.then(Vec::new),
             echo,
-            random,
+            random: None,
             lazy: None,
             fs,
             deadlines: Vec::new(),
@@ -1906,7 +1926,7 @@ impl Host {
     ) -> Result<u32, ElfError> {
         let _p = cost::scope(Part::Spawn);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let (random, seed) = start_random();
+        let random = start_random();
         let kernel = memory::kernel_tables();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
         let parsed = Image::parse(image, user::MACHINE)?;
@@ -1922,7 +1942,7 @@ impl Host {
             &[],
             random,
         )?;
-        let live = self.new_live(cell, capture, echo, seed, files);
+        let live = self.new_live(cell, capture, echo, files);
         self.state().sched.place(live);
         Ok(id)
     }
@@ -1947,7 +1967,7 @@ impl Host {
         echo: bool,
     ) -> Result<u32, ExecError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let (random, seed) = start_random();
+        let random = start_random();
         let kernel = memory::kernel_tables();
         let kernel_half = user::CELL_ROOT_HAS_KERNEL_HALF.then_some(&kernel);
         let cell = rhizo_abi::exec::<Format, _, _>(
@@ -1964,7 +1984,7 @@ impl Host {
             envp,
             random,
         )?;
-        let live = self.new_live(cell, capture, echo, seed, files);
+        let live = self.new_live(cell, capture, echo, files);
         self.state().sched.place(live);
         Ok(id)
     }
@@ -2038,7 +2058,7 @@ impl Host {
         if mode == Resume::Eager {
             lazy.finish(&pt);
         }
-        let mut live = self.new_live(cell, capture, echo, Counter.cycles() | 1, fs);
+        let mut live = self.new_live(cell, capture, echo, fs);
         live.lazy = (lazy.left > 0).then_some(lazy);
         file(self.state(), None, live);
         Ok(id)
@@ -2317,7 +2337,7 @@ impl Host {
             root: child.root(),
             ..cell.clone()
         };
-        let mut live = self.new_live(cell, capture, echo, Counter.cycles() | 1, fork_files(fs));
+        let mut live = self.new_live(cell, capture, echo, fork_files(fs));
         live.shares = true;
         Some(live)
     }
@@ -3814,15 +3834,43 @@ fn cow_fault_ticks() -> u64 {
     samples[ROUNDS / 2]
 }
 
+/// Rounds of each workload in a `sampling` build (one otherwise): more
+/// samples.
+#[cfg(all(feature = "bench-cell", feature = "profile"))]
+const SAMPLED_ROUNDS: usize = if cfg!(feature = "sampling") { 5 } else { 1 };
+
+/// Room for samples on the CPU that takes them (spec `profiling`).
+#[cfg(all(feature = "bench-cell", feature = "sampling"))]
+const SAMPLE_ROOM: usize = 1 << 16;
+
 /// Runs `f` with every part accounted and prints its breakdown (spec
 /// `profiling`): the parts, the scopes entered, and the system calls that
 /// took most time. `per_trap` is the cost of one entry into cell code and
-/// back, in counter ticks.
+/// back, in counter ticks. A `sampling` build also samples where the cells
+/// (running `image`) are and prints the samples, folded.
 #[cfg(all(feature = "bench-cell", feature = "profile"))]
-fn breakdown(console: &mut impl Console, workload: &str, per_trap: u64, f: impl FnOnce()) {
+fn breakdown(
+    console: &mut impl Console,
+    workload: &str,
+    #[cfg_attr(not(feature = "sampling"), allow(unused_variables))] image: &str,
+    per_trap: u64,
+    f: impl FnOnce(),
+) {
     use core::fmt::Write;
     cost::start(cost::ALL);
+    #[cfg(feature = "sampling")]
+    let (sampler, period) = cost::start_sampling(SAMPLE_ROOM);
     f();
+    #[cfg(feature = "sampling")]
+    cost::stop_sampling(|samples| {
+        let mut w = rhizo_hal::ConsoleWriter(&mut *console);
+        let _ = writeln!(
+            w,
+            "rhizo-samples {workload} image={image} sampler={sampler} period={period} lost={}",
+            samples.lost()
+        );
+        let _ = rhizo_prof::samples::write(&mut w, workload, samples.sorted());
+    });
     cost::stop(|account, calls| {
         let ns = |t: u64| timer::cycles_to_ns(t).unwrap_or(0);
         let mut w = rhizo_hal::ConsoleWriter(console);
@@ -3862,7 +3910,7 @@ fn breakdowns(console: &mut impl Console) {
         cost::stop(|a, _| a.time(Part::Cell) / a.count(Part::Cell).max(1))
     };
     let mut host = Host::new();
-    breakdown(console, "cell_loop", per_trap, || {
+    breakdown(console, "cell_loop", "hello", per_trap, || {
         for _ in 0..101 {
             let id = host
                 .spawn(test_image("hello"), &[b"hello"], true, false)
@@ -3871,17 +3919,21 @@ fn breakdowns(console: &mut impl Console) {
         }
     });
     let big = ballast_template(&mut host, b"50");
-    breakdown(console, "fork_touch", per_trap, || {
-        let id = host.spawn_from_template(big, true, false).expect("fork");
-        host.run(|h| h.finished(id).is_some());
+    breakdown(console, "fork_touch", "ballast", per_trap, || {
+        for _ in 0..SAMPLED_ROUNDS {
+            let id = host.spawn_from_template(big, true, false).expect("fork");
+            host.run(|h| h.finished(id).is_some());
+        }
     });
     if let Some(files) = cpython_files() {
         const ARGV: [&[u8]; 2] = [b"/usr/bin/python3", b"/app/agent_demo.py"];
-        breakdown(console, "cpython_cold", per_trap, || {
-            let id = host
-                .spawn_with_files(test_image("cpython"), &ARGV, files, true, false)
-                .expect("spawn");
-            host.run(|h| h.finished(id).is_some());
+        breakdown(console, "cpython_cold", "cpython", per_trap, || {
+            for _ in 0..SAMPLED_ROUNDS {
+                let id = host
+                    .spawn_with_files(test_image("cpython"), &ARGV, files.clone(), true, false)
+                    .expect("spawn");
+                host.run(|h| h.finished(id).is_some());
+            }
         });
     }
 }
@@ -3910,7 +3962,7 @@ fn parallel_breakdown(console: &mut impl Console) {
         })
         .collect();
     let before = locks(&host);
-    breakdown(console, "parallel", 0, || host.run(|_| false));
+    breakdown(console, "parallel", "spin", 0, || host.run(|_| false));
     let after = locks(&host);
     for id in ids {
         assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
