@@ -1,4 +1,4 @@
-//! Minimal 16550 UART driver (polling, transmit only).
+//! Minimal 16550 UART driver (polling; receiving in control builds only).
 
 use super::port::{inb, outb};
 use rhizo_hal::Console;
@@ -8,6 +8,9 @@ const COM1: u16 = 0x3F8;
 
 /// Line status register bit: transmit holding register empty.
 const LSR_THR_EMPTY: u8 = 1 << 5;
+/// Line status register bit: a received byte is waiting.
+#[cfg(feature = "control")]
+const LSR_DATA_READY: u8 = 1 << 0;
 
 /// A 16550-compatible serial port.
 #[derive(Debug)]
@@ -34,6 +37,22 @@ impl Serial {
             outb(b + 3, 0x03); // 8 bits, no parity, one stop bit
             outb(b + 2, 0xC7); // enable and clear FIFOs, 14-byte threshold
             outb(b + 4, 0x03); // DTR | RTS
+        }
+    }
+
+    /// The next received byte, if one is waiting.
+    #[cfg(feature = "control")]
+    pub fn read_byte(&mut self) -> Option<u8> {
+        // SAFETY: reading the line status register has no side effect, and
+        // reading the receive buffer of COM1 only takes the byte it holds.
+        unsafe { (inb(self.base + 5) & LSR_DATA_READY != 0).then(|| inb(self.base)) }
+    }
+
+    /// Sends `bytes` as they are (no `\r` before `\n`).
+    #[cfg(feature = "control")]
+    pub fn write_raw(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_byte(byte);
         }
     }
 

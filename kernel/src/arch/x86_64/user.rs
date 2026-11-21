@@ -122,12 +122,13 @@ pub fn fp_load(state: &FpState) {
     unsafe { asm!("fxrstor64 [{}]", in(reg) state, options(nostack)) };
 }
 
-/// Enables SSE for cells (and for the save and load above), and PCIDs when
-/// the CPU has them; returns the highest tag cells may use (4095), or 0
-/// without PCIDs (every switch flushes). Call once, on the boot CPU, before
-/// the others start.
+/// Enables SSE for cells (and for the save and load above), SMEP and SMAP,
+/// and PCIDs when the CPU has them; returns the highest tag cells may use
+/// (4095), or 0 without PCIDs (every switch flushes). Call once, on the
+/// boot CPU, before the others start.
 pub fn init_tags() -> u16 {
     enable_sse();
+    enable_user_guards();
     if core::arch::x86_64::__cpuid(1).ecx & (1 << 17) == 0 {
         return 0;
     }
@@ -136,10 +137,11 @@ pub fn init_tags() -> u16 {
     4095
 }
 
-/// Sets up a secondary CPU like [`init_tags`] did the boot CPU: SSE, and
-/// PCIDs if the boot CPU uses them.
+/// Sets up a secondary CPU like [`init_tags`] did the boot CPU: SSE, SMEP
+/// and SMAP, and PCIDs if the boot CPU uses them.
 pub fn init_cpu() {
     enable_sse();
+    enable_user_guards();
     if PCID.load(Ordering::Relaxed) {
         enable_pcid();
     }
@@ -165,6 +167,54 @@ fn enable_sse() {
     }
 }
 
+/// CR4.SMEP (bit 20) and CR4.SMAP (bit 21), for the features CPUID lists.
+const SMEP: u64 = 1 << 20;
+const SMAP: u64 = 1 << 21;
+
+/// The CR4 guards this CPU has: SMEP (`CPUID.7.0:EBX[7]`) and SMAP
+/// (`EBX[20]`).
+pub fn user_guards() -> u64 {
+    if core::arch::x86_64::__cpuid(0).eax < 7 {
+        return 0;
+    }
+    let ebx = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+    (if ebx & (1 << 7) != 0 { SMEP } else { 0 }) | (if ebx & (1 << 20) != 0 { SMAP } else { 0 })
+}
+
+/// Turns on SMEP (ring 0 never executes a user page) and SMAP (ring 0 never
+/// reads or writes one) where the CPU has them (design D1 of
+/// `add-user-access-guards`).
+fn enable_user_guards() {
+    let guards = user_guards();
+    if guards == 0 {
+        return;
+    }
+    // SAFETY: the kernel never executes, reads or writes a lower-half
+    // address: cell memory is reached through the direct map, and the entry
+    // code touches only per-CPU data, kernel stacks and the `Registers` in
+    // the kernel heap. RFLAGS.AC, which would lift SMAP, is cleared on every
+    // entry from a cell (SFMASK for SYSCALL, `popfq` for exceptions).
+    unsafe {
+        asm!(
+            "mov {t}, cr4",
+            "or {t}, {bits}",
+            "mov cr4, {t}",
+            t = out(reg) _,
+            bits = in(reg) guards,
+            options(nostack)
+        );
+    }
+}
+
+/// The guards turned on in CR4 on this CPU.
+#[cfg(feature = "ktest")]
+pub fn user_guards_on() -> u64 {
+    let cr4: u64;
+    // SAFETY: reading CR4 has no side effects.
+    unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    cr4 & (SMEP | SMAP)
+}
+
 fn enable_pcid() {
     // SAFETY: CR4.PCIDE may be set while CR3 holds PCID 0, as it does (the
     // kernel's tables are loaded with no PCID bits).
@@ -178,6 +228,19 @@ fn enable_pcid() {
             options(nostack)
         );
     }
+}
+
+/// RFLAGS direction flag (string instructions run backwards) and
+/// alignment-check flag (also lifts SMAP in ring 0).
+const DF: u64 = 1 << 10;
+const AC: u64 = 1 << 18;
+
+/// The kernel's own RFLAGS.
+fn kernel_flags() -> u64 {
+    let flags: u64;
+    // SAFETY: `pushfq; pop` only reads RFLAGS (through the stack).
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) };
+    flags
 }
 
 fn load_cr3(value: u64) {
@@ -221,6 +284,11 @@ pub fn enter_user(root: u64, tag: u16, flush: bool, regs: &mut Registers) -> Tra
     // the SYSCALL entry or a ring-3 exception, which restore the kernel
     // stack and callee-saved registers.
     let vector = unsafe { rhizo_enter_cell(regs, sysret as u64) };
+    debug_assert_eq!(
+        kernel_flags() & (DF | AC),
+        0,
+        "the kernel runs with a cell's direction or alignment-check flag"
+    );
     if vector == 256 {
         return Trap::Syscall;
     }
@@ -280,3 +348,11 @@ pub fn flush_user(root: u64, tag: u16) {
 
 /// Nothing to do on x86_64: instruction fetch sees data writes.
 pub fn sync_code(_virt: u64, _len: u64) {}
+
+/// Loads the tables rooted at `root` (sharing the kernel half), untagged:
+/// for the self-checks that touch a user page from the kernel.
+#[cfg(any(feature = "ktest-user-read", feature = "ktest-user-exec"))]
+pub fn load_tables(root: u64) {
+    USER_CR3[index()].store(root, Ordering::Relaxed);
+    load_cr3(root);
+}
