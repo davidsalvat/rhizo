@@ -44,7 +44,9 @@ pay almost nothing today, and must keep paying nothing.
 - **Trapping follows the owner.** FP/SIMD is enabled exactly while a
   thread owns the registers and trapping while they are clear, so a
   switch between threads that do not use FP/SIMD writes no control
-  register, and x86_64's `fp_save` leaves trapping as it found it.
+  register, and x86_64's `fp_save` and `fp_load` leave trapping as they
+  found it (AArch64's never touch it), so a load or save outside
+  switching, as a test does, cannot break that.
 - **The hint is not state.** Snapshots leave `fp_used` out: a restored
   thread traps once, as a new one does, then is switched eagerly. Forks,
   templates and new threads copy it with the registers. Snapshot format,
@@ -66,8 +68,11 @@ pay almost nothing today, and must keep paying nothing.
 - XSAVE, AVX and SVE state: cells get SSE and Advanced SIMD only, as now
   (`CR4.OSXSAVE` and `CPACR_EL1.ZEN` stay off).
 - AMD's `FXSAVE` pointer leak (x87 `FIP`/`FDP`/`FOP` not restored by
-  `FXRSTOR` without a pending exception on CPUs without `XSAVEERPTR`):
-  pre-existing, left for a change of its own.
+  `FXRSTOR` without a pending exception on CPUs without `XSAVEERPTR`, and
+  under QEMU's emulation): change `scrub-x87-pointers` scrubs them inside
+  x86_64's `fp_load`. Every path this change loads FP/SIMD state on (a
+  thread switched in, a first use, clearing to the initial state) goes
+  through `fp_load`, so that guarantee holds on all of them.
 - Clearing the hint of a thread that stopped using FP/SIMD: a thread that
   used it once is switched eagerly for good, as Linux switches every
   thread.
@@ -85,7 +90,7 @@ pay almost nothing today, and must keep paying nothing.
   const.
 - `kernel/src/cell.rs`: switching (`fp_enter`, `fp_first_use`, saves when a
   thread stops running), the benchmark; `kernel/src/arch/x86_64/user.rs`:
-  `fp_save` keeps trapping as it was.
+  `fp_save` and `fp_load` keep trapping as it was.
 - `cells`: `fp_regs.c`, `fp_peek.rs`; `cells/expected.rs`.
 - `xtask`: `cell.switch_fp_ns`; `bench/README.md`, `bench/baseline.json`
   (new entries only); `docs/security.md`.

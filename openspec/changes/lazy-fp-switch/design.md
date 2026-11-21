@@ -60,8 +60,14 @@ Trapping follows the owner: enabled while a thread owns the registers,
 trapping while they are `FP_CLEAN` (either while `FP_STALE`). The common
 cases then write no control register: two non-FP threads taking turns
 find `FP_CLEAN` and trapping already on; an FP thread that runs again
-finds itself the owner. x86_64's `fp_save`, which must clear `CR0.TS` to
-run `FXSAVE`, puts it back as it was.
+finds itself the owner. x86_64's `fp_save` and `fp_load`, which must
+clear `CR0.TS` to run `FXSAVE`/`FXRSTOR`, put it back as it was, as
+AArch64's never change `CPACR_EL1`: a save or load outside switching (the
+in-kernel tests that read the registers) cannot leave FP/SIMD enabled
+on `FP_CLEAN` registers. The switching paths enable FP/SIMD before they
+load, so no `CR0` write is undone. Every load, the clearing included,
+goes through `fp_load`, which is where `scrub-x87-pointers` overwrites
+the x87 pointers on CPUs whose `FXRSTOR` keeps them.
 
 | Option | For | Against |
 |---|---|---|
