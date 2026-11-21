@@ -1,8 +1,0 @@
-cargo:rustc-link-arg-bins=-T/home/user/rhizo/.claude/worktrees/agent-a0dc0773bf658a93e/kernel/linker.ld
-cargo:rerun-if-changed=linker.ld
-cargo:rerun-if-changed=linker-aarch64.ld
-cargo:rerun-if-env-changed=RHIZO_CELLS_DIR
-cargo:rerun-if-env-changed=RHIZO_MICROPYTHON_SRC
-cargo:rerun-if-env-changed=RHIZO_CPYTHON_SRC
-cargo:rerun-if-changed=/home/user/rhizo/.claude/worktrees/agent-a0dc0773bf658a93e/kernel/../cells/src/bin
-cargo:rerun-if-changed=/home/user/rhizo/.claude/worktrees/agent-a0dc0773bf658a93e/kernel/../cells/c
