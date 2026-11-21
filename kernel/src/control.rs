@@ -374,7 +374,7 @@ impl Server {
             }
         };
         self.host
-            .send_bytes(to.ip, to.port, &bytes)
+            .send_bytes(to.ip, to.port, to.token, &bytes)
             .map_err(transfer)?;
         Ok(Body::Bytes(bytes.len() as u64))
     }
@@ -389,7 +389,7 @@ impl Server {
             return Err((Error::NoMemory, format!("{size} bytes do not fit")));
         }
         self.host
-            .fetch_bytes(from.ip, from.port, size, &mut bytes)
+            .fetch_bytes(from.ip, from.port, from.token, size, &mut bytes)
             .map_err(transfer)?;
         let mut snapshot = Snapshot::from_bytes(bytes, crate::arch::user::MACHINE)
             .map_err(|e| (Error::BadSnapshot, describe(e)))?;

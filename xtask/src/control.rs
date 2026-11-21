@@ -441,13 +441,31 @@ fn chat_turn(vm: &mut Vm, cell: u32, partial: &mut Vec<u8>, turn: usize) -> Resu
 /// How long the host's end of a snapshot transfer waits for the guest.
 const TRANSFER_WAIT: Duration = Duration::from_secs(60);
 
+/// How long a connection to the host's end of a transfer may take to send
+/// its token.
+const TOKEN_WAIT: Duration = Duration::from_secs(2);
+
 /// The host's end of a snapshot transfer (design D2 of `snapshots-on-disk`):
-/// a TCP listener the guest on a VMM reaches through its network card.
+/// a TCP listener the guest on a VMM reaches through its network card. It
+/// takes only a connection from the guest's address that first sends the
+/// request's token: another local process can neither read a file being
+/// loaded nor pass bytes off as a saved cell.
 #[derive(Debug)]
 pub struct Transfer {
     listener: std::net::TcpListener,
-    /// Where the guest reaches it.
+    /// Where the guest's connections come from, as the host sees them.
+    guest: std::net::IpAddr,
+    /// Where the guest reaches it, and the token.
     pub host: rhizo_control::Host,
+}
+
+/// A random token, from the host's generator.
+fn token() -> Result<u64> {
+    let mut b = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| format!("no random token: {e}"))?;
+    Ok(u64::from_le_bytes(b))
 }
 
 impl Transfer {
@@ -463,23 +481,37 @@ impl Transfer {
             .map_err(|e| format!("cannot listen on {bind} for the transfer: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let ip: std::net::Ipv4Addr = guest_sees.parse().map_err(|e| format!("{e}"))?;
+        let guest = crate::hostnet::guest_address(vmm)
+            .parse()
+            .map_err(|e| format!("{e}"))?;
         Ok(Self {
             listener,
+            guest,
             host: rhizo_control::Host {
                 ip: ip.octets(),
                 port,
+                token: token()?,
             },
         })
     }
 
-    /// The guest's connection, within [`TRANSFER_WAIT`].
+    /// The guest's connection, within [`TRANSFER_WAIT`]: from its address
+    /// and with the token first; any other is closed unanswered.
     fn accept(&self) -> Result<std::net::TcpStream> {
         let deadline = Instant::now() + TRANSFER_WAIT;
         loop {
             match self.listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
-                    return Ok(stream);
+                Ok((mut stream, peer)) => {
+                    let mut got = [0u8; 8];
+                    let admitted = peer.ip() == self.guest
+                        && stream.set_nonblocking(false).is_ok()
+                        && stream.set_read_timeout(Some(TOKEN_WAIT)).is_ok()
+                        && stream.read_exact(&mut got).is_ok()
+                        && u64::from_le_bytes(got) == self.host.token
+                        && stream.set_read_timeout(None).is_ok();
+                    if admitted {
+                        return Ok(stream);
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() > deadline {
@@ -1274,6 +1306,49 @@ fn answers_right(turn: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host's end of a transfer takes only the connection that sends
+    /// the request's token first (design D2 of `snapshots-on-disk`): an
+    /// impostor that connects first gets nothing of a file being loaded,
+    /// and its bytes are not taken for a saved cell.
+    #[test]
+    fn transfers_take_only_the_token_s_connection() {
+        use std::net::TcpStream;
+        let connect = |t: &rhizo_control::Host, token: u64, data: &[u8]| {
+            let mut s = TcpStream::connect(("127.0.0.1", t.port)).unwrap();
+            s.write_all(&token.to_le_bytes()).unwrap();
+            s.write_all(data).unwrap();
+            s
+        };
+        // Save: the impostor's bytes are dropped, the guest's kept.
+        let t = Transfer::new(Vmm::QemuMicrovm).unwrap();
+        let host = t.host;
+        let received = t.receive();
+        let mut impostor = connect(&host, host.token ^ 1, b"not the cell");
+        let mut rest = Vec::new();
+        let _ = impostor.read_to_end(&mut rest); // closed, or reset
+        assert!(rest.is_empty(), "closed unanswered");
+        drop(connect(&host, host.token, b"the cell"));
+        assert_eq!(received.join().unwrap().unwrap(), b"the cell");
+        // Load: the impostor reads nothing, the guest the whole file.
+        let t = Transfer::new(Vmm::QemuMicrovm).unwrap();
+        let host = t.host;
+        let sent = t.send(b"the file".to_vec());
+        let mut impostor = connect(&host, host.token.wrapping_add(1), b"");
+        let mut leaked = Vec::new();
+        let _ = impostor.read_to_end(&mut leaked);
+        assert!(leaked.is_empty(), "nothing for the impostor");
+        let mut guest = connect(&host, host.token, b"");
+        let mut file = Vec::new();
+        guest.read_to_end(&mut file).unwrap();
+        assert_eq!(file, b"the file");
+        sent.join().unwrap().unwrap();
+        // Tokens differ from one transfer to the next.
+        assert_ne!(
+            host.token,
+            Transfer::new(Vmm::QemuMicrovm).unwrap().host.token
+        );
+    }
 
     #[test]
     fn answers_are_checked() {

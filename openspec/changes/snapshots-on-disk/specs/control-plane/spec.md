@@ -69,9 +69,14 @@ it; its memory goes back once no cell made from it shares it.
 ### Requirement: Save
 `save` SHALL send the exported snapshot of a suspended cell or a template
 over TCP to the host address and port it names, through the network card,
-then reply with its size, leaving the cell as it was. `rhizo save <id>
+first sending the request's one-time token, which the host checks before
+it keeps a byte, then reply with its size, leaving the cell as it was. `rhizo save <id>
 <file>` SHALL write the file once all its bytes came, and print its size,
 the kernel's time, the round trip and the rate.
+
+#### Scenario: Only the guest's connection
+- **WHEN** another connection reaches the host's end of a save or a load first, with a wrong token
+- **THEN** it is closed without a byte sent to it or kept from it, and the transfer completes with the connection that sends the request's token
 
 #### Scenario: Save a template
 - **WHEN** the `control` test step saves a template

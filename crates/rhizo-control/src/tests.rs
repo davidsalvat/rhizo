@@ -106,6 +106,7 @@ fn every_request_round_trips() {
             host: Host {
                 ip: [10, 0, 2, 2],
                 port: 40123,
+                token: 0x0123_4567_89ab_cdef,
             },
         },
         Request::Load {
@@ -114,6 +115,7 @@ fn every_request_round_trips() {
             host: Host {
                 ip: [172, 16, 0, 1],
                 port: 1,
+                token: u64::MAX,
             },
         },
     ];
@@ -335,13 +337,21 @@ fn input_is_bounded_and_its_flag_checked() {
         host: Host::default(),
     }
     .encode(5);
-    let flag = load.len() - 7;
+    let flag = load.len() - 15;
     load[flag] = 2;
     assert_eq!(Request::decode(&frames(&load)[0]), Err(Error::Malformed));
 }
 
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..24)
+}
+
+fn host() -> impl Strategy<Value = Host> {
+    (any::<[u8; 4]>(), any::<u16>(), any::<u64>()).prop_map(|(ip, port, token)| Host {
+        ip,
+        port,
+        token,
+    })
 }
 
 fn request() -> impl Strategy<Value = Request> {
@@ -381,17 +391,12 @@ fn request() -> impl Strategy<Value = Request> {
         (any::<u32>(), bytes()).prop_map(|(cell, data)| Request::Input { cell, data }),
         any::<u32>().prop_map(Request::CloseInput),
         any::<u32>().prop_map(Request::Freeze),
-        (any::<u32>(), any::<[u8; 4]>(), any::<u16>()).prop_map(|(cell, ip, port)| Request::Save {
-            cell,
-            host: Host { ip, port }
+        (any::<u32>(), host()).prop_map(|(cell, host)| Request::Save { cell, host }),
+        (any::<u64>(), any::<bool>(), host()).prop_map(|(size, template, host)| Request::Load {
+            size,
+            template,
+            host
         }),
-        (any::<u64>(), any::<bool>(), any::<[u8; 4]>(), any::<u16>()).prop_map(
-            |(size, template, ip, port)| Request::Load {
-                size,
-                template,
-                host: Host { ip, port }
-            }
-        ),
     ]
 }
 

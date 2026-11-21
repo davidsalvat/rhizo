@@ -2888,10 +2888,16 @@ impl Host {
         not(feature = "control"),
         allow(dead_code, reason = "used by the control kernel")
     )]
-    pub fn send_bytes(&mut self, ip: [u8; 4], port: u16, bytes: &[u8]) -> Result<(), Transfer> {
+    pub fn send_bytes(
+        &mut self,
+        ip: [u8; 4],
+        port: u16,
+        token: u64,
+        bytes: &[u8],
+    ) -> Result<(), Transfer> {
         let mut sent = 0;
         let mut shut = false;
-        self.stream(ip, port, |net, h| {
+        self.stream(ip, port, token, |net, h| {
             if sent < bytes.len() {
                 return match net.send(h, &bytes[sent..], None) {
                     Ok(n) => {
@@ -2927,10 +2933,11 @@ impl Host {
         &mut self,
         ip: [u8; 4],
         port: u16,
+        token: u64,
         size: usize,
         out: &mut Vec<u8>,
     ) -> Result<(), Transfer> {
-        self.stream(ip, port, |net, h| {
+        self.stream(ip, port, token, |net, h| {
             if out.len() == size {
                 return Ok(None);
             }
@@ -2947,7 +2954,9 @@ impl Host {
         })
     }
 
-    /// Connects to `port` at `ip` and polls the card and `step` until
+    /// Connects to `port` at `ip`, sends `token` (the request's, which the
+    /// host checks before it sends or keeps a byte), and polls the card and
+    /// `step` until
     /// `step` says the transfer is done (`None`), fails, or makes no
     /// progress for [`TRANSFER_STALL_NS`]; the socket is released either
     /// way. `step` says whether it moved bytes.
@@ -2955,12 +2964,15 @@ impl Host {
         &mut self,
         ip: [u8; 4],
         port: u16,
+        token: u64,
         mut step: impl FnMut(&mut Net, rhizo_net::Handle) -> Result<Option<bool>, Transfer>,
     ) -> Result<(), Transfer> {
         use rhizo_net::{Addr, Error, Family, Type};
         let h = with_net(|net| net.socket(Family::Inet, Type::Stream)).map_err(Transfer::Net)?;
         let to = Addr::Inet { ip, port };
         let (mut connected, mut last) = (false, now_ns());
+        let token = token.to_le_bytes();
+        let mut told = 0;
         let result = loop {
             let now = now_ns();
             if now - last > TRANSFER_STALL_NS {
@@ -2976,6 +2988,16 @@ impl Host {
                             Ok(Some(true))
                         }
                         Err(Error::InProgress | Error::Again) => Ok(Some(false)),
+                        Err(e) => Err(Transfer::Net(e)),
+                    };
+                }
+                if told < token.len() {
+                    return match net.send(h, &token[told..], None) {
+                        Ok(n) => {
+                            told += n;
+                            Ok(Some(n > 0))
+                        }
+                        Err(Error::Again) => Ok(Some(false)),
                         Err(e) => Err(Transfer::Net(e)),
                     };
                 }

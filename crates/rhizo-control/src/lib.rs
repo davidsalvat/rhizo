@@ -314,7 +314,7 @@ impl Writer {
     fn host(&mut self, h: &Host) -> &mut Self {
         self.u32(u32::from_be_bytes(h.ip));
         self.0.extend_from_slice(&h.port.to_le_bytes());
-        self
+        self.u64(h.token)
     }
     fn bytes(&mut self, v: &[u8]) -> &mut Self {
         self.u32(v.len() as u32);
@@ -364,6 +364,7 @@ impl<'a> Reader<'a> {
         Ok(Host {
             ip,
             port: u16::from_le_bytes([b[0], b[1]]),
+            token: self.u64()?,
         })
     }
     fn flag(&mut self) -> Result<bool, Error> {
@@ -474,6 +475,10 @@ pub enum Request {
 pub struct Host {
     pub ip: [u8; 4],
     pub port: u16,
+    /// A random number for this transfer only: the kernel sends it first
+    /// on the connection, and the host takes no other (design D2 of
+    /// `snapshots-on-disk`).
+    pub token: u64,
 }
 
 impl Request {

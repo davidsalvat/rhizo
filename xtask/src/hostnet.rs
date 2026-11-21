@@ -89,6 +89,16 @@ pub fn host_address(vmm: Vmm) -> &'static str {
     }
 }
 
+/// Where the host sees connections from a guest on `vmm` come from: QEMU's
+/// user network makes them the host's own loopback.
+pub fn guest_address(vmm: Vmm) -> &'static str {
+    match vmm {
+        Vmm::QemuMicrovm | Vmm::QemuVirt | Vmm::QemuQ35 => "127.0.0.1",
+        Vmm::Firecracker => TAP_GUEST,
+        Vmm::CloudHypervisor => CH_TAP_GUEST,
+    }
+}
+
 /// The port of a TCP echo server listening on `addr` (started once).
 fn echo_server(addr: &str) -> Result<u16, String> {
     static SERVERS: OnceLock<Mutex<BTreeMap<String, Result<u16, String>>>> = OnceLock::new();

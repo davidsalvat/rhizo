@@ -78,6 +78,20 @@ A VM without a card with an address (Firecracker and Cloud Hypervisor
 when the host cannot make a tap) cannot save or load: the request is
 refused with that reason.
 
+**Only the guest's connection.** The listener is reachable by other local
+processes (on the loopback behind QEMU, on the tap's address otherwise),
+and it would otherwise take the first connection: on a `load` that
+process would read the file, on a `save` its bytes would be taken for the
+cell. So each request carries a random 64-bit token, made by the host from
+`/dev/urandom` for that transfer only and sent on the serial line, which
+the kernel writes first on the connection. The host takes a connection
+only from the guest's address (the tap's guest address, or the loopback
+that QEMU's user network makes of 10.0.2.15) and only once it has read the
+token, within 2 s; any other connection is closed before a byte is sent or
+kept. The token is as secret as the serial line, which only the host's
+`rhizo` server holds; the address check alone would not do behind QEMU,
+where every local process connects from the loopback too.
+
 ### Measured
 
 On the development host (QEMU 8.2.2 with TCG, x86_64 guest on
