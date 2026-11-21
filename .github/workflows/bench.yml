@@ -142,7 +142,6 @@ jobs:
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT: ${{ github.event_name }}
         run: |
-          # shellcheck disable=SC2016 # backticks in printf formats are Markdown
           title="bench: timing gate failing on main"
           good=$(gh api "repos/$REPO/actions/workflows/bench.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty')
           if [ -n "$good" ]; then
@@ -151,6 +150,7 @@ jobs:
           else
             commits="" since="No green timing run of this workflow yet."
           fi
+          # shellcheck disable=SC2016 # backticks in printf formats are Markdown
           body=$(printf 'The timing gate failed on `%s` (%s, %s).\n\nMetrics:\n%s\n\n%s\n%s\n\nReproduce: `cargo xtask --arch x86_64 bench --env ci --check`. A real regression is fixed or justified with a baseline update (rule 8); runner noise is noted here and the gate rerun.\n' \
             "${SHA:0:7}" "$EVENT" "$RUN" "$(tr ';' '\n' <<< "$METRICS" | sed '/^$/d; s/^/- /')" "$since" "$commits")
           number=$(gh api "repos/$REPO/issues?state=open&per_page=100" --jq ".[] | select(.pull_request == null and .title == \"$title\") | .number" | head -n 1)
