@@ -9,6 +9,7 @@
 //! the kernel, launching VMMs and the host's network side are the same code
 //! for both (design D5 of `add-control-plane`).
 
+mod affected;
 pub mod arch;
 mod bench;
 mod compare;
@@ -20,6 +21,7 @@ mod differential;
 mod dynamic;
 pub mod hostnet;
 mod packages;
+mod parts;
 mod profile;
 mod refguest;
 pub mod report;
@@ -66,6 +68,11 @@ Commands:
                              host, boot, ktest, ktest-smp (4 CPUs),
                              control (`rhizo` against a control kernel) or
                              a self-check name (e.g. ktest-page-fault)
+      --affected             Only the host test crates and steps the files
+                             changed against origin/main reach (local loop;
+                             CI runs everything)
+      --part <k>/<n>         Only the k-th of n shares of the steps (the n
+                             shares together run every step once)
   bench [options]            Release-build boot benchmarks on every VMM
       --runs <n>             Boots per VMM (default 20)
       --vmm <a,b,...>        Restrict the VMMs
@@ -97,7 +104,9 @@ Commands:
       --accel <a>            QEMU acceleration
       --out <dir>            Where to write them (default target/profile)
       --per-cell             One frame per cell under the image
-  ci                         Everything CI runs: fmt, clippy, test
+  ci [--part <k>/<n>]        Everything CI runs: fmt, clippy, test; with
+                             --part, part 1 lints and every part runs its
+                             share of the test steps
   demo agent --llm <url> --model <name> [--vmm <name>] [--accel <a>]
                              The CPython agent in a cell against a real
                              OpenAI-compatible model (Ollama, llama-server),
@@ -149,7 +158,7 @@ pub fn main() -> ExitCode {
         Some("test") => RunArgs::parse(rest).and_then(|a| cmd_test(&a)),
         Some("bench") => bench::Options::parse(rest).and_then(|o| bench::cmd(&o)),
         Some("profile") => profile::ProfileArgs::parse(rest).and_then(|a| profile::cmd(&a)),
-        Some("ci") => cmd_ci(),
+        Some("ci") => RunArgs::parse_ci(rest).and_then(|a| cmd_ci(&a)),
         Some("demo") => demo::cmd(rest),
         Some("mutants") => cmd_mutants(),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -212,6 +221,10 @@ struct RunArgs {
     gdb: bool,
     /// Run only this step of `test`.
     only: Option<String>,
+    /// Run only this share `(k, n)` of the steps (`--part k/n`).
+    part: Option<(usize, usize)>,
+    /// Run only what the changed files reach (`--affected`).
+    affected: Option<affected::Affected>,
 }
 
 impl RunArgs {
@@ -222,6 +235,8 @@ impl RunArgs {
             accel: Accel::Auto,
             gdb: false,
             only: None,
+            part: None,
+            affected: None,
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -257,6 +272,10 @@ impl RunArgs {
                     }
                     parsed.only = Some(step);
                 }
+                "--part" => parsed.part = Some(parts::parse(&value("--part")?)?),
+                "--affected" => {
+                    parsed.affected = Some(affected::Affected::of(&affected::changed_paths()?))
+                }
                 other => return Err(format!("unknown option `{other}`")),
             }
         }
@@ -266,8 +285,27 @@ impl RunArgs {
         Ok(parsed)
     }
 
+    /// `ci`'s options: only `--part`.
+    fn parse_ci(args: &[String]) -> Result<Self> {
+        match args {
+            [] => Self::parse(&[]),
+            [flag, _] if flag == "--part" => Self::parse(args),
+            _ => Err(format!("ci takes only --part <k>/<n>, not {args:?}")),
+        }
+    }
+
     fn wants(&self, step: &str) -> bool {
         self.only.as_deref().is_none_or(|only| only == step)
+            && self
+                .part
+                .is_none_or(|(k, n)| parts::part_of(step, &test_steps(), n) == k)
+            && self.affected.as_ref().is_none_or(|a| a.wants(step))
+    }
+
+    /// Whether this run is the first share (or the only one): `ci` lints
+    /// and runs its extra x86_64 steps there.
+    fn first_part(&self) -> bool {
+        self.part.is_none_or(|(k, _)| k == 1)
     }
 
     /// Command that reruns `step` with the same VMM.
@@ -373,7 +411,7 @@ fn test_steps() -> Vec<&'static str> {
 }
 
 fn cmd_test(args: &RunArgs) -> Result {
-    let host_args = [
+    let mut host_args = vec![
         "test",
         "--workspace",
         "--exclude",
@@ -381,6 +419,24 @@ fn cmd_test(args: &RunArgs) -> Result {
         "--exclude",
         CELLS_PACKAGE,
     ];
+    if let Some(affected) = &args.affected {
+        let crates = affected.host_crates();
+        if !crates.is_empty() {
+            host_args = vec!["test"];
+            for c in crates {
+                host_args.extend(["-p", c]);
+            }
+        }
+        let steps: Vec<&str> = test_steps().into_iter().filter(|s| args.wants(s)).collect();
+        report::text(&format!(
+            "[xtask] affected steps (files changed against origin/main): {}",
+            if steps.is_empty() {
+                "none".to_string()
+            } else {
+                steps.join(", ")
+            }
+        ));
+    }
     let parallel = parallelism(args);
     if args.wants("host") && parallel == 1 {
         step("host tests");
@@ -1031,7 +1087,20 @@ fn cmd_check() -> Result {
     Ok(())
 }
 
-fn cmd_ci() -> Result {
+fn cmd_ci(args: &RunArgs) -> Result {
+    if args.first_part() {
+        lint_all()?;
+    }
+    cmd_test(args)?;
+    if arch::current() != arch::Arch::X86_64 || !args.first_part() {
+        return Ok(());
+    }
+    ci_q35()
+}
+
+/// `ci`'s lints: format, clippy for the host crates, the cells and every
+/// kernel feature set, and the crate dependency rules.
+fn lint_all() -> Result {
     step("format");
     cargo(&["fmt", "--all", "--check"])?;
 
@@ -1080,13 +1149,11 @@ fn cmd_ci() -> Result {
     }
 
     step("crate dependency rules");
-    deps::check()?;
+    deps::check()
+}
 
-    cmd_test(&RunArgs::parse(&[])?)?;
-    if arch::current() != arch::Arch::X86_64 {
-        return Ok(());
-    }
-
+/// x86_64's extra `ci` steps on the q35 machine.
+fn ci_q35() -> Result {
     step("boot check on qemu-q35");
     let kernel = build_kernel(Profile::Debug, &[])?;
     let q35 = RunArgs::parse(&["--machine".into(), "q35".into()])?;
@@ -1697,6 +1764,23 @@ mod tests {
         assert!(parse(&["--machine", "pc"]).is_err());
         assert!(parse(&["--vmm", "firecracker", "--gdb"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+        assert_eq!(parse(&["--part", "2/3"]).unwrap().part, Some((2, 3)));
+        assert!(parse(&["--part", "4/3"]).is_err());
+    }
+
+    #[test]
+    fn the_parts_of_a_run_hold_every_step_once() {
+        for n in 1..=3 {
+            let parts: Vec<RunArgs> = (1..=n)
+                .map(|k| RunArgs::parse_ci(&["--part".into(), format!("{k}/{n}")]).unwrap())
+                .collect();
+            for step in test_steps() {
+                let runs = parts.iter().filter(|p| p.wants(step)).count();
+                assert_eq!(runs, 1, "{step} with {n} parts");
+            }
+            assert_eq!(parts.iter().filter(|p| p.first_part()).count(), 1);
+        }
+        assert!(RunArgs::parse_ci(&["--only".into(), "ktest".into()]).is_err());
     }
 
     #[test]
