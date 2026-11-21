@@ -1,26 +1,28 @@
 //! Minimal 16550 UART driver (polling; receiving in control builds only).
 
 use super::port::{inb, outb};
+#[cfg(feature = "control")]
 use core::sync::atomic::{AtomicBool, Ordering};
 use rhizo_hal::Console;
 
 /// I/O base of the first serial port.
 const COM1: u16 = 0x3F8;
 
-/// Line status register bit: transmit holding register empty (with FIFOs
-/// on: the transmit FIFO is empty).
+/// Line status register bit: transmit holding register empty.
 const LSR_THR_EMPTY: u8 = 1 << 5;
-/// Bytes the transmit FIFO takes once it is empty.
-const TX_FIFO: usize = 16;
-
-/// Whether [`Serial::init`] turned the FIFOs on. Each register access traps
-/// to the VMM, so the transmitter fills the FIFO after one look at the line
-/// status instead of looking before every byte (change
-/// `measure-control-path`).
-static FIFOS_ON: AtomicBool = AtomicBool::new(false);
 /// Line status register bit: a received byte is waiting.
 #[cfg(feature = "control")]
 const LSR_DATA_READY: u8 = 1 << 0;
+/// Bytes the transmit FIFO takes once the line status says it is empty.
+#[cfg(feature = "control")]
+const TX_FIFO: usize = 16;
+
+/// Whether [`Serial::init`] turned the FIFOs on. Each register access traps
+/// to the VMM, so control frames fill the transmit FIFO after one look at
+/// the line status instead of looking before every byte (change
+/// `measure-control-path`).
+#[cfg(feature = "control")]
+static FIFOS_ON: AtomicBool = AtomicBool::new(false);
 
 /// A 16550-compatible serial port.
 #[derive(Debug)]
@@ -48,6 +50,7 @@ impl Serial {
             outb(b + 2, 0xC7); // enable and clear FIFOs, 14-byte threshold
             outb(b + 4, 0x03); // DTR | RTS
         }
+        #[cfg(feature = "control")]
         FIFOS_ON.store(true, Ordering::Relaxed);
     }
 
@@ -62,41 +65,44 @@ impl Serial {
     /// Sends `bytes` as they are (no `\r` before `\n`).
     #[cfg(feature = "control")]
     pub fn write_raw(&mut self, bytes: &[u8]) {
-        self.send(bytes.iter().copied());
-    }
-
-    /// Sends `bytes`, waiting for an empty transmitter before each burst
-    /// of [`TX_FIFO`] bytes (one byte with the FIFOs off).
-    fn send(&mut self, bytes: impl Iterator<Item = u8>) {
-        let burst = if FIFOS_ON.load(Ordering::Relaxed) {
-            TX_FIFO
-        } else {
-            1
-        };
-        let mut room = 0;
-        for byte in bytes {
-            if room == 0 {
-                // SAFETY: reading the line status register of COM1 has no
-                // side effect.
-                while unsafe { inb(self.base + 5) } & LSR_THR_EMPTY == 0 {
+        if !FIFOS_ON.load(Ordering::Relaxed) {
+            bytes.iter().for_each(|&byte| self.write_byte(byte));
+            return;
+        }
+        for burst in bytes.chunks(TX_FIFO) {
+            // SAFETY: reading the line status register and writing the
+            // transmit register of COM1 have no side effects beyond sending
+            // the bytes; once the transmit FIFO is empty it takes `TX_FIFO`.
+            unsafe {
+                while inb(self.base + 5) & LSR_THR_EMPTY == 0 {
                     core::hint::spin_loop();
                 }
-                room = burst;
+                for &byte in burst {
+                    outb(self.base, byte);
+                }
             }
-            // SAFETY: writing the transmit register of COM1 only sends the
-            // byte; the transmitter was empty and has room for `room` more.
-            unsafe { outb(self.base, byte) };
-            room -= 1;
+        }
+    }
+
+    fn write_byte(&mut self, byte: u8) {
+        // SAFETY: reading the line status register and writing the transmit
+        // register of COM1 have no side effects beyond sending the byte.
+        unsafe {
+            while inb(self.base + 5) & LSR_THR_EMPTY == 0 {
+                core::hint::spin_loop();
+            }
+            outb(self.base, byte);
         }
     }
 }
 
 impl Console for Serial {
     fn write_bytes(&mut self, bytes: &[u8]) {
-        self.send(
-            bytes
-                .iter()
-                .flat_map(|&b| (b == b'\n').then_some(b'\r').into_iter().chain([b])),
-        );
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.write_byte(b'\r');
+            }
+            self.write_byte(byte);
+        }
     }
 }
