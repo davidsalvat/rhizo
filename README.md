@@ -164,11 +164,12 @@ again:
   numpy's computation takes about as long as in a Linux process in the
   same kind of VM, cold or forked from a warm interpreter.
 - **Node.js.** The official Node.js 24 build, dynamically linked and
-  unmodified, runs as a cell with `--jitless` (V8's compiler wants memory
-  both writable and executable, which cells refuse). A cell forked from
+  unmodified, runs as a cell with its JIT: V8 asks for memory both
+  writable and executable, and the kernel gives it pages that are either,
+  changed on faults, never both (change `node-jit`). A cell forked from
   Node.js frozen after its warm-up answers in about 4 ms, against about
-  35 ms from a cold start, in a cell or as a Linux process (which cannot
-  fork Node.js).
+  35 ms from a cold start (with `--jitless`), in a cell or as a Linux
+  process (which cannot fork Node.js).
 - **Control plane.** `rhizo`, a command-line tool on the host, drives a
   running kernel over its serial line: `rhizo up`, `run`, `ps`, `fork`,
   `suspend`, `resume`, `attach`, `kill`, `down`; `rhizo chat` is an

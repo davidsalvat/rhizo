@@ -90,6 +90,9 @@ struct Machine<F> {
     fs: rhizo_fs::Fs,
     net: rhizo_net::Net,
     pages: PageCache,
+    /// Keeps write-or-execute ranges; never backs a page (the frames
+    /// here are counted).
+    pager: Ranges,
     /// Every kernel frame: its tables, data, code and both ends of its
     /// 2 MiB page.
     kernel: Vec<u64>,
@@ -189,6 +192,7 @@ impl<F: EntryFormat> Machine<F> {
             fs,
             net: rhizo_net::Net::new(),
             pages: PageCache::new(16),
+            pager: Ranges::default(),
             kernel: kernel_frames,
             format: core::marker::PhantomData,
         }
@@ -228,7 +232,7 @@ impl<F: EntryFormat> Machine<F> {
             fs: &mut self.fs,
             net: &mut self.net,
             deadline: None,
-            pager: &mut NoPager,
+            pager: &mut self.pager,
             pages: &mut self.pages,
         };
         let outcome = self.abi.handle(&mut self.cell, &mut cx);
@@ -329,6 +333,11 @@ fn survive_in<F: EntryFormat>(mut m: Machine<F>, calls: &[(u64, [u64; 6])]) {
         }
     }
     assert!(m.kernel_memory() == kernel, "kernel memory changed");
+    // Never writable and executable (spec `virtual-memory`, `node-jit`).
+    let pt = PageTable::<F>::from_root(m.cell.root);
+    pt.for_each_lower_leaf(&m.mem, &mut |virt, _, _, f| {
+        assert!(!(f.is_writable() && f.is_executable()), "W+X at {virt:#x}");
+    });
     numbers.sort_unstable();
     numbers.dedup();
     assert!(
@@ -414,6 +423,7 @@ fn pointer_calls(p: u64, n: u64) -> Vec<(u64, u64, [u64; 6])> {
 }
 
 // x86_64 call numbers.
+const X_MMAP: u64 = 9;
 const X_MPROTECT: u64 = 10;
 const X_MUNMAP: u64 = 11;
 const X_ARCH_PRCTL: u64 = 158;
@@ -471,6 +481,13 @@ fn huge_empty_ranges_take_few_steps() {
     );
     assert_eq!(m.call(X_MUNMAP, [0, USER_END, 0, 0, 0, 0]).1, 0);
     assert!(m.pt_translate(DATA).is_none(), "everything unmapped");
+    // Writable and executable over terabytes: refused, or a range at once.
+    assert_eq!(m.call(X_MPROTECT, [0, USER_END, 7, 0, 0, 0]).1, -ENOMEM);
+    let anon = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
+    let huge = 1 << 45;
+    let at = m.call(X_MMAP, [0, huge, 0, anon, u64::MAX, 0]).1 as u64;
+    assert_eq!(m.call(X_MPROTECT, [at, huge, 7, 0, 0, 0]).1, 0);
+    assert_eq!(m.call(X_MUNMAP, [at, huge, 0, 0, 0, 0]).1, 0);
     assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
     m.end();
 }
@@ -650,4 +667,18 @@ fn buffer_lengths_that_overflow_their_sum_are_harmless() {
         "recvmsg: {got}"
     );
     m.end();
+}
+
+/// A pager that keeps write-or-execute ranges and pages nothing in.
+#[derive(Default)]
+struct Ranges(WxRanges);
+
+impl<F: EntryFormat> Pager<F, FakePhysicalMemory> for Ranges {
+    fn page_in(&mut self, _: &PageTable<F>, _: &mut FakePhysicalMemory, _: u64, _: bool) -> bool {
+        false
+    }
+
+    fn wx(&mut self) -> Option<&mut WxRanges> {
+        Some(&mut self.0)
+    }
 }

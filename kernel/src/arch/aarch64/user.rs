@@ -65,6 +65,16 @@ impl UserFault {
         ((esr >> 26) & 0x3f == 0x24 && permission && write).then_some(self.0.far)
     }
 
+    /// The address of an instruction fetch refused by permissions (an
+    /// instruction abort from EL0 with a permission fault), if that is what
+    /// it was: possibly a write-or-execute page that is writing (change
+    /// `node-jit`).
+    pub fn exec_denied(&self) -> Option<u64> {
+        let esr = self.0.esr;
+        let permission = (esr & 0x3f) >> 2 == 0b0011;
+        ((esr >> 26) & 0x3f == 0x20 && permission).then_some(self.0.far)
+    }
+
     /// Answers the cell's read of an ID register (`MRS Xt, MIDR_EL1`...,
     /// which EL0 cannot do; `HWCAP_CPUID` tells programs they may, as on
     /// Linux): the value goes to `regs`, which then resume after the
@@ -263,6 +273,22 @@ pub fn init_cpu() {
     // value is UNKNOWN, so every CPU sets it (design D8 of
     // `add-node-workload`). EL1's own use of the timer is unaffected.
     unsafe { asm!("msr cntkctl_el1, {}", "isb", in(reg) 1u64 << 1, options(nostack)) };
+    // SAFETY: SCTLR_EL1.UCT (bit 15) lets EL0 read `CTR_EL0`, and UCI (bit
+    // 26) lets it clean and invalidate caches by address (`DC CVAU`,
+    // `IC IVAU`) on memory it can read, as on Linux: a JIT makes the code
+    // it writes visible this way (design D8 of `node-jit`). Neither gives
+    // a cell any state outside its own memory, nor changes how EL1 runs.
+    unsafe {
+        asm!(
+            "mrs {t}, sctlr_el1",
+            "orr {t}, {t}, #(1 << 15)",
+            "orr {t}, {t}, #(1 << 26)",
+            "msr sctlr_el1, {t}",
+            "isb",
+            t = out(reg) _,
+            options(nostack)
+        );
+    }
     USER_ROOT[index()].store(EMPTY_ROOT.load(Ordering::Relaxed), Ordering::Relaxed);
     if has_e0pd() {
         // SAFETY: TCR_EL1.E0PD1 only makes EL0 accesses to the kernel half
