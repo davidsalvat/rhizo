@@ -389,6 +389,12 @@ pub trait Services: Console {
     fn save_fp(&mut self, fp: &mut FpState) {
         let _ = fp;
     }
+    /// Cell `cell`'s call was refused `proto` to `ip`:`port` by its egress
+    /// policy or the host's deny floor (`EACCES`): the kernel audits it
+    /// (design D7 and D18 of `add-cell-hierarchy`).
+    fn egress_denied(&mut self, cell: u32, proto: rhizo_net::Proto, ip: [u8; 4], port: u16) {
+        let _ = (cell, proto, ip, port);
+    }
 }
 
 /// What the cell does after a system call.
@@ -764,16 +770,15 @@ impl Abi {
     /// ephemeral port, with the cell's own network and ports entered into
     /// the sockets (design D2 of `close-cross-cell-leaks`, D5 of
     /// `add-cell-hierarchy`).
-    fn with_ports<'c, F, M, T, A, S>(
+    fn with_ports<'c, F, M, T, A, S: Services>(
         &mut self,
         cell: &mut Cell,
         cx: &mut Context<'c, F, M, T, A, S>,
         call: impl FnOnce(&mut Context<'c, F, M, T, A, S>) -> i64,
     ) -> i64 {
         let ports = Ports {
-            key: cell.id,
             next: self.next_port,
-            out: false,
+            ..Ports::new(cell.id)
         };
         cx.net.net().enter(ports);
         let result = call(cx);
@@ -782,6 +787,9 @@ impl Abi {
         // A cell that reached the network card may hold a secret from
         // outside (design D22 of `add-cell-hierarchy`).
         cell.exposed |= ports.is_some_and(|p| p.out);
+        if let Some((proto, ip, port)) = ports.and_then(|p| p.denied) {
+            cx.services.egress_denied(cell.id, proto, ip, port);
+        }
         result
     }
 

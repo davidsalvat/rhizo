@@ -122,6 +122,26 @@ impl Peer {
             u.send_slice(&data, from).unwrap();
         }
     }
+
+    /// The port its current TCP client comes from, as the wire shows it.
+    fn client_port(&self) -> Option<u16> {
+        let t = self.sockets.get::<tcp::Socket>(self.tcp);
+        t.remote_endpoint().map(|e| e.port)
+    }
+
+    /// Sends `data` to `to`:`port` from its own UDP port `from` (a
+    /// stranger, when `from` is not 53).
+    fn send_from(&mut self, from: u16, to: [u8; 4], port: u16, data: &[u8]) {
+        let mut u = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
+        );
+        u.bind(from).unwrap();
+        let [a, b, c, d] = to;
+        u.send_slice(data, (IpAddress::v4(a, b, c, d), port))
+            .unwrap();
+        self.sockets.add(u);
+    }
 }
 
 /// A kernel's sockets on a card with address 10.0.0.2/24, and the peer.
@@ -134,6 +154,11 @@ struct World {
 
 impl World {
     fn new() -> Self {
+        Self::with_gateway(None)
+    }
+
+    /// The same, with `gateway` as the card's gateway (the host).
+    fn with_gateway(gateway: Option<[u8; 4]>) -> Self {
         let mut link = QueueLink {
             mac: [2, 0, 0, 0, 0, 2],
             ..QueueLink::default()
@@ -142,7 +167,7 @@ impl World {
         let config = WireConfig::Static {
             addr: ME,
             prefix: 24,
-            gateway: None,
+            gateway,
         };
         net.attach(&mut link, config, 0, 7);
         Self {
@@ -151,6 +176,14 @@ impl World {
             peer: Peer::new(),
             now: 0,
         }
+    }
+
+    /// A socket of `ty` made by a call of the cell with network `key`.
+    fn socket_in(&mut self, key: u32, ty: Type) -> Handle {
+        self.net.enter(Ports::new(key));
+        let s = self.net.socket(Family::Inet, ty).unwrap();
+        self.net.leave();
+        s
     }
 
     /// Lets frames cross the wire for `ms` milliseconds.
@@ -579,4 +612,287 @@ fn a_flood_from_the_wire_lets_the_kernel_go() {
     net.attach(&mut link, config, 0, 7);
     assert_eq!(net.poll_wire(&mut link, MS), Some(0), "poll again soon");
     assert_eq!(link.taken, wire::POLL_FRAMES, "one ring of frames per poll");
+}
+
+fn tcp_rule(ip: [u8; 4], port: u16) -> Rule {
+    Rule::new(Proto::Tcp, ip, 32, port, port).unwrap()
+}
+
+fn peer_at(port: u16) -> Addr {
+    Addr::Inet { ip: PEER, port }
+}
+
+/// The port a socket shows its cell (`getsockname`).
+fn shown_port(net: &Net, h: Handle) -> u16 {
+    match net.local_addr(h) {
+        Ok(Some(Addr::Inet { port, .. })) => port,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Design D6 of `add-cell-hierarchy`: a connection through the card keeps
+/// its network's port for its cell (consecutive ports here), while the wire
+/// shows a card port drawn at random, which the kernel's secret decides.
+#[test]
+fn card_ports_are_drawn_at_random_and_hidden() {
+    let ports = |secret: [u64; 2]| {
+        let mut w = World::new();
+        w.net.set_secret(secret);
+        let (mut shown, mut wire) = (Vec::new(), Vec::new());
+        for _ in 0..16 {
+            let s = w.connect(80);
+            shown.push(shown_port(&w.net, s));
+            wire.push(w.peer.client_port().expect("the peer's client"));
+            w.net.release(s);
+            w.run(20);
+        }
+        (shown, wire)
+    };
+    let (shown, wire) = ports([1, 2]);
+    assert!(
+        shown.windows(2).all(|p| p[1] == p[0] + 1),
+        "the cell's ports follow one another: {shown:?}"
+    );
+    assert!(wire.iter().all(|p| EPHEMERAL.contains(p)));
+    assert!(
+        wire.windows(2).filter(|p| p[1] == p[0] + 1).count() <= 1,
+        "card ports do not: {wire:?}"
+    );
+    assert!(shown.iter().zip(&wire).filter(|(a, b)| a == b).count() <= 1);
+    assert_ne!(ports([3, 4]).1, wire, "the secret decides");
+}
+
+/// Hostile (spec `networking`, "Ports of other domains"): while one cell
+/// takes 1,000 connections to the outside and ephemeral ports, another
+/// cell reads with `getsockname` the very ports it reads alone.
+#[test]
+fn card_ports_of_other_networks_do_not_show() {
+    let reader = |w: &mut World| -> Vec<u16> {
+        (0..8)
+            .map(|_| {
+                let s = w.socket_in(2, Type::Stream);
+                w.net.enter(Ports::new(2));
+                w.net.bind(s, &Addr::Inet { ip: ANY, port: 0 }).unwrap();
+                w.net.leave();
+                shown_port(&w.net, s)
+            })
+            .collect()
+    };
+    let mut alone = World::new();
+    alone.net.set_secret([5, 6]);
+    let want = reader(&mut alone);
+    let mut busy = World::new();
+    busy.net.set_secret([5, 6]);
+    busy.net.set_egress(1, Egress::Full);
+    for _ in 0..1000 {
+        let s = busy.socket_in(1, Type::Stream);
+        busy.net.enter(Ports::new(1));
+        assert_eq!(busy.net.connect(s, &peer_at(80)), Err(Error::InProgress));
+        busy.net.leave();
+    }
+    assert_eq!(reader(&mut busy), want);
+}
+
+/// Each egress level (design D7): `None`, the default, reaches nothing; a
+/// rule reaches what it names; `Full` everything; loopback never depends
+/// on it, and a refused call never touches the card.
+#[test]
+fn egress_levels_decide_what_a_cell_reaches() {
+    let mut w = World::new();
+    w.net
+        .set_egress(2, Egress::rules(&[tcp_rule(PEER, 80)]).unwrap());
+    w.net.set_egress(3, Egress::Full);
+    // Network 1 has no policy: `None`; network 4 is set to it.
+    w.net.set_egress(4, Egress::None);
+    for (key, tcp80, tcp81, udp53) in [
+        (1, false, false, false),
+        (2, true, false, false),
+        (3, true, true, true),
+        (4, false, false, false),
+    ] {
+        let try_call = |w: &mut World, ty: Type, port: u16| {
+            let s = w.socket_in(key, ty);
+            w.net.enter(Ports::new(key));
+            let r = match ty {
+                Type::Stream => w.net.connect(s, &peer_at(port)),
+                Type::Dgram => w.net.send(s, b"q", Some(&peer_at(port))).map(|_| ()),
+            };
+            let ports = w.net.leave().unwrap();
+            (r, ports.out, ports.denied, ty, port)
+        };
+        type Tried = (Result<()>, bool, Option<(Proto, [u8; 4], u16)>, Type, u16);
+        let check = |(r, out, denied, ty, port): Tried, allowed: bool, what: &str| {
+            if allowed {
+                assert!(
+                    matches!(r, Ok(()) | Err(Error::InProgress)),
+                    "{key} {what}: {r:?}"
+                );
+                assert!(out, "{key} {what}: reached the card");
+                assert_eq!(denied, None);
+            } else {
+                assert_eq!(r, Err(Error::Access), "{key} {what}");
+                assert!(!out, "{key} {what}: never touched the card");
+                let proto = if ty == Type::Stream {
+                    Proto::Tcp
+                } else {
+                    Proto::Udp
+                };
+                assert_eq!(
+                    denied,
+                    Some((proto, PEER, port)),
+                    "{key} {what}: for the audit log"
+                );
+            }
+        };
+        check(try_call(&mut w, Type::Stream, 80), tcp80, "tcp 80");
+        check(try_call(&mut w, Type::Stream, 81), tcp81, "tcp 81");
+        check(try_call(&mut w, Type::Dgram, 53), udp53, "udp 53");
+        // Loopback, whatever the policy.
+        let l = w.socket_in(key, Type::Stream);
+        w.net
+            .bind(
+                l,
+                &Addr::Inet {
+                    ip: LOOPBACK,
+                    port: 9,
+                },
+            )
+            .unwrap();
+        w.net.listen(l, 1).unwrap();
+        let c = w.socket_in(key, Type::Stream);
+        assert_eq!(
+            w.net.connect(
+                c,
+                &Addr::Inet {
+                    ip: LOOPBACK,
+                    port: 9
+                }
+            ),
+            Ok(())
+        );
+    }
+    assert_eq!(Error::Access.errno(), 13, "EACCES");
+}
+
+/// Narrowing a policy resets the connections it no longer allows (design
+/// D7): `ECONNRESET` at the next call, the peer sees its connection end,
+/// and datagrams to it are refused.
+#[test]
+fn egress_narrowing_resets_connections() {
+    let mut w = World::new();
+    w.net.set_egress(3, Egress::Full);
+    let s = w.socket_in(3, Type::Stream);
+    assert_eq!(w.net.connect(s, &peer_at(80)), Err(Error::InProgress));
+    w.run(20);
+    assert_eq!(w.net.send(s, b"hi", None), Ok(2));
+    w.run(20);
+    assert_eq!(drain(&mut w.net, s).unwrap(), b"hi");
+    w.net.set_egress(4, Egress::Full);
+    w.net
+        .set_egress(3, Egress::rules(&[tcp_rule(PEER, 81)]).unwrap());
+    assert_eq!(drain(&mut w.net, s), Err(Error::ConnReset));
+    assert_eq!(
+        drain(&mut w.net, s).unwrap(),
+        b"",
+        "then the end of the stream"
+    );
+    assert_eq!(w.net.send(s, b"x", None), Err(Error::Pipe));
+    w.run(20);
+    assert_eq!(w.peer.client_port(), None, "the peer's connection ended");
+    let u = w.socket_in(3, Type::Dgram);
+    assert_eq!(w.net.send(u, b"q", Some(&peer_at(53))), Err(Error::Access));
+    let other = w.socket_in(4, Type::Dgram);
+    assert_eq!(
+        w.net.send(other, b"q", Some(&peer_at(53))),
+        Ok(1),
+        "another network's policy is untouched"
+    );
+}
+
+/// Datagrams from the outside reach a socket only from sources its policy
+/// allows (spec `networking`, "Stranger's datagram"): the endpoint's
+/// answers come, a stranger's are dropped, whatever order they arrive in.
+#[test]
+fn egress_drops_datagrams_from_strangers() {
+    let mut w = World::new();
+    let dns = Rule::new(Proto::Udp, PEER, 32, 53, 53).unwrap();
+    w.net.set_egress(2, Egress::rules(&[dns]).unwrap());
+    let u = w.socket_in(2, Type::Dgram);
+    w.net.enter(Ports::new(2));
+    assert_eq!(w.net.send(u, b"query", Some(&peer_at(53))), Ok(5));
+    w.net.leave();
+    let card = w.net.card_of(u);
+    assert_ne!(card, 0);
+    w.run(20);
+    // The stranger's come after the answer, then before the next.
+    w.peer.send_from(54, ME, card, b"evil");
+    w.run(20);
+    let mut got = Vec::new();
+    let take = |net: &mut Net, got: &mut Vec<Vec<u8>>| {
+        net.recv(u, 100, false, &mut |d| {
+            got.push(d.to_vec());
+            true
+        })
+    };
+    assert!(take(&mut w.net, &mut got).is_ok());
+    assert_eq!(take(&mut w.net, &mut got), Err(Error::Again));
+    assert_eq!(got, [b"query".to_vec()]);
+    w.peer.send_from(55, ME, card, b"evil");
+    w.run(20);
+    assert_eq!(w.net.poll(u) & IN, 0, "dropped as it came");
+    w.net.set_egress(2, Egress::Full);
+    w.peer.send_from(56, ME, card, b"now");
+    w.run(20);
+    assert!(
+        take(&mut w.net, &mut got).is_ok(),
+        "allowed once the policy is"
+    );
+    assert_eq!(got.last().map(Vec::as_slice), Some(&b"now"[..]));
+}
+
+/// The deny floor (design D7, spec "Host services behind the gateway"): the
+/// card's gateway, the host, is out of reach even of `Full`, except the
+/// exact endpoints carved out of it; the floor's own rules hold too, and a
+/// floor that grows resets what it now denies. The kernel's own sockets
+/// (network 0) are not a cell's: they reach it.
+#[test]
+fn floor_holds_the_host_and_carves_the_model() {
+    let mut w = World::with_gateway(Some(PEER));
+    w.net.set_egress(3, Egress::Full);
+    let connect = |w: &mut World, port: u16| {
+        let s = w.socket_in(3, Type::Stream);
+        (s, w.net.connect(s, &peer_at(port)))
+    };
+    assert_eq!(connect(&mut w, 80).1, Err(Error::Access), "the host");
+    w.net.set_floor(&[], &[tcp_rule(PEER, 80)]).unwrap();
+    let (model, r) = connect(&mut w, 80);
+    assert_eq!(r, Err(Error::InProgress), "the model endpoint");
+    assert_eq!(connect(&mut w, 81).1, Err(Error::Access), "another port");
+    let u = w.socket_in(3, Type::Dgram);
+    assert_eq!(
+        w.net.send(u, b"q", Some(&peer_at(80))),
+        Err(Error::Access),
+        "UDP"
+    );
+    let kernel = w.net.socket(Family::Inet, Type::Stream).unwrap();
+    assert_eq!(w.net.connect(kernel, &peer_at(81)), Err(Error::InProgress));
+    w.run(20);
+    w.net.set_floor(&[], &[]).unwrap();
+    assert_eq!(
+        drain(&mut w.net, model),
+        Err(Error::ConnReset),
+        "no longer carved"
+    );
+    // The floor's own rules, past the gateway.
+    let mut w = World::new();
+    w.net.set_egress(3, Egress::Full);
+    let net = Rule::new(Proto::Any, [10, 0, 0, 0], 24, 0, u16::MAX).unwrap();
+    w.net.set_floor(&[net], &[]).unwrap();
+    assert_eq!(connect(&mut w, 80).1, Err(Error::Access));
+    let max = rhizo_cap::limits::FLOOR_MAX;
+    assert_eq!(
+        w.net.set_floor(&vec![net; max + 1], &[]),
+        Err(Error::Invalid)
+    );
+    assert_eq!(w.net.set_floor(&vec![net; max], &[]), Ok(()));
 }

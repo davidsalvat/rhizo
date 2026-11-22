@@ -157,7 +157,10 @@ pub fn serve() {
         items: Vec::new(),
         vsock: None,
     };
-    // Cells may talk to the host's network as soon as they start.
+    // Cells may talk to the host's network as soon as they start, as their
+    // egress policies and the deny floor allow (design D7 of
+    // `add-cell-hierarchy`): the host's own addresses are in the floor
+    // until `rhizo up` carves endpoints out of it (`floor`).
     server.host.wire_address(10_000_000_000);
     crate::vsock::init();
     send(0, &Message::Hello { version: VERSION });
@@ -444,6 +447,12 @@ impl Server {
             } => self.policy(cell, &egress, ceiling.as_ref()),
             Request::Limits { cell, limits } => self.limits(cell, &limits),
             Request::Scoped { root, request } => self.scoped(id, root, *request),
+            Request::Floor { deny, carved } => {
+                let (deny, carved) = (tree::floor_rules(&deny)?, tree::floor_rules(&carved)?);
+                crate::cell::set_floor(&deny, &carved)
+                    .then_some(Body::None)
+                    .ok_or_else(|| (Error::Invalid, String::from("the floor does not fit")))
+            }
             Request::Kill(target) => {
                 let entry = self.entry(target)?;
                 match core::mem::replace(&mut entry.place, Place::Ended(State::Killed)) {
@@ -868,6 +877,7 @@ fn about(request: &Request) -> (&'static str, u32) {
         Request::Policy { cell, .. } => ("policy", *cell),
         Request::Limits { cell, .. } => ("limits", *cell),
         Request::Scoped { root, .. } => ("scoped", *root),
+        Request::Floor { .. } => ("floor", 0),
         Request::Kill(cell) => ("kill", *cell),
         Request::KillTree(cell) => ("kill --tree", *cell),
         Request::Suspend(cell) => ("suspend", *cell),
@@ -934,8 +944,40 @@ fn administered(request: &Request) -> Option<(Kind, String)> {
             format!("egress {egress:?}, ceiling {ceiling:?}"),
         )),
         Request::Limits { limits, .. } => Some((Kind::Limits, format!("{limits:?}"))),
+        // Every change of the floor and every exception to it (design D18).
+        Request::Floor { deny, carved } => Some((
+            Kind::Floor,
+            format!(
+                "deny {}, carved out {}",
+                rules_text(deny),
+                rules_text(carved)
+            ),
+        )),
         _ => None,
     }
+}
+
+/// `rules` for the audit log, as `rhizo up` takes them
+/// (`tcp:10.0.2.2/32:11434`).
+fn rules_text(rules: &[rhizo_control::Rule]) -> String {
+    if rules.is_empty() {
+        return String::from("nothing");
+    }
+    let mut text = String::new();
+    for (k, r) in rules.iter().enumerate() {
+        let proto = match r.proto {
+            rhizo_control::Proto::Tcp => "tcp",
+            rhizo_control::Proto::Udp => "udp",
+            rhizo_control::Proto::Any => "any",
+        };
+        let [a, b, c, d] = r.addr;
+        let sep = if k == 0 { "" } else { "," };
+        text += &format!(
+            "{sep}{proto}:{a}.{b}.{c}.{d}/{}:{}-{}",
+            r.prefix, r.lo, r.hi
+        );
+    }
+    text
 }
 
 fn failed(id: u32, ns: u64, error: Error, why: String) {

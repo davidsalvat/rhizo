@@ -406,6 +406,15 @@ fn socket_errors_follow_linux() {
     w.poke(ADDR, &sin([127, 0, 0, 1], 9));
     assert_eq!(w.call(CONNECT, &[c, ADDR, 16]).0, -111, "ECONNREFUSED");
     w.poke(ADDR, &sin([10, 0, 0, 1], 9));
+    // Egress `none`, every cell's default (design D7 of `add-cell-hierarchy`).
+    assert_eq!(w.call(CONNECT, &[c, ADDR, 16]).0, -13, "EACCES");
+    assert_eq!(
+        w.services.denied,
+        [(w.cell.id, rhizo_net::Proto::Tcp, [10, 0, 0, 1], 9)],
+        "reported for the audit log"
+    );
+    // Egress `full`, and the kernel has no card.
+    w.net.set_egress(w.cell.id, rhizo_net::Egress::Full);
     assert_eq!(w.call(CONNECT, &[c, ADDR, 16]).0, -101, "ENETUNREACH");
     assert_eq!(w.call(BIND, &[c, ADDR, 16]).0, -99, "EADDRNOTAVAIL");
     assert_eq!(w.call(CONNECT, &[c, ADDR, 8]).0, -EINVAL, "short address");

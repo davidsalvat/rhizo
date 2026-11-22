@@ -55,10 +55,12 @@ pub enum Kind {
     Attested = 21,
     /// A request from a client scoped to a subtree, let through.
     Scoped = 22,
+    /// The host's deny floor set: its rules and the endpoints carved out.
+    Floor = 23,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 13] = [
+    pub const ALL: [Kind; 14] = [
         Kind::Egress,
         Kind::Scope,
         Kind::Tree,
@@ -72,6 +74,7 @@ impl Kind {
         Kind::Limits,
         Kind::Attested,
         Kind::Scoped,
+        Kind::Floor,
     ];
 
     /// Whether it is a refusal (these fold).
@@ -99,6 +102,7 @@ impl Kind {
             Kind::Limits => "limits",
             Kind::Attested => "publish-attested",
             Kind::Scoped => "scoped",
+            Kind::Floor => "floor",
         }
     }
 

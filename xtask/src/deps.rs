@@ -16,7 +16,7 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
     ("rhizo-mm", &["rhizo-hal"]),
     ("rhizo-cell", &["rhizo-hal", "rhizo-mm"]),
     ("rhizo-fs", &[]),
-    ("rhizo-net", &["rhizo-hal"]),
+    ("rhizo-net", &["rhizo-hal", "rhizo-cap"]),
     ("rhizo-virtio", &["rhizo-hal"]),
     (
         "rhizo-abi",

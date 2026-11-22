@@ -193,6 +193,7 @@ impl Host {
                 continue;
             };
             for &gone in &ended.gone {
+                forget_network(gone);
                 if let Some(at) = self.suspended.iter().position(|&s| s == gone) {
                     self.suspended.swap_remove(at);
                     self.finished.push(Finished {
@@ -384,9 +385,11 @@ impl Host {
                 self.tree.add_child(id, old, saved, Actor::Host, &|_| used)
             };
             self.sync(id);
+            self.sync_networks(id);
             return Err(e);
         }
         self.sync(id);
+        self.sync_networks(id);
         self.sync_up(parent);
         self.sync_up(old);
         self.reshare_after(plain);
@@ -421,8 +424,11 @@ impl Host {
     /// Sets cell `id`'s egress policy and ceiling at `by`'s request
     /// (protocol version 4, `policy`): see `rhizo_cap::Tree::set_egress`.
     #[cfg_attr(
-        not(feature = "control"),
-        allow(dead_code, reason = "used by the control kernel")
+        not(any(feature = "ktest", feature = "bench-cell", feature = "control")),
+        allow(
+            dead_code,
+            reason = "used by in-kernel tests, benchmarks and the control kernel"
+        )
     )]
     pub fn set_policy(
         &mut self,
@@ -431,7 +437,10 @@ impl Host {
         ceiling: Egress,
         by: Actor,
     ) -> Result<(), TreeError> {
-        self.tree.set_egress(id, egress, ceiling, by)
+        self.tree.set_egress(id, egress, ceiling, by)?;
+        // Enforced from now on (design D7): narrowed connections reset.
+        self.sync_networks(id);
+        Ok(())
     }
 
     /// Moves cell `id` under `to` (`HOST`: makes it a root) at `by`'s
@@ -448,6 +457,7 @@ impl Host {
         self.tree
             .reparent(id, to, by, &|_| used, &mut fresh_domain)?;
         self.sync_down(id);
+        self.sync_networks(id);
         self.sync_up(old);
         self.sync_up(to);
         self.reshare();

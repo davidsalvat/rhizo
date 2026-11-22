@@ -42,6 +42,28 @@ upgrade (save the cells, `rhizo down`, `rhizo up` with the new kernel,
 - **WHEN** `rhizo` meets a kernel two protocol versions older
 - **THEN** it talks to no cell and prints both versions and the upgrade steps
 
+### Requirement: The deny floor from `rhizo up`
+`rhizo up` SHALL send the kernel its deny floor (`floor`, protocol version
+4) after the hello and before any cell starts: the `--deny CIDR` rules,
+and carved out of the host's own addresses the `--model HOST:PORT`
+endpoint and each `--allow-host-port PORT`, as exact TCP endpoints, at
+most 64 of each. The kernel SHALL refuse it from a scoped client and
+SHALL audit every floor it is given.
+
+#### Scenario: Host service and model endpoint
+- **WHEN** the `control` test step runs `rhizo up --model` and a cell with egress `any:0.0.0.0/0:0-65535` connects to another service on the host and to the model endpoint
+- **THEN** the first fails with `EACCES`, the second connects, and `rhizo audit tail` shows the refusal as `egress-denied`
+
+### Requirement: Model endpoints named by clients
+A client giving a cell `--egress model` for an endpoint the deny floor
+does not carve out yet (`rhizo chat --llm`, `rhizo run python-agent
+--llm`, `--egress model --llm`) SHALL carve out exactly that endpoint
+first, and the kernel SHALL audit the new floor.
+
+#### Scenario: Chat against another endpoint
+- **WHEN** a cell is run with `--egress model --llm` naming a host port the floor holds
+- **THEN** it connects there, and `rhizo audit tail` shows a `floor` record carving that endpoint out
+
 ### Requirement: Tree under control
 `run`, `load` and the fork of a template SHALL take a parent, a label,
 limits (CPU weight and cap among them), an egress policy and ceiling

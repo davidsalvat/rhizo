@@ -169,6 +169,26 @@ fn every_request_round_trips() {
             cell: 7,
             limits: placed().limits,
         },
+        Request::Floor {
+            deny: Vec::new(),
+            carved: Vec::new(),
+        },
+        Request::Floor {
+            deny: vec![Rule {
+                proto: Proto::Any,
+                addr: [192, 168, 0, 0],
+                prefix: 16,
+                lo: 0,
+                hi: u16::MAX,
+            }],
+            carved: vec![Rule {
+                proto: Proto::Tcp,
+                addr: [10, 0, 2, 2],
+                prefix: 32,
+                lo: 11434,
+                hi: 11434,
+            }],
+        },
         Request::Scoped {
             root: 3,
             request: Box::new(Request::KillTree(9)),
@@ -594,6 +614,10 @@ fn version_4_requests_stay_in_version_4() {
             root: 1,
             request: Box::new(Request::List),
         },
+        Request::Floor {
+            deny: Vec::new(),
+            carved: Vec::new(),
+        },
     ] {
         assert_eq!(
             request.encode_as(PREVIOUS, 1),
@@ -888,6 +912,16 @@ fn request() -> impl Strategy<Value = Request> {
             }
         ),
         (any::<u32>(), limits()).prop_map(|(cell, limits)| Request::Limits { cell, limits }),
+        (egress(), egress()).prop_map(|(d, c)| {
+            let rules = |e: Egress| match e {
+                Egress::Rules(r) => r,
+                _ => Vec::new(),
+            };
+            Request::Floor {
+                deny: rules(d),
+                carved: rules(c),
+            }
+        }),
     ];
     prop_oneof![
         3 => leaf.clone(),

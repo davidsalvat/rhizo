@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 186282149c60a037871afd31e6a08a930085b37b7b021d01d1107f3cc9f50795 # shrinks to steps = [Reply { kind: 2, yiaddr: [10, 0, 0, 2], lease: 0, m: Mutation { edits: [], cut: None, fix: false } }, Reply { kind: 5, yiaddr: [10, 0, 0, 2], lease: 4294967295, m: Mutation { edits: [], cut: None, fix: false } }]
