@@ -92,17 +92,25 @@ impl<F: EntryFormat> PageTable<F> {
         frames: &mut impl Frames,
     ) -> Result<Self, MapError> {
         let child = frames.alloc().ok_or(MapError::OutOfFrames)?;
-        for i in 0..ENTRIES {
-            let entry = mem.read_u64(self.root() + i * 8);
-            let entry = if i < ENTRIES / 2 && F::is_valid(entry) {
-                frames.share(F::address(entry));
-                let shared = F::with_table_writable(entry, false);
-                mem.write_u64(self.root() + i * 8, shared);
-                shared
-            } else {
-                entry
-            };
-            mem.write_u64(child + i * 8, entry);
+        // The whole root in one page copy (the kernel's), then the user
+        // half's tables made shared in both: a loop over every entry,
+        // copying each, cost a fork thousands of instructions.
+        mem.copy(self.root(), child, ENTRIES * 8);
+        // Most entries are empty: four at a time.
+        for quad in 0..ENTRIES / 8 {
+            let at = |j: u64| (quad * 4 + j) * 8;
+            let entries = [0, 1, 2, 3].map(|j| mem.read_u64(self.root() + at(j)));
+            if entries.iter().fold(0, |any, e| any | e) == 0 {
+                continue;
+            }
+            for (j, entry) in (0..).zip(entries) {
+                if F::is_valid(entry) {
+                    frames.share(F::address(entry));
+                    let shared = F::with_table_writable(entry, false);
+                    mem.write_u64(self.root() + at(j), shared);
+                    mem.write_u64(child + at(j), shared);
+                }
+            }
         }
         Ok(Self::from_root(child))
     }

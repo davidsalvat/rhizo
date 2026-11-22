@@ -632,10 +632,11 @@ impl<F: EntryFormat> PageTable<F> {
 
     /// Copies the root entries of the upper (kernel) half from `kernel`, so
     /// this hierarchy shares the kernel's mappings (x86_64 cells).
+    /// One copy of the half table (the kernel's `memcpy`): every cell's
+    /// root is made this way.
     pub fn share_upper_half(&self, mem: &mut impl PhysicalMemory, kernel: &PageTable<F>) {
-        for i in ENTRIES / 2..ENTRIES {
-            mem.write_u64(self.root + i * 8, mem.read_u64(kernel.root + i * 8));
-        }
+        let half = ENTRIES / 2 * 8;
+        mem.copy(kernel.root + half, self.root + half, half);
     }
 
     /// Calls `f(virt, phys, size, flags)` for every page mapped in the lower
