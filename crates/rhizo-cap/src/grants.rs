@@ -564,6 +564,32 @@ impl Grants {
         self.add(tree, g)
     }
 
+    /// A message carrying grant `id` (made by [`transfer`](Self::transfer)
+    /// for one holder of the endpoint it was sent to) is taken by `holder`,
+    /// another holder of that endpoint `on`: `id` becomes `holder`'s, with
+    /// the checks every new grant passes (bounds, control never flowing up,
+    /// the exposure check). Refused, changing nothing, if `holder` holds no
+    /// grant on `on` with the receive right.
+    pub fn rehome(&mut self, tree: &Tree, id: u32, holder: u32, on: Object) -> Result<(), Error> {
+        let g = self.get(id).ok_or(Error::NotFound)?;
+        if g.holder == holder {
+            return Ok(());
+        }
+        if !self.iter().any(|(_, r)| {
+            r.object == on && r.holder == holder && r.rights.contains(Rights::RECEIVE)
+        }) {
+            return Err(Error::Denied);
+        }
+        let mut moved = g.clone();
+        moved.holder = holder;
+        self.valid(tree, &moved)?;
+        // The check runs with the old holder's edge still in the table:
+        // removing an edge only narrows what anyone reaches.
+        self.exposed(tree, &[holder], &[Rec::of(&moved)])?;
+        self.used_mut(id).holder = holder;
+        Ok(())
+    }
+
     /// Unlinks grant `id` from its parent's children.
     fn detach(&mut self, id: u32) {
         let (parent, next) = {

@@ -16,6 +16,7 @@ const O_EXCL: u64 = 0x80;
 const O_TRUNC: u64 = 0x200;
 const O_APPEND: u64 = 0x400;
 const O_CLOEXEC: u64 = 0x8_0000;
+const O_NONBLOCK: u64 = 0x800;
 const PATH_MAX: usize = 4096;
 const ERANGE: i64 = 34;
 const ENOSPC: i64 = 28;
@@ -247,7 +248,20 @@ pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Service
         let kept = (flags & (O_ACCMODE | O_APPEND)) as u32;
         let opened = cx.fs.open(dir, &name, how, kept);
         cx.settle(most, before);
-        let fd = opened.map_err(err)?;
+        let fd = match opened {
+            Ok(fd) => fd,
+            // An entry of `/run/rhizo` (design D9 of `add-cell-hierarchy`).
+            Err(Error::NoDevice) => match cx.fs.rhizo_entry(dir, &name) {
+                Ok(rhizo_fs::Kept::Generation) => return generation(cx, cell, access, flags),
+                Ok(entry) => {
+                    let nonblock = flags & O_NONBLOCK != 0;
+                    let cloexec = flags & O_CLOEXEC != 0;
+                    return Ok(crate::packets::open(cx, entry, nonblock, cloexec));
+                }
+                Err(_) => return Err(err(Error::NoDevice)),
+            },
+            Err(e) => return Err(err(e)),
+        };
         if flags & O_CLOEXEC != 0 {
             let _ = cx.fs.cloexec(fd, Some(true));
         }

@@ -119,7 +119,7 @@ pub(super) fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
 /// made reads as reset.
 pub(super) fn fork_files(fs: &Fs, id: u32) -> Fs {
     let mut child = fs.clone();
-    if fs.sockets().next().is_some() {
+    if fs.has_sockets() {
         with_net(|net| child.map_sockets(|h| net.fork(h, id).unwrap_or(u32::MAX)));
     }
     child
@@ -188,7 +188,7 @@ pub fn close_parked(snapshot: &Snapshot) {
 /// ([`forget_network`]).
 pub(super) fn release_sockets(fs: &Fs, id: u32, network_ends: bool) {
     let policy = network_ends && POLICIES.load(Ordering::Acquire);
-    if fs.sockets().next().is_some() || policy {
+    if fs.has_sockets() || policy {
         with_net(|net| {
             fs.sockets().for_each(|h| {
                 net.forget(h, id);
@@ -228,7 +228,7 @@ pub(super) fn forget_network(id: u32) {
 /// `keep-tcp-across-suspend`).
 pub(super) fn export_sockets(fs: &Fs) -> (Fs, Vec<rhizo_net::Record>) {
     let mut records = Vec::new();
-    if fs.sockets().next().is_none() {
+    if !fs.has_sockets() {
         return (fs.clone(), records);
     }
     let mut out = fs.clone();

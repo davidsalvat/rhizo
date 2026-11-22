@@ -27,6 +27,7 @@ pub const ALLOWED: &[(&str, &[&str])] = &[
             "rhizo-fs",
             "rhizo-net",
             "rhizo-virtio",
+            "rhizo-cap",
         ],
     ),
     ("rhizo-sched", &[]),

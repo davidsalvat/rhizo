@@ -966,3 +966,50 @@ proptest! {
         }
     }
 }
+
+/// A handle sent to one holder of an endpoint and taken by another holder
+/// of it becomes the taker's, after the checks every grant passes; a cell
+/// that holds no receiving grant on the endpoint cannot take it.
+#[test]
+fn rehome_moves_a_received_handle() {
+    let mut t = root();
+    child(&mut t, 2, 1, Egress::None, Egress::None); // B
+    child(&mut t, 3, 1, Egress::None, Egress::None); // C
+    child(&mut t, 4, 1, Egress::None, Egress::None); // D
+    let mut ch = Channels::new();
+    let mut g = Grants::new();
+    let a = Actor::Cell(1);
+    let carry = ch.create(&t, a, &none).unwrap();
+    let tool = ch.create(&t, a, &none).unwrap();
+    let all = Rights::SEND | Rights::RECEIVE | Rights::CARRY;
+    let [c0, c1] = Channels::endpoints(carry);
+    let [t0, _] = Channels::endpoints(tool);
+    let mine = g
+        .grant(&t, &ch, a, Object::Endpoint(c0), ask(all, 1))
+        .unwrap();
+    g.grant(&t, &ch, a, Object::Endpoint(c1), ask(all, 2))
+        .unwrap();
+    g.grant(&t, &ch, a, Object::Endpoint(c1), ask(Rights::RECEIVE, 3))
+        .unwrap();
+    g.grant(&t, &ch, a, Object::Endpoint(c1), ask(Rights::SEND, 4))
+        .unwrap();
+    let src = g
+        .grant(&t, &ch, a, Object::Endpoint(t0), ask(all, 1))
+        .unwrap();
+    let sent = g
+        .transfer(&t, 1, src, mine, ask(Rights::SEND, 2), &no_use)
+        .unwrap();
+    let before = g.clone();
+    assert_eq!(
+        g.rehome(&t, sent, 4, Object::Endpoint(c1)),
+        Err(Error::Denied),
+        "D may only send on the endpoint"
+    );
+    assert_eq!(g, before, "a refused move changes nothing");
+    g.rehome(&t, sent, 3, Object::Endpoint(c1)).unwrap();
+    let moved = g.get(sent).unwrap();
+    assert_eq!((moved.holder(), moved.grantor()), (3, 1));
+    assert_eq!(moved.parent(), Some(src), "still revocable by the sender");
+    assert_eq!(g.rehome(&t, sent, 3, Object::Endpoint(c1)), Ok(()));
+    g.check(&t, &ch).unwrap();
+}

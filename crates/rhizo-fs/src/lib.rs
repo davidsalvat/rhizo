@@ -16,6 +16,7 @@ extern crate alloc;
 
 mod codec;
 mod io;
+mod rhizo;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -25,6 +26,7 @@ use alloc::vec::Vec;
 
 pub use codec::DecodeError;
 pub use io::{EpollOp, Interest, PIPE_BUF, PIPE_CAP};
+pub use rhizo::{Kept, Place};
 
 /// Inode number (index in the inode table).
 pub type Ino = u32;
@@ -83,6 +85,8 @@ pub enum Error {
     NoDevice,
     /// The path names no socket (`ECONNREFUSED`).
     Refused,
+    /// The kernel keeps it: `/run/rhizo` (`EROFS`).
+    ReadOnly,
 }
 
 impl Error {
@@ -105,6 +109,7 @@ impl Error {
             Error::TooManySockets => 23,
             Error::TooManyFiles => 24,
             Error::TooBig => 27,
+            Error::ReadOnly => 30,
             Error::NoSpace => 28,
             Error::NameTooLong => 36,
             Error::NotEmpty => 39,
@@ -194,6 +199,8 @@ enum Node {
     /// A Unix socket's name: the number the kernel's sockets know it by
     /// (0: no socket any more).
     Socket(u64),
+    /// An entry of `/run/rhizo`, kept by the kernel (module `rhizo`).
+    Kept(Kept),
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +360,12 @@ pub struct Tables {
     /// The pipe whose write end the host holds, outside the descriptors:
     /// standard input from the host ([`Tables::host_input`]).
     input: Option<u32>,
+    /// The directory `/run/rhizo`, once the kernel made it
+    /// ([`Tables::rhizo_dir`]).
+    rhizo: Option<Ino>,
+    /// Grants of `/run/rhizo` entries the cell unlinked, for the kernel to
+    /// drop ([`Tables::take_dropped`]); empty between system calls.
+    dropped: Vec<u32>,
 
     /// Counts changes to pipes, event counters and `epoll` instances
     /// ([`Tables::changes`]).
@@ -388,6 +401,8 @@ impl Tables {
             fd_limit: FD_MAX,
             socket_limit: SOCKETS_DEFAULT,
             input: None,
+            rhizo: None,
+            dropped: Vec::new(),
 
             changes: 0,
         }
@@ -657,6 +672,9 @@ impl Tables {
                 if !matches!(self.inode(dir).node, Node::Dir { .. }) {
                     return Err(Error::NotDir);
                 }
+                if self.kept_dir(dir) {
+                    return Err(Error::ReadOnly);
+                }
                 let ino = self.alloc_inode(Inode {
                     links: 1,
                     node: Node::File(File::default()),
@@ -667,8 +685,12 @@ impl Tables {
             Err(e) => return Err(e),
         };
         let is_dir = matches!(self.inode(ino).node, Node::Dir { .. });
-        if matches!(self.inode(ino).node, Node::Socket(_)) {
-            return Err(Error::NoDevice);
+        match self.inode(ino).node {
+            Node::Kept(Kept::Generation) if flags.write || flags.truncate => {
+                return Err(Error::ReadOnly);
+            }
+            Node::Socket(_) | Node::Kept(_) => return Err(Error::NoDevice),
+            _ => {}
         }
         if flags.directory && !is_dir {
             return Err(Error::NotDir);
@@ -1050,6 +1072,7 @@ impl Tables {
                 Node::File(f) => f.size,
                 Node::Dir { .. } => BLOCK as u64,
                 Node::Socket(_) => 0,
+                Node::Kept(k) => k.size(),
             },
         }
     }
@@ -1088,7 +1111,7 @@ impl Tables {
         match &self.inode(ino).node {
             Node::File(f) => Ok((ino, f.size)),
             Node::Dir { .. } => Err(Error::IsDir),
-            Node::Socket(_) => Err(Error::NoDevice),
+            Node::Socket(_) | Node::Kept(_) => Err(Error::NoDevice),
         }
     }
 
@@ -1153,6 +1176,9 @@ impl Tables {
     pub fn mkdir(&mut self, dirfd: Option<Fd>, path: &[u8]) -> Result<()> {
         let (dir, name) = self.parent_of(dirfd, path)?;
         let name = name.ok_or(Error::Exists)?;
+        if self.kept_dir(dir) {
+            return Err(Error::ReadOnly);
+        }
         let Node::Dir { entries, .. } = &self.inode(dir).node else {
             return Err(Error::NotDir);
         };
@@ -1180,13 +1206,16 @@ impl Tables {
             return Err(Error::NotDir);
         };
         let ino = *entries.get(name).ok_or(Error::NotFound)?;
+        if self.kept_dir(dir) || Some(ino) == self.rhizo {
+            return self.unlink_kept(dir, ino, rmdir);
+        }
         match (&self.inode(ino).node, rmdir) {
             (Node::Dir { entries, .. }, true) if !entries.is_empty() => {
                 return Err(Error::NotEmpty);
             }
             (Node::Dir { .. }, true) if ino == self.cwd => return Err(Error::Busy),
             (Node::Dir { .. }, false) => return Err(Error::IsDir),
-            (Node::File(_) | Node::Socket(_), true) => return Err(Error::NotDir),
+            (Node::File(_) | Node::Socket(_) | Node::Kept(_), true) => return Err(Error::NotDir),
             _ => {}
         }
         self.unlink_name(dir, name);
@@ -1217,6 +1246,12 @@ impl Tables {
         let ino = *entries.get(from_name).ok_or(Error::NotFound)?;
         let (to_dir, to_name) = self.parent_of(newdir, new)?;
         let to_name = to_name.ok_or(Error::Busy)?;
+        if self.kept_dir(from_dir) || self.kept_dir(to_dir) {
+            return Err(Error::ReadOnly);
+        }
+        if self.holds_rhizo(ino) {
+            return Err(Error::Busy);
+        }
         let moving_dir = matches!(self.inode(ino).node, Node::Dir { .. });
         if moving_dir {
             // A directory cannot move into itself or below.
@@ -1243,7 +1278,9 @@ impl Tables {
             }
             match (&self.inode(target).node, moving_dir) {
                 (Node::Dir { .. }, false) => return Err(Error::IsDir),
-                (Node::File(_) | Node::Socket(_), true) => return Err(Error::NotDir),
+                (Node::File(_) | Node::Socket(_) | Node::Kept(_), true) => {
+                    return Err(Error::NotDir);
+                }
                 (Node::Dir { entries, .. }, true) if !entries.is_empty() => {
                     return Err(Error::NotEmpty);
                 }
@@ -1377,10 +1414,13 @@ fn kind_of(inode: &Inode) -> Kind {
         Node::Dir { .. } => Kind::Dir,
         Node::File(_) => Kind::File,
         Node::Socket(_) => Kind::Socket,
+        Node::Kept(k) => k.kind(),
     }
 }
 
 #[cfg(test)]
 mod io_tests;
+#[cfg(test)]
+mod rhizo_tests;
 #[cfg(test)]
 mod tests;
