@@ -157,8 +157,8 @@ impl Host {
     ///
     /// [`enter_restored`]: Self::enter_restored
     pub(super) fn leave_restored(&mut self, cell: &Cell, origin: u32) {
-        if cell.domain == cell.id {
-            let _ = self.tree.end(cell.id, &mut fresh_domain); // a new root
+        if cell.domain == cell.id || self.tree.get(origin).is_some() {
+            let _ = self.tree.end(cell.id, &mut fresh_domain); // a new root or a copy
         } else if self.tree.rekey(cell.id, origin).is_some() {
             self.suspended.push(origin);
         }
