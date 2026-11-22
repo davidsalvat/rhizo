@@ -23,7 +23,7 @@ cells = []
 # `selfcheck=NAME` on its command line, one harness self-check that must
 # fail in a precise way (`cargo xtask test`, change `fewer-kernel-builds`).
 # Test code stays behind this one feature: no other build contains it.
-ktest = ["cells", "sampling"]
+ktest = ["cells", "sampling", "rhizo-sched/ktest"]
 # Node.js builds (change `add-node-workload`): embed `node-files` (over
 # 100 MiB, so only here); with `ktest`, run the Node.js tests only, with
 # `bench-cell`, measure the Node.js workload only. Their VMs get more memory.

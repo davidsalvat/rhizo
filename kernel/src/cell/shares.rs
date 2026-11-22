@@ -156,11 +156,12 @@ impl Host {
         self.with_live(id, |live| live.cell.cpu_ns)
     }
 
-    /// The CPU time the scheduler charged root `id`, alone in its domain,
-    /// while cells share by weight: the slices it weighs domains by
-    /// (in-kernel tests).
+    /// The CPU time the scheduler charged the domain of cell `id`, exactly,
+    /// while cells share by weight: what it weighs domains by (in-kernel
+    /// tests).
     #[cfg(feature = "ktest")]
     pub fn charged_ns(&mut self, id: u32) -> Option<u64> {
-        self.locked(|s| s.sched.shares().as_ref()?.charged_ns(id))
+        let domain = self.domain(id)?;
+        self.locked(|s| s.sched.shares().as_ref()?.domain_charged_ns(domain))
     }
 }

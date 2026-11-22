@@ -537,6 +537,10 @@ its own (by default, equal to it), set by its creator and only narrowed.
 - A read-only view: from the owner to the viewer. A read-write view: both
   ways.
 - The tree edge: both ways between parent and child.
+- The holders of one channel endpoint, who share its queue: both ways
+  between them. A holder that consumes a message changes what the others
+  can read.
+- An accelerator: both ways between the holders of handles on it (D24).
 
 **Invariant.** For every cell `c`, let the cells reachable from `c` be
 those reached along flow edges without passing through an ancestor of `c`.
@@ -628,6 +632,12 @@ difference from Linux:
   the handle model;
 - the kernel endpoint acts as its holder.
 
+**Who grants.** The host grants any object to any cell. A cell grants,
+from no other handle, only to itself or a descendant: handles on its
+descendants (D2) and the endpoints of channels it made. Accelerators are
+granted only by the host (D24). Every other handle is derived from one
+the granter holds.
+
 **Revocation.** A cell revokes the grants it derived from one of its
 handles (`revoke(fd)`). An ancestor or the host can revoke any grant whose
 grantor is in its subtree. Revocation removes the derivation subtree at
@@ -640,6 +650,11 @@ handles see:
   ends;
 - a view disappears: its mount point reads empty, and descriptors opened
   through it fail with `EIO`.
+
+Dropping a handle (`unlink`, closing its last descriptor) is not a
+revocation: the grants derived from it stay, now derived from its
+source, so whoever could revoke them still can. A sender's close does not
+take back what it sent, as on Linux.
 
 **Bounds.** At most 256 handles per cell. Their records are charged to the
 cell's memory (D4).
@@ -656,7 +671,8 @@ a channel, and they make delegation and revocation awkward.
 A channel is two endpoints. Each endpoint has a receive queue bounded to
 64 messages and 256 KiB. A message holds at most 64 KiB and 16 handles.
 The kernel copies bytes in and out, and no memory is ever shared. The room
-for both queues (512 KiB) is reserved from the creator's memory budget
+for both queues (512 KiB, with the records of their messages and
+handles) is reserved from the creator's memory budget
 when the channel is made. Sending into a full queue blocks or fails with
 `EAGAIN`, and never fails because of memory, so the queue reveals nothing
 of anyone's budget.
@@ -860,7 +876,13 @@ handles or quota by it.
 - Copies have no children, and they hold no control handle on the source's
   descendants: a cell has one parent.
 - Other handles are inherited as grants derived from the source's, with
-  the same grantor, so they are revoked together.
+  the same grantor, so they are revoked together. Channel endpoints are
+  not inherited as grants: an endpoint whose peer is outside the copy
+  reads as reset (it carries nothing, so it is no flow edge), and a
+  channel within the source becomes a new channel the copy's grants name.
+  The copies pass the exposure check of D8 like any new cell: a copy
+  holding the source's handles is no longer under the source, so a cell
+  the source excluded as an ancestor may reach through it.
 - A channel endpoint whose peer is outside the copy reads as reset in the
   copy, as inherited connections do today: the peer agreed to talk to the
   source, not to new cells. A channel with both ends in the source is
@@ -1334,6 +1356,7 @@ the tree as it was.
 | Message | 64 KiB and 16 handles | `EMSGSIZE`, `ETOOMANYREFS` |
 | Queue per endpoint | 64 messages, 256 KiB | `EAGAIN` or block |
 | Rules per egress policy | 64 | `EINVAL` |
+| Models one accelerator serves | 64 (one bit each in a handle, D24) | Refused by `rhizo up` |
 | Deny-floor rules | 64 | Refused by `rhizo up` |
 | Label | 64 bytes, `[A-Za-z0-9._-]` | `EINVAL` |
 | Pending module approvals per cell | 1 (`add-cell-modules`) | `EBUSY` |
@@ -1874,6 +1897,15 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   quarters and a quarter of a CPU). `--cpus` (exclusive CPU sets) is
   enforced by task 1.9a (D17, "As built in phase 1").
 - `sched.domain_share_pct`: 49 under `-icount` on AArch64.
+- **Within one slice, for any number of domains (change
+  `fix-fair-bound`).** A domain's finishing virtual time counts the
+  longest slice charged so far, not the nominal 10 ms. With the nominal
+  slice and slices a busy host stretched, three or more domains could
+  stray up to about two of the longest slices. With the longest slice,
+  each busy domain stays within one slice (the longest yet) of its
+  weight's part, whatever the slices' lengths. That change's design
+  (D1) gives the proof. In-kernel tests compare domains by their exact
+  charged time, counted only in test builds.
 
 Alternatives:
 
@@ -1920,6 +1952,17 @@ charged to the cell's memory), device time (`accel.time`) and open
 sessions (`accel.sessions`). A child's are carved from its parent's and
 come back when it ends; a root's are admitted against what the broker
 bound to its domain.
+
+The budgets live in the handle, with the models it lists (one bit per
+model the host registered for the accelerator, so at most 64): a child
+gets its budget by derivation, carved from what its source handle has
+free (its budget less what was derived from it and what its own
+sessions use), and gives it back when the derived handle is revoked or
+its holder ends. A derivation past what is free fails with `EDQUOT`, as
+any request beyond a budget (`add-accelerators`); one asking for a right
+or a model the source lacks fails with `EACCES`. The host's own grants
+of an accelerator are admitted against the capacity it registered for
+it.
 
 **Exposure ceilings.**
 

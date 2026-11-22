@@ -43,6 +43,12 @@ pub(super) fn tree_error(e: cap::Error) -> (Error, String) {
         ),
         cap::Error::Exists => (Error::Failed, "the cell is in the tree already"),
         cap::Error::NoMemory => (Error::NoMemory, "the tree's records do not fit"),
+        // Refusals of handles and channels, which tree requests never make.
+        cap::Error::TooManyHandles
+        | cap::Error::Full
+        | cap::Error::Pipe
+        | cap::Error::TooBig
+        | cap::Error::TooManyRefs => (Error::Failed, "not a tree refusal"),
     };
     (error, String::from(why))
 }

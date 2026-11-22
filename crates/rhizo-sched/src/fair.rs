@@ -136,25 +136,27 @@ struct Paced {
     weight: u64,
     inv: u64,
     vtime: u64,
+    /// What the longest slice charged so far ([`Fair::longest`]) adds to
+    /// [`vtime`](Self::vtime).
     slice: u64,
 }
 
 impl Paced {
-    fn new(weight: u64) -> Self {
+    fn new(weight: u64, longest: u64) -> Self {
         let weight = weight.max(1);
         let inv = reciprocal(weight);
         Self {
             weight,
             inv,
             vtime: 0,
-            slice: paced(crate::SLICE_NS, inv),
+            slice: paced(longest, inv),
         }
     }
 
-    fn set_weight(&mut self, weight: u64) {
+    fn set_weight(&mut self, weight: u64, longest: u64) {
         *self = Self {
             vtime: self.vtime,
-            ..Self::new(weight)
+            ..Self::new(weight, longest)
         };
     }
 
@@ -162,7 +164,8 @@ impl Paced {
         self.vtime = self.vtime.wrapping_add(paced(ns, self.inv));
     }
 
-    /// Its virtual time at the end of a full slice from now.
+    /// Its virtual time at the end of a slice as long as the longest yet,
+    /// from now.
     fn finish(&self) -> u64 {
         self.vtime.wrapping_add(self.slice)
     }
@@ -301,6 +304,9 @@ struct Dom {
     lanes: Vec<Lane>,
     /// The pick that last counted it.
     stamp: u32,
+    /// The CPU time charged to it, exactly (in-kernel tests).
+    #[cfg(any(test, feature = "ktest"))]
+    charged: u64,
 }
 
 /// A capped node: its budget per period and what it used in the current
@@ -504,6 +510,9 @@ pub struct Fair {
     cells: Vec<Member>,
     caps: Vec<Cap>,
     clocks: Vec<Clock>,
+    /// The longest slice charged so far, on any CPU: the slice a domain's
+    /// finishing virtual time counts (see [`Share::pick`]).
+    longest: u64,
     /// Set by every change of the tables: the queues are learnt again.
     dirty: bool,
     spent: Vec<u32>,
@@ -517,6 +526,7 @@ impl Share for Fair {
             cells: Vec::new(),
             caps: Vec::new(),
             clocks: alloc::vec![Clock::default(); cpus.max(1)],
+            longest: 0,
             dirty: true,
             spent: Vec::new(),
             stamp: 0,
@@ -666,10 +676,17 @@ impl Share for Fair {
         if clock.weight != 0 {
             clock.vtime = clock.vtime.wrapping_add(paced(ns, clock.inv));
         }
+        if ns > self.longest {
+            self.lengthen(ns);
+        }
         let m = &mut self.cells[i];
         m.account.charge(ns);
         if let Some(d) = self.domains.get_mut(m.dom as usize) {
             d.account.charge(ns);
+            #[cfg(any(test, feature = "ktest"))]
+            {
+                d.charged += ns;
+            }
         }
         if m.capped.is_empty() {
             return false;
@@ -714,7 +731,9 @@ impl Fair {
     /// CPU in proportion to their weights.
     pub fn set_domain(&mut self, domain: u32, weight: u32) {
         let at = self.domain_at(domain);
-        self.domains[at].account.set_weight(weight.into());
+        self.domains[at]
+            .account
+            .set_weight(weight.into(), self.longest);
         self.dirty = true;
     }
 
@@ -754,13 +773,12 @@ impl Fair {
         self.dirty = true;
     }
 
-    /// The CPU time charged so far to the cell known by `key`, as its
-    /// virtual time times its share: exact for a cell alone in its domain
-    /// (in-kernel tests compare roots by it); for a cell sharing its
-    /// domain, rounded, and moved by its arrivals (see `arrive`).
-    pub fn charged_ns(&self, key: u32) -> Option<u64> {
-        let a = &self.cell(key)?.account;
-        Some(((a.vtime << 32) / u128::from(a.inv)) as u64)
+    /// The CPU time charged so far to `domain`, exactly (in-kernel tests
+    /// compare domains by it).
+    #[cfg(any(test, feature = "ktest"))]
+    pub fn domain_charged_ns(&self, domain: u32) -> Option<u64> {
+        let at = self.domains.binary_search_by_key(&domain, |d| d.id).ok()?;
+        Some(self.domains[at].charged)
     }
 
     /// Forgets the cell known by `key` (it ended).
@@ -837,10 +855,8 @@ impl Fair {
     fn choose(&mut self, cpu: usize, q: usize) -> Option<usize> {
         let now = self.clocks[cpu].vtime;
         let mut weight = 0;
-        // The eligible domain that would finish a slice first, and of
-        // those with the least virtual time the one that would.
+        // The eligible domain that would finish a slice first.
         let mut best = None::<(u64, u32)>;
-        let mut low = None::<(u64, u64, u32)>;
         let mut i = 0;
         while i < self.clocks[q].present.len() {
             let d = self.clocks[q].present[i];
@@ -857,23 +873,39 @@ impl Fair {
             if !before(now, a.vtime) && best.is_none_or(|(f, _)| before(finish, f)) {
                 best = Some((finish, d));
             }
-            let lower = |(v, f, _): (u64, u64, u32)| {
-                before(a.vtime, v) || (a.vtime == v && before(finish, f))
-            };
-            if low.is_none_or(lower) {
-                low = Some((a.vtime, finish, d));
+        }
+        self.clocks[cpu].set_weight(weight);
+        match best {
+            Some((_, d)) => Some(d as usize),
+            None => self.least(cpu, q..q + 1),
+        }
+    }
+
+    /// Of the domains with work in queues `queues`, none eligible, the one
+    /// with the least virtual time (then finishing first, then first
+    /// listed): `cpu`'s clock moves to its virtual time.
+    #[cold]
+    #[inline(never)]
+    fn least(&mut self, cpu: usize, queues: Range<usize>) -> Option<usize> {
+        let mut low = None::<(u64, u64, u32)>;
+        for q in queues {
+            for &d in &self.clocks[q].present {
+                let dom = &self.domains[d as usize];
+                if dom.lanes[q].heap.is_empty() {
+                    continue;
+                }
+                let a = &dom.account;
+                let finish = a.finish();
+                let lower = |(v, f, _): (u64, u64, u32)| {
+                    before(a.vtime, v) || (a.vtime == v && before(finish, f))
+                };
+                if low.is_none_or(lower) {
+                    low = Some((a.vtime, finish, d));
+                }
             }
         }
-        let clock = &mut self.clocks[cpu];
-        clock.set_weight(weight);
-        let d = match (best, low) {
-            (Some((_, d)), _) => d,
-            (None, Some((vtime, _, d))) => {
-                clock.vtime = vtime;
-                d
-            }
-            (None, None) => return None,
-        };
+        let (vtime, _, d) = low?;
+        self.clocks[cpu].vtime = vtime;
         Some(d as usize)
     }
 
@@ -890,7 +922,6 @@ impl Fair {
         let now = self.clocks[cpu].vtime;
         let mut weight = 0;
         let mut best = None::<(u64, u32)>;
-        let mut low = None::<(u64, u64, u32)>;
         for q in queues.clone() {
             for &d in &self.clocks[q].present {
                 let dom = &mut self.domains[d as usize];
@@ -904,24 +935,13 @@ impl Fair {
                 if !before(now, a.vtime) && best.is_none_or(|(f, _)| before(finish, f)) {
                     best = Some((finish, d));
                 }
-                let lower = |(v, f, _): (u64, u64, u32)| {
-                    before(a.vtime, v) || (a.vtime == v && before(finish, f))
-                };
-                if low.is_none_or(lower) {
-                    low = Some((a.vtime, finish, d));
-                }
             }
         }
-        let clock = &mut self.clocks[cpu];
-        clock.set_weight(weight);
-        let d = match (best, low) {
-            (Some((_, d)), _) => d,
-            (None, Some((vtime, _, d))) => {
-                clock.vtime = vtime;
-                d
-            }
-            (None, None) => return None,
-        } as usize;
+        self.clocks[cpu].set_weight(weight);
+        let d = match best {
+            Some((_, d)) => d as usize,
+            None => self.least(cpu, queues.clone())?,
+        };
         let lanes = &self.domains[d].lanes;
         let q = queues
             .filter(|&q| !lanes[q].heap.is_empty())
@@ -929,6 +949,17 @@ impl Fair {
         let slot = self.domains[d].lanes[q].remove(0);
         self.clocks[cpu].last = Some((slot.key, slot.cell));
         Some((q, slot.arrival))
+    }
+
+    /// A slice of `ns`, longer than any charged before: the domains'
+    /// finishing virtual times count it from now on.
+    #[cold]
+    #[inline(never)]
+    fn lengthen(&mut self, ns: u64) {
+        self.longest = ns;
+        for d in &mut self.domains {
+            d.account.slice = paced(ns, d.account.inv);
+        }
     }
 
     /// Takes the first entry of queue `q` no cell is known for.
@@ -968,9 +999,11 @@ impl Fair {
             Err(at) => {
                 let dom = Dom {
                     id: domain,
-                    account: Paced::new(DEFAULT_WEIGHT.into()),
+                    account: Paced::new(DEFAULT_WEIGHT.into(), self.longest),
                     lanes: alloc::vec![Lane::default(); self.clocks.len()],
                     stamp: 0,
+                    #[cfg(any(test, feature = "ktest"))]
+                    charged: 0,
                 };
                 self.domains.insert(at, dom);
                 self.dirty = true;
@@ -1044,6 +1077,50 @@ mod fair_shares {
 
     fn within_one_slice(slices: &[u64], weights: &[u32], total: u64) -> bool {
         within(slices, weights, total, 1)
+    }
+
+    /// Busy domains of `weights`, one cell each, run slices of lengths
+    /// `lens`, each charged as it lasted, with one CPU stepping through
+    /// the queues of `cpus` (as `Host::step` does): after every slice,
+    /// each domain's CPU time is within the longest slice yet of its
+    /// weight's part of the total, and is what
+    /// [`Fair::domain_charged_ns`] reads.
+    fn stretched(cpus: usize, weights: &[u32], lens: &[u64]) -> Result<(), TestCaseError> {
+        let mut s = Scheduler::fair(cpus);
+        domains(&mut s, weights, &alloc::vec![1; weights.len()]);
+        let sum: u128 = weights.iter().map(|&w| u128::from(w)).sum();
+        let mut used = alloc::vec![0u64; weights.len()];
+        let (mut total, mut longest) = (0u128, 0u128);
+        for &ns in lens {
+            let key = s.next_oldest(0).expect("all busy");
+            s.charge(0, key, ns, 0);
+            s.requeue(0, key);
+            let d = key as usize / 100;
+            used[d] += ns;
+            prop_assert_eq!(s.shares().domain_charged_ns(d as u32), Some(used[d]));
+            total += u128::from(ns);
+            longest = longest.max(u128::from(ns));
+            for (&got, &w) in used.iter().zip(weights) {
+                let off = (u128::from(got) * sum).abs_diff(total * u128::from(w));
+                prop_assert!(
+                    off <= longest * sum,
+                    "weight {} off by {} ns, longest slice {}: {:?}",
+                    w,
+                    off / sum,
+                    longest,
+                    used
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Slice lengths for [`stretched`]: any up to 20 nominal slices, or
+    /// short ones, so that a slice longer than every one before it comes
+    /// after many shorter ones.
+    fn lens() -> impl Strategy<Value = Vec<u64>> {
+        let len = prop_oneof![1..=20 * SLICE_NS, 1..=SLICE_NS / 50];
+        proptest::collection::vec(len, 1..300)
     }
 
     #[test]
@@ -1295,35 +1372,26 @@ mod fair_shares {
         /// `Host::step` does): after every slice, each domain's CPU time is
         /// within the longest slice yet of its weight's part of the total
         /// (design D23: within one slice), and is what
-        /// [`Fair::charged_ns`] reads.
+        /// [`Fair::domain_charged_ns`] reads.
         #[test]
         fn stretched_slices_stay_within_one_slice(
             cpus in 1usize..5,
             weights in (1u32..=10_000, 1u32..=10_000),
             lens in proptest::collection::vec(1..=20 * SLICE_NS, 1..300),
         ) {
-            let weights = [weights.0, weights.1];
-            let mut s = Scheduler::fair(cpus);
-            domains(&mut s, &weights, &[1, 1]);
-            let sum = u128::from(weights[0] + weights[1]);
-            let mut used = [0u64; 2];
-            let (mut total, mut longest) = (0u128, 0u128);
-            for &ns in &lens {
-                let key = s.next_oldest(0).expect("both busy");
-                s.charge(0, key, ns, 0);
-                s.requeue(0, key);
-                let d = key as usize / 100;
-                used[d] += ns;
-                prop_assert_eq!(s.shares().charged_ns(key), Some(used[d]));
-                total += u128::from(ns);
-                longest = longest.max(u128::from(ns));
-                for (&got, &w) in used.iter().zip(&weights) {
-                    let off = (u128::from(got) * sum).abs_diff(total * u128::from(w));
-                    prop_assert!(off <= longest * sum,
-                        "weight {} off by {} ns, longest slice {}: {:?}",
-                        w, off / sum, longest, used);
-                }
-            }
+            stretched(cpus, &[weights.0, weights.1], &lens)?;
+        }
+
+        /// The same with three to six domains, and slices of any length
+        /// among short ones (change `fix-fair-bound`): within the longest
+        /// slice yet, whatever the number of domains.
+        #[test]
+        fn many_domains_stay_within_one_stretched_slice(
+            cpus in 1usize..5,
+            weights in proptest::collection::vec(1u32..=10_000, 3..=6),
+            lens in lens(),
+        ) {
+            stretched(cpus, &weights, &lens)?;
         }
 
         /// The cells of one domain share it by their flattened weights,

@@ -630,17 +630,20 @@ fn usage(id: u32) -> Limits {
     }
 }
 
-/// Runs `op` on `t`, with identifiers from `next`.
-fn apply(t: &mut Tree, op: &Op, next: &mut u32, domains: &mut u32) -> Result<(), Error> {
+/// Runs `op` on `t`, with identifiers from `next`. New domains take
+/// identifiers from the same counter, as the kernel's do: a root's domain
+/// is its identifier, so a separate counter would reuse a domain.
+fn apply(t: &mut Tree, op: &Op, next: &mut u32) -> Result<(), Error> {
     let ids: Vec<u32> = t.iter().map(|n| n.id()).collect();
     let pick = |i: usize| ids.get(i % ids.len().max(1)).copied().unwrap_or(1);
     let actor = |i: Option<usize>| i.map_or(Actor::Host, |i| Actor::Cell(pick(i)));
-    let mut fresh = || {
-        *domains += 1;
-        *domains
-    };
+    // Room for the copies of one operation.
     *next += 4;
     let id = *next;
+    let mut fresh = || {
+        *next += 1;
+        *next
+    };
     match op {
         Op::Root(l) => t.add_root(id, spec(*l), 0).map(|_| ()),
         Op::Child(p, by, f, promote, e, within) => {
@@ -727,10 +730,10 @@ proptest! {
     fn budgets_hold_under_any_operations(ops in prop::collection::vec(arb_op(), 1..60)) {
         let mut t = Tree::new();
         t.add_root(1, spec(timed(64 * MIB, 100_000, 32)), 0).unwrap();
-        let (mut next, mut domains) = (1, 1);
+        let mut next = 1;
         for op in &ops {
             let before = t.clone();
-            if apply(&mut t, op, &mut next, &mut domains).is_err() {
+            if apply(&mut t, op, &mut next).is_err() {
                 prop_assert_eq!(&t, &before, "{:?} failed but changed the tree", op);
             }
             prop_assert_eq!(t.check(), Ok(()), "after {:?}", op);
@@ -744,19 +747,19 @@ proptest! {
     fn failed_allocations_change_nothing(ops in prop::collection::vec(arb_op(), 1..40)) {
         let mut t = Tree::new();
         t.add_root(1, spec(timed(64 * MIB, 100_000, 32)), 0).unwrap();
-        let (mut next, mut domains) = (1, 1);
+        let mut next = 1;
         for op in &ops {
             for k in 0.. {
                 let before = t.clone();
-                let (n, d) = (next, domains);
+                let n = next;
                 FAIL_IN.with(|f| f.set(Some(k)));
-                let r = apply(&mut t, op, &mut next, &mut domains);
+                let r = apply(&mut t, op, &mut next);
                 FAIL_IN.with(|f| f.set(None));
                 let failed = FAILED.with(|f| f.replace(false));
                 if failed && r.is_err() {
                     prop_assert_eq!(r, Err(Error::NoMemory));
                     prop_assert_eq!(&t, &before, "{:?} changed the tree", op);
-                    (next, domains) = (n, d);
+                    next = n;
                     continue;
                 }
                 prop_assert_eq!(t.check(), Ok(()));
@@ -795,3 +798,7 @@ fn a_child_avoids_the_number_it_is_told() {
     assert_ne!(t.get(6).unwrap().pid(), t.get(5).unwrap().pid());
     t.check().unwrap();
 }
+
+mod accelerators;
+mod channels;
+mod grants;
