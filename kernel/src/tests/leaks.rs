@@ -42,18 +42,18 @@ fn cells_run_alike_with_and_without_kpti() {
 }
 
 /// Hostile (finding S24): `sysinfo` shows a cell its own memory limit and
-/// use, and its own threads; a neighbour taking 32 MiB changes nothing in
+/// use, and its own threads; a neighbour taking 16 MiB changes nothing in
 /// it (it showed the kernel's free memory before).
 fn sysinfo_shows_a_cell_only_itself() {
     use rhizo_cell::quota::Quota;
     let mut host = Host::new();
     let observer = spawn(&mut host, "observer", &[b"memory"]);
     let quota = Quota {
-        memory: 64 << 20,
+        memory: 32 << 20,
         ..Quota::NONE
     };
     assert!(host.set_quota(observer, quota));
-    let neighbour = neighbour_meanwhile(&mut host, observer, &[b"neighbour", b"32", b"0"]);
+    let neighbour = neighbour_meanwhile(&mut host, observer, &[b"neighbour", b"16", b"0"]);
     assert_eq!(
         ended(&host, neighbour),
         (Ending::Exit(0), "holding\n".into())
@@ -62,7 +62,7 @@ fn sysinfo_shows_a_cell_only_itself() {
         ended(&host, observer),
         (
             Ending::Exit(0),
-            "ready\nmemory total=64 change=0 procs=1\n".into()
+            "ready\nmemory total=32 change=0 procs=1\n".into()
         )
     );
 }

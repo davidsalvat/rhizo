@@ -138,7 +138,7 @@ fn write_sized<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     0
 }
 
-pub(crate) fn socket<F, M, T, A, S>(
+pub(crate) fn socket<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     domain: u64,
     ty: u64,
@@ -170,12 +170,24 @@ pub(crate) fn socket<F, M, T, A, S>(
     open_fd(cx, h, flags)
 }
 
-/// A descriptor for new socket `h` (released if none is free).
-fn open_fd<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, h: Handle, flags: u64) -> i64 {
-    match cx
+/// A descriptor for new socket `h` (released if none is free), the
+/// socket counted against the cell's memory at its full size (design D4
+/// and D23 of `add-cell-hierarchy`) until its last descriptor closes.
+fn open_fd<F, M, T, A: Frames, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    h: Handle,
+    flags: u64,
+) -> i64 {
+    let before = cx.held();
+    if !cx.store(rhizo_net::SOCKET_BYTES) {
+        cx.net.net().release(h);
+        return -ENOMEM;
+    }
+    let opened = cx
         .fs
-        .socket_fd(h, flags & SOCK_NONBLOCK != 0, flags & SOCK_CLOEXEC != 0)
-    {
+        .socket_fd(h, flags & SOCK_NONBLOCK != 0, flags & SOCK_CLOEXEC != 0);
+    cx.settle(rhizo_net::SOCKET_BYTES, before);
+    match opened {
         Ok(fd) => fd as i64,
         Err(e) => {
             cx.net.net().release(h);
@@ -184,7 +196,7 @@ fn open_fd<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, h: Handle, flags:
     }
 }
 
-pub(crate) fn socketpair<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn socketpair<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     a: [u64; 6],
 ) -> i64 {
@@ -206,18 +218,26 @@ pub(crate) fn socketpair<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     }
     let fy = open_fd(cx, y, flags);
     if fy < 0 {
-        let _ = cx.fs.close(fx as u32);
+        close_fd(cx, fx);
         return fy;
     }
     let mut out = [0u8; 8];
     out[..4].copy_from_slice(&(fx as i32).to_le_bytes());
     out[4..].copy_from_slice(&(fy as i32).to_le_bytes());
     if cx.write(a[3], &out).is_err() {
-        let _ = cx.fs.close(fx as u32);
-        let _ = cx.fs.close(fy as u32);
+        close_fd(cx, fx);
+        close_fd(cx, fy);
         return -EFAULT;
     }
     0
+}
+
+/// Closes descriptor `fd`, which the call just opened, giving back what
+/// its socket counted.
+fn close_fd<F, M, T, A: Frames, S: Services>(cx: &mut Context<'_, F, M, T, A, S>, fd: i64) {
+    let before = cx.held();
+    let _ = cx.fs.close(fd as u32);
+    cx.settle(0, before);
 }
 
 pub(crate) fn bind<F: EntryFormat, M: PhysicalMemory, T, A, S>(
@@ -279,7 +299,7 @@ pub(crate) fn listen<F, M, T, A, S>(
     }
 }
 
-pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     addr: u64,
@@ -313,7 +333,7 @@ pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     match write_addr(cx, &peer, addr, lenp) {
         0 => new,
         e => {
-            let _ = cx.fs.close(new as u32);
+            close_fd(cx, new);
             e
         }
     }

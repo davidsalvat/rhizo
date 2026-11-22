@@ -442,18 +442,18 @@ pub(super) fn switch_ns(mut host: Host) -> u64 {
 /// counted (a quota never reached).
 fn bounded(host: &mut Host, id: u32, cells: u32) {
     let quota = Quota {
-        memory: 1 << 30,
+        memory: 20 << 20,
         cpu_ns: u64::MAX - 1,
         ..Quota::DEFAULT
     };
     assert!(host.set_limits(id, quota, cells));
 }
 
-/// A child's spec: 64 MiB, one socket, CPU time counted.
+/// A child's spec: 1 MiB, one socket, CPU time counted.
 fn child_spec() -> rhizo_cap::Spec {
     rhizo_cap::Spec {
         limits: rhizo_cap::Limits {
-            memory: 64 << 20,
+            memory: 1 << 20,
             cpu_ns: 1 << 56,
             sockets: 1,
             cells: 0,

@@ -277,6 +277,58 @@ decides another's failures, which is a storage channel.
 What accounting costs, and how CPUs are shared between subtrees while
 they run (weights and caps), are in D23. Accelerator budgets are in D24.
 
+**As built in phase 1 (tasks 1.2 and 1.3).**
+
+- **One meter.** A cell's `Meter` (`rhizo_cell::quota`) counts its frames
+  and, in bytes, the kernel memory its actions take besides them, whose
+  whole frames join the same count, so pages and kernel memory share the
+  one limit. `rhizo_mm::cow::Frames` gains `charge` and `credit`, which
+  the metered frames forward to the meter. A credit never gives back more
+  than was charged (a fork inherits its parent's files uncounted, as it
+  inherits its frames).
+- **What is counted.** `rhizo-fs` counts what its tables hold
+  (`Tables::charged`: file blocks, shared ones included, and each name at
+  its bytes plus `NAME_COST`, 256, for its entry and inode) and its open
+  socket descriptions (`socket_count`), both kept up to date where the
+  tables change, never computed by a walk. `rhizo-abi` counts the most a
+  call may add before it runs (`Context::store`: the meter first, then the
+  kernel's memory), runs it, and keeps counted only what the files hold
+  more or less after it (`Context::settle`): a write piece that needs a new
+  block counts one, an overwrite none; creating a name 512 bytes; a
+  socket `rhizo_net::SOCKET_BYTES` (its record and a full stream queue,
+  256 KiB, at least what `smoltcp` buffers for a card connection both
+  ways), from its descriptor to the close of its last; a thread record
+  from `clone` to its `exit`. Close, unlink, rename, truncate and `dup2`
+  give back what they free. Pipe buffers stay bounded per pipe, outside
+  the count; channel queues come with phase 2 and the domain's file pages
+  with task 1.8.
+- **The reserve.** The kernel keeps one `Reserve` (`memory::RESERVE`):
+  the frames the meters with a memory limit allow and do not use. Every
+  live cell's meter joins it; a meter takes what it counts out of the
+  reserve before it asks for frames, so frames and kernel memory for
+  reserved cells check only the kernel's own reserve, and everyone else
+  (cells without a limit, the image and page caches through
+  `alloc_for_cell`, `cells_may_take`) must also leave the reserve. Tracking
+  it costs a comparison per meter change, and an atomic addition only
+  when a meter with a limit changes. Suspended cells and templates hold no
+  frames aside: a suspended reserved cell is admitted again when it is
+  resumed, a copy of a reserved root when it is made.
+- **Admission.** `Tree::reserved_roots` (`rhizo-cap`) sums what the roots
+  with a memory limit reserve (`Limits::reservation`: memory, sockets and
+  one cell with its descendant limit; an unlimited socket or descendant
+  limit counts nothing). The kernel admits a reserved root, new (a
+  placement, a load, a copy of a reserved root) or raised (`set_quota`,
+  `limits`, the host's promotion), when its memory beyond what it already
+  sets aside fits what cells can take now less the reserve (the caches
+  dropped first), the sum of socket limits stays within half of
+  `SOCKETS_MAX`, and the sum of cells within `CELLS_MAX` (65,536, a new
+  bound in `rhizo_cap::limits`). Admission against free memory, not only
+  against the sum of limits, is what keeps a root's limit takeable when
+  unlimited cells already hold memory. The kernel keeps twice the
+  reserved socket limits from cells without a memory limit
+  (`Net::set_reserved`, `Ports::reserved`), and refuses a new unlimited
+  root past `CELLS_MAX` less the reserved cells.
+
 ## D5. Loopback networks
 
 Every socket in `rhizo-net` gets a network number, and everything on the

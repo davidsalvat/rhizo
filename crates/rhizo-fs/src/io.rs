@@ -96,7 +96,7 @@ impl Tables {
     fn open_target(&mut self, target: Target, flags: u32, cloexec: bool) -> Result<Fd> {
         let desc = self.new_desc(target, flags);
         self.new_fd(desc, 0, cloexec)
-            .inspect_err(|_| self.descs[desc as usize] = None)
+            .inspect_err(|_| self.free_desc(desc))
     }
 
     fn status(nonblock: bool, access: u32) -> u32 {
@@ -210,7 +210,7 @@ impl Tables {
     /// A descriptor for kernel socket `handle`. On failure the caller still
     /// holds the handle.
     pub fn socket_fd(&mut self, handle: u32, nonblock: bool, cloexec: bool) -> Result<Fd> {
-        if self.sockets().count() >= self.socket_limit {
+        if self.socket_descs as usize >= self.socket_limit {
             return Err(Error::TooManySockets);
         }
         self.open_target(Target::Socket(handle), Self::status(nonblock, 2), cloexec)
@@ -562,9 +562,7 @@ impl Tables {
             links: 1,
             node: Node::Socket(name),
         })?;
-        if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
-            entries.insert(last.to_vec(), ino);
-        }
+        self.link(dir, last, ino);
         Ok(())
     }
 

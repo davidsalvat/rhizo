@@ -45,6 +45,27 @@ descriptors, memory and CPU time.
 - **WHEN** a cell with quotas of 16 descriptors and 3 sockets makes sockets until refused, closes them, then opens files until refused
 - **THEN** it gets 3 sockets then `-ENFILE`, 13 files then `-EMFILE`, and `RLIMIT_NOFILE` reads 16
 
+### Requirement: No cell reads another through shared counters
+What the kernel tells a cell about memory (`sysinfo`) and the ephemeral
+ports it gives a cell SHALL NOT depend on what other cells allocate or
+bind, and no cell SHALL make the kernel drop the kept file pages another
+cell maps (findings S24 to S26 in `docs/security.md`). Ports other cells
+hold, pages other cells keep in the cache, cell identifiers and errors
+from pools all cells share are outside this requirement (change
+`add-cell-hierarchy`).
+
+#### Scenario: Free memory
+- **WHEN** a cell with a 32 MiB memory quota, a reserved root whose limit the kernel sets aside, reads `sysinfo`, then again while another cell holds 16 MiB
+- **THEN** it reads 32 MiB of total memory both times and the same free memory
+
+#### Scenario: Ports
+- **WHEN** another cell binds 100 sockets to ephemeral ports and closes them between two binds of a cell to port 0
+- **THEN** the cell's two ports are one apart
+
+#### Scenario: Page cache
+- **WHEN** a cell takes memory until refused while another cell maps a page of its own file
+- **THEN** that page stays kept
+
 ## ADDED Requirements
 
 ### Requirement: No storage channel between domains

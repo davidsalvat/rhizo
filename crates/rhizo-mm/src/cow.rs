@@ -39,6 +39,18 @@ pub trait Frames {
     fn metered(&self) -> Option<(u64, u64)> {
         None
     }
+    /// Counts `bytes` of kernel memory held for whoever these frames are
+    /// for (file data and names, thread and socket records, socket queues)
+    /// against its quota; `false`, counting nothing, past it. Frames that
+    /// are not metered take any.
+    fn charge(&mut self, bytes: u64) -> bool {
+        let _ = bytes;
+        true
+    }
+    /// Gives back `bytes` counted by [`charge`](Self::charge).
+    fn credit(&mut self, bytes: u64) {
+        let _ = bytes;
+    }
 }
 
 const ENTRIES: u64 = 512;

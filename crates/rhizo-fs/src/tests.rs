@@ -638,3 +638,100 @@ proptest! {
         }
     }
 }
+
+/// Design D4 of `add-cell-hierarchy`: what the tables hold for the cell,
+/// its file blocks and names, is what the kernel counts against its memory.
+#[test]
+fn metered_blocks_and_names() {
+    let mut fs = Fs::new();
+    assert_eq!(fs.charged(), 0);
+    fs.mkdir(None, b"/d").unwrap();
+    let name = NAME_COST + 1;
+    assert_eq!(fs.charged(), name);
+    let fd = fs.open(None, b"/d/file", RW, 2).unwrap();
+    assert_eq!(fs.charged(), name + NAME_COST + 4);
+    assert_eq!(fs.write(fd, &[1; 5000], None), Ok(5000));
+    let both = 2 * NAME_COST + 5;
+    assert_eq!(fs.charged(), both + 2 * BLOCK as u64, "two blocks");
+    assert_eq!(fs.write(fd, &[2], Some(100_000)), Ok(1));
+    assert_eq!(fs.charged(), both + 3 * BLOCK as u64, "a hole takes none");
+    let copy = fs.clone();
+    fs.rename(None, b"/d/file", None, b"/d/longer").unwrap();
+    assert_eq!(fs.charged(), both + 2 + 3 * BLOCK as u64);
+    assert_eq!(
+        copy.charged(),
+        both + 3 * BLOCK as u64,
+        "a fork keeps its own"
+    );
+    fs.truncate(fd, 10).unwrap();
+    assert_eq!(fs.charged(), both + 2 + BLOCK as u64);
+    fs.unlink(None, b"/d/longer", false).unwrap();
+    assert_eq!(fs.charged(), name + BLOCK as u64, "open: its block stays");
+    fs.close(fd).unwrap();
+    assert_eq!(fs.charged(), name);
+    fs.unlink(None, b"/d", true).unwrap();
+    assert_eq!(fs.charged(), 0, "everything given back");
+}
+
+/// Socket descriptions are counted, so the kernel charges each socket the
+/// cell holds; a duplicate holds the same socket.
+#[test]
+fn metered_socket_descriptions() {
+    let mut fs = Fs::new();
+    let a = fs.socket_fd(7, false, false).unwrap();
+    let b = fs.socket_fd(8, false, false).unwrap();
+    let dup = fs.dup(a, 0, false, false).unwrap();
+    assert_eq!(fs.socket_count(), 2);
+    fs.close(a).unwrap();
+    assert_eq!(fs.socket_count(), 2, "the duplicate holds it");
+    fs.close(dup).unwrap();
+    assert_eq!(fs.socket_count(), 1);
+    let mut bytes = Vec::new();
+    fs.encode(&mut bytes);
+    assert_eq!(Fs::decode(&bytes).unwrap().socket_count(), 1);
+    fs.close(b).unwrap();
+    assert_eq!(fs.socket_count(), 0);
+}
+
+proptest! {
+    /// Whatever a cell does to its files, what the tables count for it is
+    /// what a count from scratch (a decoded snapshot) finds.
+    #[test]
+    fn metered_count_matches_a_count_from_scratch(ops in prop::collection::vec(op(), 1..60)) {
+        let mut fs = Fs::new();
+        fs.mkdir(None, b"/dir").unwrap();
+        for op in ops {
+            match op {
+                Op::Write { file, at, len, byte, .. } => {
+                    let fd = fs.open(None, &path(file), RW, 2).unwrap();
+                    let _ = fs.write(fd, &vec![byte; len as usize], Some(at as u64));
+                    fs.close(fd).unwrap();
+                }
+                Op::Truncate { file, size, .. } => {
+                    if let Ok(fd) = fs.open(None, &path(file), RDONLY, 2) {
+                        let _ = fs.truncate(fd, size as u64);
+                        fs.close(fd).unwrap();
+                    }
+                }
+                Op::Unlink { file, .. } => {
+                    let _ = fs.unlink(None, &path(file), false);
+                }
+                Op::Rename { from, to, .. } => {
+                    let to = format!("/dir/renamed-{to}").into_bytes();
+                    let _ = fs.rename(None, &path(from), None, &to);
+                }
+                Op::Fork { .. } => {
+                    let copy = fs.clone();
+                    fs = copy;
+                }
+                Op::Snapshot { .. } => {}
+            }
+            let mut bytes = Vec::new();
+            fs.encode(&mut bytes);
+            prop_assert_eq!(Fs::decode(&bytes).unwrap().charged(), fs.charged());
+            let listed = names(&mut fs, b"/dir").into_iter().skip(2);
+            let names: u64 = listed.map(|n| NAME_COST + n.len() as u64).sum();
+            prop_assert_eq!(fs.charged(), fs.data_bytes() + NAME_COST + 3 + names);
+        }
+    }
+}

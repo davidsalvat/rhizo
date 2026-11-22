@@ -408,6 +408,9 @@ pub mod testing {
         pub max_refs: u32,
         /// What [`Frames::metered`] answers.
         pub metered: Option<(u64, u64)>,
+        /// Kernel memory counted by [`Frames::charge`], and its limit.
+        pub kernel: u64,
+        pub kernel_limit: u64,
     }
 
     /// Builds an ELF file of `kind` (2: executable, 3: shared object) with
@@ -470,6 +473,8 @@ pub mod testing {
                 limit: usize::MAX,
                 max_refs: u32::MAX,
                 metered: None,
+                kernel: 0,
+                kernel_limit: u64::MAX,
             }
         }
 
@@ -547,6 +552,20 @@ pub mod testing {
 
         fn metered(&self) -> Option<(u64, u64)> {
             self.metered
+        }
+
+        fn charge(&mut self, bytes: u64) -> bool {
+            match self.kernel.checked_add(bytes) {
+                Some(more) if more <= self.kernel_limit => {
+                    self.kernel = more;
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        fn credit(&mut self, bytes: u64) {
+            self.kernel = self.kernel.saturating_sub(bytes);
         }
     }
 }

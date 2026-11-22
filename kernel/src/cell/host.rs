@@ -66,6 +66,10 @@ pub struct Host {
     pub(super) ends: Vec<u32>,
     /// Ends are being applied (not again from inside).
     pub(super) settling: bool,
+    /// What this host's reserved roots hold of the kernel's sockets and
+    /// cell table (design D4 of `add-cell-hierarchy`), counted in
+    /// [`RESERVED_SOCKETS`] and [`RESERVED_CELLS`].
+    pub(super) reserved: rhizo_cap::Limits,
 }
 
 /// Words of a running cell's memory ([`Host::watch`]), read through the
@@ -123,6 +127,7 @@ impl Host {
             suspended: Vec::new(),
             ends: Vec::new(),
             settling: false,
+            reserved: rhizo_cap::Limits::ZERO,
         }
     }
 
@@ -281,6 +286,7 @@ impl Host {
             prof::add(Count::Untagged, 1);
         }
         let frames = Meter::new(0, cell.quota.frames());
+        frames.join(&memory::RESERVE);
         Box::new(Live {
             cell,
             tag: tag.unwrap_or(0),
@@ -622,5 +628,7 @@ impl Drop for Host {
             let id = template.id;
             self.drop_template(id);
         }
+        self.tree = rhizo_cap::Tree::new();
+        self.refresh_reserved();
     }
 }

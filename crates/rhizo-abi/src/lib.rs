@@ -483,6 +483,63 @@ impl<F: EntryFormat, M: PhysicalMemory, T, A, S> Context<'_, F, M, T, A, S> {
     }
 }
 
+/// Kernel memory the cell's actions take besides its pages is counted
+/// against its memory quota (design D4 of `add-cell-hierarchy`): what its
+/// files hold, and its thread records.
+impl<F, M, T, A: Frames, S: Services> Context<'_, F, M, T, A, S> {
+    /// Counts `bytes` more against the cell's memory, then asks the kernel
+    /// whether it has them: `false`, counting nothing, if either refuses.
+    /// Counted first, a cell with a memory limit takes them out of what is
+    /// set aside for it.
+    fn store(&mut self, bytes: u64) -> bool {
+        if !self.frames.charge(bytes) {
+            return false;
+        }
+        if self.services.can_store(bytes) {
+            return true;
+        }
+        self.frames.credit(bytes);
+        false
+    }
+
+    /// Whether the kernel has `bytes` more memory for the cell's pages:
+    /// what its memory limit leaves is set aside for it (design D4 of
+    /// `add-cell-hierarchy`), so only the rest is asked of the kernel.
+    fn can_map(&mut self, bytes: u64) -> bool {
+        let room = match self.frames.metered() {
+            Some((used, limit)) if limit < Quota::NONE.frames() => {
+                limit.saturating_sub(used).saturating_mul(FRAME_SIZE)
+            }
+            _ => 0,
+        };
+        bytes <= room || self.services.can_store(bytes - room)
+    }
+
+    /// Kernel memory the cell's files hold for it: file blocks and names,
+    /// and each socket it holds at its full size (`rhizo_net::SOCKET_BYTES`).
+    fn held(&self) -> u64 {
+        self.fs.charged() + u64::from(self.fs.socket_count()) * rhizo_net::SOCKET_BYTES
+    }
+
+    /// After a change to the cell's files for which [`store`](Self::store)
+    /// counted `most` (0 for none) when they held `before`: only what they
+    /// hold more, or less, stays counted.
+    fn settle(&mut self, most: u64, before: u64) {
+        let after = self.held();
+        if after == before && most == 0 {
+            return; // most calls: nothing to count
+        }
+        if after < before {
+            self.frames.credit(most + (before - after));
+        } else if after - before <= most {
+            self.frames.credit(most - (after - before));
+        } else {
+            self.frames.credit(most);
+            let _ = self.frames.charge(after - before); // more than asked
+        }
+    }
+}
+
 /// The system-call handler.
 #[derive(Debug)]
 pub struct Abi {
@@ -770,14 +827,21 @@ impl Abi {
     /// ephemeral port, with the cell's own network and ports entered into
     /// the sockets (design D2 of `close-cross-cell-leaks`, D5 of
     /// `add-cell-hierarchy`).
-    fn with_ports<'c, F, M, T, A, S: Services>(
+    fn with_ports<'c, F, M, T, A: Frames, S: Services>(
         &mut self,
         cell: &mut Cell,
         cx: &mut Context<'c, F, M, T, A, S>,
         call: impl FnOnce(&mut Context<'c, F, M, T, A, S>) -> i64,
     ) -> i64 {
+        // A cell with a memory limit is in a reserved domain, whose sockets
+        // were admitted (design D4 of `add-cell-hierarchy`).
+        let reserved = cx
+            .frames
+            .metered()
+            .is_some_and(|(_, limit)| limit < Quota::NONE.frames());
         let ports = Ports {
             next: self.next_port,
+            reserved,
             ..Ports::new(cell.id)
         };
         cx.net.net().enter(ports);
@@ -813,7 +877,7 @@ fn sleep(cell: &mut Cell, until: u64) -> Outcome {
 }
 
 /// `writev`, or `readv` with `read`.
-fn writev<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+fn writev<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     iov: u64,
@@ -862,7 +926,7 @@ fn brk<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
     let (old_end, new_end) = (align_up(cell.brk, FRAME_SIZE), align_up(want, FRAME_SIZE));
     // Memory that cannot be had is refused before any of it is zeroed.
     let ok = if new_end > old_end {
-        cx.services.can_store(new_end - old_end)
+        cx.can_map(new_end - old_end)
             && space::map_anonymous(
                 &cx.pt,
                 cx.mem,
@@ -1019,7 +1083,7 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
         addr
     };
     let wx = is_wx(prot);
-    if prot != 0 && !wx && anonymous && !cx.services.can_store(len) {
+    if prot != 0 && !wx && anonymous && !cx.can_map(len) {
         return -ENOMEM; // refused before any of it is zeroed
     }
     let Ok(ranges) = wx_after(cx.pager.wx(), addr, addr + len, wx, fixed) else {

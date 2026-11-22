@@ -237,6 +237,47 @@ fn promotion_moves_the_reservation() {
     t.check().unwrap();
 }
 
+/// Design D4, roots and admission: only roots with a memory limit count,
+/// with their socket limits and descendant charges; promotion by a parent
+/// moves a reservation, the host's adds one.
+#[test]
+fn reserved_roots_add_up() {
+    let mut t = Tree::new();
+    assert_eq!(t.reserved_roots(), Limits::ZERO);
+    t.add_root(1, spec(limits(64 * MIB, 4)), 0).unwrap();
+    t.add_root(2, spec(Limits::UNLIMITED), 0).unwrap();
+    let wide = Limits {
+        sockets: u32::MAX,
+        cells: u32::MAX,
+        ..limits(8 * MIB, 0)
+    };
+    t.add_root(3, spec(wide), 0).unwrap();
+    let both = Limits {
+        memory: 72 * MIB,
+        cpu_ns: 0,
+        sockets: 64,
+        cells: 6,
+    };
+    assert_eq!(t.reserved_roots(), both);
+    t.add_child(4, 1, spec(limits(16 * MIB, 1)), Actor::Host, &none)
+        .unwrap();
+    assert_eq!(t.reserved_roots(), both, "children are carved, not added");
+    t.reparent(4, HOST, Actor::Cell(1), &none, &mut fresh())
+        .unwrap();
+    assert_eq!(t.reserved_roots(), both, "a parent's promotion moves it");
+    t.end(4, &mut fresh()).unwrap();
+    t.end(1, &mut fresh()).unwrap();
+    assert_eq!(
+        t.reserved_roots(),
+        Limits {
+            memory: 8 * MIB,
+            cpu_ns: 0,
+            sockets: 0,
+            cells: 1,
+        }
+    );
+}
+
 #[test]
 fn the_host_promotes_without_shrinking() {
     let mut t = Tree::new();

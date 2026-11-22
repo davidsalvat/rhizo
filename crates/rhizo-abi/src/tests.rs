@@ -1062,6 +1062,40 @@ fn file_writes_stop_when_the_kernel_refuses_memory() {
     );
 }
 
+/// Design D4 of `add-cell-hierarchy`: file blocks and names, sockets and
+/// thread records count against the cell's memory while it holds them.
+#[test]
+fn files_sockets_and_threads_are_metered() {
+    let mut w = World::new(Arch::Aarch64);
+    let block = rhizo_fs::BLOCK as u64;
+    w.frames.kernel_limit = 2 * block;
+    let p = name(&mut w, "/f");
+    let fd = w.call(OPENAT, &[AT_FDCWD, p, 0x42]).0 as u64;
+    let named = rhizo_fs::NAME_COST + 1;
+    assert_eq!(w.frames.kernel, named, "only the name is counted");
+    w.poke(DATA, &[1; 4000]);
+    assert_eq!(w.call(WRITE, &[fd, DATA, 4000]).0, 4000);
+    assert_eq!(w.frames.kernel, named + block);
+    assert_eq!(w.call(WRITE, &[fd, DATA, 96]).0, 96, "same block");
+    assert_eq!(w.call(WRITE, &[fd, DATA, 4000]).0, -28, "ENOSPC");
+    assert_eq!(w.frames.kernel, named + block, "a refusal counts nothing");
+    assert_eq!(w.call(CLOSE, &[fd]).0, 0);
+    let p = name(&mut w, "/f");
+    assert_eq!(w.call(35 /* unlinkat */, &[AT_FDCWD, p, 0]).0, 0);
+    assert_eq!(w.frames.kernel, 0, "everything given back");
+    assert_eq!(w.call(198 /* socket */, &[2, 1, 0]).0, -ENOMEM, "too big");
+    w.frames.kernel_limit = u64::MAX;
+    let s = w.call(198, &[2, 1, 0]).0 as u64;
+    assert_eq!(w.frames.kernel, rhizo_net::SOCKET_BYTES);
+    assert_eq!(w.call(CLOSE, &[s]).0, 0);
+    assert_eq!(w.frames.kernel, 0);
+    assert!(w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]).0 > 0);
+    assert_eq!(
+        w.frames.kernel,
+        size_of::<rhizo_cell::threads::Thread>() as u64
+    );
+}
+
 #[test]
 fn select_without_descriptors_sleeps() {
     let mut w = World::new(Arch::X86_64);

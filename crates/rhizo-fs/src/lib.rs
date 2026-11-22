@@ -45,6 +45,10 @@ pub const DATA_MAX: u64 = 256 << 20;
 /// Most files and directories a cell may have (the root included): bounds
 /// the kernel memory its names take, and so how deep a path can nest.
 pub const INODES_MAX: usize = 4096;
+/// Kernel memory a name takes besides its bytes, counted against the
+/// cell's memory ([`Tables::charged`]): its directory entry, and the inode
+/// it most often is the only name of (an estimate, on the high side).
+pub const NAME_COST: u64 = 256;
 const ROOT: Ino = 0;
 
 /// Why an operation failed, with its Linux error number.
@@ -320,6 +324,10 @@ pub struct Tables {
     cwd: Ino,
     /// File blocks held (shared ones included), at most `DATA_MAX / BLOCK`.
     used: u64,
+    /// Bytes the directory entries take: [`NAME_COST`] and the name each.
+    names: u64,
+    /// Open socket descriptions.
+    socket_descs: u32,
     /// Pipes, event counters and `epoll` instances.
     objects: Vec<Option<Arc<io::Object>>>,
     /// Socket handles whose last description closed, for the kernel to
@@ -360,6 +368,8 @@ impl Tables {
             fds: vec![Some((0, false)); 3],
             cwd: ROOT,
             used: 0,
+            names: 0,
+            socket_descs: 0,
             objects: Vec::new(),
             released: Vec::new(),
             fd_limit: FD_MAX,
@@ -426,6 +436,45 @@ impl Tables {
             }
             self.inodes[ino as usize] = None;
         }
+    }
+
+    /// Names `ino` `name` in directory `dir`.
+    fn link(&mut self, dir: Ino, name: &[u8], ino: Ino) {
+        if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
+            entries.insert(name.to_vec(), ino);
+            self.names += NAME_COST + name.len() as u64;
+        }
+    }
+
+    /// Removes the name `name` from directory `dir`.
+    fn unlink_name(&mut self, dir: Ino, name: &[u8]) {
+        if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node
+            && entries.remove(name).is_some()
+        {
+            self.names -= NAME_COST + name.len() as u64;
+        }
+    }
+
+    /// Frees description `d`.
+    fn free_desc(&mut self, d: u32) {
+        if let Some(desc) = self.descs[d as usize].take()
+            && matches!(desc.target, Target::Socket(_))
+        {
+            self.socket_descs -= 1;
+        }
+    }
+
+    /// Kernel memory these tables hold for the cell, counted against its
+    /// memory (design D4 of `add-cell-hierarchy`): its file blocks, shared
+    /// ones included, and its names. A fork starts with its parent's.
+    pub fn charged(&self) -> u64 {
+        self.used * BLOCK as u64 + self.names
+    }
+
+    /// Open socket descriptions: each holds a socket of the kernel, which
+    /// the kernel counts against the cell's memory.
+    pub fn socket_count(&self) -> u32 {
+        self.socket_descs
     }
 
     fn desc(&self, fd: Fd) -> Result<&Desc> {
@@ -552,6 +601,9 @@ impl Tables {
     }
 
     fn new_desc(&mut self, target: Target, flags: u32) -> u32 {
+        if matches!(target, Target::Socket(_)) {
+            self.socket_descs += 1;
+        }
         let desc = Some(Desc {
             target,
             offset: 0,
@@ -589,14 +641,14 @@ impl Tables {
                 if path.ends_with(b"/") {
                     return Err(Error::IsDir);
                 }
+                if !matches!(self.inode(dir).node, Node::Dir { .. }) {
+                    return Err(Error::NotDir);
+                }
                 let ino = self.alloc_inode(Inode {
                     links: 1,
                     node: Node::File(File::default()),
                 })?;
-                let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node else {
-                    return Err(Error::NotDir);
-                };
-                entries.insert(name.to_vec(), ino);
+                self.link(dir, name, ino);
                 ino
             }
             Err(e) => return Err(e),
@@ -621,7 +673,7 @@ impl Tables {
         }
         let desc = self.new_desc(Target::Inode(ino), access);
         self.new_fd(desc, 0, false)
-            .inspect_err(|_| self.descs[desc as usize] = None)
+            .inspect_err(|_| self.free_desc(desc))
     }
 
     /// Opens, read only, a new file holding `data` (at most one block)
@@ -635,7 +687,7 @@ impl Tables {
         })?;
         let desc = self.new_desc(Target::Inode(ino), 0); // O_RDONLY
         let Ok(fd) = self.new_fd(desc, 0, false) else {
-            self.descs[desc as usize] = None;
+            self.free_desc(desc);
             self.maybe_free(ino);
             return Err(Error::TooManyFiles);
         };
@@ -666,7 +718,7 @@ impl Tables {
         desc.refs -= 1;
         if desc.refs == 0 {
             let target = desc.target;
-            self.descs[d as usize] = None;
+            self.free_desc(d);
             match target {
                 Target::Inode(ino) => self.maybe_free(ino),
                 Target::Socket(h) => self.released.push(h),
@@ -805,6 +857,16 @@ impl Tables {
             _ => &HOLE[..],
         };
         Ok(drain(&block[off..off + n]).then_some(n))
+    }
+
+    /// Whether file `fd` has a block holding byte `at` (a write there takes
+    /// no new one).
+    pub fn holds_block(&self, fd: Fd, at: u64) -> bool {
+        self.file_of(fd).is_ok_and(|(_, file, _)| {
+            file.blocks
+                .get((at / BLOCK as u64) as usize)
+                .is_some_and(Option::is_some)
+        })
     }
 
     /// Hands `fill` the file bytes of `fd` from `at`, at most `len` and
@@ -1058,9 +1120,7 @@ impl Tables {
                 parent: dir,
             },
         })?;
-        if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
-            entries.insert(name.to_vec(), ino);
-        }
+        self.link(dir, name, ino);
         Ok(())
     }
 
@@ -1083,9 +1143,7 @@ impl Tables {
             (Node::File(_) | Node::Socket(_), true) => return Err(Error::NotDir),
             _ => {}
         }
-        if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
-            entries.remove(name);
-        }
+        self.unlink_name(dir, name);
         let inode = self.inode_mut(ino);
         inode.links -= 1;
         if let Node::Dir { parent, .. } = &mut inode.node {
@@ -1145,9 +1203,7 @@ impl Tables {
                 }
                 _ => {}
             }
-            if let Node::Dir { entries, .. } = &mut self.inode_mut(to_dir).node {
-                entries.remove(to_name);
-            }
+            self.unlink_name(to_dir, to_name);
             let inode = self.inode_mut(target);
             inode.links -= 1;
             if let Node::Dir { parent, .. } = &mut inode.node {
@@ -1155,12 +1211,8 @@ impl Tables {
             }
             self.maybe_free(target);
         }
-        if let Node::Dir { entries, .. } = &mut self.inode_mut(from_dir).node {
-            entries.remove(from_name);
-        }
-        if let Node::Dir { entries, .. } = &mut self.inode_mut(to_dir).node {
-            entries.insert(to_name.to_vec(), ino);
-        }
+        self.unlink_name(from_dir, from_name);
+        self.link(to_dir, to_name, ino);
         if let Node::Dir { parent, .. } = &mut self.inode_mut(ino).node {
             *parent = to_dir;
         }

@@ -9,6 +9,8 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(identifiers_are_per_domain),
     ktest_case!(tree_operations),
     ktest_case!(cascade_and_promote),
+    ktest_case!(files_count_in_the_memory_limit),
+    ktest_case!(a_reserved_root_keeps_its_memory),
 ];
 
 const MIB: u64 = 1 << 20;
@@ -209,4 +211,66 @@ fn cascade_and_promote() {
     let before = free_or_in_heap();
     round();
     assert_eq!(free_or_in_heap(), before, "every frame came back");
+}
+
+/// Spec `cell-hierarchy`, "Files count": a cell with an 8 MiB memory limit
+/// that writes a file until refused has taken at most 8 MiB in all, its
+/// file data counted with its pages; all of it comes back.
+fn files_count_in_the_memory_limit() {
+    const LIMIT: u64 = 8 * MIB;
+    let before = memory_balance();
+    let mut host = Host::new();
+    let hog = spawn(&mut host, "hog", &[b"write"]);
+    assert!(host.set_quota(hog, quota(8)));
+    while host.output(hog) != Some(b"exhausted\n") {
+        host.step();
+    }
+    let charged = host.charged_frames(hog).expect("still live") * FRAME_SIZE;
+    // Refused within the last block (and the name's share of a frame).
+    assert!(
+        charged <= LIMIT && charged > LIMIT - (16 << 10),
+        "{charged}"
+    );
+    host.run(|_| false);
+    assert_eq!(ended(&host, hog), (Ending::Exit(0), "exhausted\n".into()));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame came back");
+}
+
+/// Spec `cell-hierarchy`, "Unlimited neighbour": once a cell without a
+/// memory limit has taken memory until refused, a reserved root of 32 MiB
+/// next to it still takes all of its 32 MiB; and the kernel refuses to make
+/// a root reserved when what cells can take no longer holds its limit.
+fn a_reserved_root_keeps_its_memory() {
+    const LIMIT: u64 = 32 * MIB;
+    let before = memory_balance();
+    let mut host = Host::new();
+    let reserved = spawn(&mut host, "hog", &[b"wait"]);
+    assert!(host.set_quota(reserved, quota(32)));
+    let late = idle(&mut host);
+    let unlimited = spawn(&mut host, "hog", &[b"hold"]);
+    while host.output(unlimited) != Some(b"exhausted\n") {
+        host.step();
+    }
+    assert!(!host.set_quota(late, quota(64)), "no room to set aside");
+    assert!(host.write_file(reserved, b"/go", b""));
+    while host.output(reserved) != Some(b"exhausted\n") {
+        host.step();
+    }
+    let charged = host.charged_frames(reserved).expect("still live") * FRAME_SIZE;
+    // `mmap` takes 1 MiB at a time, then `brk` 64 KiB.
+    assert!(
+        charged <= LIMIT && charged > LIMIT - (128 << 10),
+        "{charged}"
+    );
+    for id in [unlimited, late] {
+        assert!(host.kill(id));
+    }
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, reserved),
+        (Ending::Exit(0), "exhausted\n".into())
+    );
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame came back");
 }

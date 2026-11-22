@@ -64,6 +64,13 @@ pub const DGRAM_BUF: usize = 256 << 10;
 pub const DGRAM_MAX: usize = 65_507;
 /// Most sockets open at once in the kernel.
 pub const SOCKETS_MAX: usize = 4096;
+/// Kernel memory one socket may take, counted against the memory of the
+/// cell holding it from when it is made (design D4 and D23 of
+/// `add-cell-hierarchy`, never per packet): its record and its queue
+/// filled, which is at least what `smoltcp` buffers for a connection
+/// through the card both ways.
+pub const SOCKET_BYTES: u64 = (STREAM_BUF + size_of::<Socket>()) as u64;
+const _: () = assert!(STREAM_BUF >= 2 * wire::TCP_BUF && DGRAM_BUF <= STREAM_BUF);
 /// Largest accepted `listen` backlog.
 pub const BACKLOG_MAX: usize = 4096;
 /// Longest Unix socket path (`sun_path` without its NUL).
@@ -335,6 +342,10 @@ pub struct Ports {
     /// policy or the deny floor (`EACCES`), for the audit log (design D7
     /// and D18 of `add-cell-hierarchy`); `None` if none was.
     pub denied: Option<(Proto, [u8; 4], u16)>,
+    /// The cell has a memory limit, so its sockets were reserved for its
+    /// domain (design D4 of `add-cell-hierarchy`): it may take sockets that
+    /// [`Net::set_reserved`] keeps from the others.
+    pub reserved: bool,
 }
 
 impl Ports {
@@ -345,6 +356,7 @@ impl Ports {
             next: 0,
             out: false,
             denied: None,
+            reserved: false,
         }
     }
 }
@@ -386,6 +398,9 @@ pub struct Net {
     carved: Vec<Rule>,
     /// Card ports drawn so far.
     card_draws: u64,
+    /// Sockets kept for the cells of reserved domains, which no other
+    /// cell's call may take ([`set_reserved`](Self::set_reserved)).
+    reserved: usize,
     /// The sockets the current call looked at: its waiter joins their wait
     /// queues if it blocks ([`end_call`](Self::end_call)).
     looked: RefCell<Vec<Handle>>,
@@ -439,7 +454,22 @@ impl Net {
             floor: Vec::new(),
             carved: Vec::new(),
             card_draws: 0,
+            reserved: 0,
         }
+    }
+
+    /// Keeps `n` sockets for the cells of reserved domains (design D4 of
+    /// `add-cell-hierarchy`: twice their roots' socket limits, a connection
+    /// costing two): a call of a cell without a memory limit is refused a
+    /// socket that would leave fewer free. The kernel's own calls and those
+    /// of reserved cells are not.
+    pub fn set_reserved(&mut self, n: usize) {
+        self.reserved = n;
+    }
+
+    /// The sockets [`set_reserved`](Self::set_reserved) keeps.
+    pub fn reserved(&self) -> usize {
+        self.reserved
     }
 
     /// Sets the egress policy of network `net` (design D7 of
@@ -686,7 +716,11 @@ impl Net {
     }
 
     fn insert(&mut self, socket: Socket) -> Result<Handle> {
-        if self.open >= SOCKETS_MAX {
+        let kept = match self.caller {
+            Some(c) if !c.reserved => self.reserved,
+            _ => 0,
+        };
+        if self.open.saturating_add(kept) >= SOCKETS_MAX {
             return Err(Error::TooMany);
         }
         self.open += 1;

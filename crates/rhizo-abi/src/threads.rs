@@ -1,7 +1,7 @@
 //! Threads of a cell (spec `threads`): `clone`, `clone3`, the exit of one
 //! thread, and futexes (design D3 and D5 of `add-threads`).
 
-use super::{Context, Services, errno::*, timespec_ns};
+use super::{Context, Frames, Services, errno::*, timespec_ns};
 use rhizo_cell::Cell;
 use rhizo_cell::threads::{Thread, Wait};
 use rhizo_hal::PhysicalMemory;
@@ -46,9 +46,12 @@ pub(crate) struct CloneArgs {
     pub child_tid: u64,
 }
 
+/// Kernel memory a thread's record takes.
+const THREAD_BYTES: u64 = size_of::<Thread>() as u64;
+
 /// Creates a thread (spec `threads`, creating threads and refused clones);
 /// returns its identifier or a negated `errno`.
-pub(crate) fn clone<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn clone<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
     args: CloneArgs,
@@ -64,7 +67,9 @@ pub(crate) fn clone<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     if args.flags & CLONE_SETTLS != 0 && args.tls >= LOWER_HALF_END {
         return -EPERM;
     }
-    if !cx.services.can_store(size_of::<Thread>() as u64) {
+    // Its record counts against the cell's memory (design D4 of
+    // `add-cell-hierarchy`) until it exits.
+    if !cx.store(THREAD_BYTES) {
         return -EAGAIN;
     }
     let mut regs = *cell.regs();
@@ -81,6 +86,7 @@ pub(crate) fn clone<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         _ => args.child_tid,
     };
     let Some(tid) = cell.threads.spawn(regs, clear) else {
+        cx.frames.credit(THREAD_BYTES);
         return -EAGAIN;
     };
     // As on Linux, a bad address here does not undo the thread.
@@ -147,13 +153,14 @@ pub(crate) fn clone3_args<F: EntryFormat, M: PhysicalMemory, T, A, S>(
 
 /// `exit` of a thread that is not the last: its clear-tid word is zeroed
 /// and one waiter on it woken (what `pthread_join` waits for).
-pub(crate) fn exit_thread<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn exit_thread<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S>(
     cell: &mut Cell,
     cx: &mut Context<'_, F, M, T, A, S>,
 ) {
     let Some(gone) = cell.threads.exit_current() else {
         return;
     };
+    cx.frames.credit(THREAD_BYTES);
     if gone.clear_tid != 0 && cx.write(gone.clear_tid, &0u32.to_le_bytes()).is_ok() {
         cell.threads.wake(gone.clear_tid, u32::MAX, 1);
     }

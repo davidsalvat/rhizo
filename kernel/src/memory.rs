@@ -272,19 +272,35 @@ fn reserve_frames(f: &FrameAllocator<'_>) -> usize {
     (f.usable_frames() / 8).min((8 << 20) / FRAME_SIZE as usize)
 }
 
+/// Frames set aside for the cells of reserved domains (design D4 of
+/// `add-cell-hierarchy`): what their memory limits leave unused. Their
+/// meters join it, and take what they count out of it first, so only the
+/// kernel's caches and cells without a memory limit are kept off it.
+#[cfg(feature = "cells")]
+pub static RESERVE: rhizo_cell::quota::Reserve = rhizo_cell::quota::Reserve::new();
+
+/// Frames cells and the kernel's caches may not take: the kernel's
+/// reserve, and what is set aside for reserved domains.
+#[cfg(feature = "cells")]
+fn kept_frames(f: &FrameAllocator<'_>) -> u64 {
+    reserve_frames(f) as u64 + RESERVE.frames()
+}
+
 /// Whether cells may take `bytes` more (frames or heap) and still leave the
-/// kernel its reserve.
+/// kernel its reserve and reserved domains what is set aside for them.
 #[cfg(feature = "cells")]
 pub fn cells_may_take(bytes: u64) -> bool {
-    with_frames(|f| f.free_frames() as u64 >= reserve_frames(f) as u64 + bytes.div_ceil(FRAME_SIZE))
+    with_frames(|f| f.free_frames() as u64 >= kept_frames(f) + bytes.div_ceil(FRAME_SIZE))
         .unwrap_or(false)
 }
 
-/// Allocates `count` contiguous frames for a cell, keeping the reserve.
+/// Allocates `count` contiguous frames for a cell or a cache, keeping the
+/// reserve and what is set aside for reserved domains (a reserved cell's
+/// meter took these frames out of it before asking).
 #[cfg(feature = "cells")]
 pub fn alloc_for_cell(count: usize) -> Option<u64> {
     with_frames(|f| {
-        if f.free_frames() < reserve_frames(f) + count {
+        if (f.free_frames() as u64) < kept_frames(f) + count as u64 {
             return None;
         }
         match count {

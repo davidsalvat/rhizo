@@ -355,12 +355,29 @@ impl Tables {
                 _ => 0,
             })
             .sum();
+        let names = inodes
+            .iter()
+            .flatten()
+            .map(|i| match &i.node {
+                Node::Dir { entries, .. } => {
+                    entries.keys().map(|n| NAME_COST + n.len() as u64).sum()
+                }
+                _ => 0,
+            })
+            .sum();
+        let socket_descs = descs
+            .iter()
+            .flatten()
+            .filter(|d| matches!(d.target, Target::Socket(_)))
+            .count() as u32;
         Ok(Tables {
             inodes,
             descs,
             fds,
             cwd,
             used,
+            names,
+            socket_descs,
             objects,
             released: Vec::new(),
             fd_limit: FD_MAX,

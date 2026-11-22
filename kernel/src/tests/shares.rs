@@ -18,11 +18,12 @@ pub(super) const ALL: &[TestCase] = &[
 
 const MIB: u64 = 1 << 20;
 
-/// A root's limits: 1 GiB, CPU time counted (a quota no test reaches),
-/// and room for `cells` descendants.
+/// A root's limits: 20 MiB (a reserved root, admitted against the memory
+/// cells can take: design D4 of `add-cell-hierarchy`), CPU time counted (a
+/// quota no test reaches), and room for `cells` descendants.
 fn parent(host: &mut Host, id: u32, cells: u32) {
     let quota = Quota {
-        memory: 1 << 30,
+        memory: 20 * MIB,
         cpu_ns: u64::MAX - 1,
         ..Quota::DEFAULT
     };
@@ -78,7 +79,7 @@ fn domains_share_by_weight() {
         many.push(spinner_under(
             &mut host,
             root,
-            child(32, 1 << 56, 0, u32::MAX),
+            child(1, 1 << 56, 0, u32::MAX),
         ));
     }
     let one = spawn(&mut host, "spin", &[]);
@@ -152,10 +153,10 @@ fn cpu_cap_holds() {
     let mut host = Host::new();
     let root = spawn(&mut host, "idle", &[]);
     parent(&mut host, root, 2);
-    let top = spinner_under(&mut host, root, child(256, 1 << 60, 1, 250));
+    let top = spinner_under(&mut host, root, child(8, 1 << 60, 1, 250));
     let capped = [
         top,
-        spinner_under(&mut host, top, child(64, 1 << 58, 0, 250)),
+        spinner_under(&mut host, top, child(1, 1 << 58, 0, 250)),
     ];
     let t0 = now_ns();
     host.run_until(t0 + 1_000_000_000, |_| false);
@@ -221,7 +222,7 @@ fn exclusive_sets_hold() {
     parent(&mut host, root, 2);
     host.place(root, HOST, with(set, 2), 0).expect("its set");
     let threads = spawn(&mut host, "threads", &[b"spin", b"3"]);
-    let child_spec = child(32, 1 << 56, 0, u32::MAX);
+    let child_spec = child(1, 1 << 56, 0, u32::MAX);
     host.adopt(threads, root, child_spec.clone(), Actor::Host)
         .expect("placed");
     let inside = [root, spinner_under(&mut host, root, child_spec), threads];

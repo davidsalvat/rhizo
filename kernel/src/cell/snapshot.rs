@@ -177,6 +177,10 @@ impl Host {
     pub fn fork(&mut self, id: u32, n: usize) -> Option<Vec<u32>> {
         let _p = cost::scope(Part::Spawn);
         let (mut parent, wake) = self.take_cell(id)?;
+        if parent.cell.quota.memory != u64::MAX && !self.admits_copies(id, n) {
+            self.requeue(parent, wake);
+            return None;
+        }
         let pt = PageTable::<Format>::from_root(parent.cell.root);
         if let Some(lazy) = parent.demand.lazy.as_mut() {
             lazy.finish(&pt, &parent.frames);
@@ -424,6 +428,9 @@ impl Host {
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
         let _p = cost::scope(Part::Spawn);
         let index = self.templates.iter().position(|(c, ..)| c.id == id)?;
+        if self.templates[index].0.quota.memory != u64::MAX && !self.admits_copies(id, 1) {
+            return None;
+        }
         let (cell, fs, wx) = &self.templates[index];
         let (cell, fs, wx) = (cell.clone(), fs.clone(), wx.clone());
         let mut child = self.child_of(&cell, &fs, &wx, capture, echo)?;
