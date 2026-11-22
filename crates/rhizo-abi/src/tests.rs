@@ -112,7 +112,10 @@ impl World {
         let ro = PageFlags::USER | PageFlags::NO_EXECUTE;
         space::map_anonymous(&pt, &mut mem, &mut tlb, &mut frames, RO, FRAME_SIZE, ro).unwrap();
         Self {
-            cell: Cell::new(5, pt.root(), 0x40_0000, STACK_TOP - 64, HEAP),
+            cell: Cell {
+                domain: 5, // a root's domain is its identifier
+                ..Cell::new(5, pt.root(), 0x40_0000, STACK_TOP - 64, HEAP)
+            },
             abi: Abi::new(arch),
             mem,
             tlb,

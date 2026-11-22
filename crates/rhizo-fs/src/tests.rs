@@ -123,6 +123,52 @@ fn pages_name_their_bytes_while_held() {
     assert_eq!(fs.file(0).unwrap_err(), Error::Invalid, "the console");
 }
 
+/// Design D21 of `add-cell-hierarchy`: files the host publishes are
+/// public in every copy given them, until a cell writes or truncates its
+/// own (in that cell only); new files, and files read back from bytes, are
+/// never public.
+#[test]
+fn published_files_stay_public_until_written() {
+    let public = |fs: &Fs, path: &[u8]| {
+        let (ino, _) = fs.file_at(path).unwrap();
+        fs.page(ino, 0).unwrap().is_public()
+    };
+    let mut set = Fs::new();
+    for path in [&b"/lib/a.so"[..], b"/lib/b.so", b"/lib/c.so", b"/app"] {
+        set.put_file(path, &[1u8; 100]).unwrap();
+    }
+    assert!(!public(&set, b"/lib/a.so"), "private until published");
+    set.publish();
+    let listed: Vec<u64> = set.files().map(|(_, size)| size).collect();
+    assert_eq!(listed, [100; 4], "every regular file, no directory");
+    let mut cell = set.clone();
+    assert!(public(&cell, b"/lib/a.so") && public(&cell, b"/app"));
+    let fd = cell.open(None, b"/lib/a.so", RW, 2).unwrap();
+    cell.write(fd, b"!", Some(50)).unwrap();
+    assert!(!public(&cell, b"/lib/a.so"), "written");
+    assert!(
+        public(&set, b"/lib/a.so"),
+        "the set's own file stays public"
+    );
+    let fd = cell.open(None, b"/lib/b.so", RW, 2).unwrap();
+    cell.truncate(fd, 100).unwrap();
+    assert!(!public(&cell, b"/lib/b.so"), "truncated, even to its size");
+    let trunc = OpenFlags {
+        write: true,
+        truncate: true,
+        ..OpenFlags::default()
+    };
+    cell.open(None, b"/lib/c.so", trunc, 2).unwrap();
+    cell.put_file(b"/lib/c.so", &[1u8; 100]).unwrap();
+    assert!(!public(&cell, b"/lib/c.so"), "emptied and written again");
+    cell.rename(None, b"/app", None, b"/moved").unwrap();
+    assert!(public(&cell, b"/moved"), "a name change keeps the contents");
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes);
+    let decoded = Fs::decode(&bytes).unwrap();
+    assert!(!public(&decoded, b"/lib/a.so"), "bytes hold no publication");
+}
+
 #[test]
 fn console_is_open_and_lowest_fd_is_reused() {
     let mut fs = Fs::new();

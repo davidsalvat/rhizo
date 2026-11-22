@@ -36,6 +36,28 @@ pub fn drop_images() -> bool {
     PAGES.with(|pages| pages.trim(&mut ImageFrames)) || any
 }
 
+/// The read-only pages of the executables kept loaded, sorted: frames of
+/// public objects, which copies into other domains share (design D21 of
+/// `add-cell-hierarchy`). Gathered on demand, by the rare operations that
+/// need them.
+pub(super) fn image_frames() -> Vec<u64> {
+    let mut frames = Vec::new();
+    IMAGES.with(|images| {
+        for root in images.roots() {
+            PageTable::<Format>::from_root(root).for_each_lower_leaf(
+                &DirectMap,
+                &mut |_, phys, _, flags| {
+                    if !flags.is_writable() && !flags.contains(PageFlags::COPY_ON_WRITE) {
+                        frames.push(phys);
+                    }
+                },
+            );
+        }
+    });
+    frames.sort_unstable();
+    frames
+}
+
 /// Whether cells may take `bytes` more, dropping the images kept loaded if
 /// that is what it takes (design D4 of `add-image-cache`).
 pub(crate) fn cells_may_take(bytes: u64) -> bool {

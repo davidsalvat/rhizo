@@ -2,8 +2,9 @@
 //! `control-plane`, design D2 of `add-control-plane`): the host asks the
 //! kernel to run, list, suspend, resume, fork and kill cells, to freeze
 //! them into templates, to save and load snapshots as bytes (change
-//! `snapshots-on-disk`), and to place and move cells in the cell tree
-//! (version 4, design D14 of `add-cell-hierarchy`); the kernel answers each
+//! `snapshots-on-disk`), to place and move cells in the cell tree and to
+//! publish templates (version 4, design D14 and D21 of
+//! `add-cell-hierarchy`); the kernel answers each
 //! request with its outcome and the time it took.
 //!
 //! Both directions carry the same frames on one byte stream, which may also
@@ -89,6 +90,8 @@ mod kind {
     pub const LIMITS: u8 = 0x12;
     pub const SCOPED: u8 = 0x13;
     pub const FLOOR: u8 = 0x14;
+    pub const PUBLISH: u8 = 0x15;
+    pub const WITHDRAW: u8 = 0x16;
     // Kernel to host.
     pub const HELLO: u8 = 0x80;
     pub const DONE: u8 = 0x81;
@@ -822,6 +825,14 @@ pub enum Request {
     /// reaches it, through the network card); replies [`Body::Bytes`],
     /// their total, once the host has them all.
     Save { cell: u32, host: Host },
+    /// Publish a template (version 4, design D21 of `add-cell-hierarchy`):
+    /// its copies placed in any domain share its frames. Refused for a
+    /// template whose cell reached the network card unless `attest`: the
+    /// host's word that it holds no secret, which the kernel audits.
+    Publish { cell: u32, attest: bool },
+    /// End a template's publication (version 4): later copies placed in
+    /// another domain are full copies.
+    Withdraw(u32),
     /// Fetch a snapshot of `size` bytes over TCP from `port` at `host`, and
     /// make it a suspended cell, or a template; replies [`Body::Cell`].
     Load {
@@ -989,6 +1000,14 @@ impl Request {
                 w.rules(deny).rules(carved);
                 kind::FLOOR
             }
+            Request::Publish { cell, attest } => {
+                w.u32(*cell).u8(*attest as u8);
+                kind::PUBLISH
+            }
+            Request::Withdraw(cell) => {
+                w.u32(*cell);
+                kind::WITHDRAW
+            }
             Request::Scoped { root, request } => {
                 // A nested one is written, and refused when read.
                 let inner = request.encode_as(VERSION, 0)?;
@@ -1112,6 +1131,11 @@ impl Request {
                 cell: r.u32()?,
                 limits: r.limits()?,
             },
+            kind::PUBLISH => Request::Publish {
+                cell: r.u32()?,
+                attest: r.flag()?,
+            },
+            kind::WITHDRAW => Request::Withdraw(r.u32()?),
             kind::SCOPED if outer => {
                 let root = r.u32()?;
                 let kind = r.u8()?;

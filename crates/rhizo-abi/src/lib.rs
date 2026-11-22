@@ -17,7 +17,7 @@ mod sockets;
 mod threads;
 
 pub use exec::{ExecError, exec};
-pub use pages::{FilePages, PageCache, Share, own_copy};
+pub use pages::{FilePages, PUBLIC, PageCache, Share, own_copy};
 
 use core::fmt;
 use rhizo_cell::memory::{self, Pager};
@@ -1048,7 +1048,10 @@ fn mmap<F: EntryFormat, M: PhysicalMemory, T: Tlb, A: Frames, S: Services>(
                 addr,
                 len,
                 pf,
-                &mut |i, mem, frames| pages.frame(&fs.page(ino, first + i).ok()?, mem, frames),
+                &mut |i, mem, frames| {
+                    let page = fs.page(ino, first + i).ok()?;
+                    pages.frame(&page, cell.domain, mem, frames)
+                },
             )
         }
     };

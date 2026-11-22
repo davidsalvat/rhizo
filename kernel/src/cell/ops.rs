@@ -179,6 +179,17 @@ impl Host {
         self.set_quota(id, quota) && self.set_limits_from(id, &quota, Some(cells))
     }
 
+    /// The frame live cell `id` maps at `addr`, if any: which frames cells
+    /// share (design D21 of `add-cell-hierarchy`).
+    #[cfg(feature = "ktest")]
+    pub fn frame_of(&mut self, id: u32, addr: u64) -> Option<u64> {
+        self.with_live(id, |live| {
+            let pt = PageTable::<Format>::from_root(live.cell.root);
+            pt.translate(&DirectMap, addr)
+                .map(|t| t.phys & !(FRAME_SIZE - 1))
+        })?
+    }
+
     /// Frames counted against the memory quota of live cell `id`.
     #[cfg_attr(
         not(feature = "ktest"),
