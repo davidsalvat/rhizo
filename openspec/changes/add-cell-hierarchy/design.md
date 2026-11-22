@@ -2070,6 +2070,22 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   queue to search) and keep a heap of one cell inline; both change every
   operation of the scheduler, not only the pick, and are left as the
   next step if the figure matters more than the change's size.
+- **After the performance pass of phase 1 (`perf-pass-phase1`).**
+  Clock reads cost one multiplication (every switch reads the clock
+  twice, three times by weight), a cell put back by weight is charged
+  and queued in one call to `Fair` (`Share::charge_queued`) when no cap
+  counts it, and the by-weight take is inlined into the scheduler's
+  `next`. `cell.switch_domains_insns` went from 1,343 to 1,252 on x86_64
+  and from 1,267 to 1,101 on AArch64, against `cell.switch_insns` 853
+  and 756: sharing by weight costs 399 and 345 instructions per switch,
+  still over the 200 aimed at. Of the x86_64 figure, measured from
+  QEMU's execution log: about 185 to take a cell (the domain choice, the
+  heap and the queue searched by arrival) and 160 to put it back (three
+  charges, the heap push and the queue), about 25 for the benchmark's
+  first cell's CPU quota and 25 for its third cell and the host's stop
+  test. The two-level pick by itself is lean code; going under 200 needs
+  the next step named above (entries kept in the heaps while sharing by
+  weight), which changes every operation of the scheduler.
 - **Shares are computed when the tree changes.** The host recomputes every
   cell's domain, flattened share and capped nodes (`fair::flatten`) after
   a spawn, a copy, a resume, a placement and each settled end, only while
