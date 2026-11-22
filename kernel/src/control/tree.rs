@@ -38,7 +38,8 @@ pub(super) fn tree_error(e: cap::Error) -> (Error, String) {
         ),
         cap::Error::Invalid => (
             Error::Invalid,
-            "a value out of bounds (CPU weight 1 to 10000; an exclusive CPU set for a root only)",
+            "a value out of bounds (CPU weight 1 to 10000; an exclusive CPU set for a root \
+             only, of CPUs the VM has, never CPU 0, and none another root's set holds)",
         ),
         cap::Error::Exists => (Error::Failed, "the cell is in the tree already"),
         cap::Error::NoMemory => (Error::NoMemory, "the tree's records do not fit"),

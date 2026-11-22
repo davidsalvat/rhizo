@@ -704,8 +704,10 @@ impl Tree {
         Ok(Arc::new(policy))
     }
 
-    /// `node`'s policies with egress `egress` and ceiling `ceiling`: the
-    /// same record when they do not change.
+    /// `node`'s policies with egress `egress`, ceiling `ceiling` and cap
+    /// `cap`, under a parent, so without an exclusive CPU set (a root's
+    /// alone, design D17: a cell moved into another domain runs on its
+    /// CPUs): the same record when they do not change.
     fn narrowed(
         &self,
         node: &Node,
@@ -714,13 +716,14 @@ impl Tree {
         cap: u32,
     ) -> Result<Arc<Policy>, Error> {
         let p = &node.policy;
-        if p.egress == egress && p.ceiling == ceiling && p.cpu_max == cap {
+        if p.egress == egress && p.ceiling == ceiling && p.cpu_max == cap && p.cpus == 0 {
             return Ok(p.clone());
         }
         self.shared(Policy {
             egress,
             ceiling,
             cpu_max: cap,
+            cpus: 0,
             ..Policy::clone(p)
         })
     }

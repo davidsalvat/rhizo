@@ -1062,6 +1062,86 @@ but it wastes CPU and adds latency for every domain. Exclusive sets give
 the same separation where it matters, at a cost the operator chooses
 domain by domain.
 
+**As built in phase 1 (task 1.9a).**
+
+- **Classes of CPUs.** `rhizo_sched::Sets` splits the CPUs into classes:
+  each set is one, and the CPUs no set holds (the shared CPUs) are
+  another. Each cell of a domain with a set is given that set, by key;
+  every other cell, the shared CPUs. The scheduler queues a cell only on a
+  CPU of its class (`place` picks the shortest such queue, a wake-up or a
+  cap's release onto another class's CPU goes to the shortest of its own,
+  and a cell put back balances only within its class), and a CPU steals
+  only from the queues of its class and joins only gangs of cells it may
+  run. So every queue holds cells of one class, and the pick by weight
+  (D23) runs unchanged on the queue the class gives: sets restrict where,
+  weights decide who.
+- **"At least one CPU stays shared" means one besides the boot CPU**, as
+  `docs/cell-hierarchy.md` says: the boot CPU polls the card and the
+  serial line and runs the host's operations, so the other domains keep a
+  CPU that does only their work. `Sets::fits` (no CPU 0, only CPUs the
+  machine has, no other root's CPU, and a shared CPU left beside CPU 0) is
+  checked by `Host::place` for a root (protocol version 4, `run`, `load`
+  and `fork` with `--cpus`): a refused set is `Invalid`, and the request
+  changes nothing. On fewer than three CPUs no set fits. The control
+  kernel audits the refusal as a tree denial, as every refused tree
+  request (task 1.9b).
+- **Re-parenting.** A root moved under a parent leaves its set
+  (`rhizo_cap::Tree::reparent`, through `narrowed`): its subtree runs on
+  the new domain's CPUs, and gets no set back if it is made a root again.
+  Protocol version 4's `reparent` carries no CPU set, so a set comes only
+  with a placement; giving one on `reparent` to root waits for a protocol
+  version that has the field.
+- **When the sets take effect.** The host computes them from the tree in
+  `Host::reshare`, with the shares, on every tree change while a set or a
+  weight is in use (one field tested otherwise, as D23 built it). Cells
+  queued where they may no longer run move at once; a cell running on
+  such a CPU moves when its slice ends (at most two timer ticks).
+- **Waking the right CPUs.** A cell made runnable may now be for another
+  class than the CPU that woke it. With sets, each locked section that can
+  make cells runnable (taking a cell, giving one back, a host operation)
+  wakes the lowest idle CPU of each class with queued cells
+  (`Scheduler::wanting`), instead of the lowest idle CPU.
+- **Cost.** With no set, round robin pays one test of the sets in each of
+  `place`, the put back (`back_to`), `push` and a steal, and the host one
+  in taking a cell and one in giving it back, each only while another CPU
+  idles; the work with sets is out of line. Placement, a put back and a
+  wake-up with sets search the sets by key (binary search) and scan the
+  queues of the class: linear in the CPUs. `Scheduler::next` and its wake
+  of due sleepers are marked inline, as the compiler inlined them before
+  (a second caller made it call them, +21 instructions per switch), and
+  `Host::resume` no longer lets its threads waiting on descriptors look
+  again twice (`file` does it for a cell new to the scheduler). Measured
+  with `--icount-only` against `main` (6b1ea42), x86_64 then AArch64:
+  `cell.switch_insns` 878 to 869 and 831 to 826, `cell.switch_domains_insns`
+  1,376 to 1,370 and 1,298 to 1,289, `cell.resume_insns` 4,352 to 4,324
+  and 11,777 to 11,759, `cell.spawn_insns` +1 and +5, `cell.run_insns`
+  +42 and +17 (+0.05 %); every other figure within ±0.25 % (no increase above +0.07 %).
+- **`rhizo up --pin`** pins each vCPU thread of the VMM, found by the name
+  QEMU (`CPU <n>/KVM`, `CPU <n>/TCG`) and Cloud Hypervisor (`vcpu<n>`)
+  give it, to the first allowed host CPU of a physical core of its own
+  (cores told apart by `core_cpus_list`), with `sched_setaffinity`
+  (`libc`, MIT OR Apache-2.0, already a dependency of `xtask`). That needs
+  no VMM option, works the same on both VMMs, and refuses a VM with more
+  vCPUs than the host has cores. Firecracker is not covered (its vCPU
+  threads are named otherwise and the design does not ask for it).
+- **Tests.** `cargo test -p rhizo-sched exclusive_sets`: a property over
+  any interleaving of CPUs taking, preempting, putting to sleep and waking
+  cells and of the host taking them out, putting them back and changing
+  the sets, round robin and by weight: no cell runs or is queued outside
+  its class, and a CPU (outside a set too) idles only when nothing it may
+  run is queued, and `wanting` then reaches it; a busy machine where every
+  CPU always has work it may run; queued cells moving when the sets
+  change; `fits`; gangs. In-kernel `exclusive_sets_hold` (4 vCPUs,
+  `ktest-smp`): a domain with CPUs 2 and 3 (a spinner, and a cell
+  spreading three threads) runs only there and on both, while eight
+  spinning roots, one of weight 300, and a cell spreading four threads run
+  only on CPUs 0 and 1, and on both; refused sets (CPU 0, absent CPUs, no
+  shared CPU left, overlap, a child's set); on one CPU (`ktest`) every set
+  is refused.
+- **`covert.cpu_bps`** with and without sets is left to task 1.13, with
+  the colluder cells of task 1.12: it needs a sender and a receiver cell
+  and a benchmark of its own in `cargo xtask bench`.
+
 ## D18. Audit log
 
 Operators must be able to say after the fact who granted what to whom,
@@ -1740,7 +1820,7 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   `adopt` and `place`, the weight or cap in the `Spec`
   (`root_weights_share_a_cpu`: roots of weights 300 and 100 get three
   quarters and a quarter of a CPU). `--cpus` (exclusive CPU sets) is
-  recorded and not yet enforced.
+  enforced by task 1.9a (D17, "As built in phase 1").
 - `sched.domain_share_pct`: 49 under `-icount` on AArch64.
 
 Alternatives:

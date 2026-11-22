@@ -12,7 +12,8 @@ use super::*;
 pub(super) struct Shared {
     /// The live cells that are not running: one run queue per CPU, and the
     /// sleepers (spec `scheduling`); round robin, or by weight once the
-    /// tree needs it ([`Host::reshare`]).
+    /// tree needs it, and within exclusive CPU sets once a domain has one
+    /// ([`Host::reshare`]).
     pub(super) sched: Scheduler<Box<Live>, Option<Fair>>,
     /// When each CPU took the cell it runs: the start of the slice charged
     /// to it while cells share by weight.
@@ -101,9 +102,13 @@ pub(super) enum Back {
 
 /// The lowest idle secondary CPU if a cell is runnable (bit `n` for CPU
 /// `n`; 0 for none, as between runs): the boot CPU, working for the host,
-/// leaves runnable cells to it.
+/// leaves runnable cells to it. With exclusive sets, one for each class of
+/// CPUs that has runnable cells.
 pub(super) fn idle_for_runnable(s: &Shared) -> u32 {
     let others = s.idle & !1;
+    if s.sched.sets().is_some() {
+        return s.sched.wanting(others.into(), None) as u32;
+    }
     if others != 0 && s.sched.runnable() > 0 {
         others & others.wrapping_neg()
     } else {
@@ -142,6 +147,9 @@ pub(super) fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
         } else {
             s.sched.next(cpu, now)
         };
+        if s.idle & !(1 << cpu) != 0 && s.sched.sets().is_some() {
+            wake_classes(s, cpu);
+        }
         if let Some(mut live) = next {
             nudge(s, &mut live);
             live.ready.ran(now);
@@ -155,7 +163,7 @@ pub(super) fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
             }
             return Take::Run(live, now);
         }
-        if !oldest && let Some(gang) = s.gangs.join(cpu, now) {
+        if !oldest && let Some(gang) = join(s, cpu, now) {
             s.on_cpu[cpu] = gang.1;
             s.taken[cpu] = now; // the last CPU to leave gives the cell back
             s.idle &= !(1 << cpu);
@@ -187,6 +195,28 @@ pub(super) fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
         // Its timer only if no other idle CPU's covers the deadline.
         Take::Wait(s.timer.idle(cpu, wake))
     })
+}
+
+/// With exclusive CPU sets (design D17 of `add-cell-hierarchy`), the
+/// cells `cpu` just woke may run only on another class of CPUs: wakes the
+/// lowest idle CPU of each class with runnable cells. Out of line, and
+/// only asked while another CPU idles.
+#[cold]
+#[inline(never)]
+fn wake_classes(s: &Shared, cpu: usize) {
+    let idle = u64::from(s.idle & !(1 << cpu));
+    wake_cpus(s.sched.wanting(idle, None) as u32);
+}
+
+/// A gang `cpu` joins at `now`: one of a cell it may run (design D17 of
+/// `add-cell-hierarchy`).
+fn join(s: &mut Shared, cpu: usize, now: u64) -> Option<GangPtr> {
+    if s.sched.sets().is_none() {
+        return s.gangs.join(cpu, now);
+    }
+    let sched = &s.sched;
+    s.gangs
+        .join_where(cpu, now, |g| sched.allowed(g.1) & 1 << cpu != 0)
 }
 
 /// The earliest deadline of the cells that are not running.
@@ -318,7 +348,9 @@ pub(super) fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>
             s.ended.push(finished);
         }
         let others = s.idle & !(1 << cpu);
-        if s.sched.runnable() > 1 && others != 0 {
+        if others != 0 && s.sched.sets().is_some() {
+            within_classes(s, cpu, others, was_end)
+        } else if s.sched.runnable() > 1 && others != 0 {
             others & others.wrapping_neg() // the lowest idle CPU
         } else if was_end || (s.running == 0 && s.sched.runnable() == 0) {
             others & 1 // the boot CPU checks whether the run is over
@@ -327,6 +359,18 @@ pub(super) fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>
         }
     });
     wake_cpus(wake);
+}
+
+/// [`give_back`]'s CPUs to wake with exclusive CPU sets (design D17 of
+/// `add-cell-hierarchy`), among the idle CPUs `others`: the lowest of each
+/// class with a runnable cell `cpu` does not take next, and the boot CPU
+/// if a cell ended or nothing is left.
+#[cold]
+#[inline(never)]
+fn within_classes(s: &Shared, cpu: usize, others: u32, was_end: bool) -> u32 {
+    let wake = s.sched.wanting(others.into(), Some(cpu)) as u32;
+    let over = was_end || (s.running == 0 && s.sched.runnable() == 0);
+    wake | if over { others & 1 } else { 0 }
 }
 
 /// The length and end of a slice taken at `taken`, ending now.
