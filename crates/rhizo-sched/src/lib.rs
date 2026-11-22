@@ -506,6 +506,8 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     }
 
     /// [`wake_due`](Self::wake_due) but for the caps it lets run again.
+    /// Inlined: it costs a switch two tests when nothing is due.
+    #[inline(always)]
     fn wake_sleepers(&mut self, cpu: usize, now: u64, mut f: impl FnMut(&mut T)) {
         // The due ones are at the front: no search, nothing else moves (an
         // entry a cap still holds goes back to sleep, later than `now`).
@@ -538,6 +540,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// weight: the one owed the most CPU time), or else the one that has
     /// waited longest in another CPU's queue (by weight: the one there owed
     /// the most).
+    #[inline(always)]
     pub fn next(&mut self, cpu: usize, now: u64) -> Option<T> {
         if self.share.by_weight() {
             return self.next_by_weight(cpu, now);

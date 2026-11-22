@@ -73,9 +73,10 @@ impl Host {
         echo: bool,
     ) -> Result<u32, Snapshot> {
         let _p = cost::scope(Part::Spawn);
-        let mut live = self.restore(snapshot, mode, capture, echo)?;
-        live.cell.threads.wake_io();
+        let live = self.restore(snapshot, mode, capture, echo)?;
         let id = live.cell.id;
+        // New to the scheduler: `file` lets its threads waiting on
+        // descriptors make their calls again.
         self.admit(|s| file(s, None, live));
         Ok(id)
     }

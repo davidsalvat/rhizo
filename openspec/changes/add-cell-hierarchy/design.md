@@ -1101,10 +1101,20 @@ domain by domain.
   wakes the lowest idle CPU of each class with queued cells
   (`Scheduler::wanting`), instead of the lowest idle CPU.
 - **Cost.** With no set, round robin pays one test of the sets in each of
-  `place`, the put back (`back_to`), `push`, a steal and a take; the
-  work with sets is out of line. Placement, a put back and a wake-up with
-  sets search the sets by key (binary search) and scan the queues of the
-  class: linear in the CPUs.
+  `place`, the put back (`back_to`), `push` and a steal, and the host one
+  in taking a cell and one in giving it back, each only while another CPU
+  idles; the work with sets is out of line. Placement, a put back and a
+  wake-up with sets search the sets by key (binary search) and scan the
+  queues of the class: linear in the CPUs. `Scheduler::next` and its wake
+  of due sleepers are marked inline, as the compiler inlined them before
+  (a second caller made it call them, +21 instructions per switch), and
+  `Host::resume` no longer lets its threads waiting on descriptors look
+  again twice (`file` does it for a cell new to the scheduler). Measured
+  with `--icount-only` against `main` (239adf1), x86_64 then AArch64:
+  `cell.switch_insns` 875 to 869 and 819 to 814, `cell.switch_domains_insns`
+  1,374 to 1,370 and 1,286 to 1,277, `cell.resume_insns` 4,352 to 4,324
+  and 11,777 to 11,759, `cell.spawn_insns` +1 and +5, `cell.run_insns`
+  +45 and +15 (+0.05 %); every other figure within ±0.15 %.
 - **`rhizo up --pin`** pins each vCPU thread of the VMM, found by the name
   QEMU (`CPU <n>/KVM`, `CPU <n>/TCG`) and Cloud Hypervisor (`vcpu<n>`)
   give it, to the first allowed host CPU of a physical core of its own

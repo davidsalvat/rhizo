@@ -147,7 +147,7 @@ pub(super) fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
         } else {
             s.sched.next(cpu, now)
         };
-        if s.sched.sets().is_some() {
+        if s.idle & !(1 << cpu) != 0 && s.sched.sets().is_some() {
             wake_classes(s, cpu);
         }
         if let Some(mut live) = next {
@@ -199,8 +199,8 @@ pub(super) fn take(shared: &Global<Shared>, cpu: usize, oldest: bool) -> Take {
 
 /// With exclusive CPU sets (design D17 of `add-cell-hierarchy`), the
 /// cells `cpu` just woke may run only on another class of CPUs: wakes the
-/// lowest idle CPU of each class with runnable cells. Out of line: without
-/// sets, taking a cell costs a test.
+/// lowest idle CPU of each class with runnable cells. Out of line, and
+/// only asked while another CPU idles.
 #[cold]
 #[inline(never)]
 fn wake_classes(s: &Shared, cpu: usize) {
@@ -348,7 +348,7 @@ pub(super) fn give_back(shared: &Global<Shared>, cpu: usize, mut live: Box<Live>
             s.ended.push(finished);
         }
         let others = s.idle & !(1 << cpu);
-        if s.sched.sets().is_some() {
+        if others != 0 && s.sched.sets().is_some() {
             within_classes(s, cpu, others, was_end)
         } else if s.sched.runnable() > 1 && others != 0 {
             others & others.wrapping_neg() // the lowest idle CPU
