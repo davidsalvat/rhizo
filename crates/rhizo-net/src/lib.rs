@@ -434,6 +434,34 @@ pub struct Net {
     /// whether a release is draining them (module `endpoints`).
     orphans: Vec<Handle>,
     draining: bool,
+    /// Each cell's inbox, a listening sequenced-packet socket the kernel
+    /// holds one reference to (module `endpoints`).
+    inboxes: Vec<(u32, Handle)>,
+    /// Channel endpoints the kernel holds for a cell's observers and input
+    /// (module `endpoints`).
+    held: Vec<Held>,
+    /// Cells with input waiting in an endpoint the kernel holds.
+    inputs: Vec<u32>,
+    /// The creators of cells' channels that ended, one entry per channel:
+    /// their reserved room comes back to them.
+    refunds: Vec<u32>,
+    /// The kernel has something to do after the call ([`Net::take_after`]).
+    after: bool,
+    /// The calling cell received from another cell ([`Net::take_received`]).
+    received: bool,
+}
+
+/// A channel endpoint the kernel holds for cell `cell` (no socket holds
+/// it), through the cell handle `grant` that opened it: it sends the
+/// cell's output to the peer when `observe`, and takes what the peer sends
+/// as the cell's standard input when `input`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Held {
+    end: u32,
+    cell: u32,
+    grant: u32,
+    observe: bool,
+    input: bool,
 }
 
 impl Default for Net {
@@ -490,6 +518,12 @@ impl Net {
             dropped: Vec::new(),
             orphans: Vec::new(),
             draining: false,
+            inboxes: Vec::new(),
+            held: Vec::new(),
+            inputs: Vec::new(),
+            refunds: Vec::new(),
+            after: false,
+            received: false,
         }
     }
 
@@ -851,6 +885,12 @@ impl Net {
             State::Wire { handle, .. } => self.wire_close(handle),
             State::Listening { queue, .. } => {
                 for q in queue {
+                    // An inbox's channels waiting there go as any closed
+                    // endpoint socket does (module `endpoints`).
+                    if let Ok(State::Endpoint { .. }) = self.get(q).map(|q| &q.state) {
+                        self.orphans.push(q);
+                        continue;
+                    }
                     if let Ok(State::Connected { peer: Some(p) }) = self.get(q).map(|q| &q.state) {
                         let p = *p;
                         self.reset(p);
@@ -859,6 +899,7 @@ impl Net {
                         self.open -= 1;
                     }
                 }
+                self.drain_orphans();
             }
             State::Connected { peer: Some(p) } => {
                 if !s.rx.is_empty() {
@@ -873,6 +914,7 @@ impl Net {
                 end, grant, next, ..
             } => {
                 self.dropped.push(grant);
+                self.after = true;
                 self.leave_end(h, end, next);
             }
             _ => {}
@@ -1043,11 +1085,16 @@ impl Net {
     pub fn accept(&mut self, h: Handle) -> Result<Handle> {
         self.look(h);
         let s = self.get_mut(h)?;
+        let inbox = s.ty == Type::SeqPacket;
         let State::Listening { queue, .. } = &mut s.state else {
             return Err(Error::Invalid);
         };
         let conn = queue.pop_front().ok_or(Error::Again)?;
         self.get_mut(conn)?.refs = 1;
+        // A channel from an inbox is a handle another cell gave.
+        if inbox {
+            self.received();
+        }
         Ok(conn)
     }
 
@@ -1603,7 +1650,11 @@ impl Net {
         let s = self.get(h)?;
         let mut copy = Socket::new(s.family, s.ty, s.opts, net);
         let again = match &s.state {
-            State::Listening { backlog, .. } => Some((s.local.clone(), Some(*backlog))),
+            // An inbox is its cell's: a copy has its own, and the one it
+            // inherited reads as closed, as an endpoint does.
+            State::Listening { backlog, .. } if s.ty != Type::SeqPacket => {
+                Some((s.local.clone(), Some(*backlog)))
+            }
             State::Open => {
                 copy.remote = s.remote.clone();
                 Some((s.local.clone(), None))
@@ -1663,9 +1714,10 @@ impl Net {
     /// back (design D1 of `keep-tcp-across-suspend`).
     pub fn export(&mut self, h: Handle) -> Result<Record> {
         let s = self.get(h)?;
+        let inbox = s.ty == Type::SeqPacket;
         let (state, local) = match &s.state {
             State::Open => (Saved::Open, s.local.clone()),
-            State::Listening { backlog, .. } => {
+            State::Listening { backlog, .. } if !inbox => {
                 (Saved::Listening(*backlog as u32), s.local.clone())
             }
             _ => (Saved::Reset, None),
@@ -1678,10 +1730,12 @@ impl Net {
             opts: s.opts,
             parked: None,
         };
-        if matches!(
-            s.state,
-            State::Listening { .. } | State::Connected { .. } | State::Wire { .. }
-        ) {
+        if !inbox
+            && matches!(
+                s.state,
+                State::Listening { .. } | State::Connected { .. } | State::Wire { .. }
+            )
+        {
             // A key no other parked socket has, unpredictable without the
             // secret.
             let key = loop {

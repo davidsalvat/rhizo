@@ -28,6 +28,10 @@ pub enum Kept {
     Socket(u32),
     /// A grant of the kernel's table (`cell/<label>`).
     Grant(u32),
+    /// The cell's inbox, which the kernel keeps for it by the cell's
+    /// identifier (`inbox`): the same entry in every cell's tree, so trees
+    /// shared copy-on-write stay shared.
+    Inbox,
     /// The cell's copy generation, 8 bytes the kernel gives when it is
     /// opened (`generation`).
     Generation,
@@ -36,7 +40,7 @@ pub enum Kept {
 impl Kept {
     pub(crate) fn kind(self) -> Kind {
         match self {
-            Kept::Socket(_) | Kept::Grant(_) => Kind::Socket,
+            Kept::Socket(_) | Kept::Grant(_) | Kept::Inbox => Kind::Socket,
             Kept::Generation => Kind::File,
         }
     }
@@ -90,6 +94,11 @@ impl Tables {
     /// before it exists): only there are entries of the kernel, so finding
     /// them never walks the cell's own files.
     pub(crate) fn kept_inos(&self) -> impl Iterator<Item = Ino> + '_ {
+        self.kept_inos_in(self.rhizo)
+    }
+
+    /// [`kept_inos`](Self::kept_inos) under `rhizo`, `/run/rhizo` or none.
+    pub(crate) fn kept_inos_in(&self, rhizo: Option<Ino>) -> impl Iterator<Item = Ino> + '_ {
         let names = move |dir: Ino| {
             match &self.inode(dir).node {
                 Node::Dir { entries, .. } => Some(entries.values().copied()),
@@ -98,7 +107,7 @@ impl Tables {
             .into_iter()
             .flatten()
         };
-        self.rhizo.into_iter().flat_map(move |rhizo| {
+        rhizo.into_iter().flat_map(move |rhizo| {
             names(rhizo).flat_map(move |i| {
                 let sub = matches!(self.inode(i).node, Node::Dir { .. });
                 core::iter::once(i).chain(sub.then(|| names(i)).into_iter().flatten())
@@ -169,9 +178,12 @@ impl Tables {
         };
         self.inodes[ino as usize] = None;
         match kept {
-            Kept::Socket(h) => self.released.push(h),
-            Kept::Grant(g) => self.dropped.push(g),
-            Kept::Generation => {}
+            Kept::Socket(h) => {
+                self.kept_sockets -= 1;
+                self.released.push(h);
+            }
+            Kept::Grant(g) => self.dropped.push((g, name.to_vec())),
+            Kept::Inbox | Kept::Generation => {}
         }
         let empty =
             matches!(&self.inode(dir).node, Node::Dir { entries, .. } if entries.is_empty());
@@ -223,14 +235,23 @@ impl Tables {
         if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
             entries.insert(name.to_vec(), ino);
         }
+        if let Kept::Socket(_) = kept {
+            self.kept_sockets += 1;
+        }
         Ok(())
+    }
+
+    /// Whether `/run/rhizo` exists ([`rhizo_dir`](Self::rhizo_dir)).
+    pub fn has_rhizo(&self) -> bool {
+        self.rhizo.is_some()
     }
 
     /// The kernel puts an entry holding `kept` at `place` (making
     /// `/run/rhizo` and the subdirectory if needed). Refused: a label that
     /// is empty, `.`, `..` or holds `/` or NUL (`Invalid`), a place already
-    /// taken (`Exists`), or [`Kept::Generation`] (`Invalid`). On failure
-    /// the caller still holds what `kept` names.
+    /// taken (`Exists`), [`Kept::Generation`], or [`Kept::Inbox`] anywhere
+    /// but at [`Place::Inbox`] (`Invalid`). On failure the caller still
+    /// holds what `kept` names.
     pub fn rhizo_put(&mut self, place: Place<'_>, kept: Kept) -> Result<()> {
         let (sub, name) = place.split();
         let bad = name.is_empty()
@@ -239,7 +260,8 @@ impl Tables {
             || name == b".."
             || name.contains(&b'/')
             || name.contains(&0)
-            || kept == Kept::Generation;
+            || kept == Kept::Generation
+            || (kept == Kept::Inbox && place != Place::Inbox);
         if bad {
             return Err(Error::Invalid);
         }
@@ -315,8 +337,10 @@ impl Tables {
     }
 
     /// The grants of the `/run/rhizo` entries the cell unlinked since the
-    /// last call: the kernel drops them.
-    pub fn take_dropped(&mut self) -> Vec<u32> {
+    /// last call, with the labels they had: the kernel drops each that is
+    /// still the cell's under that label (an entry a copy inherited, or
+    /// one whose grant was revoked, names none).
+    pub fn take_dropped(&mut self) -> Vec<(u32, Vec<u8>)> {
         core::mem::take(&mut self.dropped)
     }
 }

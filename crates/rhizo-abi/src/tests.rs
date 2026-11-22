@@ -76,7 +76,7 @@ pub(crate) struct World {
     abi: Abi,
     mem: FakePhysicalMemory,
     tlb: RecordingTlb,
-    frames: CountingFrames,
+    pub(crate) frames: CountingFrames,
     pub(crate) services: FakeServices,
     pub(crate) fs: rhizo_fs::Fs,
     pub(crate) net: rhizo_net::Net,
@@ -116,6 +116,10 @@ impl Sockets for Noting<'_> {
             grants: self.3,
             net: self.0,
         })
+    }
+    /// As the kernel does, without its framing of each piece.
+    fn output(&mut self, cell: u32, bytes: &[u8]) {
+        self.0.tell(cell, bytes);
     }
 }
 

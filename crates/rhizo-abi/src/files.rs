@@ -133,6 +133,7 @@ pub(crate) fn read<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 /// `write`/`pwrite64` (with `offset`) to the console or a file.
 pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     fd: u64,
     addr: u64,
     len: u64,
@@ -143,7 +144,7 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services
         Err(e) => return err(e),
         Ok(Kind::File | Kind::Dir) => {}
         Ok(_) if offset.is_some() => return -ESPIPE,
-        Ok(Kind::Console) => return console(cx, addr, len),
+        Ok(Kind::Console) => return console(cx, cell, addr, len),
         Ok(Kind::Pipe) => return poll::write_pipe(cx, fd, addr, len),
         Ok(Kind::Event) => return poll::write_event(cx, fd, addr, len),
         Ok(Kind::Socket) => return sockets::send(cx, fd, addr, len, 0),
@@ -194,9 +195,11 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services
     done as i64
 }
 
-/// Console output in small steps, so a fault reports what was written.
+/// Console output of cell `cell` in small steps, so a fault reports what
+/// was written; each step goes to the cell's observers too.
 fn console<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     base: u64,
     len: u64,
 ) -> i64 {
@@ -208,6 +211,7 @@ fn console<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
             return if off == 0 { -EFAULT } else { off as i64 };
         }
         cx.services.write_bytes(&buf[..n]);
+        cx.net.output(cell, &buf[..n]);
         off += n as u64;
     }
     len as i64
@@ -256,7 +260,9 @@ pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Service
                 Ok(entry) => {
                     let nonblock = flags & O_NONBLOCK != 0;
                     let cloexec = flags & O_CLOEXEC != 0;
-                    return Ok(crate::packets::open(cx, entry, nonblock, cloexec));
+                    let label = name.rsplit(|&b| b == b'/').next().unwrap_or_default();
+                    let how = (access, nonblock, cloexec);
+                    return Ok(crate::packets::open(cx, cell.id, entry, label, how));
                 }
                 Err(_) => return Err(err(Error::NoDevice)),
             },
@@ -676,6 +682,7 @@ pub(crate) fn mkdirat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Servic
 
 pub(crate) fn unlinkat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     dir: u64,
     addr: u64,
     flags: u64,
@@ -690,6 +697,11 @@ pub(crate) fn unlinkat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Servi
         let gone = cx.fs.unlink(dir, &name, flags & AT_REMOVEDIR != 0);
         cx.settle(0, before);
         gone.map_err(err)?;
+        // A cell handle unlinked from `/run/rhizo/cell/` (design D9 of
+        // `add-cell-hierarchy`).
+        if cx.fs.has_dropped() {
+            crate::packets::drop_entries(cx, cell);
+        }
         Ok(0)
     };
     run().unwrap_or_else(|e| e)

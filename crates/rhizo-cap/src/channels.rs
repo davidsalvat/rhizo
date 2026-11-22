@@ -276,6 +276,12 @@ impl Channels {
             .is_some_and(|(m, b)| m < QUEUE_MESSAGES_MAX as usize && b < QUEUE_BYTES_MAX as usize)
     }
 
+    /// The length of the oldest message queued on endpoint `end`, if any.
+    pub fn peek(&self, end: u32) -> Option<usize> {
+        let q = &self.get(end >> 1)?.queues[(end & 1) as usize];
+        q.messages.front().map(|m| m.len as usize)
+    }
+
     /// The number of messages and bytes queued on endpoint `end`.
     pub fn queued(&self, end: u32) -> Option<(usize, usize)> {
         let q = &self.get(end >> 1)?.queues[(end & 1) as usize];

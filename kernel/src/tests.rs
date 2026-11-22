@@ -31,6 +31,7 @@ mod density;
 mod dynamic;
 mod files;
 mod fork;
+mod handles;
 mod hierarchy;
 mod images;
 mod isolation;
@@ -75,6 +76,7 @@ const AREAS: &[&[TestCase]] = &[
     leaks::ALL,
     hierarchy::ALL,
     collusion::ALL,
+    handles::ALL,
     sharing::ALL,
     shares::ALL,
     micropython::ALL,

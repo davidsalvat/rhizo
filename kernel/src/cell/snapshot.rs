@@ -86,6 +86,11 @@ impl Host {
             )
         });
         self.record_tree(&mut snapshot, id);
+        // Files never changed: its resume shares them again without
+        // comparing their bytes.
+        if files.shares_with(&no_files()) {
+            snapshot.mark_plain_files();
+        }
         // What its limit leaves stays set aside for it (design D4).
         let (used, limit) = (live.frames.used(), live.frames.limit());
         self.end(live, Ending::Suspended);
@@ -435,7 +440,7 @@ impl Host {
     pub fn may_publish(&self, id: u32, attested: bool) -> Option<bool> {
         let (cell, ..) = self.templates.iter().find(|(c, ..)| c.id == id)?;
         if cell.exposed {
-            let domain = self.tree.root_of(id).unwrap_or(0);
+            let domain = self.tree.get().root_of(id).unwrap_or(0);
             if attested {
                 crate::audit::record(
                     crate::audit::Kind::Attested,
@@ -476,6 +481,7 @@ impl Host {
         let (template, fs, _) = self.templates.swap_remove(index);
         self.end_template_memory(template.id, template.root);
         release_sockets(&fs, template.id, true);
+        self.cell_left(template.id, Ending::Killed);
         true
     }
 

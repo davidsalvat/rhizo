@@ -24,6 +24,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+pub use codec::Base;
 pub use codec::DecodeError;
 pub use io::{EpollOp, Interest, PIPE_BUF, PIPE_CAP};
 pub use rhizo::{Kept, Place};
@@ -363,9 +364,12 @@ pub struct Tables {
     /// The directory `/run/rhizo`, once the kernel made it
     /// ([`Tables::rhizo_dir`]).
     rhizo: Option<Ino>,
-    /// Grants of `/run/rhizo` entries the cell unlinked, for the kernel to
-    /// drop ([`Tables::take_dropped`]); empty between system calls.
-    dropped: Vec<u32>,
+    /// Grants of `/run/rhizo` entries the cell unlinked, with their labels,
+    /// for the kernel to drop ([`Tables::take_dropped`]); empty between
+    /// system calls.
+    dropped: Vec<(u32, Vec<u8>)>,
+    /// `/run/rhizo` entries holding a socket ([`Kept::Socket`]).
+    kept_sockets: u32,
 
     /// Counts changes to pipes, event counters and `epoll` instances
     /// ([`Tables::changes`]).
@@ -403,6 +407,7 @@ impl Tables {
             input: None,
             rhizo: None,
             dropped: Vec::new(),
+            kept_sockets: 0,
 
             changes: 0,
         }

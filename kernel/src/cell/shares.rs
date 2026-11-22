@@ -77,18 +77,18 @@ impl Host {
     #[cold]
     #[inline(never)]
     pub(super) fn reshare(&mut self) {
-        self.by_weight = !self.tree.iter().all(plain);
+        self.by_weight = !self.tree.get().iter().all(plain);
         let sets = self.sets();
         self.locked(|s| {
             if sets.is_some() || s.sched.sets().is_some() {
                 s.sched.set_sets(sets);
             }
         });
-        if self.tree.iter().all(even) {
+        if self.tree.get().iter().all(even) {
             self.locked(|s| *s.sched.shares() = None);
             return;
         }
-        let nodes: Vec<&Node> = self.tree.iter().collect();
+        let nodes: Vec<&Node> = self.tree.get().iter().collect();
         let at = |id: u32| nodes.binary_search_by_key(&id, |n| n.id()).ok();
         let flat: Vec<fair::Node> = nodes
             .iter()
@@ -133,7 +133,11 @@ impl Host {
     /// of a domain whose root has one, with it; `None` when no root has
     /// one. The host gives only sets that fit ([`set_fits`]).
     fn sets(&self) -> Option<Sets> {
-        let roots = self.tree.iter().filter(|n| n.is_root() && n.cpus() != 0);
+        let roots = self
+            .tree
+            .get()
+            .iter()
+            .filter(|n| n.is_root() && n.cpus() != 0);
         let mut sets: Vec<(u32, u64)> = roots.map(|n| (n.domain(), n.cpus())).collect();
         if sets.is_empty() {
             return None;
@@ -145,7 +149,7 @@ impl Host {
         };
         Sets::new(
             crate::smp::count(),
-            self.tree.iter().filter_map(set).collect(),
+            self.tree.get().iter().filter_map(set).collect(),
         )
     }
 

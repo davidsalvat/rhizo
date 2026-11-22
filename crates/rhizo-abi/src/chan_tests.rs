@@ -157,19 +157,14 @@ impl Cells {
         Ok(())
     }
 
-    /// What the kernel does after a call: the grants let go are dropped.
+    /// What the kernel does after a call: the grants let go are dropped
+    /// (those of unlinked entries by the call itself).
     fn settle(&mut self) {
-        let mut dropped = Vec::new();
-        for w in &mut self.w {
-            dropped.extend(w.fs.take_dropped());
+        for w in &self.w {
+            assert!(!w.fs.has_dropped(), "an unlink drops its handle");
         }
         let k = self.kernel();
-        dropped.extend(k.net.take_dropped());
-        for g in dropped {
-            if let Some(holder) = k.grants.get(g).map(rhizo_cap::Grant::holder) {
-                k.grants.unlink(holder, g).unwrap();
-            }
-        }
+        drop_handed_back(&mut k.grants, &mut k.net);
     }
 
     /// The grants cell `i` holds, with their grantors.
@@ -715,4 +710,228 @@ fn channels_entries_are_read_only() {
         8,
         "the generation, as before"
     );
+}
+
+const ACCEPT4: u64 = 242;
+const GETPEERNAME: u64 = 205;
+
+impl Cells {
+    /// The host grants cell `i` a handle on cell `t` with `rights`, as
+    /// `/run/rhizo/cell/<label>`; returns the grant.
+    fn grant_cell(&mut self, i: usize, t: usize, rights: Rights, label: &str) -> u32 {
+        let (holder, t) = (self.id(i), self.id(t));
+        let k = self.kernel();
+        let ask = Ask {
+            rights,
+            holder,
+            label: Label::new(label.as_bytes()).unwrap(),
+            ..Ask::default()
+        };
+        let g = k
+            .grants
+            .grant(&k.tree, k.net.channels(), Actor::Host, Object::Cell(t), ask)
+            .unwrap();
+        self.w[i]
+            .fs
+            .rhizo_put(Place::Cell(label.as_bytes()), Kept::Grant(g))
+            .unwrap();
+        g
+    }
+
+    /// What the kernel puts in every cell's tree: its inbox.
+    fn inboxes(&mut self) {
+        for w in &mut self.w {
+            w.fs.rhizo_put(Place::Inbox, Kept::Inbox).unwrap();
+        }
+    }
+}
+
+impl World {
+    /// Connects a new `SOCK_SEQPACKET` socket to `/run/rhizo/cell/<label>`.
+    fn connect_cell(&mut self, label: &str) -> i64 {
+        let s = self.call(SOCKET, &[1, SOCK_SEQPACKET, 0]).0;
+        assert!(s >= 0);
+        let mut addr = vec![1, 0];
+        addr.extend_from_slice(format!("/run/rhizo/cell/{label}").as_bytes());
+        addr.push(0);
+        self.poke(OUT, &addr);
+        match self.call(CONNECT, &[s as u64, OUT, addr.len() as u64]).0 {
+            0 => s,
+            e => e,
+        }
+    }
+
+    /// Opens `/run/rhizo/cell/<label>`.
+    fn open_cell(&mut self, label: &str, flags: u64) -> i64 {
+        let p = self.path(&format!("/run/rhizo/cell/{label}"));
+        self.call(OPENAT, &[AT_FDCWD, p, flags]).0
+    }
+
+    /// The path `getpeername` gives for `fd`.
+    fn peer(&mut self, fd: i64) -> Vec<u8> {
+        self.poke(OUT + 128, &110u32.to_le_bytes());
+        assert_eq!(self.call(GETPEERNAME, &[fd as u64, OUT, OUT + 128]).0, 0);
+        let len = u32::from_le_bytes(self.peek(OUT + 128, 4).try_into().unwrap()) as usize;
+        let mut path = self.peek(OUT + 2, len - 2);
+        path.pop(); // its NUL
+        path
+    }
+}
+
+/// Spec `cell-hierarchy`, "Accepting from the inbox": a cell with the
+/// message right on another connects to its handle and the other accepts
+/// on its inbox; both ends exchange messages, the accepting end's peer is
+/// the label of its handle on the opener, the opener's memory holds the
+/// channel's room until the channel ends, and a cell without the right,
+/// or whose handle was revoked, gets `EACCES`.
+#[test]
+fn message_right_opens_a_channel_to_the_inbox() {
+    let mut c = Cells::roots(&[Egress::None, Egress::None, Egress::None]);
+    c.inboxes();
+    let message = c.grant_cell(0, 1, Rights::MESSAGE, "server");
+    c.grant_cell(1, 0, Rights::OBSERVE, "client");
+    c.grant_cell(2, 1, Rights::OBSERVE | Rights::INPUT, "server");
+    let before = c.on(0).frames.kernel;
+    let x = c.on(0).connect_cell("server");
+    assert!(x >= 0, "connect gives a descriptor: {x}");
+    let room = c.on(0).frames.kernel - before;
+    assert!(room >= rhizo_cap::ROOM, "the room is counted: {room}");
+    assert_eq!(c.on(2).connect_cell("server"), -EACCES, "no message right");
+    assert_eq!(c.on(2).connect_cell("none"), -ENOENT);
+    let w = c.on(1);
+    let p = w.path("/run/rhizo/inbox");
+    let inbox = w.call(OPENAT, &[AT_FDCWD, p, 2 | O_NONBLOCK]).0;
+    assert!(inbox >= 0);
+    assert_eq!(w.events(inbox), POLLIN, "a channel waits");
+    let y = w.call(ACCEPT4, &[inbox as u64, 0, 0, 0]).0;
+    assert!(y >= 0);
+    assert_eq!(w.services.received, 1, "a handle received");
+    assert_eq!(
+        w.call(ACCEPT4, &[inbox as u64, 0, 0, 0]).0,
+        -EAGAIN,
+        "nothing else waits"
+    );
+    assert_eq!(w.peer(y), b"client", "its handle on the opener");
+    assert_eq!(c.on(0).write_msg(x, b"ping"), 4);
+    assert_eq!(c.on(1).read_msg(y, 64), Ok(b"ping".to_vec()));
+    assert_eq!(c.on(1).write_msg(y, b"pong"), 4);
+    assert_eq!(c.on(0).read_msg(x, 64), Ok(b"pong".to_vec()));
+    assert_eq!(c.on(0).peer(x), b"", "the opener's own end names nothing");
+    // Neither end may carry handles: the opener gave none the right.
+    let [t0, _] = c.channel();
+    c.grant(0, t0, ALL, "tool");
+    let tool = c.on(0).open_chan("tool", 2);
+    assert_eq!(c.on(0).send_fds(x, b"h", &[tool]), -EACCES);
+    // Both ends closed: the channel ends and its room comes back.
+    assert_eq!(c.on(0).call(CLOSE, &[x as u64]).0, 0);
+    assert_eq!(c.on(1).call(CLOSE, &[y as u64]).0, 0);
+    c.settle();
+    let opener = c.id(0);
+    assert_eq!(c.kernel().net.take_refunds(opener), 1);
+    c.revoke(Actor::Host, message).unwrap();
+    assert_eq!(c.on(0).connect_cell("server"), -EACCES, "revoked");
+    let k = c.kernel();
+    k.grants.check(&k.tree, k.net.channels()).unwrap();
+}
+
+/// A cell handle opened for reading streams its cell's output from then
+/// on, for writing gives the cell's standard input, each with its right;
+/// unlinking the handle ends what was opened through it, revoking it too,
+/// and an entry a copy inherited names nothing (task 2.5).
+#[test]
+fn cell_handles_observe_and_give_input() {
+    let mut c = Cells::roots(&[Egress::None, Egress::None]);
+    let both = c.grant_cell(0, 1, Rights::OBSERVE | Rights::INPUT, "agent");
+    let watch = c.grant_cell(0, 1, Rights::OBSERVE, "watch");
+    c.on(1).fs.host_input().unwrap();
+    c.on(1).poke(BUF, b"early");
+    assert_eq!(c.on(1).call(WRITE, &[1, BUF, 5]).0, 5);
+    let o = c.on(0).open_cell("agent", O_NONBLOCK);
+    let i = c.on(0).open_cell("agent", 1);
+    assert!(o >= 0 && i >= 0);
+    assert_eq!(c.on(0).read_msg(o, 64), Err(-EAGAIN), "from now on");
+    let w = c.on(1);
+    w.poke(BUF, b"hello");
+    assert_eq!(w.call(WRITE, &[1, BUF, 5]).0, 5);
+    assert_eq!(c.on(0).read_msg(o, 64), Ok(b"hello".to_vec()));
+    assert_eq!(c.on(0).write_msg(o, b"x"), -EACCES, "read only");
+    assert_eq!(c.on(0).write_msg(i, b"line\n"), 5);
+    let id = c.id(1);
+    let w = c.on(1);
+    assert!(deliver_input(&mut w.net, id, &mut w.fs));
+    assert_eq!(w.read_msg(0, 64), Ok(b"line\n".to_vec()));
+    assert!(!deliver_input(&mut w.net, id, &mut w.fs), "nothing left");
+    // Each way needs its right.
+    assert_eq!(c.on(0).open_cell("watch", 1), -EACCES);
+    assert_eq!(c.on(0).open_cell("watch", 2), -EACCES);
+    let v = c.on(0).open_cell("watch", 0);
+    assert!(v >= 0);
+    // Revoked: what it opened ends, and it opens no more.
+    c.revoke(Actor::Host, watch).unwrap();
+    assert_eq!(c.on(0).read_msg(v, 64), Ok(vec![]), "end of file");
+    assert_eq!(c.on(0).open_cell("watch", 0), -EACCES);
+    // An entry inherited by a copy names its source's handle: nothing.
+    c.w[1]
+        .fs
+        .rhizo_put(Place::Cell(b"agent"), Kept::Grant(both))
+        .unwrap();
+    assert_eq!(c.on(1).open_cell("agent", 0), -EACCES);
+    let w = c.on(1);
+    let p = w.path("/run/rhizo/cell/agent");
+    assert_eq!(w.call(UNLINKAT, &[AT_FDCWD, p, 0]).0, 0);
+    assert!(c.kernel().grants.get(both).is_some(), "the source keeps it");
+    // Unlinked: the handle goes, a drop and no revocation (design D9):
+    // what was opened through it stays until closed, and its room then
+    // comes back.
+    let w = c.on(0);
+    let p = w.path("/run/rhizo/cell/agent");
+    assert_eq!(w.call(UNLINKAT, &[AT_FDCWD, p, 0]).0, 0);
+    assert!(c.kernel().grants.get(both).is_none());
+    assert_eq!(c.on(0).open_cell("agent", 0), -ENOENT);
+    let w = c.on(1);
+    w.poke(BUF, b"still");
+    assert_eq!(w.call(WRITE, &[1, BUF, 5]).0, 5);
+    assert_eq!(c.on(0).read_msg(o, 64), Ok(b"still".to_vec()));
+    assert_eq!(c.on(0).write_msg(i, b"more"), 4);
+    let w = c.on(1);
+    assert!(deliver_input(&mut w.net, id, &mut w.fs));
+    assert_eq!(w.read_msg(0, 64), Ok(b"more".to_vec()));
+    let opener = c.id(0);
+    let refunds = c.kernel().net.take_refunds(opener);
+    for fd in [o, i, v] {
+        assert_eq!(c.on(0).call(CLOSE, &[fd as u64]).0, 0);
+    }
+    c.settle();
+    let k = c.kernel();
+    assert_eq!(
+        refunds + k.net.take_refunds(opener),
+        3,
+        "every channel ended"
+    );
+    assert!(!k.net.observed());
+    let k = c.kernel();
+    k.grants.check(&k.tree, k.net.channels()).unwrap();
+}
+
+/// Open point O9 for the room channels reserve (design D10): a channel a
+/// cell makes through a handle is counted against its memory before it is
+/// made, so a cell whose memory cannot hold the room is refused with
+/// `ENOMEM`, and nothing of the channel is left.
+#[test]
+fn a_cell_handle_channel_needs_its_room() {
+    let mut c = Cells::roots(&[Egress::None, Egress::None]);
+    c.inboxes();
+    c.grant_cell(0, 1, Rights::MESSAGE | Rights::OBSERVE, "peer");
+    let w = c.on(0);
+    w.frames.kernel_limit = w.frames.kernel + rhizo_cap::ROOM - 1;
+    let open = w.net.open();
+    assert_eq!(w.connect_cell("peer"), -ENOMEM);
+    assert_eq!(w.open_cell("peer", 0), -ENOMEM);
+    let w = c.on(0);
+    assert_eq!(w.net.open(), open + 1, "only the socket it connected");
+    assert_eq!(c.held(0).len(), 1, "no endpoint granted");
+    let w = c.on(0);
+    w.frames.kernel_limit = u64::MAX;
+    let x = w.connect_cell("peer");
+    assert!(x >= 0);
 }

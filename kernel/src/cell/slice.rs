@@ -43,19 +43,25 @@ pub(super) fn syscall(
         };
         let outcome = live.abi.handle(&mut live.cell, &mut cx);
         let deadline = cx.deadline;
-        let waits = || matches!(live.cell.threads.current().wait, Wait::Io { .. });
-        if let Some((net, changes)) = sockets.0.as_mut() {
+        let waits = |cell: &Cell| matches!(cell.threads.current().wait, Wait::Io { .. });
+        if let Some(state) = sockets.0.as_mut() {
+            let (net, changes) = state;
             // A call that waits on descriptors joins the wait queues of the
             // sockets it looked at (design D1 of `add-socket-wait-queues`),
             // under the lock it looked at them with.
-            if net.end_call(|| waits().then_some(live.cell.id)) {
+            if net.end_call(|| waits(&live.cell).then_some(live.cell.id)) {
                 WOKEN.store(true, Ordering::Release);
             }
             if prof::on() && net.changes() != *changes {
                 prof::net_changed(now_ns());
             }
+            // Handles: what the call received, gave back or left for
+            // another cell (design D9, D10 and D22 of `add-cell-hierarchy`).
+            if net.take_after() {
+                after_handles(&mut live.cell, &live.frames, state);
+            }
         }
-        if prof::on() && core::mem::take(&mut live.io_woken) && waits() {
+        if prof::on() && core::mem::take(&mut live.io_woken) && waits(&live.cell) {
             prof::add(Count::IoWasted, 1);
         }
         (outcome, deadline)
@@ -82,8 +88,17 @@ pub(super) fn syscall(
 /// instead of the cell going through the scheduler, which would wake them
 /// all the same. Asked only when no thread of the cell can run.
 fn woke_itself(live: &mut Live) -> bool {
-    if !WOKEN.load(Ordering::Acquire) || !NET.with(|net| net.take_woken(live.cell.id)) {
+    if !WOKEN.load(Ordering::Acquire) {
         return false;
+    }
+    let id = live.cell.id;
+    let Some(input) = NET.with(|net| net.take_woken(id).then(|| net.has_input())) else {
+        return false;
+    };
+    // Input it sent itself through a handle on itself (task 2.5 of
+    // `add-cell-hierarchy`).
+    if input {
+        take_input(live);
     }
     live.cell.threads.wake_io()
 }

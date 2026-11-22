@@ -22,7 +22,7 @@ use crate::poll::{with_user_bytes, would_wait};
 use crate::sockets::{MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, Scatter, net_err};
 use alloc::vec::Vec;
 use rhizo_cap::limits::{MESSAGE_HANDLES_MAX, MESSAGE_MAX};
-use rhizo_cap::{Actor, Ask, Object, Recv};
+use rhizo_cap::{Actor, Ask, Object, Recv, Rights};
 use rhizo_fs::Kept;
 use rhizo_net::{Error as NetError, Family, Handle, Type};
 
@@ -460,10 +460,13 @@ pub(crate) fn recvmsg_rights<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S:
     Some(n)
 }
 
-/// `connect` of sequenced-packet socket `h` of `fd` to `path`: a
-/// `/run/rhizo` entry holding an endpoint makes `fd` a descriptor of it.
-pub(crate) fn connect<F, M, T, A, S>(
+/// `connect` of sequenced-packet socket `h` of `fd`, cell `cell`'s, to
+/// `path`: a `/run/rhizo` entry holding an endpoint makes `fd` a
+/// descriptor of it; a cell handle with the message right opens a new
+/// channel to its cell ([`connect_handle`]).
+pub(crate) fn connect<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     fd: u64,
     h: Handle,
     path: &[u8],
@@ -474,45 +477,236 @@ pub(crate) fn connect<F, M, T, A, S>(
     }
     let e = match cx.fs.rhizo_entry(None, path) {
         Ok(Kept::Socket(e)) if is_packet(net, e) => e,
+        Ok(Kept::Grant(g)) => {
+            let label = path.rsplit(|&b| b == b'/').next().unwrap_or_default();
+            return match connect_handle(cx, cell, g, label) {
+                Ok(e) => give(cx, fd, e),
+                Err(x) => x,
+            };
+        }
         Err(rhizo_fs::Error::NotFound) => return -ENOENT,
         Err(e @ (rhizo_fs::Error::NotDir | rhizo_fs::Error::NameTooLong)) => return err(e),
         _ => return -ECONNREFUSED,
     };
     net.retain(e);
+    give(cx, fd, e)
+}
+
+/// Makes `fd` a descriptor of socket `e`, whose reference it takes over.
+fn give<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, fd: u64, e: Handle) -> i64 {
     match cx.fs.replace_socket(fd as u32, e) {
         Ok(old) => {
-            net.release(old);
+            cx.net.net().release(old);
             0
         }
         Err(x) => {
-            net.release(e);
+            cx.net.net().release(e);
             err(x)
         }
     }
 }
 
-/// `open` of the `/run/rhizo` entry `kept`: a descriptor of the endpoint
-/// it holds; `ENXIO` for any other entry.
+/// The cell that cell `cell`'s grant `g`, its `/run/rhizo/cell/<label>`
+/// entry, names, if it holds every right of `want`; `EACCES` otherwise: a
+/// handle revoked, gone with its cell, inherited from the copy's source,
+/// or short of a right (design D9 of `add-cell-hierarchy`).
+fn target(
+    grants: &rhizo_cap::Grants,
+    cell: u32,
+    g: u32,
+    label: &[u8],
+    want: Rights,
+) -> Result<u32, i64> {
+    let x = grants.get(g).ok_or(-EACCES)?;
+    match x.object() {
+        Object::Cell(t)
+            if x.holder() == cell && x.label().as_bytes() == label && x.rights().contains(want) =>
+        {
+            Ok(t)
+        }
+        _ => Err(-EACCES),
+    }
+}
+
+/// What a channel refused by the channels or the sockets returns.
+fn channel_err(e: rhizo_cap::Error) -> i64 {
+    match e {
+        rhizo_cap::Error::Budget | rhizo_cap::Error::NoMemory => -ENOMEM,
+        e => grant_err(e),
+    }
+}
+
+/// Opening a channel to the cell of cell `cell`'s handle `g` (its entry
+/// `cell/<label>`), which needs the message right (design D10 of
+/// `add-cell-hierarchy`): a channel `cell` makes, its room counted against
+/// `cell`'s memory until the channel ends, one endpoint for `cell` and one
+/// waiting in the target's inbox, both sending and receiving. Returns the
+/// socket of `cell`'s endpoint, with one reference.
+fn connect_handle<F, M, T, A: Frames, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
+    g: u32,
+    label: &[u8],
+) -> Result<Handle, i64> {
+    if !cx.store(rhizo_cap::ROOM) {
+        return Err(-ENOMEM);
+    }
+    let mut created = false;
+    let made = (|| {
+        let hs = cx.net.handles().ok_or(-EACCES)?;
+        let t = target(hs.grants, cell, g, label, Rights::MESSAGE)?;
+        let ch = hs
+            .net
+            .channels_mut()
+            .create(hs.tree, Actor::Cell(cell), &|_| rhizo_cap::Limits::ZERO)
+            .map_err(channel_err)?;
+        // From here the channel's end gives its room back.
+        created = true;
+        let (mine, theirs) = match hs
+            .grants
+            .open_channel(hs.tree, hs.net.channels(), cell, g, ch)
+        {
+            Ok(x) => x,
+            Err(e) => {
+                hs.net.drop_channel(ch);
+                return Err(grant_err(e));
+            }
+        };
+        let [e0, e1] = rhizo_cap::Channels::endpoints(ch);
+        let both = Rights::SEND | Rights::RECEIVE;
+        let s0 = hs.net.endpoint(e0, mine, both);
+        let s1 = hs.net.endpoint(e1, theirs, both);
+        let delivered = match (s0, s1) {
+            (Ok(_), Ok(s1)) => hs.net.deliver(t, s1).map_err(net_err),
+            (_, Err(e)) | (Err(e), _) => Err(net_err(e)),
+        };
+        if let Err(x) = delivered {
+            for (id, s) in [(mine, s0), (theirs, s1)] {
+                hs.net.grant_gone(id);
+                if let Ok(s) = s {
+                    hs.net.release(s);
+                }
+                let _ = hs.grants.revoke(hs.tree, Actor::Host, id, &mut |_, _| {});
+            }
+            hs.net.drop_channel(ch);
+            return Err(x);
+        }
+        s0.map_err(net_err)
+    })();
+    if made.is_err() && !created {
+        cx.frames.credit(rhizo_cap::ROOM);
+    }
+    made
+}
+
+/// Observing or giving input to the cell of cell `cell`'s handle `g` (its
+/// entry `cell/<label>`), as `open` of the entry for reading, writing or
+/// both (`access`) asks, which needs the observe right, the input right or
+/// both (task 2.5 of `add-cell-hierarchy`): a channel `cell` makes, its
+/// room counted against `cell`'s memory until it ends, whose other
+/// endpoint the kernel holds for the target. Returns the socket of
+/// `cell`'s endpoint, with one reference.
+fn open_handle<F, M, T, A: Frames, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
+    g: u32,
+    label: &[u8],
+    access: u64,
+) -> Result<Handle, i64> {
+    let (observe, input) = (access != 1, access != 0);
+    let pick = |on, r| if on { r } else { Rights::NONE };
+    let want = pick(observe, Rights::OBSERVE) | pick(input, Rights::INPUT);
+    let rights = pick(observe, Rights::RECEIVE) | pick(input, Rights::SEND);
+    if !cx.store(rhizo_cap::ROOM) {
+        return Err(-ENOMEM);
+    }
+    let mut created = false;
+    let made = (|| {
+        let hs = cx.net.handles().ok_or(-EACCES)?;
+        let t = target(hs.grants, cell, g, label, want)?;
+        let ch = hs
+            .net
+            .channels_mut()
+            .create(hs.tree, Actor::Cell(cell), &|_| rhizo_cap::Limits::ZERO)
+            .map_err(channel_err)?;
+        // From here the channel's end gives its room back.
+        created = true;
+        let [e0, e1] = rhizo_cap::Channels::endpoints(ch);
+        let ask = Ask {
+            rights,
+            holder: cell,
+            ..Ask::default()
+        };
+        let object = Object::Endpoint(e0);
+        let mine = match hs
+            .grants
+            .grant(hs.tree, hs.net.channels(), Actor::Cell(cell), object, ask)
+        {
+            Ok(x) => x,
+            Err(e) => {
+                hs.net.drop_channel(ch);
+                return Err(grant_err(e));
+            }
+        };
+        let s = hs.net.endpoint(e0, mine, rights);
+        let held = s.and_then(|_| hs.net.hold(e1, t, g, observe, input));
+        if let Err(e) = held {
+            if let Ok(s) = s {
+                hs.net.grant_gone(mine);
+                hs.net.release(s);
+            }
+            let _ = hs.grants.revoke(hs.tree, Actor::Host, mine, &mut |_, _| {});
+            hs.net.drop_channel(ch);
+            return Err(net_err(e));
+        }
+        s.map_err(net_err)
+    })();
+    match made {
+        Err(_) if !created => cx.frames.credit(rhizo_cap::ROOM),
+        Ok(_) if observe => cx.net.observing(),
+        _ => {}
+    }
+    made
+}
+
+/// `open` of the `/run/rhizo` entry `kept`, named `label`, by cell `cell`
+/// for `access` (`O_RDONLY` 0, `O_WRONLY` 1, `O_RDWR` 2), non-blocking and
+/// close-on-exec as `how` says: a descriptor of the endpoint it holds, of
+/// the cell's inbox, or of a channel observing or giving input to the
+/// cell a cell handle names ([`open_handle`]); `ENXIO` for any other
+/// entry.
 pub(crate) fn open<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     kept: Kept,
-    nonblock: bool,
-    cloexec: bool,
+    label: &[u8],
+    (access, nonblock, cloexec): (u64, bool, bool),
 ) -> i64 {
-    let net = cx.net.net();
-    let Kept::Socket(e) = kept else {
-        return -ENXIO;
+    let e = match kept {
+        Kept::Socket(e) if is_packet(cx.net.net(), e) => {
+            cx.net.net().retain(e);
+            e
+        }
+        Kept::Inbox => match cx.net.net().inbox(cell) {
+            Ok(e) => {
+                cx.net.net().retain(e);
+                e
+            }
+            Err(e) => return net_err(e),
+        },
+        Kept::Grant(g) => match open_handle(cx, cell, g, label, access) {
+            Ok(e) => e,
+            Err(x) => return x,
+        },
+        _ => return -ENXIO,
     };
-    if !is_packet(net, e) {
-        return -ENXIO;
-    }
     // Its descriptor counts as a socket's against the cell's memory
     // (design D4 of `add-cell-hierarchy`).
     let before = cx.held();
     if !cx.store(rhizo_net::SOCKET_BYTES) {
+        cx.net.net().release(e);
         return -ENOMEM;
     }
-    cx.net.net().retain(e);
     let opened = cx.fs.socket_fd(e, nonblock, cloexec);
     cx.settle(rhizo_net::SOCKET_BYTES, before);
     match opened {
@@ -522,4 +716,50 @@ pub(crate) fn open<F, M, T, A: Frames, S: Services>(
             err(x)
         }
     }
+}
+
+/// The `/run/rhizo/cell/` entries cell `cell` unlinked: each handle that
+/// is still the cell's under its label is dropped (design D9 of
+/// `add-cell-hierarchy`), what was derived from it staying; what was
+/// opened through it stays open until its descriptors close.
+pub(crate) fn drop_entries<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, cell: u32) {
+    let dropped = cx.fs.take_dropped();
+    let Some(hs) = cx.net.handles() else {
+        return;
+    };
+    for (g, label) in dropped {
+        if target(hs.grants, cell, g, &label, Rights::NONE).is_ok() {
+            hs.net.forget_grant(g);
+            let _ = hs.grants.unlink(cell, g);
+        }
+    }
+}
+
+/// For endpoint socket `h`, granted to its holder by another cell (a
+/// channel that cell opened to it, or a handle it sent), the label of the
+/// holder's handle on that cell, or `?` when it holds none (design D10 of
+/// `add-cell-hierarchy`); `None` for an endpoint the host or its holder
+/// granted.
+pub(crate) fn opener_label<F, M, T, A, S>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    h: Handle,
+) -> Option<Vec<u8>> {
+    let hs = cx.net.handles()?;
+    let (_, g, _) = hs.net.endpoint_of(h)?;
+    let x = hs.grants.get(g)?;
+    let (holder, by) = (x.holder(), x.grantor());
+    if by == rhizo_cap::HOST || by == holder {
+        return None;
+    }
+    let label = hs
+        .grants
+        .iter()
+        .map(|(_, y)| y)
+        .find(|y| {
+            y.holder() == holder
+                && y.object() == Object::Cell(by)
+                && !y.label().as_bytes().is_empty()
+        })
+        .map_or(&b"?"[..], |y| y.label().as_bytes());
+    Some(label.to_vec())
 }

@@ -602,6 +602,9 @@ enum Op {
     Unlink(usize),
     End(usize),
     Copy(usize),
+    /// A channel opened through a grant with the message right, by its
+    /// holder.
+    Open(usize),
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -619,6 +622,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
         1 => i().prop_map(Op::Unlink),
         1 => i().prop_map(Op::End),
         1 => i().prop_map(Op::Copy),
+        2 => i().prop_map(Op::Open),
     ]
 }
 
@@ -890,6 +894,30 @@ fn apply(w: &mut World, op: &Op) -> Result<Vec<u32>, Error> {
             }
             r.map(|_| vec![])
         }
+        Op::Open(g) => {
+            // Mostly through a grant with the message right.
+            let message: Vec<u32> = grants
+                .iter()
+                .filter(|(_, x)| x.rights().contains(Rights::MESSAGE))
+                .map(|(i, _)| i)
+                .collect();
+            let via = message
+                .get(g % message.len().max(1))
+                .copied()
+                .unwrap_or_else(|| grant(g));
+            let by = grants.get(via).map_or(0, |x| x.holder());
+            let c = channels.create(tree, Actor::Cell(by), &none)?;
+            *made += 1;
+            let (mine, theirs) = grants.open_channel(tree, channels, by, via, c)?;
+            let Object::Cell(t) = grants.get(via).unwrap().object() else {
+                unreachable!("the message right is a cell's");
+            };
+            let (m, o) = (grants.get(mine).unwrap(), grants.get(theirs).unwrap());
+            assert_eq!((m.holder(), o.holder()), (by, t));
+            assert_eq!((m.grantor(), o.grantor()), (by, by));
+            assert!(!m.rights().any(Rights::CARRY) && !o.rights().any(Rights::CARRY));
+            Ok(vec![])
+        }
     }
 }
 
@@ -1011,5 +1039,68 @@ fn rehome_moves_a_received_handle() {
     assert_eq!((moved.holder(), moved.grantor()), (3, 1));
     assert_eq!(moved.parent(), Some(src), "still revocable by the sender");
     assert_eq!(g.rehome(&t, sent, 3, Object::Endpoint(c1)), Ok(()));
+    g.check(&t, &ch).unwrap();
+}
+
+/// Spec `cell-hierarchy`, "Accepting from the inbox": a cell with the
+/// message right on another gives a channel it made to itself and to that
+/// cell, sending and receiving but not carrying, both ends granted by it;
+/// without the right, on a channel it did not make, or past a ceiling,
+/// nothing is granted.
+#[test]
+fn open_channel_through_the_message_right() {
+    let mut t = root();
+    child(&mut t, 2, 1, Egress::None, Egress::None);
+    child(&mut t, 3, 1, Egress::None, Egress::None);
+    child(&mut t, 4, 1, Egress::Full, Egress::Full);
+    let mut ch = Channels::new();
+    let mut g = Grants::new();
+    let host = Actor::Host;
+    let message = g
+        .grant(&t, &ch, host, Object::Cell(3), ask(Rights::MESSAGE, 2))
+        .unwrap();
+    let observe = g
+        .grant(&t, &ch, host, Object::Cell(3), ask(Rights::OBSERVE, 2))
+        .unwrap();
+    let mine = ch.create(&t, Actor::Cell(2), &none).unwrap();
+    let theirs = ch.create(&t, Actor::Cell(3), &none).unwrap();
+    let before = g.clone();
+    assert_eq!(
+        g.open_channel(&t, &ch, 2, observe, mine),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        g.open_channel(&t, &ch, 3, message, mine),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        g.open_channel(&t, &ch, 2, message, theirs),
+        Err(Error::Denied)
+    );
+    assert_eq!(g.open_channel(&t, &ch, 2, 99, mine), Err(Error::NotFound));
+    assert_eq!(g, before, "a refusal changes nothing");
+    let (a, b) = g.open_channel(&t, &ch, 2, message, mine).unwrap();
+    let [e0, e1] = Channels::endpoints(mine);
+    let both = Rights::SEND | Rights::RECEIVE;
+    for (id, end, holder) in [(a, e0, 2), (b, e1, 3)] {
+        let x = g.get(id).unwrap();
+        assert_eq!(x.object(), Object::Endpoint(end));
+        assert_eq!((x.holder(), x.grantor(), x.rights()), (holder, 2, both));
+    }
+    assert!(g.holds(3, Object::Endpoint(e1), Rights::RECEIVE));
+    assert!(!g.holds(3, Object::Endpoint(e1), Rights::CARRY));
+    // The opener revokes what it gave.
+    let mut gone = Vec::new();
+    g.revoke(&t, Actor::Cell(2), b, &mut collect(&mut gone))
+        .unwrap();
+    assert_eq!(gone, [b]);
+    // To a cell whose egress is past the opener's ceiling: refused.
+    let wide = g
+        .grant(&t, &ch, host, Object::Cell(4), ask(Rights::MESSAGE, 2))
+        .unwrap();
+    let third = ch.create(&t, Actor::Cell(2), &none).unwrap();
+    let before = g.clone();
+    assert_eq!(g.open_channel(&t, &ch, 2, wide, third), Err(Error::Denied));
+    assert_eq!(g, before);
     g.check(&t, &ch).unwrap();
 }

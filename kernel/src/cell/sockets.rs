@@ -37,10 +37,11 @@ impl Host {
     pub(super) fn sync_networks(&self, id: u32) {
         let policies: Vec<(u32, rhizo_cap::Egress)> = self
             .tree
+            .get()
             .subtree(id)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|c| Some((c, self.tree.get(c)?.egress().clone())))
+            .filter_map(|c| Some((c, self.tree.get().get(c)?.egress().clone())))
             .collect();
         let none = policies.iter().all(|(_, e)| *e == rhizo_cap::Egress::None);
         if none && !POLICIES.load(Ordering::Acquire) {
@@ -62,7 +63,7 @@ impl Host {
             return;
         }
         let policies: Vec<(u32, rhizo_cap::Egress)> = ids
-            .filter_map(|id| Some((id, self.tree.get(id)?.egress().clone())))
+            .filter_map(|id| Some((id, self.tree.get().get(id)?.egress().clone())))
             .filter(|(_, egress)| *egress != rhizo_cap::Egress::None)
             .collect();
         if !policies.is_empty() {
@@ -84,23 +85,11 @@ pub(super) static WOKEN: AtomicBool = AtomicBool::new(false);
 
 /// The sockets as a system call reaches them (design D1 of
 /// `split-sockets-lock`): locked the first time the call uses them, until
-/// the call ends, with their change count then; a call that uses no socket
+/// the call ends, with their change count then, and the grant table for a
+/// call that moves handles (module `handles`); a call that uses no socket
 /// never waits for another CPU's socket calls.
 #[derive(Default)]
-pub(super) struct CallNet(pub(super) Option<(rhizo_core::sync::Guard<'static, Net>, u64)>);
-
-impl rhizo_abi::Sockets for CallNet {
-    fn net(&mut self) -> &mut Net {
-        &mut self
-            .0
-            .get_or_insert_with(|| {
-                let net = NET.lock();
-                let changes = net.changes();
-                (net, changes)
-            })
-            .0
-    }
-}
+pub(super) struct CallNet(pub(super) Option<CallState>);
 
 /// Runs `f` on the sockets, noting woken waiters for [`wake_woken`].
 pub(super) fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
