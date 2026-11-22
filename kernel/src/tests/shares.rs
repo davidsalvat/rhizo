@@ -100,8 +100,11 @@ fn domains_share_by_weight() {
 
 /// Spec `cell-hierarchy`, "CPU weights between domains": on one CPU, two
 /// spinning roots placed with weights 300 and 100 (protocol version 4,
-/// `run --cpu-weight`) get three quarters and one quarter of it, within
-/// 5 %, over 1 s.
+/// `run --cpu-weight`) get three quarters and one quarter of the CPU time
+/// the scheduler charges, within 5 %, over at least 1 s and 20 of the
+/// longest slice charged (change `fix-share-test`). The scheduler keeps
+/// each domain within one slice of its weight's part (design D23), so 20
+/// slices bound the share to 5 %, however long a busy host stretched them.
 fn root_weights_share_a_cpu() {
     let mut host = Host::new();
     let mut root = |weight| {
@@ -115,12 +118,21 @@ fn root_weights_share_a_cpu() {
         id
     };
     let (heavy, light) = (root(300), root(100));
-    step_for(&mut host, 1_000_000_000);
-    let (a, b) = (cpu_of(&mut host, &[heavy]), cpu_of(&mut host, &[light]));
+    let charged = |host: &mut Host, id| host.charged_ns(id).expect("shared by weight");
+    let (t0, mut longest, mut before) = (now_ns(), 0, 0);
+    let (a, b) = loop {
+        host.step();
+        let (a, b) = (charged(&mut host, heavy), charged(&mut host, light));
+        longest = longest.max(a + b - before);
+        before = a + b;
+        if now_ns() - t0 >= 1_000_000_000 && a + b >= 20 * longest {
+            break (a, b);
+        }
+    };
     let pct = 100 * a / (a + b);
     assert!(
         (70..=80).contains(&pct),
-        "weight 300 got {pct} % ({a} ns of {})",
+        "weight 300 got {pct} % ({a} ns of {}, longest slice {longest} ns)",
         a + b
     );
     for id in [heavy, light] {
