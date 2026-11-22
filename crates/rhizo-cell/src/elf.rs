@@ -106,16 +106,19 @@ pub struct Image<'a> {
     interp: Option<(usize, usize)>,
 }
 
+#[inline(always)]
 fn u16_at(d: &[u8], o: usize) -> Result<u16, ElfError> {
     let b = d.get(o..o.saturating_add(2)).ok_or(ElfError::Truncated)?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
+#[inline(always)]
 fn u32_at(d: &[u8], o: usize) -> Result<u32, ElfError> {
     let b = d.get(o..o.saturating_add(4)).ok_or(ElfError::Truncated)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+#[inline(always)]
 fn u64_at(d: &[u8], o: usize) -> Result<u64, ElfError> {
     let b = d.get(o..o.saturating_add(8)).ok_or(ElfError::Truncated)?;
     Ok(u64::from_le_bytes([

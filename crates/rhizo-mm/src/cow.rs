@@ -367,16 +367,21 @@ impl<F: EntryFormat> PageTable<F> {
             level: u32,
             entries: u64,
         ) -> Result<(), MapError> {
-            for i in 0..entries {
-                let slot = table + i * 8;
-                let entry = mem.read_u64(slot);
-                if !F::is_valid(entry) || F::is_leaf(entry, level) {
+            // Most entries are empty: four at a time.
+            for at in (table..table + entries * 8).step_by(32) {
+                let four = [0, 8, 16, 24].map(|off| mem.read_u64(at + off));
+                if four[0] | four[1] | four[2] | four[3] == 0 {
                     continue;
                 }
-                let next = private_table::<F>(mem, frames, slot, entry, level)?;
-                // A table of the last level holds only pages.
-                if level > 1 {
-                    walk::<F>(mem, frames, next, level - 1, ENTRIES)?;
+                for (slot, entry) in (at..).step_by(8).zip(four) {
+                    if !F::is_valid(entry) || F::is_leaf(entry, level) {
+                        continue;
+                    }
+                    let next = private_table::<F>(mem, frames, slot, entry, level)?;
+                    // A table of the last level holds only pages.
+                    if level > 1 {
+                        walk::<F>(mem, frames, next, level - 1, ENTRIES)?;
+                    }
                 }
             }
             Ok(())
@@ -555,24 +560,30 @@ impl<F: EntryFormat> PageTable<F> {
             level: u32,
             entries: u64,
         ) {
-            for i in 0..entries {
-                let entry = mem.read_u64(table + i * 8);
-                if !F::is_valid(entry) {
+            // Most entries are empty: four at a time.
+            for at in (table..table + entries * 8).step_by(32) {
+                let four = [0, 8, 16, 24].map(|off| mem.read_u64(at + off));
+                if four[0] | four[1] | four[2] | four[3] == 0 {
                     continue;
                 }
-                if F::is_leaf(entry, level) {
-                    let size = match level {
-                        0 => PageSize::Small,
-                        1 => PageSize::Large,
-                        _ => PageSize::Huge,
-                    };
-                    frames.free(F::address(entry) & !(size.bytes() - 1), size);
-                } else {
-                    let next = F::address(entry);
-                    if !frames.is_shared(next) {
-                        walk::<F>(mem, frames, next, level - 1, ENTRIES);
+                for entry in four {
+                    if !F::is_valid(entry) {
+                        continue;
                     }
-                    frames.free(next, PageSize::Small);
+                    if F::is_leaf(entry, level) {
+                        let size = match level {
+                            0 => PageSize::Small,
+                            1 => PageSize::Large,
+                            _ => PageSize::Huge,
+                        };
+                        frames.free(F::address(entry) & !(size.bytes() - 1), size);
+                    } else {
+                        let next = F::address(entry);
+                        if !frames.is_shared(next) {
+                            walk::<F>(mem, frames, next, level - 1, ENTRIES);
+                        }
+                        frames.free(next, PageSize::Small);
+                    }
                 }
             }
         }

@@ -654,22 +654,29 @@ impl<F: EntryFormat> PageTable<F> {
             range: core::ops::Range<u64>,
             f: &mut impl FnMut(u64, u64, PageSize, PageFlags),
         ) {
-            for i in range {
-                let entry = mem.read_u64(table + i * 8);
-                if !F::is_valid(entry) {
+            // Most entries are empty: four at a time (ranges are of 256 or
+            // 512 entries).
+            for first in range.step_by(4) {
+                let four = [0, 1, 2, 3].map(|j| mem.read_u64(table + (first + j) * 8));
+                if four[0] | four[1] | four[2] | four[3] == 0 {
                     continue;
                 }
-                let virt = base + (i << (12 + 9 * level));
-                if F::is_leaf(entry, level) {
-                    let size = PageSize::from_leaf_level(level);
-                    f(
-                        virt,
-                        F::address(entry) & !(size.bytes() - 1),
-                        size,
-                        F::flags(entry),
-                    );
-                } else {
-                    walk::<F>(mem, F::address(entry), level - 1, virt, 0..ENTRIES, f);
+                for (i, entry) in (first..).zip(four) {
+                    if !F::is_valid(entry) {
+                        continue;
+                    }
+                    let virt = base + (i << (12 + 9 * level));
+                    if F::is_leaf(entry, level) {
+                        let size = PageSize::from_leaf_level(level);
+                        f(
+                            virt,
+                            F::address(entry) & !(size.bytes() - 1),
+                            size,
+                            F::flags(entry),
+                        );
+                    } else {
+                        walk::<F>(mem, F::address(entry), level - 1, virt, 0..ENTRIES, f);
+                    }
                 }
             }
         }
