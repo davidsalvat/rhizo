@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 250" width="800" height="250" role="img" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title>Thesis targets and where they stand</title>
-<desc>Fork a 50 MB cell: target under 1 ms, measured 2.4–2.7 µs, met. Resume from memory: target under 100 µs, measured 1.3–1.4 µs with lazy restore, met (600 µs eager). Overhead per idle cell: target a few KB plus its own pages, measured 23 KB with 1,000 idle cells live, met.</desc>
+<desc>Fork a 50 MB cell: target under 1 ms, measured 1.4–2.6 µs, met. Resume from memory: target under 100 µs, measured 0.6–0.8 µs with lazy restore, met (150 µs eager). Overhead per idle cell: target a few KB plus its own pages, measured 23 KB with 1,000 idle cells live, met.</desc>
 <defs><marker id="a" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8b98a5"/></marker><marker id="g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#63d4a0"/></marker><marker id="b" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#79b8ff"/></marker><marker id="o" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#f2c14e"/></marker><marker id="r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff8a80"/></marker><marker id="c" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#63d4a0"/></marker></defs>
 <rect class="bg" x="0.5" y="0.5" width="799" height="249" rx="12" fill="#0d1117" stroke="#30363d"/>
 <rect x="24" y="24" width="240" height="202" rx="12" fill="#0f2a1f" stroke="#63d4a0" stroke-width="1.5"/>
 <text x="42" y="56" font-size="16" fill="#e6edf3" font-weight="700">Fork a ~50 MB cell</text>
 <text x="42" y="80" font-size="14" fill="#9ba7b3">target &lt; 1 ms</text>
-<text x="42" y="134" font-size="30" fill="#63d4a0" font-weight="700">2.4–2.7 µs</text>
+<text x="42" y="134" font-size="30" fill="#63d4a0" font-weight="700">1.4–2.6 µs</text>
 <text x="42" y="160" font-size="14" fill="#9ba7b3">copy-on-write</text>
 <circle cx="51" cy="194" r="9" fill="#63d4a0"/>
 <path d="M46.5 194l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -14,8 +14,8 @@
 <rect x="280" y="24" width="240" height="202" rx="12" fill="#0f2a1f" stroke="#63d4a0" stroke-width="1.5"/>
 <text x="298" y="56" font-size="16" fill="#e6edf3" font-weight="700">Resume from memory</text>
 <text x="298" y="80" font-size="14" fill="#9ba7b3">target &lt; 100 µs</text>
-<text x="298" y="134" font-size="30" fill="#63d4a0" font-weight="700">1.3–1.4 µs</text>
-<text x="298" y="160" font-size="14" fill="#9ba7b3">lazy; eager 600 µs</text>
+<text x="298" y="134" font-size="30" fill="#63d4a0" font-weight="700">0.6–0.8 µs</text>
+<text x="298" y="160" font-size="14" fill="#9ba7b3">lazy; eager 150 µs</text>
 <circle cx="307" cy="194" r="9" fill="#63d4a0"/>
 <path d="M302.5 194l3 3l6-6" fill="none" stroke="#0e2a20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="324" y="199" font-size="14" fill="#63d4a0" font-weight="700">Met</text>

@@ -123,34 +123,34 @@ runs.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/highlights-dark.svg">
-    <img src="docs/img/highlights.svg" alt="Six headline figures from one benchmark run. Node.js, ready to answer, forked from a warm template: 8.30 ms (warm fork 8.30 ms, cold start 50.16 ms); with its JIT, cold is 17% faster. numpy from PyPI wheels, forked after import numpy: 19.00 ms (Rhizo cell 19.00 ms, Linux process 18.33 ms); cold: cell 78.13, Linux 65.65 ms. 50 agents on a laptop, 45 of them suspended: 6.6 MB (shared snapshots 6.6 MB, full copies (before) 60 MB); snapshots point at shared pages. A template saved to a file, loaded into a fresh VM: 22.1× sooner (loaded template 1.30 ms, cold agent 28.75 ms); to its first answer (QEMU). Host operation on one cell, how long other cells stall: 21 µs (now 21 µs, every CPU stopped 122 µs); 6× shorter. 10,000 busy cells, 1 vCPU, 99th percentile wait to wake: 0.5–0.9 ms; 39k–45k operations/s." width="800">
+    <img src="docs/img/highlights.svg" alt="Six headline figures from one benchmark run. Node.js, ready to answer, forked from a warm template: 4.17 ms (warm fork 4.17 ms, cold start 30.31 ms); with its JIT, cold is 19% faster. numpy from PyPI wheels, forked after import numpy: 9.87 ms (Rhizo cell 9.87 ms, Linux process 9.01 ms); cold: cell 48.60, Linux 44.98 ms. 50 agents on a laptop, 45 of them suspended: 6.6 MB (shared snapshots 6.6 MB, full copies (before) 60 MB); snapshots point at shared pages. A template saved to a file, loaded into a fresh VM: 10.7× sooner (loaded template 1.83 ms, cold agent 19.64 ms); to its first answer (QEMU). Host operation on one cell, how long other cells stall: 14 µs (now 14 µs, every CPU stopped 85 µs); 6× shorter. 10,000 busy cells, 1 vCPU, 99th percentile wait to wake: 0.4–3.7 ms; 39k–46k operations/s." width="800">
   </picture>
 </p>
 
-- **Node.js** forked from a warm template answers in about **4 to 8 ms**,
-  against **30 to 51 ms** from a cold start; a Linux process cannot fork
+- **Node.js** forked from a warm template answers in about **4 to 7 ms**,
+  against **30 to 46 ms** from a cold start; a Linux process cannot fork
   Node.js at all. With its JIT (under write-or-execute pages), a cold start is
   about **16 to 24% faster** than with `--jitless`.
 - **numpy** runs **about as fast as in a Linux process** in the same kind of
-  VM: a fork after `import numpy` takes 9 to 19 ms in either, and cold
-  starts are within about 20% of each other.
+  VM: a fork after `import numpy` takes 9 to 18 ms in either, and cold
+  starts are within about 15% of each other.
 - **On a laptop**, 50 agents of one template with 45 suspended take
   **6.6 MB** together, down from **60 MB** before snapshots referred to the
   pages they share.
 - **A template saved to a file** and loaded into a fresh VM answers about
-  **10 to 24 times sooner** than a cold agent (1.1 to 2.8 ms against 20 to
-  29 ms) since the control channel moved to vsock; 2.6 to 4.1 times before.
+  **10 to 12 times sooner** than a cold agent (1.8 to 2.8 ms against 20 to
+  28 ms) since the control channel moved to vsock; 2.6 to 4.1 times before.
 - **Host operations** on one cell stall the others about **5 to 7 times
   less**: 14 to 22 µs against 80 to 143 µs when every CPU stopped (4 to 5
-  times less on Cloud Hypervisor, up to 32 µs).
+  times less on Cloud Hypervisor).
 - **10,000 busy cells** on one vCPU: the 99th percentile of the wait to wake
   stays between **0.4 and 4.7 ms** depending on the VMM and the run
   (Firecracker the slowest), back to where it was before the cell tree once
   cells that leave no longer cost every other cell a pass over the tree, and
   is gated on main like every other timing.
-- For scale: a cell starts a program and runs it to its end in **6.2 to
-  7.2 µs**, 63 to 91 times faster than a Linux process in the same VM, and
-  forks while holding 50 MiB in **1 to 3 µs**.
+- For scale: a cell starts a program and runs it to its end in **6.5 to
+  7.2 µs**, 63 to 85 times faster than a Linux process in the same VM, and
+  forks while holding 50 MiB in **1 to 2 µs**.
 
 <details>
 <summary>Every measurement: charts, both architectures, boot time and the full tables</summary>
@@ -183,10 +183,10 @@ on the same machine with the same timing method.
 
 | VMM | Rhizo median (ms) | Rhizo p90 (ms) | Linux median (ms) | Linux p90 (ms) | Runs |
 |---|---:|---:|---:|---:|---:|
-| Firecracker | 6.5 | 7.4 | 169.0 | 171.4 | 20 |
-| Cloud Hypervisor | 8.5 | 11.8 | 100.4 | 105.6 | 20 |
-| QEMU microvm | 42.9 | 45.0 | — | — | 20 |
-| QEMU q35 | 56.7 | 58.6 | 168.2 | 172.7 | 20 |
+| Firecracker | 5.6 | 6.4 | 144.2 | 150.1 | 20 |
+| Cloud Hypervisor | 6.5 | 9.2 | 75.9 | 80.4 | 20 |
+| QEMU microvm | 38.4 | 40.4 | — | — | 20 |
+| QEMU q35 | 47.7 | 51.4 | 129.0 | 135.8 | 20 |
 
 ### A cell against a Linux process, in the same kind of VM
 
@@ -194,10 +194,10 @@ Same machine, same run. Rhizo runs inside Firecracker, and so does the Linux gue
 
 | Operation | Rhizo cell | Linux process, same VM | Linux process, host |
 |---|---:|---:|---:|
-| The `fork` call, holding 50 MiB written | 2.7 µs | 84.2 µs | 762.4 µs |
-| Fork, then the child writes all 50 MiB and exits | 7.46 ms | 28.03 ms | 28.92 ms |
-| Start a program and run it to its exit (`hello`) | 6.2 µs | 563.7 µs | 122.3 µs |
-| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 1.3 µs / 600.3 µs | — | 4.06 ms (CRIU) |
+| The `fork` call, holding 50 MiB written | 1.4 µs | 58.8 µs | 1.01 ms |
+| Fork, then the child writes all 50 MiB and exits | 1.98 ms | 12.92 ms | 25.30 ms |
+| Start a program and run it to its exit (`hello`) | 6.6 µs | 416.9 µs | 104.6 µs |
+| Resume a suspended 8 MiB program: lazy / eager (CRIU on the host) | 0.8 µs / 150.1 µs | — | 3.87 ms (CRIU) |
 
 ### Whole VMs and sandboxes, for scale
 
@@ -205,8 +205,8 @@ A microVM or a sandbox starts or restores a whole environment (a VM, or a sandbo
 
 | Operation | Rhizo cell | Firecracker microVM | gVisor sandbox |
 |---|---:|---:|---:|
-| Start a program and run it to its exit (`hello`) | 6.2 µs | 168.97 ms | 74.63 ms |
-| Resume a suspended environment until it runs (eager for the cell) | 600.3 µs | 3.55 ms | 102.79 ms |
+| Start a program and run it to its exit (`hello`) | 6.6 µs | 144.17 ms | 61.07 ms |
+| Resume a suspended environment until it runs (eager for the cell) | 150.1 µs | 3.47 ms | 87.28 ms |
 
 ### A real interpreter
 
@@ -214,29 +214,29 @@ CPython (static, 3.13.18) answering one agent tool call (`cells/python/agent_dem
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 18.41 ms | 18.35 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 4.06 ms (4.5× faster) | 5.57 ms |
+| Cold, from its executable (interpreter start, imports, warm-up) | 13.51 ms | 14.66 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after the warm-up | 2.48 ms (5.5× faster) | 3.26 ms |
 
 MicroPython (static, v1.24.1) answering one request (`cells/python/rhizo_demo.py`, imported from the cell's own files), in a cell in Firecracker:
 
 | Started | Time |
 |---|---:|
-| Cold, from its executable (interpreter start, imports, warm-up) | 3.45 ms |
-| Forked from a template frozen after the warm-up | 509.2 µs (6.8× faster) |
+| Cold, from its executable (interpreter start, imports, warm-up) | 2.69 ms |
+| Forked from a template frozen after the warm-up | 289.9 µs (9.3× faster) |
 
 numpy and its OpenBLAS, installed from their PyPI wheels into a dynamically linked CPython, computing on arrays (`cells/python/numpy_demo.py`: a linear solve, a ufunc, a matrix product), in a cell and as a Linux process in the same Firecracker VM:
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold (interpreter start, `import numpy`, compute) | 78.13 ms | 65.65 ms |
-| Forked from an interpreter frozen (cell) or kept (process) after `import numpy` | 19.00 ms (4.1× faster) | 18.33 ms |
+| Cold (interpreter start, `import numpy`, compute) | 48.60 ms | 44.98 ms |
+| Forked from an interpreter frozen (cell) or kept (process) after `import numpy` | 9.87 ms (4.9× faster) | 9.01 ms |
 
 Node.js (the official build, dynamically linked, run unmodified with `--jitless`) answering one agent tool call (`cells/node/demo.js`), in a cell and as a Linux process in the same Firecracker VM (Node.js cannot fork itself, so the process has no warm row):
 
 | Started | Rhizo cell | Linux process |
 |---|---:|---:|
-| Cold, from its executable (`ld.so`, V8 start-up, warm-up) | 50.16 ms | 44.25 ms |
-| Forked from Node.js frozen after its warm-up | 8.30 ms (6.0× faster) | — |
+| Cold, from its executable (`ld.so`, V8 start-up, warm-up) | 30.31 ms | 28.52 ms |
+| Forked from Node.js frozen after its warm-up | 4.17 ms (7.3× faster) | — |
 
 ### Both architectures, in instructions
 
@@ -244,14 +244,14 @@ Retired instructions per operation, counted under QEMU with `-icount` (the same 
 
 | Operation | x86_64 | AArch64 |
 |---|---:|---:|
-| Switch between two cells | 853 | 756 |
-| Create the `hello` cell | 20,401 | 12,960 |
-| Run `hello` from start to exit | 72,309 | 80,384 |
-| Fork a cell holding 50 MiB | 3,015 | 2,976 |
-| A static glibc program, cold | 35,257,082 | 36,523,856 |
-| The same, forked from a warm template | 67,819 | 66,064 |
+| Switch between two cells | 875 | 817 |
+| Create the `hello` cell | 28,077 | 21,712 |
+| Run `hello` from start to exit | 88,401 | 94,336 |
+| Fork a cell holding 50 MiB | 7,010 | 7,696 |
+| A static glibc program, cold | 35,246,162 | 36,519,376 |
+| The same, forked from a warm template | 76,819 | 73,792 |
 
-Environment: `ci`, KVM: yes, measured 2026-11-22. Regenerate with
+Environment: `ci`, KVM: yes, measured 2026-11-21. Regenerate with
 `cargo xtask bench --readme`.
 <!-- bench:end -->
 
