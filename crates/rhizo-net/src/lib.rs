@@ -384,8 +384,6 @@ pub struct Net {
     /// and the destinations carved out of it.
     floor: Vec<Rule>,
     carved: Vec<Rule>,
-    /// Whether the card's gateway and name servers are in the floor.
-    host_floor: bool,
     /// Card ports drawn so far.
     card_draws: u64,
     /// The sockets the current call looked at: its waiter joins their wait
@@ -440,7 +438,6 @@ impl Net {
             policies: Vec::new(),
             floor: Vec::new(),
             carved: Vec::new(),
-            host_floor: true,
             card_draws: 0,
         }
     }
@@ -493,15 +490,6 @@ impl Net {
         Ok(())
     }
 
-    /// Leaves the card's gateway and name servers out of the floor
-    /// (`false`), or puts them back in it (the default). Only for a host
-    /// that cannot name its model endpoint yet (a control kernel before
-    /// protocol version 4, task 1.11 of `add-cell-hierarchy`).
-    pub fn set_host_floor(&mut self, on: bool) {
-        self.host_floor = on;
-        self.enforce(None);
-    }
-
     /// Whether a socket of network `net` may reach `ip`:`port` outside with
     /// `proto` (TCP or UDP), or receive a datagram from it: never through
     /// the floor (unless carved out of it), then as the network's policy
@@ -513,7 +501,7 @@ impl Net {
         let Some((_, egress)) = self.policies.iter().find(|(n, _)| *n == net) else {
             return false;
         };
-        let host = self.host_floor && self.wire.as_ref().is_some_and(|w| w.is_host(ip));
+        let host = self.wire.as_ref().is_some_and(|w| w.is_host(ip));
         if (host || self.floor.iter().any(|r| r.allows(proto, ip, port)))
             && !self.carved.iter().any(|r| r.allows(proto, ip, port))
         {

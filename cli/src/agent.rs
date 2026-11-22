@@ -37,16 +37,27 @@ pub fn guest_endpoint(url: &str, vmm: Vmm) -> Result<String, String> {
 
 /// Where an agent goes (spec `control-plane`): a root with egress `model`,
 /// the model endpoint `endpoint` (`IP:PORT`) and nothing else, as `rhizo
-/// chat` and the agent templates pass `--egress model` themselves. A
-/// kernel of protocol 3 has no egress: the root it makes every cell.
-pub fn agent_placement(client: &Client, endpoint: &str) -> Result<Placement, String> {
+/// chat` and the agent templates pass `--egress model` themselves; the
+/// endpoint is carved out of the deny floor if it is not yet. A kernel of
+/// protocol 3 has no egress: the root it makes every cell.
+pub fn agent_placement(client: &mut Client, endpoint: &str) -> Result<Placement, String> {
     if !client.current() {
         return Ok(Placement::root());
     }
+    let model = model_endpoint(client, endpoint)?;
     Ok(Placement {
-        egress: Egress::Rules(vec![crate::tree::endpoint_rule(endpoint)?]),
+        egress: Egress::Rules(vec![model]),
         ..Placement::root()
     })
+}
+
+/// The rule of the model endpoint `endpoint` (`IP:PORT`), carved out of the
+/// deny floor.
+fn model_endpoint(client: &mut Client, endpoint: &str) -> Result<rhizo_control::Rule, String> {
+    let model = crate::tree::endpoint_rule(endpoint)?;
+    let dir = client.dir.clone();
+    crate::floor::carve(client, &dir, model)?;
+    Ok(model)
 }
 
 fn say(text: &str) {
@@ -102,7 +113,7 @@ pub fn run(client: &mut Client, run: &args::Run) -> Result<(), String> {
     let placement = if run.place.is_default() {
         agent_placement(client, &endpoint)?
     } else {
-        let model = Some(crate::tree::endpoint_rule(&endpoint)?);
+        let model = Some(model_endpoint(client, &endpoint)?);
         run.place.placement(model)?
     };
     let reply = client.call(&Request::Run(Run {

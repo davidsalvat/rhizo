@@ -22,11 +22,8 @@ impl Host {
     /// new policies deny are reset. `false` if refused (no such cell, or a
     /// child asking for more than its parent has).
     #[cfg_attr(
-        not(any(feature = "ktest", feature = "bench-cell", feature = "control")),
-        allow(
-            dead_code,
-            reason = "used by in-kernel tests, benchmarks and the control kernel"
-        )
+        not(any(feature = "ktest", feature = "bench-cell")),
+        allow(dead_code, reason = "used by in-kernel tests and benchmarks")
     )]
     pub fn set_egress(&mut self, id: u32, egress: rhizo_cap::Egress) -> bool {
         let ceiling = egress.clone();
@@ -128,15 +125,16 @@ pub(super) fn fork_files(fs: &Fs, id: u32) -> Fs {
     child
 }
 
-/// Puts the card's gateway and name servers, the host, in the deny floor
-/// (`true`, the default) or leaves them out of it
-/// (`rhizo_net::Net::set_host_floor`).
+/// Sets the host's deny floor (`rhizo_net::Net::set_floor`, protocol
+/// version 4's `floor`): `deny` beyond the card's gateway and name servers,
+/// which are always in it, and the endpoints `carved` out. Connections it
+/// now denies are reset. `false` if it holds too many rules.
 #[cfg_attr(
     not(feature = "control"),
     allow(dead_code, reason = "used by the control kernel")
 )]
-pub fn host_floor(on: bool) {
-    with_net(|net| net.set_host_floor(on));
+pub fn set_floor(deny: &[rhizo_net::Rule], carved: &[rhizo_net::Rule]) -> bool {
+    with_net(|net| net.set_floor(deny, carved)).is_ok()
 }
 
 /// Sockets open in the kernel.

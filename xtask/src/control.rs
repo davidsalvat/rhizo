@@ -1513,6 +1513,20 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         }
     };
     let kernel_path = kernel.to_string_lossy().into_owned();
+    // Two services on the host (design D7 of `add-cell-hierarchy`): the
+    // model endpoint `rhizo up --model` carves out of the deny floor, and
+    // another one the floor keeps from every cell.
+    let bind = match vmm {
+        Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
+        other => crate::hostnet::host_address(other),
+    };
+    let listen = || {
+        std::net::TcpListener::bind((bind, 0))
+            .and_then(|l| Ok((l.local_addr()?.port(), l)))
+            .map_err(|e| format!("cannot listen on {bind}: {e}"))
+    };
+    let ((model_port, _model), (service_port, _service)) = (listen()?, listen()?);
+    let model = format!("{bind}:{model_port}");
     let up = || {
         ok(&[
             "up",
@@ -1524,6 +1538,8 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             accel.id(),
             "--kernel",
             &kernel_path,
+            "--model",
+            &model,
         ])
     };
     up()?;
@@ -1914,12 +1930,64 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             ok(&["kill", c])?; // forget it
         }
         ok(&["kill", &other])?;
+        // The deny floor (spec `networking`, "Host services behind the
+        // gateway"): a cell allowed everywhere connects to the host's other
+        // service and to the model endpoint, as the guest reaches them; the
+        // first is refused, the second carved out, and the refusal is
+        // audited.
+        let host = crate::hostnet::host_address(vmm);
+        let (service, endpoint) = (
+            format!("{host}:{service_port}"),
+            format!("{host}:{model_port}"),
+        );
+        let out = ok(&[
+            "run",
+            "reach",
+            "--egress",
+            "any:0.0.0.0/0:0-65535",
+            "--",
+            &service,
+            &endpoint,
+        ])?;
+        must(
+            out.contains("DC\n") && out.contains(" exited 0"),
+            "a cell with egress 0.0.0.0/0 reaches the model endpoint but no other host service",
+            "`DC` (denied, then connected) and `exited 0`",
+        )?;
+        let denied = format!("tcp {service}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let out = loop {
+            let out = ok(&["audit", "tail", "--kind", "egress-denied"])?;
+            if out.contains(&denied) || Instant::now() > deadline {
+                break out;
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        must(
+            out.lines()
+                .any(|l| l.contains("egress-denied") && l.contains(&denied)),
+            "`rhizo audit tail` shows the floor's refusal",
+            &format!("an `egress-denied` line with `{denied}`"),
+        )?;
+        // `--egress model` naming another endpoint, as `rhizo chat --llm`
+        // does, carves exactly that one out, audited.
+        let llm = format!("http://{bind}:{service_port}");
+        let out = ok(&[
+            "run", "reach", "--egress", "model", "--llm", &llm, "--", &service, &endpoint,
+        ])?;
+        must(
+            out.contains("CD\n"),
+            "`--egress model --llm` carves its endpoint out of the floor, and allows only it",
+            "`CD` (connected, then denied by its policy)",
+        )?;
+        let out = ok(&["audit", "tail", "--kind", "floor"])?;
+        must(
+            out.contains(&format!("tcp:{host}/32:{service_port}-{service_port}")),
+            "`rhizo audit tail` shows the floor changed with the endpoint carved out",
+            "a `floor` line naming it",
+        )?;
         // The agent, against the host's fake model.
         if crate::cpython::root().join("usr/bin/python3").exists() {
-            let bind = match vmm {
-                Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
-                other => crate::hostnet::host_address(other),
-            };
             let port = crate::hostnet::llm_server(bind, 0)?;
             let llm = format!("http://{bind}:{port}");
             let out = ok(&[

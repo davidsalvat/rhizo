@@ -885,6 +885,33 @@ fn run_jobs(vmm: Vmm, jobs: &[Job], parallel: usize) -> Result {
         .unwrap_or(Ok(()))
 }
 
+/// On a CI runner with KVM, the egress tests ran against the host's echo
+/// and model servers (design D7 of `add-cell-hierarchy`, task 1.6: on
+/// Firecracker and Cloud Hypervisor too), rather than noting they could
+/// not: a tap device that failed must not pass for a skip.
+fn egress_ran(vmm: Vmm, reproduce: &str, run: &VmRun) -> Result {
+    // A shard holds only some of the tests: the whole run is checked.
+    let required = std::env::var_os("CI").is_some()
+        && vmm.requires_kvm()
+        && std::env::var_os("RHIZO_SHARDS").is_none();
+    check_vm(
+        !required
+            || (run
+                .output
+                .contains("test egress_levels_against_the_echo_server")
+                && !run
+                    .output
+                    .contains("(no network card, echo and model servers: not run)")),
+        VmCheck {
+            kind: "ktest",
+            what: format!("the egress tests must run on {} in CI", vmm.id()),
+            expected: "`egress_levels_against_the_echo_server` run, not skipped".into(),
+            reproduce: reproduce.into(),
+        },
+        run,
+    )
+}
+
 /// Checks a test VM's outcome.
 fn verify(vmm: Vmm, check: Check, reproduce: &str, run: &VmRun) -> Result {
     match check {
@@ -918,17 +945,21 @@ fn verify(vmm: Vmm, check: Check, reproduce: &str, run: &VmRun) -> Result {
             }
             Ok(())
         }
-        Check::Ktest { cpus: 1 } => check_vm(
-            run.result == VmResult::Passed && run.output.contains("test result: ok."),
-            VmCheck {
-                kind: "ktest",
-                what: "in-kernel tests must pass".into(),
-                expected: "Passed with `test result: ok.`".into(),
-                reproduce: reproduce.into(),
-            },
-            run,
-        ),
+        Check::Ktest { cpus: 1 } => {
+            check_vm(
+                run.result == VmResult::Passed && run.output.contains("test result: ok."),
+                VmCheck {
+                    kind: "ktest",
+                    what: "in-kernel tests must pass".into(),
+                    expected: "Passed with `test result: ok.`".into(),
+                    reproduce: reproduce.into(),
+                },
+                run,
+            )?;
+            egress_ran(vmm, reproduce, run)
+        }
         Check::Ktest { cpus } => {
+            egress_ran(vmm, reproduce, run)?;
             let online = format!("cpus: {cpus} online");
             check_vm(
                 run.result == VmResult::Passed

@@ -57,6 +57,10 @@ impl Dir {
     pub fn log(&self) -> PathBuf {
         self.0.join("server.log")
     }
+    /// What clients changing the deny floor lock (`crate::floor::carve`).
+    pub fn floor_lock(&self) -> PathBuf {
+        self.0.join("floor.lock")
+    }
     /// The kernel image the VM booted (a copy: later builds replace the
     /// original).
     pub fn kernel(&self) -> PathBuf {
@@ -72,6 +76,7 @@ impl Dir {
             self.socket(),
             self.kernel(),
             self.log(),
+            self.floor_lock(),
             self.state(),
         ] {
             let _ = fs::remove_file(file);
@@ -96,6 +101,9 @@ pub struct Info {
     /// of a server older than version 4, whose kernel speaks version 3 at
     /// most.
     pub protocol: Option<u8>,
+    /// The deny floor the kernel holds (`None`: a kernel of protocol 3, or
+    /// a server that sent none).
+    pub floor: Option<crate::floor::Floor>,
 }
 
 impl Info {
@@ -106,6 +114,9 @@ impl Info {
         );
         if let Some(p) = self.protocol {
             text += &format!("protocol={p}\n");
+        }
+        if let Some(f) = &self.floor {
+            text += &f.encode();
         }
         text
     }
@@ -127,6 +138,7 @@ impl Info {
                 Some(p) => Some(p.parse().ok()?),
                 None => None,
             },
+            floor: crate::floor::Floor::decode(text),
         })
     }
 
@@ -165,11 +177,17 @@ mod tests {
             cpus: 2,
             boot_ms: 40,
             protocol: Some(4),
+            floor: Some(crate::floor::Floor {
+                deny: Vec::new(),
+                carved: vec![crate::tree::endpoint_rule("10.0.2.2:11434").unwrap()],
+                model: None,
+            }),
         };
         assert_eq!(Info::decode(&info.encode()), Some(info.clone()));
         // A version-3 server wrote no protocol.
         let old = Info {
             protocol: None,
+            floor: None,
             ..info
         };
         assert_eq!(old.encode().lines().count(), 7);
@@ -190,6 +208,7 @@ mod tests {
             dir.console(),
             dir.log(),
             dir.kernel(),
+            dir.floor_lock(),
         ] {
             fs::write(file, b"x").unwrap();
         }

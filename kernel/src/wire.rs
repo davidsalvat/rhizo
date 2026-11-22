@@ -109,6 +109,10 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
 
 /// The egress policy `model` (design D7 of `add-cell-hierarchy`): the
 /// host's model endpoint (`llm=` on the command line); `None` without one.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
 pub fn model_egress() -> Egress {
     let Some((ip, port)) = options().llm else {
         return Egress::None;
