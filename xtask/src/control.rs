@@ -5,13 +5,20 @@
 //! line, the VMM's standard input and output. `rhizo up` keeps one of these
 //! behind a socket; the benchmark times requests through one; the `control`
 //! test step drives `rhizo` itself against one.
+//!
+//! A vsock connection presents, before its frames, the secret the kernel
+//! gave on the serial line (change `authenticate-control-channel`): any
+//! local user may connect to a guest's vsock port on QEMU, but only this
+//! process reads the VMM's standard output. The secret is kept in memory
+//! only, and its line never reaches the console text.
 
 use crate::bench::{Metric, summarize};
 use crate::report::Failure;
 use crate::vmm::{self, Accel, Guest, RunOptions, Vmm};
 use crate::{Profile, Result, arch, build_kernel, report, target_dir, workspace_root};
 use rhizo_control::{
-    Body, Decoder, Frame, Item, Message, Placement, Request, Run, State, VSOCK_PORT,
+    Body, Decoder, Frame, Item, Message, Placement, Request, Run, SECRET_LEN, SECRET_LINE, State,
+    VSOCK_PORT,
 };
 use std::io::{self as stdio, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -79,6 +86,72 @@ pub enum Event {
 /// Where frames go: the serial line, or the vsock stream once connected.
 type Link = Box<dyn Write + Send>;
 
+/// The secret a vsock connection presents first.
+pub type Secret = [u8; SECRET_LEN];
+
+/// Takes the kernel's secret line ([`SECRET_LINE`]) out of its console
+/// text, so that the secret reaches no console log or error report. A line
+/// is held back only while it may still be that line.
+#[derive(Debug, Default)]
+struct SecretFilter {
+    /// The current line, while it may be the secret line.
+    held: Vec<u8>,
+    /// Whether the next byte continues a line.
+    mid_line: bool,
+    /// The first secret seen.
+    secret: Option<Secret>,
+}
+
+impl SecretFilter {
+    /// Takes a byte of console text; what is text goes to `text`.
+    fn push(&mut self, byte: u8, text: &mut Vec<u8>) {
+        if self.held.is_empty() && (self.mid_line || byte != SECRET_LINE.as_bytes()[0]) {
+            text.push(byte);
+            self.mid_line = byte != b'\n';
+            return;
+        }
+        self.held.push(byte);
+        if byte == b'\n' {
+            if let Some(secret) = secret_of(&self.held) {
+                self.secret.get_or_insert(secret);
+                self.held.clear();
+                self.mid_line = false;
+                return;
+            }
+        } else if may_be_secret_line(&self.held) {
+            return;
+        }
+        text.append(&mut self.held);
+        self.mid_line = byte != b'\n';
+    }
+}
+
+/// Whether `line` (without its end) may be the start of a secret line.
+fn may_be_secret_line(line: &[u8]) -> bool {
+    let prefix = SECRET_LINE.as_bytes();
+    let n = line.len().min(prefix.len());
+    line[..n] == prefix[..n]
+        && line.len() <= prefix.len() + 2 * SECRET_LEN + 1
+        && line[n..]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() || *b == b'\r')
+}
+
+/// The secret a whole line gives, if it is a secret line.
+fn secret_of(line: &[u8]) -> Option<Secret> {
+    let line = line.strip_suffix(b"\n")?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let hex = line.strip_prefix(SECRET_LINE.as_bytes())?;
+    if hex.len() != 2 * SECRET_LEN {
+        return None;
+    }
+    let mut secret = [0; SECRET_LEN];
+    for (b, pair) in secret.iter_mut().zip(hex.chunks(2)) {
+        *b = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(secret)
+}
+
 /// Sends frames to a VM, from any thread.
 #[derive(Clone)]
 pub struct Writer(Arc<Mutex<Link>>);
@@ -110,6 +183,10 @@ pub struct Vm {
     next_id: u32,
     /// The VM's socket device, if it has one.
     vsock: Option<vmm::Vsock>,
+    /// The secret the kernel gave on the serial line.
+    secret: Arc<Mutex<Option<Secret>>>,
+    /// Where events go, until the vsock reader takes it.
+    tx: Option<Sender<Event>>,
     /// Where the frames go, for people: `vsock`, or the serial line and
     /// why.
     pub channel: String,
@@ -117,11 +194,13 @@ pub struct Vm {
     pub protocol: u8,
 }
 
-/// Decodes what `from` carries into `tx` until it ends; then, if
-/// `vmm_output`, tells that the VMM ended.
-fn read_frames(mut from: impl Read, tx: &Sender<Event>, vmm_output: bool) {
+/// Decodes what `from` carries into `tx` until it ends. With `serial` (the
+/// VMM's output), the kernel's secret goes there instead of into the text,
+/// and the end tells that the VMM ended.
+fn read_frames(mut from: impl Read, tx: &Sender<Event>, serial: Option<&Mutex<Option<Secret>>>) {
     // Every version: the hello of a kernel `rhizo` does not speak names it.
     let mut decoder = Decoder::any_version();
+    let mut filter = SecretFilter::default();
     let mut buf = [0u8; 4096];
     while let Ok(n) = from.read(&mut buf) {
         if n == 0 {
@@ -130,10 +209,14 @@ fn read_frames(mut from: impl Read, tx: &Sender<Event>, vmm_output: bool) {
         let mut text = Vec::new();
         for &byte in &buf[..n] {
             match decoder.push(byte) {
+                Some(Item::Text(b)) if serial.is_some() => filter.push(b, &mut text),
                 Some(Item::Text(b)) => text.push(b),
                 Some(Item::Frame(frame)) => {
                     if !text.is_empty() {
                         let _ = tx.send(Event::Text(std::mem::take(&mut text)));
+                    }
+                    if let (Some(secret), Some(s)) = (serial, filter.secret.take()) {
+                        *secret.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
                     }
                     let _ = tx.send(Event::Frame(frame));
                 }
@@ -147,14 +230,15 @@ fn read_frames(mut from: impl Read, tx: &Sender<Event>, vmm_output: bool) {
             let _ = tx.send(Event::Text(text));
         }
     }
-    if vmm_output {
+    if serial.is_some() {
         let _ = tx.send(Event::Exited);
     }
 }
 
-/// Connects to the control kernel's port on `vsock`, retrying while the
-/// VMM or the kernel is not ready, for at most [`VSOCK_TIMEOUT`].
-fn connect(vsock: vmm::Vsock) -> stdio::Result<(Box<dyn Read + Send>, Link)> {
+/// Connects to the control kernel's port on `vsock` and sends `first` (the
+/// secret), retrying while the VMM or the kernel is not ready, for at most
+/// [`VSOCK_TIMEOUT`].
+fn connect(vsock: vmm::Vsock, first: &[u8]) -> stdio::Result<(Box<dyn Read + Send>, Link)> {
     let deadline = Instant::now() + VSOCK_TIMEOUT;
     loop {
         let attempt = match vsock {
@@ -163,7 +247,12 @@ fn connect(vsock: vmm::Vsock) -> stdio::Result<(Box<dyn Read + Send>, Link)> {
                 let reader: Box<dyn Read + Send> = Box::new(f.try_clone()?);
                 Ok((reader, Box::new(f) as Link))
             }),
-        };
+        }
+        .and_then(|(reader, mut writer)| {
+            writer.write_all(first)?;
+            writer.flush()?;
+            Ok((reader, writer))
+        });
         match attempt {
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             result => return result,
@@ -250,7 +339,14 @@ pub fn run_options(accel: Accel, cpus: u32, memory_mib: u32) -> RunOptions {
 impl Vm {
     /// Boots `kernel` (a `control` build) on `vmm` and waits for its hello.
     /// The VMM's error output goes to `stderr`.
-    pub fn start(vmm: Vmm, kernel: &Path, mut opts: RunOptions, stderr: Stdio) -> Result<Self> {
+    pub fn start(vmm: Vmm, kernel: &Path, opts: RunOptions, stderr: Stdio) -> Result<Self> {
+        let mut vm = Self::boot(vmm, kernel, opts, stderr)?;
+        vm.attach(vmm)?;
+        Ok(vm)
+    }
+
+    /// Boots `kernel` and waits for its hello on the serial line.
+    fn boot(vmm: Vmm, kernel: &Path, mut opts: RunOptions, stderr: Stdio) -> Result<Self> {
         if let Some(reason) = vmm.unavailable_reason(opts.accel) {
             return Err(format!("{} is not available: {reason}", vmm.id()));
         }
@@ -278,7 +374,9 @@ impl Vm {
         let stdout = child.stdout.take().expect("stdout is piped");
         let (tx, events) = mpsc::channel();
         let serial = tx.clone();
-        thread::spawn(move || read_frames(stdout, &serial, true));
+        let secret = Arc::new(Mutex::new(None));
+        let to_serial = Arc::clone(&secret);
+        thread::spawn(move || read_frames(stdout, &serial, Some(&to_serial)));
         let mut vm = Vm {
             child,
             stdin: Writer(Arc::new(Mutex::new(Box::new(stdin)))),
@@ -286,24 +384,41 @@ impl Vm {
             console: Vec::new(),
             next_id: 1,
             vsock,
+            secret,
+            tx: Some(tx),
             channel,
             protocol: 0,
         };
         vm.hello(vmm, BOOT_TIMEOUT, "on its serial line")?;
-        if let Some(v) = vsock {
-            // From now on the frames take the stream (design D3 of
-            // `control-over-vsock`).
-            let (reader, writer) = connect(v).map_err(|e| {
-                format!(
-                    "cannot connect to the control kernel's vsock on {}: {e}",
-                    vmm.id()
-                )
-            })?;
-            thread::spawn(move || read_frames(reader, &tx, false));
-            *vm.stdin.0.lock().unwrap_or_else(|e| e.into_inner()) = writer;
-            vm.hello(vmm, VSOCK_TIMEOUT, "on its vsock")?;
-        }
         Ok(vm)
+    }
+
+    /// The secret the kernel gave before its hello on the serial line.
+    fn secret(&self) -> Option<Secret> {
+        *self.secret.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// From now on the frames take the VM's vsock, if it has one (design D3
+    /// of `control-over-vsock`), on a connection that presents the
+    /// kernel's secret first; a kernel that gave none listens on no vsock.
+    fn attach(&mut self, vmm: Vmm) -> Result {
+        let Some(v) = self.vsock else {
+            return Ok(());
+        };
+        let Some(secret) = self.secret() else {
+            self.channel = String::from("serial line (the kernel gave no vsock secret)");
+            return Ok(());
+        };
+        let (reader, writer) = connect(v, &secret).map_err(|e| {
+            format!(
+                "cannot connect to the control kernel's vsock on {}: {e}",
+                vmm.id()
+            )
+        })?;
+        let tx = self.tx.take().expect("attached once");
+        thread::spawn(move || read_frames(reader, &tx, None));
+        *self.stdin.0.lock().unwrap_or_else(|e| e.into_inner()) = writer;
+        self.hello(vmm, VSOCK_TIMEOUT, "on its vsock")
     }
 
     /// Waits at most `timeout` for the kernel's hello; on failure, ends the
@@ -1170,9 +1285,127 @@ fn read_reply(stream: &mut UnixStream, id: u32) -> Result<Message> {
 }
 
 /// Builds the `rhizo` tool (debug) and returns its path.
+/// Connections to a control kernel's vsock that do not present its secret
+/// run no request (change `authenticate-control-channel`): each one asks
+/// for the power off and is reset without a byte back, then the host's
+/// connection is greeted and answered, and the kernel counted the
+/// refusals. Nothing to check on a VM without a socket device.
+fn strangers_are_refused(vmm: Vmm, accel: Accel, kernel: &Path, reproduce: &str) -> Result {
+    let opts = run_options(accel, 1, vmm::DEFAULT_MEMORY_MIB);
+    let mut vm = Vm::boot(vmm, kernel, opts, Stdio::null())?;
+    let fail = |vm: &Vm, what: &str, expected: &str, actual: &str| {
+        Failure::new("control", what)
+            .expected(expected)
+            .actual(format!(
+                "{actual}\nconsole:\n{}",
+                String::from_utf8_lossy(&vm.console)
+            ))
+            .hint("the kernel admits a vsock connection only after its first 32 bytes are the secret it printed on the serial line (`Gate`)")
+            .reproduce(reproduce)
+            .into_error()
+    };
+    let (Some(v), Some(secret)) = (vm.vsock, vm.secret()) else {
+        let why = match vm.vsock {
+            None => vm.channel.clone(),
+            Some(_) => String::from("serial line (the kernel gave no vsock secret)"),
+        };
+        report::text(&format!("[xtask] control: frames over the {why}"));
+        if vsock_required(vmm, accel) {
+            return Err(fail(
+                &vm,
+                "on a CI runner a VMM with a socket device carries the control frames over vsock",
+                "vsock",
+                &why,
+            ));
+        }
+        return Ok(());
+    };
+    report::text("[xtask] control: frames over vsock, strangers checked");
+    let power_off = Request::Shutdown.encode(1);
+    let mut wrong = secret;
+    wrong[SECRET_LEN - 1] ^= 1;
+    let strangers = [
+        ("no secret", power_off.repeat(3)),
+        ("a wrong secret", [&wrong[..], &power_off].concat()),
+        (
+            "half the secret, then nothing",
+            secret[..SECRET_LEN / 2].to_vec(),
+        ),
+    ];
+    for (what, first) in &strangers {
+        let (reader, writer) =
+            connect(v, first).map_err(|e| format!("cannot connect to the vsock: {e}"))?;
+        let (tx, got) = mpsc::channel();
+        thread::spawn(move || read_frames(reader, &tx, None));
+        // A reset ends the reader, which got nothing: no hello, no reply.
+        match got.recv_timeout(Duration::from_secs(10)) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            other => {
+                return Err(fail(
+                    &vm,
+                    &format!("a vsock connection with {what} is reset and gets nothing"),
+                    "the connection reset, nothing received",
+                    &format!("{other:?}"),
+                ));
+            }
+        }
+        drop(writer);
+    }
+    vm.attach(vmm)?;
+    match vm.call(&Request::List)? {
+        (Message::Done { .. }, _) => {}
+        (other, _) => {
+            return Err(fail(
+                &vm,
+                "the host's connection is answered after the strangers",
+                "a reply to `list`",
+                &format!("{other:?}"),
+            ));
+        }
+    }
+    let counted = format!(
+        "refused a connection without the secret ({} so far)",
+        strangers.len()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&vm.console).contains(&counted) && Instant::now() < deadline {
+        if let Some(Event::Text(t)) = vm.next(Duration::from_millis(100)) {
+            vm.console.extend(t);
+        }
+    }
+    if !String::from_utf8_lossy(&vm.console).contains(&counted) {
+        return Err(fail(
+            &vm,
+            "the kernel counts and reports each refusal",
+            &counted,
+            "",
+        ));
+    }
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    if String::from_utf8_lossy(&vm.console).contains(&hex) {
+        return Err(fail(
+            &vm,
+            "the secret never reaches the console text",
+            "no secret line",
+            "",
+        ));
+    }
+    vm.shutdown();
+    Ok(())
+}
+
 pub fn build_rhizo() -> Result<PathBuf> {
     crate::cargo(&["build", "-p", "rhizo-cli", "--bin", "rhizo"])?;
     Ok(target_dir().join("debug").join("rhizo"))
+}
+
+/// Whether the control frames must take vsock: on a CI runner (`CI` set),
+/// on a VMM that has a socket device there (Firecracker, Cloud Hypervisor,
+/// and QEMU with KVM, whose runners get `/dev/vhost-vsock`), so that a
+/// fallback to the serial line never hides the vsock path (change
+/// `authenticate-control-channel`).
+fn vsock_required(vmm: Vmm, accel: Accel) -> bool {
+    std::env::var_os("CI").is_some() && (vmm.requires_kvm() || accel.uses_kvm())
 }
 
 /// The `control` test step (spec `control-plane`): boots `kernel` with
@@ -1181,7 +1414,9 @@ pub fn build_rhizo() -> Result<PathBuf> {
 /// and listed, a small cell tree placed, moved, narrowed, suspended,
 /// resumed, reached through a scoped socket and killed as one, and the
 /// CPython agent against the host's fake model, its transcript checked.
+/// First, connections to its vsock without the secret are refused.
 pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &str) -> Result {
+    strangers_are_refused(vmm, accel, kernel, reproduce)?;
     let state = target_dir()
         .join("xtask-test")
         .join(arch::current().id())
@@ -1254,6 +1489,25 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         ])
     };
     up()?;
+    let console = std::fs::read_to_string(state.join("console.log")).unwrap_or_default();
+    must(
+        !console.contains(SECRET_LINE),
+        "the vsock secret stays out of the console log",
+        "no secret line in `console.log`",
+    )?;
+    must(
+        !vsock_required(vmm, accel) || console.contains("[rhizo] control frames over vsock"),
+        "on a CI runner `rhizo up` carries the control frames over vsock",
+        "`[rhizo] control frames over vsock` in `console.log`",
+    )?;
+    let mode = std::fs::metadata(&state).map_or(0, |m| {
+        std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777
+    });
+    must(
+        mode == 0o700,
+        "`rhizo up` keeps its state directory to its user",
+        "mode 0700",
+    )?;
     // Saved snapshots live beside the state, which `down` empties.
     let files = state.with_extension("files");
     let _ = std::fs::remove_dir_all(&files);
@@ -1914,8 +2168,8 @@ mod tests {
     use super::*;
 
     /// A fake VMM's vsock socket that answers `CONNECT 1024` with `answer`,
-    /// then sends `hello` and returns what it reads back (4 bytes).
-    fn fake_vmm(path: &Path, answer: &'static [u8]) -> thread::JoinHandle<Vec<u8>> {
+    /// then sends `hello` and returns the `back` bytes it reads back.
+    fn fake_vmm(path: &Path, answer: &'static [u8], back: usize) -> thread::JoinHandle<Vec<u8>> {
         let _ = std::fs::remove_file(path);
         let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
         thread::spawn(move || {
@@ -1925,7 +2179,7 @@ mod tests {
             assert_eq!(&line, b"CONNECT 1024\n");
             s.write_all(answer).unwrap();
             s.write_all(b"hello").unwrap();
-            let mut back = vec![0u8; 4];
+            let mut back = vec![0u8; back];
             let _ = s.read_exact(&mut back);
             back
         })
@@ -1937,14 +2191,14 @@ mod tests {
     #[test]
     fn the_vmm_s_socket_connects_to_the_guest_s_port() {
         let path = std::env::temp_dir().join(format!("rhizo-test-{}.sock", std::process::id()));
-        let vmm = fake_vmm(&path, b"OK 1073741824\n");
+        let vmm = fake_vmm(&path, b"OK 1073741824\n", 4);
         let (mut from, mut to) = connect_unix(&path).unwrap();
         let mut got = [0u8; 5];
         from.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello", "nothing of the guest's bytes is lost");
         to.write_all(b"ping").unwrap();
         assert_eq!(vmm.join().unwrap(), b"ping");
-        let vmm = fake_vmm(&path, b"no such port\n");
+        let vmm = fake_vmm(&path, b"no such port\n", 4);
         let refused = connect_unix(&path).err().map(|e| e.to_string());
         assert_eq!(
             refused.as_deref(),
@@ -1952,6 +2206,82 @@ mod tests {
         );
         drop(vmm);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The secret goes first on the vsock connection, before any frame
+    /// (change `authenticate-control-channel`).
+    #[test]
+    fn a_vsock_connection_presents_the_secret_first() {
+        let v = vmm::Vsock::Unix {
+            cid: 0x4000_0000 | std::process::id(),
+        };
+        let vmm = fake_vmm(&v.socket(), b"OK 7\n", SECRET_LEN + 4);
+        let secret: Secret = core::array::from_fn(|i| i as u8 ^ 0xa5);
+        let (mut from, mut to) = connect(v, &secret).unwrap();
+        let mut got = [0u8; 5];
+        from.read_exact(&mut got).unwrap();
+        to.write_all(b"ping").unwrap();
+        assert_eq!(vmm.join().unwrap(), [&secret[..], b"ping"].concat());
+        let _ = std::fs::remove_file(v.socket());
+    }
+
+    const HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    /// The kernel's secret line is taken out of its console text, whatever
+    /// the reads cut it into, and the secret is kept; lines that only look
+    /// like it, and every other line, stay as they are.
+    #[test]
+    fn the_secret_line_never_reaches_the_console_text() {
+        let lookalikes = format!(
+            "vsock: secretly\r\nvsock: secret {}\r\nvsock: secret zz\r\n  vsock: secret {HEX}\n",
+            &HEX[..62]
+        );
+        let console = format!(
+            "rhizo: boot\r\nvsock: cid 3 port 1024\r\n{SECRET_LINE}{HEX}\r\n{lookalikes}\
+             {SECRET_LINE}{}\r\nlast",
+            HEX.replace('0', "f")
+        );
+        let hello = Message::Hello {
+            version: rhizo_control::VERSION,
+        }
+        .encode(0);
+        let bytes = [console.as_bytes(), &hello].concat();
+        for cut in [1, 7, 4096] {
+            let (tx, rx) = mpsc::channel();
+            let slot = Mutex::new(None);
+            read_frames(Chunks(&bytes, cut), &tx, Some(&slot));
+            drop(tx);
+            let mut text = Vec::new();
+            let mut frames = 0;
+            for event in rx {
+                match event {
+                    Event::Text(t) => text.extend(t),
+                    Event::Frame(_) => frames += 1,
+                    _ => {}
+                }
+            }
+            let text = String::from_utf8(text).unwrap();
+            assert_eq!(
+                text,
+                format!("rhizo: boot\r\nvsock: cid 3 port 1024\r\n{lookalikes}last"),
+                "reads of {cut} bytes"
+            );
+            assert_eq!(frames, 1, "the hello still comes");
+            let expected: Secret = core::array::from_fn(|i| i as u8);
+            assert_eq!(*slot.lock().unwrap(), Some(expected), "the first secret");
+        }
+    }
+
+    /// A reader that gives at most `.1` bytes at a time.
+    struct Chunks<'a>(&'a [u8], usize);
+
+    impl Read for Chunks<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> stdio::Result<usize> {
+            let n = self.0.len().min(self.1).min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
     }
 
     /// The host's end of a transfer takes only the connection that sends

@@ -54,6 +54,7 @@ impl Host {
         };
         cell.renumber(pid);
         cell.domain = cell.id;
+        self.reshare_if_by_weight();
         true
     }
 
@@ -80,9 +81,14 @@ impl Host {
                 (copy.cell.pid, copy.cell.domain) = (pid, domain);
             }
         };
-        self.tree
+        let entered = self
+            .tree
             .add_copies(source, ids, &|_| used, &mut placed)
-            .is_ok()
+            .is_ok();
+        if entered {
+            self.reshare_if_by_weight();
+        }
+        entered
     }
 
     /// Records in `snapshot`, taken of cell `id`, its node's limits and
@@ -110,6 +116,7 @@ impl Host {
         {
             (cell.pid, cell.domain) = (n.pid(), n.domain());
             self.suspended.swap_remove(at);
+            self.reshare_if_by_weight();
             return true;
         }
         let Ok(spec) = snapshot.placed(&Egress::None, &Egress::None, root_limits(&cell.quota))
@@ -120,10 +127,12 @@ impl Host {
             0 => 1,
             pid => pid,
         };
+        let plain = super::shares::plain_root(&spec);
         let Ok(pid) = self.tree.add_root(cell.id, spec, source) else {
             return false;
         };
         (cell.pid, cell.domain) = (pid, cell.id);
+        self.reshare_after(plain);
         true
     }
 
@@ -226,6 +235,7 @@ impl Host {
         }
         self.settling = false;
         self.release_held();
+        self.reshare_if_by_weight();
     }
 
     /// Gives cell `id` (live or a template) what its node says: its number,
@@ -292,6 +302,7 @@ impl Host {
             return false;
         }
         self.sync(id);
+        self.reshare_if_by_weight();
         true
     }
 
@@ -371,6 +382,7 @@ impl Host {
                 l.sockets
             };
         }
+        let plain = parent == HOST && super::shares::plain_root(&spec);
         let used = self.usage(parent);
         self.tree.end(id, &mut fresh_domain)?; // a leaf: allocates nothing
         let placed = if parent == HOST {
@@ -395,6 +407,7 @@ impl Host {
         self.sync(id);
         self.sync_up(parent);
         self.sync_up(old);
+        self.reshare_after(plain);
         // A cell placed before it ran: its thread takes its new number.
         let pid = self.tree.get(id).map_or(0, |n| n.pid());
         self.with_live(id, |live| {
@@ -464,6 +477,7 @@ impl Host {
         self.sync_down(id);
         self.sync_up(old);
         self.sync_up(to);
+        self.reshare();
         Ok(())
     }
 

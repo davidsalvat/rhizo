@@ -22,7 +22,8 @@ first pass over the shared state through which cells could observe each
 other (change `close-cross-cell-leaks`: findings S24 to S26, section
 [Cross-cell leaks](#cross-cell-leaks)), then by a review of the control
 channel over virtio-vsock (boundaries B7 and B8 of the audit scope,
-change `control-over-vsock`: finding S27 and open finding O8, section
+change `control-over-vsock`: findings S27 and S28, the latter closed by
+`authenticate-control-channel`, section
 [The control channel over vsock](#the-control-channel-over-vsock-b7-b8)).
 
 The scope we would hand an external auditor (trust boundaries, components
@@ -393,6 +394,7 @@ the threat model above.
 | S25 | Medium | both | Ephemeral ports came from one counter for all cells: the distance between a cell's ports counted every other cell's binds | Fixed (`close-cross-cell-leaks`) |
 | S26 | Medium | both | Any cell could empty the whole page cache (65,536 pages of its own files, or memory pressure from a cell without a quota): the flush half of a flush-and-probe timing channel; the frames of mapped pages then left the cache uncounted in their mappers' quotas | Fixed (`close-cross-cell-leaks`) |
 | S27 | Low | both | A vsock connection that replaced the previous one before the control kernel looked got no hello, and its first bytes completed the old connection's unfinished frame | Fixed (`fix-vsock-reconnect`, PR #142, in review) |
+| S28 | Low | both | Any local user could connect to the control kernel's vsock port on QEMU without privilege and, while the host held no connection, control every cell (open finding O8 until then) | Fixed (`authenticate-control-channel`) |
 
 **S1. `mprotect` reached the kernel half (Critical, x86_64).** On x86_64 a
 cell's root table shares the kernel's upper-half entries, and those
@@ -849,7 +851,7 @@ protocol under it, which parses everything as hostile:
 | **Credit**: `buf_alloc` and `fwd_cnt` of any value, counters that wrap | The stream sends at most `buf_alloc` less what it sent and the peer has not acknowledged. The subtraction wraps and the result saturates at zero, so a peer that claims to have read more than it got gets no credit at all, never extra. A peer that sends past the 256 KiB the stream advertises is reset, so at most 256 KiB is ever held unread. More than 4 MiB written and not sent (a peer that stopped reading, or gives no credit) resets the connection. Property test `credit_is_never_exceeded`; tests `a_peer_that_breaks_the_protocol_is_reset`, `a_peer_that_never_reads_cannot_fill_memory`. |
 | **Resets and shutdowns** | They close the connection and drop both buffers. Until S27 (below), a connection that replaced the previous one before the kernel looked was missed. |
 | **The device**: used-ring entries, lengths, descriptor numbers | A used buffer shorter than a header is skipped, a length beyond the buffer is clipped to it, and a descriptor number is folded into the ring. A transmit slot returned twice is taken back once. No buffer outside the driver's own is read or written, and each packet is copied out before its buffer goes back to the device. Test `a_hostile_device_cannot_overrun_buffers`. |
-| **CIDs and ports** | The kernel reads the guest's CID from the device's configuration, so the host chooses it: 3 plus the `xtask` or `rhizo` process identifier shifted left by 6, plus a counter. That is unique on the host, as QEMU's vhost requires, but anyone can work it out (O8). The stream accepts a request from any source CID. Today that has no effect, because the VMMs deliver only the host's packets to a guest: vhost-vsock, Firecracker and Cloud Hypervisor have no guest-to-guest path. Checking for CID 2 would be defence in depth. In the other direction, the guest chooses the source CID and port of the packets it sends, and the VMM is trusted to drop a forged source (B9). The host listens on no vsock port, so a guest can open no connection to the host. |
+| **CIDs and ports** | The kernel reads the guest's CID from the device's configuration, so the host chooses it: 3 plus the `xtask` or `rhizo` process identifier shifted left by 6, plus a counter. That is unique on the host, as QEMU's vhost requires, but anyone can work it out (S28: a connection must present the boot's secret). The stream accepts a request from any source CID. Today that has no effect, because the VMMs deliver only the host's packets to a guest: vhost-vsock, Firecracker and Cloud Hypervisor have no guest-to-guest path. Checking for CID 2 would be defence in depth. In the other direction, the guest chooses the source CID and port of the packets it sends, and the VMM is trusted to drop a forged source (B9). The host listens on no vsock port, so a guest can open no connection to the host. |
 
 Cells never reach the device. Their output still reaches the host only
 inside frames (B8, Q12 of the audit scope). A cell that prints without end
@@ -877,7 +879,8 @@ The mode decides who may *be* a vhost-vsock VMM. Such a user can claim a
 CID (taking the one `xtask` would use stops its VM from starting) and,
 from inside their own guest, connect to the host's vsock listeners. It
 does not decide who may connect *to* a guest: on Linux that needs no
-privilege at all (O8).
+privilege at all. Since S28 such a connection is served only once it
+presents the secret the kernel gave on its serial line.
 
 ### Findings
 
@@ -907,47 +910,84 @@ connection it reads for, and the control kernel greets and starts a fresh
 decoder whenever the number changes. *Test:*
 `a_reconnect_between_two_polls_is_a_new_connection`.
 
-**O8. Any local user can take the control channel on QEMU (Low, both;
-open).** On QEMU the host connects with an `AF_VSOCK` socket to
-`(guest CID, 1024)`. Linux lets any local process open such a connection,
-without privilege, whatever the mode of `/dev/vhost-vsock`. The CID
-follows from the process identifier of `xtask` or `rhizo`, which `ps`
-shows. The kernel holds one connection at a time and takes the first
-request it receives while it holds none:
+**S28. Any local user could take the control channel on QEMU (Low,
+both; open finding O8 until `authenticate-control-channel`).** On QEMU
+the host connects with an `AF_VSOCK` socket to `(guest CID, 1024)`. Linux
+lets any local process open such a connection, without privilege,
+whatever the mode of `/dev/vhost-vsock`. The CID follows from the process
+identifier of `xtask` or `rhizo`, which `ps` shows. The kernel held one
+connection at a time and took the first request it received while it
+held none:
 
 - **Before the host connects.** The kernel listens from `vsock::init`,
   before its serial hello, and the host connects only after that hello.
-  A local user who keeps connecting to the expected CID gets there first
-  and receives the hello. The host gets a reset, retries for 10 s, gives
-  up and stops the VM. For those seconds the intruder controls an empty
-  control kernel: they can start cells from its images, have it load a
+  A local user who kept connecting to the expected CID got there first
+  and received the hello. The host got a reset, retried for 10 s, gave up
+  and stopped the VM. For those seconds the intruder controlled an empty
+  control kernel: they could start cells from its images, have it load a
   snapshot (B3 input in any case), or power it off.
 - **After the host's connection ends** while the VM still runs (for
   example, the `rhizo` server was killed and QEMU outlived it). The
-  intruder then controls every cell: they can read output, save snapshots
-  of the cells' memory, kill, and power off.
+  intruder then controlled every cell: they could read output, save
+  snapshots of the cells' memory, kill, and power off.
 
-Firecracker and Cloud Hypervisor are not reachable this way. Their host
+Firecracker and Cloud Hypervisor were not reachable this way. Their host
 end is the VMM's Unix socket `$TMPDIR/rhizo-vsock-<cid>.sock`, which only
 users with write permission on it can connect to (its mode follows the
-VMM's umask). Its predictable name only lets another user create the path
-first, between `xtask` removing a stale socket and the VMM binding it,
-which stops the VM from starting.
+VMM's umask).
 
-This is outside the model's main attackers: local host users are attacker
-5 of the audit scope, low priority. But snapshot transfers already defend
+This is outside the model's main attackers (local host users are
+attacker 5 of the audit scope), but snapshot transfers already defend
 against other local processes with one-time tokens
-(`snapshots-on-disk`), and the serial line that vsock replaces reached no
-other user. On CI's single-user runners O8 changes nothing.
+(`snapshots-on-disk`), and the serial line that vsock replaced reached no
+other user. Found by reading the host ends while documenting
+`control-over-vsock`.
 
-*Mitigation, to be designed:* the kernel admits a connection only after
-its first bytes match a secret that only the host can know. One option is
-a random token the kernel prints on its serial console, which only the
-process that started the VMM reads. Until the token has arrived, a new
-request replaces the waiting connection, so an intruder cannot hold the
-only connection. Meanwhile, on a shared host, run control kernels on
-Firecracker or Cloud Hypervisor, or keep `/dev/vhost-vsock` closed to the
-user so that the channel stays on the serial line.
+*Fix* (`authenticate-control-channel`):
+
+- At boot the control kernel draws a 256-bit secret from its generator
+  (seeded from the CPU's random instruction) and prints it on its serial
+  line, before the hello, as `vsock: secret <64 hex digits>`. Only the
+  process that started the VMM reads that pipe; the secret is never on
+  the command line (`/proc/<pid>/cmdline`). Without a hardware random
+  source the kernel does not listen on vsock at all, and the frames stay
+  on the serial line.
+- `rhizo_virtio::vsock::Gate` serves a connection only once its first 32
+  bytes are the secret, compared in constant time and only when all 32
+  have come (no byte-by-byte answer). Until then it is not greeted, none
+  of its bytes is decoded, and nothing is written to it. A wrong secret,
+  no secret within 2 s, or another peer's request resets it; the kernel
+  keeps listening, counts the refusal and prints it. Every new
+  connection, after a drop too, presents the secret again.
+- `xtask`'s `Vm`, and so `rhizo up`'s relay, takes the secret line out of
+  the console text (it reaches neither `console.log` nor an error
+  report), keeps the secret in memory only, and writes it first on every
+  vsock connection, on QEMU, Firecracker and Cloud Hypervisor alike.
+  `rhizo up`'s state directory is `0700` and its control socket `0600`.
+- The frames and the protocol version are unchanged: the secret comes
+  before the first frame.
+
+*Tests:* in `rhizo-virtio`, `a_connection_is_admitted_only_with_the_secret`,
+`a_wrong_secret_is_refused_and_the_gate_keeps_listening`,
+`requests_without_the_secret_never_reach_the_reader`,
+`a_slow_prover_is_reset`, `a_secret_split_over_many_packets_is_admitted`,
+`a_reconnect_after_a_drop_must_present_the_secret_again`,
+`a_stranger_cannot_hold_the_only_connection`, and the properties
+`only_the_secret_admits` (arbitrary first bytes, cut into arbitrary
+packets) and `hostile_packets_are_never_admitted`; in `xtask`,
+`the_secret_line_never_reaches_the_console_text` and
+`a_vsock_connection_presents_the_secret_first`; in `rhizo-cli`,
+`the_state_directory_is_private`. The `control` test step, on a VM with a
+socket device, connects three strangers (frames, a wrong secret followed
+by a power off, half the secret then silence), checks that each is reset
+without a byte back and that the VM still answers the host, and that the
+kernel reported three refusals.
+
+*What is left:* a local user can still keep the host out, by claiming
+the guest's CID before QEMU starts or by sending requests that keep
+replacing the host's connection before its secret arrives. Both are
+denial of service with no access to a cell; `xtask` reports the failed
+hello and stops the VM.
 
 ### What is tested, and what is not
 
@@ -982,16 +1022,13 @@ Not covered:
   since every index is folded into the ring. A device that keeps
   advancing the used index does keep the control loop receiving for as
   long as it does so (the device is trusted, B6).
-- **The weekly random-seed run** does not include the vsock property
-  tests: its `cargo test -p rhizo-virtio -- hostile::` selects only the
-  configuration-space fuzzer.
 - **The kernel's glue** (`kernel/src/vsock.rs`, the `link` module) runs
   only in the `control` test step: over vsock on CI's runners and on Cloud
-  Hypervisor, over the serial line elsewhere. It is not fuzzed, and no
-  step reconnects.
+  Hypervisor, over the serial line elsewhere. It is not fuzzed; the step
+  connects strangers without the secret, but the host never reconnects.
 - **The host ends** (`xtask`'s `connect_unix` handshake with Firecracker
   and Cloud Hypervisor, and `connect_vhost`) are host tooling, out of
-  scope except for O8.
+  scope except for S28.
 - **Transport resets** are never received: the event queue is set up with
   no buffer. A VMM sends one after it restores a VM snapshot, and VMM
   snapshots of a control kernel are not supported.
@@ -1009,7 +1046,7 @@ These are not fixed by this change; each needs its own design.
 | O5 | Low | **SMEP, SMAP and PAN closed by `add-user-access-guards`.** Left: SMAP and PAN cannot see accesses through the direct map (software checks guard it); on x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
 | O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. Only the host creates cells, so no cell can signal through it; see [Cross-cell leaks](#cross-cell-leaks) for this and the other channels still open. |
 | O7 | Low | **Host paths may panic.** Forking one cell, or spawning one kept image, more than 65535 times while every copy lives panics (frame reference counts are 16 bits; a cell's own path, mapping file pages, gives copies instead since S14); a frame lost when loading an executable fails half way. Only the host can do either. |
-| O8 | Low | **Any local user can take the control channel on QEMU** (vsock, see [The control channel over vsock](#the-control-channel-over-vsock-b7-b8)): an unprivileged `AF_VSOCK` connection to the guest's guessable CID gets the control kernel's only connection when the host holds none (before the host connects: the VM fails to start; after the host's connection ended: every cell). Firecracker and Cloud Hypervisor go through a Unix socket guarded by its file mode. Mitigation to be designed: admit only a connection that presents a secret only the host knows. |
+| O8 | — | **Closed by `authenticate-control-channel`** (finding S28, see [The control channel over vsock](#the-control-channel-over-vsock-b7-b8)). What remains: a local user can keep the host from connecting (claiming the guest's CID, or replacing its connection before the secret arrives), without access to any cell; a CPU without a hardware random source keeps the control channel on the serial line. |
 | — | Low | **Hosts on the VM's network segment** (B5, above) can evict the card's neighbour-cache entries, delaying a connection's frames by about a second, and a rogue DHCP server can change or take away the card's address. Both come with sharing a segment; give the VM a network of its own. |
 | — | — | **Concurrency between CPUs** was reviewed by reading and by hostile cells (second review), not by a model checker or a proof. |
 | — | — | **No hardware, firmware or VMM audit.** Device emulation, the boot path and the VMMs are trusted. |
@@ -1073,8 +1110,11 @@ review:
   `ephemeral_ports_do_not_show_other_cells_binds`,
   `memory_pressure_keeps_the_pages_other_cells_map`; on the host the tests
   named under each finding.
-- The control channel over vsock (S27), on the host in `rhizo-virtio`:
-  `hostile_packets_are_survived`, `credit_is_never_exceeded` (properties),
+- The control channel over vsock (S27, S28), on the host in
+  `rhizo-virtio`: `hostile_packets_are_survived`,
+  `credit_is_never_exceeded`, `only_the_secret_admits`,
+  `hostile_packets_are_never_admitted` (properties), the gate's tests
+  under S28,
   `a_hostile_device_cannot_overrun_buffers`,
   `a_peer_that_never_reads_cannot_fill_memory`,
   `a_reconnect_between_two_polls_is_a_new_connection`.

@@ -53,6 +53,13 @@ pub const MAX_INPUT: usize = 64 << 10;
 /// `control-over-vsock`): the host connects there, and the stream carries
 /// the same frames as the serial line, without console text.
 pub const VSOCK_PORT: u32 = 1024;
+/// The console line, on the serial line before the hello, that gives the
+/// host the secret every vsock connection presents before its frames
+/// (change `authenticate-control-channel`): this prefix, then the
+/// [`SECRET_LEN`] bytes in lowercase hex.
+pub const SECRET_LINE: &str = "vsock: secret ";
+/// Bytes of that secret.
+pub const SECRET_LEN: usize = 32;
 
 /// Frame kinds of requests, host to kernel.
 mod kind {
