@@ -28,7 +28,9 @@ impl Host {
         if let Some(lazy) = &live.demand.lazy {
             bytes += 2 * lazy.pending_bytes();
         }
-        if !cells_may_take(bytes) {
+        // What its memory limit leaves is its own (design D4 of
+        // `add-cell-hierarchy`): its snapshot stays charged to it.
+        if !may_take(&live.frames, bytes) {
             self.requeue(live, wake);
             return None;
         }
@@ -59,7 +61,14 @@ impl Host {
             )
         });
         self.record_tree(&mut snapshot, id);
+        // What its limit leaves stays set aside for it (design D4).
+        let (used, limit) = (live.frames.used(), live.frames.limit());
         self.end(live, Ending::Suspended);
+        if limit < Quota::NONE.frames() {
+            let frames = limit.saturating_sub(used);
+            memory::RESERVE.hold(frames);
+            self.held_aside.push((id, frames));
+        }
         Some(snapshot)
     }
 
@@ -125,8 +134,15 @@ impl Host {
                 .map(|i| snapshot.page(i))
                 .filter(|p| matches!(p.data, Data::Bytes(_)))
                 .map(|p| p.size.bytes())
-                .sum();
-            if !cells_may_take(bytes) {
+                .sum::<u64>();
+            // A suspended cell's reservation, set aside, is its own.
+            let origin = snapshot.origin();
+            let aside = self
+                .held_aside
+                .iter()
+                .find(|&&(c, _)| c == origin)
+                .map_or(0, |&(_, frames)| frames * FRAME_SIZE);
+            if !cells_may_take(bytes.saturating_sub(aside)) {
                 return Err(snapshot);
             }
         }

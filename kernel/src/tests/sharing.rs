@@ -283,12 +283,13 @@ fn template_dropped_under_two_domains() {
     assert_eq!(memory_balance(), before, "gone with its last copy");
 }
 
-/// A root with 64 MiB to give children, and child `id` placed under it
-/// with 16 MiB.
+/// A root with 40 MiB to give children (a reserved root the smallest test
+/// machine admits next to a promoted child: design D4 of
+/// `add-cell-hierarchy`), and child `id` placed under it with 16 MiB.
 fn parent_of(host: &mut Host, id: u32) -> u32 {
     let parent = spawn(host, "idle", &[]);
     let quota = Quota {
-        memory: 64 * MIB,
+        memory: 40 * MIB,
         ..Quota::DEFAULT
     };
     assert!(host.set_limits(parent, quota, 8));

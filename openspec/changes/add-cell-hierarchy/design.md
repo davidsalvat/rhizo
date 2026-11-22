@@ -316,9 +316,14 @@ they run (weights and caps), are in D23. Accelerator budgets are in D24.
   `alloc_for_cell`, published pages through `alloc_kept`,
   `cells_may_take`) must also leave the reserve. Tracking
   it costs a comparison per meter change, and an atomic addition only
-  when a meter with a limit changes. Suspended cells and templates hold no
-  frames aside: a suspended reserved cell is admitted again when it is
-  resumed, a copy of a reserved root when it is made. Checks made before
+  when a meter with a limit changes.
+  A suspended cell with a limit keeps what its limit left unused set
+  aside (`Host::held_aside`) until it is resumed, its meter then taking it
+  over, or ends; its snapshot stays charged to it, so suspending it counts
+  that room as its own. Templates set nothing aside (they take no more
+  memory); a copy of a reserved root is admitted when it is made, and the
+  host's promotion of a child adds the child's whole reservation (its
+  parent keeps its limits). Checks made before
   taking frames for a cell (`can_map` in `rhizo-abi`, `may_take` for its
   stack, write-or-execute pages and private copies before a move) count
   what its limit leaves as its own. Copy-on-write copies stay outside the

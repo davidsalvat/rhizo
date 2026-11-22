@@ -70,6 +70,10 @@ pub struct Host {
     /// cell table (design D4 of `add-cell-hierarchy`), counted in
     /// [`RESERVED_SOCKETS`] and [`RESERVED_CELLS`].
     pub(super) reserved: rhizo_cap::Limits,
+    /// Frames set aside for suspended cells with a memory limit, which
+    /// stay charged to their reservation (design D4): the cell, and what
+    /// its limit left unused when it was suspended.
+    pub(super) held_aside: Vec<(u32, u64)>,
     /// Templates published, and dropped ones still shared (design D21 of
     /// `add-cell-hierarchy`).
     pub(super) published: Published,
@@ -131,6 +135,7 @@ impl Host {
             ends: Vec::new(),
             settling: false,
             reserved: rhizo_cap::Limits::ZERO,
+            held_aside: Vec::new(),
             published: Published::default(),
         }
     }
@@ -634,6 +639,9 @@ impl Drop for Host {
         }
         self.tree = rhizo_cap::Tree::new();
         self.refresh_reserved();
+        for (_, frames) in core::mem::take(&mut self.held_aside) {
+            memory::RESERVE.release(frames);
+        }
         self.drop_held();
     }
 }

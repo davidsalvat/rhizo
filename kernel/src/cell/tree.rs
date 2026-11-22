@@ -181,10 +181,17 @@ impl Host {
             .get(id)
             .filter(|n| n.is_root())
             .map_or(Limits::ZERO, |n| n.limits().reservation());
-        // What its meter sets aside now, and will.
-        let (used, limit) = self
-            .with_live(id, |live| (live.frames.used(), live.frames.limit()))
-            .unwrap_or((0, u64::MAX));
+        // What its meter, or its suspension, sets aside now, and will.
+        let aside = self.held_aside.iter().find(|&&(c, _)| c == id);
+        let (used, limit) = match aside {
+            Some(&(_, frames)) => {
+                let limit = self.tree.get(id).map_or(0, |n| n.limits().memory) / FRAME_SIZE;
+                (limit.saturating_sub(frames), limit)
+            }
+            None => self
+                .with_live(id, |live| (live.frames.used(), live.frames.limit()))
+                .unwrap_or((0, u64::MAX)),
+        };
         let held = |limit: u64| match limit < Quota::NONE.frames() {
             true => limit.saturating_sub(used),
             false => 0,
@@ -238,25 +245,14 @@ impl Host {
     /// `false` if the tree has no room.
     pub(super) fn enter_restored(&mut self, cell: &mut Cell, snapshot: &Snapshot) -> bool {
         let origin = snapshot.origin();
-        // A suspended cell keeps its node, and its reservation in the tree,
-        // but not the memory set aside for it: admitted again (a cell with
-        // a memory limit has it in its quota).
+        // A cell with a memory limit has it in its quota.
         let limited = cell.quota.memory != u64::MAX;
-        if limited
-            && self.suspended.contains(&origin)
-            && let Some(n) = self.tree.get(origin)
-            && !admits(Limits {
-                memory: n.limits().reservation().memory,
-                ..Limits::ZERO
-            })
-        {
-            return false;
-        }
         if let Some(at) = self.suspended.iter().position(|&s| s == origin)
             && let Some(n) = self.tree.rekey(origin, cell.id)
         {
             (cell.pid, cell.domain) = (n.pid(), n.domain());
-            self.suspended.swap_remove(at);
+            // Its meter sets aside what was held for it while suspended.
+            self.unsuspend(at);
             self.reshare_if_by_weight();
             return true;
         }
@@ -297,6 +293,15 @@ impl Host {
             self.refresh_reserved();
         }
         true
+    }
+
+    /// Takes suspended cell `suspended[at]` off the list (resumed or gone),
+    /// with the frames set aside for it.
+    fn unsuspend(&mut self, at: usize) {
+        let id = self.suspended.swap_remove(at);
+        if let Some(i) = self.held_aside.iter().position(|&(c, _)| c == id) {
+            memory::RESERVE.release(self.held_aside.swap_remove(i).1);
+        }
     }
 
     /// Takes `cell`, just entered by [`enter_restored`] from a snapshot of
@@ -347,7 +352,7 @@ impl Host {
     pub fn drop_snapshot(&mut self, snapshot: &Snapshot) {
         let origin = snapshot.origin();
         if let Some(at) = self.suspended.iter().position(|&s| s == origin) {
-            self.suspended.swap_remove(at);
+            self.unsuspend(at);
             self.ends.push(origin);
             self.settle();
         }
@@ -370,7 +375,7 @@ impl Host {
             for &gone in &ended.gone {
                 forget_network(gone);
                 if let Some(at) = self.suspended.iter().position(|&s| s == gone) {
-                    self.suspended.swap_remove(at);
+                    self.unsuspend(at);
                     self.finished.push(Finished {
                         id: gone,
                         ending: Ending::Killed,
@@ -660,8 +665,8 @@ impl Host {
         let n = self.tree.get(id).ok_or(TreeError::NotFound)?;
         let (old, limits) = (n.parent(), n.limits());
         // The host's promotion keeps the parent's limits: the new root's
-        // reservation is new to the kernel (a parent's moves it).
-        if to == HOST && by == Actor::Host && old != HOST && !self.admits_root(id, limits) {
+        // whole reservation is new to the kernel (a parent's moves it).
+        if to == HOST && by == Actor::Host && old != HOST && !admits(limits.reservation()) {
             return Err(TreeError::Budget);
         }
         // Leaving its domain, its subtree first takes private copies of
@@ -738,7 +743,7 @@ impl Host {
     /// by [`kill_tree`](Self::kill_tree)).
     fn end_node(&mut self, id: u32) {
         if let Some(at) = self.suspended.iter().position(|&s| s == id) {
-            self.suspended.swap_remove(at);
+            self.unsuspend(at);
             self.finished.push(Finished {
                 id,
                 ending: Ending::Killed,

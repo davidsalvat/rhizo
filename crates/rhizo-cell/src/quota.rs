@@ -210,6 +210,17 @@ impl Reserve {
         self.0.load(Ordering::Relaxed)
     }
 
+    /// Sets `frames` aside for a holder that is not a meter (a suspended
+    /// cell's reservation), until [`release`](Self::release).
+    pub fn hold(&self, frames: u64) {
+        self.shift(0, frames);
+    }
+
+    /// Gives back `frames` set aside by [`hold`](Self::hold).
+    pub fn release(&self, frames: u64) {
+        self.shift(frames, 0);
+    }
+
     #[inline(always)]
     fn shift(&self, from: u64, to: u64) {
         if to > from {
