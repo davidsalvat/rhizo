@@ -145,6 +145,10 @@ SHALL fail with `EROFS`.
 - **WHEN** a cell renames `/run/rhizo/chan/tools`
 - **THEN** it receives `EROFS` and the entry is unchanged
 
+#### Scenario: Endpoint dropped
+- **WHEN** a cell unlinks `/run/rhizo/chan/tools` and closes its descriptors of it
+- **THEN** it holds the handle no more, and the cell at the other end reads what was queued, then end of file
+
 ### Requirement: Attenuation
 A cell SHALL be able to derive from a handle another holding a subset of
 its rights (for a view, also a subdirectory), and no request SHALL give a

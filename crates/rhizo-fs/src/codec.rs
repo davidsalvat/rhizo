@@ -3,10 +3,13 @@
 //! refused instead of trusted.
 //!
 //! Layout: `cwd: u32`, then the inode table (`count: u32`, per slot a
-//! present byte, then `kind: u8` (0 directory, 1 file, 2 socket),
-//! `links: u32`, and for a directory `parent: u32`, `entries: u32`, each
-//! `len: u16, name, ino: u32`; for a file `size: u64`, `blocks: u32`, each
-//! a present byte and 4096 bytes when present; for a socket `name: u64`),
+//! present byte, then `kind: u8` (0 directory, 1 file, 2 socket, 3 entry
+//! of `/run/rhizo`, 4 the directory `/run/rhizo`), `links: u32`, and for a
+//! directory (either kind) `parent: u32`, `entries: u32`, each `len: u16,
+//! name, ino: u32`; for a file `size: u64`, `blocks: u32`, each a present
+//! byte and 4096 bytes when present; for a socket `name: u64`; for an entry
+//! of `/run/rhizo` `tag: u8`, 0 a socket then its index `u32` among the
+//! socket records, as a description's, 2 the copy generation),
 //! the descriptions (`count: u32`, per slot a present byte, then the target
 //! (`tag: u8`: 0 console, 1 inode, 2 pipe read end, 3 pipe write end,
 //! 4 event counter, 5 `epoll`, 6 socket; then `index: u32` but for the
@@ -18,7 +21,10 @@
 //! `fd: u32`, `events: u32`, `data: u64`), then the host's input pipe
 //! (`u32`: the object index, `u32::MAX` for none; design D1 of
 //! `add-interactive-chat`). A socket target's index is the kernel's
-//! business (a snapshot's socket record).
+//! business (a snapshot's socket record). A cell handle of `/run/rhizo`
+//! (a grant) is not encoded: grants carry no authority across a snapshot
+//! (design D13 of `add-cell-hierarchy`), so its name and inode are left
+//! out.
 
 use super::*;
 
@@ -99,22 +105,44 @@ impl Tables {
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.cwd.to_le_bytes());
         out.extend_from_slice(&(self.inodes.len() as u32).to_le_bytes());
-        for slot in &self.inodes {
-            let Some(inode) = slot else {
+        let grant = |ino: &Ino| {
+            matches!(
+                self.inodes[*ino as usize].as_deref(),
+                Some(Inode {
+                    node: Node::Kept(Kept::Grant(_)),
+                    ..
+                })
+            )
+        };
+        for (i, slot) in self.inodes.iter().enumerate() {
+            let Some(inode) = slot.as_deref().filter(|_| !grant(&(i as Ino))) else {
                 out.push(0);
                 continue;
             };
             out.push(1);
             match &inode.node {
                 Node::Dir { entries, parent } => {
-                    out.push(0);
+                    out.push(if self.rhizo == Some(i as Ino) { 4 } else { 0 });
                     out.extend_from_slice(&inode.links.to_le_bytes());
                     out.extend_from_slice(&parent.to_le_bytes());
-                    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-                    for (name, ino) in entries {
+                    let kept = entries.iter().filter(|(_, ino)| !grant(ino));
+                    out.extend_from_slice(&(kept.clone().count() as u32).to_le_bytes());
+                    for (name, ino) in kept {
                         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
                         out.extend_from_slice(name);
                         out.extend_from_slice(&ino.to_le_bytes());
+                    }
+                }
+                Node::Kept(kept) => {
+                    out.push(3);
+                    out.extend_from_slice(&inode.links.to_le_bytes());
+                    match kept {
+                        Kept::Socket(h) => {
+                            out.push(0);
+                            out.extend_from_slice(&h.to_le_bytes());
+                        }
+                        Kept::Generation => out.push(2),
+                        Kept::Grant(_) => unreachable!("grants are left out"),
                     }
                 }
                 Node::Socket(name) => {
@@ -219,7 +247,8 @@ impl Tables {
         let cwd = r.u32()?;
         let count = r.count()?;
         let mut inodes = Vec::with_capacity(count);
-        for _ in 0..count {
+        let mut rhizo = None;
+        for i in 0..count {
             if !r.flag()? {
                 inodes.push(None);
                 continue;
@@ -227,7 +256,11 @@ impl Tables {
             let kind = r.u8()?;
             let links = r.u32()?;
             let node = match kind {
-                0 => {
+                4 if rhizo.is_some() => return Err(DecodeError::Corrupt),
+                0 | 4 => {
+                    if kind == 4 {
+                        rhizo = Some(i as Ino);
+                    }
                     let parent = r.u32()?;
                     let mut entries = BTreeMap::new();
                     for _ in 0..r.count()? {
@@ -266,6 +299,11 @@ impl Tables {
                     Node::File(File { size, blocks })
                 }
                 2 => Node::Socket(r.u64()?),
+                3 => Node::Kept(match r.u8()? {
+                    0 => Kept::Socket(r.u32()?),
+                    2 => Kept::Generation,
+                    _ => return Err(DecodeError::Corrupt),
+                }),
                 _ => return Err(DecodeError::Corrupt),
             };
             inodes.push(Some(Arc::new(Inode { links, node })));
@@ -366,6 +404,8 @@ impl Tables {
             fd_limit: FD_MAX,
             socket_limit: crate::SOCKETS_DEFAULT,
             input,
+            rhizo,
+            dropped: Vec::new(),
 
             changes: 0,
         })
@@ -381,6 +421,7 @@ impl Tables {
         };
         if !is_dir(ROOT)
             || !is_dir(self.cwd)
+            || self.rhizo == Some(ROOT)
             || self.fds.len() > FD_MAX
             || self.used > DATA_MAX / BLOCK as u64
         {
@@ -400,6 +441,10 @@ impl Tables {
                 let Some(Some(c)) = self.inodes.get(child as usize) else {
                     return false;
                 };
+                // Only the kernel's directories hold its entries.
+                if matches!(c.node, Node::Kept(_)) && !self.kept_dir(ino as Ino) {
+                    return false;
+                }
                 if let Node::Dir { parent, .. } = c.node
                     && parent != ino as Ino
                 {
@@ -424,7 +469,7 @@ impl Tables {
             }
             match desc.target {
                 Target::Inode(ino) => match self.inodes.get(ino as usize) {
-                    Some(Some(i)) if !matches!(i.node, Node::Socket(_)) => {
+                    Some(Some(i)) if !matches!(i.node, Node::Socket(_) | Node::Kept(_)) => {
                         open[ino as usize] = true;
                     }
                     _ => return false,
@@ -501,7 +546,7 @@ impl Tables {
             let links_ok = match inode.node {
                 Node::Dir { .. } => inode.links == u32::from(root) || (!root && inode.links <= 1),
                 Node::File(_) => true,
-                Node::Socket(_) => !root,
+                Node::Socket(_) | Node::Kept(_) => !root,
             };
             if names[ino] != expected || !links_ok || (names[ino] == 0 && !root && !open[ino]) {
                 return false;

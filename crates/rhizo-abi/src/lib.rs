@@ -11,6 +11,7 @@ extern crate alloc;
 
 mod exec;
 mod files;
+mod packets;
 mod pages;
 mod poll;
 mod sockets;
@@ -395,6 +396,10 @@ pub trait Services: Console {
     fn egress_denied(&mut self, cell: u32, proto: rhizo_net::Proto, ip: [u8; 4], port: u16) {
         let _ = (cell, proto, ip, port);
     }
+    /// The calling cell received a message or a handle from another cell
+    /// over a channel: it may now hold a secret, and the kernel sets its
+    /// sticky bit (`Cell::exposed`, design D22 of `add-cell-hierarchy`).
+    fn received(&mut self) {}
 }
 
 /// What the cell does after a system call.
@@ -434,6 +439,29 @@ fn wake_on_fs_change(cell: &mut Cell, changed: bool) {
 pub trait Sockets {
     /// The sockets, locked until the end of the call.
     fn net(&mut self) -> &mut rhizo_net::Net;
+    /// The cell tree and the grant table with the sockets, for a call that
+    /// moves handles over a channel endpoint (`SCM_RIGHTS`, design D9 of
+    /// `add-cell-hierarchy`); locked until the end of the call. A call
+    /// asks for them before it reaches the sockets any other way, so the
+    /// kernel can take its locks in order. `None` where the kernel keeps
+    /// no grants: no handle moves.
+    ///
+    /// Grants whose holder let them go during the call
+    /// (`rhizo_net::Net::take_dropped`, `rhizo_fs::Tables::take_dropped`)
+    /// are the kernel's to drop from its table after the call.
+    fn handles(&mut self) -> Option<Handles<'_>> {
+        None
+    }
+}
+
+/// What [`Sockets::handles`] gives: the cell tree, to check new flows
+/// against (design D8 of `add-cell-hierarchy`), the grant table and the
+/// sockets.
+#[derive(Debug)]
+pub struct Handles<'a> {
+    pub tree: &'a rhizo_cap::Tree,
+    pub grants: &'a mut rhizo_cap::Grants,
+    pub net: &'a mut rhizo_net::Net,
 }
 
 impl Sockets for rhizo_net::Net {
@@ -601,9 +629,10 @@ impl Abi {
             Some(Sys::Sendto) => self.with_ports(cell, cx, |cx| sockets::sendto(cx, a)),
             Some(Sys::Recvfrom) => sockets::recvfrom(cx, a),
             Some(Sys::Sendmsg) => {
-                self.with_ports(cell, cx, |cx| sockets::sendmsg(cx, a[0], a[1], a[2]))
+                let id = cell.id;
+                self.with_ports(cell, cx, |cx| sockets::sendmsg(cx, id, a[0], a[1], a[2]))
             }
-            Some(Sys::Recvmsg) => sockets::recvmsg(cx, a[0], a[1], a[2]),
+            Some(Sys::Recvmsg) => sockets::recvmsg(cx, cell.id, a[0], a[1], a[2]),
             Some(Sys::Shutdown) => sockets::shutdown(cx, a[0], a[1]),
             Some(Sys::Setsockopt) => sockets::setsockopt(cx, a),
             Some(Sys::Getsockopt) => sockets::getsockopt(cx, a),
@@ -1636,6 +1665,8 @@ fn arch_prctl<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     }
 }
 
+#[cfg(test)]
+mod chan_tests;
 #[cfg(test)]
 mod hostile;
 #[cfg(test)]

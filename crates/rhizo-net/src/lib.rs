@@ -40,6 +40,7 @@
 
 extern crate alloc;
 
+mod endpoints;
 mod record;
 mod wire;
 
@@ -48,6 +49,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 pub use record::{DecodeError, Park, Record, Saved, decode_records, encode_records};
+use rhizo_cap::{Channels, Rights};
 pub use rhizo_cap::{Egress, Proto, Rule};
 use smoltcp::iface::SocketHandle;
 pub use wire::WireConfig;
@@ -97,6 +99,9 @@ pub enum Family {
 pub enum Type {
     Stream,
     Dgram,
+    /// A Unix sequenced-packet socket: unconnected, or a channel endpoint
+    /// (design D10 of `add-cell-hierarchy`, module `endpoints`).
+    SeqPacket,
 }
 
 /// A socket address.
@@ -133,6 +138,9 @@ pub enum Error {
     TooMany,
     /// A connection to the outside has started (`EINPROGRESS`).
     InProgress,
+    /// A message with more handles than a channel carries
+    /// (`ETOOMANYREFS`).
+    TooManyRefs,
     /// The cell's egress policy or the host's deny floor forbids the
     /// destination (`EACCES`, as Landlock: "denied", not "no route").
     Access,
@@ -149,6 +157,7 @@ impl Error {
             Error::Invalid => 22,
             Error::DestAddrReq => 89,
             Error::MsgSize => 90,
+            Error::TooManyRefs => 109,
             Error::OpNotSupp => 95,
             Error::AddrInUse => 98,
             Error::AddrNotAvail => 99,
@@ -246,6 +255,15 @@ enum State {
         handle: SocketHandle,
         ever_open: bool,
         report: bool,
+    },
+    /// A channel endpoint as one grant holds it (design D10 of
+    /// `add-cell-hierarchy`): its endpoint in [`Channels`], the grant and
+    /// its rights, and the next socket on the same endpoint.
+    Endpoint {
+        end: u32,
+        grant: u32,
+        rights: Rights,
+        next: Handle,
     },
 }
 
@@ -389,6 +407,18 @@ pub struct Net {
     /// The sockets the current call looked at: its waiter joins their wait
     /// queues if it blocks ([`end_call`](Self::end_call)).
     looked: RefCell<Vec<Handle>>,
+    /// The kernel's channels, whose endpoints sockets hold.
+    channels: Channels,
+    /// Per channel endpoint, the first socket holding it (`NO_SOCKET`:
+    /// none), the others linked through [`State::Endpoint`].
+    ends: Vec<Handle>,
+    /// Grants whose last socket closed, for the kernel to drop
+    /// ([`take_dropped`](Self::take_dropped)).
+    dropped: Vec<u32>,
+    /// Sockets in flight on endpoints that closed, still to release, and
+    /// whether a release is draining them (module `endpoints`).
+    orphans: Vec<Handle>,
+    draining: bool,
 }
 
 impl Default for Net {
@@ -439,6 +469,11 @@ impl Net {
             floor: Vec::new(),
             carved: Vec::new(),
             card_draws: 0,
+            channels: Channels::new(),
+            ends: Vec::new(),
+            dropped: Vec::new(),
+            orphans: Vec::new(),
+            draining: false,
         }
     }
 
@@ -710,7 +745,9 @@ impl Net {
     /// A new socket with one reference, in the calling cell's network.
     /// Unix sockets are streams only.
     pub fn socket(&mut self, family: Family, ty: Type) -> Result<Handle> {
-        if family == Family::Unix && ty == Type::Dgram {
+        if (family == Family::Unix && ty == Type::Dgram)
+            || (family == Family::Inet && ty == Type::SeqPacket)
+        {
             return Err(Error::OpNotSupp);
         }
         let net = self.caller_net();
@@ -797,6 +834,12 @@ impl Net {
                     peer.state = State::Connected { peer: None };
                     self.touch(p);
                 }
+            }
+            State::Endpoint {
+                end, grant, next, ..
+            } => {
+                self.dropped.push(grant);
+                self.leave_end(h, end, next);
             }
             _ => {}
         }
@@ -1080,7 +1123,7 @@ impl Net {
     /// call starts it (`InProgress`), a call made again reports it.
     fn connect_out(&mut self, h: Handle, ty: Type, ip: [u8; 4], port: u16) -> Result<()> {
         let proto = match ty {
-            Type::Stream => Proto::Tcp,
+            Type::Stream | Type::SeqPacket => Proto::Tcp,
             Type::Dgram => Proto::Udp,
         };
         if !self.allows(self.get(h)?.net, proto, ip, port) {
@@ -1453,6 +1496,7 @@ impl Net {
                 }
             }
             State::Reset { pending } => IN | OUT | HUP | RDHUP | if *pending { ERR } else { 0 },
+            State::Endpoint { end, .. } => self.end_events(*end),
             State::Connected { peer } => {
                 let mut ev = 0;
                 if !s.rx.is_empty() || s.eof || s.shut_rd {
@@ -1483,6 +1527,7 @@ impl Net {
         let s = self.get(h)?;
         match (&s.state, &s.remote) {
             (State::Connected { .. } | State::Wire { .. }, Some(a)) => Ok(a.clone()),
+            (State::Endpoint { .. }, _) => Ok(Addr::UnixUnnamed),
             (State::Open, Some(a)) if s.ty == Type::Dgram => Ok(a.clone()),
             _ => Err(Error::NotConn),
         }
@@ -1530,7 +1575,11 @@ impl Net {
                 Some((s.local.clone(), None))
             }
             _ => {
-                copy.state = State::Reset { pending: true };
+                // An endpoint reads as closed in a copy (design D13 of
+                // `add-cell-hierarchy`); a connection reports its reset.
+                copy.state = State::Reset {
+                    pending: s.ty != Type::SeqPacket,
+                };
                 copy.eof = true;
                 None
             }
@@ -1645,7 +1694,9 @@ impl Net {
         }
         let mut s = Socket::new(r.family, r.ty, r.opts, net);
         if r.state == Saved::Reset {
-            s.state = State::Reset { pending: true };
+            s.state = State::Reset {
+                pending: r.ty != Type::SeqPacket,
+            };
             s.eof = true;
         }
         let h = self.insert(s)?;
@@ -1715,6 +1766,8 @@ fn siphash24(key: [u64; 2], m: u64) -> u64 {
     v[0] ^ v[1] ^ v[2] ^ v[3]
 }
 
+#[cfg(test)]
+mod endpoint_tests;
 #[cfg(test)]
 mod hostile;
 #[cfg(test)]

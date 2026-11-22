@@ -14,9 +14,9 @@ const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
 const SOCK_NONBLOCK: u64 = 0x800;
 const SOCK_CLOEXEC: u64 = 0x8_0000;
-const MSG_PEEK: u64 = 0x2;
-const MSG_TRUNC: u64 = 0x20;
-const MSG_DONTWAIT: u64 = 0x40;
+pub(crate) const MSG_PEEK: u64 = 0x2;
+pub(crate) const MSG_TRUNC: u64 = 0x20;
+pub(crate) const MSG_DONTWAIT: u64 = 0x40;
 const SOL_SOCKET: u64 = 1;
 const IPPROTO_IP: u64 = 0;
 const IPPROTO_TCP: u64 = 6;
@@ -27,7 +27,7 @@ const BUF_MAX: u32 = 212_992;
 const MSGHDR: usize = 56;
 type MsgHdr = [u8; MSGHDR];
 
-fn net_err(e: NetError) -> i64 {
+pub(crate) fn net_err(e: NetError) -> i64 {
     -e.errno()
 }
 
@@ -153,11 +153,15 @@ pub(crate) fn socket<F, M, T, A, S>(
     let kind = match ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) {
         1 => Type::Stream,
         2 if family == Family::Inet => Type::Dgram,
+        // A channel endpoint once connected (design D10 of
+        // `add-cell-hierarchy`).
+        5 if family == Family::Unix => Type::SeqPacket,
         _ => return -ESOCKTNOSUPPORT,
     };
     let protocol_ok = match (family, kind) {
         (Family::Inet, Type::Stream) => matches!(protocol, 0 | IPPROTO_TCP),
         (Family::Inet, Type::Dgram) => matches!(protocol, 0 | IPPROTO_UDP),
+        (Family::Inet, Type::SeqPacket) => false,
         (Family::Unix, _) => protocol == 0,
     };
     if !protocol_ok {
@@ -329,6 +333,9 @@ pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         let (h, family, ty) = socket_of(cx, fd)?;
         let to = match read_addr(cx, family, addr, len)? {
             Given::Inet(ip, port) => Addr::Inet { ip, port },
+            Given::UnixPath(path) if ty == Type::SeqPacket => {
+                return Ok(crate::packets::connect(cx, fd, h, &path));
+            }
             Given::UnixPath(path) => {
                 let name = cx.fs.socket_name(None, &path).map_err(err)?;
                 Addr::Unix { name, path }
@@ -397,6 +404,7 @@ pub(crate) fn sendto<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         Type::Dgram if a[2] > rhizo_net::DGRAM_MAX as u64 => return -EMSGSIZE,
         Type::Dgram => a[2],
         Type::Stream => a[2].min(rhizo_net::STREAM_BUF as u64),
+        Type::SeqPacket => return crate::packets::send(cx, a[0], h, a[1], a[2], a[3]),
     };
     with_user_bytes(cx, a[1], cap as usize, |cx, bytes| {
         send_bytes(cx, a[0], h, bytes, dest.as_ref(), a[3])
@@ -430,15 +438,15 @@ fn send_bytes<F, M, T, A, S: Services>(
 }
 
 /// Where received bytes go: a list of cell buffers filled in order.
-struct Scatter {
+pub(crate) struct Scatter {
     iov: Vec<(u64, u64)>,
     at: usize,
     off: u64,
-    faulted: bool,
+    pub(crate) faulted: bool,
 }
 
 impl Scatter {
-    fn total(&self) -> u64 {
+    pub(crate) fn total(&self) -> u64 {
         // Each length is at most `SSIZE_MAX`; their sum may pass 2^64
         // (finding S16).
         self.iov
@@ -448,7 +456,7 @@ impl Scatter {
 
     /// Copies `piece` into the buffers; `false` (nothing counted) on a
     /// fault.
-    fn put<F: EntryFormat, M: PhysicalMemory>(
+    pub(crate) fn put<F: EntryFormat, M: PhysicalMemory>(
         &mut self,
         pt: &PageTable<F>,
         mem: &mut M,
@@ -488,8 +496,13 @@ fn recv_into<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         Err(e) => return (e, None, false),
     };
     let len = into.total();
-    if ty == Type::Stream && len == 0 {
-        return (0, None, false);
+    match ty {
+        Type::Stream if len == 0 => return (0, None, false),
+        Type::SeqPacket => {
+            let (n, cut) = crate::packets::recv(cx, fd, h, into, flags);
+            return (n, None, cut);
+        }
+        _ => {}
     }
     let (pt, mem, pager) = (&cx.pt, &mut *cx.mem, &mut *cx.pager);
     let got = cx
@@ -586,13 +599,35 @@ fn read_msghdr<F: EntryFormat, M: PhysicalMemory, T, A, S>(
 
 pub(crate) fn sendmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     fd: u64,
     msg: u64,
     flags: u64,
 ) -> i64 {
     let run = |cx: &mut Context<'_, F, M, T, A, S>| -> Result<i64, i64> {
-        let (h, family, ty) = socket_of(cx, fd)?;
+        // The descriptor first, as Linux checks it.
+        cx.fs.socket(fd as u32).map_err(err)?;
         let (hdr, iov) = read_msghdr(cx, msg)?;
+        let word = |at: usize| u64::from_le_bytes(hdr[at..at + 8].try_into().unwrap_or_default());
+        // Handles go over channel endpoints only (design D9 of
+        // `add-cell-hierarchy`); other sockets ignore control data.
+        let rights = match word(40) {
+            0 => Ok(Vec::new()),
+            len => crate::packets::read_rights(cx, word(32), len),
+        };
+        if let Ok(fds) = &rights
+            && !fds.is_empty()
+            && let Some(r) = crate::packets::sendmsg_rights(cx, cell, fd, &iov, fds, flags)
+        {
+            return Ok(r);
+        }
+        let (h, family, ty) = socket_of(cx, fd)?;
+        if ty == Type::SeqPacket {
+            // No grants to move them with: no handle is sent.
+            if !rights?.is_empty() {
+                return Err(-EPERM);
+            }
+        }
         let name = u64::from_le_bytes(hdr[..8].try_into().unwrap_or_default());
         let name_len = u64::from(u32::from_le_bytes(
             hdr[8..12].try_into().unwrap_or_default(),
@@ -613,6 +648,10 @@ pub(crate) fn sendmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
             Type::Dgram if total > rhizo_net::DGRAM_MAX as u64 => return Err(-EMSGSIZE),
             Type::Dgram => total,
             Type::Stream => total.min(rhizo_net::STREAM_BUF as u64),
+            Type::SeqPacket if total > u64::from(rhizo_cap::limits::MESSAGE_MAX) => {
+                return Err(-EMSGSIZE);
+            }
+            Type::SeqPacket => total,
         };
         let mut bytes = vec![0u8; cap as usize];
         let mut at = 0usize;
@@ -621,6 +660,9 @@ pub(crate) fn sendmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
             cx.read(base, &mut bytes[at..at + n]).map_err(|_| -EFAULT)?;
             at += n;
         }
+        if ty == Type::SeqPacket {
+            return Ok(crate::packets::send_bytes(cx, fd, h, &bytes, flags));
+        }
         Ok(send_bytes(cx, fd, h, &bytes, dest.as_ref(), flags))
     };
     run(cx).unwrap_or_else(|e| e)
@@ -628,6 +670,7 @@ pub(crate) fn sendmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 
 pub(crate) fn recvmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     fd: u64,
     msg: u64,
     flags: u64,
@@ -642,6 +685,22 @@ pub(crate) fn recvmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         off: 0,
         faulted: false,
     };
+    // Room for at least one handle: a channel endpoint delivers its
+    // handles there (design D9 of `add-cell-hierarchy`).
+    let word = |at: usize| u64::from_le_bytes(hdr[at..at + 8].try_into().unwrap_or_default());
+    if word(40) >= 20
+        && let Some(r) = crate::packets::recvmsg_rights(
+            cx,
+            cell,
+            fd,
+            msg,
+            (word(32), word(40)),
+            &mut into,
+            flags,
+        )
+    {
+        return r;
+    }
     let (n, from, cut) = recv_into(cx, fd, &mut into, flags);
     if n < 0 {
         return n;
@@ -852,7 +911,11 @@ pub(crate) fn getsockopt<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         }
         (SOL_SOCKET, SO_RCVTIMEO | SO_RCVTIMEO_NEW) => time(o.rcv_timeout_ns),
         (SOL_SOCKET, SO_SNDTIMEO | SO_SNDTIMEO_NEW) => time(o.snd_timeout_ns),
-        (SOL_SOCKET, SO_TYPE) => int(if ty == Type::Stream { 1 } else { 2 }),
+        (SOL_SOCKET, SO_TYPE) => int(match ty {
+            Type::Stream => 1,
+            Type::Dgram => 2,
+            Type::SeqPacket => 5,
+        }),
         (SOL_SOCKET, SO_DOMAIN) => int(if family == Family::Inet { 2 } else { 1 }),
         (SOL_SOCKET, SO_PROTOCOL) => int(match (family, ty) {
             (Family::Inet, Type::Stream) => IPPROTO_TCP as u32,

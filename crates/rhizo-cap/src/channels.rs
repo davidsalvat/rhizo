@@ -104,7 +104,7 @@ impl Default for Channels {
 }
 
 impl Channels {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             slots: Vec::new(),
             free: NIL,
@@ -222,6 +222,24 @@ impl Channels {
         buf: &mut [u8],
         handles: &mut [u32; MESSAGE_HANDLES_MAX as usize],
     ) -> Result<Recv, Error> {
+        let mut at = 0;
+        self.recv_with(end, buf.len(), handles, &mut |piece| {
+            buf[at..at + piece.len()].copy_from_slice(piece);
+            at += piece.len();
+            true
+        })
+    }
+
+    /// [`recv`](Self::recv), handing `take` at most `max` bytes of the
+    /// message in pieces, in order, until it returns `false` (the caller's
+    /// memory faulted). The message is taken whole either way.
+    pub fn recv_with(
+        &mut self,
+        end: u32,
+        max: usize,
+        handles: &mut [u32; MESSAGE_HANDLES_MAX as usize],
+        take: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<Recv, Error> {
         let c = self.get_mut(end >> 1).ok_or(Error::NotFound)?;
         let side = (end & 1) as usize;
         if !c.open[side] {
@@ -233,16 +251,29 @@ impl Channels {
             return Ok(if peer_open { Recv::Empty } else { Recv::End });
         };
         let (len, h) = (m.len as usize, m.handles as usize);
-        let n = len.min(buf.len());
+        let n = len.min(max);
         let (a, b) = q.bytes.as_slices();
         let k = n.min(a.len());
-        buf[..k].copy_from_slice(&a[..k]);
-        buf[k..n].copy_from_slice(&b[..n - k]);
+        if (k == 0 || take(&a[..k])) && n > k {
+            take(&b[..n - k]);
+        }
         q.bytes.drain(..len);
         for (out, v) in handles.iter_mut().zip(q.handles.drain(..h)) {
             *out = v;
         }
         Ok(Recv::Message { len, handles: h })
+    }
+
+    /// Whether endpoint `end` is open (`None`: no such channel).
+    pub fn is_open(&self, end: u32) -> Option<bool> {
+        Some(self.get(end >> 1)?.open[(end & 1) as usize])
+    }
+
+    /// Whether the queue of endpoint `end` has room for another message
+    /// (of any size up to what is left of its bytes).
+    pub fn has_room(&self, end: u32) -> bool {
+        self.queued(end)
+            .is_some_and(|(m, b)| m < QUEUE_MESSAGES_MAX as usize && b < QUEUE_BYTES_MAX as usize)
     }
 
     /// The number of messages and bytes queued on endpoint `end`.

@@ -677,6 +677,67 @@ Alternatives:
   channel nobody can bound or revoke, and copies of messages up to 64 KiB
   are cheap next to an agent's turn.
 
+**As built in phase 2 (tasks 2.3 and 2.4).**
+
+- An endpoint is a socket of `rhizo-net`, of type `SOCK_SEQPACKET`, so it
+  takes the paths every socket takes: descriptions share it, `poll`,
+  `epoll` and the wait queues see it, closing and copying release and
+  copy it. The kernel's channels live beside the sockets, under the
+  same lock. Each grant on an endpoint is one socket, the sockets on one
+  endpoint form a list, and a message wakes only the waiters of the
+  sockets on its peer endpoint. The endpoint closes with its last socket.
+- A `/run/rhizo/chan/<label>` entry holds one reference to its grant's
+  socket, as a description does. `open` and `connect` of the entry give a
+  descriptor of that socket, so several opens share one queue. An entry
+  can be opened for writing, since writing sends messages; the
+  generation cannot.
+- A handle in flight is a socket too. A message carries the sockets made
+  for the grants it moves, and the receiver's descriptor takes over each
+  one's reference. The grant is made when the message is sent, by
+  `transfer` to the newest holder of the peer endpoint, so `sendmsg`
+  fails at once with `EACCES` if the exposure check refuses it. If
+  another holder of that endpoint takes the message, the grant moves to
+  it (`rehome`), after the same checks. A handle refused then, or with no
+  room in the control buffer, or read with `read`, is let go, and
+  `recvmsg` reports `MSG_CTRUNC`, as Linux does when it drops descriptors.
+- A missing right fails with `EACCES`: sending without the send right,
+  receiving without the receive right, or sending handles without the
+  carry right. A descriptor that is no handle fails with `EPERM`. More
+  than 16 handles fail with `ETOOMANYREFS`, a message over 64 KiB with
+  `EMSGSIZE`.
+- Grants live in the kernel's table, not with the sockets. A socket names
+  its grant. The sockets hand back the grants whose last socket closed,
+  and the kernel drops them after the call. Unlinked cell handles are
+  handed back the same way. A grant revoked, or gone with its holder or
+  object, makes its sockets read as closed. The system call takes the
+  tree and the grant table before the sockets, and only when it moves
+  handles.
+- Endpoints that travel in each other's queues, with no socket outside a
+  message left on them, stay until their grants go with the cell that
+  holds them. There is no collector as Linux has for Unix sockets. The
+  holder's endpoint bound and the creator's reserved room bound what such
+  a cycle keeps.
+- `/run/rhizo` holds `generation`, then `inbox` and `kernel` once the
+  kernel puts them there. `chan/` and `cell/` each appear with their
+  first entry and go with their last, so a cell given nothing finds only
+  the generation and its inbox. A label is unique in its directory: the
+  kernel refuses a second grant under a taken label with `EEXIST`, before
+  it grants. A grant with no label (a handle received as `SCM_RIGHTS`) has
+  no entry, only descriptors. Unlinking an entry of `chan/` or `cell/`,
+  or `kernel`, drops the handle once its last descriptor closes too. The
+  inbox and the generation cannot be unlinked (`EROFS`), and `/run` and
+  `/run/rhizo` cannot be moved (`EBUSY`).
+- Until format version 12 (task 2.6), a snapshot keeps the endpoint
+  entries and descriptors as endpoints that read as closed, under a new
+  socket record type. It leaves out cell-handle entries, since a grant
+  number confers nothing outside the kernel that made it.
+- Receiving a message or a handle calls the kernel's `received` hook,
+  which sets the sticky bit of D22 once the kernel wires it (task 2.5).
+- Not done yet: `MSG_PEEK` on an endpoint (`EOPNOTSUPP`); `readv` and
+  `writev`, which take and send one message per buffer, as they do on
+  datagram sockets today; the inbox and `connect` to a cell handle (task
+  2.5).
+
 ## D11. Shared file views (phase 3)
 
 `rhizo-fs` keeps one tree per cell, with blocks shared copy-on-write. There

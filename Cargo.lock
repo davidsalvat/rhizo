@@ -407,6 +407,7 @@ name = "rhizo-abi"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "rhizo-cap",
  "rhizo-cell",
  "rhizo-fs",
  "rhizo-hal",

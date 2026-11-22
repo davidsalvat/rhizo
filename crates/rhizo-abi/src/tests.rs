@@ -20,6 +20,8 @@ pub(crate) struct FakeServices {
     memory: u64,
     /// The egress refusals reported (`egress_denied`).
     pub(crate) denied: Vec<(u32, rhizo_net::Proto, [u8; 4], u16)>,
+    /// Messages and handles received from other cells (`received`).
+    pub(crate) received: u32,
 }
 
 impl Console for FakeServices {
@@ -62,6 +64,9 @@ impl Services for FakeServices {
     fn egress_denied(&mut self, cell: u32, proto: rhizo_net::Proto, ip: [u8; 4], port: u16) {
         self.denied.push((cell, proto, ip, port));
     }
+    fn received(&mut self) {
+        self.received += 1;
+    }
 }
 
 /// A cell with one writable page at `DATA`, a read-only page at `RO`, and
@@ -75,6 +80,9 @@ pub(crate) struct World {
     pub(crate) services: FakeServices,
     pub(crate) fs: rhizo_fs::Fs,
     pub(crate) net: rhizo_net::Net,
+    /// The cell tree and grant table the kernel keeps beside the sockets.
+    pub(crate) tree: rhizo_cap::Tree,
+    pub(crate) grants: rhizo_cap::Grants,
     pub(crate) pages: PageCache,
     /// Keeps the cell's write-or-execute ranges, and backs their pages
     /// for system calls when told to, as the kernel's pager does.
@@ -87,13 +95,27 @@ pub(crate) struct World {
     pub(crate) used_net: bool,
 }
 
-/// The sockets, noting whether a call reached them.
-struct Noting<'a>(&'a mut rhizo_net::Net, &'a mut bool);
+/// The sockets, noting whether a call reached them, with the tree and the
+/// grants.
+struct Noting<'a>(
+    &'a mut rhizo_net::Net,
+    &'a mut bool,
+    &'a rhizo_cap::Tree,
+    &'a mut rhizo_cap::Grants,
+);
 
 impl Sockets for Noting<'_> {
     fn net(&mut self) -> &mut rhizo_net::Net {
         *self.1 = true;
         self.0
+    }
+    fn handles(&mut self) -> Option<Handles<'_>> {
+        *self.1 = true;
+        Some(Handles {
+            tree: self.2,
+            grants: self.3,
+            net: self.0,
+        })
     }
 }
 
@@ -120,6 +142,8 @@ impl World {
             services: FakeServices::default(),
             fs: rhizo_fs::Fs::new(),
             net: rhizo_net::Net::new(),
+            tree: rhizo_cap::Tree::new(),
+            grants: rhizo_cap::Grants::new(),
             pages: PageCache::new(64),
             pager: Ranges::default(),
             deadline: None,
@@ -154,7 +178,12 @@ impl World {
             frames: &mut self.frames,
             services: &mut self.services,
             fs: &mut self.fs,
-            net: &mut Noting(&mut self.net, &mut self.used_net),
+            net: &mut Noting(
+                &mut self.net,
+                &mut self.used_net,
+                &self.tree,
+                &mut self.grants,
+            ),
             deadline: self.deadline.take(),
             pager: &mut self.pager,
             pages: &mut self.pages,

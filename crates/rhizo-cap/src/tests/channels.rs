@@ -273,3 +273,61 @@ proptest! {
         }
     }
 }
+
+/// `recv_with` hands the message in pieces up to its bound and takes it
+/// whole, even when the caller stops early; `is_open` and `has_room` say
+/// what `poll` reports.
+#[test]
+fn channels_receive_in_pieces() {
+    let (mut ch, a, b) = host_channel();
+    // Wrap the queue's ring so the next message spans its two halves.
+    let big = vec![1u8; MESSAGE_MAX as usize];
+    for _ in 0..3 {
+        ch.send(a, &big, &[]).unwrap();
+    }
+    let mut hs = [0; H];
+    let mut sink = vec![0; MESSAGE_MAX as usize];
+    for _ in 0..2 {
+        ch.recv(b, &mut sink, &mut hs).unwrap();
+    }
+    let msg: Vec<u8> = (0..MESSAGE_MAX).map(|i| i as u8).collect();
+    ch.send(a, &msg, &[]).unwrap();
+    ch.send(a, &msg, &[5]).unwrap();
+    ch.recv(b, &mut sink, &mut hs).unwrap();
+    let mut got = Vec::new();
+    let r = ch.recv_with(b, 100_000, &mut hs, &mut |p| {
+        got.extend_from_slice(p);
+        true
+    });
+    assert_eq!(
+        r,
+        Ok(Recv::Message {
+            len: msg.len(),
+            handles: 0
+        })
+    );
+    assert_eq!(got, msg);
+    let mut calls = 0;
+    let r = ch.recv_with(b, 10, &mut hs, &mut |_| {
+        calls += 1;
+        false
+    });
+    assert_eq!(
+        r,
+        Ok(Recv::Message {
+            len: msg.len(),
+            handles: 1
+        })
+    );
+    assert_eq!((calls, hs[0]), (1, 5), "stopped at the first piece");
+    assert_eq!(ch.queued(b), Some((0, 0)), "taken whole");
+    assert_eq!(ch.is_open(b), Some(true));
+    assert!(ch.has_room(b));
+    for k in 0..QUEUE_MESSAGES_MAX {
+        ch.send(a, &k.to_le_bytes(), &[]).unwrap();
+    }
+    assert!(!ch.has_room(b), "64 messages queued");
+    ch.close(a, &mut |_| {});
+    assert_eq!(ch.is_open(a), Some(false));
+    assert_eq!(ch.is_open(u32::MAX - 1), None);
+}
