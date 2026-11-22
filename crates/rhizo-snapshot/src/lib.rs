@@ -357,9 +357,14 @@ impl Snapshot {
         );
         // Allocated zeroed at its final size, then filled in place: no copy
         // of the pages when it grows, and no zeroing loop, which unoptimized
-        // builds run a byte at a time.
+        // builds run a byte at a time. With room for the largest tree
+        // section, so that `set_tree` rewrites it in place: growing the
+        // vector would copy every page held here, and leave the kernel heap
+        // holding the snapshot twice.
         let data_end = data_start + data_len;
-        let mut b = vec![0u8; data_end + 16 + encoded.len() + records.len() + tree.len()];
+        let len = data_end + 16 + encoded.len() + records.len() + tree.len();
+        let mut b = vec![0u8; len - tree.len() + tree.len().max(tree::SECTION_MAX)];
+        b.truncate(len);
         let mut rec = 0;
         let mut put = |bytes: &[u8]| {
             b[rec..rec + bytes.len()].copy_from_slice(bytes);
@@ -869,6 +874,7 @@ impl Snapshot {
             spec: spec.clone(),
             ..self.tree()
         };
+        // In place: `capture` left room for the largest section.
         self.bytes.truncate(self.tree_at());
         tree::encode(&state, &mut self.bytes);
     }

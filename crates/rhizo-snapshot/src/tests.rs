@@ -1312,6 +1312,53 @@ fn tree_state_round_trip() {
     assert_eq!(again, loaded);
 }
 
+/// Recording a node's largest policies and label in a snapshot (`set_tree`,
+/// once a cell is suspended) rewrites its tree section in place: the
+/// buffer that holds its pages is never grown, which would copy them all
+/// and leave the kernel heap holding the snapshot twice (a Node.js cell
+/// with an egress rule then ran out of memory on export).
+#[test]
+fn the_largest_tree_section_is_written_in_place() {
+    use rhizo_cap::limits::{LABEL_MAX, RULES_MAX};
+    use rhizo_cap::{Egress, Label, Proto, Rule};
+    let (mut mem, mut frames) = (FakePhysicalMemory::new(), CountingFrames::new(1024));
+    let c = cell::<Aarch64>(&mut mem, &mut frames);
+    let mut wx = WxRanges::default();
+    for i in 0..space::MAX_WX_RANGES as u64 {
+        wx.wipe(0x60_0000 + i * 0x2000, 0x60_1000 + i * 0x2000)
+            .unwrap();
+    }
+    let mut snap = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &[],
+        &wx,
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
+    let rules = |port: u16| -> Vec<Rule> {
+        (0..RULES_MAX as u8)
+            .map(|i| Rule::new(Proto::Tcp, [10, 1, i, 0], 32, port, port).unwrap())
+            .collect()
+    };
+    let spec = rhizo_cap::Spec {
+        egress: Egress::rules(&rules(80)).unwrap(),
+        ceiling: Some(Egress::rules(&rules(81)).unwrap()),
+        label: Label::new(&[b'a'; LABEL_MAX]).unwrap(),
+        ..rhizo_cap::Spec::default()
+    };
+    let at = snap.bytes.as_ptr();
+    snap.set_tree(&spec);
+    assert_eq!(snap.bytes.as_ptr(), at, "rewritten in place");
+    assert_eq!(snap.bytes.len() - snap.tree_at(), tree::SECTION_MAX);
+    let loaded = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
+    assert_eq!(loaded.tree().spec, spec);
+}
+
 /// Spec `snapshots`, "Forged authority": a file changed to claim egress
 /// `full`, a 4 GiB limit and a CPU set, loaded under a parent with egress
 /// `none` and a 16 MiB budget, gets egress `none`, limits within the
