@@ -18,4 +18,4 @@
 - [x] 3.2 Verify `cargo xtask check`, and `cargo xtask test` on both architectures
 - [x] 3.3 Instruction counts within the gate: verify `cargo xtask --arch x86_64 bench --icount-only --env ci --check` (fork and resume +0.5 % and +1.3 %, design)
 - [x] 3.4 PR #138's weighted scheduler measured with and without this change under `-icount` (design, evidence)
-- [ ] 3.5 After merge, the `bench` workflow on main passes `density.sched_p99_us` and `density.wake_p99_us` on every VMM
+- [x] 3.5 After merge, the `bench` workflow on main passes `density.sched_p99_us` and `density.wake_p99_us` on every VMM (run 44955721925 on `2a3beec`: both pass on `qemu-microvm`, `qemu-q35`, `firecracker` and `cloud-hypervisor`, the job failing only on agent-turn timings; runs 44957785504 to 44963070334, `8f942c6` to `1fa45c5`, green)

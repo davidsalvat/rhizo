@@ -284,6 +284,9 @@ model runs natively on the host, so the demo stays usable.
   Firecracker and Cloud Hypervisor, on QEMU when the host's vhost-vsock
   device is usable) and the serial line otherwise, which is fine for
   requests and output but slow for bulk data (change `control-over-vsock`).
+  A vsock connection is served only once it presents the secret the kernel
+  drew at boot and printed on its serial line, which `rhizo up` keeps in
+  memory and out of `console.log` (change `authenticate-control-channel`).
 - **Snapshots stay in the VM's memory**; `rhizo down` drops them.
 - **Memory.** `rhizo up` gives the guest 256 MiB: the agent and its three
   branches fit easily (they share their pages copy-on-write).

@@ -393,7 +393,7 @@ the threat model above.
 | S24 | Medium | both | `sysinfo` reported the kernel's free memory: every cell saw every other cell's allocations, a storage channel between cells | Fixed (`close-cross-cell-leaks`) |
 | S25 | Medium | both | Ephemeral ports came from one counter for all cells: the distance between a cell's ports counted every other cell's binds | Fixed (`close-cross-cell-leaks`) |
 | S26 | Medium | both | Any cell could empty the whole page cache (65,536 pages of its own files, or memory pressure from a cell without a quota): the flush half of a flush-and-probe timing channel; the frames of mapped pages then left the cache uncounted in their mappers' quotas | Fixed (`close-cross-cell-leaks`) |
-| S27 | Low | both | A vsock connection that replaced the previous one before the control kernel looked got no hello, and its first bytes completed the old connection's unfinished frame | Fixed (`fix-vsock-reconnect`, PR #142, in review) |
+| S27 | Low | both | A vsock connection that replaced the previous one before the control kernel looked got no hello, and its first bytes completed the old connection's unfinished frame | Fixed (`fix-vsock-reconnect`, PR #142) |
 | S28 | Low | both | Any local user could connect to the control kernel's vsock port on QEMU without privilege and, while the host held no connection, control every cell (open finding O8 until then) | Fixed (`authenticate-control-channel`) |
 
 **S1. `mprotect` reached the kernel half (Critical, x86_64).** On x86_64 a
