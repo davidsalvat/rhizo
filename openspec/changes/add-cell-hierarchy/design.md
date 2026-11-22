@@ -1111,11 +1111,11 @@ domain by domain.
   (a second caller made it call them, +21 instructions per switch), and
   `Host::resume` no longer lets its threads waiting on descriptors look
   again twice (`file` does it for a cell new to the scheduler). Measured
-  with `--icount-only` against `main` (239adf1), x86_64 then AArch64:
-  `cell.switch_insns` 875 to 869 and 819 to 814, `cell.switch_domains_insns`
-  1,374 to 1,370 and 1,286 to 1,277, `cell.resume_insns` 4,352 to 4,324
+  with `--icount-only` against `main` (6b1ea42), x86_64 then AArch64:
+  `cell.switch_insns` 878 to 869 and 831 to 826, `cell.switch_domains_insns`
+  1,376 to 1,370 and 1,298 to 1,289, `cell.resume_insns` 4,352 to 4,324
   and 11,777 to 11,759, `cell.spawn_insns` +1 and +5, `cell.run_insns`
-  +45 and +15 (+0.05 %); every other figure within ±0.15 %.
+  +42 and +17 (+0.05 %); every other figure within ±0.25 % (no increase above +0.07 %).
 - **`rhizo up --pin`** pins each vCPU thread of the VMM, found by the name
   QEMU (`CPU <n>/KVM`, `CPU <n>/TCG`) and Cloud Hypervisor (`vcpu<n>`)
   give it, to the first allowed host CPU of a physical core of its own
