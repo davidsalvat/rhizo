@@ -48,7 +48,7 @@ change (design D16).
   Done so far: every figure reported (`net.egress_check_insns` and `net.tcp_rtt_rules_us` were there; `covert.cpu_bps`, `covert.cpu_sets_bps`, never gated by a rule in `xtask`, and `cell.parallel_sets_us` added); `cargo xtask bench --icount-only --env ci --check` (x86_64) and `--env ci-arm` (AArch64) with no regression; `cell.idle_bytes` 21,688 against 22,478 in the baseline and `cell.suspended_bytes` 67,078 against 67,006 (+72 bytes, within the deterministic threshold), both justified in the pull request. Left:
   - the timed `cargo xtask bench --env ci --check` runs where KVM is, and the KVM figures of `covert.cpu_bps` with and without sets replace the emulated ones in `docs/security.md` (under TCG, sets did not lower the figure: see there)
 - [x] 1.14 `docs/security.md`: threat model of colluding cells, the covert-channel inventory with `covert.cpu_bps`, O6 closed, content sharing bounded by the domain (D21), what copies keep of their template (D22); `docs/audit-scope.md`: B2 rewritten; verify by reading
-- [ ] 1.15 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
+- [x] 1.15 Everything CI runs; verify `cargo xtask ci` on both architectures and CI green
 
 ## 2. Phase 2: handles and channels
 
