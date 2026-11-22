@@ -693,8 +693,8 @@ def security(t):
 # ---------------------------------------------------------------- hierarchy
 def hierarchy(t):
     s = Svg(t, 560, "Being built: the cell hierarchy",
-            "Being built: the tree, its domains, CPU shares by weight and the audit log "
-            "are in; budgets, egress policies, channels and handles come next. The host "
+            "Being built: the tree, its domains, budgets, egress policies, CPU shares by "
+            "weight and the audit log are in; channels and handles come next. The host "
             "is the root; each of its children roots a "
             "domain. Agent A, with egress to the model only and a budget of 1 GiB and 8 "
             "cells, has two children with no egress: tools, reached over a channel, and "

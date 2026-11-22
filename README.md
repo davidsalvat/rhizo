@@ -349,20 +349,24 @@ and what is still open: [`docs/security.md`](docs/security.md).
 </p>
 
 Being built ([`docs/cell-hierarchy.md`](docs/cell-hierarchy.md)): agents
-that live in families, each family walled off from the others. The cell tree
-is in: its roots each start a domain with its own identifiers, the host
-places, re-parents, suspends and kills subtrees, CPUs are shared between
-domains by weight with caps per subtree, every tree change is recorded in a
-hash-chained audit log, snapshots (format version 11) carry a cell's place in
-the tree, and control protocol version 4 speaks it (`rhizo ps --tree`,
-`reparent`, `policy`). Designed and coming next: abilities (data analysis,
+that live in families, each family walled off from the others. Its first
+phase is in, but for the last checks of CPU weights and timed benchmarks
+on KVM: the cell tree, whose roots each start a domain with its own
+identifiers; budgets carved from the parent; a private loopback network
+per cell; egress policies checked on every socket; the host places,
+re-parents, suspends and kills subtrees; CPUs are shared between domains
+by weight with caps per subtree; every tree change is recorded in a
+hash-chained audit log; snapshots (format version 11) carry a cell's place
+in the tree, and control protocol version 4 speaks it (`rhizo ps --tree`,
+`reparent`, `policy`). Channels and handles are being built next. Designed
+and coming after: abilities (data analysis,
 coding tools, a web browser, documents, your own tools) added to an agent as
 child cells from a signed catalogue, as each task needs them.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/hierarchy-dark.svg">
-    <img src="docs/img/hierarchy.svg" alt="Being built: the cell hierarchy; the tree, its domains, CPU shares by weight and the audit log are in, budgets, egress, channels and handles come next. The host is the root; each of its children roots a domain. In domain 1, agent A (egress to the model only, 1 GiB and 8 cells) has two children with no egress, tools and a python module, each reached over a channel. In domain 2, agent B (allowlist egress, 512 MiB and 4 cells) has a worker child. A wall separates the domains. Authority flows down; budgets are carved from the parent; there is no shared loopback, files or counters between domains; egress is checked on every socket and only narrowed, by default none; handles carry rights that only shrink. Timing channels on shared CPUs remain, listed and measured." width="800">
+    <img src="docs/img/hierarchy.svg" alt="Being built: the cell hierarchy; the tree, its domains, budgets, egress policies, CPU shares by weight and the audit log are in, channels and handles come next. The host is the root; each of its children roots a domain. In domain 1, agent A (egress to the model only, 1 GiB and 8 cells) has two children with no egress, tools and a python module, each reached over a channel. In domain 2, agent B (allowlist egress, 512 MiB and 4 cells) has a worker child. A wall separates the domains. Authority flows down; budgets are carved from the parent; there is no shared loopback, files or counters between domains; egress is checked on every socket and only narrowed, by default none; handles carry rights that only shrink. Timing channels on shared CPUs remain, listed and measured." width="800">
   </picture>
 </p>
 
@@ -373,8 +377,8 @@ child cells from a signed catalogue, as each task needs them.
   </picture>
 </p>
 
-- **Families of cells** (the tree, domains, CPU weights and the audit log
-  are built; the rest is next). A tree of cells with budgets carved from the parent,
+- **Families of cells** (the tree, budgets, private loopback, egress, CPU
+  weights and the audit log are built; channels and handles are next). A tree of cells with budgets carved from the parent,
   so no fork bomb escapes them; capability handles whose rights only shrink;
   channels as the only way to talk; a private loopback per cell; egress
   policies per family (none, the model, an allowlist), checked on every
