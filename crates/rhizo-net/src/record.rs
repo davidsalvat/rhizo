@@ -2,7 +2,8 @@
 //! and its encoding: explicit little endian, every field checked on decode.
 //!
 //! Per record: `family: u8` (0 Inet, 1 Unix), `type: u8` (0 stream,
-//! 1 datagram), `state: u8` (0 open, 1 listening, 2 reset), `backlog: u32`,
+//! 1 datagram, 2 Unix sequenced packets: open or reset, never parked),
+//! `state: u8` (0 open, 1 listening, 2 reset), `backlog: u32`,
 //! `parked: u8` (1: a listener or connection parked in the kernel, then
 //! `boot: u64` and `key: u64`; a parked reset connection has no address),
 //! the address (`tag: u8`: 0 none; 1 Inet, `ip: [u8; 4]`, `port: u16`;
@@ -66,6 +67,7 @@ pub fn encode_records(records: &[Record], out: &mut Vec<u8>) {
         out.push(match r.ty {
             Type::Stream => 0,
             Type::Dgram => 1,
+            Type::SeqPacket => 2,
         });
         let (state, backlog) = match r.state {
             Saved::Open => (0, 0),
@@ -166,21 +168,24 @@ pub fn decode_records(bytes: &[u8]) -> core::result::Result<Vec<Record>, DecodeE
         let ty = match r.u8()? {
             0 => Type::Stream,
             1 if family == Family::Inet => Type::Dgram,
+            2 if family == Family::Unix => Type::SeqPacket,
             _ => return Err(Corrupt),
         };
         let (state, backlog) = (r.u8()?, r.u32()?);
         let state = match state {
             0 => Saved::Open,
             1 if ty == Type::Stream && backlog as usize <= BACKLOG_MAX => Saved::Listening(backlog),
-            2 if ty == Type::Stream => Saved::Reset,
+            2 if ty != Type::Dgram => Saved::Reset,
             _ => return Err(Corrupt),
         };
         let parked = match r.u8()? {
             0 => None,
-            1 if matches!(state, Saved::Listening(_) | Saved::Reset) => Some(Park {
-                boot: r.u64()?,
-                key: r.u64()?,
-            }),
+            1 if ty != Type::SeqPacket && matches!(state, Saved::Listening(_) | Saved::Reset) => {
+                Some(Park {
+                    boot: r.u64()?,
+                    key: r.u64()?,
+                })
+            }
             _ => return Err(Corrupt),
         };
         let local = match (r.u8()?, family) {

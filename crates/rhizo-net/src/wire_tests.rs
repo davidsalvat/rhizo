@@ -714,7 +714,7 @@ fn egress_levels_decide_what_a_cell_reaches() {
             let s = w.socket_in(key, ty);
             w.net.enter(Ports::new(key));
             let r = match ty {
-                Type::Stream => w.net.connect(s, &peer_at(port)),
+                Type::Stream | Type::SeqPacket => w.net.connect(s, &peer_at(port)),
                 Type::Dgram => w.net.send(s, b"q", Some(&peer_at(port))).map(|_| ()),
             };
             let ports = w.net.leave().unwrap();

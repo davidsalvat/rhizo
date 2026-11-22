@@ -210,7 +210,13 @@ impl Tables {
     /// A descriptor for kernel socket `handle`. On failure the caller still
     /// holds the handle.
     pub fn socket_fd(&mut self, handle: u32, nonblock: bool, cloexec: bool) -> Result<Fd> {
-        if self.sockets().count() >= self.socket_limit {
+        let open = self
+            .descs
+            .iter()
+            .flatten()
+            .filter(|d| matches!(d.target, Target::Socket(_)))
+            .count();
+        if open >= self.socket_limit {
             return Err(Error::TooManySockets);
         }
         self.open_target(Target::Socket(handle), Self::status(nonblock, 2), cloexec)
@@ -224,20 +230,56 @@ impl Tables {
         }
     }
 
-    /// The socket handles of every description (each once).
-    pub fn sockets(&self) -> impl Iterator<Item = u32> + '_ {
-        self.descs.iter().flatten().filter_map(|d| match d.target {
-            Target::Socket(h) => Some(h),
-            _ => None,
-        })
+    /// Whether a description or a `/run/rhizo` entry holds a socket: what
+    /// [`sockets`](Self::sockets) would find, asked on every fork and end
+    /// of a cell, so the cell's files are never walked for it.
+    pub fn has_sockets(&self) -> bool {
+        self.descs
+            .iter()
+            .flatten()
+            .any(|d| matches!(d.target, Target::Socket(_)))
+            || (self.rhizo.is_some() && self.sockets().next().is_some())
     }
 
-    /// Replaces every socket handle `h` by `f(h)`.
+    /// The socket handles every description and every `/run/rhizo` entry
+    /// holds, one reference each: the descriptions first, in order.
+    pub fn sockets(&self) -> impl Iterator<Item = u32> + '_ {
+        let descs = self.descs.iter().flatten().filter_map(|d| match d.target {
+            Target::Socket(h) => Some(h),
+            _ => None,
+        });
+        let kept = self.kept_inos().filter_map(|i| match self.inode(i).node {
+            Node::Kept(Kept::Socket(h)) => Some(h),
+            _ => None,
+        });
+        descs.chain(kept)
+    }
+
+    /// Replaces every socket handle `h` by `f(h)`, in the order
+    /// [`sockets`](Self::sockets) gives them.
     pub fn map_sockets(&mut self, mut f: impl FnMut(u32) -> u32) {
         for d in self.descs.iter_mut().flatten() {
             if let Target::Socket(h) = &mut d.target {
                 *h = f(*h);
             }
+        }
+        let kept: Vec<Ino> = self.kept_inos().collect();
+        for i in kept {
+            if let Node::Kept(Kept::Socket(h)) = self.inode(i).node {
+                let new = f(h);
+                self.inode_mut(i).node = Node::Kept(Kept::Socket(new));
+            }
+        }
+    }
+
+    /// Makes descriptor `fd`, a socket's, refer to socket `handle` instead
+    /// (a `connect` that reached a channel endpoint, design D10 of
+    /// `add-cell-hierarchy`); returns the socket it referred to, whose
+    /// reference the caller now holds.
+    pub fn replace_socket(&mut self, fd: Fd, handle: u32) -> Result<u32> {
+        match &mut self.desc_mut(fd)?.target {
+            Target::Socket(h) => Ok(core::mem::replace(h, handle)),
+            _ => Err(Error::NotSocket),
         }
     }
 
@@ -552,6 +594,9 @@ impl Tables {
     pub fn bind_name(&mut self, dirfd: Option<Fd>, path: &[u8], name: u64) -> Result<()> {
         let (dir, last) = self.parent_of(dirfd, path)?;
         let last = last.ok_or(Error::Exists)?;
+        if self.kept_dir(dir) {
+            return Err(Error::ReadOnly);
+        }
         let Node::Dir { entries, .. } = &self.inode(dir).node else {
             return Err(Error::NotDir);
         };
