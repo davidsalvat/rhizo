@@ -387,29 +387,48 @@ fn a_moved_snapshot_unshares() {
     assert_eq!(memory_balance(), before, "every frame back");
 }
 
-/// A snapshot of a template, resumed lazily and eagerly as roots of new
-/// domains (as CPython's copies are loaded), first stops referring to the
-/// template's frames, then pages in every page it needs: each copy reads
-/// what the template wrote and finishes. CPython's copies faulted on a
-/// page the moved snapshot no longer found.
+/// A snapshot of a template resumed is a copy of it, in its domain
+/// (design D13): it shares the template's memory instead of copying it,
+/// lazily or eagerly. A suspended fork moved into another domain and
+/// resumed lazily first stops referring to its old domain's frames, then
+/// pages in every page it needs (CPython's loaded copies faulted on one,
+/// and copying a template's snapshot into a new domain each time ran a
+/// 128 MiB VM out of memory).
 fn a_template_snapshot_resumes_lazily_elsewhere() {
     let before = memory_balance();
     let mut host = Host::new();
     let template = writer_template(&mut host, b"2");
-    for mode in [Resume::Lazy, Resume::Eager, Resume::Lazy] {
-        let snapshot = host.template_snapshot(template).expect("snapshot");
-        assert!(snapshot.refers(), "it refers to the template's frames");
-        let copy = host.resume(snapshot, mode, true, true).expect("resume");
-        assert_ne!(host.domain(copy), host.domain(template), "{mode:?}");
+    let run_out = |host: &mut Host, copy: u32| {
         if host.asleep(copy) {
             assert!(host.wake(copy));
         }
-        until_asleep_with(&mut host, copy, b"written\n");
+        until_asleep_with(host, copy, b"written\n");
         assert!(host.wake(copy));
         host.run(|h| h.finished(copy).is_some());
-        assert_eq!(ended(&host, copy), (Ending::Exit(0), "written\n".into()));
+        assert_eq!(ended(host, copy), (Ending::Exit(0), "written\n".into()));
+    };
+    for mode in [Resume::Lazy, Resume::Eager] {
+        let snapshot = host.template_snapshot(template).expect("snapshot");
+        assert!(snapshot.refers(), "it refers to the template's frames");
+        let free = memory::free_bytes();
+        let copy = host.resume(snapshot, mode, true, true).expect("resume");
+        let taken = free.saturating_sub(memory::free_bytes());
+        assert!(taken < NOISE, "{mode:?}: it shares, {taken} bytes taken");
+        assert_eq!(host.domain(copy), host.domain(template), "{mode:?}");
+        run_out(&mut host, copy);
     }
     assert!(host.drop_template(template));
+    let (parent, source, sibling) = siblings(&mut host);
+    let snapshot = host.suspend(sibling).expect("suspend");
+    host.reparent(sibling, HOST, Actor::Host).expect("promoted");
+    let moved = host
+        .resume(snapshot, Resume::Lazy, true, true)
+        .expect("resume");
+    assert_ne!(host.domain(moved), host.domain(source));
+    run_out(&mut host, moved);
+    for id in [source, parent] {
+        assert!(host.kill(id));
+    }
     drop(host);
     assert_eq!(memory_balance(), before, "every frame back");
 }

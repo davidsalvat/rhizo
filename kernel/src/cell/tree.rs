@@ -101,7 +101,9 @@ impl Host {
     }
 
     /// Places a cell restored from `snapshot`, not yet run: under the
-    /// parent it had, in its domain, if it was suspended from this host;
+    /// parent it had, in its domain, if it was suspended from this host; as
+    /// a copy of the cell it was taken of (a template's snapshot), a
+    /// sibling in its domain, if the host holds that cell;
     /// otherwise as the root of a new domain, with no authority from the
     /// bytes (spec `snapshots`, loaded snapshots hold no authority): egress
     /// and ceiling `none`, limits within the quotas the host left it, no
@@ -118,6 +120,20 @@ impl Host {
             self.suspended.swap_remove(at);
             self.reshare_if_by_weight();
             return true;
+        }
+        // A snapshot of a cell this host still holds (a template's) makes a
+        // copy of it: a sibling in its domain (design D13).
+        if origin != 0 && self.tree.get(origin).is_some() {
+            let parent = self.tree.get(origin).map_or(0, |n| n.parent());
+            let used = self.usage(parent);
+            let mut placed = |_, pid, domain| (cell.pid, cell.domain) = (pid, domain);
+            let entered = self
+                .tree
+                .add_copies(origin, &[cell.id], &|_| used, &mut placed);
+            if entered.is_ok() {
+                self.reshare_if_by_weight();
+            }
+            return entered.is_ok();
         }
         let Ok(spec) = snapshot.placed(&Egress::None, &Egress::None, root_limits(&cell.quota))
         else {
