@@ -18,6 +18,10 @@ pub(super) struct Published {
 }
 
 /// Why [`Host::publish`] refused.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "control")),
+    allow(dead_code, reason = "used by in-kernel tests and the control kernel")
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
     /// There is no such template.
@@ -55,11 +59,8 @@ impl Host {
     /// network card, unless the host attests (`attested`) that it holds no
     /// secret (design D22). Publishing it again changes nothing.
     #[cfg_attr(
-        not(any(feature = "ktest", feature = "bench-cell")),
-        allow(
-            dead_code,
-            reason = "used by in-kernel tests and benchmarks until protocol 4 (task 1.11)"
-        )
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn publish(&mut self, id: u32, attested: bool) -> Result<(), Refused> {
         match self.may_publish(id, attested) {
@@ -87,11 +88,8 @@ impl Host {
     /// copies made before keep sharing, and its memory stays until the
     /// last of them ends. Returns whether it was published.
     #[cfg_attr(
-        not(feature = "ktest"),
-        allow(
-            dead_code,
-            reason = "used by in-kernel tests until protocol 4 (task 1.11)"
-        )
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn withdraw(&mut self, id: u32) -> bool {
         let found = self.published.templates.iter_mut().find(|(t, _)| *t == id);

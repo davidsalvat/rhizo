@@ -790,14 +790,21 @@ handles or quota by it.
   or wherever the host names. All copies are made or none. Copies placed
   in another domain share no private frame with the source: they are full
   copies, unless the source is a published template (D21).
-- A sibling of a root is a root, so **every copy of a root is the root of
-  a new domain**: a host fork of a root, or a copy of a root template,
-  shares no private frame with its source unless the source is published.
-  Today's copy-on-write forks of roots (the `cell.fork_us` path, the
-  density loads) keep sharing only within one domain: the content-sharing
-  work (tasks 1.8 and 1.8a) either places such copies under a common root,
-  publishes their source, or pays for the full copy, and says which in
-  its benchmarks.
+- **A copy stays in its source's domain**, a sibling of a root being a
+  root of that domain (decided by the coordinator under the owner's
+  delegation, after tasks 1.8 and 1.8a first built the opposite). The
+  domain is the tenant, not a single tree root: a copy holds exactly its
+  source's data and secrets at the time of the copy, so sharing frames
+  with its source, or with the template it came from, tells it nothing it
+  does not hold, and D21's aim, isolation between tenants, needs no full
+  copy there. A host fork of a root and a copy of a root template share
+  copy-on-write (the `cell.fork_us` path, the density loads and forks of
+  live agents). A copy goes into another domain only where the host
+  places it (protocol 4 placement, `Host::place`), and then takes private
+  copies first (D21). A root the host makes or loads, and a promoted cell,
+  start a domain of their own; a domain lives while any of its cells
+  does, and numbers its cells (`getpid`) in the order they join it, so a
+  copy's number is never its source's.
 - Every copy gets a new copy generation, its `MADV_WIPEONFORK` ranges
   read as zero, and its `getpid` differs from the source's (D22).
 - Accelerator handles are not inherited; open sessions are forked by the
@@ -1364,24 +1371,23 @@ Alternatives:
 
 **As built in phase 1 (tasks 1.8 and 1.8a).**
 
-- **Forks of roots.** Every copy of a root is the root of a new domain
-  (D13), so `Host::fork` of a root and a copy of an unpublished template
-  are full copies: `rhizo-mm`'s `copy_lower_half` copies every page into
-  tables of the copy's own, sharing only read-only pages of public objects
-  (published file pages and the read-only pages of the executables the
-  kernel keeps loaded). A fork of a cell under a parent, and a copy of a
-  published template, still share copy-on-write and allocate only a root.
-  The common paths stay fast because what the host ships is published:
-  the host's file sets when the kernel decodes them, and the templates the
-  benchmarks, the reference workloads and the agent workload make
-  (`Host::publish` after `freeze`). The agent workload's template talked to
-  the fake model through the card, so its host attests. A live root forked
-  by the host pays the copy, proportional to its private memory; the
-  `fork` spec's "Fork cost independent of memory size" says so.
-- **The control kernel** has no `publish` request until protocol version 4
-  (task 1.11): templates it freezes or loads stay unpublished, and their
-  copies are full copies. `rhizo up` publishes its templates once the
-  request exists.
+- **Copies keep their domain** (D13), so forks and template copies share
+  copy-on-write as before. `rhizo-cap` numbers each domain apart from its
+  roots (a table of open domains, closed with their last cell), since a
+  domain may now hold several roots.
+- **Placed in another domain** (`Host::place`, `adopt`, `reparent`), a
+  cell first takes private copies: `rhizo-mm`'s `copy_lower_half` gives it
+  tables of its own and shares only the frames of public objects that the
+  source cannot write in place, copy-on-write: published file pages, the
+  read-only pages of the executables the kernel keeps loaded, and every
+  page of a template published now. A cell that shares nothing else is
+  left as it is.
+- **Publication** (`publish` and `withdraw`, protocol 4 requests 0x14 and
+  0x15, `rhizo publish N [--attest]` and `rhizo withdraw N`) therefore
+  decides only what copies placed in other domains share. A client scoped
+  to a subtree is refused both. The control kernel publishes the file sets
+  it ships when it starts. `Host::publish` asks `Host::may_publish`, where
+  task 1.9b records an attestation or a refusal.
 - **The page cache** keeps public pages apart from domains' pages, so a
   domain's pages, once dropped, leave no record behind. Each domain keeps
   at most 65,536 pages; one past its limit is the cell's own copy. Charging
@@ -1391,24 +1397,26 @@ Alternatives:
   nothing is filled for every domain on demand.
 - **Published sets** fill a frame for every page of their executables and
   libraries (ELF files: `ld.so` maps libraries by ranges of its own), not
-  of their other files.
+  of their other files, taken from the top of memory as the heap's pages
+  are, so frames that stay do not split the free runs cells allocate
+  from. Only sets the host ships are published: the test kernels'
+  distribution set (`python3` and its libraries, about 16 MiB of ELF
+  files) is a fixture, kept per domain; published, it held a quarter of a
+  128 MiB test VM for good and ran cells in parallel out of memory.
 - **A dropped template that was published** keeps its tables while any
   table or page of them is shared with another cell, except pages a cache
   of the kernel holds (whose counts never fall to one); it goes when the
   last cell sharing it ends. A template never published goes at once.
-- **Leaving a domain.** `Host::reparent` across domains first gives every
-  live cell and template of the moved subtree private copies of what it
-  shares, and is refused with `NoMemory` (`ENOMEM`) if the cell's memory
-  quota or the machine cannot hold them; a cell promoted when its parent
-  ends does the same, or ends. A suspended cell's snapshot is moved when it
-  is resumed: the kernel keeps the domain a snapshot was taken in beside
-  its bytes, and a resume into another domain first turns its references
+- **Leaving a domain.** A move across domains is refused with `NoMemory`
+  (`ENOMEM`) if the cell's memory quota or the machine cannot hold its
+  private copies; a cell promoted when its parent ends takes them, or
+  ends. A suspended cell's snapshot moves when it is resumed: the kernel
+  keeps the domain a snapshot was taken in beside its bytes, the resume
+  compares it with the domain the cell enters (one comparison when they
+  are the same, the usual case), and otherwise first turns its references
   to frames other than public ones into data (`Snapshot::move_to`), as
   `export` does. No format change: a snapshot from bytes refers to no
   frame, so format version 11 needs no field for this.
-- Frames of a published template count as private when a cell that
-  shares them leaves its domain or is copied into another: they are
-  copied, which costs memory, never isolation.
 
 ## D22. Randomness after fork, resume and template spawn
 

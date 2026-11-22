@@ -67,16 +67,25 @@ grant, list and revoke handles (`rhizo reparent`, `policy`, `grant`,
 - **THEN** the message arrives, and after the revocation both ends read end of file
 
 ### Requirement: Publishing templates
-`rhizo publish T [--attest-no-secrets]` SHALL make template `T` a public
-object whose copies in any domain share its frames, and `rhizo withdraw
-T` SHALL end that: later copies outside its domain are full copies, and
-its frames stay until its last copy ends. The host's own
-file sets and the templates `rhizo up` makes from them SHALL be
-published at start.
+`rhizo publish T [--attest]` (protocol 4, request `publish`) SHALL make
+template `T` a public object whose copies placed in any domain share its
+frames, refused for a template whose cell reached the network card
+unless `--attest` is given, and `rhizo withdraw T` (request `withdraw`)
+SHALL end that: later copies placed outside its domain are full copies,
+and its frames stay until its last copy ends. A client scoped to a
+subtree SHALL be refused both.
 
 #### Scenario: Publish and copy
-- **WHEN** the host publishes a template and runs a copy of it in each of two new roots
-- **THEN** both copies share the template's frames, and after `withdraw` a third copy as a new root shares none while the two run on
+- **WHEN** the host publishes a template and places a copy of it under a cell of each of two other domains
+- **THEN** both copies share the template's frames, and after `withdraw` a third copy placed in a third domain shares none while the two run on
+
+### Requirement: Shipped file sets published at start
+The file sets the control kernel ships SHALL be published when it
+starts, so that the first cell to use one tells no other domain anything.
+
+#### Scenario: Two domains run a dynamic program
+- **WHEN** cells of two domains run the dynamically linked `hello` of the shipped set
+- **THEN** each maps its libraries' pages on the frames published at start
 
 ### Requirement: Scoped host access
 `rhizo scope N --socket PATH` SHALL serve on PATH requests limited to

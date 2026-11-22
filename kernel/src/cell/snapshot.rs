@@ -357,6 +357,10 @@ impl Host {
     /// (`attested`) that it holds no secret. `None` if there is no such
     /// template ([`publish`](Self::publish) asks it). The audit record of
     /// an attestation comes with task 1.9b.
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
+    )]
     pub fn may_publish(&self, id: u32, attested: bool) -> Option<bool> {
         let (cell, ..) = self.templates.iter().find(|(c, ..)| c.id == id)?;
         Some(attested || !cell.exposed)

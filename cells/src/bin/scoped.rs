@@ -9,13 +9,17 @@
 //!   `i + 1`, prints `ready` and sleeps until the host wakes it (or at once
 //!   in a copy of its template); then checks every page still holds what
 //!   it wrote, writes `i + 1000` into each, prints `written`, sleeps until
-//!   woken again, and exits.
+//!   woken again, and exits;
+//! - `hold MIB`: maps MIB MiB, writes every page, prints `ready` and waits
+//!   on a futex with no deadline for ever, so a copy of its template
+//!   writes nothing and shares every page it can.
 //!
 //! Never run on Linux.
 #![no_std]
 #![no_main]
 
-use rhizo_cells::{arg, check, nr, number, print, sleep_ns, syscall};
+use core::sync::atomic::AtomicU32;
+use rhizo_cells::{arg, check, futex_wait, nr, number, print, sleep_ns, syscall};
 
 const AT_FDCWD: usize = -100isize as usize;
 const PROT_READ: usize = 1;
@@ -91,10 +95,29 @@ fn write(mib: usize) {
     until_woken();
 }
 
+fn hold(mib: usize) -> ! {
+    let size = mib << 20;
+    let p = syscall(
+        nr::MMAP,
+        [0, size, PROT_RW, MAP_PRIVATE_ANONYMOUS, usize::MAX, 0],
+    );
+    check(p > 0, "mmap");
+    for page in 0..size / PAGE {
+        // SAFETY: inside the writable mapping just made.
+        unsafe { ((p as usize + page * PAGE) as *mut usize).write_volatile(page + 1) };
+    }
+    print(b"ready\n");
+    let never = AtomicU32::new(0);
+    loop {
+        futex_wait(&never, 0, None, u32::MAX);
+    }
+}
+
 fn main() -> i32 {
     match arg(1) {
         Some(b"map") => map(arg(2).unwrap_or(b""), arg(3).map_or(1, number)),
         Some(b"write") => write(arg(2).map_or(1, number)),
+        Some(b"hold") => hold(arg(2).map_or(1, number)),
         _ => check(false, "mode"),
     }
     0
