@@ -169,11 +169,17 @@ A cell SHALL be able to revoke every handle derived from one it holds,
 and an ancestor or the host any handle granted by a cell of its subtree,
 at once: a revoked endpoint SHALL read end of file and fail writes with
 `EPIPE`, a revoked cell handle SHALL refuse operations with `EACCES`, and
-a revoked view SHALL disappear.
+a revoked view SHALL disappear. Dropping a handle SHALL NOT revoke the
+handles derived from it: they stay revocable by whoever could revoke them
+before.
 
 #### Scenario: Revoked while passed on
 - **WHEN** A grants B a channel, B passes it to C, and A revokes it
 - **THEN** both B and C read end of file on it and their writes fail with `EPIPE`
+
+#### Scenario: Passed on, then closed
+- **WHEN** A grants B a channel, B passes it to C and closes its own, and A revokes it
+- **THEN** C keeps using the channel until A's revocation, then reads end of file on it
 
 ### Requirement: Exposure ceilings
 Each cell SHALL have an exposure ceiling, an egress policy at least its
@@ -378,3 +384,15 @@ domain at a time, and a copy SHALL not inherit the handle.
 #### Scenario: Copy of a cell with a handle
 - **WHEN** a cell holding an accelerator handle is forked by its parent
 - **THEN** the copy holds no accelerator handle, and opening a new session in it fails
+
+### Requirement: Accelerator budgets carved by derivation
+An accelerator handle SHALL carry its budgets and the models it lists, at
+most 64. A derived handle's budgets SHALL be carved from what its source
+has free (its budgets less what was derived from it and what its own
+sessions use) and come back when it is revoked; a derivation past that
+SHALL fail with `EDQUOT` and change nothing. The host's grants of an
+accelerator SHALL fit the capacity it registered for it.
+
+#### Scenario: Carving a budget
+- **WHEN** a cell holding a handle with 4 sessions derives one with 2 for a child while one of its own sessions is open, then asks for 2 more
+- **THEN** the first derivation succeeds, the second fails with `EDQUOT`, and once the child's handle is revoked the same derivation succeeds

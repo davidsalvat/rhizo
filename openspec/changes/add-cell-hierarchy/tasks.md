@@ -50,11 +50,11 @@ change (design D16).
 
 ## 2. Phase 2: handles and channels
 
-- [ ] 2.1 Grant table, rights, derivation, revocation and the exposure check in `rhizo-cap` (D8, D9); verify `cargo test -p rhizo-cap` (properties: no request raises rights; revocation removes the whole derivation subtree; after any sequence of grants every cell's exposure is within its ceiling; control never flows up)
-- [ ] 2.2 Channels: queues, bounds and room reserved at creation (D10); verify `cargo test -p rhizo-cap channels`
+- [x] 2.1 Grant table, rights, derivation, revocation and the exposure check in `rhizo-cap` (D8, D9); verify `cargo test -p rhizo-cap` (properties: no request raises rights; revocation removes the whole derivation subtree; after any sequence of grants every cell's exposure is within its ceiling; control never flows up)
+- [x] 2.2 Channels: queues, bounds and room reserved at creation (D10); verify `cargo test -p rhizo-cap channels`
 - [ ] 2.3 Endpoints as `SOCK_SEQPACKET` descriptors in `rhizo-abi`: read, write, `sendmsg` and `recvmsg` with `SCM_RIGHTS`, poll, epoll, non-blocking mode, wait queues, `EPERM` for other descriptors (D9, D10); verify `cargo test -p rhizo-abi channels`
 - [ ] 2.4 `/run/rhizo` in `rhizo-fs`: `chan/`, `cell/`, `inbox`, read only, `unlink` drops (D9); verify `cargo test -p rhizo-fs rhizo_dir`
-- [ ] 2.4a Accelerator handles as plain data in `rhizo-cap`: rights `infer`, `compute` and `stats`, narrowing by derivation (rights, models, budget), the budgets of `add-accelerators` D5 carved and admitted, the exposure check, no inheritance by copies (D24); verify `cargo test -p rhizo-cap accelerators` (properties: a derived handle never exceeds its source; budgets never go negative). Sessions and the broker come with `add-accelerators`
+- [x] 2.4a Accelerator handles as plain data in `rhizo-cap`: rights `infer`, `compute` and `stats`, narrowing by derivation (rights, models, budget), the budgets of `add-accelerators` D5 carved and admitted, the exposure check, no inheritance by copies (D24); verify `cargo test -p rhizo-cap accelerators` (properties: a derived handle never exceeds its source; budgets never go negative). Sessions and the broker come with `add-accelerators`
 - [ ] 2.5 Cell handles: observe stream, input, message (inbox), control (D9); verify the in-kernel `cell_handles` on both architectures
 - [ ] 2.6 Forks and snapshots with handles: format version 12 with its upgrade step from 11, keys, parked endpoints, subtree bundles, labels bound at load (D13); verify `cargo test -p rhizo-snapshot handles` and the in-kernel `handles_across_suspend_and_fork` on both architectures
 - [ ] 2.7 Host grants: `grant`, `revoke`, `grants`, `load --bind`; verify `cargo test -p rhizo-control` and the `control` test step
