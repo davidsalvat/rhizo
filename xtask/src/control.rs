@@ -2185,7 +2185,14 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             refused(&["save", "99999", &path(&cell_file)])?;
             ok(&["down"])?;
             up()?;
-            let out = ok(&["load", &path(&template_file), "--template"])?;
+            let template_path = path(&template_file);
+            // A loaded file holds no authority (spec `snapshots`): the host
+            // gives it its egress, which carves the model endpoint out of
+            // the new VM's deny floor.
+            let model_egress = ["--egress", "model", "--llm", llm.as_str()];
+            let mut words = vec!["load", &template_path, "--template"];
+            words.extend(model_egress);
+            let out = ok(&words)?;
             let loaded = out
                 .split_once(" as template ")
                 .and_then(|(_, rest)| rest.split(' ').next())
@@ -2232,7 +2239,10 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             for copy in &copies {
                 answer(copy, "")?;
             }
-            let out = ok(&["load", &path(&cell_file)])?;
+            let cell_path = path(&cell_file);
+            let mut words = vec!["load", cell_path.as_str()];
+            words.extend(model_egress);
+            let out = ok(&words)?;
             let resumed = out
                 .split_once(" as suspended cell ")
                 .and_then(|(_, rest)| rest.split(' ').next())
