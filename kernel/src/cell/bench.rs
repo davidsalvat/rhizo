@@ -64,14 +64,23 @@ pub fn bench(console: &mut impl Console) {
         let (one, four, shootdown) = parallel_threads();
         let timer_error = timer_error();
         let (stall, stall_stopped) = host_op_stall();
+        let sets = parallel_sets();
         let _ = writeln!(
             rhizo_hal::ConsoleWriter(console),
             "rhizo-smp cpus={} serial_ns={serial} parallel_ns={parallel} ipi_wake_ns={wake} \
              threads1_ns={one} threads4_ns={four} shootdown_ns={shootdown} \
              timer_error_ns={timer_error} syscalls_serial_ns={calls_serial} \
              syscalls_parallel_ns={calls_parallel} host_op_stall_ns={stall} \
-             host_op_stall_stopped_ns={stall_stopped}",
+             host_op_stall_stopped_ns={stall_stopped} parallel_sets_ns={sets}",
             crate::smp::count()
+        );
+        // A timing channel between two domains (design D12 of
+        // `add-cell-hierarchy`): reported, never gated.
+        let (period, bits, errors, sets_errors) = covert();
+        let _ = writeln!(
+            rhizo_hal::ConsoleWriter(console),
+            "rhizo-covert period_ns={period} bits={bits} errors={errors} \
+             sets_errors={sets_errors}"
         );
         return; // the other metrics are measured with one CPU
     }

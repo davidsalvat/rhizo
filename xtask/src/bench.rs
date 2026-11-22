@@ -26,6 +26,11 @@ const DETERMINISTIC: [&str; 4] = [
 /// Metrics for which higher is better (every other metric: lower is).
 const HIGHER_IS_BETTER: [&str; 3] = ["density.cells", "density.ops_per_s", "density.oom_cells"];
 
+/// Metrics reported and never gated, whatever the baseline holds: the
+/// bandwidth of a timing channel between domains is a figure to publish,
+/// not a speed (spec `benchmarks`, containment metrics).
+const REPORTED_ONLY: [&str; 1] = ["covert."];
+
 /// A reference workload measured alone (`--workload`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Only {
@@ -860,6 +865,8 @@ fn measure_cells(
             (Vec::new(), Vec::new(), Vec::new());
         let mut syscall_scaling = Vec::new();
         let (mut host_op_stall, mut host_op_stall_stopped) = (Vec::new(), Vec::new());
+        let mut parallel_sets = Vec::new();
+        let (mut covert, mut covert_sets) = (Vec::new(), Vec::new());
         for _ in 0..opts.runs.clamp(1, 3) {
             let smp = RunOptions {
                 cpus: crate::SMP_CPUS,
@@ -880,6 +887,13 @@ fn measure_cells(
                     timer_error.push(s.timer_error_ns as f64 / 1000.0);
                     host_op_stall.push(s.host_op_stall_ns as f64 / 1000.0);
                     host_op_stall_stopped.push(s.host_op_stall_stopped_ns as f64 / 1000.0);
+                    parallel_sets.push(s.parallel_sets_ns as f64 / cells / 1000.0);
+                    if let Some(c) = parse_covert_line(&out.output) {
+                        covert.push(c.bps(c.errors));
+                        if s.cpus >= 4 {
+                            covert_sets.push(c.bps(c.sets_errors));
+                        }
+                    }
                     if s.syscalls_serial_ns > 0 {
                         syscall_scaling.push(
                             100.0 * s.syscalls_parallel_ns as f64 * s.cpus as f64
@@ -942,6 +956,9 @@ fn measure_cells(
             ("cell.thread_create_us", "us", &mut thread_create),
             ("cell.futex_wake_ns", "ns", &mut futex_wake),
             ("cell.parallel_us", "us", &mut parallel),
+            ("cell.parallel_sets_us", "us", &mut parallel_sets),
+            ("covert.cpu_bps", "bps", &mut covert),
+            ("covert.cpu_sets_bps", "bps", &mut covert_sets),
             ("cell.scaling_pct", "%", &mut scaling),
             ("cell.ipi_wake_us", "us", &mut ipi_wake),
             ("cell.thread_scaling_pct", "%", &mut thread_scaling),
@@ -1318,6 +1335,41 @@ struct SmpLine {
     /// D6 of `host-ops-per-cell`).
     host_op_stall_ns: u64,
     host_op_stall_stopped_ns: u64,
+    /// The `spin` batch with exclusive CPU sets (design D17 of
+    /// `add-cell-hierarchy`).
+    parallel_sets_ns: u64,
+}
+
+/// The CPU-contention channel between two domains of a `bench-cell`
+/// kernel booted with several CPUs (design D12 of `add-cell-hierarchy`):
+/// bits of `period_ns` each, and the receiver's errors on a shared CPU and
+/// with an exclusive set each.
+#[derive(Debug, PartialEq, Eq)]
+struct CovertLine {
+    period_ns: u64,
+    bits: u64,
+    errors: u64,
+    sets_errors: u64,
+}
+
+impl CovertLine {
+    /// The channel's capacity in bits per second with `errors` wrong bits:
+    /// a binary symmetric channel's, `1 - H(p)` bits per period.
+    fn bps(&self, errors: u64) -> f64 {
+        let p = errors as f64 / self.bits.max(1) as f64;
+        let h = |x: f64| if x <= 0.0 { 0.0 } else { -x * x.log2() };
+        (1.0 - h(p) - h(1.0 - p)) * 1e9 / self.period_ns.max(1) as f64
+    }
+}
+
+fn parse_covert_line(output: &str) -> Option<CovertLine> {
+    let field = |key| crate::profile::field(output, "rhizo-covert", key);
+    Some(CovertLine {
+        period_ns: field("period_ns")?,
+        bits: field("bits")?,
+        errors: field("errors")?,
+        sets_errors: field("sets_errors")?,
+    })
 }
 
 fn parse_smp_line(output: &str) -> Option<SmpLine> {
@@ -1341,6 +1393,7 @@ fn parse_smp_line(output: &str) -> Option<SmpLine> {
         syscalls_parallel_ns: field("syscalls_parallel_ns")?,
         host_op_stall_ns: field("host_op_stall_ns")?,
         host_op_stall_stopped_ns: field("host_op_stall_stopped_ns")?,
+        parallel_sets_ns: field("parallel_sets_ns")?,
     })
 }
 
@@ -1658,6 +1711,9 @@ fn load_baseline() -> Result<Value> {
 /// runners, whose hosts run at different TSC frequencies); an entry ending
 /// in `.` covers every metric it starts (`breakdown.`).
 fn is_gated(baseline: &Value, env: &str, metric: &str) -> bool {
+    if REPORTED_ONLY.iter().any(|p| metric.starts_with(p)) {
+        return false;
+    }
     !baseline["ungated"][env].as_array().is_some_and(|names| {
         names
             .iter()
@@ -3514,7 +3570,7 @@ mod tests {
                 "cpus: 4 online\nrhizo-smp cpus=4 serial_ns=800 parallel_ns=220 ipi_wake_ns=9000 \
                  threads1_ns=400 threads4_ns=110 shootdown_ns=3000 timer_error_ns=40000 \
                  syscalls_serial_ns=900 syscalls_parallel_ns=250 host_op_stall_ns=20000 \
-                 host_op_stall_stopped_ns=900000\n"
+                 host_op_stall_stopped_ns=900000 parallel_sets_ns=240\n"
             ),
             Some(SmpLine {
                 cpus: 4,
@@ -3529,9 +3585,30 @@ mod tests {
                 syscalls_parallel_ns: 250,
                 host_op_stall_ns: 20000,
                 host_op_stall_stopped_ns: 900000,
+                parallel_sets_ns: 240,
             })
         );
         assert_eq!(parse_smp_line("rhizo-smp cpus=4 serial_ns=1\n"), None);
+    }
+
+    #[test]
+    fn covert_line_gives_capacities() {
+        let c =
+            parse_covert_line("rhizo-covert period_ns=20000000 bits=100 errors=0 sets_errors=50\n")
+                .expect("parsed");
+        assert_eq!(c.bps(c.errors), 50.0, "every bit right: one per period");
+        assert_eq!(c.bps(c.sets_errors), 0.0, "a coin toss carries nothing");
+        assert_eq!(c.bps(100), 50.0, "every bit inverted carries as much");
+        let tenth = c.bps(10);
+        assert!(tenth > 26.0 && tenth < 27.0, "{tenth}");
+        assert_eq!(parse_covert_line("rhizo-covert period_ns=1\n"), None);
+    }
+
+    #[test]
+    fn covert_figures_are_never_gated() {
+        let baseline = json!({"ungated": {}});
+        assert!(!is_gated(&baseline, "ci", "covert.cpu_bps"));
+        assert!(is_gated(&baseline, "ci", "cell.parallel_sets_us"));
     }
 
     #[test]

@@ -815,13 +815,22 @@ impl Snapshot {
     /// (spec `isolation`, design D4 of `snapshots-on-disk`).
     pub fn cap_quota(&mut self, most: Quota) {
         let q = self.state().quota;
+        self.set_quota(Quota {
+            memory: q.memory.min(most.memory),
+            cpu_ns: q.cpu_ns.min(most.cpu_ns),
+            files: q.files.min(most.files),
+            sockets: q.sockets.min(most.sockets),
+        });
+    }
+
+    /// Sets the cell's quotas to `q`: a snapshot from outside that the host
+    /// places under a parent gets the limits of its placement, never those
+    /// its bytes claim (design D13 of `add-cell-hierarchy`).
+    pub fn set_quota(&mut self, q: Quota) {
         let words = [
-            (4, q.memory.min(most.memory)),
-            (5, q.cpu_ns.min(most.cpu_ns)),
-            (
-                7,
-                q.files.min(most.files) as u64 | (q.sockets.min(most.sockets) as u64) << 32,
-            ),
+            (4, q.memory),
+            (5, q.cpu_ns),
+            (7, q.files as u64 | (q.sockets as u64) << 32),
         ];
         for (i, v) in words {
             let at = HEADER + i * 8;

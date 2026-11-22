@@ -19,6 +19,17 @@ pub trait Frames {
     /// 512 contiguous frames aligned to 2 MiB (contents undefined), with one
     /// reference.
     fn alloc_large(&mut self) -> Option<u64>;
+    /// [`alloc`](Self::alloc) for a cell whose memory limit set the frame
+    /// aside (design D4 of `add-cell-hierarchy`): an allocator that keeps
+    /// a reserve of its own may serve it from that reserve, since the
+    /// frame is the cell's whatever the kernel itself took meanwhile.
+    fn alloc_set_aside(&mut self) -> Option<u64> {
+        self.alloc()
+    }
+    /// [`alloc_large`](Self::alloc_large), as [`alloc_set_aside`](Self::alloc_set_aside).
+    fn alloc_large_set_aside(&mut self) -> Option<u64> {
+        self.alloc_large()
+    }
     /// Drops one reference to a page obtained from `alloc` (`Small`) or
     /// `alloc_large` (`Large`); the page is freed with the last one.
     fn free(&mut self, phys: u64, size: PageSize);
@@ -32,6 +43,14 @@ pub trait Frames {
     /// cell a copy when it fails (finding S14 of `docs/security.md`).
     fn try_share(&mut self, phys: u64) -> bool {
         self.share(phys);
+        true
+    }
+    /// [`free`](Self::free), and whether the reference given back was
+    /// counted for whoever these frames are for: not one to a frame the
+    /// kernel keeps for itself, which nobody was charged for (a page of
+    /// its page cache, mapped by a cell).
+    fn release(&mut self, phys: u64, size: PageSize) -> bool {
+        self.free(phys, size);
         true
     }
     /// The frames counted against a quota and the quota's limit, in

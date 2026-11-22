@@ -20,12 +20,15 @@ trip over it and exited, as robust cell figures.
 ### Requirement: Containment metrics
 `cargo xtask bench` SHALL report `net.egress_check_insns` (one egress
 check against 16 rules), `net.tcp_rtt_us` with such a policy next to the
-figure without, and `covert.cpu_bps` (a CPU-contention channel between
-two domains) with and without exclusive CPU sets, reported and not gated.
+figure without (`net.tcp_rtt_rules_us`), `covert.cpu_bps` (a
+CPU-contention channel between two domains on one CPU) and
+`covert.cpu_sets_bps` (the same with an exclusive CPU set each), reported
+and never gated, and `cell.parallel_us` with exclusive CPU sets next to
+the figure without (`cell.parallel_sets_us`).
 
 #### Scenario: Metrics present
 - **WHEN** `cargo xtask bench` runs a `bench-cell` kernel with 4 vCPUs
-- **THEN** the results contain `net.egress_check_insns` and both `covert.cpu_bps` figures, and the gated metrics of system calls, switches, forks and loopback are within their thresholds
+- **THEN** the results contain `net.egress_check_insns`, `covert.cpu_bps`, `covert.cpu_sets_bps` and `cell.parallel_sets_us`, and the gated metrics of system calls, switches, forks and loopback are within their thresholds
 
 ### Requirement: Fairness metrics
 `cargo xtask bench` SHALL report `sched.domain_share_pct`, the CPU share

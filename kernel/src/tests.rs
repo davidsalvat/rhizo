@@ -25,6 +25,7 @@ use rhizo_mm::paging::PageFlags;
 
 mod boot;
 mod cells;
+mod collusion;
 mod cpython;
 mod density;
 mod dynamic;
@@ -73,6 +74,7 @@ const AREAS: &[&[TestCase]] = &[
     quotas::ALL,
     leaks::ALL,
     hierarchy::ALL,
+    collusion::ALL,
     sharing::ALL,
     shares::ALL,
     micropython::ALL,

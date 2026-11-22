@@ -354,6 +354,7 @@ pub(crate) fn recvmsg_rights<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S:
     flags: u64,
 ) -> Option<i64> {
     let h = cx.fs.socket(fd as u32).ok()?;
+    let reserved = cx.reserved();
     let got = {
         let hs = cx.net.handles()?;
         if !is_packet(hs.net, h) {
@@ -396,7 +397,7 @@ pub(crate) fn recvmsg_rights<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S:
                     let counted = mine
                         && fds.len() < room
                         && cx.frames.charge(bytes)
-                        && (cx.services.can_store(bytes) || {
+                        && (reserved || cx.services.can_store(bytes) || {
                             cx.frames.credit(bytes);
                             false
                         });

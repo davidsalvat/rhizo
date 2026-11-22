@@ -43,16 +43,19 @@ impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
             Share::OutOfMemory if drop_images() => share(),
             shared => shared,
         };
-        let (phys, fresh) = match shared {
-            Share::Kept(phys, fresh) => (phys, fresh),
+        let (phys, fresh, kept) = match shared {
+            Share::Kept(phys, fresh) => (phys, fresh, true),
             // Not kept (no room, or a count that is full), or no frame the
             // cache may take (none that a reservation does not hold, design
             // D4 of `add-cell-hierarchy`): a copy from the cell's frames,
             // counted in its quota.
-            Share::Own | Share::OutOfMemory => (own_copy(page, mem, frames)?, true),
+            Share::Own | Share::OutOfMemory => (own_copy(page, mem, frames)?, true, false),
         };
         if fresh {
             <Self as FilePages<DirectMap, A>>::code(self, phys);
+        }
+        if fresh && kept {
+            super::frames::keep(phys);
         }
         Some(phys)
     }
@@ -86,6 +89,7 @@ pub(super) fn publish_files(fs: &mut Fs) -> Vec<rhizo_fs::Page> {
             };
             if fresh {
                 user::sync_code(DirectMap::virt(phys), FRAME_SIZE);
+                super::frames::keep(phys);
             }
             pinned.push(page);
         }

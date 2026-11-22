@@ -25,7 +25,7 @@ pub(super) const ALL: &[TestCase] = &[
 ];
 
 /// `ADDR:PORT` of `at`.
-fn endpoint((ip, port): ([u8; 4], u16)) -> alloc::string::String {
+pub(super) fn endpoint((ip, port): ([u8; 4], u16)) -> alloc::string::String {
     alloc::format!("{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3])
 }
 

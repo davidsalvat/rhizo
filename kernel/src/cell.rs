@@ -145,6 +145,7 @@ static MAX_TAG: AtomicU16 = AtomicU16::new(0);
 /// many CPUs are online. Call once, before any [`Host`].
 pub fn init(smp: Option<u16>) -> usize {
     crate::heap::window::init();
+    frames::init_refs();
     let (generator, strong) =
         random::seeded(&mut crate::arch::random::HardwareEntropy, Counter.cycles());
     RANDOM.with(|g| *g = Batched::new(generator));

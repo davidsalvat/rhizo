@@ -523,11 +523,29 @@ impl<F, M, T, A: Frames, S: Services> Context<'_, F, M, T, A, S> {
         if !self.frames.charge(bytes) {
             return false;
         }
-        if self.services.can_store(bytes) {
+        if self.has_counted(bytes) {
             return true;
         }
         self.frames.credit(bytes);
         false
+    }
+
+    /// Whether the kernel has `bytes` for what the cell's memory counts
+    /// already: a cell with a memory limit has them, set aside within its
+    /// limit (design D4 of `add-cell-hierarchy`), whatever other domains
+    /// took; only a cell without one asks the kernel. Asking for a reserved
+    /// cell too let cells of other domains, by exhausting the memory no
+    /// reservation holds, make its file names, file data, sockets and
+    /// threads fail (finding S30 in `docs/security.md`).
+    fn has_counted(&mut self, bytes: u64) -> bool {
+        self.reserved() || self.services.can_store(bytes)
+    }
+
+    /// Whether the cell has a memory limit, so is in a reserved domain.
+    fn reserved(&self) -> bool {
+        self.frames
+            .metered()
+            .is_some_and(|(_, limit)| limit < Quota::NONE.frames())
     }
 
     /// Whether the kernel has `bytes` more memory for the cell's pages:
@@ -864,10 +882,7 @@ impl Abi {
     ) -> i64 {
         // A cell with a memory limit is in a reserved domain, whose sockets
         // were admitted (design D4 of `add-cell-hierarchy`).
-        let reserved = cx
-            .frames
-            .metered()
-            .is_some_and(|(_, limit)| limit < Quota::NONE.frames());
+        let reserved = cx.reserved();
         let ports = Ports {
             next: self.next_port,
             reserved,

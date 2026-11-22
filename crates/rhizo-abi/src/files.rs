@@ -166,7 +166,7 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services
         };
         let before = cx.held();
         let room = match most {
-            0 => cx.services.can_store(n as u64),
+            0 => cx.has_counted(n as u64),
             _ => cx.store(most),
         };
         if !room {

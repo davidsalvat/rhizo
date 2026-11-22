@@ -168,3 +168,114 @@ pub(super) fn parallel_threads() -> (u64, u64, u64) {
     let shootdown = run(&[b"shootdown", b"bench", b"200"]);
     (one, four, shootdown)
 }
+
+/// With exclusive CPU sets (design D17 of `add-cell-hierarchy`): the
+/// batch of [`multi_core`] (four `spin 5` cells per CPU) on every CPU, the
+/// cells of each CPU from 2 on in a domain of their own with that CPU as
+/// its exclusive set (a root and three copies of it, roots of its domain),
+/// the others on CPUs 0 and 1; median over 3 rounds.
+pub(super) fn parallel_sets() -> u64 {
+    const ROUNDS: usize = 3;
+    let image = test_image("spin");
+    let argv: [&[u8]; 2] = [b"spin", b"5"];
+    let cpus = crate::smp::count();
+    let mut t: Vec<u64> = (0..ROUNDS)
+        .map(|_| {
+            let mut host = Host::new();
+            let mut ids = Vec::new();
+            for cpu in 2..cpus {
+                let root = host.spawn(image, &argv, false, false).expect("spawn");
+                let set = rhizo_cap::Spec {
+                    cpus: 1 << cpu,
+                    ..rhizo_cap::Spec::default()
+                };
+                host.place(root, rhizo_cap::HOST, set, 0).expect("its set");
+                ids.extend(host.fork(root, 3).expect("copies"));
+                ids.push(root);
+            }
+            while ids.len() < 4 * cpus {
+                ids.push(host.spawn(image, &argv, false, false).expect("spawn"));
+            }
+            let t0 = bench_clock();
+            host.run(|_| false);
+            let t1 = bench_clock();
+            for id in ids {
+                assert_eq!(host.finished(id).map(|f| f.ending), Some(Ending::Exit(0)));
+            }
+            bench_ns(t1 - t0).unwrap_or(0)
+        })
+        .collect();
+    t.sort_unstable();
+    t[ROUNDS / 2]
+}
+
+/// Period of one bit of the CPU-contention channel: four slices (a
+/// sender woken at the start of a period may wait a slice for the CPU).
+const COVERT_PERIOD_NS: u64 = 4 * rhizo_sched::SLICE_NS;
+/// Bits sent over it.
+const COVERT_BITS: u64 = 100;
+
+/// A CPU-contention channel between two domains (design D12 and D17 of
+/// `add-cell-hierarchy`, `covert.cpu_bps`): `colluder bits` spins through
+/// a period for a 1 and sleeps through it for a 0, `colluder count` counts
+/// its loops in each period and decodes; each a root of its own domain.
+/// On the boot CPU alone (both share it), then with an exclusive set of one
+/// CPU each (CPUs 2 and 3). Returns the period, the bits, and the
+/// receiver's errors without and with sets (0 with sets on fewer than
+/// four CPUs, where two sets of one CPU do not fit).
+pub(super) fn covert() -> (u64, u64, u64, u64) {
+    let image = test_image("colluder");
+    let round = |sets: bool| -> u64 {
+        let mut host = Host::new();
+        let start = alloc::format!("{}", now_ns() + 100_000_000);
+        let period = alloc::format!("{COVERT_PERIOD_NS}");
+        let bits = alloc::format!("{COVERT_BITS}");
+        let args = |mode: &'static [u8]| -> [&[u8]; 5] {
+            [
+                b"colluder",
+                mode,
+                start.as_bytes(),
+                period.as_bytes(),
+                bits.as_bytes(),
+            ]
+        };
+        let sender = host
+            .spawn(image, &args(b"bits"), false, false)
+            .expect("spawn");
+        let receiver = host
+            .spawn(image, &args(b"count"), true, false)
+            .expect("spawn");
+        let done = |h: &Host| h.finished(sender).is_some() && h.finished(receiver).is_some();
+        if sets {
+            for (cell, cpu) in [(sender, 2), (receiver, 3)] {
+                let set = rhizo_cap::Spec {
+                    cpus: 1 << cpu,
+                    ..rhizo_cap::Spec::default()
+                };
+                host.place(cell, rhizo_cap::HOST, set, 0).expect("its set");
+            }
+            // A run may give back the CPUs while both sleep to their start.
+            while !done(&host) {
+                host.run(|h| done(h));
+            }
+        } else {
+            while !done(&host) {
+                host.step();
+            }
+        }
+        let out = &host.finished(receiver).expect("ended").output;
+        let text = core::str::from_utf8(out).unwrap_or("");
+        text.trim_end()
+            .rsplit('=')
+            .next()
+            .and_then(|e| e.parse().ok())
+            .unwrap_or_else(|| panic!("covert receiver said {text:?}"))
+    };
+    let shared = round(false);
+    let sets = if crate::smp::count() >= 4 {
+        round(true)
+    } else {
+        0
+    };
+    (COVERT_PERIOD_NS, COVERT_BITS, shared, sets)
+}
