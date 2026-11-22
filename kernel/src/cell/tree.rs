@@ -74,17 +74,26 @@ impl Host {
         } else {
             &many[..]
         };
-        let parent = self.tree.get(source).map_or(0, |n| n.parent());
-        let used = self.usage(parent);
         let mut placed = |k: usize, pid, domain| {
             if let Some(copy) = copies.get_mut(k) {
                 (copy.cell.pid, copy.cell.domain) = (pid, domain);
             }
         };
-        let entered = self
-            .tree
-            .add_copies(source, ids, &|_| used, &mut placed)
-            .is_ok();
+        self.add_copies(source, ids, &mut placed)
+    }
+
+    /// Adds `ids` to the tree as copies of cell `source`, telling `placed`
+    /// each one's number and domain: all, or none and `false`.
+    #[inline(never)]
+    fn add_copies(
+        &mut self,
+        source: u32,
+        ids: &[u32],
+        placed: &mut dyn FnMut(usize, u32, u32),
+    ) -> bool {
+        let parent = self.tree.get(source).map_or(0, |n| n.parent());
+        let used = self.usage(parent);
+        let entered = self.tree.add_copies(source, ids, &|_| used, placed).is_ok();
         if entered {
             self.reshare_if_by_weight();
         }
@@ -124,16 +133,14 @@ impl Host {
         // A snapshot of a cell this host still holds (a template's) makes a
         // copy of it: a sibling in its domain (design D13).
         if origin != 0 && self.tree.get(origin).is_some() {
-            let parent = self.tree.get(origin).map_or(0, |n| n.parent());
-            let used = self.usage(parent);
-            let mut placed = |_, pid, domain| (cell.pid, cell.domain) = (pid, domain);
-            let entered = self
-                .tree
-                .add_copies(origin, &[cell.id], &|_| used, &mut placed);
-            if entered.is_ok() {
-                self.reshare_if_by_weight();
-            }
-            return entered.is_ok();
+            // Not `cell` itself in the closure: its address would escape,
+            // and every resume would copy all of it to pass it on.
+            let mut at = (0, 0);
+            let entered = self.add_copies(origin, &[cell.id], &mut |_, pid, domain| {
+                at = (pid, domain);
+            });
+            (cell.pid, cell.domain) = at;
+            return entered;
         }
         let Ok(spec) = snapshot.placed(&Egress::None, &Egress::None, root_limits(&cell.quota))
         else {
