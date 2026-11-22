@@ -300,6 +300,15 @@ another domain. A write SHALL make the writer's file private.
 - **WHEN** cells of two domains map the same published library, and one of them maps it again after the other ended
 - **THEN** both map one frame per page, and every map is a hit
 
+### Requirement: Published pages give way to cells
+Short of memory, the published pages no cell maps SHALL give way, as
+executables kept loaded do. A domain that maps one later SHALL keep its
+own copy, never one filled for every domain on demand.
+
+#### Scenario: Short of memory
+- **WHEN** a cell needs frames that only published pages no cell maps hold
+- **THEN** those pages give way and the cell gets its frames, while the published pages a cell maps stay
+
 ### Requirement: Copy generation
 Each cell SHALL have a 64-bit copy generation, readable in
 `/run/rhizo/generation` (8 bytes, little endian), that changes in every

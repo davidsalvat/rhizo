@@ -1544,6 +1544,13 @@ Alternatives:
   distribution set (`python3` and its libraries, about 16 MiB of ELF
   files) is a fixture, kept per domain; published, it held a quarter of a
   128 MiB test VM for good and ran cells in parallel out of memory.
+  Short of frames, the published pages no cell maps give way with the
+  kept executables and domains' pages (`drop_images`): pinned for good,
+  Node.js's 110 MiB left a fork of a Node.js cell resumed from bytes
+  within a few MiB of the reserve in a 1 GiB VM, and a fork that ran out
+  then lost pages (now refused instead: a lazy resume that cannot finish
+  keeps its pages pending). A domain that maps a page that gave way keeps
+  its own copy, as for any page not published.
 - **A dropped template that was published** keeps its tables while any
   table or page of them is shared with another cell, except pages a cache
   of the kernel holds (whose counts never fall to one); it goes when the

@@ -215,12 +215,28 @@ impl PageCache {
     /// Drops every page whose dropping frees memory: those no mapping
     /// uses, and those no file holds any more. A page a cell maps from a
     /// file stays, so memory pressure from one cell never drops the pages
-    /// another uses, and a pinned public page stays. Returns whether one
-    /// was dropped.
+    /// another uses. Public pages no cell maps go too, published or not
+    /// (design D21 of `add-cell-hierarchy`): a domain that maps one later
+    /// keeps its own. Returns whether one was dropped.
     pub fn trim(&mut self, frames: &mut impl Frames) -> bool {
-        self.drop_unless(frames, |_, page, phys, frames| {
+        let dropped = self.drop_unless(frames, |_, page, phys, frames| {
             page.is_held_elsewhere() && frames.is_shared(phys)
-        })
+        });
+        let before = self.public.len();
+        let owners = &mut self.public_frames;
+        self.public.retain(|_, kept| {
+            let mapped = frames.is_shared(kept.phys);
+            if !mapped {
+                frames.free(kept.phys, PageSize::Small);
+                owners.remove(&kept.phys);
+            }
+            mapped
+        });
+        if self.public.is_empty() {
+            // Gives back their last nodes, as `drop_from` does.
+            (self.public, self.public_frames) = Default::default();
+        }
+        dropped || self.public.len() < before
     }
 
     /// Room for one more page of `scope`: drops that domain's pages no
@@ -538,7 +554,8 @@ mod tests {
 
     /// Design D21 of `add-cell-hierarchy`: the same bytes mapped in two
     /// domains take one frame per domain; a public page that was published
-    /// takes one frame for all, pinned until withdrawn; a public page never
+    /// takes one frame for all, kept until withdrawn or, short of memory,
+    /// until no cell maps it; a public page never
     /// published is kept per domain; and one domain's full part leaves the
     /// others' alone.
     #[test]
@@ -609,17 +626,27 @@ mod tests {
         };
         mapped.push(fourth);
 
-        // Unmapped and trimmed, the published page stays until withdrawn.
+        // Trimmed (short of memory), the published page stays while a cell
+        // maps it, and gives way once none does, pinned or not: a domain
+        // that maps it later fills its own, never a public one.
+        let last = mapped.remove(0);
         for phys in mapped {
             frames.free(phys, PageSize::Small);
         }
         drop((one, two));
         assert!(cache.trim(&mut frames));
-        assert_eq!(cache.len(), 1, "only the pinned page");
-        let again = cache.share(&page(&set, libc, 0), 7, &mut mem, &mut frames);
-        assert_eq!(again, Share::Kept(lib, false));
-        frames.free(lib, PageSize::Small);
-        cache.withdraw(&page(&set, libc, 0));
+        assert_eq!(cache.len(), 1, "only the mapped published page");
+        assert!(cache.is_public(lib));
+        frames.free(last, PageSize::Small);
+        assert!(cache.trim(&mut frames) && cache.is_empty());
+        assert!(!cache.is_public(lib) && !cache.holds(lib));
+        let Share::Kept(own, true) = cache.share(&page(&set, libc, 0), 7, &mut mem, &mut frames)
+        else {
+            panic!("filled for domain 7");
+        };
+        assert!(!cache.is_public(own) && cache.kept(PUBLIC) == 0);
+        cache.withdraw(&page(&set, libc, 0)); // gone already: nothing to do
+        frames.free(own, PageSize::Small);
         assert!(cache.trim(&mut frames) && cache.is_empty());
         assert_eq!(frames.outstanding(), 0);
     }
