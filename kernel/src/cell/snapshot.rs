@@ -225,9 +225,9 @@ impl Host {
         let mut children = Vec::with_capacity(n);
         for _ in 0..n {
             let Some(child) = self.child_of(
-                &parent.cell,
-                &parent.fs,
-                &parent.demand.wx,
+                parent.cell.clone(),
+                parent.fs.clone(),
+                parent.demand.wx.clone(),
                 parent.output.is_some(),
                 parent.echo,
             ) else {
@@ -287,9 +287,9 @@ impl Host {
     /// ranges read as zero, the only work done for cells that have some.
     fn child_of(
         &mut self,
-        cell: &Cell,
-        fs: &Fs,
-        wx: &WxRanges,
+        cell: Cell,
+        fs: Fs,
+        wx: WxRanges,
         capture: bool,
         echo: bool,
     ) -> Option<Box<Live>> {
@@ -303,12 +303,13 @@ impl Host {
             root: child.root(),
             cpu_ns: 0,
             generation: cell.generation + 1,
-            ..cell.clone()
+            ..cell
         };
         let mut live = self.new_live(cell, capture, echo, fork_files(fs, id), 1); // its root
         live.shares = true;
-        live.demand.wx = wx.clone();
-        if !wx.wiped().is_empty() && !wipe_copy(&live) {
+        let wiped = !wx.wiped().is_empty();
+        live.demand.wx = wx;
+        if wiped && !wipe_copy(&live) {
             self.discard(&live);
             return None;
         }
@@ -472,7 +473,7 @@ impl Host {
         }
         let (cell, fs, wx) = &self.templates[index];
         let (cell, fs, wx) = (cell.clone(), fs.clone(), wx.clone());
-        let mut child = self.child_of(&cell, &fs, &wx, capture, echo)?;
+        let mut child = self.child_of(cell, fs, wx, capture, echo)?;
         child.expire_timers();
         let mut copies = [child];
         if !self.enter_copies(id, &mut copies) {
