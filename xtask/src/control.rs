@@ -1835,7 +1835,9 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         )?;
         ok(&["freeze", &held])?;
         refused_with(&["publish", &other], "not a template")?;
-        let domain = || detached(&["--mem", "64M", "--sockets", "2", "--cells", "4"]);
+        // Reserved roots the machine holds together (design D4: admitted
+        // against its memory, with the agent).
+        let domain = || detached(&["--mem", "32M", "--sockets", "2", "--cells", "4"]);
         let (a, b, c) = (domain()?, domain()?, domain()?);
         // Memory one copy placed under `parent` takes, in MiB.
         let copy_under = |parent: &str| -> Result<(String, f64)> {

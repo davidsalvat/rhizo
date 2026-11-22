@@ -318,7 +318,13 @@ they run (weights and caps), are in D23. Accelerator budgets are in D24.
   it costs a comparison per meter change, and an atomic addition only
   when a meter with a limit changes. Suspended cells and templates hold no
   frames aside: a suspended reserved cell is admitted again when it is
-  resumed, a copy of a reserved root when it is made.
+  resumed, a copy of a reserved root when it is made. Checks made before
+  taking frames for a cell (`can_map` in `rhizo-abi`, `may_take` for its
+  stack, write-or-execute pages and private copies before a move) count
+  what its limit leaves as its own. Copy-on-write copies stay outside the
+  meter (design D1 of `add-cell-quotas`), so they do not come out of a
+  reservation: under memory pressure a reserved fork's first write to a
+  shared page can still be refused, left for a later task.
 - **Admission.** `Tree::reserved_roots` (`rhizo-cap`) sums what the roots
   with a memory limit reserve (`Limits::reservation`: memory, sockets and
   one cell with its descendant limit; an unlimited socket or descendant

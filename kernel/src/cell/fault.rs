@@ -94,7 +94,7 @@ fn wx_page_in(
         return true;
     }
     let (mem, frames) = (&mut DirectMap, &mut cell_frames(meter));
-    cells_may_take(FRAME_SIZE) && space::back_wx(pt, mem, &mut CpuTlb, frames, wx, addr)
+    may_take(meter, FRAME_SIZE) && space::back_wx(pt, mem, &mut CpuTlb, frames, wx, addr)
 }
 
 /// The instruction at `pc` in the cell with tables `pt`, if it is mapped
@@ -109,7 +109,11 @@ pub(super) fn instruction(pt: &PageTable<Format>, pc: u64) -> Option<u32> {
 /// of `add-cpython`), if memory allows.
 pub(super) fn grow_stack(pt: &PageTable<Format>, frames: &mut impl Frames, addr: u64) -> bool {
     let _p = cost::scope(Part::Fault);
-    cells_may_take(FRAME_SIZE) && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, frames, addr)
+    let room = frames
+        .metered()
+        .is_some_and(|(used, limit)| limit < Quota::NONE.frames() && used < limit);
+    (room || cells_may_take(FRAME_SIZE))
+        && space::grow_stack(pt, &mut DirectMap, &mut CpuTlb, frames, addr)
 }
 
 /// Resolves a write refused because the page is shared (copy-on-write).
@@ -148,7 +152,7 @@ pub(super) fn back_wx(live: &Live, pt: &PageTable<Format>, addr: u64) -> bool {
     let (mem, frames) = (&mut DirectMap, &mut cell_frames(&live.frames));
     let wx = &live.demand.wx;
     wx.contains(addr)
-        && cells_may_take(FRAME_SIZE)
+        && may_take(&live.frames, FRAME_SIZE)
         && sharing(live.shares, || {
             space::back_wx(pt, mem, &mut CpuTlb, frames, wx, addr)
         })
