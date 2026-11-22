@@ -283,11 +283,17 @@ so. `rhizo load <file> [--template]` SHALL send a file and print as
 A control kernel SHALL say hello on its serial line once booted, listen on
 vsock port 1024 of its socket device, and say hello again on each
 connection the host makes there, after which its frames SHALL take that
-connection until it ends.
+connection until it ends. A connection that replaces another between two
+looks of the kernel SHALL be greeted in the same way, and no byte of one
+connection SHALL be read as part of another's frames.
 
 #### Scenario: Second hello
 - **WHEN** the host connects to port 1024 of a booted control kernel's socket device
 - **THEN** it receives a hello on the connection, and its requests sent there are answered there
+
+#### Scenario: A reconnect between two looks
+- **WHEN** the host resets its connection in the middle of a frame and connects again, and the kernel receives the reset, the new connection and its first bytes together
+- **THEN** the new connection has a new number, the old connection's partial frame is dropped, and the new connection's bytes are read only as its own
 
 ### Requirement: Socket device on every VMM
 The host SHALL give a control kernel's VM a socket device on Firecracker
@@ -323,3 +329,60 @@ make the driver read or write outside its buffers.
 #### Scenario: Hostile device
 - **WHEN** the device reports a used buffer shorter than a header, a length beyond the buffer, or a descriptor out of range
 - **THEN** the driver skips or clips it and its buffers keep working
+
+### Requirement: Control channel secret
+A control kernel with a socket device SHALL draw a 256-bit secret at boot
+from its generator seeded from the hardware, and give it only on its
+serial line, before its hello, as the console line `vsock: secret `
+followed by 64 hex digits; never on its command line. Without a hardware
+random source it SHALL not listen on vsock, and its frames SHALL stay on
+the serial line.
+
+#### Scenario: Secret before the hello
+- **WHEN** a control kernel with a socket device boots on a CPU with a hardware random source
+- **THEN** its serial line carries the secret line, then the hello
+
+### Requirement: Authenticated vsock connections
+The control kernel SHALL serve a vsock connection only once its first 32
+bytes are the secret, compared in constant time once all 32 have come.
+Before that it SHALL neither read nor answer the connection's bytes, nor
+send it any frame. Every new connection, after a drop too, SHALL present
+the secret again.
+
+#### Scenario: A stranger's request
+- **WHEN** a connection to port 1024 sends frames, or a wrong secret followed by a power-off request, as its first bytes
+- **THEN** it is reset without receiving a byte, the kernel does not power off, and the host's connection that presents the secret is then greeted and answered
+
+#### Scenario: A split secret
+- **WHEN** a connection sends the secret split over many packets, followed by a frame
+- **THEN** it is served, and the frame is read as its first
+
+#### Scenario: A reconnect after a drop
+- **WHEN** the host's served connection ends and a new connection is made
+- **THEN** the new connection is not served until it presents the secret
+
+### Requirement: Refused vsock connections
+The control kernel SHALL reset a connection whose first 32 bytes are not
+the secret, that has not sent them within 2 seconds, or that has not sent
+them when another peer asks to connect; it SHALL then keep listening, and
+count and report each refusal on its console.
+
+#### Scenario: A slow connection
+- **WHEN** a connection sends part of the secret and nothing more for 2 seconds
+- **THEN** it is reset, the refusal is reported, and a later connection with the secret is served
+
+#### Scenario: A stranger connected first
+- **WHEN** a stranger's connection holds the stream without the secret and the host connects
+- **THEN** the stranger's connection is reset and the host's is served once it presents the secret
+
+### Requirement: The host presents the secret
+The host's tools (`xtask` and `rhizo up`) SHALL read the control kernel's
+secret from its serial line, keep it out of the console text they show or
+store, persist it nowhere, and send it as the first bytes of every vsock
+connection to the kernel, on every VMM; with no secret given they SHALL
+drive the kernel over its serial line. `rhizo up` SHALL keep its state
+directory at mode `0700` and its control socket at mode `0600`.
+
+#### Scenario: Console log
+- **WHEN** `rhizo up` boots a control kernel with a socket device
+- **THEN** its `console.log` holds no secret line, its state directory has mode `0700`, and its requests are answered over the vsock connection
