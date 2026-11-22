@@ -754,6 +754,15 @@ impl Fair {
         self.dirty = true;
     }
 
+    /// The CPU time charged so far to the cell known by `key`, as its
+    /// virtual time times its share: exact for a cell alone in its domain
+    /// (in-kernel tests compare roots by it); for a cell sharing its
+    /// domain, rounded, and moved by its arrivals (see `arrive`).
+    pub fn charged_ns(&self, key: u32) -> Option<u64> {
+        let a = &self.cell(key)?.account;
+        Some(((a.vtime << 32) / u128::from(a.inv)) as u64)
+    }
+
     /// Forgets the cell known by `key` (it ended).
     pub fn forget_cell(&mut self, key: u32) {
         if let Some(at) = self.cell_at(key) {
@@ -1277,6 +1286,44 @@ mod fair_shares {
             let got = run(&mut s, 1_000, &mut 0, |_| SLICE_NS);
             let slices = per_domain(&got, weights.len());
             prop_assert!(within_one_slice(&slices, &weights, 1_000), "{:?}", slices);
+        }
+
+        /// Two busy domains, one cell each, with slices of any length, as a
+        /// host that stops the CPU in the middle of one stretches them (a
+        /// busy host under TCG, a descheduled vCPU), each charged as it
+        /// lasted, and one CPU stepping through the queues of several (as
+        /// `Host::step` does): after every slice, each domain's CPU time is
+        /// within the longest slice yet of its weight's part of the total
+        /// (design D23: within one slice), and is what
+        /// [`Fair::charged_ns`] reads.
+        #[test]
+        fn stretched_slices_stay_within_one_slice(
+            cpus in 1usize..5,
+            weights in (1u32..=10_000, 1u32..=10_000),
+            lens in proptest::collection::vec(1..=20 * SLICE_NS, 1..300),
+        ) {
+            let weights = [weights.0, weights.1];
+            let mut s = Scheduler::fair(cpus);
+            domains(&mut s, &weights, &[1, 1]);
+            let sum = u128::from(weights[0] + weights[1]);
+            let mut used = [0u64; 2];
+            let (mut total, mut longest) = (0u128, 0u128);
+            for &ns in &lens {
+                let key = s.next_oldest(0).expect("both busy");
+                s.charge(0, key, ns, 0);
+                s.requeue(0, key);
+                let d = key as usize / 100;
+                used[d] += ns;
+                prop_assert_eq!(s.shares().charged_ns(key), Some(used[d]));
+                total += u128::from(ns);
+                longest = longest.max(u128::from(ns));
+                for (&got, &w) in used.iter().zip(&weights) {
+                    let off = (u128::from(got) * sum).abs_diff(total * u128::from(w));
+                    prop_assert!(off <= longest * sum,
+                        "weight {} off by {} ns, longest slice {}: {:?}",
+                        w, off / sum, longest, used);
+                }
+            }
         }
 
         /// The cells of one domain share it by their flattened weights,
