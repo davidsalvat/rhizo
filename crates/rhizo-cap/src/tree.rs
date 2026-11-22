@@ -595,8 +595,7 @@ impl Tree {
         let (pid, next_pid) = first_numbers(skip);
         node.pid = pid;
         self.nodes.insert(i, node);
-        self.open(id, next_pid);
-        self.join(id);
+        self.open(id, next_pid, 1);
         Ok(pid)
     }
 
@@ -605,11 +604,10 @@ impl Tree {
         self.domains.binary_search_by_key(&id, |d| d.id)
     }
 
-    /// Opens domain `id`, with no cell yet, numbering from `next_pid`
+    /// Opens domain `id` with `members` cells, numbering from `next_pid`
     /// (room reserved).
-    fn open(&mut self, id: u32, next_pid: u32) {
+    fn open(&mut self, id: u32, next_pid: u32, members: u32) {
         if let Err(at) = self.domain_at(id) {
-            let members = 0;
             self.domains.insert(
                 at,
                 Domain {
@@ -686,8 +684,7 @@ impl Tree {
         let i = self.insert_at(id)?;
         self.nodes.insert(i, node);
         self.link(id, parent);
-        self.join(domain);
-        let pid = self.number(domain, skip);
+        let pid = self.enroll(domain, skip);
         self.node_mut(id).pid = pid;
         Ok(())
     }
@@ -820,9 +817,22 @@ impl Tree {
         n.next_sibling = HOST;
     }
 
+    /// A cell joins domain `domain` and takes its next number there, never
+    /// `skip`: one look in the domains.
+    fn enroll(&mut self, domain: u32, skip: u32) -> u32 {
+        let at = self.domain_at(domain).expect("an open domain");
+        self.domains[at].members += 1;
+        self.next_number(at, skip)
+    }
+
     /// The next number in domain `domain`, never `skip`.
     fn number(&mut self, domain: u32, skip: u32) -> u32 {
         let at = self.domain_at(domain).expect("an open domain");
+        self.next_number(at, skip)
+    }
+
+    /// The next number in the domain at `at`, never `skip`.
+    fn next_number(&mut self, at: usize, skip: u32) -> u32 {
         let d = &mut self.domains[at];
         let mut pid = d.next_pid;
         if pid == skip {
@@ -896,8 +906,7 @@ impl Tree {
             if parent != HOST {
                 self.link(id, parent);
             }
-            self.join(domain);
-            let p = self.number(domain, pid);
+            let p = self.enroll(domain, pid);
             self.node_mut(id).pid = p;
             placed(k, p, domain);
         }
@@ -1083,7 +1092,7 @@ impl Tree {
     /// its top is its root.
     fn renumber(&mut self, sub: &[u32], domain: u32, fresh: bool) {
         if fresh {
-            self.open(domain, 1);
+            self.open(domain, 1, 0);
         }
         for &c in sub {
             let old = core::mem::replace(&mut self.node_mut(c).domain, domain);

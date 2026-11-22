@@ -130,6 +130,22 @@ impl Lazy {
         }
     }
 
+    /// The snapshot it restores from.
+    pub(super) fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// The snapshot it restores from, to change where none of its pages
+    /// is restored yet.
+    pub(super) fn snapshot_mut(&mut self) -> &mut Snapshot {
+        &mut self.snapshot
+    }
+
+    /// The snapshot back, nothing restored.
+    pub(super) fn into_snapshot(self) -> Snapshot {
+        self.snapshot
+    }
+
     /// Restores the page containing `addr` if it is still pending.
     pub(super) fn page_in(
         &mut self,

@@ -923,6 +923,8 @@ fn about(request: &Request) -> (&'static str, u32) {
         Request::WriteFile { cell, .. } => ("write file", *cell),
         Request::Input { cell, .. } => ("input", *cell),
         Request::Save { cell, .. } => ("save", *cell),
+        Request::Publish { cell, .. } => ("publish", *cell),
+        Request::Withdraw(cell) => ("withdraw", *cell),
         Request::List => ("list", 0),
         Request::Stats => ("stats", 0),
         Request::Shutdown => ("shutdown", 0),

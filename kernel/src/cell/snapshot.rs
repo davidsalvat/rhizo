@@ -104,7 +104,7 @@ impl Host {
     /// The live cell `snapshot` holds, not yet scheduled.
     fn restore(
         &mut self,
-        mut snapshot: Snapshot,
+        snapshot: Snapshot,
         mode: Resume,
         capture: bool,
         echo: bool,
@@ -140,23 +140,21 @@ impl Host {
             space::destroy(pt, &mut DirectMap, &mut KernelFrames);
             return Err(snapshot);
         }
+        let mut lazy = Lazy::new(snapshot);
         // Resumed into another domain than it was taken in (a suspended
         // cell moved meanwhile, a copy of a template's snapshot), it first
         // stops referring to its old domain's frames (design D21 of
-        // `add-cell-hierarchy`). One comparison otherwise.
-        if cell.domain != snapshot.domain()
-            && snapshot.refers()
-            && !self.move_snapshot(&mut snapshot, cell.domain)
-        {
-            self.leave_restored(&cell, snapshot.origin());
+        // `add-cell-hierarchy`). One comparison otherwise, the snapshot
+        // where it is.
+        if cell.domain != lazy.snapshot().domain() && !self.moved(lazy.snapshot_mut(), &cell) {
             space::destroy(pt, &mut DirectMap, &mut KernelFrames);
-            return Err(snapshot);
+            return Err(lazy.into_snapshot());
         }
+        let snapshot = lazy.snapshot();
         let deadlines = snapshot.deadlines(now);
-        let mut fs = files_of(&snapshot);
+        let mut fs = files_of(snapshot);
         import_sockets(&mut fs, &snapshot.sockets());
         let wx = snapshot.wx();
-        let mut lazy = Lazy::new(snapshot);
         let used = Meter::new(1, u64::MAX); // the root
         if mode == Resume::Eager {
             lazy.finish(&pt, &used);
@@ -438,17 +436,20 @@ impl Host {
 }
 
 impl Host {
-    /// Makes `snapshot` one of domain `domain` (design D21 of
-    /// `add-cell-hierarchy`): it keeps referring only to public frames;
-    /// `false` if memory cannot hold the contents of the others.
+    /// Makes `snapshot`, taken in another domain than the one `cell`,
+    /// restored from it, just entered, one of `cell`'s domain (design D21
+    /// of `add-cell-hierarchy`): it keeps referring only to public frames.
+    /// `false`, with `cell` taken out of the tree again, if memory cannot
+    /// hold the contents of the others.
     #[cold]
     #[inline(never)]
-    fn move_snapshot(&mut self, snapshot: &mut Snapshot, domain: u32) -> bool {
-        if !cells_may_take(snapshot.shared_bytes()) {
+    fn moved(&mut self, snapshot: &mut Snapshot, cell: &Cell) -> bool {
+        if snapshot.refers() && !cells_may_take(snapshot.shared_bytes()) {
+            self.leave_restored(cell, snapshot.origin());
             return false;
         }
         let mut public = self.public_frames();
-        snapshot.move_to(domain, &DirectMap, &mut public);
+        snapshot.move_to(cell.domain, &DirectMap, &mut public);
         true
     }
 }

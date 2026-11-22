@@ -18,6 +18,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(template_dropped_under_two_domains),
     ktest_case!(promotion_unshares),
     ktest_case!(a_moved_snapshot_unshares),
+    ktest_case!(a_template_snapshot_resumes_lazily_elsewhere),
 ];
 
 const MIB: u64 = 1 << 20;
@@ -382,6 +383,33 @@ fn a_moved_snapshot_unshares() {
     for id in [resumed, source, parent] {
         assert!(host.kill(id));
     }
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
+}
+
+/// A snapshot of a template, resumed lazily and eagerly as roots of new
+/// domains (as CPython's copies are loaded), first stops referring to the
+/// template's frames, then pages in every page it needs: each copy reads
+/// what the template wrote and finishes. CPython's copies faulted on a
+/// page the moved snapshot no longer found.
+fn a_template_snapshot_resumes_lazily_elsewhere() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let template = writer_template(&mut host, b"2");
+    for mode in [Resume::Lazy, Resume::Eager, Resume::Lazy] {
+        let snapshot = host.template_snapshot(template).expect("snapshot");
+        assert!(snapshot.refers(), "it refers to the template's frames");
+        let copy = host.resume(snapshot, mode, true, true).expect("resume");
+        assert_ne!(host.domain(copy), host.domain(template), "{mode:?}");
+        if host.asleep(copy) {
+            assert!(host.wake(copy));
+        }
+        until_asleep_with(&mut host, copy, b"written\n");
+        assert!(host.wake(copy));
+        host.run(|h| h.finished(copy).is_some());
+        assert_eq!(ended(&host, copy), (Ending::Exit(0), "written\n".into()));
+    }
+    assert!(host.drop_template(template));
     drop(host);
     assert_eq!(memory_balance(), before, "every frame back");
 }
