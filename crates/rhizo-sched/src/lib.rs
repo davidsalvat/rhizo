@@ -486,6 +486,18 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         Some((entry, Some(wake)))
     }
 
+    /// Removes the entry known by `key` if it is runnable, from whichever
+    /// queue holds it, to run it before every other (a host waiting for
+    /// that entry to pause, design D1 of `fix-node-pause`). `None` if it
+    /// sleeps, waits or is unknown: a sleeper whose time has come is
+    /// runnable only once [`wake_due`](Self::wake_due) has moved it.
+    pub fn take(&mut self, key: u32) -> Option<T> {
+        self.queues.iter_mut().find_map(|queue| {
+            let i = queue.iter().position(|e| e.1 == key)?;
+            queue.remove(i).map(|(_, _, e)| e)
+        })
+    }
+
     /// Removes some entry, if there is one (to empty the scheduler).
     pub fn pop(&mut self) -> Option<T> {
         if let Some(&key) = self.waiting.keys().next() {
@@ -1196,6 +1208,90 @@ mod tests {
                 seen[id] = true;
             }
             prop_assert!(seen.iter().all(|&s| s));
+        }
+    }
+
+    #[test]
+    fn take_removes_only_a_runnable_entry() {
+        let mut s = Scheduler::new(2);
+        s.place(1u32);
+        s.place(2);
+        s.place(3);
+        s.sleep(4, 100);
+        s.wait(5, 5, Some(100));
+        assert_eq!(s.take(4), None, "asleep");
+        assert_eq!(s.take(5), None, "waiting");
+        assert_eq!(s.take(9), None, "unknown");
+        assert_eq!(s.take(3), Some(3), "from either queue");
+        assert_eq!(s.take(3), None, "taken once");
+        assert_eq!(s.runnable(), 2);
+        s.wake_due(1, 100, |_| {});
+        assert_eq!(s.take(4), Some(4), "its time came");
+        // The others keep their order.
+        assert_eq!(s.next_oldest(100), Some(1));
+        assert_eq!(s.next_oldest(100), Some(2));
+        assert_eq!(s.next_oldest(100), Some(5));
+    }
+
+    /// The held cell of the model below ([`steps_to_pause`]).
+    const HELD: u32 = 1_000;
+
+    /// A host stepping one CPU (change `fix-node-pause`): `busy` cells
+    /// each use a whole slice; the held cell has printed its line at time
+    /// 0, and its main thread sleeps `pause_ns` from then. Another of its
+    /// threads can still run: it runs `runs` times for `run_ns` each, the
+    /// cell's slice ending after each (a yield, or a block while the host
+    /// holds it); after the last run every thread waits. Each step takes
+    /// the held cell first if `first`, else the one that has waited
+    /// longest. Returns whether the host saw every thread of the held cell
+    /// wait before its main thread went past the pause.
+    fn steps_to_pause(busy: u32, runs: u32, run_ns: u64, pause_ns: u64, first: bool) -> bool {
+        let mut s = Scheduler::new(1);
+        for key in 0..busy {
+            s.place(key);
+        }
+        s.place(HELD);
+        let (mut now, mut left) = (0, runs);
+        loop {
+            let next = if first { s.take(HELD) } else { None };
+            let key = next.or_else(|| s.next_oldest(now)).expect("a cell runs");
+            if key != HELD {
+                now += SLICE_NS;
+                s.requeue(0, key);
+                continue;
+            }
+            if now >= pause_ns {
+                return false; // its main thread runs on, past the pause
+            }
+            now += run_ns;
+            left -= 1;
+            if left == 0 {
+                return true; // every thread waits: the host sees the pause
+            }
+            s.requeue(0, HELD);
+        }
+    }
+
+    #[test]
+    fn a_pause_behind_busy_cells_passes_unseen_in_turn() {
+        // The race of `ktest-node`: Node.js's thread woken at `warm` waits
+        // behind three busy cells, longer than the 50 ms timer.
+        assert!(!steps_to_pause(3, 2, 100_000, 50_000_000, false));
+        assert!(steps_to_pause(3, 2, 100_000, 50_000_000, true));
+    }
+
+    proptest! {
+        /// Taken first, a held cell pauses whatever the other cells do,
+        /// as long as its own threads settle within its pause.
+        #[test]
+        fn a_held_cell_taken_first_is_seen_at_its_pause(
+            busy in 0u32..16,
+            runs in 1u32..32,
+            run_ns in 1u64..2_000_000,
+            spare_ns in 1u64..50_000_000,
+        ) {
+            let pause_ns = u64::from(runs) * run_ns + spare_ns;
+            prop_assert!(steps_to_pause(busy, runs, run_ns, pause_ns, true));
         }
     }
 }

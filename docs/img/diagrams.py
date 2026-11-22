@@ -457,8 +457,9 @@ def memory(t):
 def arch(t):
     s = Svg(t, 600, "Architecture of Rhizo",
             "On the host machine, the rhizo command-line tool talks to a small server, "
-            "which drives one virtual machine over its virtio socket device (vsock), or "
-            "its serial line where it has none. The VMM (QEMU, "
+            "which drives one virtual machine over its virtio socket device (vsock), "
+            "authenticated with a secret the kernel draws at each boot, or over its "
+            "serial line where it has none. The VMM (QEMU, "
             "Firecracker or Cloud Hypervisor) runs the Rhizo kernel; above it run the "
             "cells, unmodified Linux programs. The kernel is a set of Rust crates: the "
             "control loop, Linux system calls, sockets, files, memory, the scheduler, "
@@ -512,8 +513,9 @@ def arch(t):
            anchor="middle", fill=t["muted"])
     # vsock (or the serial line) to the control loop; network card to the sockets.
     s.path("M309 178 V 190 H 200 V 344", dash=True, sw=1.8)
-    s.text(208, 262, "vsock, or", 12, fill=t["muted"], weight=700)
-    s.text(208, 277, "serial line", 12, fill=t["muted"], weight=700)
+    s.text(208, 262, "vsock, with", 12, fill=t["muted"], weight=700)
+    s.text(208, 277, "a secret, or", 12, fill=t["muted"], weight=700)
+    s.text(208, 292, "serial line", 12, fill=t["muted"], weight=700)
     nx = 72 + 2 * (bw + 8) + bw / 2
     s.path(f"M720 178 V 294 H {nx} V 344", color=t["blue"], sw=2)
     s.text(712, 226, "network card", 12, fill=t["blue"], weight=700, anchor="end")
@@ -634,7 +636,7 @@ def security(t):
             "defensively; the VMM and hardware are trusted. The kernel defends with "
             "privilege levels and own address spaces, quotas, KPTI, E0PD, eager FP/SIMD switching, SMEP, SMAP "
             "and PAN, write-or-execute pages, and zeroed memory. Three internal reviews "
-            "and the fixes since then dealt with 26 findings and fuzzers keep them fixed; an external audit is scoped "
+            "and the fixes since then dealt with 28 findings and fuzzers keep them fixed; an external audit is scoped "
             "but not done yet.")
     heading(s, "Who is trusted, and what stands in the way")
     # Untrusted inputs.
@@ -675,7 +677,7 @@ def security(t):
     s.text(426, 462, "trusted, out of scope", 12.5, fill=t["muted"])
     # Assurance.
     s.line(24, 496, 776, 496, color=t["boxline"], arrow=False, sw=1)
-    items = [("check", "26 findings so far", "25 fixed, 1 worked around", t["accent"]),
+    items = [("check", "28 findings so far", "27 fixed, 1 worked around", t["accent"]),
              ("check", "Fuzzers, hostile cells", "calls, snapshots, frames", t["accent"]),
              ("eye", "External audit", "scoped, not done yet", t["warn"])]
     for i, (ic, a, b, c) in enumerate(items):
@@ -690,16 +692,18 @@ def security(t):
 
 # ---------------------------------------------------------------- hierarchy
 def hierarchy(t):
-    s = Svg(t, 560, "Designed: the cell hierarchy",
-            "Designed, not built yet. The host is the root; each of its children roots a "
+    s = Svg(t, 560, "Being built: the cell hierarchy",
+            "Being built: the tree, its domains, CPU shares by weight and the audit log "
+            "are in; budgets, egress policies, channels and handles come next. The host "
+            "is the root; each of its children roots a "
             "domain. Agent A, with egress to the model only and a budget of 1 GiB and 8 "
             "cells, has two children with no egress: tools, reached over a channel, and "
             "a python module. Agent B has an allowlist egress policy and a worker child. "
             "Authority flows down. Between domains nothing is shared: no loopback, no "
             "files, no counters; only slow timing channels remain, measured. Handles carry "
             "rights that can only shrink.")
-    heading(s, "Next: agents in families, walled from each other")
-    tagline(s, 776, 20, "designed, not built yet")
+    heading(s, "Agents in families, walled from each other")
+    tagline(s, 776, 20, "being built")
     # Host.
     s.rect(330, 74, 140, 42, t["box"], t["boxline"], rx=21)
     icon(s, "user", 362, 95, 18, t["text"])

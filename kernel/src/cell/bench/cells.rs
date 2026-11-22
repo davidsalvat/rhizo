@@ -274,13 +274,13 @@ pub(super) fn wire_rtts() -> Result<(u64, u64), alloc::string::String> {
         .collect();
     rules.extend(Rule::new(Proto::Tcp, ip, 32, port, port));
     let sixteen = Egress::rules(&rules).map_err(|e| alloc::format!("{e:?}"))?;
-    Ok((wire_rtt(Egress::Full)?, wire_rtt(sixteen)?))
+    Ok((wire_rtt(&Egress::Full)?, wire_rtt(&sixteen)?))
 }
 
 /// A robust figure (see [`robust`]) of the round trip of a 64-byte message
 /// between a `loopback` cell with egress `egress` and the host's echo
 /// server, through the network card.
-fn wire_rtt(egress: rhizo_net::Egress) -> Result<u64, alloc::string::String> {
+fn wire_rtt(egress: &rhizo_net::Egress) -> Result<u64, alloc::string::String> {
     const RUNS: usize = 3 * ROUNDS;
     const TRIPS: u64 = 100;
     let (ip, port) = crate::wire::options()

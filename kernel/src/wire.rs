@@ -121,8 +121,8 @@ pub fn model_egress() -> Egress {
 /// A policy allowing TCP to the in-kernel tests' echo server only (`echo=`);
 /// `None` without one.
 #[cfg_attr(
-    not(any(feature = "ktest", feature = "bench-cell")),
-    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
 )]
 pub fn echo_egress() -> Egress {
     let Some((ip, port)) = options().echo else {

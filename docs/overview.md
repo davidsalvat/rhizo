@@ -73,7 +73,7 @@ start it again.
   travel over TCP through the VM's network card, admitted with a one-time
   token, while requests stay on the control channel; a loaded file is checked
   (header, CRC-32C, every field), may not name a physical page, and its
-  quotas are capped. A cell of a loaded template answers about 11 to 12
+  quotas are capped. A cell of a loaded template answers about 10 to 12
   times sooner than a cold agent.
 - **Threads.** `pthread_create`, mutexes, condition variables and futexes;
   snapshots, forks and templates carry every thread.
@@ -85,7 +85,7 @@ start it again.
   cell needs run more threads of a running cell at once (TLB shootdowns on
   x86_64); only system calls on sockets take turns. A host operation on one
   cell (suspend, resume, fork, freeze, kill) stops only the CPUs running that
-  cell: the others keep running, and stall about 6 to 7 times less than when every
+  cell: the others keep running, and stall about 5 to 7 times less than when every
   CPU stopped.
 - **CPython and packages from PyPI.** Unmodified CPython 3.13 runs as a cell,
   its standard library in the cell's own files; a template frozen after its
@@ -99,11 +99,14 @@ start it again.
   and executable, and the kernel gives it pages that are either, changed on
   faults, never both (change `node-jit`); with the JIT a cold start is about
   16 to 24% faster than with `--jitless`. A cell forked from Node.js frozen after
-  its warm-up answers in about 4 to 6 ms, against about 35 to 46 ms from a
+  its warm-up answers in about 4 to 7 ms, against about 30 to 46 ms from a
   cold start, in a cell or as a Linux process (which cannot fork Node.js).
 - **Control plane.** `rhizo`, a command-line tool on the host, drives a
-  running kernel over its vsock, or its serial line where it has none
-  (every VMM answers): `rhizo up`, `run`, `ps`, `fork`,
+  running kernel over its vsock, authenticated with a secret the kernel
+  draws at each boot and gives only on its serial line, or over the serial
+  line where there is no socket device (every VMM answers); protocol
+  version 4 returns a cell's first output with the reply that started it:
+  `rhizo up`, `run`, `ps` (`--tree`), `fork`,
   `suspend`, `resume`, `freeze`, `save`, `load`, `attach`, `kill`, `down`;
   `rhizo chat` is an interactive conversation with an agent in a cell, whose
   tools run in the cell, and which can be forked, suspended and picked up
@@ -111,6 +114,15 @@ start it again.
 - **Quotas.** The host can cap each cell's memory, CPU time, descriptors and
   sockets; a cell past its quota is refused or ended, not its neighbours, and
   its quotas travel with its snapshots and forks.
+- **The cell tree, being built** (change `add-cell-hierarchy`). Cells form
+  a tree whose roots each start a domain, with identifiers per domain;
+  the host places, re-parents, promotes, suspends and kills subtrees; CPUs
+  are shared between domains by weight, with caps per subtree; the kernel
+  sends the host an audit record for each tree change, cell creation and
+  end, and refused request, which the host keeps in a hash-chained log
+  (`rhizo audit tail`, `verify`); snapshots (format version 11) carry a
+  cell's place in the tree. Budgets, private loopback
+  networks, egress policies and channels come next.
 - **Isolation, reviewed.** Two adversarial reviews of the cell boundary and
   one of frames from the network, with hostile cells, property tests and a
   network fuzzer that keep the findings fixed. The kernel is unmapped while
@@ -189,7 +201,7 @@ the same run:
   CPUs wake about once a second.
 - **Server**: 10,000 busy cells in a 1 GiB VM with one vCPU, about 35,000 to
   46,000 operations per second; the 99th percentile of the time a cell waits
-  to be woken (about 0.6 to 4 ms, Firecracker the slowest) is gated like the
+  to be woken (about 0.4 to 4.7 ms, Firecracker the slowest) is gated like the
   other figures. Pushed until memory runs out (about 46,000 to 48,000 idle
   cells), the kernel refuses new cells cleanly and gets every byte back, its
   heap included.
