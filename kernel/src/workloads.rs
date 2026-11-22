@@ -130,6 +130,9 @@ fn laptop(console: &mut impl Console) {
     let template = host
         .spawn_with_files(test_image("agent"), &argv, shared_folder(), true, false)
         .expect("spawn the agent");
+    // Egress `model`, as agent templates ask (design D7 of
+    // `add-cell-hierarchy`); every agent opened from it inherits it.
+    assert!(host.set_egress(template, crate::wire::model_egress()));
     wait_for(&mut host, template, b"ready\n", 1);
     assert!(host.freeze(template));
     let after_template = memory::free_bytes();

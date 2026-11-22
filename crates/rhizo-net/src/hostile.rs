@@ -596,11 +596,10 @@ impl World {
         self.net.end_call(|| None);
     }
 
+    /// The port `h` has on the wire: its card port, which the outside
+    /// sees and its cell does not (design D6 of `add-cell-hierarchy`).
     fn port(&self, h: Handle) -> u16 {
-        match self.net.local_addr(h) {
-            Ok(Some(Addr::Inet { port, .. })) => port,
-            other => panic!("{other:?}"),
-        }
+        self.net.card_of(h)
     }
 
     fn seed(&self, seed: Seed, n: u32, s: &Sockets) -> Vec<u8> {

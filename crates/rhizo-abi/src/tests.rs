@@ -18,6 +18,8 @@ pub(crate) struct FakeServices {
     cpu_fp: Option<u64>,
     /// The memory cells share (`memory`).
     memory: u64,
+    /// The egress refusals reported (`egress_denied`).
+    pub(crate) denied: Vec<(u32, rhizo_net::Proto, [u8; 4], u16)>,
 }
 
 impl Console for FakeServices {
@@ -56,6 +58,9 @@ impl Services for FakeServices {
         if let Some(word) = self.cpu_fp {
             fp.0[0] = word;
         }
+    }
+    fn egress_denied(&mut self, cell: u32, proto: rhizo_net::Proto, ip: [u8; 4], port: u16) {
+        self.denied.push((cell, proto, ip, port));
     }
 }
 

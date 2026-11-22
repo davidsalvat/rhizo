@@ -405,7 +405,7 @@ pub(super) fn end(live: Box<Live>, ending: Ending) -> (Finished, u16) {
                 &mut KernelFrames,
             )
         });
-        release_sockets(&live.fs, live.cell.id);
+        release_sockets(&live.fs, live.cell.id, ending != Ending::Suspended);
         let finished = Finished {
             id: live.cell.id,
             ending,

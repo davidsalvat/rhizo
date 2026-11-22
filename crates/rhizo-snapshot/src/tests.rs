@@ -358,8 +358,25 @@ fn socket_records_travel_one_per_descriptor() {
         unshared,
     );
     let snap = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
+    assert!(snap.has_sockets());
     assert_eq!(snap.sockets(), std::slice::from_ref(&listener));
     assert_eq!(snap.files().socket(fd), Ok(0));
+    // A cell without sockets: nothing to decode on resume.
+    let none = Snapshot::capture::<Aarch64>(
+        Machine::Aarch64,
+        &c,
+        &[],
+        &WxRanges::default(),
+        &Fs::new(),
+        &[],
+        0,
+        &mut mem,
+        &mut frames,
+        unshared,
+    );
+    let none = Snapshot::from_bytes(none.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
+    assert!(!none.has_sockets());
+    assert_eq!(none.sockets(), []);
     let mut refused = |fs: &Fs, records: &[Record]| {
         let snap = Snapshot::capture::<Aarch64>(
             Machine::Aarch64,

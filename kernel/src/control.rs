@@ -157,8 +157,14 @@ pub fn serve() {
         items: Vec::new(),
         vsock: None,
     };
-    // Cells may talk to the host's network as soon as they start.
+    // Cells may talk to the host's network as soon as they start, as their
+    // egress policies allow (design D7 of `add-cell-hierarchy`). The host's
+    // addresses stay out of the deny floor until `rhizo up` can send it
+    // (`--model`, `--deny`, `--allow-host-port`): `rhizo chat` names its
+    // model, most often on the host, only in each cell's `--egress model`
+    // rule, which the floor would refuse.
     server.host.wire_address(10_000_000_000);
+    crate::cell::host_floor(false);
     crate::vsock::init();
     send(0, &Message::Hello { version: VERSION });
     let mut fast_until = 0;

@@ -1,13 +1,83 @@
 //! The kernel's sockets (spec `networking`): their lock, and what a cell's
 //! sockets become when it forks, is suspended or resumed. Each cell has a
 //! loopback network of its own, numbered by its identifier (design D5 of
-//! `add-cell-hierarchy`).
+//! `add-cell-hierarchy`), with the egress policy its node in the tree holds
+//! (design D7): `None` unless the host gives it one.
 
 use super::*;
 
 /// The sockets of every cell (spec `networking`), each in its cell's own
 /// loopback network.
 pub(super) static NET: Global<Net> = Global::new(Net::new());
+
+/// Whether a network has an egress policy other than `None`, set under the
+/// sockets' lock: until one has, a cell's end takes no lock for its network
+/// when it holds no socket.
+static POLICIES: AtomicBool = AtomicBool::new(false);
+
+impl Host {
+    /// Sets the egress policy of cell `id` (and, narrowed with it, of its
+    /// descendants), as the host (design D7 of `add-cell-hierarchy`): a
+    /// root's freely, another cell's within its parent's. Connections the
+    /// new policies deny are reset. `false` if refused (no such cell, or a
+    /// child asking for more than its parent has).
+    #[cfg_attr(
+        not(any(feature = "ktest", feature = "bench-cell", feature = "control")),
+        allow(
+            dead_code,
+            reason = "used by in-kernel tests, benchmarks and the control kernel"
+        )
+    )]
+    pub fn set_egress(&mut self, id: u32, egress: rhizo_cap::Egress) -> bool {
+        let ceiling = egress.clone();
+        self.set_policy(id, egress, ceiling, rhizo_cap::Actor::Host)
+            .is_ok()
+    }
+
+    /// Gives the networks of the cells of `id`'s subtree the egress
+    /// policies their nodes now hold (after a placement, a re-parenting or a
+    /// change of policy): connections a narrowed policy denies are reset.
+    pub(super) fn sync_networks(&self, id: u32) {
+        let policies: Vec<(u32, rhizo_cap::Egress)> = self
+            .tree
+            .subtree(id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| Some((c, self.tree.get(c)?.egress().clone())))
+            .collect();
+        let none = policies.iter().all(|(_, e)| *e == rhizo_cap::Egress::None);
+        if none && !POLICIES.load(Ordering::Acquire) {
+            return; // nothing to set, nothing to clear
+        }
+        with_net(|net| {
+            for (c, egress) in policies {
+                net.set_egress(c, egress);
+            }
+            POLICIES.store(net.has_policies(), Ordering::Release);
+        });
+    }
+
+    /// Gives the networks of copies `ids` the egress policies of their
+    /// nodes (their source's); those with `None` need nothing. While no
+    /// network has a policy, no source has one: nothing to look up.
+    pub(super) fn enter_networks(&self, ids: impl Iterator<Item = u32>) {
+        if !POLICIES.load(Ordering::Acquire) {
+            return;
+        }
+        let policies: Vec<(u32, rhizo_cap::Egress)> = ids
+            .filter_map(|id| Some((id, self.tree.get(id)?.egress().clone())))
+            .filter(|(_, egress)| *egress != rhizo_cap::Egress::None)
+            .collect();
+        if !policies.is_empty() {
+            with_net(|net| {
+                for (id, egress) in policies {
+                    net.set_egress(id, egress);
+                }
+                POLICIES.store(true, Ordering::Release);
+            });
+        }
+    }
+}
 
 /// Set, under the sockets' lock, when a change woke waiters that nobody
 /// drained yet: the scheduler takes the lock to drain them only then, not
@@ -58,6 +128,17 @@ pub(super) fn fork_files(fs: &Fs, id: u32) -> Fs {
     child
 }
 
+/// Puts the card's gateway and name servers, the host, in the deny floor
+/// (`true`, the default) or leaves them out of it
+/// (`rhizo_net::Net::set_host_floor`).
+#[cfg_attr(
+    not(feature = "control"),
+    allow(dead_code, reason = "used by the control kernel")
+)]
+pub fn host_floor(on: bool) {
+    with_net(|net| net.set_host_floor(on));
+}
+
 /// Sockets open in the kernel.
 #[cfg_attr(
     not(feature = "ktest"),
@@ -103,14 +184,43 @@ pub fn close_parked(snapshot: &Snapshot) {
 }
 
 /// Releases the sockets `fs` of cell `id` holds (it ended or was
-/// suspended), leaving their wait queues first.
-pub(super) fn release_sockets(fs: &Fs, id: u32) {
-    if fs.sockets().next().is_some() {
+/// suspended), leaving their wait queues first. Its network's policy goes
+/// when `network_ends`; a suspended cell's stays for its resume
+/// ([`resume_network`]), or until its snapshot is dropped
+/// ([`forget_network`]).
+pub(super) fn release_sockets(fs: &Fs, id: u32, network_ends: bool) {
+    let policy = network_ends && POLICIES.load(Ordering::Acquire);
+    if fs.sockets().next().is_some() || policy {
         with_net(|net| {
             fs.sockets().for_each(|h| {
                 net.forget(h, id);
                 net.release(h);
-            })
+            });
+            if policy {
+                net.drop_network(id);
+                POLICIES.store(net.has_policies(), Ordering::Release);
+            }
+        });
+    }
+}
+
+/// Whether a network has an egress policy other than `None`.
+pub(super) fn has_policies() -> bool {
+    POLICIES.load(Ordering::Acquire)
+}
+
+/// Suspended cell `old` was resumed as `new`: its network's policy follows.
+pub(super) fn resume_network(old: u32, new: u32) {
+    with_net(|net| net.rename_network(old, new));
+}
+
+/// Cell `id` is gone for good (a dropped snapshot, a cascade): its
+/// network's policy goes. Nothing to do while no network has one.
+pub(super) fn forget_network(id: u32) {
+    if POLICIES.load(Ordering::Acquire) {
+        with_net(|net| {
+            net.drop_network(id);
+            POLICIES.store(net.has_policies(), Ordering::Release);
         });
     }
 }

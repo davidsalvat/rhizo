@@ -231,6 +231,7 @@ fn tainted_template_not_published() {
         "copies",
         &[b"connect", port.as_bytes(), ip.as_bytes()],
     );
+    assert!(host.set_egress(id, crate::wire::echo_egress()));
     while host.output(id) != Some(b"connected\n") {
         assert!(host.finished(id).is_none(), "{:?}", ended(&host, id));
         host.step();

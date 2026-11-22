@@ -16,8 +16,12 @@ pub(super) const ALL: &[TestCase] = &[
 fn spawn_node(host: &mut Host, files: &rhizo_fs::Fs, args: &[&str]) -> u32 {
     let mut argv: Vec<&[u8]> = expected::NODE_ARGV.iter().map(|a| a.as_bytes()).collect();
     argv.extend(args.iter().map(|a| a.as_bytes()));
-    host.spawn_file(files.clone(), argv[0], &argv, &[], true, true)
-        .unwrap_or_else(|e| panic!("cannot spawn Node.js: {e:?}"))
+    let id = host
+        .spawn_file(files.clone(), argv[0], &argv, &[], true, true)
+        .unwrap_or_else(|e| panic!("cannot spawn Node.js: {e:?}"));
+    // Egress `model` (design D7 of `add-cell-hierarchy`), for its HTTP call.
+    host.set_egress(id, crate::wire::model_egress());
+    id
 }
 
 /// Node.js, the official build run unmodified with its JIT (spec

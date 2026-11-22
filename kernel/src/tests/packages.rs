@@ -67,6 +67,9 @@ fn requests_gets_from_the_host_as_on_linux() {
     let url = alloc::format!("http://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
     let [python, flag, script] = expected::REQUESTS_ARGV;
     let id = spawn_python(&mut host, &files, &[python, flag, script, &url]);
+    // Egress `model` (design D7 of `add-cell-hierarchy`): the fake model
+    // server is what it gets from.
+    assert!(host.set_egress(id, crate::wire::model_egress()));
     let end = crate::cell::now_ns() + 600_000_000_000;
     while host.finished(id).is_none() && crate::cell::now_ns() < end {
         host.step();

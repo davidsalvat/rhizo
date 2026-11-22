@@ -228,10 +228,59 @@ pub(super) fn net() -> (u64, u64, u64) {
     )
 }
 
-/// A robust figure (see [`robust`]) of the round trip of a 64-byte message
+/// Nanoseconds of one egress check (design D7 of `add-cell-hierarchy`,
+/// `net.egress_check_insns` under QEMU's instruction counting): a TCP
+/// destination against a policy of 16 rules that allows it by its last,
+/// behind the deny floor, as an outside `connect` makes it.
+pub(super) fn egress_check() -> u64 {
+    use rhizo_net::{Egress, Proto, Rule};
+    const CHECKS: u64 = 10_000;
+    // A network no cell has: cells' identifiers count up from 1.
+    const NETWORK: u32 = u32::MAX;
+    let rules: Vec<Rule> = (0..16u8)
+        .filter_map(|i| Rule::new(Proto::Tcp, [192, 0, 2, i], 32, 443, 443))
+        .collect();
+    let to = [192, 0, 2, 15];
+    with_net(|net| {
+        net.set_egress(NETWORK, Egress::rules(&rules).unwrap_or_default());
+        let t0 = bench_clock();
+        for _ in 0..CHECKS {
+            let allowed = net.allows(
+                core::hint::black_box(NETWORK),
+                Proto::Tcp,
+                core::hint::black_box(to),
+                443,
+            );
+            assert!(core::hint::black_box(allowed));
+        }
+        let ns = bench_ns(bench_clock() - t0).unwrap_or(0) / CHECKS;
+        net.drop_network(NETWORK);
+        ns
+    })
+}
+
+/// Robust figures (see [`robust`]) of the round trip of a 64-byte message
 /// between a `loopback` cell and the host's echo server, through the
-/// network card (`echo=` on the command line).
-pub(super) fn wire_rtt() -> Result<u64, alloc::string::String> {
+/// network card (`echo=` on the command line): with egress `full`, and
+/// with a policy of 16 rules allowing the echo server by its last (design
+/// D7 of `add-cell-hierarchy`: a connection is checked once, when made).
+pub(super) fn wire_rtts() -> Result<(u64, u64), alloc::string::String> {
+    use rhizo_net::{Egress, Proto, Rule};
+    let (ip, port) = crate::wire::options()
+        .echo
+        .ok_or("no network card and echo server on this VMM")?;
+    let mut rules: Vec<Rule> = (0..15u8)
+        .filter_map(|i| Rule::new(Proto::Tcp, [192, 0, 2, i], 32, 443, 443))
+        .collect();
+    rules.extend(Rule::new(Proto::Tcp, ip, 32, port, port));
+    let sixteen = Egress::rules(&rules).map_err(|e| alloc::format!("{e:?}"))?;
+    Ok((wire_rtt(Egress::Full)?, wire_rtt(sixteen)?))
+}
+
+/// A robust figure (see [`robust`]) of the round trip of a 64-byte message
+/// between a `loopback` cell with egress `egress` and the host's echo
+/// server, through the network card.
+fn wire_rtt(egress: rhizo_net::Egress) -> Result<u64, alloc::string::String> {
     const RUNS: usize = 3 * ROUNDS;
     const TRIPS: u64 = 100;
     let (ip, port) = crate::wire::options()
@@ -249,6 +298,7 @@ pub(super) fn wire_rtt() -> Result<u64, alloc::string::String> {
         host.finished.clear();
         let t0 = bench_clock();
         let id = host.spawn(image, &argv, true, false).expect("spawn");
+        host.set_egress(id, egress.clone());
         // A connection that never answers must not stop the benchmarks.
         let end = now_ns().saturating_add(10_000_000_000);
         host.run_until(end, |h| h.finished(id).is_some());

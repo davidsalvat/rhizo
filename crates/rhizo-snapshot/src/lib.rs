@@ -902,6 +902,12 @@ impl Snapshot {
         })
     }
 
+    /// Whether the cell had sockets (most resumed cells have none, and then
+    /// need no records decoded).
+    pub fn has_sockets(&self) -> bool {
+        self.sockets_bytes() != [0; 4]
+    }
+
     /// The records of the cell's sockets, in the order its descriptors
     /// refer to them.
     pub fn sockets(&self) -> Vec<Record> {

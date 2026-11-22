@@ -81,6 +81,9 @@ pub fn agent(
     let mut id = host
         .spawn_with_files(test_image("cpython"), &argv, files, true, false)
         .map_err(|e| format!("cannot spawn CPython: {e:?}"))?;
+    // Egress `model`, explicitly (design D7 of `add-cell-hierarchy`): its
+    // branches and resumes keep it.
+    host.set_egress(id, crate::wire::model_egress());
     let mut run = AgentRun {
         transcript: Vec::new(),
         suspend_resume_ns: Vec::new(),

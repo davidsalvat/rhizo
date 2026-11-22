@@ -70,6 +70,27 @@ impl Services for KernelServices<'_> {
             .get_or_insert_with(|| RANDOM.with(Batched::split))
             .fill(out);
     }
+
+    /// The one place egress refusals reach the audit log (design D7 and
+    /// D18 of `add-cell-hierarchy`), with their destination, as
+    /// `tcp 1.2.3.4:443`.
+    fn egress_denied(&mut self, cell: u32, proto: rhizo_net::Proto, ip: [u8; 4], port: u16) {
+        let proto = match proto {
+            rhizo_net::Proto::Tcp => "tcp",
+            rhizo_net::Proto::Udp => "udp",
+            rhizo_net::Proto::Any => "any",
+        };
+        let detail = alloc::format!("{proto} {}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+        // The domain is filled in by the control kernel (0); repeats are
+        // folded per cell, kind and second (spec `networking`, "Denial
+        // storm").
+        crate::audit::deny(
+            rhizo_control::audit::Kind::Egress,
+            cell,
+            0,
+            detail.as_bytes(),
+        );
+    }
 }
 
 /// The 16 random bytes of a new cell's stack (`AT_RANDOM`), from the
