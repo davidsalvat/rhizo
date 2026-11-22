@@ -19,6 +19,10 @@ xtask = { path = "../xtask" }
 # `rhizo snapshot upgrade`: the same format code as the kernel's (design D20
 # of `add-cell-hierarchy`).
 rhizo-snapshot = { path = "../crates/rhizo-snapshot" }
+# `rhizo up --pin`: the affinity of the VMM's vCPU threads, which the
+# standard library cannot set (MIT OR Apache-2.0, already a dependency of
+# xtask; design D17 of `add-cell-hierarchy`).
+libc = "0.2"
 # The audit log's JSON lines (design D18 of `add-cell-hierarchy`): already
 # in the workspace through xtask (MIT OR Apache-2.0).
 serde_json = "1"

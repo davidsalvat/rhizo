@@ -1,9 +1,10 @@
 //! How cells share the CPUs: by weight between domains, within caps per
-//! subtree (design D23 of `add-cell-hierarchy`).
+//! subtree (design D23 of `add-cell-hierarchy`), and where they run when
+//! domains have exclusive CPU sets (design D17).
 
 use super::*;
 use crate::cell::now_ns;
-use rhizo_cap::{Actor, HOST, Limits, Spec};
+use rhizo_cap::{Actor, Error as TreeError, HOST, Limits, Spec};
 use rhizo_cell::quota::Quota;
 use rhizo_sched::SLICE_NS;
 
@@ -12,6 +13,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(domains_share_by_weight, 45),
     ktest_case!(root_weights_share_a_cpu, 25),
     ktest_case!(cpu_cap_holds, 25),
+    ktest_case!(exclusive_sets_hold, 25),
 ];
 
 const MIB: u64 = 1 << 20;
@@ -98,8 +100,11 @@ fn domains_share_by_weight() {
 
 /// Spec `cell-hierarchy`, "CPU weights between domains": on one CPU, two
 /// spinning roots placed with weights 300 and 100 (protocol version 4,
-/// `run --cpu-weight`) get three quarters and one quarter of it, within
-/// 5 %, over 1 s.
+/// `run --cpu-weight`) get three quarters and one quarter of the CPU time
+/// the scheduler charges, within 5 %, over at least 1 s and 20 of the
+/// longest slice charged (change `fix-share-test`). The scheduler keeps
+/// each domain within one slice of its weight's part (design D23), so 20
+/// slices bound the share to 5 %, however long a busy host stretched them.
 fn root_weights_share_a_cpu() {
     let mut host = Host::new();
     let mut root = |weight| {
@@ -113,12 +118,21 @@ fn root_weights_share_a_cpu() {
         id
     };
     let (heavy, light) = (root(300), root(100));
-    step_for(&mut host, 1_000_000_000);
-    let (a, b) = (cpu_of(&mut host, &[heavy]), cpu_of(&mut host, &[light]));
+    let charged = |host: &mut Host, id| host.charged_ns(id).expect("shared by weight");
+    let (t0, mut longest, mut before) = (now_ns(), 0, 0);
+    let (a, b) = loop {
+        host.step();
+        let (a, b) = (charged(&mut host, heavy), charged(&mut host, light));
+        longest = longest.max(a + b - before);
+        before = a + b;
+        if now_ns() - t0 >= 1_000_000_000 && a + b >= 20 * longest {
+            break (a, b);
+        }
+    };
     let pct = 100 * a / (a + b);
     assert!(
         (70..=80).contains(&pct),
-        "weight 300 got {pct} % ({a} ns of {})",
+        "weight 300 got {pct} % ({a} ns of {}, longest slice {longest} ns)",
         a + b
     );
     for id in [heavy, light] {
@@ -161,5 +175,97 @@ fn cpu_cap_holds() {
     for id in [capped[1], capped[0], root] {
         assert!(host.kill(id));
     }
+    assert!(host.tree().is_empty());
+}
+
+/// Spec `isolation`, "Exclusive CPU sets per domain" (design D17),
+/// hostile: a domain given the upper half of the CPUs (2 and 3 of 4) runs
+/// only there, and no cell of another domain runs there, over a busy run
+/// with stealing and balancing: the domain's three cells, one spreading
+/// three threads, on its two CPUs; two spinning roots per CPU, one of
+/// weight 300 (cells share by weight too), and a root spreading a thread
+/// per CPU, on the others, which serve them all. Checked by the CPUs each
+/// cell ran on. Sets holding the boot CPU or CPUs the machine lacks, or
+/// leaving no CPU shared beside it, a set overlapping another root's and a
+/// set for a child are refused (on fewer than three CPUs, every set).
+fn exclusive_sets_hold() {
+    let cpus = crate::smp::count();
+    let all = (1u64 << cpus) - 1;
+    let mut host = Host::new();
+    let with = |set: u64, cells: u32| Spec {
+        cpus: set,
+        limits: Limits {
+            cells,
+            ..Limits::UNLIMITED
+        },
+        ..Spec::default()
+    };
+    let probe = spawn(&mut host, "idle", &[]);
+    for bad in [1, 0b11, 1 << cpus, all, all & !1]
+        .into_iter()
+        .filter(|&b| b != 0)
+    {
+        let refused = host.place(probe, HOST, with(bad, 0), 0);
+        assert_eq!(refused, Err(TreeError::Invalid), "set {bad:#b}");
+    }
+    if cpus < 3 {
+        assert!(host.kill(probe));
+        assert!(host.tree().is_empty());
+        return;
+    }
+    let set = all & !(all >> (cpus / 2)); // CPUs 2 and 3 of 4
+    let shared = all & !set;
+    // The domain with the set: a spinning root, a spinning child and a
+    // child spreading three threads.
+    let root = spawn(&mut host, "spin", &[]);
+    parent(&mut host, root, 2);
+    host.place(root, HOST, with(set, 2), 0).expect("its set");
+    let threads = spawn(&mut host, "threads", &[b"spin", b"3"]);
+    let child_spec = child(32, 1 << 56, 0, u32::MAX);
+    host.adopt(threads, root, child_spec.clone(), Actor::Host)
+        .expect("placed");
+    let inside = [root, spinner_under(&mut host, root, child_spec), threads];
+    let low = set & set.wrapping_neg();
+    let overlap = host.place(probe, HOST, with(low, 0), 0);
+    assert_eq!(overlap, Err(TreeError::Invalid), "another root's CPU");
+    let to_child = host.adopt(probe, root, with(low, 0), Actor::Host);
+    assert_eq!(to_child, Err(TreeError::Invalid), "a child's set");
+    assert!(host.kill(probe));
+    // Every other domain, hostile: more cells than the shared CPUs, one
+    // heavier, one spreading over every CPU.
+    let mut outside: Vec<u32> = (0..2 * cpus)
+        .map(|_| spawn(&mut host, "spin", &[]))
+        .collect();
+    let heavy = Spec {
+        weight: 300,
+        ..Spec::default()
+    };
+    host.place(outside[0], HOST, heavy, 0).expect("weight");
+    let spread = alloc::format!("{cpus}");
+    outside.push(spawn(&mut host, "threads", &[b"spin", spread.as_bytes()]));
+    host.run_until(now_ns() + 1_000_000_000, |_| false);
+    for &id in inside.iter().rev().chain(&outside) {
+        assert!(host.kill(id), "cell {id} still ran");
+    }
+    let ran = |ids: &[u32]| -> Vec<u64> {
+        let on = |id: u32| u64::from(host.finished(id).expect("ended").cpus);
+        ids.iter().map(|&id| on(id)).collect()
+    };
+    let (mine, theirs) = (ran(&inside), ran(&outside));
+    for (id, on) in inside.iter().zip(&mine) {
+        assert!(
+            *on != 0 && on & !set == 0,
+            "cell {id} of the domain with CPUs {set:#b} ran on {on:#b}"
+        );
+    }
+    for (id, on) in outside.iter().zip(&theirs) {
+        assert!(
+            *on != 0 && on & set == 0,
+            "cell {id} of another domain ran on {on:#b}, inside the set {set:#b}"
+        );
+    }
+    let used = |r: &[u64]| r.iter().fold(0, |m, on| m | on);
+    assert_eq!(used(&mine), set, "the domain ran on each of its CPUs");
+    assert_eq!(used(&theirs), shared, "the shared CPUs served the others");
     assert!(host.tree().is_empty());
 }

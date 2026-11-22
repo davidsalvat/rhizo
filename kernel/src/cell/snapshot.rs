@@ -77,12 +77,13 @@ impl Host {
         // (design D7); a loaded one starts with none, unless placed.
         let origin = snapshot.origin();
         let policy = has_policies() && self.suspended.contains(&origin);
-        let mut live = self.restore(snapshot, mode, capture, echo)?;
+        let live = self.restore(snapshot, mode, capture, echo)?;
         if policy {
             resume_network(origin, live.cell.id);
         }
-        live.cell.threads.wake_io();
         let id = live.cell.id;
+        // New to the scheduler: `file` lets its threads waiting on
+        // descriptors make their calls again.
         self.admit(|s| file(s, None, live));
         Ok(id)
     }

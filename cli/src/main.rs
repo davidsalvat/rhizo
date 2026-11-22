@@ -12,6 +12,7 @@ mod audit;
 mod chat;
 mod client;
 mod floor;
+mod pin;
 mod scope;
 mod serve;
 mod state;
@@ -211,6 +212,7 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
         .args(["--memory", &up.memory_mib.to_string()])
         .args(["--cpus", &up.cpus.to_string()])
         .args(["--accel", up.accel.id()])
+        .args(up.pin.then_some("--pin"))
         .args(up.floor.args())
         .stdin(Stdio::null())
         .stdout(log)

@@ -82,10 +82,16 @@ impl<T: Copy + PartialEq> Gangs<T> {
     /// in and takes one offered thread (or the deadline: another CPU does
     /// not join for it).
     pub fn join(&mut self, cpu: usize, now: u64) -> Option<T> {
+        self.join_where(cpu, now, |_| true)
+    }
+
+    /// [`join`](Self::join), among the entries `may` allows `cpu` to run
+    /// (exclusive CPU sets, design D17 of `add-cell-hierarchy`).
+    pub fn join_where(&mut self, cpu: usize, now: u64, may: impl Fn(T) -> bool) -> Option<T> {
         let g = self
             .gangs
             .iter_mut()
-            .find(|g| g.spare > 0 || g.wake.is_some_and(|w| w <= now))?;
+            .find(|g| (g.spare > 0 || g.wake.is_some_and(|w| w <= now)) && may(g.entry))?;
         if g.spare > 0 {
             g.spare -= 1;
         } else {
@@ -142,6 +148,24 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert_eq!(g.join(0, 0), Some('b'), "one thread still offered");
         assert_eq!(g.join(2, 0), None);
+    }
+
+    #[test]
+    fn exclusive_sets_keep_cpus_out_of_gangs_they_may_not_run() {
+        let mut g = Gangs::new();
+        g.start(2, 'a'); // a domain with a set: CPUs 2 and 3
+        g.start(0, 'b');
+        g.offer('a', 2, None);
+        g.offer('b', 1, None);
+        let set = |e: char| e != 'a';
+        assert_eq!(
+            g.join_where(1, 0, set),
+            Some('b'),
+            "past 'a', offered first"
+        );
+        assert_eq!(g.join_where(1, 0, set), None, "only 'a' offers now");
+        assert_eq!(g.join_where(3, 0, |e| e == 'a'), Some('a'));
+        assert_eq!(g.cpus('a'), 0b1100);
     }
 
     #[test]
