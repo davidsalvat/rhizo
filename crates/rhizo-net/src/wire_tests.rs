@@ -379,7 +379,7 @@ fn binding_takes_the_card_s_address_only() {
 fn wire_connections_reset_on_fork() {
     let mut w = World::new();
     let s = w.connect(80);
-    let child = w.net.fork(s).unwrap();
+    let child = w.net.fork(s, 3).unwrap();
     assert_eq!(drain(&mut w.net, child), Err(Error::ConnReset));
     assert_eq!(drain(&mut w.net, child).unwrap(), b"");
     assert_eq!(w.net.send(child, b"x", None), Err(Error::Pipe));
@@ -407,7 +407,7 @@ fn wire_connections_stay_up_while_parked() {
     let peer = w.peer.sockets.get::<tcp::Socket>(w.peer.tcp);
     assert_eq!(peer.state(), tcp::State::Established);
     assert_eq!(peer.send_queue(), 0, "the peer's echo was acknowledged");
-    let (s2, _) = w.net.import(&r).unwrap();
+    let (s2, _) = w.net.import(&r, 0).unwrap();
     assert_eq!(s2, s);
     assert_eq!(drain(&mut w.net, s).unwrap(), b"lost once");
     assert_eq!(w.net.send(s, b"after", None), Ok(5));
@@ -424,7 +424,7 @@ fn a_reset_while_parked_is_reported_after() {
     let peer = w.peer.tcp;
     w.peer.sockets.get_mut::<tcp::Socket>(peer).abort();
     w.run(20);
-    let (s, _) = w.net.import(&r).unwrap();
+    let (s, _) = w.net.import(&r, 0).unwrap();
     assert_eq!(drain(&mut w.net, s), Err(Error::ConnReset));
     assert_eq!(drain(&mut w.net, s).unwrap(), b"");
 }

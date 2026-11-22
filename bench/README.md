@@ -67,8 +67,8 @@ way. Firecracker and Cloud Hypervisor need KVM.
 | `cell.file_write_read_us/rhizo/<vmm>` | timing | The `filer` cell creating a file, writing 1 MiB in 64 KiB writes and reading it back, spawn to exit |
 | `cell.fork_with_files_us/rhizo/<vmm>` | timing | Forking a cell (frozen as a template) that holds a 16 MiB file: the file blocks are shared, not copied |
 | `cell.pipe_rtt_ns/rhizo/<vmm>` | timing | The `piper` cell writing one byte into a pipe and reading it back (two system calls), per round trip over 2000 |
-| `cell.loopback_rtt_us/rhizo/<vmm>` | timing | Two `loopback` cells exchanging a 64-byte message over TCP on 127.0.0.1, per round trip over 200 (each side blocks in `read`, wakes, and the other runs) |
-| `cell.tcp_resume_us/rhizo/<vmm>` | timing | A `loopback twice` client suspended right after its first round trip with a `loopback` server, its connection parked in the kernel: lazy resume until it has made its second 64-byte round trip on the same connection and exited (against `cell.resume_us` and `cell.loopback_rtt_us`) |
+| `cell.loopback_rtt_us/rhizo/<vmm>` | timing | The two threads of a `loopback pair` cell exchanging a 64-byte message over TCP on 127.0.0.1, per round trip over 200, counted from the moment its server thread waits in `accept` and the host wakes its client (each side blocks in `read`, wakes, and the other runs). Cells have no shared loopback network since `add-cell-hierarchy` (design D5): before it, the figure was two cells and included a switch between them |
+| `cell.tcp_resume_us/rhizo/<vmm>` | timing | A `loopback pair PORT twice` cell suspended right after its client thread's first round trip with its server thread, both ends of the connection parked in the kernel: lazy resume until the client has made its second 64-byte round trip on the same connection and the cell exited (against `cell.resume_us` and `cell.loopback_rtt_us`; two cells before `add-cell-hierarchy`) |
 | `net.tcp_rtt_us/rhizo/<vmm>` | timing | A `loopback` cell exchanging a 64-byte message with a TCP echo server on the host through the virtio-net card (virtio-mmio on `microvm` and Firecracker, virtio-pci on `q35` and Cloud Hypervisor; QEMU user network, Firecracker and Cloud Hypervisor on a tap device each), per round trip over 100. Skipped, with the reason, without password-less `sudo` for a tap device |
 | `cell.idle_bytes` | deterministic | Memory each of 1000 idle cells costs (forks of a template of `idle`, each run into its sleep): what "thousands of mostly idle cells per node" costs |
 | `cell.suspended_bytes` | deterministic | Snapshot size of one idle cell |
@@ -148,10 +148,13 @@ the VMM has no network card.
 | `laptop.idle_wakeups_per_s/rhizo/<vmm>` | rate | While every agent waits (2 s, 60 s in the soak): returns of the guest's CPUs from waiting for an interrupt, per second. Idle CPUs have no tick, and only one of them programs its timer, for the earliest deadline (change `add-tickless-idle`); what still wakes them is that deadline, work handed over by another CPU, and the boot CPU polling the network card while a cell waits on a descriptor |
 | `laptop.idle_host_cpu_pct/rhizo/<vmm>` | rate | Over the same window, read on the host: the VMM process's CPU time (all threads, `/proc/PID/task/*/schedstat`) over wall time, in percent of one CPU |
 
-**Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from four
-`worker` templates, in groups of ten: 4 computing (2,000 xorshift rounds),
-2 writing and reading back 4 KiB of a file, and 2 pairs over loopback TCP
-(the servers share one listener). Each runs one operation every 200 ms for
+**Server** (B2B, 1 vCPU, 1 GiB): up to 10,000 cells forked from three
+`worker` templates, in groups of ten: 6 computing (2,000 xorshift rounds),
+2 writing and reading back 4 KiB of a file, and 2 pairs over loopback TCP,
+each pair the two threads of one cell (each fork listens again in its own
+loopback network and closes its listener once connected; before
+`add-cell-hierarchy`, 4 computing and each pair two cells sharing one
+listener). Each runs one operation every 200 ms for
 3 s (600 s in the soak): 50,000 operations per second offered at 10,000
 cells. Every 10 ms the host suspends and lazily resumes the next worker
 (its connections stay open) and forks a computing one, killing the

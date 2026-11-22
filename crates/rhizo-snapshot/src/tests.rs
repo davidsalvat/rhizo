@@ -823,7 +823,7 @@ mod hostile {
         }
         let mut net = rhizo_net::Net::new();
         for r in &sockets {
-            let _ = net.import(r);
+            let _ = net.import(r, 0);
         }
         // Every descriptor answers (no operation panics).
         let mut buf = [0u8; 64];

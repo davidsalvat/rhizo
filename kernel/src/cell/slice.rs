@@ -76,6 +76,18 @@ pub(super) fn syscall(
     (outcome, tlb.shrank || pager_tlb.shrank)
 }
 
+/// Whether calls of `live`'s threads woke threads of their own cell waiting
+/// on descriptors (two threads talking over loopback, design D5 of
+/// `add-cell-hierarchy`): then they are woken here, to run in this slice,
+/// instead of the cell going through the scheduler, which would wake them
+/// all the same. Asked only when no thread of the cell can run.
+fn woke_itself(live: &mut Live) -> bool {
+    if !WOKEN.load(Ordering::Acquire) || !NET.with(|net| net.take_woken(live.cell.id)) {
+        return false;
+    }
+    live.cell.threads.wake_io()
+}
+
 impl Live {
     /// A [`Host::wake`] came before any thread waited with a deadline: the
     /// first wait with one ends at once (design D5 of
@@ -162,7 +174,10 @@ pub(super) fn run_slice(
                             // not while the host waits for the cell to
                             // pause, which it sees only between slices
                             // (change `fix-warm-wait-race`).
-                            if !live.hold && live.cell.threads.next(now_ns()) {
+                            if !live.hold
+                                && (live.cell.threads.next(now_ns())
+                                    || (woke_itself(&mut live) && live.cell.threads.next(now_ns())))
+                            {
                                 continue 'thread;
                             }
                             break 'thread Back::File;
