@@ -104,12 +104,22 @@ fn same_file_in_two_domains() {
 /// other cell ended is a hit too: nothing is ever filled for a domain. A
 /// whole run of a dynamically linked program (its executable, `ld.so` and
 /// the libraries `ld.so` maps) fills no page for its domain either, but
-/// for its files that are not executables (`ld.so`'s cache).
+/// for its files that are not executables (`ld.so`'s cache). Only the sets
+/// the host ships are published.
 fn public_library_always_hits() {
     let files = crate::cell::dynamic_files().expect("xtask packs the dynamic hello");
     let &(path, ..) = expected::DYNAMIC.first().expect("a dynamic program");
     let public = kept_pages_of(PUBLIC);
     assert!(public > 0, "loaded when published");
+    // A test fixture the host does not ship pins nothing: the distribution's
+    // programs pinned 16 MiB, which made cells in parallel run out of memory
+    // in a VM of 128 MiB.
+    let _ = crate::cell::distro_files();
+    assert_eq!(
+        kept_pages_of(PUBLIC),
+        public,
+        "the fixture is not published"
+    );
     let mut host = Host::new();
     let (a, b) = (
         mapper(&mut host, &files, path, "1"),
@@ -174,50 +184,69 @@ fn writer_template(host: &mut Host, mib: &[u8]) -> u32 {
     id
 }
 
-/// Spec `control-plane`, "Publish and copy", and spec `cell-hierarchy`,
-/// "Unpublished template in another domain": a copy of an unpublished
-/// template as a root, and a host fork of a root, are full copies; copies
-/// of a published template, each a root, share its frames; after
-/// `withdraw` a new copy shares none while the earlier ones run on.
+/// Copy `id` of a template, not yet run, placed by the host as the root of
+/// a new domain (protocol version 4 placement, design D13).
+fn elsewhere(host: &mut Host, id: u32) -> u32 {
+    host.place(id, HOST, Spec::default(), 0).expect("placed");
+    id
+}
+
+/// Spec `control-plane`, "Publish and copy", spec `cell-hierarchy`,
+/// "Unpublished template in another domain", and spec `fork`, "Fork of a
+/// root": a copy of a template, and a fork of a root, stay in the source's
+/// domain and share its frames; a copy of an unpublished template placed
+/// in another domain shares none; copies of a published template placed
+/// in other domains share its frames; after `withdraw`, a new copy placed
+/// elsewhere shares none while the earlier ones run on.
 fn publication_decides_what_copies_share() {
     let mut host = Host::new();
     let template = writer_template(&mut host, b"1");
     let frame = |host: &mut Host, id| host.frame_of(id, MMAP_BASE).expect("mapped");
-    let private = host
-        .spawn_from_template(template, true, true)
-        .expect("copy");
+    let copy = |host: &mut Host| {
+        host.spawn_from_template(template, true, true)
+            .expect("copy")
+    };
+    let in_domain = copy(&mut host);
+    let fork = host.fork(in_domain, 1).expect("fork")[0];
+    let private = copy(&mut host);
+    let private = elsewhere(&mut host, private);
     assert_eq!(
         host.publish(template + 1000, false),
         Err(Refused::NoTemplate)
     );
     assert_eq!(host.publish(template, false), Ok(()));
     let shared = [0; 2].map(|_| {
-        host.spawn_from_template(template, true, true)
-            .expect("copy")
+        let id = copy(&mut host);
+        elsewhere(&mut host, id)
     });
-    let fork = host.fork(shared[0], 1).expect("fork")[0];
     assert!(host.withdraw(template) && !host.withdraw(template));
-    let late = host
-        .spawn_from_template(template, true, true)
-        .expect("copy");
-    let mut domains: Vec<u32> = [template, private, shared[0], shared[1], fork, late]
+    let late = copy(&mut host);
+    let late = elsewhere(&mut host, late);
+    let domain = |host: &Host, id| host.domain(id).expect("in the tree");
+    for id in [in_domain, fork] {
+        assert_eq!(
+            domain(&host, id),
+            domain(&host, template),
+            "{id}: same domain"
+        );
+    }
+    let mut domains: Vec<u32> = [template, private, shared[0], shared[1], late]
         .iter()
-        .map(|&id| host.domain(id).expect("in the tree"))
+        .map(|&id| domain(&host, id))
         .collect();
     domains.sort_unstable();
     domains.dedup();
-    assert_eq!(domains.len(), 6, "every copy a root of its own domain");
+    assert_eq!(domains.len(), 5, "each placed copy in a domain of its own");
     // Compared before the copies run: they would rewrite every page at once
     // (a template's deadlines expire in its copies).
-    let of_template = [shared[0], shared[1]].map(|id| frame(&mut host, id));
-    assert_eq!(
-        of_template[0], of_template[1],
-        "a published template shares"
-    );
-    for id in [private, fork, late] {
-        assert_ne!(frame(&mut host, id), of_template[0], "{id}: a full copy");
+    let of_template = frame(&mut host, in_domain);
+    for id in [fork, shared[0], shared[1]] {
+        assert_eq!(frame(&mut host, id), of_template, "{id}: shared");
     }
-    for id in [private, shared[0], shared[1], fork, late] {
+    for id in [private, late] {
+        assert_ne!(frame(&mut host, id), of_template, "{id}: a full copy");
+    }
+    for id in [in_domain, fork, private, shared[0], shared[1], late] {
         until_asleep_with(&mut host, id, b"written\n");
         assert!(host.kill(id));
     }
@@ -233,12 +262,12 @@ fn template_dropped_under_two_domains() {
     let mut host = Host::new();
     let template = writer_template(&mut host, b"1");
     assert_eq!(host.publish(template, false), Ok(()));
-    let a = host
-        .spawn_from_template(template, true, true)
-        .expect("copy");
-    let b = host
-        .spawn_from_template(template, true, true)
-        .expect("copy");
+    let [a, b] = [0; 2].map(|_| {
+        let id = host
+            .spawn_from_template(template, true, true)
+            .expect("copy");
+        elsewhere(&mut host, id)
+    });
     assert_ne!(host.domain(a), host.domain(b));
     assert!(host.drop_template(template));
     assert!(host.kill(b), "b ends before a writes");

@@ -127,6 +127,18 @@ impl Host {
         true
     }
 
+    /// Takes `cell`, just entered by [`enter_restored`] from a snapshot of
+    /// cell `origin`, out of the tree again: suspended as it was, or gone.
+    ///
+    /// [`enter_restored`]: Self::enter_restored
+    pub(super) fn leave_restored(&mut self, cell: &Cell, origin: u32) {
+        if cell.domain == cell.id {
+            let _ = self.tree.end(cell.id, &mut fresh_domain); // a new root
+        } else if self.tree.rekey(cell.id, origin).is_some() {
+            self.suspended.push(origin);
+        }
+    }
+
     /// What cell `id` uses itself, as limits: its frames, CPU time and
     /// sockets while it is live, nothing otherwise.
     fn usage(&mut self, id: u32) -> Limits {
@@ -335,6 +347,12 @@ impl Host {
             return Err(TreeError::NotFound);
         }
         let (saved, old, old_pid) = (n.spec(), n.parent(), n.pid());
+        // Into another domain (a root's is new), it first takes private
+        // copies of what it shares, or stays (design D21).
+        let domain = n.domain();
+        if self.tree.domain(parent) != Some(domain) {
+            self.unshare_subtree(id)?;
+        }
         if parent == HOST {
             let (l, was) = (&mut spec.limits, saved.limits);
             l.memory = if l.memory == u64::MAX {
@@ -438,11 +456,7 @@ impl Host {
             _ => self.tree.domain(to) != self.tree.domain(id),
         };
         if leaves && self.tree.controls(by, id) {
-            for cell in self.tree.subtree(id)? {
-                if !self.unshare(cell) {
-                    return Err(TreeError::NoMemory);
-                }
-            }
+            self.unshare_subtree(id)?;
         }
         let used = self.usage(to);
         self.tree

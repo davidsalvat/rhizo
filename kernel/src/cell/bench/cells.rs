@@ -23,9 +23,6 @@ pub(super) fn fork_and_templates() -> [u64; 4] {
         host.step();
     }
     assert!(host.freeze(big));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(big, false), Ok(()));
     let (mut fork, mut touch) = (Vec::new(), Vec::new());
     let mut frames = 0;
     for _ in 0..ROUNDS {
@@ -49,9 +46,6 @@ pub(super) fn fork_and_templates() -> [u64; 4] {
         .spawn(test_image("hello"), &[b"hello"], true, false)
         .expect("spawn");
     assert!(host.freeze(hello));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(hello, false), Ok(()));
     let mut template = Vec::new();
     for _ in 0..101 {
         let t0 = bench_clock();
@@ -145,9 +139,6 @@ pub(super) fn files() -> (u64, u64) {
         host.step();
     }
     assert!(host.freeze(holder));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(holder, false), Ok(()));
     let mut fork = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         let t0 = bench_clock();

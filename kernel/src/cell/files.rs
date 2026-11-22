@@ -79,16 +79,21 @@ pub fn dynamic_files() -> Option<Fs> {
 }
 
 /// The files of the distribution's programs (`distro-files`: `ls`, `sort`,
-/// `python3`, their interpreter, libraries and data), as
-/// [`dynamic_files`]; packed natively only, and embedded in test kernels
-/// only.
+/// `python3`, their interpreter, libraries and data), decoded once and
+/// shared copy-on-write like [`dynamic_files`]; packed natively only, and
+/// embedded in test kernels only. A test fixture, not a set the host ships:
+/// not published (design D21 of `add-cell-hierarchy`), so its pages are
+/// kept per domain and go once unmapped, instead of pinning about 16 MiB
+/// for as long as the kernel runs.
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "used by in-kernel tests")
 )]
 pub fn distro_files() -> Option<Fs> {
     static FILES: Global<Option<Fs>> = Global::new(None);
-    decoded(&FILES, "distro-files")
+    let bytes = test_image("distro-files");
+    let decode = || Fs::decode(bytes).expect("xtask packs a valid file system");
+    (!bytes.is_empty()).then(|| FILES.with(|files| files.get_or_insert_with(decode).clone()))
 }
 
 /// The files of the dynamically linked CPython with packages from PyPI

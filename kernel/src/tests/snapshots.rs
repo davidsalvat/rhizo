@@ -112,9 +112,7 @@ fn lazy_resume_restores_only_touched_pages() {
 /// A cell forked from a template and suspended before it writes refers to
 /// the template's pages instead of copying them (spec `snapshots`, change
 /// `add-shared-snapshots`); resumed, it writes its own copies, and the
-/// template's pages stay as they were. The template is published: only
-/// then do its copies, each a root, share its frames (design D21 of
-/// `add-cell-hierarchy`).
+/// template's pages stay as they were.
 fn a_suspended_fork_refers_to_its_template() {
     let mut host = Host::new();
     let template = spawn(&mut host, "ballast", &[b"write", b"2"]);
@@ -122,7 +120,6 @@ fn a_suspended_fork_refers_to_its_template() {
         host.step();
     }
     assert!(host.freeze(template));
-    assert_eq!(host.publish(template, false), Ok(()));
     let checked = (Ending::Exit(0), "checked\n".into());
     for mode in [Resume::Lazy, Resume::Eager] {
         let id = host

@@ -595,6 +595,36 @@ fn full_copy_shares_only_kept_pages<F: EntryFormat>() {
     }
     assert_eq!(w.frames.live(), 0, "every frame returned once");
 
+    // Kept pages: one the source cannot write in place (behind its fork's
+    // shared tables) is shared copy-on-write; one it writes in place is
+    // its own alone, so copied whatever `keep` says.
+    let parent = w.table();
+    w.map(&parent, 0x60_0000, PageSize::Small, RW);
+    w.map(&parent, 0x70_0000, PageSize::Small, RW);
+    w.write(&parent, 0x60_0000, 9);
+    let (kept, own) = (w.page(&parent, 0x60_0000), w.page(&parent, 0x70_0000));
+    let behind = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    let copy = behind
+        .copy_lower_half(&mut w.mem, &mut w.frames, &mut |p| p == kept)
+        .unwrap();
+    assert_eq!(w.page(&copy, 0x60_0000), kept, "shared");
+    let flags = w.flags(&copy, 0x60_0000);
+    assert!(!flags.is_writable() && flags.contains(PageFlags::COPY_ON_WRITE));
+    assert!(w.write(&copy, 0x60_0000, 10));
+    assert_ne!(w.page(&copy, 0x60_0000), kept, "its write copied");
+    assert_eq!(w.read(&behind, 0x60_0000), 9);
+    let alone = w.table();
+    w.map(&alone, 0x70_0000, PageSize::Small, RW);
+    let mine = w.page(&alone, 0x70_0000);
+    let copy2 = alone
+        .copy_lower_half(&mut w.mem, &mut w.frames, &mut |p| p == mine || p == own)
+        .unwrap();
+    assert_ne!(w.page(&copy2, 0x70_0000), mine, "written in place: copied");
+    for pt in [parent, behind, copy, alone, copy2] {
+        pt.destroy_lower_half(&mut w.mem, &mut w.frames);
+    }
+    assert_eq!(w.frames.live(), 0);
+
     // No 2 MiB block: the large page comes as 4 KiB pages.
     let source = w.table();
     w.map(&source, 0x4000_0000_0000, PageSize::Large, RW);
@@ -692,6 +722,9 @@ enum Op {
     /// A full copy that shares no page (design D21 of
     /// `add-cell-hierarchy`).
     Copy(usize),
+    /// A full copy told to keep every page: it shares what the source
+    /// cannot write in place, copy-on-write.
+    CopyKeeping(usize),
     Destroy(usize),
     /// Holds a reference to every page of a cell another one can reach,
     /// after `unshare_tables`, as a snapshot does.
@@ -710,6 +743,7 @@ fn op() -> impl Strategy<Value = Op> {
         (0..4usize).prop_map(Op::Destroy),
         (0..4usize).prop_map(Op::Hold),
         (0..4usize).prop_map(Op::Copy),
+        (0..4usize).prop_map(Op::CopyKeeping),
     ]
 }
 
@@ -776,6 +810,14 @@ fn model_check<F: EntryFormat>(ops: &[Op]) {
                     .copy_lower_half(&mut w.mem, &mut w.frames, &mut |_| false)
                     .unwrap();
                 assert!(!copy.shares(&w.mem, &w.frames, &mut |_| false), "{op:?}");
+                let model = cells[c].1.clone();
+                cells.push((copy, model));
+            }
+            Op::CopyKeeping(c) if c < n && n < 4 => {
+                let copy = cells[c]
+                    .0
+                    .copy_lower_half(&mut w.mem, &mut w.frames, &mut |_| true)
+                    .unwrap();
                 let model = cells[c].1.clone();
                 cells.push((copy, model));
             }

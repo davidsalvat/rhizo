@@ -42,9 +42,6 @@ pub(super) fn numpy() -> Option<(u64, u64)> {
     host.run_to_pause(template, b"ready", Pause::Slice)
         .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     let mut warm = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         host.finished.clear();
@@ -91,9 +88,6 @@ pub(super) fn dynamic() -> Option<(u64, u64)> {
     host.run_to_pause(template, b"ready", Pause::Waits)
         .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     let mut warm = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         host.finished.clear();
@@ -131,9 +125,6 @@ pub(super) fn workload() -> (u64, u64) {
     host.run_to_pause(template, b"warm", Pause::Slice)
         .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     for _ in 0..ROUNDS {
         let t0 = bench_clock();
         let id = host
@@ -191,9 +182,6 @@ pub(super) fn python() -> Option<(u64, u64)> {
     host.run_to_pause(template, b"warm", Pause::Waits)
         .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     for _ in 0..ROUNDS {
         let t0 = bench_clock();
         let id = host
@@ -255,9 +243,6 @@ pub(super) fn node(jit: bool) -> Option<(u64, u64, u64)> {
     host.run_to_pause(template, b"warm", Pause::Waits)
         .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     // The pause (50 ms) ends before the first fork, as for a template made
     // long before: a fork's `epoll_pwait` has timed out, but libuv compares
     // the timer's due time with the clock and would wait for the rest.
@@ -306,9 +291,6 @@ pub(super) fn cpython() -> Option<(u64, u64)> {
     host.run_to_pause(template, b"warm", Pause::Waits)
         .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     for _ in 0..ROUNDS {
         let t0 = bench_clock();
         let id = host
@@ -385,9 +367,6 @@ pub(super) fn density() -> (u64, u64) {
             host.step();
         }
         assert!(host.freeze(template));
-        // Shipped by the host: its copies, each a root, share it (design D21
-        // of `add-cell-hierarchy`).
-        assert_eq!(host.publish(template, false), Ok(()));
         let before = memory::free_bytes();
         let ids: Vec<u32> = (0..N)
             .map(|_| {

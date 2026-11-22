@@ -99,12 +99,13 @@ pub(super) fn withdraw_pages(pages: &[rhizo_fs::Page]) {
 }
 
 /// Tells whether a frame is of a public object, which every domain may
-/// share (design D21 of `add-cell-hierarchy`): a published page of a file,
-/// or a read-only page of an executable the kernel keeps loaded (as they
-/// are now).
-pub(super) fn public_frames() -> impl FnMut(u64) -> bool {
-    let images = image_frames();
-    move |phys| images.binary_search(&phys).is_ok() || PAGES.with(|p| p.is_public(phys))
+/// share (design D21 of `add-cell-hierarchy`): one of `frames`, a published
+/// page of a file, or a read-only page of an executable the kernel keeps
+/// loaded (as they are now).
+pub(super) fn public_frames(mut frames: Vec<u64>) -> impl FnMut(u64) -> bool + use<> {
+    frames.extend(image_frames());
+    frames.sort_unstable();
+    move |phys| frames.binary_search(&phys).is_ok() || PAGES.with(|p| p.is_public(phys))
 }
 
 /// Tells whether a frame is one a cache of the kernel holds (a file page

@@ -161,9 +161,12 @@ impl<F: EntryFormat> PageTable<F> {
     }
 
     /// Copies the user half into a new hierarchy that shares nothing with
-    /// this one but the read-only pages `keep` names (design D21 of
+    /// this one but the pages `keep` names (design D21 of
     /// `add-cell-hierarchy`: a copy into another domain shares only public
-    /// objects). Every other page, copy-on-write, writable or read-only, is
+    /// objects) that this hierarchy cannot write in place (read-only, or
+    /// behind a table that forbids writes), copy-on-write if their entry is
+    /// writable. Every other page,
+    /// copy-on-write, writable or read-only, is
     /// copied into a frame of its own whose entry keeps every permission
     /// and mark (a copy-on-write mark left on it is resolved by the next
     /// write without a copy); a 2 MiB page with no 2 MiB block free is
@@ -178,6 +181,8 @@ impl<F: EntryFormat> PageTable<F> {
         frames: &mut impl Frames,
         keep: &mut impl FnMut(u64) -> bool,
     ) -> Result<Self, MapError> {
+        /// `writable`: no table above `from` forbids writes.
+        #[allow(clippy::too_many_arguments)]
         fn walk<F: EntryFormat>(
             mem: &mut impl PhysicalMemory,
             frames: &mut impl Frames,
@@ -186,6 +191,7 @@ impl<F: EntryFormat> PageTable<F> {
             to: u64,
             level: u32,
             entries: u64,
+            writable: bool,
         ) -> Result<(), MapError> {
             for i in 0..entries {
                 let entry = mem.read_u64(from + i * 8);
@@ -208,16 +214,23 @@ impl<F: EntryFormat> PageTable<F> {
                         table,
                         level - 1,
                         ENTRIES,
+                        writable && F::table_writable(entry),
                     )?;
                     continue;
                 }
                 let bytes = leaf_bytes::<F>(entry, level);
                 let page = F::address(entry) & !(bytes - 1);
-                let flags = F::flags(entry);
-                let shareable = !flags.is_writable() && !flags.contains(PageFlags::COPY_ON_WRITE);
-                if shareable && keep(page) {
+                // A page this hierarchy writes in place is its own alone:
+                // copied, whatever `keep` says.
+                let own = writable && F::flags(entry).is_writable();
+                if !own && keep(page) {
+                    // Shared, so never writable in place (invariant).
                     frames.share(page);
-                    mem.write_u64(to + i * 8, entry);
+                    let shared = match F::flags(entry).is_writable() {
+                        true => F::with_cow(F::with_leaf_writable(entry, false), true),
+                        false => entry,
+                    };
+                    mem.write_u64(to + i * 8, shared);
                     continue;
                 }
                 let copy = match bytes {
@@ -245,7 +258,7 @@ impl<F: EntryFormat> PageTable<F> {
             mem.write_u64(root + i * 8, mem.read_u64(self.root() + i * 8));
         }
         let copy = Self::from_root(root);
-        if let Err(e) = walk::<F>(mem, frames, keep, self.root(), root, 3, ENTRIES / 2) {
+        if let Err(e) = walk::<F>(mem, frames, keep, self.root(), root, 3, ENTRIES / 2, true) {
             copy.destroy_lower_half(mem, frames);
             return Err(e);
         }

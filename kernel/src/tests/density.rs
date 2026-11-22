@@ -95,9 +95,6 @@ fn a_thousand_idle_cells() {
             host.step();
         }
         assert!(host.freeze(template));
-        // Its copies, each a root, share it only once published (design
-        // D21 of `add-cell-hierarchy`), as the host's templates are.
-        assert_eq!(host.publish(template, false), Ok(()));
         let before = memory::free_bytes();
         let ids: Vec<u32> = (0..N)
             .map(|_| {

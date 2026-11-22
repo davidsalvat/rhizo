@@ -27,16 +27,16 @@ pub enum Refused {
     MayHoldSecret,
 }
 
-/// A copy of `pt`'s user half that shares only public frames (design D21
-/// of `add-cell-hierarchy`), its frames counted by `meter`; `None` if they
-/// do not fit it or memory.
-pub(super) fn full_copy(pt: &PageTable<Format>, meter: &Meter) -> Option<PageTable<Format>> {
-    pt.copy_lower_half(
-        &mut DirectMap,
-        &mut cell_frames(meter),
-        &mut public_frames(),
-    )
-    .ok()
+/// A copy of `pt`'s user half that shares only the frames `public` names
+/// (design D21 of `add-cell-hierarchy`), its frames counted by `meter`;
+/// `None` if they do not fit it or memory.
+fn full_copy(
+    pt: &PageTable<Format>,
+    meter: &Meter,
+    public: &mut impl FnMut(u64) -> bool,
+) -> Option<PageTable<Format>> {
+    pt.copy_lower_half(&mut DirectMap, &mut cell_frames(meter), public)
+        .ok()
 }
 
 /// Bytes `pt`'s user half maps.
@@ -110,12 +110,6 @@ impl Host {
         found.is_some_and(|(_, pages)| pages.is_some())
     }
 
-    /// Whether copies of cell `id` go into a domain of their own: those of
-    /// a root, which are roots (design D13), or of a cell not in the tree.
-    pub(super) fn copies_leave_domain(&self, id: u32) -> bool {
-        self.tree.get(id).is_none_or(|n| n.is_root())
-    }
-
     /// The memory of template `id`, whose tables are at `root`, goes: at
     /// once, unless it was ever published and another cell still shares
     /// it, which then keeps it until none does (item 12 of design D12: no
@@ -166,15 +160,17 @@ impl Host {
     /// changing nothing, if its memory quota or the machine cannot hold
     /// them. A suspended cell's snapshot moves when it is resumed.
     pub(super) fn unshare(&mut self, id: u32) -> bool {
+        let mut public = self.public_frames();
         if let Some((cell, ..)) = self.templates.iter_mut().find(|(c, ..)| c.id == id) {
             let old = PageTable::<Format>::from_root(cell.root);
-            if !shares_private(&old, true) {
+            if !shares_private(&old, true, &mut public) {
                 return true;
             }
             if !cells_may_take(mapped_bytes(&old)) {
                 return false;
             }
-            let Some(new) = sharing(true, || full_copy(&old, &Meter::new(0, u64::MAX))) else {
+            let all = Meter::new(0, u64::MAX);
+            let Some(new) = sharing(true, || full_copy(&old, &all, &mut public)) else {
                 return false;
             };
             cell.root = new.root();
@@ -189,13 +185,13 @@ impl Host {
             lazy.finish(&old, &live.frames);
         }
         live.demand.lazy = None;
-        if !shares_private(&old, live.shares) {
+        if !shares_private(&old, live.shares, &mut public) {
             self.requeue(live, wake);
             return true;
         }
         let used = Meter::new(0, live.frames.limit());
         let copy = match cells_may_take(mapped_bytes(&old)) {
-            true => sharing(live.shares, || full_copy(&old, &used)),
+            true => sharing(live.shares, || full_copy(&old, &used, &mut public)),
             false => None,
         };
         let Some(new) = copy else {
@@ -214,14 +210,42 @@ impl Host {
         self.requeue(live, wake);
         true
     }
+
+    /// Gives every cell of `id`'s subtree private copies of what it shares
+    /// before the subtree moves into another domain (design D21):
+    /// `NoMemory` if one of them cannot hold them.
+    pub(super) fn unshare_subtree(&mut self, id: u32) -> Result<(), rhizo_cap::Error> {
+        for cell in self.tree.subtree(id)? {
+            if !self.unshare(cell) {
+                return Err(rhizo_cap::Error::NoMemory);
+            }
+        }
+        Ok(())
+    }
+
+    /// Tells whether a frame is of a public object (design D21), as they
+    /// are now: those [`public_frames`] names, and every page of a template
+    /// published now.
+    pub(super) fn public_frames(&self) -> impl FnMut(u64) -> bool + use<> {
+        let mut frames = Vec::new();
+        for (cell, ..) in &self.templates {
+            if self.is_published(cell.id) {
+                PageTable::<Format>::from_root(cell.root)
+                    .for_each_lower_leaf(&DirectMap, &mut |_, phys, _, _| frames.push(phys));
+            }
+        }
+        public_frames(frames)
+    }
 }
 
-/// Whether another cell may reach a page of `pt` that is no public
-/// object's, under [`SHARING`] if `locked`.
-fn shares_private(pt: &PageTable<Format>, locked: bool) -> bool {
-    sharing(locked, || {
-        pt.shares(&DirectMap, &KernelFrames, &mut public_frames())
-    })
+/// Whether another cell may reach a page of `pt` that `public` does not
+/// name, under [`SHARING`] if `locked`.
+fn shares_private(
+    pt: &PageTable<Format>,
+    locked: bool,
+    public: &mut impl FnMut(u64) -> bool,
+) -> bool {
+    sharing(locked, || pt.shares(&DirectMap, &KernelFrames, public))
 }
 
 /// Whether another cell may still reach a page of `pt` that no cache of

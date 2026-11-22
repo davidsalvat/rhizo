@@ -132,9 +132,6 @@ fn laptop(console: &mut impl Console) {
         .expect("spawn the agent");
     wait_for(&mut host, template, b"ready\n", 1);
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     let after_template = memory::free_bytes();
 
     let ns = |t0: u64| timer::cycles_to_ns(Counter.cycles() - t0).unwrap_or(0);
@@ -273,9 +270,6 @@ fn server(console: &mut impl Console) {
                 host.step();
             }
             assert!(host.freeze(id));
-            // Shipped by the host: its copies, each a root, share it (design D21
-            // of `add-cell-hierarchy`).
-            assert_eq!(host.publish(id, false), Ok(()));
             id
         })
         .collect();
@@ -504,9 +498,6 @@ pub fn fill_memory() -> Oom {
     wait_for(&mut host, small, b"idle\n", 1);
     let snapshot = host.suspend(small).expect("suspend");
     assert!(host.freeze(template));
-    // Shipped by the host: its copies, each a root, share it (design D21
-    // of `add-cell-hierarchy`).
-    assert_eq!(host.publish(template, false), Ok(()));
     let mut cells = Vec::new();
     while let Some(id) = host.spawn_from_template(template, false, false) {
         cells.push(id);
