@@ -73,6 +73,20 @@ impl Frames for KernelFrames {
     }
 }
 
+/// Whether the cell of `meter` may take `bytes` more: what its memory
+/// limit leaves is set aside for it (design D4 of `add-cell-hierarchy`),
+/// only the rest must be free for cells.
+pub(super) fn may_take(meter: &Meter, bytes: u64) -> bool {
+    let room = match meter.limit() < Quota::NONE.frames() {
+        true => meter
+            .limit()
+            .saturating_sub(meter.used())
+            .saturating_mul(FRAME_SIZE),
+        false => 0,
+    };
+    bytes <= room || cells_may_take(bytes - room)
+}
+
 /// The frames of a cell, counted by its meter against its memory quota
 /// (design D1 of `add-cell-quotas`).
 pub(super) fn cell_frames(meter: &Meter) -> Metered<'_, KernelFrames> {

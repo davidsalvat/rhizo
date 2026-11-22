@@ -5,6 +5,10 @@
 pub const DEPTH_MAX: u8 = 16;
 /// Most children of one cell (`EMLINK`), whatever its descendant budget.
 pub const CHILDREN_MAX: u16 = 1024;
+/// Capacity of the kernel's table of cells: the reserved roots' descendant
+/// budgets are admitted against it, and the host refuses a root past it
+/// (design D4 and D19).
+pub const CELLS_MAX: u32 = 1 << 16;
 /// Most handles one cell holds (`EMFILE`).
 pub const HANDLES_MAX: u32 = 256;
 /// Longest derivation chain of a grant (`EMLINK`).
@@ -54,6 +58,7 @@ const _: () = assert!(MESSAGE_HANDLES_MAX <= HANDLES_MAX);
 const _: () = assert!(INBOX_MAX <= CHANNELS_MAX);
 const _: () = assert!(CHAIN_MAX <= DEPTH_MAX as u32);
 const _: () = assert!(CHILDREN_MAX as u32 <= DESCRIPTORS_MAX);
+const _: () = assert!(CHILDREN_MAX as u32 <= CELLS_MAX);
 const _: () = assert!(FLOOR_MAX <= RULES_MAX);
 const _: () = assert!(WEIGHT_MIN <= WEIGHT_DEFAULT && WEIGHT_DEFAULT <= WEIGHT_MAX);
 // The audit ring holds a record naming a label for every child of a cell.

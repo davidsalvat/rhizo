@@ -22,7 +22,7 @@ use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
 /// Bytes of a TCP connection's buffers to and from the wire, each way.
-const TCP_BUF: usize = 64 << 10;
+pub(crate) const TCP_BUF: usize = 64 << 10;
 /// Datagrams and bytes a UDP socket buffers to and from the wire.
 const UDP_PACKETS: usize = 16;
 const UDP_BYTES: usize = 64 << 10;

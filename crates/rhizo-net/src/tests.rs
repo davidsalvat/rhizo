@@ -761,6 +761,30 @@ fn the_number_of_sockets_is_bounded() {
     assert!(net.socket(Family::Inet, Type::Dgram).is_ok());
 }
 
+/// Design D4 of `add-cell-hierarchy`: sockets kept for reserved domains
+/// are refused to cells without a memory limit, never to reserved ones.
+#[test]
+fn reserved_sockets_are_kept_from_unlimited_cells() {
+    let mut net = Net::new();
+    net.set_reserved(16);
+    let reserved = Ports {
+        reserved: true,
+        ..Ports::new(1)
+    };
+    net.enter(Ports::new(2));
+    for _ in 0..SOCKETS_MAX - 16 {
+        net.socket(Family::Inet, Type::Dgram).unwrap();
+    }
+    assert_eq!(net.socket(Family::Inet, Type::Dgram), Err(Error::TooMany));
+    net.leave();
+    net.enter(reserved);
+    for _ in 0..16 {
+        net.socket(Family::Inet, Type::Dgram).unwrap();
+    }
+    assert_eq!(net.socket(Family::Inet, Type::Dgram), Err(Error::TooMany));
+    net.leave();
+}
+
 proptest! {
     /// Decoding arbitrary bytes never panics.
     #[test]

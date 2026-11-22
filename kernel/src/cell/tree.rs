@@ -11,6 +11,18 @@ fn fresh_domain() -> u32 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Sockets the reserved roots of every host hold (design D4 of
+/// `add-cell-hierarchy`, roots and admission): the sum of their socket
+/// limits, at most half of `rhizo_net::SOCKETS_MAX` (a connection costs
+/// two sockets).
+pub(super) static RESERVED_SOCKETS: AtomicU32 = AtomicU32::new(0);
+/// Cells the reserved roots of every host hold: one each with its
+/// descendant limit, at most `rhizo_cap::limits::CELLS_MAX`.
+pub(super) static RESERVED_CELLS: AtomicU32 = AtomicU32::new(0);
+
+/// Most sockets the reserved roots may hold together.
+const RESERVED_SOCKETS_MAX: u64 = (rhizo_net::SOCKETS_MAX / 2) as u64;
+
 /// The limits of a root with `quota`.
 fn root_limits(quota: &Quota) -> Limits {
     Limits {
@@ -19,6 +31,19 @@ fn root_limits(quota: &Quota) -> Limits {
         sockets: quota.sockets,
         cells: u32::MAX,
     }
+}
+
+/// Whether the kernel can take reserved roots holding `more` than they
+/// do (design D4, roots and admission): memory that cells can take now,
+/// less what is set aside for other reserved domains (the kernel's caches
+/// dropped if need be), sockets within half of the kernel's and cells
+/// within its cell table.
+fn admits(more: Limits) -> bool {
+    let sockets = u64::from(RESERVED_SOCKETS.load(Ordering::Relaxed)) + u64::from(more.sockets);
+    let cells = u64::from(RESERVED_CELLS.load(Ordering::Relaxed)) + u64::from(more.cells);
+    sockets <= RESERVED_SOCKETS_MAX
+        && cells <= u64::from(rhizo_cap::limits::CELLS_MAX)
+        && (more.memory == 0 || cells_may_take(more.memory))
 }
 
 impl Host {
@@ -45,6 +70,12 @@ impl Host {
     /// number 1 (`getpid`, spec `linux-abi`); `false` if the tree has no
     /// room.
     pub(super) fn enter_root(&mut self, cell: &mut Cell) -> bool {
+        // A new cell is no reserved root: it may not take the room of the
+        // kernel's cell table reserved roots hold (design D4).
+        let reserved = u64::from(RESERVED_CELLS.load(Ordering::Relaxed));
+        if self.tree.len() as u64 + reserved >= u64::from(rhizo_cap::limits::CELLS_MAX) {
+            return false;
+        }
         let spec = Spec {
             limits: root_limits(&cell.quota),
             ..Spec::default()
@@ -100,6 +131,102 @@ impl Host {
         entered
     }
 
+    /// After copies of cell `source`, which has a memory limit, entered
+    /// the tree (design D4): copies of a root are reserved roots the
+    /// kernel's reservations count; copies of a child are carved from its
+    /// parent, which may then use that much less. Out of line: copies of
+    /// cells without a memory limit never come here.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn copies_entered(&mut self, source: u32) {
+        match self.tree.get(source).map_or(HOST, |n| n.parent()) {
+            HOST => self.refresh_reserved(),
+            parent => self.sync(parent),
+        }
+    }
+
+    /// Whether the kernel can take `n` copies of cell `source`: each copy
+    /// of a reserved root is a reserved root holding its limits, admitted
+    /// against the kernel's memory, sockets and cell table (design D4).
+    /// Copies of other cells take nothing more of the kernel's. Out of
+    /// line: only cells with a memory limit come here.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn admits_copies(&self, source: u32, n: usize) -> bool {
+        let Some(node) = self.tree.get(source).filter(|n| n.is_root()) else {
+            return true;
+        };
+        let one = node.limits().reservation();
+        if one == Limits::ZERO {
+            return true;
+        }
+        let n = n as u64;
+        admits(Limits {
+            memory: one.memory.saturating_mul(n),
+            cpu_ns: 0,
+            sockets: u32::try_from(u64::from(one.sockets) * n).unwrap_or(u32::MAX),
+            cells: u32::try_from(u64::from(one.cells) * n).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Whether the kernel can take cell `id` as a root with `limits` (a
+    /// new root, or one whose limits change), against what it holds now:
+    /// a reserved root's memory against what cells can take less what is
+    /// set aside for others, its sockets against half of the kernel's and
+    /// its descendants against the cell table (design D4, roots and
+    /// admission). A root without a memory limit reserves nothing.
+    fn admits_root(&mut self, id: u32, limits: Limits) -> bool {
+        let new = limits.reservation();
+        if new == Limits::ZERO {
+            return true;
+        }
+        let old = self
+            .tree
+            .get(id)
+            .filter(|n| n.is_root())
+            .map_or(Limits::ZERO, |n| n.limits().reservation());
+        // What its meter, or its suspension, sets aside now, and will.
+        let aside = self.held_aside.iter().find(|&&(c, _)| c == id);
+        let (used, limit) = match aside {
+            Some(&(_, frames)) => {
+                let limit = self.tree.get(id).map_or(0, |n| n.limits().memory) / FRAME_SIZE;
+                (limit.saturating_sub(frames), limit)
+            }
+            None => self
+                .with_live(id, |live| (live.frames.used(), live.frames.limit()))
+                .unwrap_or((0, u64::MAX)),
+        };
+        let held = |limit: u64| match limit < Quota::NONE.frames() {
+            true => limit.saturating_sub(used),
+            false => 0,
+        };
+        let more = held(new.memory / FRAME_SIZE).saturating_sub(held(limit));
+        admits(Limits {
+            memory: more * FRAME_SIZE,
+            cpu_ns: 0,
+            sockets: new.sockets.saturating_sub(old.sockets),
+            cells: new.cells.saturating_sub(old.cells),
+        })
+    }
+
+    /// The kernel's reservations follow this host's reserved roots, after
+    /// a change to them: sockets kept from cells without a memory limit,
+    /// and room in the cell table.
+    pub(super) fn refresh_reserved(&mut self) {
+        let now = self.tree.reserved_roots();
+        let was = core::mem::replace(&mut self.reserved, now);
+        if (now.sockets, now.cells) == (was.sockets, was.cells) {
+            return;
+        }
+        let shift = |counter: &AtomicU32, from: u32, to: u32| {
+            counter.fetch_add(to.wrapping_sub(from), Ordering::Relaxed);
+        };
+        shift(&RESERVED_CELLS, was.cells, now.cells);
+        shift(&RESERVED_SOCKETS, was.sockets, now.sockets);
+        let sockets = RESERVED_SOCKETS.load(Ordering::Relaxed) as usize;
+        with_net(|net| net.set_reserved(2 * sockets));
+    }
+
     /// Records in `snapshot`, taken of cell `id`, its node's limits and
     /// policies (format version 11, spec `snapshots`, tree state).
     pub(super) fn record_tree(&self, snapshot: &mut Snapshot, id: u32) {
@@ -122,17 +249,23 @@ impl Host {
     /// `false` if the tree has no room.
     pub(super) fn enter_restored(&mut self, cell: &mut Cell, snapshot: &Snapshot) -> bool {
         let origin = snapshot.origin();
+        // A cell with a memory limit has it in its quota.
+        let limited = cell.quota.memory != u64::MAX;
         if let Some(at) = self.suspended.iter().position(|&s| s == origin)
             && let Some(n) = self.tree.rekey(origin, cell.id)
         {
             (cell.pid, cell.domain) = (n.pid(), n.domain());
-            self.suspended.swap_remove(at);
+            // Its meter sets aside what was held for it while suspended.
+            self.unsuspend(at);
             self.reshare_if_by_weight();
             return true;
         }
         // A snapshot of a cell this host still holds (a template's) makes a
         // copy of it: a sibling in its domain (design D13).
         if origin != 0 && self.tree.get(origin).is_some() {
+            if limited && !self.admits_copies(origin, 1) {
+                return false;
+            }
             // Not `cell` itself in the closure: its address would escape,
             // and every resume would copy all of it to pass it on.
             let mut at = (0, 0);
@@ -140,6 +273,9 @@ impl Host {
                 at = (pid, domain);
             });
             (cell.pid, cell.domain) = at;
+            if entered && limited {
+                self.copies_entered(origin);
+            }
             return entered;
         }
         let Ok(spec) = snapshot.placed(&Egress::None, &Egress::None, root_limits(&cell.quota))
@@ -151,12 +287,28 @@ impl Host {
             pid => pid,
         };
         let plain = super::shares::plain_root(&spec);
+        let reserved = spec.limits.reservation() != Limits::ZERO;
+        if reserved && !self.admits_root(cell.id, spec.limits) {
+            return false;
+        }
         let Ok(pid) = self.tree.add_root(cell.id, spec, source) else {
             return false;
         };
         (cell.pid, cell.domain) = (pid, cell.id);
         self.reshare_after(plain);
+        if reserved {
+            self.refresh_reserved();
+        }
         true
+    }
+
+    /// Takes suspended cell `suspended[at]` off the list (resumed or gone),
+    /// with the frames set aside for it.
+    fn unsuspend(&mut self, at: usize) {
+        let id = self.suspended.swap_remove(at);
+        if let Some(i) = self.held_aside.iter().position(|&(c, _)| c == id) {
+            memory::RESERVE.release(self.held_aside.swap_remove(i).1);
+        }
     }
 
     /// Takes `cell`, just entered by [`enter_restored`] from a snapshot of
@@ -207,7 +359,7 @@ impl Host {
     pub fn drop_snapshot(&mut self, snapshot: &Snapshot) {
         let origin = snapshot.origin();
         if let Some(at) = self.suspended.iter().position(|&s| s == origin) {
-            self.suspended.swap_remove(at);
+            self.unsuspend(at);
             self.ends.push(origin);
             self.settle();
         }
@@ -230,7 +382,7 @@ impl Host {
             for &gone in &ended.gone {
                 forget_network(gone);
                 if let Some(at) = self.suspended.iter().position(|&s| s == gone) {
-                    self.suspended.swap_remove(at);
+                    self.unsuspend(at);
                     self.finished.push(Finished {
                         id: gone,
                         ending: Ending::Killed,
@@ -260,6 +412,9 @@ impl Host {
         self.settling = false;
         self.release_held();
         self.reshare_if_by_weight();
+        if self.reserved != Limits::ZERO {
+            self.refresh_reserved();
+        }
     }
 
     /// Gives cell `id` (live or a template) what its node says: its number,
@@ -316,7 +471,11 @@ impl Host {
         };
         // What it holds already stays (spec `isolation`): only its children
         // count against the new limits.
+        let root = n.is_root();
         let used = self.usage(n.parent());
+        if root && !self.admits_root(id, limits) {
+            return false;
+        }
         let usage = |c: u32| if c == id { Limits::ZERO } else { used };
         if self
             .tree
@@ -327,6 +486,9 @@ impl Host {
         }
         self.sync(id);
         self.reshare_if_by_weight();
+        if root {
+            self.refresh_reserved();
+        }
         true
     }
 
@@ -413,6 +575,9 @@ impl Host {
             };
         }
         let plain = parent == HOST && super::shares::plain_root(&spec);
+        if parent == HOST && !self.admits_root(id, spec.limits) {
+            return Err(TreeError::Budget);
+        }
         let used = self.usage(parent);
         self.tree.end(id, &mut fresh_domain)?; // a leaf: allocates nothing
         let placed = if parent == HOST {
@@ -440,6 +605,7 @@ impl Host {
         self.sync_up(parent);
         self.sync_up(old);
         self.reshare_after(plain);
+        self.refresh_reserved();
         // A cell placed before it ran: its thread takes its new number.
         let pid = self.tree.get(id).map_or(0, |n| n.pid());
         self.with_live(id, |live| {
@@ -460,11 +626,15 @@ impl Host {
     )]
     pub fn set_tree_limits(&mut self, id: u32, limits: Limits, by: Actor) -> Result<(), TreeError> {
         let parent = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
+        if parent == HOST && !self.admits_root(id, limits) {
+            return Err(TreeError::Budget);
+        }
         let (own, theirs) = (self.usage(id), self.usage(parent));
         let usage = |c: u32| if c == id { own } else { theirs };
         self.tree.set_limits(id, limits, by, &usage)?;
         self.sync(id);
         self.sync_up(parent);
+        self.refresh_reserved();
         Ok(())
     }
 
@@ -499,7 +669,13 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn reparent(&mut self, id: u32, to: u32, by: Actor) -> Result<(), TreeError> {
-        let old = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
+        let n = self.tree.get(id).ok_or(TreeError::NotFound)?;
+        let (old, limits) = (n.parent(), n.limits());
+        // The host's promotion keeps the parent's limits: the new root's
+        // whole reservation is new to the kernel (a parent's moves it).
+        if to == HOST && by == Actor::Host && old != HOST && !admits(limits.reservation()) {
+            return Err(TreeError::Budget);
+        }
         // Leaving its domain, its subtree first takes private copies of
         // what it shares there, or the move is refused (design D21).
         let leaves = match to {
@@ -517,6 +693,7 @@ impl Host {
         self.sync_up(old);
         self.sync_up(to);
         self.reshare();
+        self.refresh_reserved();
         Ok(())
     }
 
@@ -573,7 +750,7 @@ impl Host {
     /// by [`kill_tree`](Self::kill_tree)).
     fn end_node(&mut self, id: u32) {
         if let Some(at) = self.suspended.iter().position(|&s| s == id) {
-            self.suspended.swap_remove(at);
+            self.unsuspend(at);
             self.finished.push(Finished {
                 id,
                 ending: Ending::Killed,

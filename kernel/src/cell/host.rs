@@ -66,6 +66,14 @@ pub struct Host {
     pub(super) ends: Vec<u32>,
     /// Ends are being applied (not again from inside).
     pub(super) settling: bool,
+    /// What this host's reserved roots hold of the kernel's sockets and
+    /// cell table (design D4 of `add-cell-hierarchy`), counted in
+    /// [`RESERVED_SOCKETS`] and [`RESERVED_CELLS`].
+    pub(super) reserved: rhizo_cap::Limits,
+    /// Frames set aside for suspended cells with a memory limit, which
+    /// stay charged to their reservation (design D4): the cell, and what
+    /// its limit left unused when it was suspended.
+    pub(super) held_aside: Vec<(u32, u64)>,
     /// Templates published, and dropped ones still shared (design D21 of
     /// `add-cell-hierarchy`).
     pub(super) published: Published,
@@ -126,6 +134,8 @@ impl Host {
             suspended: Vec::new(),
             ends: Vec::new(),
             settling: false,
+            reserved: rhizo_cap::Limits::ZERO,
+            held_aside: Vec::new(),
             published: Published::default(),
         }
     }
@@ -267,13 +277,15 @@ impl Host {
         self.settle();
     }
 
-    /// A new live cell's record: its tag, nothing flushed yet.
+    /// A new live cell's record: its tag, nothing flushed yet, `used`
+    /// frames counted against its memory quota.
     pub(super) fn new_live(
         &mut self,
         cell: Cell,
         output: bool,
         echo: bool,
         mut fs: Fs,
+        used: u64,
     ) -> Box<Live> {
         // Changed only when they differ: setting them copies shared tables.
         let limits = (cell.quota.files() as usize, cell.quota.sockets as usize);
@@ -284,7 +296,7 @@ impl Host {
         if tag.is_none() {
             prof::add(Count::Untagged, 1);
         }
-        let frames = Meter::new(0, cell.quota.frames());
+        let frames = Meter::new(used, cell.quota.frames());
         Box::new(Live {
             cell,
             tag: tag.unwrap_or(0),
@@ -367,8 +379,7 @@ impl Host {
             envp,
             random,
         )?;
-        let mut live = self.new_live(cell, capture, echo, files);
-        live.frames.set_used(used.used());
+        let mut live = self.new_live(cell, capture, echo, files, used.used());
         if !self.enter_root(&mut live.cell) {
             self.discard(&live);
             return Err(ElfError::OutOfMemory);
@@ -414,7 +425,7 @@ impl Host {
             envp,
             random,
         )?;
-        let mut live = self.new_live(cell, capture, echo, files);
+        let mut live = self.new_live(cell, capture, echo, files, 0);
         if !self.enter_root(&mut live.cell) {
             self.discard(&live);
             return Err(ElfError::OutOfMemory.into());
@@ -625,6 +636,11 @@ impl Drop for Host {
         while let Some((template, ..)) = self.templates.first() {
             let id = template.id;
             self.drop_template(id);
+        }
+        self.tree = rhizo_cap::Tree::new();
+        self.refresh_reserved();
+        for (_, frames) in core::mem::take(&mut self.held_aside) {
+            memory::RESERVE.release(frames);
         }
         self.drop_held();
     }

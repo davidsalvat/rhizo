@@ -45,10 +45,11 @@ impl<A: Frames> FilePages<DirectMap, A> for KernelPages {
         };
         let (phys, fresh) = match shared {
             Share::Kept(phys, fresh) => (phys, fresh),
-            // Not kept (no room, or a count that is full): a copy from the
-            // cell's frames, counted in its quota.
-            Share::Own => (own_copy(page, mem, frames)?, true),
-            Share::OutOfMemory => return None,
+            // Not kept (no room, or a count that is full), or no frame the
+            // cache may take (none that a reservation does not hold, design
+            // D4 of `add-cell-hierarchy`): a copy from the cell's frames,
+            // counted in its quota.
+            Share::Own | Share::OutOfMemory => (own_copy(page, mem, frames)?, true),
         };
         if fresh {
             <Self as FilePages<DirectMap, A>>::code(self, phys);

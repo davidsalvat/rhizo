@@ -24,6 +24,8 @@ const ENOSPC: i64 = 28;
 /// side): asked of [`Services::can_store`] before one is made, so names
 /// count against memory like file data (spec `isolation`).
 const NAME_BYTES: u64 = 512;
+/// A file block: the most a write piece adds to what the files hold.
+const FILE_BLOCK: u64 = rhizo_fs::BLOCK as u64;
 /// Largest `getdents64` answer built at once (a caller asking for more gets
 /// fewer entries per call, as Linux allows).
 const DIRENTS_MAX: u64 = 64 << 10;
@@ -129,7 +131,7 @@ pub(crate) fn read<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 }
 
 /// `write`/`pwrite64` (with `offset`) to the console or a file.
-pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     addr: u64,
@@ -156,7 +158,18 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     while done < len {
         let at = addr.wrapping_add(done);
         let n = piece(at, len - done);
-        if !cx.services.can_store(n as u64) {
+        // A piece takes at most one new block, counted against the cell's
+        // memory (design D4 of `add-cell-hierarchy`).
+        let most = match cx.fs.holds_block(fd, start + done) {
+            true => 0,
+            false => FILE_BLOCK,
+        };
+        let before = cx.held();
+        let room = match most {
+            0 => cx.services.can_store(n as u64),
+            _ => cx.store(most),
+        };
+        if !room {
             if done == 0 {
                 return -ENOSPC;
             }
@@ -166,6 +179,7 @@ pub(crate) fn write<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         let wrote = cx.fs.write_with(fd, start + done, n, |dst| {
             memory::read(pt, mem, pager, at, dst).is_ok()
         });
+        cx.settle(most, before);
         match wrote {
             Ok(Some(n)) => done += n as u64,
             Ok(None) if done == 0 => return -EFAULT,
@@ -199,7 +213,7 @@ fn console<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     len as i64
 }
 
-pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     arch: Arch,
     cell: &Cell,
@@ -226,11 +240,15 @@ pub(crate) fn openat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
             append: flags & O_APPEND != 0,
             directory: flags & arch.o_directory() != 0,
         };
-        if how.create && !cx.services.can_store(NAME_BYTES) {
+        let most = if how.create { NAME_BYTES } else { 0 };
+        let before = cx.held();
+        if most != 0 && !cx.store(most) {
             return Err(-ENOSPC);
         }
         let kept = (flags & (O_ACCMODE | O_APPEND)) as u32;
-        let fd = match cx.fs.open(dir, &name, how, kept) {
+        let opened = cx.fs.open(dir, &name, how, kept);
+        cx.settle(most, before);
+        let fd = match opened {
             Ok(fd) => fd,
             // An entry of `/run/rhizo` (design D9 of `add-cell-hierarchy`).
             Err(Error::NoDevice) => match cx.fs.rhizo_entry(dir, &name) {
@@ -259,7 +277,7 @@ const GENERATION: &[u8] = b"/run/rhizo/generation";
 /// Opens the cell's copy generation: 8 bytes, little endian, as they are
 /// when it is opened, in a file of its own that no name refers to. Read
 /// only (`EROFS`).
-fn generation<F, M, T, A, S: Services>(
+fn generation<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     cell: &Cell,
     access: u64,
@@ -269,21 +287,27 @@ fn generation<F, M, T, A, S: Services>(
     if access != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
         return Err(-EROFS);
     }
-    if !cx.services.can_store(NAME_BYTES) {
+    let before = cx.held();
+    if !cx.store(FILE_BLOCK) {
         return Err(-ENOSPC);
     }
-    let fd = cx
-        .fs
-        .open_data(&cell.generation.to_le_bytes())
-        .map_err(err)?;
+    let opened = cx.fs.open_data(&cell.generation.to_le_bytes());
+    cx.settle(FILE_BLOCK, before);
+    let fd = opened.map_err(err)?;
     if flags & O_CLOEXEC != 0 {
         let _ = cx.fs.cloexec(fd, Some(true));
     }
     Ok(fd.into())
 }
 
-pub(crate) fn close<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, fd: u64) -> i64 {
-    match cx.fs.close(fd as u32) {
+pub(crate) fn close<F, M, T, A: Frames, S: Services>(
+    cx: &mut Context<'_, F, M, T, A, S>,
+    fd: u64,
+) -> i64 {
+    let before = cx.held();
+    let closed = cx.fs.close(fd as u32);
+    cx.settle(0, before);
+    match closed {
         Ok(()) => 0,
         Err(e) => err(e),
     }
@@ -311,17 +335,22 @@ pub(crate) fn lseek<F, M, T, A, S>(
     }
 }
 
-pub(crate) fn ftruncate<F, M, T, A, S>(
+pub(crate) fn ftruncate<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     len: u64,
 ) -> i64 {
     match cx.fs.kind(fd as u32) {
         Err(e) => err(e),
-        Ok(Kind::File) if (len as i64) >= 0 => match cx.fs.truncate(fd as u32, len) {
-            Ok(()) => 0,
-            Err(e) => err(e),
-        },
+        Ok(Kind::File) if (len as i64) >= 0 => {
+            let before = cx.held();
+            let cut = cx.fs.truncate(fd as u32, len);
+            cx.settle(0, before);
+            match cut {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            }
+        }
         Ok(_) => -EINVAL,
     }
 }
@@ -337,7 +366,7 @@ pub(crate) fn fsync<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, fd: u64)
 }
 
 /// `dup` (`min` 0), `fcntl(F_DUPFD)` (`min`), `dup2`/`dup3` (`exact`).
-pub(crate) fn dup<F, M, T, A, S>(
+pub(crate) fn dup<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     min: u64,
@@ -347,13 +376,17 @@ pub(crate) fn dup<F, M, T, A, S>(
     if min >= rhizo_fs::FD_MAX as u64 {
         return if exact { -EBADF } else { -EINVAL };
     }
-    match cx.fs.dup(fd as u32, min as u32, exact, cloexec) {
+    // `dup2` may close what `min` held.
+    let before = cx.held();
+    let duped = cx.fs.dup(fd as u32, min as u32, exact, cloexec);
+    cx.settle(0, before);
+    match duped {
         Ok(new) => new as i64,
         Err(e) => err(e),
     }
 }
 
-pub(crate) fn dup3<F, M, T, A, S>(
+pub(crate) fn dup3<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     old: u64,
     new: u64,
@@ -402,7 +435,7 @@ pub(crate) fn ioctl<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     }
 }
 
-pub(crate) fn fcntl<F, M, T, A, S>(
+pub(crate) fn fcntl<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     cmd: u64,
@@ -621,7 +654,7 @@ pub(crate) fn getdents64<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     }
 }
 
-pub(crate) fn mkdirat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn mkdirat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     dir: u64,
     addr: u64,
@@ -629,16 +662,19 @@ pub(crate) fn mkdirat<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
     let mut run = || -> Result<i64, i64> {
         let dir = dirfd(dir)?;
         let name = path(cx, addr)?;
-        if !cx.services.can_store(NAME_BYTES) {
+        let before = cx.held();
+        if !cx.store(NAME_BYTES) {
             return Err(-ENOSPC);
         }
-        cx.fs.mkdir(dir, &name).map_err(err)?;
+        let made = cx.fs.mkdir(dir, &name);
+        cx.settle(NAME_BYTES, before);
+        made.map_err(err)?;
         Ok(0)
     };
     run().unwrap_or_else(|e| e)
 }
 
-pub(crate) fn unlinkat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn unlinkat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     dir: u64,
     addr: u64,
@@ -650,15 +686,16 @@ pub(crate) fn unlinkat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         }
         let dir = dirfd(dir)?;
         let name = path(cx, addr)?;
-        cx.fs
-            .unlink(dir, &name, flags & AT_REMOVEDIR != 0)
-            .map_err(err)?;
+        let before = cx.held();
+        let gone = cx.fs.unlink(dir, &name, flags & AT_REMOVEDIR != 0);
+        cx.settle(0, before);
+        gone.map_err(err)?;
         Ok(0)
     };
     run().unwrap_or_else(|e| e)
 }
 
-pub(crate) fn renameat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
+pub(crate) fn renameat<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     a: [u64; 6],
     flags: u64,
@@ -669,7 +706,14 @@ pub(crate) fn renameat<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         }
         let (from_dir, to_dir) = (dirfd(a[0])?, dirfd(a[2])?);
         let (from, to) = (path(cx, a[1])?, path(cx, a[3])?);
-        cx.fs.rename(from_dir, &from, to_dir, &to).map_err(err)?;
+        // The new name may be longer than the old one.
+        let before = cx.held();
+        if !cx.store(NAME_BYTES) {
+            return Err(-ENOSPC);
+        }
+        let moved = cx.fs.rename(from_dir, &from, to_dir, &to);
+        cx.settle(NAME_BYTES, before);
+        moved.map_err(err)?;
         Ok(0)
     };
     run().unwrap_or_else(|e| e)

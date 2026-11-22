@@ -96,7 +96,7 @@ impl Tables {
     fn open_target(&mut self, target: Target, flags: u32, cloexec: bool) -> Result<Fd> {
         let desc = self.new_desc(target, flags);
         self.new_fd(desc, 0, cloexec)
-            .inspect_err(|_| self.descs[desc as usize] = None)
+            .inspect_err(|_| self.free_desc(desc))
     }
 
     fn status(nonblock: bool, access: u32) -> u32 {
@@ -210,13 +210,7 @@ impl Tables {
     /// A descriptor for kernel socket `handle`. On failure the caller still
     /// holds the handle.
     pub fn socket_fd(&mut self, handle: u32, nonblock: bool, cloexec: bool) -> Result<Fd> {
-        let open = self
-            .descs
-            .iter()
-            .flatten()
-            .filter(|d| matches!(d.target, Target::Socket(_)))
-            .count();
-        if open >= self.socket_limit {
+        if self.socket_descs as usize >= self.socket_limit {
             return Err(Error::TooManySockets);
         }
         self.open_target(Target::Socket(handle), Self::status(nonblock, 2), cloexec)
@@ -234,11 +228,7 @@ impl Tables {
     /// [`sockets`](Self::sockets) would find, asked on every fork and end
     /// of a cell, so the cell's files are never walked for it.
     pub fn has_sockets(&self) -> bool {
-        self.descs
-            .iter()
-            .flatten()
-            .any(|d| matches!(d.target, Target::Socket(_)))
-            || (self.rhizo.is_some() && self.sockets().next().is_some())
+        self.socket_descs > 0 || (self.rhizo.is_some() && self.sockets().next().is_some())
     }
 
     /// The socket handles every description and every `/run/rhizo` entry
@@ -607,9 +597,7 @@ impl Tables {
             links: 1,
             node: Node::Socket(name),
         })?;
-        if let Node::Dir { entries, .. } = &mut self.inode_mut(dir).node {
-            entries.insert(last.to_vec(), ino);
-        }
+        self.link(dir, last, ino);
         Ok(())
     }
 

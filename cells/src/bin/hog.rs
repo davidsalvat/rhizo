@@ -3,13 +3,19 @@
 //! refuses; prints `exhausted`, yields once, and exits (returning all of it).
 //! With argument `file`, the `mmap` steps map a one-byte file of its own
 //! instead, nearly all of each step past the file's end (finding S20).
+//! With argument `write`, it writes a file of its own 64 KiB at a time
+//! until refused (`ENOSPC` or `ENOMEM`) instead (design D4 of
+//! `add-cell-hierarchy`: files count in its memory). With argument `wait`,
+//! it starts only once the host gave it a file `/go`; with `hold`, it
+//! keeps what it took until it is ended (a reserved root's neighbour).
 //! Never run on Linux.
 #![no_std]
 #![no_main]
 
-use rhizo_cells::{arg, check, nr, print, syscall, yield_now};
+use rhizo_cells::{arg, check, nr, print, sleep_ns, syscall, yield_now};
 
 const ENOMEM: isize = -12;
+const ENOSPC: isize = -28;
 const AT_FDCWD: usize = -100isize as usize;
 const O_RDWR_CREAT: usize = 0o102;
 
@@ -33,7 +39,51 @@ fn touch(start: usize, len: usize) {
     }
 }
 
+/// Writes a file until the kernel refuses.
+fn write_file() {
+    static CHUNK: [u8; 64 << 10] = [7; 64 << 10];
+    let fd = one_byte_file();
+    let mut written = 0;
+    loop {
+        let n = syscall(
+            nr::WRITE,
+            [fd, CHUNK.as_ptr() as usize, CHUNK.len(), 0, 0, 0],
+        );
+        if n <= 0 {
+            check(
+                n == ENOSPC || n == ENOMEM,
+                "write fails with ENOSPC or ENOMEM",
+            );
+            break;
+        }
+        written += n;
+    }
+    check(written > 0, "some data was written");
+}
+
+/// Waits until the host gives the cell a file `/go`.
+fn wait_for_go() {
+    let path = c"/go".as_ptr() as usize;
+    loop {
+        let fd = syscall(nr::OPENAT, [AT_FDCWD, path, 0, 0, 0, 0]);
+        if fd >= 0 {
+            syscall(nr::CLOSE, [fd as usize, 0, 0, 0, 0, 0]);
+            return;
+        }
+        sleep_ns(1_000_000);
+    }
+}
+
 fn main() -> i32 {
+    if arg(1) == Some(b"wait") {
+        wait_for_go();
+    }
+    if arg(1) == Some(b"write") {
+        write_file();
+        print(b"exhausted\n");
+        yield_now();
+        return 0;
+    }
     let file = (arg(1) == Some(b"file")).then(one_byte_file);
     let mut mapped = 0;
     loop {
@@ -63,6 +113,9 @@ fn main() -> i32 {
     }
     check(mapped > 0, "some memory was given");
     print(b"exhausted\n");
+    while arg(1) == Some(b"hold") {
+        sleep_ns(3_600_000_000_000);
+    }
     yield_now();
     0
 }

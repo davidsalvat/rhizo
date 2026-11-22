@@ -117,9 +117,8 @@ pub(super) fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
 /// own network (design D5 of `add-cell-hierarchy`: listeners and bound
 /// sockets bound again there, connections reset). A socket that cannot be
 /// made reads as reset.
-pub(super) fn fork_files(fs: &Fs, id: u32) -> Fs {
-    let mut child = fs.clone();
-    if fs.has_sockets() {
+pub(super) fn fork_files(mut child: Fs, id: u32) -> Fs {
+    if child.has_sockets() {
         with_net(|net| child.map_sockets(|h| net.fork(h, id).unwrap_or(u32::MAX)));
     }
     child

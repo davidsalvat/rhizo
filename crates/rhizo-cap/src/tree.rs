@@ -52,6 +52,24 @@ impl Limits {
         self.memory != u64::MAX && self.sockets != u32::MAX && self.cells != u32::MAX
     }
 
+    /// What a root with these limits reserves of the kernel's (design D4,
+    /// roots and admission; [`Tree::reserved_roots`]): nothing without a
+    /// memory limit; otherwise its memory and socket limits and one cell
+    /// with its descendant limit, a socket or descendant limit left
+    /// unlimited counting nothing.
+    pub fn reservation(&self) -> Self {
+        if self.memory == u64::MAX {
+            return Self::ZERO;
+        }
+        let bounded = |l: u32| if l == u32::MAX { 0 } else { l };
+        Self {
+            memory: self.memory,
+            cpu_ns: 0,
+            sockets: bounded(self.sockets),
+            cells: bounded(self.cells).saturating_add(1),
+        }
+    }
+
     /// What a child with these limits takes from its parent: its limits,
     /// and one descendant more than its own descendant limit.
     fn charge(&self) -> Self {
@@ -558,6 +576,19 @@ impl Tree {
     fn reserved_by(&self, id: u32) -> Limits {
         self.children(id)
             .fold(Limits::ZERO, |sum, c| sum.add(self.node(c).limits.charge()))
+    }
+
+    /// What the reserved roots, those with a memory limit, hold together
+    /// (design D4, roots and admission), for the kernel to admit them
+    /// against its memory, sockets and cell table: the sum of their memory
+    /// and socket limits, and of their charges in descendants (one each
+    /// with its descendant limit). A socket or descendant limit left
+    /// unlimited counts nothing: such a root shares those with the
+    /// unlimited roots (and so has no children). CPU time is not admitted.
+    pub fn reserved_roots(&self) -> Limits {
+        self.iter()
+            .filter(|n| n.parent == HOST)
+            .fold(Limits::ZERO, |sum, n| sum.add(n.limits.reservation()))
     }
 
     /// What cell `id`'s children reserved from its limits.

@@ -28,7 +28,9 @@ impl Host {
         if let Some(lazy) = &live.demand.lazy {
             bytes += 2 * lazy.pending_bytes();
         }
-        if !cells_may_take(bytes) {
+        // What its memory limit leaves is its own (design D4 of
+        // `add-cell-hierarchy`): its snapshot stays charged to it.
+        if !may_take(&live.frames, bytes) {
             self.requeue(live, wake);
             return None;
         }
@@ -59,7 +61,14 @@ impl Host {
             )
         });
         self.record_tree(&mut snapshot, id);
+        // What its limit leaves stays set aside for it (design D4).
+        let (used, limit) = (live.frames.used(), live.frames.limit());
         self.end(live, Ending::Suspended);
+        if limit < Quota::NONE.frames() {
+            let frames = limit.saturating_sub(used);
+            memory::RESERVE.hold(frames);
+            self.held_aside.push((id, frames));
+        }
         Some(snapshot)
     }
 
@@ -125,8 +134,15 @@ impl Host {
                 .map(|i| snapshot.page(i))
                 .filter(|p| matches!(p.data, Data::Bytes(_)))
                 .map(|p| p.size.bytes())
-                .sum();
-            if !cells_may_take(bytes) {
+                .sum::<u64>();
+            // A suspended cell's reservation, set aside, is its own.
+            let origin = snapshot.origin();
+            let aside = self
+                .held_aside
+                .iter()
+                .find(|&&(c, _)| c == origin)
+                .map_or(0, |&(_, frames)| frames * FRAME_SIZE);
+            if !cells_may_take(bytes.saturating_sub(aside)) {
                 return Err(snapshot);
             }
         }
@@ -173,8 +189,7 @@ impl Host {
             // Short of frames, what is left stays pending, restored lazily.
             let _ = lazy.finish(&pt, &used);
         }
-        let mut live = self.new_live(cell, capture, echo, fs);
-        live.frames.set_used(used.used());
+        let mut live = self.new_live(cell, capture, echo, fs, used.used());
         live.demand.lazy = (lazy.left > 0).then_some(lazy);
         live.demand.wx = wx;
         live.deadlines = deadlines;
@@ -191,6 +206,11 @@ impl Host {
     pub fn fork(&mut self, id: u32, n: usize) -> Option<Vec<u32>> {
         let _p = cost::scope(Part::Spawn);
         let (mut parent, wake) = self.take_cell(id)?;
+        let limited = parent.cell.quota.memory != u64::MAX;
+        if limited && !self.admits_copies(id, n) {
+            self.requeue(parent, wake);
+            return None;
+        }
         let pt = PageTable::<Format>::from_root(parent.cell.root);
         // Pages still pending from a lazy resume come back first; short of
         // frames, no copy is made and the cell keeps the rest pending.
@@ -205,9 +225,9 @@ impl Host {
         let mut children = Vec::with_capacity(n);
         for _ in 0..n {
             let Some(child) = self.child_of(
-                &parent.cell,
-                &parent.fs,
-                &parent.demand.wx,
+                parent.cell.clone(),
+                parent.fs.clone(),
+                parent.demand.wx.clone(),
                 parent.output.is_some(),
                 parent.echo,
             ) else {
@@ -227,6 +247,9 @@ impl Host {
                 self.discard(child);
             }
             return None;
+        }
+        if limited {
+            self.copies_entered(id);
         }
         let ids: Vec<u32> = children.iter().map(|c| c.cell.id).collect();
         // Copies have their source's egress policy (design D7).
@@ -264,9 +287,9 @@ impl Host {
     /// ranges read as zero, the only work done for cells that have some.
     fn child_of(
         &mut self,
-        cell: &Cell,
-        fs: &Fs,
-        wx: &WxRanges,
+        cell: Cell,
+        fs: Fs,
+        wx: WxRanges,
         capture: bool,
         echo: bool,
     ) -> Option<Box<Live>> {
@@ -280,13 +303,13 @@ impl Host {
             root: child.root(),
             cpu_ns: 0,
             generation: cell.generation + 1,
-            ..cell.clone()
+            ..cell
         };
-        let mut live = self.new_live(cell, capture, echo, fork_files(fs, id));
-        live.frames.set_used(1); // its root
+        let mut live = self.new_live(cell, capture, echo, fork_files(fs, id), 1); // its root
         live.shares = true;
-        live.demand.wx = wx.clone();
-        if !wx.wiped().is_empty() && !wipe_copy(&live) {
+        let wiped = !wx.wiped().is_empty();
+        live.demand.wx = wx;
+        if wiped && !wipe_copy(&live) {
             self.discard(&live);
             return None;
         }
@@ -444,14 +467,21 @@ impl Host {
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
         let _p = cost::scope(Part::Spawn);
         let index = self.templates.iter().position(|(c, ..)| c.id == id)?;
+        let limited = self.templates[index].0.quota.memory != u64::MAX;
+        if limited && !self.admits_copies(id, 1) {
+            return None;
+        }
         let (cell, fs, wx) = &self.templates[index];
         let (cell, fs, wx) = (cell.clone(), fs.clone(), wx.clone());
-        let mut child = self.child_of(&cell, &fs, &wx, capture, echo)?;
+        let mut child = self.child_of(cell, fs, wx, capture, echo)?;
         child.expire_timers();
         let mut copies = [child];
         if !self.enter_copies(id, &mut copies) {
             self.discard(&copies[0]);
             return None;
+        }
+        if limited {
+            self.copies_entered(id);
         }
         let [child] = copies;
         let child_id = child.cell.id;

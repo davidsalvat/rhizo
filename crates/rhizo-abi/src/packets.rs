@@ -344,7 +344,7 @@ enum Got {
 /// control length and flags of the `msghdr` at `msg`. `None` if `fd` is
 /// no sequenced-packet socket, or the kernel moves no handles: the caller
 /// goes on.
-pub(crate) fn recvmsg_rights<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn recvmsg_rights<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     cell: u32,
     fd: u64,
@@ -390,11 +390,23 @@ pub(crate) fn recvmsg_rights<F: EntryFormat, M: PhysicalMemory, T, A, S: Service
                         }
                         _ => true,
                     };
-                    let new = if mine && fds.len() < room {
-                        cx.fs.socket_fd(id, false, cloexec).ok()
-                    } else {
-                        None
+                    // Its descriptor counts as a socket's against the
+                    // cell's memory (design D4 of `add-cell-hierarchy`).
+                    let bytes = rhizo_net::SOCKET_BYTES;
+                    let counted = mine
+                        && fds.len() < room
+                        && cx.frames.charge(bytes)
+                        && (cx.services.can_store(bytes) || {
+                            cx.frames.credit(bytes);
+                            false
+                        });
+                    let new = match counted {
+                        true => cx.fs.socket_fd(id, false, cloexec).ok(),
+                        false => None,
                     };
+                    if counted && new.is_none() {
+                        cx.frames.credit(bytes);
+                    }
                     match new {
                         Some(f) => fds.push(f),
                         None => {
@@ -480,7 +492,7 @@ pub(crate) fn connect<F, M, T, A, S>(
 
 /// `open` of the `/run/rhizo` entry `kept`: a descriptor of the endpoint
 /// it holds; `ENXIO` for any other entry.
-pub(crate) fn open<F, M, T, A, S>(
+pub(crate) fn open<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     kept: Kept,
     nonblock: bool,
@@ -493,11 +505,19 @@ pub(crate) fn open<F, M, T, A, S>(
     if !is_packet(net, e) {
         return -ENXIO;
     }
-    net.retain(e);
-    match cx.fs.socket_fd(e, nonblock, cloexec) {
+    // Its descriptor counts as a socket's against the cell's memory
+    // (design D4 of `add-cell-hierarchy`).
+    let before = cx.held();
+    if !cx.store(rhizo_net::SOCKET_BYTES) {
+        return -ENOMEM;
+    }
+    cx.net.net().retain(e);
+    let opened = cx.fs.socket_fd(e, nonblock, cloexec);
+    cx.settle(rhizo_net::SOCKET_BYTES, before);
+    match opened {
         Ok(fd) => fd.into(),
         Err(x) => {
-            net.release(e);
+            cx.net.net().release(e);
             err(x)
         }
     }
