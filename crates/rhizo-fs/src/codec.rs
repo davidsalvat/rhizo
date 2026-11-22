@@ -296,7 +296,11 @@ impl Tables {
                     if size > DATA_MAX || blocks.len() as u64 > size.div_ceil(BLOCK as u64) {
                         return Err(DecodeError::Corrupt);
                     }
-                    Node::File(File { size, blocks })
+                    Node::File(File {
+                        size,
+                        blocks,
+                        public: false,
+                    })
                 }
                 2 => Node::Socket(r.u64()?),
                 3 => Node::Kept(match r.u8()? {

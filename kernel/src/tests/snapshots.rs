@@ -9,6 +9,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(suspend_between_parallel_runs_is_invisible),
     ktest_case!(suspend_returns_all_memory),
     ktest_case!(lazy_resume_restores_only_touched_pages),
+    ktest_case!(a_fork_short_of_frames_loses_no_page),
     ktest_case!(suspended_cells_hold_no_kernel_resources),
     ktest_case!(a_suspended_fork_refers_to_its_template),
     ktest_case!(snapshot_of_another_architecture_is_rejected),
@@ -107,6 +108,46 @@ fn lazy_resume_restores_only_touched_pages() {
     );
     host.run(|_| false);
     assert_eq!(ended(&host, id), (Ending::Exit(0), "checked\n".into()));
+}
+
+/// A cell resumed lazily and forked while no frame is free: the fork is
+/// refused and the cell keeps every page it has not restored yet, so it
+/// reads back what it wrote once frames are free again. Freezing it is
+/// refused too. Pages a fork failed to restore were dropped, and read as
+/// zeros (a Node.js cell resumed from bytes jumped to address 0).
+fn a_fork_short_of_frames_loses_no_page() {
+    let before = memory_balance();
+    let mut host = Host::new();
+    let id = spawn(&mut host, "ballast", &[b"one"]);
+    while host.output(id) != Some(b"filled\n") {
+        host.step();
+    }
+    let snapshot = host.suspend(id).expect("live");
+    let pages = snapshot.pages();
+    let id = host
+        .resume(snapshot, Resume::Lazy, true, false)
+        .expect("resume");
+    // The frames taken are listed in themselves: the heap stays as it is.
+    let mut taken = u64::MAX;
+    while let Some(frame) = memory::alloc_for_cell(1) {
+        DirectMap.write_u64(frame, taken);
+        taken = frame;
+    }
+    let forked = host.fork(id, 1);
+    let frozen = host.freeze(id);
+    while taken != u64::MAX {
+        let next = DirectMap.read_u64(taken);
+        memory::with_frames(|f| f.free_contiguous(taken, 1));
+        taken = next;
+    }
+    assert_eq!(forked, None, "no copy without its pages");
+    assert!(!frozen, "no template without its pages");
+    let left = host.pending_pages(id).expect("still live");
+    assert!(left > 0 && left <= pages, "{left} of {pages} pages pending");
+    host.run(|_| false);
+    assert_eq!(ended(&host, id), (Ending::Exit(0), "checked\n".into()));
+    drop(host);
+    assert_eq!(memory_balance(), before, "every frame back");
 }
 
 /// A cell forked from a template and suspended before it writes refers to

@@ -55,6 +55,7 @@ mod ops;
 mod pages;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 mod pause;
+mod publish;
 mod sched;
 mod services;
 mod shares;
@@ -79,6 +80,7 @@ use live::*;
 pub use pages::*;
 #[cfg(any(feature = "ktest", feature = "bench-cell"))]
 pub use pause::*;
+pub use publish::*;
 use sched::*;
 use services::*;
 use slice::*;

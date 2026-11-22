@@ -42,8 +42,9 @@ fn idle(host: &mut Host) -> u32 {
 /// Spec `linux-abi`, "Identifiers per domain": `getpid` and the first
 /// thread's `gettid` count from 1 in each domain, whatever other domains
 /// made and ended meanwhile (they counted every cell ever made, finding O6).
-/// A copy takes another number than its source, and so does a resumed
-/// cell (a resume is a copy, design D22), in its own domain.
+/// A copy of a root is a root in its source's domain (the same tenant,
+/// design D13) and takes another number than its source there, and so does
+/// a resumed cell (a resume is a copy, design D22).
 fn identifiers_are_per_domain() {
     let mut host = Host::new();
     let first = spawn(&mut host, "observer", &[b"ids"]);
@@ -65,7 +66,8 @@ fn identifiers_are_per_domain() {
     let copy = host.fork(source, 1).expect("fork")[0];
     let domains = [host.domain(source), host.domain(copy)];
     assert!(domains[0].is_some_and(|d| d != 0), "{domains:?}");
-    assert_ne!(domains[0], domains[1], "a copy of a root is a root");
+    assert_eq!(domains[0], domains[1], "a copy keeps its source's domain");
+    assert!(host.tree().get(copy).is_some_and(|n| n.is_root()));
     let snapshot = host.suspend(source).expect("suspend");
     let resumed = host
         .resume(snapshot, Resume::Eager, true, false)
@@ -77,7 +79,7 @@ fn identifiers_are_per_domain() {
         ended(&host, copy),
         (Ending::Exit(0), "pid 2 tid 1\n".into())
     );
-    let out = "pid 2 tid 1\n";
+    let out = "pid 3 tid 1\n";
     assert_eq!(ended(&host, resumed), (Ending::Exit(0), out.into()));
     assert!(host.tree().is_empty(), "every node went with its cell");
 }

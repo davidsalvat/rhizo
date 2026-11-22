@@ -74,17 +74,26 @@ impl Host {
         } else {
             &many[..]
         };
-        let parent = self.tree.get(source).map_or(0, |n| n.parent());
-        let used = self.usage(parent);
         let mut placed = |k: usize, pid, domain| {
             if let Some(copy) = copies.get_mut(k) {
                 (copy.cell.pid, copy.cell.domain) = (pid, domain);
             }
         };
-        let entered = self
-            .tree
-            .add_copies(source, ids, &|_| used, &mut placed)
-            .is_ok();
+        self.add_copies(source, ids, &mut placed)
+    }
+
+    /// Adds `ids` to the tree as copies of cell `source`, telling `placed`
+    /// each one's number and domain: all, or none and `false`.
+    #[inline(never)]
+    fn add_copies(
+        &mut self,
+        source: u32,
+        ids: &[u32],
+        placed: &mut dyn FnMut(usize, u32, u32),
+    ) -> bool {
+        let parent = self.tree.get(source).map_or(0, |n| n.parent());
+        let used = self.usage(parent);
+        let entered = self.tree.add_copies(source, ids, &|_| used, placed).is_ok();
         if entered {
             self.reshare_if_by_weight();
         }
@@ -101,7 +110,9 @@ impl Host {
     }
 
     /// Places a cell restored from `snapshot`, not yet run: under the
-    /// parent it had, in its domain, if it was suspended from this host;
+    /// parent it had, in its domain, if it was suspended from this host; as
+    /// a copy of the cell it was taken of (a template's snapshot), a
+    /// sibling in its domain, if the host holds that cell;
     /// otherwise as the root of a new domain, with no authority from the
     /// bytes (spec `snapshots`, loaded snapshots hold no authority): egress
     /// and ceiling `none`, limits within the quotas the host left it, no
@@ -119,6 +130,18 @@ impl Host {
             self.reshare_if_by_weight();
             return true;
         }
+        // A snapshot of a cell this host still holds (a template's) makes a
+        // copy of it: a sibling in its domain (design D13).
+        if origin != 0 && self.tree.get(origin).is_some() {
+            // Not `cell` itself in the closure: its address would escape,
+            // and every resume would copy all of it to pass it on.
+            let mut at = (0, 0);
+            let entered = self.add_copies(origin, &[cell.id], &mut |_, pid, domain| {
+                at = (pid, domain);
+            });
+            (cell.pid, cell.domain) = at;
+            return entered;
+        }
         let Ok(spec) = snapshot.placed(&Egress::None, &Egress::None, root_limits(&cell.quota))
         else {
             return false;
@@ -134,6 +157,18 @@ impl Host {
         (cell.pid, cell.domain) = (pid, cell.id);
         self.reshare_after(plain);
         true
+    }
+
+    /// Takes `cell`, just entered by [`enter_restored`] from a snapshot of
+    /// cell `origin`, out of the tree again: suspended as it was, or gone.
+    ///
+    /// [`enter_restored`]: Self::enter_restored
+    pub(super) fn leave_restored(&mut self, cell: &Cell, origin: u32) {
+        if cell.domain == cell.id || self.tree.get(origin).is_some() {
+            let _ = self.tree.end(cell.id, &mut fresh_domain); // a new root or a copy
+        } else if self.tree.rekey(cell.id, origin).is_some() {
+            self.suspended.push(origin);
+        }
     }
 
     /// What cell `id` uses itself, as limits: its frames, CPU time and
@@ -212,12 +247,18 @@ impl Host {
             for &root in &ended.promoted {
                 for cell in self.tree.subtree(root).unwrap_or_default() {
                     self.sync(cell);
+                    // It left its domain (design D21): a cell that cannot
+                    // take private copies of what it shared there ends.
+                    if !self.unshare(cell) && !self.kill(cell) {
+                        self.drop_template(cell);
+                    }
                 }
             }
             // Its parent got its reservation back, less promoted ones.
             self.sync_up(parent);
         }
         self.settling = false;
+        self.release_held();
         self.reshare_if_by_weight();
     }
 
@@ -347,6 +388,12 @@ impl Host {
             return Err(TreeError::Invalid);
         }
         let (saved, old, old_pid) = (n.spec(), n.parent(), n.pid());
+        // Into another domain (a root's is new), it first takes private
+        // copies of what it shares, or stays (design D21).
+        let domain = n.domain();
+        if self.tree.domain(parent) != Some(domain) {
+            self.unshare_subtree(id)?;
+        }
         if parent == HOST {
             let (l, was) = (&mut spec.limits, saved.limits);
             l.memory = if l.memory == u64::MAX {
@@ -453,6 +500,15 @@ impl Host {
     )]
     pub fn reparent(&mut self, id: u32, to: u32, by: Actor) -> Result<(), TreeError> {
         let old = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
+        // Leaving its domain, its subtree first takes private copies of
+        // what it shares there, or the move is refused (design D21).
+        let leaves = match to {
+            HOST => self.tree.get(id).is_some_and(|n| !n.is_root()),
+            _ => self.tree.domain(to) != self.tree.domain(id),
+        };
+        if leaves && self.tree.controls(by, id) {
+            self.unshare_subtree(id)?;
+        }
         let used = self.usage(to);
         self.tree
             .reparent(id, to, by, &|_| used, &mut fresh_domain)?;

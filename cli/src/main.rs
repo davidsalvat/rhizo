@@ -108,6 +108,17 @@ fn main() -> ExitCode {
                 println!("froze {id} into a template in {}", reply.timing());
                 Ok(())
             }
+            Command::Publish { id, attest } => {
+                let request = Request::Publish { cell: id, attest };
+                let reply = Client::connect(&dir)?.call(&request)?;
+                println!("published template {id} in {}", reply.timing());
+                Ok(())
+            }
+            Command::Withdraw(id) => {
+                let reply = Client::connect(&dir)?.call(&Request::Withdraw(id))?;
+                println!("withdrew template {id} in {}", reply.timing());
+                Ok(())
+            }
             Command::Save { id, file } => save(&mut Client::connect(&dir)?, id, &file),
             Command::Load {
                 file,

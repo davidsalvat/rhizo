@@ -5,13 +5,22 @@
 ### Requirement: Ownership tree
 Every cell SHALL have exactly one parent: the host, or the cell at whose
 request it was created. A cell the host creates SHALL be a child of the
-host or of the cell the host names. The children of the host are roots;
-a root and its descendants form a domain. Suspending a cell SHALL NOT
-suspend its children.
+host or of the cell the host names. The children of the host are roots.
+Suspending a cell SHALL NOT suspend its children.
 
 #### Scenario: Children of a cell
 - **WHEN** the host runs cell A, then runs B with parent A, then suspends A
 - **THEN** the tree lists A under the host and B under A, A's domain holds both, and B keeps running
+
+### Requirement: Domains are tenants
+A domain SHALL be a tenant: a root the host makes or loads and its
+descendants, joined by the copies of its cells, which SHALL stay in their
+source's domain (roots among them) unless the host places them
+elsewhere. A promoted cell SHALL start a domain of its own.
+
+#### Scenario: Copy of a root
+- **WHEN** the host forks root A, then A ends
+- **THEN** the copy is a root in A's domain with another number, and the domain lives on with it
 
 ### Requirement: Authority flows down
 Only a cell's ancestors and the host SHALL be able to suspend, resume,
@@ -301,6 +310,15 @@ another domain. A write SHALL make the writer's file private.
 - **WHEN** cells of two domains map the same published library, and one of them maps it again after the other ended
 - **THEN** both map one frame per page, and every map is a hit
 
+### Requirement: Published pages give way to cells
+Short of memory, the published pages no cell maps SHALL give way, as
+executables kept loaded do. A domain that maps one later SHALL keep its
+own copy, never one filled for every domain on demand.
+
+#### Scenario: Short of memory
+- **WHEN** a cell needs frames that only published pages no cell maps hold
+- **THEN** those pages give way and the cell gets its frames, while the published pages a cell maps stay
+
 ### Requirement: Copy generation
 Each cell SHALL have a 64-bit copy generation, readable in
 `/run/rhizo/generation` (8 bytes, little endian), that changes in every
@@ -327,9 +345,9 @@ and no two loads of one snapshot file, draw the same sequence.
 - **THEN** the two copies print different values for both
 
 ### Requirement: Published templates hold no secrets
-The host SHALL be able to publish a template so that copies of it go
-into other domains, and only a published template SHALL have copies in
-more than one domain. The kernel SHALL refuse to publish a template of a
+The host SHALL be able to publish a template so that copies of it placed
+in other domains share its frames, and only a published template SHALL
+share frames with copies in more than one domain. The kernel SHALL refuse to publish a template of a
 cell that connected through the network card or received a message, a
 handle or a view, unless the host attests it holds no secret; the
 attestation SHALL be audited.
@@ -339,8 +357,8 @@ attestation SHALL be audited.
 - **THEN** the first is refused and the second is accepted with an audit record naming the attestation
 
 #### Scenario: Unpublished template in another domain
-- **WHEN** the host asks for a copy of an unpublished template as a root
-- **THEN** the copy is a full copy that shares no frame with the template
+- **WHEN** the host places a copy of an unpublished template under a cell of another domain
+- **THEN** the copy is a full copy that shares no frame with the template, public objects excepted
 
 ### Requirement: Accounting charges the using cell
 Memory, file data, kernel records and CPU time SHALL be charged only to

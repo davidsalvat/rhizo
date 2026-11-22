@@ -1805,6 +1805,84 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             "`rhizo resume --tree` resumes them where they were",
             "the helpers running under the agent",
         )?;
+        // Publishing templates (spec `control-plane`, design D21 of
+        // `add-cell-hierarchy`): copies of a template placed in other
+        // domains share its memory once it is published, and are full
+        // copies once it is withdrawn; a fork as a root stays in its
+        // domain and shares it anyway.
+        let free_mib = || -> Result<f64> {
+            let out = ok(&["stats"])?;
+            out.split("memory: ")
+                .nth(1)
+                .and_then(|rest| rest.split(" MiB free").next())
+                .and_then(|n| n.parse().ok())
+                .ok_or_else(|| fail("`rhizo stats` gives free memory", "`memory: N MiB free`"))
+        };
+        let start = free_mib()?;
+        let held = ok(&["run", "scoped", "--detach", "--", "hold", "16"]).map(started)?;
+        let mut written = false;
+        for _ in 0..200 {
+            if start - free_mib()? >= 15.0 {
+                written = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        must(
+            written,
+            "the template's cell writes its 16 MiB",
+            "16 MiB taken",
+        )?;
+        ok(&["freeze", &held])?;
+        refused_with(&["publish", &other], "not a template")?;
+        let domain = || detached(&["--mem", "64M", "--sockets", "2", "--cells", "4"]);
+        let (a, b, c) = (domain()?, domain()?, domain()?);
+        // Memory one copy placed under `parent` takes, in MiB.
+        let copy_under = |parent: &str| -> Result<(String, f64)> {
+            let before = free_mib()?;
+            let out = ok(&[
+                "fork",
+                &held,
+                "--parent",
+                parent,
+                "--mem",
+                "24M",
+                "--sockets",
+                "1",
+                "--cells",
+                "0",
+            ])?;
+            let copy = out.split(['[', ']']).nth(1).unwrap_or_default().to_string();
+            Ok((copy, before - free_mib()?))
+        };
+        let before = free_mib()?;
+        let out = ok(&["fork", &held])?;
+        let root_copy = out.split(['[', ']']).nth(1).unwrap_or_default().to_string();
+        must(
+            before - free_mib()? < 4.0,
+            "a copy of an unpublished template as a root stays in its domain and shares it",
+            "less than 4 MiB",
+        )?;
+        ok(&["kill", &root_copy])?;
+        ok(&["publish", &held])?;
+        let (in_a, took_a) = copy_under(&a)?;
+        let (in_b, took_b) = copy_under(&b)?;
+        must(
+            took_a < 4.0 && took_b < 4.0,
+            "copies of a published template in two other domains share its 16 MiB",
+            "less than 4 MiB each",
+        )?;
+        ok(&["withdraw", &held])?;
+        refused_with(&["withdraw", &held], "not published")?;
+        let (in_c, took_c) = copy_under(&c)?;
+        must(
+            took_c >= 15.0,
+            "after `rhizo withdraw` a copy placed in another domain is a full copy",
+            "16 MiB more",
+        )?;
+        for cell in [&in_a, &in_b, &in_c, &a, &b, &c, &held] {
+            ok(&["kill", cell])?;
+        }
         // Scoped access: a client of a socket scoped to the agent kills
         // the agent's child, and is refused the cell of another domain,
         // and a rule with a prefix over 32 (spec `control-plane`).
