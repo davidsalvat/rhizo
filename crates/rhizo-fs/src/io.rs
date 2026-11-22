@@ -230,6 +230,17 @@ impl Tables {
         }
     }
 
+    /// Whether a description or a `/run/rhizo` entry holds a socket: what
+    /// [`sockets`](Self::sockets) would find, asked on every fork and end
+    /// of a cell, so the cell's files are never walked for it.
+    pub fn has_sockets(&self) -> bool {
+        self.descs
+            .iter()
+            .flatten()
+            .any(|d| matches!(d.target, Target::Socket(_)))
+            || (self.rhizo.is_some() && self.sockets().next().is_some())
+    }
+
     /// The socket handles every description and every `/run/rhizo` entry
     /// holds, one reference each: the descriptions first, in order.
     pub fn sockets(&self) -> impl Iterator<Item = u32> + '_ {

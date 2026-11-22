@@ -98,6 +98,12 @@ fn rhizo_dir_lists_what_was_granted() {
         Err(Error::NoDevice)
     );
     assert_eq!(fs.sockets().collect::<Vec<_>>(), [7, 9]);
+    assert!(fs.has_sockets(), "entries hold sockets");
+    let mut plain = Fs::new();
+    plain.rhizo_dir().unwrap();
+    assert!(!plain.has_sockets());
+    plain.socket_fd(3, false, false).unwrap();
+    assert!(plain.has_sockets(), "a description holds one");
 }
 
 /// Spec `cell-hierarchy`, "Rename refused": creating, renaming, writing or
