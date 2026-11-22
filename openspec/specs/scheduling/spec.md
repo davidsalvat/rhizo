@@ -234,3 +234,36 @@ running do not wait behind the ends and resumes of others.
 #### Scenario: The server workload's latencies
 - **WHEN** the server workload of `cargo xtask bench` runs 10,000 workers on QEMU `microvm`
 - **THEN** `density.sched_p99_us` and `density.wake_p99_us` are within the `ci` thresholds of the baseline set before the ownership tree, and lazy resumes (`resume_ns` in its breakdown line) cost what they did then
+
+### Requirement: Shares by weight hold as charged
+While cells share the CPUs by weight, each busy domain's CPU time as the
+scheduler charges it SHALL stay within one slice of its weight's part of
+the total, whatever the slices' lengths, including slices a busy host
+stretched by stopping the virtual CPU. The time a slice lasted SHALL be
+charged to the cell that held the CPU. Tests of shares SHALL measure the
+charged time over enough slices that one slice is within their bound.
+
+#### Scenario: Stretched slices
+- **WHEN** two busy domains of any weights run slices of any length, up to 20 nominal slices each, with one CPU stepping through the queues of one to four CPUs
+- **THEN** after every slice each domain's charged time is within the longest slice so far of its weight's part of the total
+
+#### Scenario: Weights 300 and 100 on a busy host
+- **WHEN** two spinning roots of weights 300 and 100 run on one CPU for at least 1 s, and until their charged time is at least 20 of the longest slice charged, while the host runs other work
+- **THEN** the root of weight 300 has 70 to 80 % of their charged time
+
+### Requirement: Shares by weight hold for any number of domains
+While cells share the CPUs by weight, the domain a CPU runs next SHALL be
+chosen so that each busy domain's charged CPU time stays within one slice
+(the longest charged so far) of its weight's part of the total, whatever
+the number of domains and the slices' lengths. A domain's finishing
+virtual time SHALL count the longest slice charged so far. In-kernel test
+builds SHALL count each domain's charged time exactly, and other builds
+SHALL NOT count it.
+
+#### Scenario: Three or more domains, stretched slices
+- **WHEN** three to six busy domains of any weights run slices of any length, up to 20 nominal slices each and mixed with short ones, with one CPU stepping through the queues of one to four CPUs
+- **THEN** after every slice each domain's charged time is within the longest slice so far of its weight's part of the total
+
+#### Scenario: Many cells do not buy CPU, on a busy host
+- **WHEN** on one CPU a domain of 16 spinning cells and a domain of one spinning cell, with equal weights, run for at least 2 s, and until their charged time is at least 20 of the longest slice charged, while the host runs other work
+- **THEN** each domain has half of their charged time within 5 %

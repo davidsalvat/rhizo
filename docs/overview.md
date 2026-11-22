@@ -121,8 +121,9 @@ start it again.
   sends the host an audit record for each tree change, cell creation and
   end, and refused request, which the host keeps in a hash-chained log
   (`rhizo audit tail`, `verify`); snapshots (format version 11) carry a
-  cell's place in the tree. Budgets, private loopback
-  networks, egress policies and channels come next.
+  cell's place in the tree; budgets carved from the parent, a private
+  loopback network per cell and egress policies checked on every socket
+  are in too. Channels and handles come next.
 - **Isolation, reviewed.** Two adversarial reviews of the cell boundary and
   one of frames from the network, with hostile cells, property tests and a
   network fuzzer that keep the findings fixed. The kernel is unmapped while

@@ -338,6 +338,12 @@ def highlights(t):
     stall = median("cell.host_op_stall_us", required=False)
     stopped = median("cell.host_op_stall_stopped_us", required=False)
     wake = rhizo_values("density.wake_p99_us")
+    slowest = max((m for m in RESULTS["metrics"]
+                   if m["name"] == "density.wake_p99_us" and m["guest"] == "rhizo"),
+                  key=lambda m: m["median"], default={}).get("vmm")
+    slowest = {"qemu-microvm": "QEMU microvm", "qemu-q35": "QEMU q35",
+               "firecracker": "Firecracker",
+               "cloud-hypervisor": "Cloud Hypervisor"}.get(slowest, slowest)
     ops = rhizo_values("density.ops_per_s")
     need = [NODE_WARM, NODE_COLD, node_jit, NP_WARM, LX_NP_WARM, laptop, loaded,
             cold_answer, stall, stopped, wake, ops]
@@ -402,7 +408,7 @@ def highlights(t):
                        c, c, rx=3, sw=0)
         else:
             s.text(x + 16, y + 116, "range over four VMMs,", 12.5, fill=t["muted"])
-            s.text(x + 16, y + 136, "the slowest: Firecracker", 12.5, fill=t["muted"])
+            s.text(x + 16, y + 136, f"the slowest: {slowest}", 12.5, fill=t["muted"])
         s.text(x + 16, y + ch - 16, foot, 12.5, weight=700, fill=t["accent"])
     s.text(24, h - 18, "Shared runners are noisy: figures move between runs. The tables "
            "hold every value.", 12.5, fill=t["muted"])
