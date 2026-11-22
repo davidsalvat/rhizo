@@ -379,6 +379,57 @@ between runs there. The `ci` gate therefore only catches gross regressions
 (for example, a boot that doubles); the `dedicated` run is the precise one. It runs from the `bench-dedicated` workflow, started manually
 (Actions → bench-dedicated → Run workflow) once such a runner is registered.
 
+## Runner classes (change `bench-runner-class`)
+
+Hosted runners fall into hardware classes of very different speed. In
+issue #121, three classes appeared on main's runs, told apart by boot
+cycles, `cell.syscall_ns` and the guest's PMU. On the slowest, several
+timings (`cell.fork_with_files_us`, the agent turns, the control path on
+Cloud Hypervisor) read 2.0 to 2.4 times their baseline on every VMM at
+once, and the gate failed on noise. So every result names its runner, and
+timings are compared with baselines of the same class where it has some.
+
+`bench-results.json` holds `runner`: `model_name`, `cpu_family`, `model`,
+`stepping` and `microcode` from `/proc/cpuinfo`, `cores`, `kvm`,
+`guest_pmu` (whether a guest had performance counters) and `tsc_mhz`.
+`tsc_mhz` is the TSC frequency in the host kernel's log, read with
+`dmesg` or `sudo -n dmesg`, and is `null` when neither works. `bench.yml`
+publishes `runner` as the `bench-runner` annotation, and the printed
+table ends with a `runner:` line.
+
+The class is the model name, normalized (`class` in `runner`): lower case,
+`(R)` and `(TM)` dropped, every other run of non-alphanumeric characters
+one `-`. For example, `Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz` is
+`intel-xeon-platinum-8370c-cpu-2-80ghz`. The key is not inferred from the
+figures: a regression must not move a run into a slower class.
+
+`baseline.json` may hold `classes.<env>.<class>`, medians of timings for
+one class. The gate compares a run's timings with its class's values where
+the class has them, and with `environments.<env>` otherwise, with the same
+thresholds. It always compares deterministic metrics and `-icount`
+instruction counts with the default. A class may hold only timings that
+`environments.<env>` has. Any other entry fails the gate, so a class can
+neither loosen an instruction count nor add a metric. A run whose class
+has none is gated against the default, and the gate prints:
+
+```
+unknown runner class: <model>; compared against the default class
+```
+
+A known class prints this instead:
+
+```
+runner class `<class>`: timings compared against its own baselines
+```
+
+When the gate fails on main, the timing-gate issue names the runner, its
+class and that line.
+
+The default `ci` baseline was measured on the class with the guest PMU
+(about 6.5 M boot cycles on `microvm`, `cell.syscall_ns` 68). The first
+run that recorded its runner landed on it, an `Intel(R) Xeon(R) 6975P-C`
+(class `intel-xeon-6975p-c`).
+
 ## Where the gates run (change `faster-ci`)
 
 A timing gate on a shared runner fails on noise often enough to cost
@@ -489,6 +540,21 @@ run on main), joined in order, are the `ci-arm` results:
 ```bash
 cargo xtask bench --from results-aarch64.json --env ci-arm --update-baseline
 ```
+
+The baselines of a new runner class come from one run on that class
+(its `bench-results-N` annotations joined, as above):
+
+```bash
+cargo xtask bench --from results.json --env ci --update-baseline --class <class>
+```
+
+This writes `classes.ci.<class>`: the run's timings that the default `ci`
+baseline has, and nothing else. It refuses results measured on another
+class, and it refuses a class that already has baselines. Change an
+existing class by hand, with the reason. A new class, like any baseline
+change, needs the project owner's approval in its pull request: give the
+runs it comes from, and their spread against the class's other runs. The
+gate never adds or raises a baseline by itself.
 
 ## README chart
 

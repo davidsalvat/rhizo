@@ -1103,3 +1103,5 @@ proptest! {
         let _ = Message::decode(&frame);
     }
 }
+
+mod audit;

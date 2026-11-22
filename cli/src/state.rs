@@ -1,7 +1,8 @@
 //! The small local state that lets later commands find the VM `rhizo up`
 //! started: a directory with the state file, the control socket and logs.
 //! Once the VM is down only the console log stays, the last VM's, until the
-//! next `rhizo up` replaces it.
+//! next `rhizo up` replaces it, and the audit log (`audit/`), which stays
+//! for good.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -178,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn cleaning_leaves_only_the_console_log() {
+    fn cleaning_leaves_only_the_console_and_audit_logs() {
         let dir = Dir(std::env::temp_dir().join(format!("rhizo-clean-{}", std::process::id())));
         let _ = fs::remove_dir_all(&dir.0);
         fs::create_dir_all(&dir.0).unwrap();
@@ -192,14 +193,19 @@ mod tests {
         ] {
             fs::write(file, b"x").unwrap();
         }
+        let audit = crate::audit::dir(&dir.0);
+        fs::create_dir_all(&audit).unwrap();
+        fs::write(audit.join("audit-000000.jsonl"), b"x").unwrap();
         dir.clean();
-        let left: Vec<_> = fs::read_dir(&dir.0)
+        let mut left: Vec<_> = fs::read_dir(&dir.0)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(left, ["console.log"]);
+        left.sort();
+        assert_eq!(left, ["audit", "console.log"]);
         dir.clean();
         assert!(dir.console().exists());
+        assert!(audit.join("audit-000000.jsonl").exists());
         fs::remove_dir_all(&dir.0).unwrap();
     }
 

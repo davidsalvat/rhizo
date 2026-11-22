@@ -82,6 +82,9 @@ Commands:
                              (repeat to merge another architecture's)
       --check                Fail if a metric regressed beyond its threshold
       --update-baseline      Store the results as the baseline for --env
+      --class <key>          With --update-baseline: create the baselines of
+                             a new runner class (the results' own class)
+                             instead; never changes an existing class
       --readme               Regenerate the README benchmark section
       --no-reference         Skip the reference Linux guest
       --no-icount            Skip the instruction counts under QEMU -icount

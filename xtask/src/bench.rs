@@ -50,6 +50,9 @@ pub struct Options {
     pub from: Vec<PathBuf>,
     pub check: bool,
     pub update_baseline: bool,
+    /// With `update_baseline`: create this runner class's baselines instead
+    /// of the default ones (change `bench-runner-class`).
+    pub class: Option<String>,
     pub readme: bool,
     pub reference: bool,
     /// Also count instructions under QEMU with `-icount` (spec `profiling`).
@@ -79,6 +82,7 @@ impl Default for Options {
             from: Vec::new(),
             check: false,
             update_baseline: false,
+            class: None,
             readme: false,
             reference: true,
             icount: true,
@@ -124,6 +128,7 @@ impl Options {
                 "--from" => o.from.push(PathBuf::from(value("--from")?)),
                 "--check" => o.check = true,
                 "--update-baseline" => o.update_baseline = true,
+                "--class" => o.class = Some(value("--class")?),
                 "--readme" => o.readme = true,
                 "--no-reference" => o.reference = false,
                 "--no-icount" => o.icount = false,
@@ -167,6 +172,9 @@ impl Options {
                 }
                 other => return Err(format!("unknown bench option `{other}`")),
             }
+        }
+        if o.class.is_some() && !o.update_baseline {
+            return Err("--class only goes with --update-baseline".into());
         }
         if o.cpus != 1 && (o.check || o.update_baseline) {
             // The baselines hold the server run on 1 CPU.
@@ -244,6 +252,9 @@ pub struct Results {
     pub kvm: bool,
     pub metrics: Vec<Metric>,
     pub skipped: Vec<(String, String)>,
+    /// The machine that measured them; `None` in results stored before
+    /// change `bench-runner-class`.
+    pub runner: Option<Runner>,
 }
 
 impl Results {
@@ -252,6 +263,7 @@ impl Results {
             "environment": self.environment,
             "date": self.date,
             "kvm": self.kvm,
+            "runner": self.runner.as_ref().map(Runner::to_json),
             "metrics": self.metrics.iter().map(Metric::to_json).collect::<Vec<_>>(),
             "skipped": self.skipped.iter()
                 .map(|(vmm, reason)| json!({"vmm": vmm, "reason": reason}))
@@ -261,7 +273,7 @@ impl Results {
 
     /// Adds the metrics of another run, such as the AArch64 job's
     /// instruction counts next to the x86_64 benchmarks; this run's
-    /// environment, date and KVM label stay. A metric both runs measured is
+    /// environment, date, KVM label and runner stay. A metric both runs measured is
     /// an error: which one the README shows would be arbitrary.
     fn merge(&mut self, other: Results) -> Result {
         if let Some(m) = other
@@ -281,6 +293,9 @@ impl Results {
             environment: v["environment"].as_str().unwrap_or("unknown").into(),
             date: v["date"].as_str().unwrap_or("unknown").into(),
             kvm: v["kvm"].as_bool().unwrap_or(false),
+            runner: v["runner"]
+                .is_object()
+                .then(|| Runner::from_json(&v["runner"])),
             metrics: v["metrics"]
                 .as_array()
                 .ok_or("results have no `metrics` array")?
@@ -300,6 +315,152 @@ impl Results {
                 .unwrap_or_default(),
         })
     }
+}
+
+/// The machine a benchmark ran on (change `bench-runner-class`): hosted
+/// runners land on hardware classes of very different speed, and a timing
+/// is compared with the baselines of its own class where it has some.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Runner {
+    /// `model name` of `/proc/cpuinfo` (on AArch64, which has none, the
+    /// CPU implementer and part).
+    pub model_name: String,
+    pub cpu_family: String,
+    pub model: String,
+    pub stepping: String,
+    pub microcode: String,
+    /// Logical CPUs of the host.
+    pub cores: usize,
+    pub kvm: bool,
+    /// Whether a guest saw performance counters (`None`: no guest ran the
+    /// cell benchmarks).
+    pub guest_pmu: Option<bool>,
+    /// The TSC frequency the host's kernel found at boot, where its log is
+    /// readable.
+    pub tsc_mhz: Option<f64>,
+}
+
+impl Runner {
+    /// The first CPU's identity in `/proc/cpuinfo`, and the number of CPUs.
+    fn from_cpuinfo(cpuinfo: &str) -> Self {
+        let field = |key: &str| {
+            cpuinfo
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.trim() == key)
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default()
+        };
+        let mut model_name = field("model name");
+        if model_name.is_empty() {
+            let (implementer, part) = (field("CPU implementer"), field("CPU part"));
+            if !implementer.is_empty() {
+                model_name = format!("CPU implementer {implementer} part {part}");
+            }
+        }
+        Self {
+            model_name,
+            cpu_family: field("cpu family"),
+            model: field("model"),
+            stepping: field("stepping"),
+            microcode: field("microcode"),
+            cores: cpuinfo
+                .lines()
+                .filter(|l| l.split(':').next().map(str::trim) == Some("processor"))
+                .count(),
+            ..Self::default()
+        }
+    }
+
+    /// The class key: the model name, normalized ([`class_key`]).
+    pub fn class(&self) -> String {
+        class_key(&self.model_name)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "class": self.class(), "model_name": self.model_name,
+            "cpu_family": self.cpu_family, "model": self.model, "stepping": self.stepping,
+            "microcode": self.microcode, "cores": self.cores, "kvm": self.kvm,
+            "guest_pmu": self.guest_pmu, "tsc_mhz": self.tsc_mhz,
+        })
+    }
+
+    fn from_json(v: &Value) -> Self {
+        let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        Self {
+            model_name: s("model_name"),
+            cpu_family: s("cpu_family"),
+            model: s("model"),
+            stepping: s("stepping"),
+            microcode: s("microcode"),
+            cores: v["cores"].as_u64().unwrap_or(0) as usize,
+            kvm: v["kvm"].as_bool().unwrap_or(false),
+            guest_pmu: v["guest_pmu"].as_bool(),
+            tsc_mhz: v["tsc_mhz"].as_f64(),
+        }
+    }
+}
+
+/// A CPU model name as a baseline key: lower case, `(R)` and `(TM)`
+/// dropped, every run of characters other than ASCII letters and digits
+/// one `-` (`Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz` is
+/// `intel-xeon-platinum-8370c-cpu-2-80ghz`). Empty when the model is
+/// unknown.
+pub fn class_key(model_name: &str) -> String {
+    let lower = model_name
+        .to_lowercase()
+        .replace("(r)", "")
+        .replace("(tm)", "");
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Whether a guest had performance counters: their counts are `_insns`
+/// metrics on a VMM not under `-icount`; a `pmu/<vmm>` skip says a guest
+/// had none.
+fn guest_pmu(metrics: &[Metric], skipped: &[(String, String)]) -> Option<bool> {
+    if metrics.iter().any(|m| {
+        m.name.ends_with("_insns") && m.vmm.as_deref().is_some_and(|v| !v.ends_with("-icount"))
+    }) {
+        Some(true)
+    } else if skipped.iter().any(|(what, _)| what.starts_with("pmu/")) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The host kernel's log, read directly or through password-less `sudo`
+/// (as for the tap devices); empty when neither works.
+fn boot_log() -> String {
+    [&["dmesg"][..], &["sudo", "-n", "dmesg"]]
+        .iter()
+        .find_map(|argv| {
+            Command::new(argv[0])
+                .args(&argv[1..])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success() && !o.stdout.is_empty())
+        })
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// The TSC frequency in a Linux kernel log: the refined calibration when
+/// there is one, else the frequency detected at boot.
+fn tsc_mhz(log: &str) -> Option<f64> {
+    let after = |marker: &str| {
+        log.lines().find_map(|l| {
+            let rest = &l[l.find(marker)? + marker.len()..];
+            rest.split_whitespace().next()?.parse::<f64>().ok()
+        })
+    };
+    after("Refined TSC clocksource calibration: ").or_else(|| after("tsc: Detected "))
 }
 
 /// Entry point for `cargo xtask bench`.
@@ -323,7 +484,7 @@ pub fn cmd(opts: &Options) -> Result {
         report::text(&format!("results written to {}", path.display()));
     }
     if opts.update_baseline {
-        update_baseline(&opts.env, &results)?;
+        update_baseline(&opts.env, opts.class.as_deref(), &results)?;
     }
     if opts.readme {
         update_readme(&results)?;
@@ -354,13 +515,7 @@ fn measure(opts: &Options) -> Result<Results> {
         } else {
             crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
         }
-        return Ok(Results {
-            environment: opts.env.clone(),
-            date: today(),
-            kvm: vmm::kvm_available(),
-            metrics,
-            skipped,
-        });
+        return Ok(finish(opts, metrics, skipped));
     }
     let kernel = build_kernel(Profile::Release, &[])?;
     let size = fs::metadata(&kernel)
@@ -444,13 +599,24 @@ fn measure(opts: &Options) -> Result<Results> {
     crate::profile::measure(opts, &mut metrics, &mut skipped)?;
     crate::workloads::measure(opts, &mut metrics, &mut skipped)?;
     measure_comparisons(opts, &mut metrics, &mut skipped)?;
-    Ok(Results {
+    Ok(finish(opts, metrics, skipped))
+}
+
+/// The results of a measurement, labelled with this machine.
+fn finish(opts: &Options, metrics: Vec<Metric>, skipped: Vec<(String, String)>) -> Results {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let mut runner = Runner::from_cpuinfo(&cpuinfo);
+    runner.kvm = vmm::kvm_available();
+    runner.guest_pmu = guest_pmu(&metrics, &skipped);
+    runner.tsc_mhz = tsc_mhz(&boot_log());
+    Results {
         environment: opts.env.clone(),
         date: today(),
-        kvm: vmm::kvm_available(),
+        kvm: runner.kvm,
         metrics,
         skipped,
-    })
+        runner: Some(runner),
+    }
 }
 
 /// The same operations with existing mechanisms on this machine (spec
@@ -1441,6 +1607,28 @@ fn print_table(results: &Results) {
     for (vmm, reason) in &results.skipped {
         report::text(&format!("skipped {vmm}: {reason}"));
     }
+    if let Some(r) = &results.runner {
+        let yes_no = |b: Option<bool>| match b {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        };
+        report::text(&format!(
+            "runner: class `{}` ({}; family {} model {} stepping {} microcode {}; {} CPUs; KVM: \
+             {}; guest PMU: {}; TSC: {})",
+            r.class(),
+            r.model_name,
+            r.cpu_family,
+            r.model,
+            r.stepping,
+            r.microcode,
+            r.cores,
+            yes_no(Some(r.kvm)),
+            yes_no(r.guest_pmu),
+            r.tsc_mhz
+                .map_or("unknown".to_string(), |mhz| format!("{mhz:.3} MHz")),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,6 +1676,97 @@ fn threshold_pct(baseline: &Value, env: &str, m: &Metric) -> f64 {
     }
 }
 
+/// Whether the metric stored under `key` (`name/guest/vmm`) is a timing
+/// one: neither deterministic nor an instruction count under `-icount`.
+/// Only timings depend on the runner's class.
+fn is_timing_key(key: &str) -> bool {
+    let mut parts = key.split('/');
+    let name = parts.next().unwrap_or_default();
+    let vmm = parts.nth(1);
+    vmm.is_some_and(|v| !v.ends_with("-icount")) && !DETERMINISTIC.contains(&name)
+}
+
+/// What a run's timings are compared with (change `bench-runner-class`).
+#[derive(Debug, PartialEq)]
+pub enum Comparison {
+    /// The baselines of its runner class, `classes.<env>.<class>`.
+    Class(String),
+    /// The default baselines: its class has none (the model, or why it is
+    /// not known).
+    Unknown(String),
+}
+
+impl Comparison {
+    /// The run's class against the classes stored for `env`.
+    pub fn of(baseline: &Value, env: &str, results: &Results) -> Self {
+        match &results.runner {
+            Some(r) if baseline["classes"][env][r.class()].is_object() => Self::Class(r.class()),
+            Some(r) if !r.model_name.is_empty() => Self::Unknown(r.model_name.clone()),
+            _ => Self::Unknown("not recorded".into()),
+        }
+    }
+
+    /// The line the gate prints.
+    pub fn note(&self) -> String {
+        match self {
+            Self::Class(class) => {
+                format!("runner class `{class}`: timings compared against its own baselines")
+            }
+            Self::Unknown(model) => {
+                format!("unknown runner class: {model}; compared against the default class")
+            }
+        }
+    }
+}
+
+/// The values a run is compared with: the default `environments.<env>`,
+/// where the run's class ([`Comparison`]) stores a timing in
+/// `classes.<env>.<class>`, that value instead. Deterministic figures and
+/// instruction counts are always the default's.
+pub fn stored_values(baseline: &Value, env: &str, results: &Results) -> Map<String, Value> {
+    let mut values = baseline["environments"][env]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if let Comparison::Class(class) = Comparison::of(baseline, env, results)
+        && let Some(own) = baseline["classes"][env][&class].as_object()
+    {
+        for (key, value) in own {
+            if is_timing_key(key) && values.contains_key(key) {
+                values.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    values
+}
+
+/// Entries of `classes.<env>` that are not allowed: a class only re-values
+/// timings the default baseline has, so it can neither loosen a
+/// deterministic or `-icount` gate nor add a metric of its own.
+pub fn invalid_class_entries(baseline: &Value, env: &str) -> Vec<String> {
+    let default = &baseline["environments"][env];
+    let Some(classes) = baseline["classes"][env].as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (class, values) in classes {
+        let Some(values) = values.as_object() else {
+            out.push(format!("{class}: not an object"));
+            continue;
+        };
+        for (key, value) in values {
+            if !is_timing_key(key) {
+                out.push(format!("{class}: {key} is not a timing"));
+            } else if default[key].as_f64().is_none() {
+                out.push(format!("{class}: {key} has no default baseline"));
+            } else if value.as_f64().is_none() {
+                out.push(format!("{class}: {key} is not a number"));
+            }
+        }
+    }
+    out
+}
+
 /// A metric that got worse than allowed.
 #[derive(Debug, PartialEq)]
 pub struct Regression {
@@ -1518,18 +1797,19 @@ impl Regression {
     }
 }
 
-/// Compares `results` with the stored values for `env` (lower is better,
+/// Compares `results` with the stored values for `env` and the run's
+/// runner class ([`stored_values`]; lower is better,
 /// but for [`HIGHER_IS_BETTER`], where worse by X % means the baseline is
 /// X % above the value).
 pub fn regressions(baseline: &Value, env: &str, results: &Results) -> Vec<Regression> {
-    let stored = &baseline["environments"][env];
+    let stored = stored_values(baseline, env, results);
     let mut out = Vec::new();
     for m in results
         .metrics
         .iter()
         .filter(|m| m.guest == "rhizo" && is_gated(baseline, env, &m.name))
     {
-        let Some(base) = stored[m.key()].as_f64() else {
+        let Some(base) = stored.get(&m.key()).and_then(Value::as_f64) else {
             continue;
         };
         let r = Regression {
@@ -1591,6 +1871,28 @@ fn check_baseline(env: &str, results: &Results) -> Result {
         ));
         return Ok(());
     }
+    let invalid = invalid_class_entries(&baseline, env);
+    if !invalid.is_empty() {
+        return Err(Failure::new("bench", "runner-class baselines not allowed")
+            .location(format!("{BASELINE} (`classes.{env}`)"))
+            .expected("timings the default baseline of the environment also has")
+            .actual(invalid.join("; "))
+            .hint("a class re-values timings only (bench/README.md, \"Runner classes\")")
+            .reproduce(format!("cargo xtask bench --env {env} --check"))
+            .into_error());
+    }
+    let comparison = Comparison::of(&baseline, env, results);
+    let timed = results
+        .metrics
+        .iter()
+        .any(|m| m.guest == "rhizo" && is_timing_key(&m.key()));
+    if timed {
+        report::text(&comparison.note());
+    }
+    let against = match &comparison {
+        Comparison::Class(class) => format!("environment `{env}`, runner class `{class}`"),
+        Comparison::Unknown(_) => format!("environment `{env}`"),
+    };
     let found = regressions(&baseline, env, results);
     let lost = missing(&baseline, env, results);
     if found.is_empty() && lost.is_empty() {
@@ -1603,7 +1905,7 @@ fn check_baseline(env: &str, results: &Results) -> Result {
         .iter()
         .map(|r| {
             Failure::new("bench", format!("benchmark regression: {}", r.key))
-                .location(format!("{BASELINE} (environment `{env}`)"))
+                .location(format!("{BASELINE} ({against})"))
                 .expected(format!(
                     "{} {:.3} (baseline {:.3}, {:.0}% worse at most)",
                     if r.higher_is_better {
@@ -1654,8 +1956,19 @@ fn check_baseline(env: &str, results: &Results) -> Result {
     Err(errors.join("\n"))
 }
 
-fn update_baseline(env: &str, results: &Results) -> Result {
+fn update_baseline(env: &str, class: Option<&str>, results: &Results) -> Result {
     let mut baseline = load_baseline()?;
+    if let Some(class) = class {
+        add_class(&mut baseline, env, class, results)?;
+        let text = serde_json::to_string_pretty(&baseline).expect("serializable");
+        fs::write(baseline_path(), text + "\n")
+            .map_err(|e| format!("cannot write baseline: {e}"))?;
+        report::text(&format!(
+            "runner class `{class}` added to `{env}` in {BASELINE}: a baseline change, which \
+             needs the owner's approval in its pull request"
+        ));
+        return Ok(());
+    }
     let stored = baseline["environments"]
         .as_object_mut()
         .ok_or("baseline has no `environments` object")?
@@ -1667,6 +1980,52 @@ fn update_baseline(env: &str, results: &Results) -> Result {
     let text = serde_json::to_string_pretty(&baseline).expect("serializable");
     fs::write(baseline_path(), text + "\n").map_err(|e| format!("cannot write baseline: {e}"))?;
     report::text(&format!("baseline for `{env}` updated in {BASELINE}"));
+    Ok(())
+}
+
+/// Creates the baselines of a new runner class from a run on it
+/// (`--update-baseline --class`): the run's timings that the default
+/// baseline of `env` has. It never changes a class that exists, and the
+/// run must have been measured on that class.
+fn add_class(baseline: &mut Value, env: &str, class: &str, results: &Results) -> Result {
+    let measured = results.runner.as_ref().map(Runner::class);
+    if measured.as_deref() != Some(class) {
+        return Err(format!(
+            "these results were measured on runner class `{}`, not `{class}`",
+            measured.as_deref().unwrap_or("(not recorded)")
+        ));
+    }
+    if !baseline["classes"][env][class].is_null() {
+        return Err(format!(
+            "runner class `{class}` already has baselines for `{env}`: change them by hand, \
+             with a justification, in a reviewed pull request"
+        ));
+    }
+    let default = baseline["environments"][env]
+        .as_object()
+        .filter(|d| !d.is_empty())
+        .ok_or(format!("no default baseline for `{env}` to add a class to"))?;
+    let own: Map<String, Value> = results
+        .metrics
+        .iter()
+        .filter(|m| m.guest == "rhizo" && is_timing_key(&m.key()) && default.contains_key(&m.key()))
+        .map(|m| (m.key(), json!(m.median)))
+        .collect();
+    if own.is_empty() {
+        return Err(format!("these results hold none of the timings of `{env}`"));
+    }
+    let root = baseline
+        .as_object_mut()
+        .ok_or("baseline is not a JSON object")?;
+    let classes = root.entry("classes").or_insert_with(|| json!({}));
+    classes
+        .as_object_mut()
+        .ok_or("baseline `classes` is not an object")?
+        .entry(env)
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(format!("baseline `classes.{env}` is not an object"))?
+        .insert(class.to_string(), Value::Object(own));
     Ok(())
 }
 
@@ -2226,6 +2585,7 @@ mod tests {
                 metric("snapshot.restore_ms", "gvisor", Some("runsc"), 120.0),
             ],
             skipped: Vec::new(),
+            runner: None,
         };
         let table = comparison_table(&results);
         assert!(
@@ -2268,6 +2628,7 @@ mod tests {
             kvm: true,
             metrics,
             skipped: vec![],
+            runner: None,
         }
     }
 
@@ -2305,6 +2666,7 @@ mod tests {
             kvm: true,
             metrics: vec![metric("cell.run_us", "qemu-microvm")],
             skipped: vec![("cells/qemu-microvm".into(), "PANIC".into())],
+            runner: None,
         };
         // Lost on a VMM that ran; not on one this run did not measure, and
         // not for an ungated metric.
@@ -2471,6 +2833,257 @@ mod tests {
         )]);
         let back = Results::from_json(&r.to_json()).unwrap();
         assert_eq!(back.metrics, r.metrics);
+        assert_eq!(
+            back.runner, None,
+            "results stored before runners were recorded"
+        );
+
+        let mut r = r;
+        r.runner = Some(runner("AMD EPYC 7763 64-Core Processor"));
+        let json = r.to_json();
+        assert_eq!(json["runner"]["class"], "amd-epyc-7763-64-core-processor");
+        assert_eq!(Results::from_json(&json).unwrap().runner, r.runner);
+    }
+
+    const CPUINFO_X86: &str = "processor\t: 0\nvendor_id\t: AuthenticAMD\ncpu family\t: 25\n\
+        model\t\t: 1\nmodel name\t: AMD EPYC 7763 64-Core Processor\nstepping\t: 1\n\
+        microcode\t: 0xffffffff\ncpu MHz\t\t: 3243.215\n\nprocessor\t: 1\nvendor_id\t: \
+        AuthenticAMD\ncpu family\t: 25\nmodel\t\t: 1\nmodel name\t: AMD EPYC 7763 64-Core \
+        Processor\nstepping\t: 1\n\nprocessor\t: 2\n\nprocessor\t: 3\n";
+
+    fn runner(model_name: &str) -> Runner {
+        Runner {
+            model_name: model_name.into(),
+            cores: 4,
+            kvm: true,
+            guest_pmu: Some(false),
+            tsc_mhz: Some(2445.4),
+            ..Runner::default()
+        }
+    }
+
+    #[test]
+    fn runner_identity_comes_from_cpuinfo() {
+        let r = Runner::from_cpuinfo(CPUINFO_X86);
+        assert_eq!(r.model_name, "AMD EPYC 7763 64-Core Processor");
+        assert_eq!(
+            (r.cpu_family.as_str(), r.model.as_str(), r.stepping.as_str()),
+            ("25", "1", "1")
+        );
+        assert_eq!(r.microcode, "0xffffffff");
+        assert_eq!(r.cores, 4);
+
+        let arm = "processor\t: 0\nBogoMIPS\t: 2000.00\nCPU implementer\t: 0x41\nCPU part\t: \
+                   0xd4f\n\nprocessor\t: 1\nCPU implementer\t: 0x41\n";
+        let r = Runner::from_cpuinfo(arm);
+        assert_eq!(r.model_name, "CPU implementer 0x41 part 0xd4f");
+        assert_eq!(r.class(), "cpu-implementer-0x41-part-0xd4f");
+        assert_eq!(r.cores, 2);
+        assert_eq!(Runner::from_cpuinfo("").class(), "");
+    }
+
+    #[test]
+    fn class_key_normalizes_the_model_name() {
+        assert_eq!(
+            class_key("Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz"),
+            "intel-xeon-platinum-8370c-cpu-2-80ghz"
+        );
+        assert_eq!(
+            class_key("  AMD EPYC 7763 64-Core Processor "),
+            "amd-epyc-7763-64-core-processor"
+        );
+        assert_eq!(
+            class_key("Intel(TM)  Xeon(r)\tProcessor"),
+            "intel-xeon-processor"
+        );
+    }
+
+    #[test]
+    fn tsc_frequency_comes_from_the_kernel_log() {
+        let detected = "[    0.000097] tsc: Detected 2100.000 MHz processor\n";
+        assert_eq!(tsc_mhz(detected), Some(2100.0));
+        let refined =
+            format!("{detected}[    1.5] tsc: Refined TSC clocksource calibration: 2099.998 MHz\n");
+        assert_eq!(tsc_mhz(&refined), Some(2099.998));
+        assert_eq!(tsc_mhz("[    0.1] Linux version 6.8\n"), None);
+    }
+
+    #[test]
+    fn guest_pmu_is_read_from_the_results() {
+        let counted = [metric("cell.run_insns", "rhizo", Some("qemu-microvm"), 5.0)];
+        let icount = [metric(
+            "cell.run_insns",
+            "rhizo",
+            Some("qemu-microvm-icount"),
+            5.0,
+        )];
+        let none = [("pmu/qemu-microvm".to_string(), "no counters".to_string())];
+        assert_eq!(guest_pmu(&counted, &none), Some(true));
+        assert_eq!(guest_pmu(&icount, &none), Some(false));
+        assert_eq!(guest_pmu(&icount, &[]), None);
+    }
+
+    /// A default baseline measured on one class, and a slower class `z`
+    /// with its own timings.
+    fn classed_baseline() -> Value {
+        json!({
+            "thresholds_pct": {"deterministic": 1, "instructions": 2, "timing": {"ci": 100}},
+            "environments": {"ci": {
+                "cell.fork_with_files_us/rhizo/qemu-microvm": 0.4,
+                "cell.run_us/rhizo/qemu-microvm": 7.0,
+                "cell.run_insns/rhizo/qemu-microvm-icount": 1000.0,
+                "image.size_bytes": 1000.0
+            }},
+            "classes": {"ci": {"z": {"cell.fork_with_files_us/rhizo/qemu-microvm": 0.66}}}
+        })
+    }
+
+    fn run_on(class_model: Option<&str>, fork_with_files: f64) -> Results {
+        let mut r = results(vec![
+            metric(
+                "cell.fork_with_files_us",
+                "rhizo",
+                Some("qemu-microvm"),
+                fork_with_files,
+            ),
+            metric("cell.run_us", "rhizo", Some("qemu-microvm"), 7.0),
+            metric(
+                "cell.run_insns",
+                "rhizo",
+                Some("qemu-microvm-icount"),
+                1021.0,
+            ),
+            metric("image.size_bytes", "rhizo", None, 1011.0),
+        ]);
+        r.runner = class_model.map(runner);
+        r
+    }
+
+    #[test]
+    fn a_runner_class_gates_timings_against_its_own_baselines() {
+        let baseline = classed_baseline();
+        let keys = |r: &Results| -> Vec<String> {
+            regressions(&baseline, "ci", r)
+                .into_iter()
+                .map(|r| r.key)
+                .collect()
+        };
+        // 0.9 µs is +125 % on the default (0.4) but +36 % on class z (0.66);
+        // the instruction count and the image size are compared with the
+        // default whatever the class.
+        let on_z = run_on(Some("Z"), 0.9);
+        assert_eq!(
+            Comparison::of(&baseline, "ci", &on_z),
+            Comparison::Class("z".into())
+        );
+        assert_eq!(
+            keys(&on_z),
+            [
+                "cell.run_insns/rhizo/qemu-microvm-icount",
+                "image.size_bytes"
+            ]
+        );
+        // Class z's baselines still catch a doubling on class z.
+        assert_eq!(
+            keys(&run_on(Some("Z"), 1.4)),
+            [
+                "cell.fork_with_files_us/rhizo/qemu-microvm",
+                "cell.run_insns/rhizo/qemu-microvm-icount",
+                "image.size_bytes"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_runner_class_is_gated_against_the_default_and_says_so() {
+        let baseline = classed_baseline();
+        for (model, note) in [
+            (
+                Some("AMD EPYC 9V74 80-Core Processor"),
+                "unknown runner class: AMD EPYC 9V74 80-Core Processor; compared against the \
+                 default class",
+            ),
+            (
+                None,
+                "unknown runner class: not recorded; compared against the default class",
+            ),
+        ] {
+            let run = run_on(model, 0.9);
+            let comparison = Comparison::of(&baseline, "ci", &run);
+            assert_eq!(comparison.note(), note);
+            let found = regressions(&baseline, "ci", &run);
+            assert!(
+                found
+                    .iter()
+                    .any(|r| r.key == "cell.fork_with_files_us/rhizo/qemu-microvm"
+                        && r.baseline == 0.4),
+                "{found:?}"
+            );
+        }
+        // With no classes at all, the default alone, as before.
+        let mut plain = classed_baseline();
+        plain.as_object_mut().unwrap().remove("classes");
+        assert_eq!(
+            regressions(&plain, "ci", &run_on(Some("Z"), 0.9)).len(),
+            3,
+            "fork with files, the instruction count and the image size"
+        );
+    }
+
+    #[test]
+    fn a_class_only_re_values_default_timings() {
+        assert!(invalid_class_entries(&classed_baseline(), "ci").is_empty());
+        let mut baseline = classed_baseline();
+        baseline["classes"]["ci"]["z"] = json!({
+            "cell.run_insns/rhizo/qemu-microvm-icount": 5000.0,
+            "image.size_bytes": 5000.0,
+            "cell.new_us/rhizo/qemu-microvm": 1.0,
+            "cell.run_us/rhizo/qemu-microvm": "slow"
+        });
+        assert_eq!(
+            invalid_class_entries(&baseline, "ci"),
+            [
+                "z: cell.new_us/rhizo/qemu-microvm has no default baseline",
+                "z: cell.run_insns/rhizo/qemu-microvm-icount is not a timing",
+                "z: cell.run_us/rhizo/qemu-microvm is not a number",
+                "z: image.size_bytes is not a timing",
+            ]
+        );
+        // Whatever a class holds, the gate reads timings only from it.
+        let values = stored_values(&baseline, "ci", &run_on(Some("Z"), 0.9));
+        assert_eq!(values["cell.run_insns/rhizo/qemu-microvm-icount"], 1000.0);
+        assert_eq!(values["image.size_bytes"], 1000.0);
+        assert!(!values.contains_key("cell.new_us/rhizo/qemu-microvm"));
+    }
+
+    #[test]
+    fn a_new_class_is_created_once_from_a_run_on_it() {
+        let mut baseline = classed_baseline();
+        let run = run_on(Some("Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz"), 0.39);
+        let class = "intel-xeon-platinum-8370c-cpu-2-80ghz";
+        assert!(
+            add_class(&mut baseline, "ci", "z", &run)
+                .unwrap_err()
+                .contains("measured on runner class `intel-xeon-platinum-8370c-cpu-2-80ghz`")
+        );
+        add_class(&mut baseline, "ci", class, &run).unwrap();
+        assert_eq!(
+            baseline["classes"]["ci"][class],
+            json!({
+                "cell.fork_with_files_us/rhizo/qemu-microvm": 0.39,
+                "cell.run_us/rhizo/qemu-microvm": 7.0
+            }),
+            "timings only, and only those the default has"
+        );
+        assert!(
+            add_class(&mut baseline, "ci", class, &run)
+                .unwrap_err()
+                .contains("already has baselines"),
+            "an existing class is never changed by a run"
+        );
+        let mut empty = json!({"environments": {"ci": {}}});
+        assert!(add_class(&mut empty, "ci", class, &run).is_err());
+        assert!(add_class(&mut classed_baseline(), "ci", "", &run_on(None, 0.4)).is_err());
     }
 
     #[test]
@@ -2629,6 +3242,11 @@ mod tests {
         assert!(o.soak);
         assert_eq!((o.cells, o.llm_delay_ms, o.cpus), (500, 250, 4));
         assert_eq!(Options::default().cpus, 1);
+        let class: Vec<String> = ["--env", "ci", "--update-baseline", "--class", "z"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(Options::parse(&class).unwrap().class.as_deref(), Some("z"));
         let control = ["--workload".to_string(), "control".to_string()];
         assert_eq!(
             Options::parse(&control).unwrap().workload,
@@ -2640,6 +3258,8 @@ mod tests {
             &["--cpus", "0"],
             &["--cpus", "5"],
             &["--cpus", "4", "--check"],
+            &["--class", "z"],
+            &["--class", "z", "--check"],
         ] {
             let bad: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
             assert!(Options::parse(&bad).is_err(), "{bad:?}");

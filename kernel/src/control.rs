@@ -18,11 +18,15 @@
 //! (`Snapshot::from_bytes`).
 //!
 //! Protocol version 4 places the cells the host makes in the cell tree and
-//! operates on it (`tree`, design D14 of `add-cell-hierarchy`).
+//! operates on it (`tree`, design D14 of `add-cell-hierarchy`), and sends
+//! the host the kernel's audit records as they come (design D18): the
+//! cells the host made and that ended, its moves, policies and limits, its
+//! scoped requests, and every refusal.
 
 mod tree;
 
 use crate::arch::timer::{self, Counter};
+use crate::audit::{self, Kind};
 use crate::cell::{self, Ending, Host, Resume, now_ns};
 use crate::memory;
 use alloc::format;
@@ -174,6 +178,7 @@ pub fn serve() {
         }
         server.reap();
         server.flush();
+        server.audit();
         let now = now_ns();
         if busy {
             fast_until = now + FAST_FOR_NS;
@@ -217,6 +222,7 @@ pub fn serve() {
                 || h.has_finished()
                 || (!watched.is_empty() && now_ns() >= flush_at)
                 || watched.iter().any(|&cell| h.has_output(cell))
+                || audit::pending()
         });
     }
 }
@@ -290,7 +296,73 @@ impl Server {
         }
     }
 
+    /// Does `request` and audits it: a refusal by the tree, or what the
+    /// host administered (design D18). A scoped request is audited by
+    /// `scoped`, and the request it carries when that executes it.
     fn execute(&mut self, id: u32, request: Request) -> Outcome {
+        if matches!(request, Request::Scoped { .. }) {
+            return self.apply(id, request);
+        }
+        let (name, target) = about(&request);
+        let admin = administered(&request);
+        let outcome = self.apply(id, request);
+        match &outcome {
+            Err((Error::Denied | Error::Invalid, why)) => audit::deny(
+                Kind::Tree,
+                self.kernel_of(target),
+                0,
+                format!("{name} cell {target}: {why}").as_bytes(),
+            ),
+            Ok(body) => {
+                if let Some((kind, detail)) = admin {
+                    let (cell, detail) = match body {
+                        Body::Cell(c) => (*c, detail),
+                        Body::Cells(c) if c.len() > 1 => (
+                            c[0],
+                            format!("{detail}: cells {} to {}", c[0], c[c.len() - 1]),
+                        ),
+                        Body::Cells(c) => (c.first().copied().unwrap_or(0), detail),
+                        _ => (target, detail),
+                    };
+                    audit::record(kind, self.kernel_of(cell), 0, detail.as_bytes());
+                }
+            }
+            Err(_) => {}
+        }
+        outcome
+    }
+
+    /// The kernel cell of host cell `id` (0 if none).
+    fn kernel_of(&self, id: u32) -> u32 {
+        self.cells.iter().find(|e| e.id == id).map_or(0, |e| e.cell)
+    }
+
+    /// The host cell that kernel cell `cell` is or was (0 if none).
+    fn host_of(&self, cell: u32) -> u32 {
+        if cell == 0 {
+            return 0;
+        }
+        self.cells
+            .iter()
+            .rev()
+            .find(|e| e.cell == cell)
+            .map_or(0, |e| e.id)
+    }
+
+    /// Sends the host the audit records waiting, its identifiers in place
+    /// of the kernel's, with the root of each cell's domain where the
+    /// record did not name it.
+    fn audit(&self) {
+        while let Some(mut r) = audit::take() {
+            if r.domain == 0 {
+                r.domain = self.host.tree().root_of(r.cell).unwrap_or(0);
+            }
+            (r.cell, r.domain) = (self.host_of(r.cell), self.host_of(r.domain));
+            send(0, &Message::Audit(r));
+        }
+    }
+
+    fn apply(&mut self, id: u32, request: Request) -> Outcome {
         match request {
             Request::Run(run) => self.run(id, run),
             Request::List => Ok(Body::List(self.cells.iter().map(|e| self.row(e)).collect())),
@@ -386,9 +458,11 @@ impl Server {
                     Place::Suspended(snapshot) => {
                         cell::close_parked(&snapshot);
                         self.host.drop_snapshot(&snapshot);
+                        ended(self.kernel_of(target), State::Killed);
                     }
                     Place::Template(template) => {
                         self.host.drop_template(template);
+                        ended(template, State::Killed);
                     }
                     // Killing a cell that ended forgets it.
                     Place::Ended(_) => self.cells.retain(|e| e.id != target),
@@ -497,8 +571,8 @@ impl Server {
     /// Publishes template `target` (design D21 of `add-cell-hierarchy`):
     /// refused if its cell reached the network card and the host does not
     /// attest (`attest`) that it holds no secret. `Host::publish` asks
-    /// `Host::may_publish`, which records the attestation or the refusal in
-    /// the audit log (task 1.9b, `change/hierarchy-audit`).
+    /// `Host::may_publish`, which audits the attestation or the refusal
+    /// (design D18).
     fn publish(&mut self, target: u32, attest: bool) -> Outcome {
         let template = self.template_of(target)?;
         match self.host.publish(template, attest) {
@@ -587,8 +661,11 @@ impl Server {
         let mut snapshot =
             Snapshot::from_bytes(bytes, crate::arch::user::MACHINE, crate::arch::mem::crc32c)
                 .map_err(|e| (Error::BadSnapshot, describe(e)))?;
-        // It gets no more than a cell the host starts (design D4).
+        // It gets no more than a cell the host starts (design D4); asking
+        // for more is audited (design D18 of `add-cell-hierarchy`).
+        let asked = snapshot.state().quota;
         snapshot.cap_quota(Quota::DEFAULT);
+        let narrowed = snapshot.state().quota != asked;
         let source = snapshot.tree().pid;
         let (place, cell, pending) = if template {
             let t = self
@@ -623,6 +700,18 @@ impl Server {
             watchers: Vec::new(),
             pending,
         });
+        if narrowed {
+            audit::deny(
+                Kind::Narrowed,
+                cell,
+                0,
+                format!(
+                    "loaded as cell {id}: its memory, CPU time, files or sockets cut to what a \
+                     cell the host starts gets"
+                )
+                .as_bytes(),
+            );
+        }
         Ok(Body::Cell(id))
     }
 
@@ -759,11 +848,13 @@ impl Server {
                 if let Place::Suspended(snapshot) = &entry.place {
                     cell::close_parked(snapshot);
                 }
-                entry.place = Place::Ended(match finished.ending {
+                let state = match finished.ending {
                     Ending::Exit(code) => State::Exited(code),
                     Ending::Fault => State::Fault,
                     Ending::Killed | Ending::OutOfCpu | Ending::Suspended => State::Killed,
-                });
+                };
+                entry.place = Place::Ended(state);
+                ended(finished.id, state);
             }
         }
     }
@@ -801,6 +892,92 @@ impl Server {
                 }
             }
         }
+    }
+}
+
+/// Audits the end of kernel cell `cell`.
+fn ended(cell: u32, state: State) {
+    audit::record(Kind::Ended, cell, 0, format!("{state:?}").as_bytes());
+}
+
+/// A request's name, and the host cell it is about (0: none), for the
+/// audit log.
+fn about(request: &Request) -> (&'static str, u32) {
+    match request {
+        Request::Run(run) => ("run under", run.placement.parent),
+        Request::Load { placement, .. } => ("load under", placement.parent),
+        Request::Fork { cell, .. } => ("fork", *cell),
+        Request::Reparent { cell, .. } => ("reparent", *cell),
+        Request::Policy { cell, .. } => ("policy", *cell),
+        Request::Limits { cell, .. } => ("limits", *cell),
+        Request::Scoped { root, .. } => ("scoped", *root),
+        Request::Kill(cell) => ("kill", *cell),
+        Request::KillTree(cell) => ("kill --tree", *cell),
+        Request::Suspend(cell) => ("suspend", *cell),
+        Request::SuspendTree(cell) => ("suspend --tree", *cell),
+        Request::Resume(cell) => ("resume", *cell),
+        Request::ResumeTree(cell) => ("resume --tree", *cell),
+        Request::Output(cell) => ("output", *cell),
+        Request::CloseInput(cell) => ("close input", *cell),
+        Request::Freeze(cell) => ("freeze", *cell),
+        Request::WriteFile { cell, .. } => ("write file", *cell),
+        Request::Input { cell, .. } => ("input", *cell),
+        Request::Save { cell, .. } => ("save", *cell),
+        Request::List => ("list", 0),
+        Request::Stats => ("stats", 0),
+        Request::Shutdown => ("shutdown", 0),
+    }
+}
+
+/// What the host administers with `request`, audited once it is done.
+fn administered(request: &Request) -> Option<(Kind, String)> {
+    let made = |what: String, p: &Placement| {
+        let at = match p.parent {
+            0 => String::from("a root"),
+            parent => format!("under cell {parent}"),
+        };
+        Some((
+            Kind::Created,
+            format!(
+                "{what}, {at}, label `{}`, egress {:?}, ceiling {:?}, limits {:?}, CPUs {:#x}",
+                String::from_utf8_lossy(&p.label),
+                p.egress,
+                p.ceiling,
+                p.limits,
+                p.cpus
+            ),
+        ))
+    };
+    match request {
+        Request::Run(run) => made(
+            format!("run {}", String::from_utf8_lossy(&run.image)),
+            &run.placement,
+        ),
+        Request::Fork {
+            cell, n, placement, ..
+        } => made(format!("{n} copies of cell {cell}"), placement),
+        Request::Load {
+            template,
+            placement,
+            ..
+        } => made(
+            String::from(if *template {
+                "load a template"
+            } else {
+                "load a cell"
+            }),
+            placement,
+        ),
+        Request::Reparent { to: 0, .. } => Some((Kind::Moved, String::from("made a root"))),
+        Request::Reparent { to, .. } => Some((Kind::Moved, format!("moved under cell {to}"))),
+        Request::Policy {
+            egress, ceiling, ..
+        } => Some((
+            Kind::Policy,
+            format!("egress {egress:?}, ceiling {ceiling:?}"),
+        )),
+        Request::Limits { limits, .. } => Some((Kind::Limits, format!("{limits:?}"))),
+        _ => None,
     }
 }
 
