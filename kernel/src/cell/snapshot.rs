@@ -189,8 +189,7 @@ impl Host {
             // Short of frames, what is left stays pending, restored lazily.
             let _ = lazy.finish(&pt, &used);
         }
-        let mut live = self.new_live(cell, capture, echo, fs);
-        live.frames.set_used(used.used());
+        let mut live = self.new_live(cell, capture, echo, fs, used.used());
         live.demand.lazy = (lazy.left > 0).then_some(lazy);
         live.demand.wx = wx;
         live.deadlines = deadlines;
@@ -207,7 +206,8 @@ impl Host {
     pub fn fork(&mut self, id: u32, n: usize) -> Option<Vec<u32>> {
         let _p = cost::scope(Part::Spawn);
         let (mut parent, wake) = self.take_cell(id)?;
-        if parent.cell.quota.memory != u64::MAX && !self.admits_copies(id, n) {
+        let limited = parent.cell.quota.memory != u64::MAX;
+        if limited && !self.admits_copies(id, n) {
             self.requeue(parent, wake);
             return None;
         }
@@ -247,6 +247,9 @@ impl Host {
                 self.discard(child);
             }
             return None;
+        }
+        if limited {
+            self.copies_entered(id);
         }
         let ids: Vec<u32> = children.iter().map(|c| c.cell.id).collect();
         // Copies have their source's egress policy (design D7).
@@ -302,8 +305,7 @@ impl Host {
             generation: cell.generation + 1,
             ..cell.clone()
         };
-        let mut live = self.new_live(cell, capture, echo, fork_files(fs, id));
-        live.frames.set_used(1); // its root
+        let mut live = self.new_live(cell, capture, echo, fork_files(fs, id), 1); // its root
         live.shares = true;
         live.demand.wx = wx.clone();
         if !wx.wiped().is_empty() && !wipe_copy(&live) {
@@ -464,7 +466,8 @@ impl Host {
     pub fn spawn_from_template(&mut self, id: u32, capture: bool, echo: bool) -> Option<u32> {
         let _p = cost::scope(Part::Spawn);
         let index = self.templates.iter().position(|(c, ..)| c.id == id)?;
-        if self.templates[index].0.quota.memory != u64::MAX && !self.admits_copies(id, 1) {
+        let limited = self.templates[index].0.quota.memory != u64::MAX;
+        if limited && !self.admits_copies(id, 1) {
             return None;
         }
         let (cell, fs, wx) = &self.templates[index];
@@ -475,6 +478,9 @@ impl Host {
         if !self.enter_copies(id, &mut copies) {
             self.discard(&copies[0]);
             return None;
+        }
+        if limited {
+            self.copies_entered(id);
         }
         let [child] = copies;
         let child_id = child.cell.id;

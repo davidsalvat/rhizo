@@ -277,13 +277,15 @@ impl Host {
         self.settle();
     }
 
-    /// A new live cell's record: its tag, nothing flushed yet.
+    /// A new live cell's record: its tag, nothing flushed yet, `used`
+    /// frames counted against its memory quota.
     pub(super) fn new_live(
         &mut self,
         cell: Cell,
         output: bool,
         echo: bool,
         mut fs: Fs,
+        used: u64,
     ) -> Box<Live> {
         // Changed only when they differ: setting them copies shared tables.
         let limits = (cell.quota.files() as usize, cell.quota.sockets as usize);
@@ -294,8 +296,7 @@ impl Host {
         if tag.is_none() {
             prof::add(Count::Untagged, 1);
         }
-        let frames = Meter::new(0, cell.quota.frames());
-        frames.join(&memory::RESERVE);
+        let frames = Meter::new(used, cell.quota.frames());
         Box::new(Live {
             cell,
             tag: tag.unwrap_or(0),
@@ -378,8 +379,7 @@ impl Host {
             envp,
             random,
         )?;
-        let mut live = self.new_live(cell, capture, echo, files);
-        live.frames.set_used(used.used());
+        let mut live = self.new_live(cell, capture, echo, files, used.used());
         if !self.enter_root(&mut live.cell) {
             self.discard(&live);
             return Err(ElfError::OutOfMemory);
@@ -425,7 +425,7 @@ impl Host {
             envp,
             random,
         )?;
-        let mut live = self.new_live(cell, capture, echo, files);
+        let mut live = self.new_live(cell, capture, echo, files, 0);
         if !self.enter_root(&mut live.cell) {
             self.discard(&live);
             return Err(ElfError::OutOfMemory.into());

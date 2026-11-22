@@ -79,8 +79,8 @@ impl Default for Quota {
 /// socket queues: design D4 of `add-cell-hierarchy`) is counted in bytes
 /// and takes whole frames of the count.
 ///
-/// A meter with a limit may join the kernel's [`Reserve`]: the part of its
-/// limit it does not use is then set aside for it.
+/// While a meter with a limit lives, the part of its limit it does not
+/// use is set aside for it in the kernel's [`RESERVE`].
 #[derive(Debug)]
 pub struct Meter {
     used: Counter<u64>,
@@ -88,8 +88,13 @@ pub struct Meter {
     /// Bytes of kernel memory counted besides frames (their whole frames
     /// are in `used`).
     heap: Counter<u64>,
-    reserve: Counter<Option<&'static Reserve>>,
 }
+
+/// Memory set aside for the cells of reserved domains (design D4 of
+/// `add-cell-hierarchy`): what the limits of every live [`Meter`] leave
+/// unused, and what the kernel holds for suspended cells. The kernel's
+/// caches and cells without a limit may not take it.
+pub static RESERVE: Reserve = Reserve::new();
 
 /// The frames a meter with `used` and `limit` sets aside in the
 /// [`Reserve`]: what its limit leaves, none without a limit.
@@ -104,12 +109,15 @@ fn held(used: u64, limit: u64) -> u64 {
 
 impl Meter {
     /// A meter with `used` frames counted and a limit of `limit` frames.
-    pub const fn new(used: u64, limit: u64) -> Self {
+    pub fn new(used: u64, limit: u64) -> Self {
+        let held = held(used, limit);
+        if held != 0 {
+            RESERVE.hold(held);
+        }
         Self {
             used: Counter::new(used),
             limit: Counter::new(limit),
             heap: Counter::new(0),
-            reserve: Counter::new(None),
         }
     }
 
@@ -122,7 +130,13 @@ impl Meter {
     /// Sets the frames counted.
     #[inline]
     pub fn set_used(&self, used: u64) {
-        self.set(used, self.limit.get());
+        // Without a limit (most cells), one comparison.
+        let limit = self.limit.get();
+        if limit < Quota::NONE.frames() {
+            let was = self.used.get();
+            RESERVE.shift(limit.saturating_sub(was), limit.saturating_sub(used));
+        }
+        self.used.set(used);
     }
 
     /// The limit in frames.
@@ -139,20 +153,9 @@ impl Meter {
 
     #[inline(always)]
     fn set(&self, used: u64, limit: u64) {
-        if let Some(reserve) = self.reserve.get() {
-            reserve.shift(held(self.used.get(), self.limit.get()), held(used, limit));
-        }
+        RESERVE.shift(held(self.used.get(), self.limit.get()), held(used, limit));
         self.used.set(used);
         self.limit.set(limit);
-    }
-
-    /// Joins `reserve`: from now on what its limit leaves unused is set
-    /// aside there, until the meter goes.
-    pub fn join(&self, reserve: &'static Reserve) {
-        if self.reserve.get().is_none() {
-            reserve.shift(0, held(self.used(), self.limit()));
-            self.reserve.set(Some(reserve));
-        }
     }
 
     /// Counts `bytes` of kernel memory besides frames; `false`, counting
@@ -186,16 +189,11 @@ impl Meter {
 
 impl Drop for Meter {
     fn drop(&mut self) {
-        if let Some(reserve) = self.reserve.get() {
-            reserve.shift(held(self.used(), self.limit()), 0);
-        }
+        RESERVE.shift(held(self.used(), self.limit()), 0);
     }
 }
 
-/// Memory set aside for cells with a memory limit (design D4 of
-/// `add-cell-hierarchy`, reserved roots): the frames their limits allow and
-/// they do not use, which the kernel's caches and cells without a limit may
-/// not take. Meters that [`join`](Meter::join) it keep it up to date.
+/// Frames set aside ([`RESERVE`]).
 #[derive(Debug, Default)]
 pub struct Reserve(AtomicU64);
 
@@ -245,8 +243,8 @@ pub struct Metered<'a, A> {
 }
 
 impl<A: Frames> Metered<'_, A> {
-    /// Counts `count` frames, then takes them: a meter in the [`Reserve`]
-    /// has them out of what is set aside for it before they are asked for.
+    /// Counts `count` frames, then takes them: a meter with a limit has
+    /// them out of what is set aside for it before they are asked for.
     #[inline(always)]
     fn take(&mut self, count: u64, alloc: impl FnOnce(&mut A) -> Option<u64>) -> Option<u64> {
         let was = self.meter.used();
@@ -309,8 +307,16 @@ mod tests {
     use super::*;
     use crate::testing::CountingFrames;
 
+    /// Held by the tests that make meters with a limit: they share the
+    /// [`RESERVE`], which one of them checks.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn allocations_stop_at_the_limit_and_frees_make_room() {
+        let _serial = serial();
         let frames = CountingFrames::new(64);
         let used = Meter::new(0, 3);
         let mut m = Metered {
@@ -332,6 +338,7 @@ mod tests {
 
     #[test]
     fn large_pages_count_512_frames() {
+        let _serial = serial();
         let frames = CountingFrames::new(64);
         let used = Meter::new(0, 600);
         let mut m = Metered {
@@ -347,6 +354,7 @@ mod tests {
 
     #[test]
     fn credit_never_goes_below_zero() {
+        let _serial = serial();
         // A child giving back a page it inherited was never charged for it.
         let mut frames = CountingFrames::new(64);
         let inherited = frames.alloc().unwrap();
@@ -363,6 +371,7 @@ mod tests {
 
     #[test]
     fn kernel_memory_counts_in_whole_frames_with_the_pages() {
+        let _serial = serial();
         let used = Meter::new(0, 3);
         let mut m = Metered {
             frames: CountingFrames::new(64),
@@ -388,13 +397,11 @@ mod tests {
 
     #[test]
     fn the_reserve_holds_what_limits_leave() {
-        static RESERVE: Reserve = Reserve::new();
+        let _serial = serial();
         let unlimited = Meter::new(5, Quota::NONE.frames());
-        unlimited.join(&RESERVE);
         assert_eq!(RESERVE.frames(), 0, "no limit: nothing set aside");
         {
             let used = Meter::new(1, 4);
-            used.join(&RESERVE);
             assert_eq!(RESERVE.frames(), 3);
             let mut m = Metered {
                 frames: CountingFrames::new(64),
@@ -419,6 +426,11 @@ mod tests {
             assert_eq!(RESERVE.frames(), 1, "a failed allocation gives it back");
         }
         assert_eq!(RESERVE.frames(), 0, "a meter that goes gives it all back");
+        drop(unlimited);
+        RESERVE.hold(7);
+        assert_eq!(RESERVE.frames(), 7);
+        RESERVE.release(7);
+        assert_eq!(RESERVE.frames(), 0);
     }
 
     #[test]

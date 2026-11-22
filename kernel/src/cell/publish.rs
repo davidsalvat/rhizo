@@ -190,11 +190,12 @@ impl Host {
             self.requeue(live, wake);
             return true;
         }
+        // What its limit sets aside is its own to copy into (design D4):
+        // the copy's meter holds it meanwhile.
         let limit = live.frames.limit();
-        let used = Meter::new(0, limit);
-        // What its limit sets aside is its own to copy into (design D4).
         live.frames.set_limit(u64::MAX);
-        let copy = match cells_may_take(mapped_bytes(&old)) {
+        let used = Meter::new(0, limit);
+        let copy = match may_take(&used, mapped_bytes(&old)) {
             true => sharing(live.shares, || full_copy(&old, &used, &mut public)),
             false => None,
         };

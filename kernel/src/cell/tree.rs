@@ -105,28 +105,21 @@ impl Host {
         } else {
             &many[..]
         };
-        // Copies of a reserved root are reserved roots (admitted before
-        // they were made, `admits_copies`): they have its memory limit.
-        let limited = copies
-            .first()
-            .is_some_and(|c| c.cell.quota.memory != u64::MAX);
         let mut placed = |k: usize, pid, domain| {
             if let Some(copy) = copies.get_mut(k) {
                 (copy.cell.pid, copy.cell.domain) = (pid, domain);
             }
         };
-        self.add_copies(source, ids, limited, &mut placed)
+        self.add_copies(source, ids, &mut placed)
     }
 
     /// Adds `ids` to the tree as copies of cell `source`, telling `placed`
-    /// each one's number and domain: all, or none and `false`. `limited`:
-    /// they have a memory limit.
+    /// each one's number and domain: all, or none and `false`.
     #[inline(never)]
     fn add_copies(
         &mut self,
         source: u32,
         ids: &[u32],
-        limited: bool,
         placed: &mut dyn FnMut(usize, u32, u32),
     ) -> bool {
         let parent = self.tree.get(source).map_or(0, |n| n.parent());
@@ -134,20 +127,31 @@ impl Host {
         let entered = self.tree.add_copies(source, ids, &|_| used, placed).is_ok();
         if entered {
             self.reshare_if_by_weight();
-            if limited && parent == HOST {
-                self.refresh_reserved();
-            } else if parent != HOST {
-                // Carved from their parent: it may use that much less.
-                self.sync(parent);
-            }
         }
         entered
+    }
+
+    /// After copies of cell `source`, which has a memory limit, entered
+    /// the tree (design D4): copies of a root are reserved roots the
+    /// kernel's reservations count; copies of a child are carved from its
+    /// parent, which may then use that much less. Out of line: copies of
+    /// cells without a memory limit never come here.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn copies_entered(&mut self, source: u32) {
+        match self.tree.get(source).map_or(HOST, |n| n.parent()) {
+            HOST => self.refresh_reserved(),
+            parent => self.sync(parent),
+        }
     }
 
     /// Whether the kernel can take `n` copies of cell `source`: each copy
     /// of a reserved root is a reserved root holding its limits, admitted
     /// against the kernel's memory, sockets and cell table (design D4).
-    /// Copies of other cells take nothing more of the kernel's.
+    /// Copies of other cells take nothing more of the kernel's. Out of
+    /// line: only cells with a memory limit come here.
+    #[cold]
+    #[inline(never)]
     pub(super) fn admits_copies(&self, source: u32, n: usize) -> bool {
         let Some(node) = self.tree.get(source).filter(|n| n.is_root()) else {
             return true;
@@ -265,10 +269,13 @@ impl Host {
             // Not `cell` itself in the closure: its address would escape,
             // and every resume would copy all of it to pass it on.
             let mut at = (0, 0);
-            let entered = self.add_copies(origin, &[cell.id], limited, &mut |_, pid, domain| {
+            let entered = self.add_copies(origin, &[cell.id], &mut |_, pid, domain| {
                 at = (pid, domain);
             });
             (cell.pid, cell.domain) = at;
+            if entered && limited {
+                self.copies_entered(origin);
+            }
             return entered;
         }
         let Ok(spec) = snapshot.placed(&Egress::None, &Egress::None, root_limits(&cell.quota))

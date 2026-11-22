@@ -283,18 +283,20 @@ fn template_dropped_under_two_domains() {
     assert_eq!(memory_balance(), before, "gone with its last copy");
 }
 
-/// A root with 40 MiB to give children (a reserved root the smallest test
-/// machine admits next to a promoted child: design D4 of
-/// `add-cell-hierarchy`), and child `id` placed under it with 16 MiB.
+/// A root with 24 MiB to give children, and child `id` placed under it
+/// with 8 MiB: reserved roots the smallest test machine (76 MiB on
+/// Firecracker) admits with a child promoted by the host, which keeps the
+/// parent's limits and so adds the child's (design D4 of
+/// `add-cell-hierarchy`).
 fn parent_of(host: &mut Host, id: u32) -> u32 {
     let parent = spawn(host, "idle", &[]);
     let quota = Quota {
-        memory: 40 * MIB,
+        memory: 24 * MIB,
         ..Quota::DEFAULT
     };
     assert!(host.set_limits(parent, quota, 8));
     let limits = Limits {
-        memory: 16 * MIB,
+        memory: 8 * MIB,
         cpu_ns: u64::MAX,
         sockets: 16,
         cells: 0,

@@ -274,10 +274,10 @@ fn reserve_frames(f: &FrameAllocator<'_>) -> usize {
 
 /// Frames set aside for the cells of reserved domains (design D4 of
 /// `add-cell-hierarchy`): what their memory limits leave unused. Their
-/// meters join it, and take what they count out of it first, so only the
-/// kernel's caches and cells without a memory limit are kept off it.
+/// meters take what they count out of it first, so only the kernel's
+/// caches and cells without a memory limit are kept off it.
 #[cfg(feature = "cells")]
-pub static RESERVE: rhizo_cell::quota::Reserve = rhizo_cell::quota::Reserve::new();
+pub use rhizo_cell::quota::RESERVE;
 
 /// Frames cells and the kernel's caches may not take: the kernel's
 /// reserve, and what is set aside for reserved domains.
@@ -296,8 +296,9 @@ pub fn cells_may_take(bytes: u64) -> bool {
 
 /// Allocates one frame kept for as long as the kernel runs or nearly (a
 /// published page, design D21 of `add-cell-hierarchy`), keeping the
-/// reserve and what is set aside for reserved domains: the highest free one, as the heap's, so frames that stay do not
-/// split the free runs low in memory where cells allocate.
+/// reserve and what is set aside for reserved domains: the highest free
+/// one, as the heap's, so frames that stay do not split the free runs low
+/// in memory where cells allocate.
 #[cfg(feature = "cells")]
 pub fn alloc_kept() -> Option<u64> {
     with_frames(|f| {
