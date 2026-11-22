@@ -1,7 +1,9 @@
-//! The cell hierarchy as plain data (design D1 to D4, D7 and D19 of
-//! `add-cell-hierarchy`): the ownership tree, the budgets children carve
-//! from their parent, each cell's place in its domain, egress policies and
-//! the bounds of every structure.
+//! The cell hierarchy as plain data (design D1 to D4, D7 to D10, D19 and
+//! D24 of `add-cell-hierarchy`): the ownership tree, the budgets children
+//! carve from their parent, each cell's place in its domain, egress
+//! policies, handles as grants with their rights, derivation, revocation
+//! and exposure check, channels' queues, accelerator handles with their
+//! budgets, and the bounds of every structure.
 //!
 //! The crate never touches hardware, reads no clock and has no
 //! dependencies: the kernel keeps one [`Tree`] and passes in what only it
@@ -24,17 +26,21 @@
 
 extern crate alloc;
 
+mod channels;
 pub mod egress;
+mod grants;
 pub mod limits;
 mod tree;
 
+pub use channels::{Channels, ROOM, Recv};
 pub use egress::{Egress, Proto, Rule};
+pub use grants::{AccelBudget, AccelTerms, AccelUse, Ask, Gone, Grant, Grants, Object, Rights};
 pub use tree::{Actor, Ended, HOST, Label, Limits, Mode, Node, OnParentEnd, Spec, Tree};
 
 #[cfg(test)]
 mod tests;
 
-/// Why a tree operation was refused. It changed nothing.
+/// Why an operation was refused. It changed nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// No such cell in the tree.
@@ -44,7 +50,8 @@ pub enum Error {
     /// The actor has no authority over the cell, or the request would
     /// widen a policy or a limit it may only narrow (`EACCES`).
     Denied,
-    /// Deeper than [`limits::DEPTH_MAX`] below the host (`EMLINK`).
+    /// Deeper than [`limits::DEPTH_MAX`] below the host, or a derivation
+    /// chain longer than [`limits::CHAIN_MAX`] (`EMLINK`).
     TooDeep,
     /// More than [`limits::CHILDREN_MAX`] children (`EMLINK`).
     TooManyChildren,
@@ -58,8 +65,21 @@ pub enum Error {
     Cycle,
     /// A value outside its bounds (`EINVAL`).
     Invalid,
-    /// Memory for the tree's own records ran out (`ENOMEM`).
+    /// Memory for the crate's own records ran out (`ENOMEM`).
     NoMemory,
+    /// More than [`limits::HANDLES_MAX`] handles or
+    /// [`limits::CHANNELS_MAX`] channel endpoints held by one cell
+    /// (`EMFILE`).
+    TooManyHandles,
+    /// The peer's queue cannot take the message (`EAGAIN`, or block).
+    Full,
+    /// The peer endpoint is closed (`EPIPE`).
+    Pipe,
+    /// A message over [`limits::MESSAGE_MAX`] bytes (`EMSGSIZE`).
+    TooBig,
+    /// A message with more than [`limits::MESSAGE_HANDLES_MAX`] handles
+    /// (`ETOOMANYREFS`).
+    TooManyRefs,
 }
 
 #[cfg(test)]

@@ -29,6 +29,9 @@ pub const FLOOR_MAX: usize = 64;
 pub const LABEL_MAX: usize = 64;
 /// Most `MADV_WIPEONFORK` ranges of one cell (`ENOMEM`).
 pub const WIPE_RANGES_MAX: u32 = 64;
+/// Most models one accelerator serves, one bit each in a handle's terms
+/// (refused by `rhizo up`).
+pub const MODELS_MAX: u32 = u64::BITS;
 /// CPU weights: from 1 to 10,000, 100 when not given (`EINVAL`).
 pub const WEIGHT_MIN: u16 = 1;
 pub const WEIGHT_MAX: u16 = 10_000;

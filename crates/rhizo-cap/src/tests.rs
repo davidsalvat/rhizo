@@ -754,3 +754,7 @@ fn a_child_avoids_the_number_it_is_told() {
     assert_ne!(t.get(6).unwrap().pid(), t.get(5).unwrap().pid());
     t.check().unwrap();
 }
+
+mod accelerators;
+mod channels;
+mod grants;
