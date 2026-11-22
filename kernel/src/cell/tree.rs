@@ -711,20 +711,21 @@ impl Host {
         if by != asked && to != HOST && !self.controls(asked, to) {
             return Err(TreeError::Denied);
         }
-        // The host's promotion keeps the parent's limits: the new root's
-        // whole reservation is new to the kernel (a parent's moves it).
-        if to == HOST && by == Actor::Host && old != HOST && !admits(limits.reservation()) {
-            return Err(TreeError::Budget);
-        }
         // The move is checked whole first, the exposure check of the
         // handles included (design D8: a promoted cell's former ancestors
         // no longer count as its trusted base), so a refused move takes no
-        // private copies.
+        // private copies. What may not happen is refused whatever memory
+        // the kernel has free.
         let used = self.usage(to);
         let mut moved = self.tree.get().clone();
         moved.reparent(id, to, by, &|_| used, &mut fresh_domain)?;
         if !self.handles_admit(&moved, &moved.subtree(id)?) {
             return Err(TreeError::Denied);
+        }
+        // The host's promotion keeps the parent's limits: the new root's
+        // whole reservation is new to the kernel (a parent's moves it).
+        if to == HOST && by == Actor::Host && old != HOST && !admits(limits.reservation()) {
+            return Err(TreeError::Budget);
         }
         // Leaving its domain, its subtree first takes private copies of
         // what it shares there, or the move is refused (design D21).

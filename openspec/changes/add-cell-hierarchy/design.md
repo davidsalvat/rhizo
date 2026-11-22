@@ -904,8 +904,11 @@ the stricter reading wherever the design left one open.
   included, and only then does the cell take its private copies (D21):
   a move that would let a former ancestor's wider egress reach the cell
   through a handle is refused with `EACCES` and changes nothing, private
-  copies included. Narrowing a ceiling below what a cell's handles let
-  reach it is refused the same way, and so is a placement. A promotion
+  copies included. The exposure check comes before the kernel's budget
+  for the new root, so a move that may not happen is refused with
+  `EACCES` whatever memory the kernel has free. Narrowing a ceiling
+  below what a cell's handles let reach it is refused the same way, and
+  so is a placement. A promotion
   at the parent's end (D3), which cannot be refused, ends the cells of
   the subtree the check refuses, as a promoted cell that cannot take its
   private copies does (D21).

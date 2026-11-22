@@ -247,7 +247,7 @@ fn promotion_keeps_exposure() {
     assert!(host.set_limits(
         root,
         Quota {
-            memory: 64 * MIB,
+            memory: 32 * MIB,
             ..Quota::DEFAULT
         },
         8
@@ -265,7 +265,7 @@ fn promotion_keeps_exposure() {
         ..Spec::default()
     };
     let child = spawn(&mut host, "idle", &[]);
-    host.adopt(child, root, narrow(8, 0), Actor::Host)
+    host.adopt(child, root, narrow(4, 0), Actor::Host)
         .expect("placed");
     let g = host
         .grant(Actor::Host, root, child, Rights::OBSERVE, b"child")
