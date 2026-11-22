@@ -9,6 +9,12 @@ rust-version.workspace = true
 # Not published to crates.io (workspace path dependencies only).
 publish = false
 
+[features]
+# In-kernel test builds (the kernel's `ktest`): each domain's charged CPU
+# time, exactly. Other builds do not count it, so a switch costs nothing
+# more.
+ktest = []
+
 [dev-dependencies]
 proptest = "1"
 
