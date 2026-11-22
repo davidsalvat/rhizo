@@ -415,6 +415,22 @@ pub trait Share {
         false
     }
 
+    /// [`charge`](Self::charge) then [`queued`](Self::queued) on `to`
+    /// with number `arrival`, for an entry put back after its slice on
+    /// `cpu`, if no cap counts it: returns whether it did both. When it
+    /// returns false it did neither (a cap counts the entry, or it is not
+    /// known): the caller charges and queues it apart.
+    fn charge_queued(
+        &mut self,
+        _cpu: usize,
+        _to: usize,
+        _key: u32,
+        _ns: u64,
+        _arrival: u64,
+    ) -> bool {
+        false
+    }
+
     /// The capped nodes whose cap the last charges used up.
     fn spent(&mut self) -> Vec<u32> {
         Vec::new()
@@ -490,6 +506,12 @@ impl Share for Option<Fair> {
     #[inline]
     fn charge(&mut self, cpu: usize, key: u32, ns: u64, now: u64) -> bool {
         self.as_mut().is_some_and(|f| f.charge(cpu, key, ns, now))
+    }
+
+    #[inline]
+    fn charge_queued(&mut self, cpu: usize, to: usize, key: u32, ns: u64, arrival: u64) -> bool {
+        self.as_mut()
+            .is_some_and(|f| f.charge_queued(cpu, to, key, ns, arrival))
     }
 
     fn spent(&mut self) -> Vec<u32> {
@@ -604,20 +626,7 @@ impl Share for Fair {
             self.clocks[cpu].strays.push((arrival, key));
             return;
         };
-        let m = &self.cells[i];
-        let slot = Slot {
-            finish: m.account.finish(),
-            arrival,
-            key,
-            cell: i as u32,
-        };
-        let d = m.dom;
-        let lane = &mut self.domains[d as usize].lanes[cpu];
-        if !lane.listed {
-            lane.listed = true;
-            self.clocks[cpu].present.push(d);
-        }
-        lane.push(slot);
+        self.queue_at(i, cpu, key, arrival);
     }
 
     fn dequeued(&mut self, cpu: usize, key: u32) {
@@ -672,22 +681,8 @@ impl Share for Fair {
         let Some(i) = self.cell_of(cpu, key) else {
             return false;
         };
-        let clock = &mut self.clocks[cpu];
-        if clock.weight != 0 {
-            clock.vtime = clock.vtime.wrapping_add(paced(ns, clock.inv));
-        }
-        if ns > self.longest {
-            self.lengthen(ns);
-        }
-        let m = &mut self.cells[i];
-        m.account.charge(ns);
-        if let Some(d) = self.domains.get_mut(m.dom as usize) {
-            d.account.charge(ns);
-            #[cfg(any(test, feature = "ktest"))]
-            {
-                d.charged += ns;
-            }
-        }
+        self.charge_at(i, cpu, ns);
+        let m = &self.cells[i];
         if m.capped.is_empty() {
             return false;
         }
@@ -714,6 +709,21 @@ impl Share for Fair {
             }
         }
         any
+    }
+
+    #[inline]
+    fn charge_queued(&mut self, cpu: usize, to: usize, key: u32, ns: u64, arrival: u64) -> bool {
+        let Some(i) = self.cell_of(cpu, key) else {
+            return false;
+        };
+        if !self.cells[i].capped.is_empty() {
+            return false;
+        }
+        self.charge_at(i, cpu, ns);
+        if !self.dirty {
+            self.queue_at(i, to, key, arrival);
+        }
+        true
     }
 
     fn spent(&mut self) -> Vec<u32> {
@@ -949,6 +959,48 @@ impl Fair {
         let slot = self.domains[d].lanes[q].remove(0);
         self.clocks[cpu].last = Some((slot.key, slot.cell));
         Some((q, slot.arrival))
+    }
+
+    /// Charges `ns` of CPU time on `cpu` to the cell at `i` and its
+    /// domain, not its caps.
+    #[inline(always)]
+    fn charge_at(&mut self, i: usize, cpu: usize, ns: u64) {
+        let clock = &mut self.clocks[cpu];
+        if clock.weight != 0 {
+            clock.vtime = clock.vtime.wrapping_add(paced(ns, clock.inv));
+        }
+        if ns > self.longest {
+            self.lengthen(ns);
+        }
+        let m = &mut self.cells[i];
+        m.account.charge(ns);
+        if let Some(d) = self.domains.get_mut(m.dom as usize) {
+            d.account.charge(ns);
+            #[cfg(any(test, feature = "ktest"))]
+            {
+                d.charged += ns;
+            }
+        }
+    }
+
+    /// Queues the cell at `i`, known by `key`, on `cpu` with number
+    /// `arrival`.
+    #[inline(always)]
+    fn queue_at(&mut self, i: usize, cpu: usize, key: u32, arrival: u64) {
+        let m = &self.cells[i];
+        let slot = Slot {
+            finish: m.account.finish(),
+            arrival,
+            key,
+            cell: i as u32,
+        };
+        let d = m.dom;
+        let lane = &mut self.domains[d as usize].lanes[cpu];
+        if !lane.listed {
+            lane.listed = true;
+            self.clocks[cpu].present.push(d);
+        }
+        lane.push(slot);
     }
 
     /// A slice of `ns`, longer than any charged before: the domains'
@@ -1349,6 +1401,42 @@ mod fair_shares {
                 }
             }
             prop_assert_eq!(seen.len() + held, entries as usize);
+        }
+
+        /// Putting an entry back charged in one call
+        /// ([`Scheduler::requeue_charged`], which charges and queues it in
+        /// one call to the share when no cap counts it) picks the same
+        /// entries as charging it, then putting it back.
+        #[test]
+        fn requeue_charged_is_charge_then_requeue(
+            cpus in 1usize..4,
+            capped in proptest::collection::vec(any::<bool>(), 1..10),
+            slices in proptest::collection::vec((0usize..4, 1..=2 * SLICE_NS), 1..200),
+        ) {
+            let mut one = Scheduler::fair(cpus);
+            let mut two = Scheduler::fair(cpus);
+            for s in [&mut one, &mut two] {
+                s.shares().set_cap(7, Some(PERIOD_NS / 4));
+                for (e, &cap) in capped.iter().enumerate() {
+                    let (e, d) = (e as u32, e as u32 % 3);
+                    s.shares().set_domain(d, 100 * (d + 1));
+                    let caps = if cap { alloc::vec![7] } else { Vec::new() };
+                    s.shares().set_cell(e, d, WHOLE / 2, caps);
+                    s.place(e);
+                }
+            }
+            let mut now = 0;
+            for (c, ns) in slices {
+                let c = c % cpus;
+                let (a, b) = (one.next(c, now), two.next(c, now));
+                prop_assert_eq!(a, b);
+                now += ns;
+                if let Some(e) = a {
+                    one.requeue_charged(c, e, || (ns, now));
+                    two.charge(c, e, ns, now);
+                    two.requeue(c, e);
+                }
+            }
         }
 
         /// Busy domains share 1,000 slices by their weights within one

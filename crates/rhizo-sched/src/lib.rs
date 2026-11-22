@@ -384,14 +384,33 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     ) -> usize {
         let key = entry.key();
         if self.share.by_weight() {
-            let (ns, now) = slice();
-            self.charge(cpu, key, ns, now);
-            let to = self.back_to(cpu, key);
-            self.enqueue(to, key, entry);
-            return to;
+            return self.requeue_by_weight(cpu, key, entry, slice());
         }
         let to = self.back_to(cpu, key);
         self.queue(to, key, entry);
+        to
+    }
+
+    /// [`requeue_charged`](Self::requeue_charged) while entries share by
+    /// weight: charged and queued in one call to the share when no cap
+    /// counts the entry.
+    #[inline(never)]
+    fn requeue_by_weight(
+        &mut self,
+        cpu: usize,
+        key: u32,
+        entry: T,
+        (ns, now): (u64, u64),
+    ) -> usize {
+        self.refresh();
+        let to = self.back_to(cpu, key);
+        if self.share.charge_queued(cpu, to, key, ns, self.arrivals) {
+            self.queue(to, key, entry);
+            return to;
+        }
+        self.charge(cpu, key, ns, now);
+        let to = self.back_to(cpu, key);
+        self.enqueue(to, key, entry);
         to
     }
 
@@ -551,7 +570,7 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     }
 
     /// [`next`](Self::next) while entries share by weight.
-    #[inline(never)]
+    #[inline(always)]
     fn next_by_weight(&mut self, cpu: usize, now: u64) -> Option<T> {
         self.wake_due(cpu, now, |_| {});
         let from = self.next_from(cpu)?;
