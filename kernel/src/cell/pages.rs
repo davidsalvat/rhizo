@@ -79,7 +79,7 @@ pub(super) fn publish_files(fs: &mut Fs) -> Vec<rhizo_fs::Page> {
                 continue;
             };
             let published =
-                PAGES.with(|pages| pages.publish(&page, &mut DirectMap, &mut ImageFrames));
+                PAGES.with(|pages| pages.publish(&page, &mut DirectMap, &mut KeptFrames));
             let Some((phys, fresh)) = published else {
                 continue; // a hole, or no memory
             };
@@ -90,6 +90,36 @@ pub(super) fn publish_files(fs: &mut Fs) -> Vec<rhizo_fs::Page> {
         }
     }
     pinned
+}
+
+/// The frames of published pages: those of [`ImageFrames`], taken from the
+/// top of memory ([`memory::alloc_kept`]).
+struct KeptFrames;
+
+impl Frames for KeptFrames {
+    fn alloc(&mut self) -> Option<u64> {
+        memory::alloc_kept()
+    }
+
+    fn alloc_large(&mut self) -> Option<u64> {
+        None // a published page is one frame
+    }
+
+    fn free(&mut self, phys: u64, size: PageSize) {
+        ImageFrames.free(phys, size);
+    }
+
+    fn share(&mut self, phys: u64) {
+        ImageFrames.share(phys);
+    }
+
+    fn is_shared(&self, phys: u64) -> bool {
+        ImageFrames.is_shared(phys)
+    }
+
+    fn try_share(&mut self, phys: u64) -> bool {
+        ImageFrames.try_share(phys)
+    }
 }
 
 /// Ends the publication of `pages` ([`publish_files`]): each goes once
