@@ -1822,6 +1822,15 @@ template `fork` (protocol version 4, `--cpu-weight` and `--cpu-max`).
   quarters and a quarter of a CPU). `--cpus` (exclusive CPU sets) is
   enforced by task 1.9a (D17, "As built in phase 1").
 - `sched.domain_share_pct`: 49 under `-icount` on AArch64.
+- **Within one slice, for any number of domains (change
+  `fix-fair-bound`).** A domain's finishing virtual time counts the
+  longest slice charged so far, not the nominal 10 ms. With the nominal
+  slice and slices a busy host stretched, three or more domains could
+  stray up to about two of the longest slices. With the longest slice,
+  each busy domain stays within one slice (the longest yet) of its
+  weight's part, whatever the slices' lengths. That change's design
+  (D1) gives the proof. In-kernel tests compare domains by their exact
+  charged time, counted only in test builds.
 
 Alternatives:
 

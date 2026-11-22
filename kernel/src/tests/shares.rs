@@ -57,18 +57,32 @@ fn cpu_of(host: &mut Host, cells: &[u32]) -> u64 {
     cells.iter().map(|&c| host.cpu_ns(c).expect("live")).sum()
 }
 
-/// One CPU stepping through every cell (on any number of CPUs) for `ns`.
-fn step_for(host: &mut Host, ns: u64) {
-    let t0 = now_ns();
-    while now_ns() - t0 < ns {
+/// One CPU stepping through every cell for at least `ns`, and until the
+/// CPU time the scheduler charged the domains of cells `x` and `y` is 20
+/// times the longest slice charged (the most it moves in one step): their
+/// charges and that slice. Within one slice of its weight's part each
+/// (design D23), a domain's share is then within 5 % of it.
+fn charged_until(host: &mut Host, x: u32, y: u32, ns: u64) -> (u64, u64, u64) {
+    let charged = |host: &mut Host, id| host.charged_ns(id).expect("shared by weight");
+    let (t0, mut longest, mut before) = (now_ns(), 0, 0);
+    loop {
         host.step();
+        let (a, b) = (charged(host, x), charged(host, y));
+        longest = longest.max(a + b - before);
+        before = a + b;
+        if now_ns() - t0 >= ns && a + b >= 20 * longest {
+            return (a, b, longest);
+        }
     }
 }
 
 /// Spec `cell-hierarchy`, "Many cells do not buy CPU": on one CPU, a
 /// domain of 16 spinning cells (a root and 15 children) and a domain of
-/// one, with equal weights, each get half the CPU within 5 % over 2 s
-/// (round robin per cell would give the one cell a seventeenth).
+/// one, with equal weights, each get half the CPU time the scheduler
+/// charges, within 5 % (round robin per cell would give the one cell a
+/// seventeenth), over at least 2 s and 20 of the longest slice charged
+/// (change `fix-fair-bound`): each domain is within one slice of its
+/// half (design D23), however long a busy host stretched the slices.
 fn domains_share_by_weight() {
     let mut host = Host::new();
     let root = spawn(&mut host, "spin", &[]);
@@ -84,12 +98,11 @@ fn domains_share_by_weight() {
     let one = spawn(&mut host, "spin", &[]);
     parent(&mut host, one, 0);
     assert_eq!(host.domain(many[15]), host.domain(root), "one domain");
-    step_for(&mut host, 2_000_000_000);
-    let (a, b) = (cpu_of(&mut host, &many), cpu_of(&mut host, &[one]));
+    let (a, b, longest) = charged_until(&mut host, root, one, 2_000_000_000);
     let pct = 100 * b / (a + b);
     assert!(
         (45..=55).contains(&pct),
-        "the one cell's domain got {pct} % ({b} ns of {})",
+        "the one cell's domain got {pct} % ({b} ns of {}, longest slice {longest} ns)",
         a + b
     );
     for id in many.into_iter().rev().chain([one]) {
@@ -118,17 +131,7 @@ fn root_weights_share_a_cpu() {
         id
     };
     let (heavy, light) = (root(300), root(100));
-    let charged = |host: &mut Host, id| host.charged_ns(id).expect("shared by weight");
-    let (t0, mut longest, mut before) = (now_ns(), 0, 0);
-    let (a, b) = loop {
-        host.step();
-        let (a, b) = (charged(&mut host, heavy), charged(&mut host, light));
-        longest = longest.max(a + b - before);
-        before = a + b;
-        if now_ns() - t0 >= 1_000_000_000 && a + b >= 20 * longest {
-            break (a, b);
-        }
-    };
+    let (a, b, longest) = charged_until(&mut host, heavy, light, 1_000_000_000);
     let pct = 100 * a / (a + b);
     assert!(
         (70..=80).contains(&pct),
