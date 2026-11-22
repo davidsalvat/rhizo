@@ -258,8 +258,9 @@ is done about it. In short:
 | Loopback network and ports, card ports, socket pool, free memory (`sysinfo`), kernel heap and file data, page cache (partitioned per domain, public objects always resident), template frames (only published templates, held while shared), cell identifiers, the cell table, error codes, accelerators (one domain per device or partition) | CPU contention and scheduling (with weights and caps), hardware caches and TLB, 2 MiB block availability, the card's queues and neighbour cache, kernel locks |
 
 The phase 1 benchmarks measure a CPU-contention channel between two
-domains (`covert.cpu_bps`), and `docs/security.md` will publish the
-inventory with that number.
+domains, with and without exclusive CPU sets (`covert.cpu_bps`,
+`covert.cpu_sets_bps`), and [`security.md`](security.md#colluding-cells-add-cell-hierarchy-phase-1)
+publishes the inventory with those figures.
 
 ## Exclusive CPU sets (production option)
 

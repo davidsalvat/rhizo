@@ -1283,6 +1283,10 @@ fn quotas_from_outside_are_capped() {
     let q = snap.state().quota;
     assert_eq!((q.memory, q.cpu_ns, q.files, q.sockets), (1 << 20, 5, 8, 2));
     assert_eq!(snap.state().cpu_ns, 1234, "the time used stays");
+    // Set outright, as before a placement under a parent.
+    snap.set_quota(Quota::DEFAULT);
+    assert_eq!(snap.state().quota, Quota::DEFAULT);
+    assert_eq!(snap.state().cpu_ns, 1234, "the time used stays");
 }
 
 /// A snapshot keeps the cell's copy generation, whether it may hold a

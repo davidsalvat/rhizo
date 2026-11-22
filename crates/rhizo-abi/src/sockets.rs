@@ -393,7 +393,7 @@ const EALREADY: i64 = 114;
 const ETIMEDOUT: i64 = 110;
 
 /// `write` on a socket, and `send`/`sendto` without a destination.
-pub(crate) fn send<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn send<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u32,
     addr: u64,
@@ -404,7 +404,7 @@ pub(crate) fn send<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 }
 
 /// `sendto(fd, buf, len, flags, dest, dest_len)`.
-pub(crate) fn sendto<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn sendto<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     a: [u64; 6],
 ) -> i64 {
@@ -434,7 +434,7 @@ pub(crate) fn sendto<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
 const EMSGSIZE: i64 = 90;
 
 /// Sends `bytes` (already copied from the cell) on socket `h` of `fd`.
-fn send_bytes<F, M, T, A, S: Services>(
+fn send_bytes<F, M, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     fd: u64,
     h: Handle,
@@ -442,7 +442,8 @@ fn send_bytes<F, M, T, A, S: Services>(
     dest: Option<&Addr>,
     flags: u64,
 ) -> i64 {
-    if !cx.services.can_store(bytes.len() as u64) {
+    // Its queues were counted with the socket (`rhizo_net::SOCKET_BYTES`).
+    if !cx.has_counted(bytes.len() as u64) {
         return -ENOBUFS;
     }
     match cx.net.net().send(h, bytes, dest) {
@@ -617,7 +618,7 @@ fn read_msghdr<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     Ok((h, list))
 }
 
-pub(crate) fn sendmsg<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn sendmsg<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
     cell: u32,
     fd: u64,

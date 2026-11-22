@@ -24,7 +24,10 @@ other (change `close-cross-cell-leaks`: findings S24 to S26, section
 channel over virtio-vsock (boundaries B7 and B8 of the audit scope,
 change `control-over-vsock`: findings S27 and S28, the latter closed by
 `authenticate-control-channel`, section
-[The control channel over vsock](#the-control-channel-over-vsock-b7-b8)).
+[The control channel over vsock](#the-control-channel-over-vsock-b7-b8)),
+then by a review of colluding cells in different domains against phase 1
+of the cell hierarchy (change `add-cell-hierarchy`: findings S29 and S30, section
+[Colluding cells](#colluding-cells-add-cell-hierarchy-phase-1)).
 
 The scope we would hand an external auditor (trust boundaries, components
 ranked by risk with their size, open questions and an effort estimate) is
@@ -813,15 +816,268 @@ page stays kept, where the cache was empty before the fix),
 
 ### What is left
 
-Open, for the phases of `add-cell-hierarchy` (its D12 numbers):
+The items this change left open (D12 numbers of `add-cell-hierarchy`:
+ports as one namespace, page-cache deduplication, identifiers, shared
+pools) are closed by phase 1 of `add-cell-hierarchy`, for domains whose
+roots are reserved; timing is measured. See
+[Colluding cells](#colluding-cells-add-cell-hierarchy-phase-1).
 
-| Item | What a cell can still observe |
-|---|---|
-| 1, 2, 3 Ports as one namespace | That a port is held by someone: `EADDRINUSE` on an explicit bind, or a skipped port in its own sequence when another cell holds the very port it would take next. Closed by loopback networks per tree and kernel-chosen card ports. |
-| 9 Deduplication | Whether a page of a file another cell also holds (a host file set, a fork's files) is in the cache: a hit costs less than a miss. A cell able to exhaust memory still drops the pages no cell maps right now. Closed by a cache keyed by domain with reserved budgets; across domains only public objects are shared, loaded when published and never evicted, and nothing is merged by scanning memory (design D21 there). |
-| 19, 20 Identifiers | `getpid` and thread identifiers count the cells the host created (O6). Only the host creates cells, so no cell writes this counter. |
-| 5, 7, 8, 24, 29 Shared pools | `ENFILE`, `ENOMEM`, `ENOSPC` when the kernel's socket pool, memory or heap is exhausted by others. Closed by budgets per domain. |
-| 14 to 17, 25, 28 Timing | Contention for CPUs, caches, locks and the network card (O3). Accepted and measured (`covert.cpu_bps`) by the hierarchy. |
+## Colluding cells (`add-cell-hierarchy`, phase 1)
+
+Phase 1 of `add-cell-hierarchy` puts cells in a tree (design D1 to D4
+there; a summary in [`cell-hierarchy.md`](cell-hierarchy.md)). A
+**domain** is a root and its descendants, copies of them included: the
+unit the host isolates, its tenant. This section reviews what the phase
+closes against cooperating cells, with the hostile tests of task 1.12.
+
+### Threat model of colluding cells
+
+**Attacker** (design D0). Two or more cooperating agents, each in its own
+cell, which know the kernel's source. They want to:
+
+1. communicate when nobody gave them a channel: directly (a shared
+   loopback port), through storage channels (state one changes and the
+   other reads: a port in use, free memory, an error code, a file name) or
+   through timing;
+2. make the network card send bytes where their egress policy forbids,
+   themselves, through a cell with more egress, or with a socket such a
+   cell opened;
+3. gain authority nobody granted: control over a cell that is not a
+   descendant, wider egress, a larger quota, by re-parenting, promotion,
+   forks, snapshots or forged numbers;
+4. exhaust shared resources so that other domains fail (fork bombs, the
+   socket pool, ports, the kernel heap).
+
+**Second attacker:** a forged snapshot file, which must bring no
+authority: no tree position, no wider policy, no larger limit.
+
+**Trusted:** the host (the `rhizo` server and whoever drives it), as in
+the rest of this review.
+
+**What is promised**, strongest first:
+
+- **G1. No authority without a grant.** Every way to reach another cell
+  and every socket to the outside comes from the creator or the host. In
+  phase 1 there is no way to reach another cell at all: each has a
+  loopback network of its own and handles come with phase 2. Sockets
+  never move between cells.
+- **G2. Egress per socket**, from the policy of the cell that made it,
+  `none` by default, under a deny floor holding the host's own
+  addresses. A cell with `none` never puts a packet on the wire, whatever
+  another cell tells it.
+- **G3. No storage channel between domains** whose roots are reserved
+  (have a memory limit): apart from elapsed time, nothing a cell observes
+  depends on what another domain does.
+- **G4. Timing channels are reduced, listed and measured**, not closed:
+  on shared CPUs and caches they cannot be. They carry information
+  slowly, never a handle, a socket or reach.
+
+So two colluding domains can exchange information at the bandwidth of
+the timing channels below, and reach together at most the union of their
+own egress policies.
+
+### The covert-channel inventory
+
+Every kernel resource more than one cell can touch (design D12 of
+`add-cell-hierarchy`, 42 items), with what phase 1 did about it.
+"Within a domain" items are accepted: the domain is the unit the host
+isolates, and two agents that must not collude belong in two domains.
+
+| D12 | Shared resource | Storage | Timing | Status after phase 1 | Kept by |
+|---|---|---|---|---|---|
+| 1, 2 | Loopback network, its ports and port counter | Was direct communication; `EADDRINUSE` | — | **Partitioned**: a network per cell, never shared (D5), ports and counter per network | `separate_loopback_networks`, `colluders_on_loopback`, `differential_colluders` |
+| 3 | Card ports | Was the loopback counter | — | **Eliminated**: card ports drawn at random by the kernel, shown to no cell (D6) | `ports_of_other_domains_do_not_show` |
+| 4 | Unix socket names | Not observable; forged numbers | — | **Partitioned**: keyed by (network, name) | `colluders_on_loopback` |
+| 5 | Socket pool (4096) | `ENFILE` | — | **Partitioned**: reserved socket limits admitted against half the pool | `differential_colluders` |
+| 6 | Free memory | `sysinfo`, `ENOMEM` | Allocation time | **Eliminated** for reserved roots: `sysinfo` shows the cell's limit, a reserved root never fails because of others (D4). Unlimited roots share what is left: accepted | `sysinfo_shows_a_cell_only_itself`, `a_reserved_root_keeps_its_memory`, `differential_colluders` |
+| 7, 8 | Kernel heap, file data | `ENOSPC`, `ENOMEM` | Fragmentation | **Eliminated** (storage): file data, names, thread and socket records and queues charged to the cell's limit | `files_count_in_the_memory_limit`, `differential_colluders` |
+| 9 | Page cache | — | Hit or miss, flush | **Partitioned** per domain, bounded and charged per domain; public pages loaded at publication, never evicted (D21) | `file_pages_kept_per_domain`, `same_file_in_two_domains`, `public_library_always_hits` |
+| 10 | File blocks shared by reference | — | Sole-owner writes | No channel across domains (only the host's file sets are shared, and the kernel holds them) | — |
+| 11 | Image cache | — | Spawn time | Only the host spawns from images: no cell-driven state | — |
+| 12 | Template and snapshot frames | — | Sole-owner writes | **Eliminated**: only published templates have copies in several domains, and they keep their frames until their last copy ends | `template_dropped_under_two_domains` |
+| 13 | Frames of host forks | — | Same | Within a domain: accepted | — |
+| 14 | Free 2 MiB blocks | — | Large-page fallback | **Accepted** | — |
+| 15 | CPUs and scheduler | — | **High** | **Accepted, measured**: `covert.cpu_bps` below; exclusive CPU sets (D17) take it out | `exclusive_sets_hold` |
+| 16 | Caches, TLB, predictors, memory bus | — | High | Out of scope (O3); CPU sets reduce private-cache sharing | — |
+| 17 | `CNTVCT_EL0`, `rdtsc` | — | The stopwatch | **Accepted** | — |
+| 18 | Monotonic and real time | — | — | No channel: no cell changes them | — |
+| 19, 20 | Cell and thread identifiers | Counted every cell (O6) | — | **Eliminated**: numbered from 1 in each domain, a copy unlike its source | `identifiers_are_per_domain`, `differential_colluders` |
+| 21 to 23 | Control-plane identifiers, output relay, console reports | Host only | — | No channel; a host that pipes one domain's output into another builds the channel itself | — |
+| 24 | Error codes of shared pools | Yes | — | **Eliminated**: each depends on the domain's own state | `differential_colluders` |
+| 25 | Network card: MAC, IP, ARP, DHCP, queues | Constants | Neighbour cache, queues | **Accepted**; cells with egress `none` never touch the card | — |
+| 26 | DNS | — | — | Not in the kernel: a resolver is a destination of the policy (and a way out in names, which `rhizo` warns about) | — |
+| 27 | Socket wait queues, change counter | — | — | No channel | — |
+| 28 | Kernel locks | — | Wait time | **Accepted** | — |
+| 29 | Cell table | Refusal when full | — | **Partitioned**: descendant limits carved from the parent and admitted against the table | `fork_bomb_in_a_subtree` |
+| 30 | Random generators | — | — | No channel; copies learn to reseed from their copy generation (D22) | `copies_draw_different_random` |
+| 31 | Parked socket keys | — | — | Unguessable (S15) | — |
+| 32 to 34, 39 | Grant table, channel queues, futexes, `/run/rhizo` | — | — | No channel (handles and channels are wired in phase 2) | — |
+| 35, 36 | Constants, the host's file sets and templates | — | — | Read-only; see 10 and 12 | — |
+| 37 | Exit status | Authorized (tree edge) | — | Flow edge | — |
+| 38 | File names | None | — | **Confirmed**: each cell has its own tree; `rename` changes only the caller's. No shared namespace to signal through | — |
+| 40 | Snapshots on disk | Host mediated | — | Loaded snapshots carry no authority (D13) | `forged_snapshot_authority` |
+| 41 | Accelerators | — | — | Not built (`add-accelerators`) | — |
+| 42 | CPU weights and caps (D23) | — | A domain's share depends on others' load | Like 15: accepted; caps bound what a domain takes | `domains_share_by_weight`, `cpu_cap_holds` |
+
+**What remains is timing.** Items 14 to 17, 25, 28 and 42 cannot be closed
+on shared hardware. One of them is measured end to end by `cargo xtask
+bench` (`covert.cpu_bps`, reported and never gated): a sender cell in one
+domain spins through a period of 40 ms (four time slices) for a 1 and
+sleeps through it for a 0, a receiver in another domain counts the loops
+it makes in each period and takes those below the median of the nine
+periods around them for 1s; the figure is the capacity of what it
+decoded (`(1 - H(p))` bits per period, `p` the share of wrong bits over
+100; 25 bits per second when every bit is right), first with both on one
+CPU, then with an exclusive set of one CPU each (`covert.cpu_sets_bps`).
+
+| Measured (4 vCPUs, x86_64, QEMU `microvm`) | `covert.cpu_bps` (one CPU shared) | `covert.cpu_sets_bps` (exclusive sets) |
+|---|---|---|
+| Without KVM (TCG, vCPU threads not pinned, 4-CPU host) | 10.4 (14 % of bits wrong) | 11.1 |
+
+These are the first figures, from emulation; `bench.yml` measures both
+under KVM on every run on `main`, and this table is to be replaced by
+those. What they show already:
+
+- On a shared CPU the channel works: about 10 bits per second with this
+  crude sender, against the 25 its period allows. A better coder (shorter
+  periods, error correction) gets more; the literature reports hundreds
+  to thousands of bits per second for contention channels.
+- Exclusive sets take the kernel's scheduler out of it (no cell of
+  another domain runs on a set's CPU, `exclusive_sets_hold`), but under
+  emulation they did not lower the figure: the vCPUs are threads of the
+  host, and a spinning vCPU slows its neighbour through the host's cores
+  and caches. That is the hardware sharing D17 leaves to the VMM (each
+  vCPU pinned to a physical core of its own, `rhizo up --pin`); whether
+  pinned vCPUs under KVM bring the figure to noise is what the KVM runs
+  must show.
+
+Inside one VM, colluding agents in different domains can still signal
+each other slowly through timing; they cannot gain reach, handles or
+quota by it. Separate VMs or hosts are the answer for more.
+
+**Memory the kernel still takes unmetered.** Task 1.2 charges file data,
+names, records, queues and network buffers to the cell, but four things
+stay outside every limit, taken from the memory no reservation holds:
+copy-on-write copies of frames shared by a fork or a template, the pages
+a domain keeps in the page cache, pipe buffers, and the room a channel
+reserves. A reserved cell's first write to a page it shares with its
+source can therefore still be refused when cells without a limit have
+exhausted that memory, and so can its writes into pipes: a fault or an
+`ENOBUFS` that depends on another domain. Open as O9.
+
+### Content sharing stays in its domain (D21)
+
+A frame is shared by its contents (the same bytes mapped from one frame)
+only between cells of one domain: the domain is part of every content
+key. That covers the page cache of mapped files (executables and
+interpreters included) and the frames a snapshot refers to instead of
+copying. Across domains only **public objects** are shared: immutable,
+holding no secret, published by the host (`rhizo publish`): the host's
+file sets, read-only template files and published templates. Their pages
+are loaded when they are published and kept until they are withdrawn and
+unmapped, so a map of a public page always hits and residency tells no
+cell what another mapped. Nothing is ever merged by scanning memory (no
+KSM). A cell moved into another domain, or a suspended one resumed there,
+first takes private copies of the non-public frames it shared, or the
+move is refused. This closes the deduplication and flush-and-reload
+attacks of D21 (Flip Feng Shui, deduplication timing, prompt-cache
+timing) between domains; within a domain sharing is intended.
+
+### What copies keep of their template (D22)
+
+The kernel's generators are per cell and never copied, but generators in
+user space live in memory and a copy duplicates them. Each cell has a copy
+generation (0 at spawn, incremented in every copy: host forks, template
+copies, resumes and loads), readable in `/run/rhizo/generation`;
+`MADV_WIPEONFORK` ranges read as zero in every kind of copy; and a copy's
+`getpid` differs from its source's, which OpenSSL 3 and CPython's
+`tempfile` take as a fork. The shipped CPython and Node.js templates
+reseed after a copy. What every copy still shares with its template, as
+any fork server does: CPython's string hash seed, glibc's stack-protector
+value and pointer guard, and the address layout. A server that hashes
+untrusted keys from another domain should start from its own program,
+not from a template. Templates must hold no secrets: the host passes them
+to a copy after the copy, and the kernel refuses to publish a template of
+a cell that reached the network or received a message unless the host
+attests it (audited).
+
+### Hostile tests (task 1.12)
+
+In the kernel, on both architectures, with the colluder cells of
+`cells/src/bin/colluder.rs` (`kernel/src/tests/collusion.rs`):
+
+- `differential_colluders`: a receiver, a reserved root of 12 MiB and 16
+  sockets with two children, runs a fixed probe twice once the host wakes
+  it: identifiers, `sysinfo`, four threads, memory to its limit, a file
+  to its limit, sockets to its limit, a listener, a bind conflict, a
+  connection and a datagram on loopback ports 7400 to 7402, three
+  ephemeral ports (as distances), a round trip with the echo server
+  through the card, and a file mapped twice. Then the same beside a
+  sender's domain of the same size, whose root, two children and copies
+  of the root (as many as the kernel admits, at most two) do all of it as
+  hard as they can, on the same ports, holding what they took across
+  yields. The receiver's and its children's outputs are byte for byte
+  the same, the senders made rounds during the probe, and after the
+  hostile rounds every frame comes back.
+- `colluders_on_loopback`: a listener on TCP and UDP port 7500 of every
+  address and on a Unix socket; a knocker of another domain with egress
+  `full` gets `ECONNREFUSED` on 127.0.0.1:7500, its datagram goes
+  nowhere, the Unix name does not exist in its tree, the card's own
+  address does not loop back to the listener, it binds port 7500 itself,
+  and the listener heard nothing.
+- `fork_bomb_in_a_subtree`: under a root of 64 MiB and 8 descendants, the
+  host forks every cell of the subtree and places new cells under each,
+  round after round: the subtree never holds more than 8 descendants,
+  the rest are refused for the budget, a cell of another domain runs to
+  its end, and every frame comes back.
+- `forged_snapshot_authority`: a snapshot sealed again after its tree
+  section was changed to claim egress `full`, 4 GiB, every CPU and
+  unlimited descendants. Loaded as a template under a parent with egress
+  `none`, it and its copy have egress and ceiling `none`, the host's
+  limits, no CPU set, and their connection outside is denied; resumed as
+  a root, the 4 GiB are refused, and with a claim the kernel can hold it
+  still has egress `none` and no CPU set.
+
+### Findings
+
+**S29. A file claiming large limits could not be loaded under a parent
+(Low, both).** The control kernel enters a loaded snapshot in the tree as
+a root before it places it where the host asked, and that root took the
+limits its bytes claimed, admitted against the kernel's free memory. A
+file claiming more memory than the kernel could set aside (a forged one,
+or one saved on a larger machine) was refused (`the template does not
+fit`) even under a parent with room for the limits the host gave it:
+no authority was gained, but a placement the spec allows failed, and a
+file could make the host's request fail by what it claims. *Fix:* a
+snapshot the host places under a parent enters as a root with a new
+cell's limits (`cell::to_place`, `Snapshot::set_quota`), and its
+placement alone gives its limits. *Test:* `forged_snapshot_authority`.
+A file loaded as a root keeps the memory limit its bytes ask for (capped
+by `cap_quota`), which makes it a reserved root admitted like any other:
+it can never set aside more than the kernel has, and the host chooses
+what to load.
+
+**S30. Another domain could make a reserved cell's files and sockets fail
+(Medium, both).** Kernel memory a cell's calls take (a file name, a new
+file block, a socket, a thread record, a received descriptor) was counted
+against its limit and then also asked of the kernel's memory outside every
+reservation, and so was a write into a block the cell already held and a
+send into queues counted with the socket. Cells of other domains can
+exhaust that memory: cells without a limit, and, in a reserved domain,
+the file pages its cells keep in the page cache and copy-on-write copies,
+which no limit counts (O9). A reserved cell then got `ENOSPC`, `ENOMEM`
+or `ENOBUFS` for memory its own limit had set aside: a storage channel,
+and a breach of "a reserved root never fails because of others".
+`differential_colluders` found it on four CPUs, where the receiver could
+not create a file while the sender's domain mapped its file pages: the
+receiver's output differed from its run alone. *Fix:* for a cell with a
+memory limit, what its meter counts is its own, set aside within its
+limit, and the kernel is asked only for cells without one
+(`Context::has_counted` in `rhizo-abi`); the kernel's own reserve absorbs
+the rounding of each cell's count to whole frames. Pipe buffers, which no
+limit counts yet, still ask the kernel (O9). *Tests:*
+`a_reserved_cell_stores_within_its_limit_when_the_kernel_is_short`
+(`rhizo-abi`), `differential_colluders`.
 
 ## The control channel over vsock (B7, B8)
 
@@ -1076,7 +1332,8 @@ These are not fixed by this change; each needs its own design.
 | O3 | Medium | **Side channels other than Meltdown are out of scope.** Meltdown is closed by `add-kpti` (KPTI on x86_64 where needed, E0PD on AArch64; see *Speculation*). Caches, branch predictors, other speculation attacks (Spectre, L1TF, MDS) and timing are not reviewed. An AArch64 CPU with neither E0PD nor CSV3 is reported, not protected. Cells see a nanosecond clock. |
 | O4 | — | **Closed by `add-crypto-random`** (see *Randomness*). What remains: a CPU without a hardware random source (an AArch64 host without FEAT_RNG under KVM) falls back to the cycle counter, and the boot says `getrandom is predictable`; there is no virtio-rng driver yet. |
 | O5 | Low | **SMEP, SMAP and PAN closed by `add-user-access-guards`.** Left: SMAP and PAN cannot see accesses through the direct map (software checks guard it); on x86_64, NMI and machine-check have no stack of their own (IST): one arriving in the two instructions of the `SYSCALL` entry before the stack switch would be pushed onto the cell's stack (the platform sends neither today). |
-| O6 | Low | **Identifiers are global counters.** A cell's identifier (`getpid`) tells how many cells were created before it. Only the host creates cells, so no cell can signal through it; see [Cross-cell leaks](#cross-cell-leaks) for this and the other channels still open. |
+| O6 | — | **Closed by `add-cell-hierarchy`** (phase 1, see [Colluding cells](#colluding-cells-add-cell-hierarchy-phase-1)). Identifiers are numbered from 1 within each domain, and a copy's differs from its source's: nothing another domain does shows in them (`identifiers_are_per_domain`, `differential_colluders`). |
+| O9 | Low | **Memory the kernel takes unmetered** (`add-cell-hierarchy` phase 1). Copy-on-write copies of shared frames, the pages a domain keeps in the page cache, pipe buffers and the room a channel reserves are charged to no limit and come from the memory no reservation holds, so a reserved cell's first write to a page shared with its source, or its write into a pipe, can be refused once other domains have exhausted that memory (cells without a limit, and the unmetered pages of a reserved domain): a fault or an `ENOBUFS` another domain causes. Metering them is left to a later task. |
 | O7 | Low | **Host paths may panic.** Forking one cell, or spawning one kept image, more than 65535 times while every copy lives panics (frame reference counts are 16 bits; a cell's own path, mapping file pages, gives copies instead since S14); a frame lost when loading an executable fails half way. Only the host can do either. |
 | O8 | — | **Closed by `authenticate-control-channel`** (finding S28, see [The control channel over vsock](#the-control-channel-over-vsock-b7-b8)). What remains: a local user can keep the host from connecting (claiming the guest's CID, or replacing its connection before the secret arrives), without access to any cell; a CPU without a hardware random source keeps the control channel on the serial line. |
 | — | Low | **Hosts on the VM's network segment** (B5, above) can evict the card's neighbour-cache entries, delaying a connection's frames by about a second, and a rogue DHCP server can change or take away the card's address. Both come with sharing a segment; give the VM a network of its own. |
@@ -1142,6 +1399,11 @@ review:
   `ephemeral_ports_do_not_show_other_cells_binds`,
   `memory_pressure_keeps_the_pages_other_cells_map`; on the host the tests
   named under each finding.
+- Colluding cells (`add-cell-hierarchy` phase 1, S29, S30), in the kernel
+  with `colluder` (`kernel/src/tests/collusion.rs`):
+  `differential_colluders`, `colluders_on_loopback`,
+  `fork_bomb_in_a_subtree`, `forged_snapshot_authority`; with the tests
+  named in the inventory's last column.
 - The control channel over vsock (S27, S28), on the host in
   `rhizo-virtio`: `hostile_packets_are_survived`,
   `credit_is_never_exceeded`, `only_the_secret_admits`,

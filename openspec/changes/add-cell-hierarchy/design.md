@@ -349,6 +349,15 @@ they run (weights and caps), are in D23. Accelerator budgets are in D24.
   (`Net::set_reserved`, `Ports::reserved`), and refuses a new unlimited
   root past `CELLS_MAX` less the reserved cells.
 
+**As built (task 1.12, finding S30).** Kernel memory a cell's calls take
+was counted against its limit and then also asked of the memory outside
+every reservation (`Services::can_store`), which other domains can
+exhaust: a reserved cell's file names, blocks, sockets and threads failed
+under another domain's pressure, which `differential_colluders` showed on
+four CPUs. For a cell with a memory limit, what its meter counts is now
+its own (`Context::has_counted` in `rhizo-abi`); only a cell without one
+asks the kernel, as do pipe buffers, which no limit counts yet.
+
 ## D5. Loopback networks
 
 Every socket in `rhizo-net` gets a network number, and everything on the
@@ -931,6 +940,30 @@ summary for the user: inside one VM, colluding agents in different domains
 can still signal each other slowly through timing. They cannot gain reach,
 handles or quota by it.
 
+**As built (tasks 1.12 and 1.13).** The colluder cell
+(`cells/src/bin/colluder.rs`) has the probe, the sender, a listener and
+a knocker, a dialer for loaded snapshots, and both ends of the CPU
+channel. `differential_colluders` probes a reserved receiver twice per
+run (so that more of the sender's rounds overlap it), alone and beside a
+sender's domain (a root, two children and up to two copies, which do
+every probe as hard as they can on the same loopback ports); the
+receiver's and its children's outputs must match byte for byte. The
+probe prints ephemeral ports as distances, since each network starts its
+counter at a random place. `covert.cpu_bps` sends 100 bits of 40 ms
+(four slices: a sender woken at the start of a period may wait a slice
+for the CPU) each, from a fixed generator both ends know: the sender
+spins through a 1 and sleeps through a 0 from a monotonic start the host
+gives both, the receiver counts its loops per period and takes those
+under the median of the nine periods around them for 1s (which follows
+drifts of the CPU's speed). The figure is
+the capacity of a binary symmetric channel with the measured error rate,
+`(1 - H(p))` bits per period, computed by `xtask`. Without sets both run
+on the boot CPU alone (the host steps); with sets, CPUs 2 and 3, one
+each. `covert.` metrics are never gated, by a rule in `xtask`, whatever
+the baseline holds. `cell.parallel_sets_us` is `cell.parallel_us`'s
+batch with the cells of each CPU from 2 on in a domain with that CPU as
+its set (a root and three copies).
+
 ## D13. Fork, snapshots and machines that lack the referenced cells
 
 **Fork by the host or an ancestor.**
@@ -1029,6 +1062,18 @@ rules above.
 Alternative: global names for cells so that handles can be resolved on
 any machine. Rejected: a global namespace is a channel, and it would let a
 forged file name a victim.
+
+**As built (task 1.12).** A snapshot loaded from bytes enters the tree as
+a root before the control kernel places it, and that root took the limits
+its bytes claimed, admitted against the kernel's free memory: a file
+claiming more than the kernel could set aside (forged, or saved on a
+larger machine) could not be placed under any parent, whatever limits
+the host gave it there (finding S29 in `docs/security.md`, found by
+`forged_snapshot_authority`). A snapshot the host places under a parent
+now enters with a new cell's limits (`cell::to_place`, through
+`Snapshot::set_quota` and the tree section), and its placement alone
+gives its limits. Loaded as a root, it keeps the limits its bytes ask
+for within `cap_quota`, a reserved root admitted like any other.
 
 ## D14. Control protocol and `rhizo`
 

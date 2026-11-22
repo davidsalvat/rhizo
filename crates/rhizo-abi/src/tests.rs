@@ -1128,6 +1128,41 @@ fn files_sockets_and_threads_are_metered() {
     );
 }
 
+/// Finding S30: with the memory no reservation holds exhausted by others
+/// (the kernel refuses every `can_store`), a cell with a memory limit
+/// still makes a file, writes it, makes a socket and sends on it, and
+/// starts a thread, within its limit; a cell without one is refused.
+#[test]
+fn a_reserved_cell_stores_within_its_limit_when_the_kernel_is_short() {
+    for limited in [false, true] {
+        let mut w = World::new(Arch::Aarch64);
+        w.services.room = Some(0);
+        if limited {
+            w.frames.metered = Some((0, 1024));
+        }
+        let p = name(&mut w, "/f");
+        let fd = w.call(OPENAT, &[AT_FDCWD, p, 0x42]).0;
+        if !limited {
+            assert!(fd < 0, "{fd}: the kernel had no memory");
+            continue;
+        }
+        let fd = fd as u64;
+        w.poke(DATA, &[1; 4000]);
+        assert_eq!(w.call(WRITE, &[fd, DATA, 4000]).0, 4000);
+        assert_eq!(w.call(WRITE, &[fd, DATA, 96]).0, 96, "same block");
+        let s = w.call(198 /* socket */, &[2, 2, 0]).0;
+        assert!(s >= 0, "{s}");
+        let to = [2u8, 0, 0x1f, 0x90, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        w.poke(DATA + 0xc00, &to);
+        let sent = w.call(
+            206, /* sendto */
+            &[s as u64, DATA, 8, 0, DATA + 0xc00, 16],
+        );
+        assert_eq!(sent.0, 8);
+        assert!(w.call(CLONE, &[PTHREAD_FLAGS, 0, 0, 0, 0]).0 > 0);
+    }
+}
+
 #[test]
 fn select_without_descriptors_sleeps() {
     let mut w = World::new(Arch::X86_64);

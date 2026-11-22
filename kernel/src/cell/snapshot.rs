@@ -13,6 +13,31 @@ pub enum Resume {
     Lazy,
 }
 
+/// Readies `snapshot`, decoded from a file and capped to what a cell the
+/// host starts gets, for a placement under a parent (design D13 of
+/// `add-cell-hierarchy`): it enters the tree as a root before the host
+/// places it, and there it holds a new cell's limits, never those its bytes
+/// claim. Its placement then carves its limits from the parent's budget.
+/// Without this, a file claiming a larger limit than the kernel can set
+/// aside could not be placed under any parent, however small the limits
+/// the host gives it there.
+#[cfg_attr(
+    not(any(feature = "control", feature = "ktest")),
+    allow(dead_code, reason = "used by the control kernel and in-kernel tests")
+)]
+pub fn to_place(snapshot: &mut Snapshot) {
+    let files = snapshot.state().quota.files;
+    snapshot.set_quota(Quota {
+        files,
+        ..Quota::DEFAULT
+    });
+    let spec = rhizo_cap::Spec {
+        limits: rhizo_cap::Limits::UNLIMITED,
+        ..snapshot.tree().spec
+    };
+    snapshot.set_tree(&spec);
+}
+
 impl Host {
     /// Suspends live cell `id` into a snapshot and frees all its memory
     /// (spec `snapshots`). Its captured output stays with the host.

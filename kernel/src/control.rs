@@ -675,6 +675,10 @@ impl Server {
         let asked = snapshot.state().quota;
         snapshot.cap_quota(Quota::DEFAULT);
         let narrowed = snapshot.state().quota != asked;
+        // Under a parent, its placement alone gives its limits.
+        if !placement.is_root() {
+            cell::to_place(&mut snapshot);
+        }
         let source = snapshot.tree().pid;
         let (place, cell, pending) = if template {
             let t = self
