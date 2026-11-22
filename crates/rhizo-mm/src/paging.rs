@@ -555,33 +555,37 @@ impl<F: EntryFormat> PageTable<F> {
     /// The flags are the effective ones: a page is writable only if its entry
     /// and every table entry above it allow writes (spec `virtual-memory`).
     pub fn translate(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<Translation> {
-        let (_, entry, level) = self.leaf_slot(mem, virt)?;
-        let size = PageSize::from_leaf_level(level);
-        let offset = virt & (size.bytes() - 1);
-        let base = F::address(entry) & !(size.bytes() - 1);
-        let mut flags = F::flags(entry);
-        if !self.path_writable(mem, virt, level) {
-            flags = PageFlags(flags.0 & !PageFlags::WRITABLE.0);
+        if !is_canonical(virt) {
+            return None;
         }
-        Some(Translation {
-            phys: base + offset,
-            flags,
-            size,
-        })
-    }
-
-    /// Whether every table entry on the way to the leaf at `leaf_level` for
-    /// `virt` allows writes.
-    fn path_writable(&self, mem: &impl PhysicalMemory, virt: u64, leaf_level: u32) -> bool {
+        // One walk to the leaf, noting whether every table entry on the way
+        // allows writes (every system call that touches a cell's memory
+        // translates).
         let mut table = self.root;
-        for level in (leaf_level + 1..=3).rev() {
+        let mut writable = true;
+        for level in (0..=3).rev() {
             let entry = mem.read_u64(table + index(virt, level) * 8);
-            if !F::table_writable(entry) {
-                return false;
+            if !F::is_valid(entry) {
+                return None;
             }
+            if F::is_leaf(entry, level) {
+                let size = PageSize::from_leaf_level(level);
+                let offset = virt & (size.bytes() - 1);
+                let base = F::address(entry) & !(size.bytes() - 1);
+                let mut flags = F::flags(entry);
+                if !writable {
+                    flags = PageFlags(flags.0 & !PageFlags::WRITABLE.0);
+                }
+                return Some(Translation {
+                    phys: base + offset,
+                    flags,
+                    size,
+                });
+            }
+            writable &= F::table_writable(entry);
             table = F::address(entry);
         }
-        true
+        None
     }
 
     /// Removes the mapping of the page containing `virt`, invalidates its TLB
@@ -632,10 +636,11 @@ impl<F: EntryFormat> PageTable<F> {
 
     /// Copies the root entries of the upper (kernel) half from `kernel`, so
     /// this hierarchy shares the kernel's mappings (x86_64 cells).
+    /// One copy of the half table (the kernel's `memcpy`): every cell's
+    /// root is made this way.
     pub fn share_upper_half(&self, mem: &mut impl PhysicalMemory, kernel: &PageTable<F>) {
-        for i in ENTRIES / 2..ENTRIES {
-            mem.write_u64(self.root + i * 8, mem.read_u64(kernel.root + i * 8));
-        }
+        let half = ENTRIES / 2 * 8;
+        mem.copy(kernel.root + half, self.root + half, half);
     }
 
     /// Calls `f(virt, phys, size, flags)` for every page mapped in the lower
@@ -653,22 +658,29 @@ impl<F: EntryFormat> PageTable<F> {
             range: core::ops::Range<u64>,
             f: &mut impl FnMut(u64, u64, PageSize, PageFlags),
         ) {
-            for i in range {
-                let entry = mem.read_u64(table + i * 8);
-                if !F::is_valid(entry) {
+            // Most entries are empty: four at a time (ranges are of 256 or
+            // 512 entries).
+            for first in range.step_by(4) {
+                let four = [0, 1, 2, 3].map(|j| mem.read_u64(table + (first + j) * 8));
+                if four[0] | four[1] | four[2] | four[3] == 0 {
                     continue;
                 }
-                let virt = base + (i << (12 + 9 * level));
-                if F::is_leaf(entry, level) {
-                    let size = PageSize::from_leaf_level(level);
-                    f(
-                        virt,
-                        F::address(entry) & !(size.bytes() - 1),
-                        size,
-                        F::flags(entry),
-                    );
-                } else {
-                    walk::<F>(mem, F::address(entry), level - 1, virt, 0..ENTRIES, f);
+                for (i, entry) in (first..).zip(four) {
+                    if !F::is_valid(entry) {
+                        continue;
+                    }
+                    let virt = base + (i << (12 + 9 * level));
+                    if F::is_leaf(entry, level) {
+                        let size = PageSize::from_leaf_level(level);
+                        f(
+                            virt,
+                            F::address(entry) & !(size.bytes() - 1),
+                            size,
+                            F::flags(entry),
+                        );
+                    } else {
+                        walk::<F>(mem, F::address(entry), level - 1, virt, 0..ENTRIES, f);
+                    }
                 }
             }
         }

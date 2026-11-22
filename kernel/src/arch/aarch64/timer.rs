@@ -28,6 +28,16 @@ pub fn frequency() -> u64 {
 
 /// Converts counter ticks to nanoseconds.
 pub fn cycles_to_ns(cycles: u64) -> Option<u64> {
+    const NS: u64 = 1_000_000_000;
     let hz = frequency();
-    (hz != 0).then(|| (cycles as u128 * 1_000_000_000 / hz as u128) as u64)
+    if hz == 0 {
+        return None;
+    }
+    // A whole number of nanoseconds per tick (QEMU's 62.5 MHz, 1 GHz
+    // counters): one multiplication, the same result as the 128-bit
+    // division, which a clock read on every switch would otherwise pay.
+    if NS.is_multiple_of(hz) {
+        return Some((u128::from(cycles) * u128::from(NS / hz)) as u64);
+    }
+    Some((u128::from(cycles) * u128::from(NS) / u128::from(hz)) as u64)
 }

@@ -3,7 +3,7 @@
 //! interpreter mapped from a file's pages), and the initial stack (System V
 //! ABI / Linux layout).
 
-use crate::memory::{self, write_bytes};
+use crate::memory::write_bytes;
 use crate::space::{self, Frames};
 use crate::{STACK_PAGES, STACK_TOP, USER_END};
 use rhizo_hal::{PhysicalMemory, Tlb};
@@ -106,16 +106,19 @@ pub struct Image<'a> {
     interp: Option<(usize, usize)>,
 }
 
+#[inline(always)]
 fn u16_at(d: &[u8], o: usize) -> Result<u16, ElfError> {
     let b = d.get(o..o.saturating_add(2)).ok_or(ElfError::Truncated)?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
+#[inline(always)]
 fn u32_at(d: &[u8], o: usize) -> Result<u32, ElfError> {
     let b = d.get(o..o.saturating_add(4)).ok_or(ElfError::Truncated)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+#[inline(always)]
 fn u64_at(d: &[u8], o: usize) -> Result<u64, ElfError> {
     let b = d.get(o..o.saturating_add(8)).ok_or(ElfError::Truncated)?;
     Ok(u64::from_le_bytes([
@@ -526,9 +529,9 @@ impl Aux {
 /// guard) and writes the initial stack: `argc`, `argv`, `envp`, the auxiliary
 /// vector (`aux`), the strings and 16 random bytes. Returns the initial
 /// stack pointer (16-byte aligned, pointing at `argc`).
-pub fn build_stack<F: EntryFormat>(
+pub fn build_stack<F: EntryFormat, M: PhysicalMemory>(
     pt: &PageTable<F>,
-    mem: &mut impl PhysicalMemory,
+    mem: &mut M,
     alloc: &mut impl FnMut() -> Option<u64>,
     aux: &Aux,
     argv: &[&[u8]],
@@ -536,7 +539,10 @@ pub fn build_stack<F: EntryFormat>(
     random: [u8; 16],
 ) -> Result<u64, ElfError> {
     let rw = PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-    for i in 1..=STACK_PAGES {
+    // The frame of each stack page, from the top down: what follows is
+    // written straight into them, without a walk of the tables per write.
+    let mut frames = [0u64; STACK_PAGES as usize];
+    for (i, slot) in (1..).zip(&mut frames) {
         let frame = alloc().ok_or(ElfError::OutOfMemory)?;
         mem.zero_frame(frame);
         pt.map(
@@ -548,12 +554,37 @@ pub fn build_stack<F: EntryFormat>(
             rw,
         )
         .map_err(|_| ElfError::OutOfMemory)?;
+        *slot = frame;
     }
+    let bottom = STACK_TOP - STACK_PAGES * FRAME_SIZE;
+    // The physical address of stack address `addr` (below the top, at or
+    // above the bottom).
+    let phys = |addr: u64| {
+        let page = (STACK_TOP - (addr & !(FRAME_SIZE - 1))) / FRAME_SIZE;
+        frames[page as usize - 1] + (addr & (FRAME_SIZE - 1))
+    };
+    // Writes `bytes` at stack address `addr`, a page at a time; refused, as
+    // a fault would be, if they do not fit in the stack.
+    let write = |mem: &mut _, addr: u64, bytes: &[u8]| -> Result<(), ElfError> {
+        if addr < bottom || addr > STACK_TOP - bytes.len() as u64 {
+            return Err(ElfError::OutOfMemory);
+        }
+        let mut done = 0;
+        while done < bytes.len() {
+            let at = addr + done as u64;
+            let n = (FRAME_SIZE - (at & (FRAME_SIZE - 1))).min((bytes.len() - done) as u64);
+            write_bytes(mem, phys(at), &bytes[done..done + n as usize]);
+            done += n as usize;
+        }
+        Ok(())
+    };
 
     let mut top = STACK_TOP;
     let mut push_bytes = |mem: &mut _, bytes: &[u8]| -> Result<u64, ElfError> {
-        top -= bytes.len() as u64;
-        memory::copy_to(pt, mem, top, bytes).map_err(|_| ElfError::OutOfMemory)?;
+        top = top
+            .checked_sub(bytes.len() as u64)
+            .ok_or(ElfError::OutOfMemory)?;
+        write(mem, top, bytes)?;
         Ok(top)
     };
     let random_addr = push_bytes(mem, &random)?;
@@ -588,24 +619,27 @@ pub fn build_stack<F: EntryFormat>(
     // argc + argv + NULL + envp + NULL + auxv pairs, as 8-byte words.
     let words = 1 + argv.len() + 1 + envp.len() + 1 + aux.clone().count() * 2;
     let sp = align_down(top - words as u64 * 8, 16);
+    if sp < bottom {
+        return Err(ElfError::OutOfMemory);
+    }
+    // Words are 8-byte aligned: each within one page.
     let mut at = sp;
-    let mut put = |mem: &mut _, value: u64| -> Result<(), ElfError> {
-        memory::copy_to(pt, mem, at, &value.to_le_bytes()).map_err(|_| ElfError::OutOfMemory)?;
+    let mut put = |mem: &mut M, value: u64| {
+        mem.write_u64(phys(at), value);
         at += 8;
-        Ok(())
     };
-    put(mem, argv.len() as u64)?;
+    put(mem, argv.len() as u64);
     for &addr in &string_addrs[..argv.len()] {
-        put(mem, addr)?;
+        put(mem, addr);
     }
-    put(mem, 0)?;
+    put(mem, 0);
     for &addr in &string_addrs[argv.len()..count] {
-        put(mem, addr)?;
+        put(mem, addr);
     }
-    put(mem, 0)?;
+    put(mem, 0);
     for (key, value) in aux {
-        put(mem, key)?;
-        put(mem, value)?;
+        put(mem, key);
+        put(mem, value);
     }
     Ok(sp)
 }
@@ -613,6 +647,7 @@ pub fn build_stack<F: EntryFormat>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::memory;
     use crate::testing::CountingFrames;
     use rhizo_hal::testing::FakePhysicalMemory;
     use rhizo_mm::paging::Aarch64;
@@ -929,6 +964,36 @@ pub(crate) mod tests {
         assert!(
             pt.translate(&mem, STACK_TOP - (STACK_PAGES + 1) * FRAME_SIZE)
                 .is_none()
+        );
+    }
+
+    /// Strings that cross a page of the stack are written across it, and
+    /// arguments that do not fit in the stack are refused.
+    #[test]
+    fn stack_strings_cross_pages_and_must_fit() {
+        let data = sample();
+        let image = Image::parse(&data, Machine::Aarch64).unwrap();
+        let aux = Aux::of(&image, 0);
+        let long: Vec<u8> = (0..9000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let (pt, mut mem, mut alloc) = table();
+        let sp = build_stack(&pt, &mut mem, &mut alloc, &aux, &[&long], &[], [0; 16]).unwrap();
+        let mut b = [0u8; 8];
+        memory::copy_from(&pt, &mem, sp + 8, &mut b).unwrap();
+        let mut got = alloc::vec![0u8; long.len() + 1];
+        memory::copy_from(&pt, &mem, u64::from_le_bytes(b), &mut got).unwrap();
+        assert_eq!(&got[..long.len()], &long[..]);
+        assert_eq!(got[long.len()], 0);
+        let huge = alloc::vec![b'x'; (STACK_PAGES * FRAME_SIZE) as usize];
+        let (pt, mut mem, mut alloc) = table();
+        assert_eq!(
+            build_stack(&pt, &mut mem, &mut alloc, &aux, &[&huge], &[], [0; 16]),
+            Err(ElfError::OutOfMemory)
+        );
+        let many: Vec<&[u8]> = alloc::vec![&long[..7000]; 10];
+        let (pt, mut mem, mut alloc) = table();
+        assert_eq!(
+            build_stack(&pt, &mut mem, &mut alloc, &aux, &many, &[], [0; 16]),
+            Err(ElfError::OutOfMemory)
         );
     }
 

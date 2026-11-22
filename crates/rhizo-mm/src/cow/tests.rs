@@ -871,6 +871,43 @@ proptest! {
     }
 }
 
+/// A fork's root holds the kernel half as the parent's does (x86_64), and
+/// shares the user tables of every root entry, wherever it lies among its
+/// neighbours: the first and last of the user half, and alone or next to
+/// another in a group of four.
+#[test]
+fn fork_root_keeps_the_kernel_half_and_every_user_table() {
+    let mut w = World::<X86_64>::new();
+    let kernel = w.table();
+    let kernel_rw = PageFlags::WRITABLE.union(PageFlags::NO_EXECUTE);
+    w.map(&kernel, 0xffff_8000_0000_0000, PageSize::Small, kernel_rw);
+    w.map(&kernel, 0xffff_ffff_8000_0000, PageSize::Small, kernel_rw);
+    let parent = w.table();
+    parent.share_upper_half(&mut w.mem, &kernel);
+    // Root entries 0, 1, 6 and 255.
+    let user = [0x1000, 0x80_0000_0000, 0x300_0000_0000, 0x7f80_0000_0000];
+    for virt in user {
+        w.map(&parent, virt, PageSize::Small, RW);
+        w.write(&parent, virt, virt);
+    }
+    let child = parent.fork_lower_half(&mut w.mem, &mut w.frames).unwrap();
+    for i in 0..512 {
+        let at = |pt: &PageTable<X86_64>| w.mem.read_u64(pt.root() + i * 8);
+        assert_eq!(at(&child), at(&parent), "root entry {i}");
+    }
+    for virt in user {
+        assert_eq!(w.read(&child, virt), virt);
+        assert!(w.write(&child, virt, 1), "copied on write");
+        assert_eq!(w.read(&parent, virt), virt, "the parent keeps its page");
+    }
+    for virt in [0xffff_8000_0000_0000, 0xffff_ffff_8000_0000] {
+        assert_eq!(
+            child.translate(&w.mem, virt),
+            kernel.translate(&w.mem, virt)
+        );
+    }
+}
+
 /// A cell sharing the kernel half (x86_64): a write fault or a mapping change
 /// at a kernel address is never "resolved", and no kernel table changes.
 #[test]

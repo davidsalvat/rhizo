@@ -38,13 +38,16 @@ pub fn cycles_to_ns(cycles: u64) -> Option<u64> {
     if packed == 1 {
         return None;
     }
-    let (mul, shift) = ((packed >> 8) as u128, packed as u8 as i8);
-    let scaled = if shift >= 0 {
-        (cycles as u128) << shift
+    // `(cycles << shift) * mul` is `cycles * (mul << shift)`, which fits in
+    // 64 bits (`mul` in 32, `shift` at most 31): one 64-by-64
+    // multiplication on every clock read.
+    let (mul, shift) = (packed >> 8, packed as u8 as i8);
+    let (cycles, mul) = if shift >= 0 {
+        (cycles, mul << shift)
     } else {
-        (cycles as u128) >> -shift
+        (cycles >> -shift, mul)
     };
-    Some(((scaled * mul) >> 32) as u64)
+    Some(((u128::from(cycles) * u128::from(mul)) >> 32) as u64)
 }
 
 fn calibrate() -> Option<(u32, i8)> {

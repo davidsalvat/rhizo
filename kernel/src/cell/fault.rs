@@ -123,10 +123,13 @@ pub(super) fn grow_stack(pt: &PageTable<Format>, frames: &mut impl Frames, addr:
 /// charge one frame and credit one back.
 pub(super) fn resolve_write(pt: &PageTable<Format>, tlb: &mut CellTlb<'_>, addr: u64) -> bool {
     let _p = cost::scope(Part::Cow);
+    let shrank = core::mem::replace(&mut tlb.shrank, false);
     let resolved = pt.resolve_write(&mut DirectMap, &mut KernelFrames, tlb, addr) == Ok(true);
-    if resolved {
+    // A copied page was flushed between its two entries: once is enough.
+    if resolved && !tlb.shrank {
         tlb.flush_page(addr);
     }
+    tlb.shrank |= shrank;
     resolved
 }
 
