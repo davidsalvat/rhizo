@@ -119,7 +119,7 @@ fn copies_report() -> (alloc::string::String, Vec<alloc::string::String>) {
     let ready = |host: &mut Host| {
         let id = spawn(host, "copies", &[]);
         host.run_to_pause(id, b"ready", Pause::Waits)
-            .unwrap_or_else(|why| panic!("{why}: {:?}", ended(host, id)));
+            .unwrap_or_else(|why| panic!("{why}"));
         id
     };
     let mut host = Host::new();
@@ -269,7 +269,7 @@ fn loads_of_a_copied_template_see_new_generations() {
     assert!(host.freeze(first));
     let copy = host.spawn_from_template(first, true, false).expect("copy");
     host.run_to_pause(copy, b"ready", Pause::Waits)
-        .unwrap_or_else(|why| panic!("{why}: {:?}", ended(&host, copy)));
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(copy));
     let crc = crate::arch::mem::crc32c;
     let bytes = host

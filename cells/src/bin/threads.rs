@@ -7,9 +7,13 @@
 //!
 //! With the argument `bench` it measures instead, and prints
 //! `create_ns=<n> futex_wake_ns=<n>` (design D10 of `add-threads`). The
-//! in-kernel scheduling tests use three more modes: `starve` (a thread
+//! in-kernel scheduling tests use four more modes: `starve` (a thread
 //! prints and ends the cell while the first spins), `spin <n>` (`n`
-//! threads spin forever) and `park` (every thread waits forever).
+//! threads spin forever), `park` (every thread waits forever) and `pause`
+//! (it prints `ready`, wakes a thread that yields four times and then
+//! waits forever, sleeps 20 ms, prints `done` and ends: a template whose
+//! pause starts while another of its threads can still run, as Node.js's
+//! after `warm`, change `fix-node-pause`).
 #![no_std]
 #![no_main]
 
@@ -422,8 +426,29 @@ extern "C" fn park(_: usize) -> usize {
     }
 }
 
+static GO: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn settle(_: usize) -> usize {
+    while GO.load(Ordering::Acquire) == 0 {
+        futex_wait(&GO, 0, None, ANY);
+    }
+    for _ in 0..4 {
+        yield_now();
+    }
+    park(0)
+}
+
 fn main() -> i32 {
     match (arg(1), arg(2)) {
+        (Some(b"pause"), _) => {
+            start(0, settle, 0);
+            print(b"ready\n");
+            GO.store(1, Ordering::Release);
+            futex_wake(&GO, 1, ANY);
+            rhizo_cells::sleep_ns(20_000_000);
+            print(b"done\n");
+            rhizo_cells::exit(0)
+        }
         (Some(b"bench"), _) => {
             bench();
             return 0;
