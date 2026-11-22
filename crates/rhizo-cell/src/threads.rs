@@ -275,10 +275,22 @@ impl Threads {
         match found {
             Some(i) => {
                 // The current thread goes last; the ones skipped keep their
-                // order before it.
-                let next = self.others.remove(i);
-                let previous = core::mem::replace(&mut self.current, next);
-                self.others.push(previous);
+                // order before it. The two records trade places, and only
+                // the ones after `i` move: with two threads, nothing does
+                // (design D2 of `fast-thread-switch-aarch64`).
+                let slot: *mut Thread = &mut self.others[i];
+                let current: *mut Thread = &mut self.current;
+                // SAFETY: `slot` and `current` are two distinct, valid,
+                // aligned records; each is read once and written once, and
+                // nothing between can panic, so neither is dropped or
+                // duplicated. Three plain copies: `mem::swap` swaps a value
+                // this size byte by byte on a strict-alignment target.
+                unsafe {
+                    let next = slot.read();
+                    slot.copy_from_nonoverlapping(current, 1);
+                    current.write(next);
+                }
+                self.others[i..].rotate_left(1);
                 true
             }
             None => self.current.wait == Wait::Ready,
