@@ -577,8 +577,12 @@ impl Abi {
             Some(Sys::EpollWait | Sys::EpollPwait) => {
                 poll::epoll_wait(cx, self.arch, a[0], a[1], a[2], a[3])
             }
-            Some(Sys::Socket) => sockets::socket(cx, a[0], a[1], a[2]),
-            Some(Sys::Socketpair) => sockets::socketpair(cx, a),
+            // Sockets belong to the cell's own network (design D5 of
+            // `add-cell-hierarchy`).
+            Some(Sys::Socket) => {
+                self.with_ports(cell, cx, |cx| sockets::socket(cx, a[0], a[1], a[2]))
+            }
+            Some(Sys::Socketpair) => self.with_ports(cell, cx, |cx| sockets::socketpair(cx, a)),
             Some(Sys::Bind) => self.with_ports(cell, cx, |cx| sockets::bind(cx, a[0], a[1], a[2])),
             Some(Sys::Listen) => self.with_ports(cell, cx, |cx| sockets::listen(cx, a[0], a[1])),
             Some(Sys::Accept) => sockets::accept(cx, a[0], a[1], a[2], 0),
@@ -756,9 +760,10 @@ impl Abi {
         Outcome::Resume
     }
 
-    /// Runs `call`, a socket call that may bind an ephemeral port, with the
-    /// cell's own ports entered into the sockets (design D2 of
-    /// `close-cross-cell-leaks`).
+    /// Runs `call`, a socket call that may make a socket or bind an
+    /// ephemeral port, with the cell's own network and ports entered into
+    /// the sockets (design D2 of `close-cross-cell-leaks`, D5 of
+    /// `add-cell-hierarchy`).
     fn with_ports<'c, F, M, T, A, S>(
         &mut self,
         cell: &mut Cell,

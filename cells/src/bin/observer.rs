@@ -2,17 +2,21 @@
 //! observer looks at what the kernel tells it while a neighbour cell works,
 //! and prints what it sees; nothing of the neighbour may show.
 //!
-//! - `ports PORT`: binds a socket to an ephemeral port, prints `ready`,
-//!   waits for the neighbour's connection on 127.0.0.1:PORT and its end,
-//!   binds another socket and prints `ports +N`, N the distance between the
-//!   two ports (1 when only its own binds move its ports);
-//! - `memory PORT`: reads `sysinfo`, prints `ready`, reads it again once
-//!   the neighbour connected (while the neighbour holds its memory), and
-//!   prints `memory total=T change=C procs=P`: the total in MiB, how much
-//!   the free memory moved in MiB, and the processes;
-//! - `neighbour PORT MIB N`: takes and touches MIB MiB, binds N sockets to
-//!   ephemeral ports and closes them, connects to 127.0.0.1:PORT and waits
-//!   for the observer to close the connection;
+//! The host runs the two in turn: cells share no loopback network to meet
+//! on (design D5 of `add-cell-hierarchy`), and each sleeps until the host
+//! wakes it.
+//!
+//! - `ports`: binds a socket to an ephemeral port, prints `ready` and
+//!   sleeps while the neighbour works, binds another socket and prints
+//!   `ports +N`, N the distance between the two ports (1 when only its own
+//!   binds move its ports);
+//! - `memory`: reads `sysinfo`, prints `ready` and sleeps, reads it again
+//!   (while the neighbour holds its memory), and prints `memory total=T
+//!   change=C procs=P`: the total in MiB, how much the free memory moved in
+//!   MiB, and the processes;
+//! - `neighbour MIB N`: takes and touches MIB MiB, binds N sockets to
+//!   ephemeral ports and closes them, prints `holding` and sleeps, holding
+//!   its memory;
 //! - `page`: maps a page of a file of its own, prints `mapped`, sleeps
 //!   until the host wakes it, reads the page again and prints `page ok`;
 //! - `ids`: prints `pid P tid T` from `getpid` and `gettid`, yields three
@@ -24,14 +28,11 @@
 #![no_main]
 
 use rhizo_cells::{
-    arg, check, local_port, loopback, nr, number, print, sleep_ns, syscall, tcp_connect,
-    tcp_listen, tcp_socket, yield_now,
+    arg, check, local_port, loopback, nr, number, print, sleep_ns, syscall, tcp_socket, yield_now,
 };
 
-const ECONNREFUSED: isize = -111;
 const AT_FDCWD: usize = -100isize as usize;
 const O_RDWR_CREAT: usize = 0o102;
-const SHUT_WR: usize = 1;
 
 fn print_number(mut n: u64) {
     let mut digits = [0u8; 20];
@@ -57,39 +58,15 @@ fn ephemeral() -> (usize, u16) {
     (s as usize, local_port(s as usize))
 }
 
-/// Reads `fd` until the peer closes it.
-fn read_to_end(fd: usize) {
-    let mut buf = [0u8; 64];
-    while syscall(
-        nr::READ,
-        [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0],
-    ) > 0
-    {}
+/// Prints `said` and sleeps until the host wakes it.
+fn wait_for_host(said: &[u8]) {
+    print(said);
+    sleep_ns(3_600_000_000_000);
 }
 
-/// Listens on `port`, prints `ready`, and accepts the neighbour.
-fn wait_for_neighbour(port: u16) -> usize {
-    let l = tcp_socket(0);
-    check(l >= 0 && tcp_listen(l as usize, port) == 0, "listen");
-    print(b"ready\n");
-    let c = syscall(nr::ACCEPT4, [l as usize, 0, 0, 0, 0, 0]);
-    check(c >= 0, "accept");
-    c as usize
-}
-
-/// Lets the neighbour go and waits until it has closed its end.
-fn let_go(c: usize) {
-    check(
-        syscall(nr::SHUTDOWN, [c, SHUT_WR, 0, 0, 0, 0]) == 0,
-        "shutdown",
-    );
-    read_to_end(c);
-}
-
-fn ports(port: u16) {
+fn ports() {
     let (_, first) = ephemeral();
-    let c = wait_for_neighbour(port);
-    let_go(c);
+    wait_for_host(b"ready\n");
     let (_, second) = ephemeral();
     let span = (60999 - 32768 + 1) as u32;
     let distance = (u32::from(second) + span - u32::from(first)) % span;
@@ -111,11 +88,10 @@ fn sysinfo() -> (u64, u64, u16) {
     (word(32) * unit, word(40) * unit, procs)
 }
 
-fn memory(port: u16) {
+fn memory() {
     let (total, before, _) = sysinfo();
-    let c = wait_for_neighbour(port);
+    wait_for_host(b"ready\n");
     let (_, after, procs) = sysinfo();
-    let_go(c);
     print(b"memory total=");
     print_number(total >> 20);
     print(b" change=");
@@ -125,7 +101,7 @@ fn memory(port: u16) {
     print(b"\n");
 }
 
-fn neighbour(port: u16, mib: usize, n: usize) {
+fn neighbour(mib: usize, n: usize) {
     if mib > 0 {
         let size = mib << 20;
         let p = syscall(nr::MMAP, [0, size, 3, 0x22, usize::MAX, 0]);
@@ -139,16 +115,7 @@ fn neighbour(port: u16, mib: usize, n: usize) {
         let (s, _) = ephemeral();
         syscall(nr::CLOSE, [s, 0, 0, 0, 0, 0]);
     }
-    let c = tcp_socket(0);
-    check(c >= 0, "socket");
-    loop {
-        match tcp_connect(c as usize, port) {
-            0 => break,
-            ECONNREFUSED => yield_now(),
-            _ => check(false, "connect"),
-        }
-    }
-    read_to_end(c as usize);
+    wait_for_host(b"holding\n");
 }
 
 fn page() {
@@ -192,11 +159,10 @@ fn ids() {
 }
 
 fn main() -> i32 {
-    let port = arg(2).map_or(0, number) as u16;
     match arg(1) {
-        Some(b"ports") => ports(port),
-        Some(b"memory") => memory(port),
-        Some(b"neighbour") => neighbour(port, arg(3).map_or(0, number), arg(4).map_or(0, number)),
+        Some(b"ports") => ports(),
+        Some(b"memory") => memory(),
+        Some(b"neighbour") => neighbour(arg(2).map_or(0, number), arg(3).map_or(0, number)),
         Some(b"page") => page(),
         Some(b"ids") => ids(),
         _ => check(false, "mode"),

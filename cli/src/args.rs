@@ -19,6 +19,8 @@ Commands:
       --accel <auto|kvm|tcg> QEMU acceleration (default auto)
       --kernel <path>        A control kernel already built (default: build
                              it with `cargo xtask`)
+      --pin                  Each vCPU on a host core of its own (QEMU,
+                             Cloud Hypervisor), for exclusive CPU sets
   run <template> [options] [-- args...]
                              Start a cell and show its output until it ends
       --detach               Print its identifier and return at once
@@ -109,6 +111,9 @@ pub struct Up {
     pub cpus: u32,
     pub accel: Accel,
     pub kernel: Option<PathBuf>,
+    /// Each vCPU pinned to a host core of its own (design D17 of
+    /// `add-cell-hierarchy`).
+    pub pin: bool,
 }
 
 /// Contents of a `--file`.
@@ -469,9 +474,14 @@ fn parse_up(args: &[String]) -> Result<Up, String> {
         cpus: 1,
         accel: Accel::Auto,
         kernel: None,
+        pin: false,
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
+        if flag == "--pin" {
+            up.pin = true;
+            continue;
+        }
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--vmm" => up.vmm = Some(value.clone()),
@@ -615,6 +625,11 @@ mod tests {
         assert_eq!((up.memory_mib, up.cpus), (512, 2));
         assert_eq!(up.accel, Accel::Tcg);
         assert_eq!(up.kernel, Some(PathBuf::from("/k")));
+        assert!(!up.pin);
+        let Command::Up(pinned) = command("up --pin --cpus 4") else {
+            panic!("not up");
+        };
+        assert!(pinned.pin && pinned.cpus == 4);
         let Command::Up(defaults) = command("up") else {
             panic!("not up");
         };

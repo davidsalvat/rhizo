@@ -221,15 +221,19 @@ fn laptop(console: &mut impl Console) {
 
 /// Every worker runs one operation per period.
 const PERIOD_MS: u64 = 200;
-/// The port the `serve` workers' shared listener takes.
+/// The port each `pair` worker listens on, in its own loopback network.
 const PORT: u16 = 7600;
 /// Memory left free for what the workers take while they run.
 const HEADROOM: u64 = 32 << 20;
 /// The host suspends and resumes one worker, and forks one, this often.
 const HOST_PERIOD_NS: u64 = 10_000_000;
-/// One group of the mix: 4 computing, 2 on files, 2 pairs over TCP.
-const MIX: [usize; 10] = [0, 0, 0, 0, 1, 1, 2, 3, 2, 3];
-const MODES: [&[u8]; 4] = [b"cpu", b"file", b"serve", b"ping"];
+/// One group of the mix: 6 computing, 2 on files, 2 pairs over TCP, each
+/// pair the two threads of one cell (cells no longer share a loopback
+/// network, design D5 of `add-cell-hierarchy`: the two cells a pair took
+/// before compute now), so 10,000 cells hold 2,000 connections in about
+/// 4,000 of the kernel's 4,096 sockets, as before.
+const MIX: [usize; 10] = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2];
+const MODES: [&[u8]; 3] = [b"cpu", b"file", b"pair"];
 
 /// The value after `key=` in `out`.
 fn field(out: &[u8], key: &str) -> Option<u64> {
@@ -265,8 +269,9 @@ fn server(console: &mut impl Console) {
             // Frozen only once in its hour's sleep, which its forks find
             // expired: a slice that ends between `ready` and the sleep would
             // leave every fork to start that sleep (change
-            // `fix-lost-wakeup-smp`).
-            while !host.asleep(id) {
+            // `fix-lost-wakeup-smp`). A `pair` worker's server thread waits
+            // in `accept` meanwhile: no thread of it may run.
+            while !host.waits(id) {
                 host.step();
             }
             assert!(host.freeze(id));

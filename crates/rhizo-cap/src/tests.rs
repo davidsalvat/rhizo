@@ -461,6 +461,27 @@ fn labels_and_weights_are_checked() {
     );
 }
 
+/// Design D17: an exclusive CPU set belongs to a root; a root moved under
+/// a parent of another domain leaves its set and runs on that domain's
+/// CPUs, and keeps none if it is made a root again.
+#[test]
+fn exclusive_sets_stay_with_roots() {
+    let mut t = Tree::new();
+    t.add_root(1, spec(limits(8 * MIB, 1)), 0).unwrap();
+    let set = Spec {
+        cpus: 0b1100,
+        ..spec(limits(MIB, 0))
+    };
+    t.add_root(2, set, 0).unwrap();
+    assert_eq!(t.get(2).unwrap().cpus(), 0b1100);
+    t.reparent(2, 1, Actor::Host, &none, &mut fresh()).unwrap();
+    assert_eq!(t.get(2).unwrap().cpus(), 0, "in domain 1 now");
+    t.reparent(2, HOST, Actor::Host, &none, &mut fresh())
+        .unwrap();
+    assert_eq!(t.get(2).unwrap().cpus(), 0);
+    t.check().unwrap();
+}
+
 #[test]
 fn rules_order_and_intersect() {
     let web = rule(Proto::Tcp, [140, 82, 112, 0], 20, 443, 443);

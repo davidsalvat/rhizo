@@ -352,7 +352,9 @@ def highlights(t):
         ("numpy from PyPI wheels", "forked after import numpy", us(NP_WARM),
          [("Rhizo cell", NP_WARM, us(NP_WARM), True),
           ("Linux process", LX_NP_WARM, us(LX_NP_WARM), False)],
-         f"cold: cell {us(NP_COLD)}, Linux {us(LX_NP_COLD)}"),
+         # One unit for both when they share it, so the line fits its card.
+         f"cold: cell {us(NP_COLD).removesuffix(' ' + us(LX_NP_COLD).split()[-1])}, "
+         f"Linux {us(LX_NP_COLD)}"),
         ("50 agents on a laptop", "45 of them suspended", f"{laptop / 1e6:.1f} MB",
          [("shared snapshots", laptop, f"{laptop / 1e6:.1f} MB", True),
           ("full copies (before)", LAPTOP_FULL_COPY, f"{LAPTOP_FULL_COPY / 1e6:.0f} MB",
@@ -445,7 +447,7 @@ STAGES = [
       has("workload.numpy_warm_us"), has("cell.syscall_kpti_ns")], "now",
      (f"{DENSITY:,.0f}", "busy cells in one VM") if DENSITY else None),
     ("Families and modules", "Agents in walled families; abilities added as signed modules",
-     [False], "next", None),
+     [False], "now", None),
     ("The product", "Download a ready agent in two clicks, bring your own model",
      [False], "vision", None),
 ]

@@ -147,6 +147,10 @@ impl Reader<'_> {
 /// one.
 pub fn decode_records(bytes: &[u8]) -> core::result::Result<Vec<Record>, DecodeError> {
     use DecodeError::Corrupt;
+    // Most cells resumed have no socket: an empty list, at once.
+    if bytes == [0; 4] {
+        return Ok(Vec::new());
+    }
     let mut r = Reader(bytes);
     let count = r.u32()? as usize;
     if count > bytes.len() {

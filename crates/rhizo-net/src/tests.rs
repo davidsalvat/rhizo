@@ -409,35 +409,48 @@ fn changes_count_what_waiters_wait_for() {
     assert!(net.changes() > before, "a close");
 }
 
+/// A copy's sockets live in its own network (design D5 of
+/// `add-cell-hierarchy`): its listener is bound again there, a fresh socket
+/// is copied, a connection is reset; the source keeps all of its own, and
+/// no client of one network reaches the other's listener.
 #[test]
-fn forks_share_listeners_and_reset_connections() {
+fn networks_of_copies_bind_listeners_again() {
     let mut net = Net::new();
     let (c, s, l) = connection(&mut net, 12);
-    assert_eq!(net.fork(l), Ok(l), "shared");
+    let copy_l = net.fork(l, 5).unwrap();
+    assert_ne!(copy_l, l, "a listener of its own");
+    assert!(net.is_listening(copy_l));
+    assert_eq!(net.local_addr(copy_l), Ok(Some(inet(LOOPBACK, 12))));
+    assert_eq!(net.network(copy_l), Ok(5));
+    assert_eq!(net.network(l), Ok(0), "the source's is unchanged");
     let fresh = net.socket(Family::Inet, Type::Stream).unwrap();
-    let copy = net.fork(fresh).unwrap();
+    let copy = net.fork(fresh, 5).unwrap();
     assert_ne!(copy, fresh);
     assert_eq!(net.poll(copy), OUT | HUP);
-    let reset = net.fork(s).unwrap();
+    let reset = net.fork(s, 5).unwrap();
     assert_reset_sequence(&mut net, reset);
     net.send(c, b"still", None).unwrap();
     assert_eq!(
         drain(&mut net, s).unwrap(),
         b"still",
-        "the parent keeps its connection"
+        "the source keeps its connection"
     );
+    // A client of the copy's network reaches the copy's listener only.
+    net.enter(Ports::new(5));
+    let c5 = net.socket(Family::Inet, Type::Stream).unwrap();
+    net.leave();
+    net.connect(c5, &inet(LOOPBACK, 12)).unwrap();
+    assert_eq!(net.accept(l), Err(Error::Again), "not the source's");
+    assert!(net.accept(copy_l).is_ok());
+    // Closing the source's listener closes its port, not the copy's.
     net.release(l);
-    let c2 = net.socket(Family::Inet, Type::Stream).unwrap();
-    net.connect(c2, &inet(LOOPBACK, 12)).unwrap();
-    assert!(
-        net.accept(l).is_ok(),
-        "the fork's reference keeps it listening"
-    );
-    net.release(l);
+    let c0 = net.socket(Family::Inet, Type::Stream).unwrap();
     assert_eq!(
-        net.connect(fresh, &inet(LOOPBACK, 12)),
+        net.connect(c0, &inet(LOOPBACK, 12)),
         Err(Error::ConnRefused)
     );
+    assert_eq!(net.connect(copy, &inet(LOOPBACK, 12)), Ok(()));
+    assert!(net.accept(copy_l).is_ok());
 }
 
 #[test]
@@ -465,17 +478,17 @@ fn snapshot_records_park_listeners_and_connections() {
     );
     assert_eq!(net.poll(c) & (ERR | HUP), 0, "the peer sees nothing");
     assert_eq!(net.send(c, b" during", None), Ok(7));
-    let (l2, renamed) = net.import(&rl).unwrap();
+    let (l2, renamed) = net.import(&rl, 0).unwrap();
     assert_eq!((l2, renamed), (l, None), "the same listener");
     assert!(net.options(l2).unwrap().no_delay);
     assert!(net.accept(l2).is_ok(), "the connection made meanwhile");
-    let (s2, _) = net.import(&rs).unwrap();
+    let (s2, _) = net.import(&rs, 0).unwrap();
     assert_eq!(s2, s);
     assert_eq!(drain(&mut net, s2).unwrap(), b"before during");
     assert_eq!(net.send(s2, b"back", None), Ok(4));
     assert_eq!(drain(&mut net, c).unwrap(), b"back", "the same peer");
     assert_eq!(net.peer_addr(s2), net.local_addr(c).map(Option::unwrap));
-    let (taken, _) = net.import(&rl).unwrap();
+    let (taken, _) = net.import(&rl, 0).unwrap();
     assert_ne!(taken, l);
     assert_eq!(
         net.poll(taken) & ERR,
@@ -493,7 +506,7 @@ fn a_listener_not_parked_here_is_bound_again() {
     net.release(l);
     let mut other = Net::new();
     other.set_boot(2);
-    let (l2, _) = other.import(&r).unwrap();
+    let (l2, _) = other.import(&r, 0).unwrap();
     assert!(other.is_listening(l2));
     let c = other.socket(Family::Inet, Type::Stream).unwrap();
     other.connect(c, &inet(LOOPBACK, 19)).unwrap();
@@ -517,9 +530,9 @@ fn a_parked_connection_comes_back_once() {
     let (c, s, _) = connection(&mut net, 14);
     let r = net.export(s).unwrap();
     net.release(s);
-    let (first, _) = net.import(&r).unwrap();
+    let (first, _) = net.import(&r, 0).unwrap();
     assert_eq!(first, s, "the same socket");
-    let (second, _) = net.import(&r).unwrap();
+    let (second, _) = net.import(&r, 0).unwrap();
     assert_ne!(second, s);
     assert_reset_sequence(&mut net, second);
     assert_eq!(net.send(c, b"ok", None), Ok(2));
@@ -538,15 +551,15 @@ fn a_parked_connection_comes_back_only_in_its_boot() {
     };
     let mut other = Net::new();
     other.set_boot(2);
-    let (h, _) = other.import(&r).unwrap();
+    let (h, _) = other.import(&r, 0).unwrap();
     assert_reset_sequence(&mut other, h);
     let elsewhere = Record {
         parked: Some(Park { boot: 2, key }),
         ..r.clone()
     };
-    let (h, _) = net.import(&elsewhere).unwrap();
+    let (h, _) = net.import(&elsewhere, 0).unwrap();
     assert_reset_sequence(&mut net, h);
-    let (back, _) = net.import(&r).unwrap();
+    let (back, _) = net.import(&r, 0).unwrap();
     assert_eq!(back, s, "still parked for its own boot");
     net.send(c, b"x", None).unwrap();
     assert_eq!(drain(&mut net, back).unwrap(), b"x");
@@ -571,7 +584,7 @@ fn a_parked_connection_buffers_up_to_its_bound() {
     }
     assert_eq!(sent, STREAM_BUF);
     assert_eq!(net.poll(c) & OUT, 0);
-    let (s, _) = net.import(&r).unwrap();
+    let (s, _) = net.import(&r, 0).unwrap();
     assert_eq!(drain(&mut net, s).unwrap().len(), STREAM_BUF);
     assert_eq!(net.poll(c) & OUT, OUT);
 }
@@ -584,7 +597,7 @@ fn a_close_while_parked_is_seen_after() {
     net.release(s);
     net.send(c, b"last", None).unwrap();
     net.release(c);
-    let (s, _) = net.import(&r).unwrap();
+    let (s, _) = net.import(&r, 0).unwrap();
     assert_eq!(drain(&mut net, s).unwrap(), b"last");
     assert_eq!(drain(&mut net, s).unwrap(), b"", "end of stream");
     assert_eq!(net.send(s, b"x", None), Err(Error::Pipe));
@@ -599,7 +612,7 @@ fn both_ends_of_a_pair_park_together() {
     net.release(a);
     net.release(b);
     assert_eq!(net.open(), 2, "parked, not closed");
-    let ((a, _), (b, _)) = (net.import(&ra).unwrap(), net.import(&rb).unwrap());
+    let ((a, _), (b, _)) = (net.import(&ra, 0).unwrap(), net.import(&rb, 0).unwrap());
     assert_eq!(drain(&mut net, b).unwrap(), b"to b");
     net.send(b, b"to a", None).unwrap();
     assert_eq!(drain(&mut net, a).unwrap(), b"to a");
@@ -614,7 +627,7 @@ fn unparking_closes_the_connection() {
     net.unpark(&r);
     assert_eq!(drain(&mut net, c).unwrap(), b"", "the peer sees the end");
     net.unpark(&r); // already gone: nothing
-    let (h, _) = net.import(&r).unwrap();
+    let (h, _) = net.import(&r, 0).unwrap();
     assert_reset_sequence(&mut net, h);
     for h in [c, l, h] {
         net.release(h);
@@ -631,18 +644,30 @@ fn imported_unix_names_are_renumbered_unless_parked() {
     net.listen(l, 1).unwrap();
     let r = net.export(l).unwrap();
     net.release(l);
-    let (l2, renamed) = net.import(&r).unwrap();
+    let (l2, renamed) = net.import(&r, 0).unwrap();
     assert_eq!((l2, renamed), (l, Some((name, name))), "parked: kept");
     let mut other = Net::new();
     other.set_boot(1);
     other.new_name();
-    let (l2, renamed) = other.import(&r).unwrap();
+    let (l2, renamed) = other.import(&r, 0).unwrap();
     let (old, new) = renamed.unwrap();
     assert_eq!(old, name);
     assert_ne!(new, name);
     let c = other.socket(Family::Unix, Type::Stream).unwrap();
     assert_eq!(other.connect(c, &unix(new)), Ok(()));
     assert!(other.accept(l2).is_ok());
+}
+
+/// The list of a cell without sockets decodes at once, empty; anything
+/// after it, or a cut one, is still refused.
+#[test]
+fn an_empty_record_list_decodes_alone() {
+    let mut bytes = Vec::new();
+    encode_records(&[], &mut bytes);
+    assert_eq!(bytes, [0; 4]);
+    assert_eq!(decode_records(&bytes), Ok(Vec::new()));
+    assert!(decode_records(&[0, 0, 0, 0, 0]).is_err(), "trailing bytes");
+    assert!(decode_records(&[0, 0, 0]).is_err(), "cut");
 }
 
 #[test]
@@ -826,20 +851,29 @@ fn a_cells_ephemeral_ports_do_not_show_other_cells_binds() {
     assert_ne!(net.first_port(1), before, "the secret decides");
 }
 
-/// A cell's ports skip those in use, its own and other cells' alike.
+/// A network's ports skip its own ports in use, and only those: a port
+/// another network (here the kernel's) holds is free in this one (design D5
+/// of `add-cell-hierarchy`).
 #[test]
-fn a_cells_ephemeral_ports_skip_ports_in_use() {
+fn networks_skip_only_their_own_ports_in_use() {
     let mut net = Net::new();
     net.enter(Ports::new(9));
     let (_, first) = ephemeral_port(&mut net);
     let held = net.leave().unwrap();
     let start = net.first_port(9);
     assert_eq!(first, start);
-    // The kernel holds the port after it.
+    // The kernel holds the ports after it; the cell holds the third.
     let k = net.socket(Family::Inet, Type::Stream).unwrap();
     net.bind(k, &inet(LOOPBACK, start + 1)).unwrap();
     net.enter(held);
-    assert_eq!(ephemeral_port(&mut net).1, start + 2);
+    let mine = net.socket(Family::Inet, Type::Stream).unwrap();
+    net.bind(mine, &inet(LOOPBACK, start + 2)).unwrap();
+    assert_eq!(
+        ephemeral_port(&mut net).1,
+        start + 1,
+        "the kernel's port is free here"
+    );
+    assert_eq!(ephemeral_port(&mut net).1, start + 3, "its own is skipped");
     net.leave();
 }
 
@@ -878,6 +912,24 @@ fn a_change_wakes_only_the_waiters_of_its_socket() {
     );
     net.release(c2);
     assert_eq!(woken(&mut net), [2], "once, for the end of the stream");
+}
+
+/// A cell that woke its own waiters takes them off the woken ones (its
+/// threads run next in its slice); the others stay for the scheduler.
+#[test]
+fn a_cell_takes_its_own_woken_waiters() {
+    let mut net = Net::new();
+    let (c1, s1, _) = connection(&mut net, 23);
+    let (c2, s2, _) = connection(&mut net, 24);
+    wait_on(&mut net, 1, s1);
+    wait_on(&mut net, 2, s2);
+    net.send(c1, b"x", None).unwrap();
+    net.send(c2, b"x", None).unwrap();
+    net.end_call(|| None);
+    assert!(net.take_woken(1));
+    assert!(!net.take_woken(1), "taken once");
+    assert!(!net.take_woken(3), "never woken");
+    assert_eq!(woken(&mut net), [2]);
 }
 
 #[test]
@@ -964,11 +1016,202 @@ fn a_parked_socket_answers_only_its_own_key() {
             parked: Some(Park { key, ..park }),
             ..r.clone()
         };
-        let (h, _) = net.import(&forged).unwrap();
+        let (h, _) = net.import(&forged, 0).unwrap();
         assert_ne!(h, s, "key {key} took the parked socket");
         assert_ne!(h, s2, "key {key} took the parked socket");
         net.release(h);
     }
-    assert_eq!(net.import(&r).unwrap().0, s, "its own record");
-    assert_eq!(net.import(&r2).unwrap().0, s2);
+    assert_eq!(net.import(&r, 0).unwrap().0, s, "its own record");
+    assert_eq!(net.import(&r2, 0).unwrap().0, s2);
+}
+
+/// The socket a call of the cell with network `key` makes.
+fn socket_in(net: &mut Net, key: u32, ty: Type) -> Handle {
+    net.enter(Ports::new(key));
+    let s = net.socket(Family::Inet, ty).unwrap();
+    net.leave();
+    s
+}
+
+/// Hostile (design D5 of `add-cell-hierarchy`, "Separate networks"): a
+/// cell's listener, bound datagram socket and Unix name are not there for
+/// its sibling, which may bind the same port and name itself.
+#[test]
+fn networks_keep_listeners_datagrams_and_names_apart() {
+    let mut net = Net::new();
+    let l = socket_in(&mut net, 1, Type::Stream);
+    net.bind(l, &inet(LOOPBACK, 7300)).unwrap();
+    net.listen(l, 8).unwrap();
+    let c = socket_in(&mut net, 2, Type::Stream);
+    assert_eq!(
+        net.connect(c, &inet(LOOPBACK, 7300)),
+        Err(Error::ConnRefused)
+    );
+    let any = socket_in(&mut net, 2, Type::Stream);
+    assert_eq!(net.connect(any, &inet(ANY, 7300)), Err(Error::ConnRefused));
+    let l2 = socket_in(&mut net, 2, Type::Stream);
+    assert_eq!(net.bind(l2, &inet(LOOPBACK, 7300)), Ok(()), "the same port");
+    net.listen(l2, 8).unwrap();
+    let c2 = socket_in(&mut net, 2, Type::Stream);
+    net.connect(c2, &inet(LOOPBACK, 7300)).unwrap();
+    assert_eq!(net.accept(l), Err(Error::Again), "nothing reached cell 1");
+    assert!(net.accept(l2).is_ok());
+    // Datagrams.
+    let u1 = socket_in(&mut net, 1, Type::Dgram);
+    net.bind(u1, &inet(LOOPBACK, 9000)).unwrap();
+    let u2 = socket_in(&mut net, 2, Type::Dgram);
+    assert_eq!(net.send(u2, b"hi", Some(&inet(LOOPBACK, 9000))), Ok(2));
+    assert_eq!(net.poll(u1) & IN, 0, "not delivered to another network");
+    let mine = socket_in(&mut net, 1, Type::Dgram);
+    assert_eq!(net.send(mine, b"hi", Some(&inet(LOOPBACK, 9000))), Ok(2));
+    assert_eq!(net.poll(u1) & IN, IN, "delivered in its own");
+    // Unix names: the same number names nothing in another network.
+    let name = net.new_name();
+    net.enter(Ports::new(1));
+    let ul = net.socket(Family::Unix, Type::Stream).unwrap();
+    let uc1 = net.socket(Family::Unix, Type::Stream).unwrap();
+    net.leave();
+    net.bind(ul, &unix(name)).unwrap();
+    net.listen(ul, 1).unwrap();
+    net.enter(Ports::new(2));
+    let uc = net.socket(Family::Unix, Type::Stream).unwrap();
+    net.leave();
+    assert_eq!(net.connect(uc, &unix(name)), Err(Error::ConnRefused));
+    assert_eq!(net.connect(uc1, &unix(name)), Ok(()));
+    assert!(net.accept(ul).is_ok());
+}
+
+/// A suspended cell's parked listener and connection come back in the
+/// network of the resumed cell, with the connections waiting on the
+/// listener; its old network has nothing left.
+#[test]
+fn networks_of_resumed_cells_hold_their_parked_sockets() {
+    let mut net = Net::new();
+    let l = socket_in(&mut net, 1, Type::Stream);
+    net.bind(l, &inet(LOOPBACK, 80)).unwrap();
+    net.listen(l, 8).unwrap();
+    let c = socket_in(&mut net, 1, Type::Stream);
+    net.connect(c, &inet(LOOPBACK, 80)).unwrap();
+    let (rl, rc) = (net.export(l).unwrap(), net.export(c).unwrap());
+    net.release(l);
+    net.release(c);
+    let (l2, _) = net.import(&rl, 7).unwrap();
+    let (c2, _) = net.import(&rc, 7).unwrap();
+    assert_eq!((l2, c2), (l, c), "the same sockets");
+    assert_eq!((net.network(l2), net.network(c2)), (Ok(7), Ok(7)));
+    let s = net.accept(l2).unwrap();
+    assert_eq!(net.network(s), Ok(7), "the waiting connection moved too");
+    net.send(c2, b"on", None).unwrap();
+    assert_eq!(drain(&mut net, s).unwrap(), b"on");
+    let old = socket_in(&mut net, 1, Type::Stream);
+    assert_eq!(
+        net.connect(old, &inet(LOOPBACK, 80)),
+        Err(Error::ConnRefused)
+    );
+    let new = socket_in(&mut net, 7, Type::Stream);
+    assert_eq!(net.connect(new, &inet(LOOPBACK, 80)), Ok(()));
+}
+
+/// What one step of [`networks_never_meet`] does.
+#[derive(Debug, Clone)]
+enum NetOp {
+    Listen(u32, u16),
+    Connect(u32, u16),
+    BindUdp(u32, u16),
+    Send(u32, u16),
+    Ephemeral(u32),
+}
+
+fn net_op() -> impl Strategy<Value = NetOp> {
+    let cell = 1..4u32;
+    let port = 7000..7004u16;
+    prop_oneof![
+        (cell.clone(), port.clone()).prop_map(|(c, p)| NetOp::Listen(c, p)),
+        (cell.clone(), port.clone()).prop_map(|(c, p)| NetOp::Connect(c, p)),
+        (cell.clone(), port.clone()).prop_map(|(c, p)| NetOp::BindUdp(c, p)),
+        (cell.clone(), port).prop_map(|(c, p)| NetOp::Send(c, p)),
+        cell.prop_map(NetOp::Ephemeral),
+    ]
+}
+
+/// Whether datagram socket `h` held a datagram (taken).
+fn took_datagram(net: &mut Net, h: Handle) -> bool {
+    net.recv(h, 64, false, &mut |_| true).is_ok()
+}
+
+proptest! {
+    /// Hostile property (design D5 of `add-cell-hierarchy`): whatever three
+    /// cells do on the same ports, each sees what it would see alone: a
+    /// connect reaches a listener of its own network or is refused, a bind
+    /// fails only on its own port, a datagram reaches only its own
+    /// network's socket, and its next ephemeral port depends on its own
+    /// calls only.
+    #[test]
+    fn networks_never_meet(ops in proptest::collection::vec(net_op(), 1..60)) {
+        use alloc::collections::BTreeMap;
+        let mut net = Net::new();
+        net.set_secret([3, 4]);
+        let mut listening: BTreeMap<(u32, u16), Handle> = BTreeMap::new();
+        let mut bound: BTreeMap<(u32, u16), Handle> = BTreeMap::new();
+        let mut ports: BTreeMap<u32, Ports> = BTreeMap::new();
+        for op in ops {
+            let cell = match op {
+                NetOp::Listen(c, _) | NetOp::Connect(c, _) | NetOp::BindUdp(c, _)
+                | NetOp::Send(c, _) | NetOp::Ephemeral(c) => c,
+            };
+            let mine = *ports.entry(cell).or_insert(Ports::new(cell));
+            net.enter(mine);
+            match op {
+                NetOp::Listen(_, port) => {
+                    let l = net.socket(Family::Inet, Type::Stream).unwrap();
+                    let taken = listening.contains_key(&(cell, port));
+                    let r = net.bind(l, &inet(LOOPBACK, port));
+                    prop_assert_eq!(r.is_err(), taken, "bind {}:{}", cell, port);
+                    if r.is_ok() {
+                        net.listen(l, 64).unwrap();
+                        listening.insert((cell, port), l);
+                    }
+                }
+                NetOp::Connect(_, port) => {
+                    let c = net.socket(Family::Inet, Type::Stream).unwrap();
+                    let r = net.connect(c, &inet(LOOPBACK, port));
+                    match listening.get(&(cell, port)) {
+                        Some(&l) => {
+                            prop_assert_eq!(r, Ok(()));
+                            let s = net.accept(l).unwrap();
+                            prop_assert_eq!(net.network(s), Ok(cell));
+                        }
+                        None => prop_assert_eq!(r, Err(Error::ConnRefused)),
+                    }
+                    for &l in listening.values() {
+                        prop_assert_eq!(net.accept(l), Err(Error::Again), "nobody else's");
+                    }
+                }
+                NetOp::BindUdp(_, port) => {
+                    let u = net.socket(Family::Inet, Type::Dgram).unwrap();
+                    let taken = bound.contains_key(&(cell, port));
+                    prop_assert_eq!(net.bind(u, &inet(LOOPBACK, port)).is_err(), taken);
+                    bound.entry((cell, port)).or_insert(u);
+                }
+                NetOp::Send(_, port) => {
+                    let u = net.socket(Family::Inet, Type::Dgram).unwrap();
+                    net.send(u, b"d", Some(&inet(LOOPBACK, port))).unwrap();
+                    for (&(owner, at), &b) in &bound {
+                        let got = took_datagram(&mut net, b);
+                        prop_assert_eq!(got, owner == cell && at == port, "{}:{}", owner, at);
+                    }
+                }
+                NetOp::Ephemeral(_) => {
+                    // Its own ports in the range are all behind its next
+                    // one, the fixed ones below the range.
+                    let want = match mine.next {
+                        0 => net.first_port(cell),
+                        next => next,
+                    };
+                    prop_assert_eq!(ephemeral_port(&mut net).1, want);
+                }
+            }
+            ports.insert(cell, net.leave().unwrap());
+        }
+    }
 }
