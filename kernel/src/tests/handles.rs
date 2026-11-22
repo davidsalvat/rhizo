@@ -137,6 +137,9 @@ fn observe_and_input() {
 fn revoked_handles_refuse() {
     let mut host = Host::new();
     let target = spawn(&mut host, "idle", &[]);
+    // Its only output comes before the watcher exists, so the stream the
+    // watcher opens carries none, on any number of CPUs.
+    host.run(|h| h.output(target).is_some_and(|o| o == b"idle\n"));
     let watcher = handles(&mut host, no_files(), &[b"observe", b"t"]);
     let g = host
         .grant(Actor::Host, watcher, target, Rights::OBSERVE, b"t")
