@@ -1019,6 +1019,9 @@ In the kernel, on both architectures, with the colluder cells of
   yields. The receiver's and its children's outputs are byte for byte
   the same, the senders made rounds during the probe, and after the
   hostile rounds every frame comes back.
+- `reserved_probe_beside_an_unlimited_hog`: the receiver's probe, in a
+  reserved root of 12 MiB, prints the same alone and beside a cell
+  without a limit that took every frame it could (finding S30).
 - `colluders_on_loopback`: a listener on TCP and UDP port 7500 of every
   address and on a Unix socket; a knocker of another domain with egress
   `full` gets `ECONNREFUSED` on 127.0.0.1:7500, its datagram goes
@@ -1057,8 +1060,8 @@ by `cap_quota`), which makes it a reserved root admitted like any other:
 it can never set aside more than the kernel has, and the host chooses
 what to load.
 
-**S30. Another domain could make a reserved cell's files and sockets fail
-(Medium, both).** Kernel memory a cell's calls take (a file name, a new
+**S30. Another domain could make a reserved cell fail, or a cell pass its limit
+(High, both).** Kernel memory a cell's calls take (a file name, a new
 file block, a socket, a thread record, a received descriptor) was counted
 against its limit and then also asked of the kernel's memory outside every
 reservation, and so was a write into a block the cell already held and a
@@ -1073,11 +1076,40 @@ not create a file while the sender's domain mapped its file pages: the
 receiver's output differed from its run alone. *Fix:* for a cell with a
 memory limit, what its meter counts is its own, set aside within its
 limit, and the kernel is asked only for cells without one
-(`Context::has_counted` in `rhizo-abi`); the kernel's own reserve absorbs
-the rounding of each cell's count to whole frames. Pipe buffers, which no
-limit counts yet, still ask the kernel (O9). *Tests:*
-`a_reserved_cell_stores_within_its_limit_when_the_kernel_is_short`
-(`rhizo-abi`), `differential_colluders`.
+(`Context::has_counted` in `rhizo-abi`). Pipe buffers, which no limit
+counts yet, still ask the kernel (O9).
+
+Two more holes of the same kind showed once the test put a cell without a
+limit, holding every frame it could take, beside the probe (and on Cloud
+Hypervisor with 4 CPUs, where the receiver's run alone could not take any
+of its memory in its second round):
+
+- *Frames a reservation counts could be gone.* A reserved cell's frames
+  came from the free frames beyond the kernel's own reserve and every
+  reservation. But the kernel heap draws on that reserve for what no meter
+  counts (cell output, the kernel's tables, each meter's rounding to whole
+  frames), so once cells without a limit had taken the rest, a reserved
+  cell was refused frames its limit had set aside. *Fix:* a meter with a
+  limit asks for its frames as set aside (`Frames::alloc_set_aside`), and
+  the kernel serves them from its own reserve once nothing else is left
+  (`memory::alloc_set_aside`), keeping only what other domains hold.
+- *Unmapping a cached file page credited the cell.* A cell's meter
+  credited every frame reference it gave back, including references to
+  the kernel's page-cache frames it had mapped without being charged. A
+  cell mapping and unmapping a file page lowered its count every time, so
+  it could hold more than its limit; and whether its map was a cached page
+  (credited, never charged) or a copy of its own (charged, then credited)
+  depended on whether the cache had room, so on other domains: the probe's
+  `sysinfo` and the memory it could take differed beside the hog. *Fix:*
+  giving back a reference to a frame the kernel keeps credits nothing
+  (`Frames::release`; the kernel marks the frames its page cache keeps
+  beside their reference counts).
+
+*Tests:* `a_reserved_cell_stores_within_its_limit_when_the_kernel_is_short`
+(`rhizo-abi`), `references_to_kept_frames_credit_nothing` (`rhizo-cell`),
+`reserved_probe_beside_an_unlimited_hog` and `differential_colluders` (in
+the kernel; the hog test failed before both kernel fixes, at the probe's
+file mapping and then on its `sysinfo`).
 
 ## The control channel over vsock (B7, B8)
 
@@ -1401,7 +1433,8 @@ review:
   named under each finding.
 - Colluding cells (`add-cell-hierarchy` phase 1, S29, S30), in the kernel
   with `colluder` (`kernel/src/tests/collusion.rs`):
-  `differential_colluders`, `colluders_on_loopback`,
+  `differential_colluders`, `reserved_probe_beside_an_unlimited_hog`,
+  `colluders_on_loopback`,
   `fork_bomb_in_a_subtree`, `forged_snapshot_authority`; with the tests
   named in the inventory's last column.
 - The control channel over vsock (S27, S28), on the host in

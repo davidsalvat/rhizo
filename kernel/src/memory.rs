@@ -327,6 +327,27 @@ pub fn alloc_for_cell(count: usize) -> Option<u64> {
     .flatten()
 }
 
+/// Allocates `count` contiguous frames that a reserved cell's meter took
+/// out of what is set aside for it (design D4 of `add-cell-hierarchy`),
+/// keeping only what is set aside for the other reserved domains. The
+/// kernel's own reserve may serve them: the kernel heap draws on that
+/// reserve for what no meter counts (a cell's output, the kernel's tables,
+/// the rounding of each meter to whole frames), and those frames are not
+/// the reserved cell's to lose (finding S30 in `docs/security.md`).
+#[cfg(feature = "cells")]
+pub fn alloc_set_aside(count: usize) -> Option<u64> {
+    with_frames(|f| {
+        if (f.free_frames() as u64) < RESERVE.frames() + count as u64 {
+            return None;
+        }
+        match count {
+            1 => f.alloc(),
+            _ => f.alloc_large(),
+        }
+    })
+    .flatten()
+}
+
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "used by in-kernel tests; cells use it from H2")

@@ -11,6 +11,7 @@ use rhizo_cell::quota::Quota;
 /// This area's tests, in execution order.
 pub(super) const ALL: &[TestCase] = &[
     ktest_case!(differential_colluders, 60),
+    ktest_case!(reserved_probe_beside_an_unlimited_hog),
     ktest_case!(colluders_on_loopback),
     ktest_case!(fork_bomb_in_a_subtree),
     ktest_case!(forged_snapshot_authority),
@@ -172,6 +173,41 @@ fn differential_colluders() {
     }
     assert_eq!(crate::cell::open_sockets(), 0);
     assert_eq!(memory_balance().0, before, "every frame came back");
+}
+
+/// The receiver's probe of `differential_colluders`, alone in its reserved
+/// domain (12 MiB, 16 sockets, no children, no card), woken once `beside`
+/// has run; its output.
+fn probe(host: &mut Host, beside: impl FnOnce(&mut Host)) -> String {
+    let receiver = spawn(host, "colluder", &[b"probe"]);
+    assert!(host.set_quota(receiver, reserved(12, 16)));
+    until_said(host, receiver, b"ready\n");
+    beside(host);
+    assert!(host.wake(receiver));
+    host.run(|h| h.finished(receiver).is_some());
+    let (ending, out) = ended(host, receiver);
+    assert_eq!(ending, Ending::Exit(0), "{out}");
+    out
+}
+
+/// Hostile (spec `cell-hierarchy`, "Unlimited neighbour"; finding S30): the
+/// probe of a reserved root prints the same beside a cell without a limit
+/// that took every frame it could. In particular its second round takes
+/// all its memory again after it wrote a file to its limit and deleted it:
+/// the kernel heap kept the pages of those blocks until it trimmed, which
+/// left the reserved root without the frames its limit set aside.
+fn reserved_probe_beside_an_unlimited_hog() {
+    let mut host = Host::new();
+    let alone = probe(&mut host, |_| {});
+    let mut hog = 0;
+    let beside = probe(&mut host, |host| {
+        hog = spawn(host, "hog", &[b"hold"]);
+        until_said(host, hog, b"exhausted\n");
+    });
+    assert_eq!(alone, beside, "the probe saw its neighbour");
+    assert!(alone.contains("memory mib=11"), "{alone}");
+    assert!(host.kill(hog));
+    host.run(|_| false);
 }
 
 /// Hostile (spec `networking`, "Echo between two cells", design D5): a

@@ -356,7 +356,13 @@ exhaust: a reserved cell's file names, blocks, sockets and threads failed
 under another domain's pressure, which `differential_colluders` showed on
 four CPUs. For a cell with a memory limit, what its meter counts is now
 its own (`Context::has_counted` in `rhizo-abi`); only a cell without one
-asks the kernel, as do pipe buffers, which no limit counts yet.
+asks the kernel, as do pipe buffers, which no limit counts yet. Two
+neighbours of it: a reserved cell's frames now come from the kernel's own
+reserve once nothing else is left (`Frames::alloc_set_aside`), since the
+kernel heap draws on that reserve for what no meter counts; and giving back
+a reference to a page-cache frame credits the cell nothing
+(`Frames::release`), where mapping and unmapping one lowered its count
+every time.
 
 ## D5. Loopback networks
 

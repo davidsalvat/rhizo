@@ -411,6 +411,8 @@ pub mod testing {
         /// Kernel memory counted by [`Frames::charge`], and its limit.
         pub kernel: u64,
         pub kernel_limit: u64,
+        /// Frames the kernel keeps for itself: [`Frames::credits`] says no.
+        pub kept: Vec<u64>,
     }
 
     /// Builds an ELF file of `kind` (2: executable, 3: shared object) with
@@ -475,6 +477,7 @@ pub mod testing {
                 metered: None,
                 kernel: 0,
                 kernel_limit: u64::MAX,
+                kept: Vec::new(),
             }
         }
 
@@ -540,6 +543,12 @@ pub mod testing {
 
         fn is_shared(&self, phys: u64) -> bool {
             self.live.get(&phys).is_some_and(|e| e.1 > 1)
+        }
+
+        fn release(&mut self, phys: u64, size: PageSize) -> bool {
+            let kept = self.kept.contains(&phys) && self.is_shared(phys);
+            self.free(phys, size);
+            !kept
         }
 
         fn try_share(&mut self, phys: u64) -> bool {

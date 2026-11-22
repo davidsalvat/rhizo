@@ -262,21 +262,37 @@ impl<A: Frames> Metered<'_, A> {
 }
 
 impl<A: Frames> Frames for Metered<'_, A> {
+    /// A meter with a limit takes frames its limit set aside: the source
+    /// serves them even from a reserve of its own (finding S30 in
+    /// `docs/security.md`).
     #[inline(always)]
     fn alloc(&mut self) -> Option<u64> {
-        self.take(1, A::alloc)
+        let set_aside = self.meter.limit() < Quota::NONE.frames();
+        self.take(1, |f| match set_aside {
+            true => f.alloc_set_aside(),
+            false => f.alloc(),
+        })
     }
 
     #[inline(always)]
     fn alloc_large(&mut self) -> Option<u64> {
-        self.take(PageSize::Large.bytes() / FRAME_SIZE, A::alloc_large)
+        let set_aside = self.meter.limit() < Quota::NONE.frames();
+        self.take(PageSize::Large.bytes() / FRAME_SIZE, |f| match set_aside {
+            true => f.alloc_large_set_aside(),
+            false => f.alloc_large(),
+        })
     }
 
+    /// A reference to a frame the kernel keeps (a page of its page cache)
+    /// was never counted for the cell, so giving it back credits nothing:
+    /// a cell mapping and unmapping such a page lowered its count every
+    /// time, below what it held (finding S30 in `docs/security.md`).
     #[inline(always)]
     fn free(&mut self, phys: u64, size: PageSize) {
-        self.frames.free(phys, size);
-        let count = size.bytes() / FRAME_SIZE;
-        self.meter.set_used(self.meter.used().saturating_sub(count));
+        if self.frames.release(phys, size) {
+            let count = size.bytes() / FRAME_SIZE;
+            self.meter.set_used(self.meter.used().saturating_sub(count));
+        }
     }
 
     #[inline(always)]
@@ -312,6 +328,33 @@ mod tests {
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Finding S30: a reference to a frame the kernel keeps (a page of
+    /// its cache that the cell mapped) credits nothing when given back,
+    /// however often; the cell's own frames and shared ones do.
+    #[test]
+    fn references_to_kept_frames_credit_nothing() {
+        let _serial = serial();
+        let used = Meter::new(0, 8);
+        let mut m = Metered {
+            frames: CountingFrames::new(64),
+            meter: &used,
+        };
+        let own = m.alloc().expect("within quota");
+        let kept = m.frames.alloc().expect("the kernel's");
+        m.frames.kept.push(kept);
+        for _ in 0..3 {
+            m.share(kept); // mapped by the cell
+            m.free(kept, PageSize::Small); // and unmapped
+        }
+        assert_eq!(used.used(), 1, "only its own frame is counted");
+        let shared = m.alloc().expect("within quota");
+        m.share(shared); // a fork's copy holds it too
+        m.free(shared, PageSize::Small);
+        assert_eq!(used.used(), 1, "a shared frame of its own credits");
+        m.free(own, PageSize::Small);
+        assert_eq!(used.used(), 0);
     }
 
     #[test]

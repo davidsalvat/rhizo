@@ -136,7 +136,7 @@ impl Frames for ImageFrames {
     }
 
     fn free(&mut self, phys: u64, size: PageSize) {
-        KernelFrames.free(phys, size);
+        unkeep(phys, size);
     }
 
     fn share(&mut self, phys: u64) {

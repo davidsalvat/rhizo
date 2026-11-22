@@ -271,13 +271,15 @@ extern "C" fn thread(i: usize) -> usize {
     0
 }
 
-/// Four threads started and joined; the identifiers they saw.
-fn threads() -> [u32; 4] {
+/// Four threads started and joined; the identifiers they saw. Unless
+/// `must`, a thread its memory limit refuses is left out.
+fn threads(must: bool) -> [u32; 4] {
     for (i, tid) in TIDS.iter().enumerate() {
         // SAFETY: only the address is taken; each stack serves one thread,
         // joined before the next round.
         let top = unsafe { core::ptr::addr_of_mut!(STACKS.0[i]) as usize } + (16 << 10);
-        check(spawn_thread(thread, i, top, 0, tid) > 0, "clone");
+        let started = spawn_thread(thread, i, top, 0, tid) > 0;
+        check(started || !must, "clone");
     }
     for tid in &TIDS {
         join(tid);
@@ -317,7 +319,7 @@ fn probe_once(outside: Option<[u8; 16]>) {
     print(b"\n");
     print_sysinfo();
     print(b"threads");
-    for tid in threads() {
+    for tid in threads(true) {
         field(b"tid", tid.into());
     }
     print(b"\n");
@@ -537,7 +539,7 @@ fn send(outside: Option<[u8; 16]>) -> ! {
             viewed += 1;
         }
         sysinfo();
-        threads();
+        threads(false);
         if round == 0 {
             print(b"sending\n");
         } else {
