@@ -201,8 +201,10 @@ impl Lazy {
     }
 
     /// Restores every page still pending, counting them in `meter` (beyond
-    /// the quota if need be: they were the cell's already).
-    pub(super) fn finish(&mut self, pt: &PageTable<Format>, meter: &Meter) {
+    /// the quota if need be: they were the cell's already); returns whether
+    /// none is left. Short of frames, those it could not restore stay
+    /// pending: dropped, they would read as zeros.
+    pub(super) fn finish(&mut self, pt: &PageTable<Format>, meter: &Meter) -> bool {
         let limit = meter.limit();
         meter.set_limit(u64::MAX);
         for i in 0..self.pending.len() {
@@ -212,5 +214,6 @@ impl Lazy {
             }
         }
         meter.set_limit(limit);
+        self.left == 0
     }
 }

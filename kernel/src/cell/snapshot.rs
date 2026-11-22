@@ -33,8 +33,11 @@ impl Host {
             return None;
         }
         let pt = PageTable::<Format>::from_root(live.cell.root);
-        if let Some(lazy) = live.demand.lazy.as_mut() {
-            lazy.finish(&pt, &live.frames);
+        if let Some(lazy) = live.demand.lazy.as_mut()
+            && !lazy.finish(&pt, &live.frames)
+        {
+            self.requeue(live, wake);
+            return None;
         }
         sync_fp(&mut live, true);
         let (files, sockets) = export_sockets(&live.fs);
@@ -167,7 +170,8 @@ impl Host {
         let wx = snapshot.wx();
         let used = Meter::new(1, u64::MAX); // the root
         if mode == Resume::Eager {
-            lazy.finish(&pt, &used);
+            // Short of frames, what is left stays pending, restored lazily.
+            let _ = lazy.finish(&pt, &used);
         }
         let mut live = self.new_live(cell, capture, echo, fs);
         live.frames.set_used(used.used());
@@ -188,8 +192,13 @@ impl Host {
         let _p = cost::scope(Part::Spawn);
         let (mut parent, wake) = self.take_cell(id)?;
         let pt = PageTable::<Format>::from_root(parent.cell.root);
-        if let Some(lazy) = parent.demand.lazy.as_mut() {
-            lazy.finish(&pt, &parent.frames);
+        // Pages still pending from a lazy resume come back first; short of
+        // frames, no copy is made and the cell keeps the rest pending.
+        if let Some(lazy) = parent.demand.lazy.as_mut()
+            && !lazy.finish(&pt, &parent.frames)
+        {
+            self.requeue(parent, wake);
+            return None;
         }
         parent.demand.lazy = None;
         sync_fp(&mut parent, false);
@@ -306,12 +315,15 @@ impl Host {
     )]
     pub fn freeze(&mut self, id: u32) -> bool {
         let _p = cost::scope(Part::Spawn);
-        let Some((mut live, _)) = self.take_cell(id) else {
+        let Some((mut live, wake)) = self.take_cell(id) else {
             return false;
         };
         let pt = PageTable::<Format>::from_root(live.cell.root);
-        if let Some(lazy) = live.demand.lazy.as_mut() {
-            lazy.finish(&pt, &live.frames);
+        if let Some(lazy) = live.demand.lazy.as_mut()
+            && !lazy.finish(&pt, &live.frames)
+        {
+            self.requeue(live, wake);
+            return false;
         }
         sync_fp(&mut live, true);
         user::release_user(live.cell.root, live.tag);

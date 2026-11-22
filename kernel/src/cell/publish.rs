@@ -179,8 +179,11 @@ impl Host {
             return true; // suspended, or gone
         };
         let old = PageTable::<Format>::from_root(live.cell.root);
-        if let Some(lazy) = live.demand.lazy.as_mut() {
-            lazy.finish(&old, &live.frames);
+        if let Some(lazy) = live.demand.lazy.as_mut()
+            && !lazy.finish(&old, &live.frames)
+        {
+            self.requeue(live, wake);
+            return false;
         }
         live.demand.lazy = None;
         if !shares_private(&old, live.shares, &mut public) {
