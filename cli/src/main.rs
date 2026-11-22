@@ -8,6 +8,7 @@
 
 mod agent;
 mod args;
+mod audit;
 mod chat;
 mod client;
 mod pin;
@@ -37,6 +38,8 @@ fn main() -> ExitCode {
             Command::Up(up) => cmd_up(&dir, &up),
             Command::Serve(up) => serve::serve(&dir, &up),
             Command::Down => cmd_down(&dir),
+            Command::AuditTail { filter, follow } => audit_tail(&dir, &filter, follow),
+            Command::AuditVerify => audit_verify(&dir),
             Command::SnapshotUpgrade { input, output } => snapshot_upgrade(&input, &output),
             Command::Run(run) if run.template == "python-agent" => {
                 agent::run(&mut Client::connect(&dir)?, &run)
@@ -124,6 +127,50 @@ fn main() -> ExitCode {
             eprintln!("rhizo: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `rhizo audit tail`: the records of the log, then, with `follow`, new
+/// ones as the background server appends them.
+fn audit_tail(dir: &Dir, filter: &audit::Filter, follow: bool) -> Result<(), String> {
+    let log = audit::dir(&dir.0);
+    let mut from = 0;
+    loop {
+        let (shown, lines) = audit::tail(&log, filter, from)?;
+        for line in shown {
+            println!("{line}");
+        }
+        if !follow {
+            return Ok(());
+        }
+        from = lines;
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `rhizo audit verify`: fails if the chain is broken anywhere.
+fn audit_verify(dir: &Dir) -> Result<(), String> {
+    let log = audit::dir(&dir.0);
+    let report = audit::verify(&log)?;
+    for problem in &report.problems {
+        println!("{problem}");
+    }
+    if report.dropped > 0 {
+        println!(
+            "the kernel dropped {} records, its ring being full (the host read too slowly)",
+            report.dropped
+        );
+    }
+    match report.problems.len() {
+        0 => {
+            println!(
+                "{} records, chain intact ({})",
+                report.records,
+                log.display()
+            );
+            Ok(())
+        }
+        n => Err(format!("{n} problems in the audit log ({})", log.display())),
     }
 }
 

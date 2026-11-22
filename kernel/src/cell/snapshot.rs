@@ -342,14 +342,33 @@ impl Host {
     /// other domains (design D22 of `add-cell-hierarchy`): not if the cell
     /// it was made of reached the network card, unless the host attests
     /// (`attested`) that it holds no secret. `None` if there is no such
-    /// template. Publishing itself and the audit record of an attestation
-    /// come with tasks 1.8a and 1.9b.
+    /// template. A refusal, and a publication on the host's word, are
+    /// audited (design D18). Publishing itself comes with task 1.8a.
     #[cfg_attr(
         not(feature = "ktest"),
         allow(dead_code, reason = "publishing comes with task 1.8a")
     )]
     pub fn may_publish(&self, id: u32, attested: bool) -> Option<bool> {
         let (cell, ..) = self.templates.iter().find(|(c, ..)| c.id == id)?;
+        if cell.exposed {
+            let domain = self.tree.root_of(id).unwrap_or(0);
+            if attested {
+                crate::audit::record(
+                    crate::audit::Kind::Attested,
+                    id,
+                    domain,
+                    b"published on the host's word that it holds no secret: it reached the \
+                      network card",
+                );
+            } else {
+                crate::audit::deny(
+                    crate::audit::Kind::Publish,
+                    id,
+                    domain,
+                    b"it reached the network card: publishing it needs the host's attestation",
+                );
+            }
+        }
         Some(attested || !cell.exposed)
     }
 

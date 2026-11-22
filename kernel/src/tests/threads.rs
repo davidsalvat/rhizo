@@ -11,6 +11,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(threaded_cell_survives_suspend_and_resume, 95),
     ktest_case!(forks_of_a_threaded_cell_run_all_threads),
     ktest_case!(template_of_a_threaded_program),
+    ktest_case!(a_threaded_pause_is_seen_next_to_busy_cells),
 ];
 
 /// Raw `clone` and futexes (`threads`) and glibc's pthreads, mutexes and
@@ -171,4 +172,26 @@ fn template_of_a_threaded_program() {
     for id in ids {
         assert_eq!(ended(&host, id), (Ending::Exit(0), after_ready.into()));
     }
+}
+
+/// A threaded template pauses after its line while three other cells use
+/// every slice they get (change `fix-node-pause`): the thread it wakes at
+/// the line yields four times before it waits, and the host still sees
+/// every thread wait before the 20 ms sleep after the line ends. A copy
+/// of the template starts at that pause.
+fn a_threaded_pause_is_seen_next_to_busy_cells() {
+    let mut host = Host::new();
+    let busy: Vec<u32> = (0..3).map(|_| spawn(&mut host, "spin", &[])).collect();
+    let template = spawn(&mut host, "threads", &[b"pause"]);
+    host.run_to_pause(template, b"ready", Pause::Waits)
+        .unwrap_or_else(|why| panic!("{why}"));
+    assert!(host.freeze(template));
+    let copy = host
+        .spawn_from_template(template, true, false)
+        .expect("copy");
+    for id in busy {
+        assert!(host.kill(id));
+    }
+    host.run(|h| h.finished(copy).is_some());
+    assert_eq!(ended(&host, copy), (Ending::Exit(0), "done\n".into()));
 }

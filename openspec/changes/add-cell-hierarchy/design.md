@@ -1082,8 +1082,9 @@ domain by domain.
   machine has, no other root's CPU, and a shared CPU left beside CPU 0) is
   checked by `Host::place` for a root (protocol version 4, `run`, `load`
   and `fork` with `--cpus`): a refused set is `Invalid`, and the request
-  changes nothing. On fewer than three CPUs no set fits. The audit record
-  of a refused set is left to task 1.9b (a marked call site in `place`).
+  changes nothing. On fewer than three CPUs no set fits. The control
+  kernel audits the refusal as a tree denial, as every refused tree
+  request (task 1.9b).
 - **Re-parenting.** A root moved under a parent leaves its set
   (`rhizo_cap::Tree::reparent`, through `narrowed`): its subtree runs on
   the new domain's CPUs, and gets no set back if it is made a root again.
@@ -1199,6 +1200,67 @@ channel.
 **Limits.** The hash chain shows tampering. It cannot prevent a host
 administrator from deleting the whole log, which is why forwarding is
 recommended for production.
+
+**As built in phase 1 (task 1.9b).**
+
+- The record and its ring are in `rhizo-control` (`audit`), so the host
+  tests them: a record is its sequence number, the kernel's time, a kind,
+  the cell and the root of its domain, a count, the records dropped
+  before it and a detail for people (at most 200 bytes). The ring is one
+  `VecDeque` of 64 KiB of encoded records, allocated at the first record
+  and never grown; time is passed in. The kernel keeps one ring for all
+  CPUs behind a `Global` (`kernel/src/audit.rs`), and records cells by
+  kernel identifier; the control kernel gives the host's identifiers, and
+  the domain's root where the record did not name it, when it sends.
+- Records leave as `audit` frames of version 4 (kind `0x85`, identifier
+  0), which D14 lists; no request was needed: the control kernel sends
+  what the ring holds after each turn of its loop, and its idle loop wakes
+  for it. A frame of version 3 of that kind is refused.
+- Every record takes a sequence number, dropped ones too, so the host sees
+  a gap as well as the next record's drop count. Denials (egress, scope,
+  tree, load narrowed, publish refused) fold per cell, kind and second:
+  the first goes in at once, and once that second is over one more record
+  carries the count of the others and the first one's detail; so the
+  counts of a cell's records add up to its denials. At most 8 cells fold
+  at once; a ninth flushes the oldest early.
+- Recorded in phase 1: cells the host made (`run`, `fork`, `load`, with
+  their placement) and their ends; moves, policies and limits; requests of
+  scoped clients, let through or refused, with the scope; tree refusals
+  (`Denied`, `Invalid`); a load whose quota was cut; a publication refused
+  or made on the host's attestation (`Host::may_publish`); a vsock
+  connection to the control channel refused for want of the secret
+  (`auth-refused`, change `authenticate-control-channel`). Egress denials
+  come with task 1.6 through `audit::deny(Kind::Egress, cell, domain,
+  detail)`; grants with phase 2.
+- On the host the files are `audit/audit-<n>.jsonl` (`n` counting up from
+  0, so names sort in order), a new one at each `rhizo up` and at 64 MiB.
+  Each file's first line names its boot and the file before; each line's
+  `prev` is the SHA-256 of the line before, the first file's first line
+  after 32 zero bytes. `audit/head` holds the last line's file and hash,
+  so a cut end or an edited last line shows as well. `rhizo down` keeps
+  `audit/` (spec `control-plane`, state after down).
+- SHA-256 is written out in `rhizo` (about 60 lines) rather than taken
+  from a crate, which would add seven crates to the binary for one
+  function. Tests check it against the FIPS 180-4 vectors, and against
+  RustCrypto's `sha2` (MIT OR Apache-2.0, a dev-dependency only) at every
+  padding boundary (0, 55, 56, 63, 64, 65, 119, 120, 128 bytes) and on
+  arbitrary inputs up to 1,000 bytes. The JSON lines use `serde_json`,
+  already in the workspace through `xtask`.
+- What `verify` proves, and what it does not. The chain is unkeyed: it
+  detects an edit, removal or reordering of part of the log by someone
+  who does not rewrite everything after it. Anyone with write access to
+  the state directory can rewrite the whole chain from the edited line
+  on, and `audit/head`, and `verify` then passes. What it cannot hide
+  while a VM runs: the kernel's sequence numbers and drop counts, so
+  records missing from a live session show as a gap unless the rest of
+  that session is rewritten too. A possible later mitigation, not built:
+  export `head` (or each file's last hash) to a sink outside the host's
+  reach, or sign it with a key kept outside the state directory.
+  `docs/security.md` (audit log) says the same.
+- `rhizo audit tail [--cell N] [--domain N] [--kind K] [--follow]` shows
+  records, `--follow` then polls for new lines; `rhizo audit verify`
+  names each edited, removed or reordered line, each gap in sequence
+  numbers, and the kernel's drop counts, and fails on any break.
 
 Alternative: keep the log in the kernel and let the host read it.
 Rejected: kernel memory is bounded, and the log must outlive the VM.

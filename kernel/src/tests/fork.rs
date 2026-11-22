@@ -119,7 +119,7 @@ fn copies_report() -> (alloc::string::String, Vec<alloc::string::String>) {
     let ready = |host: &mut Host| {
         let id = spawn(host, "copies", &[]);
         host.run_to_pause(id, b"ready", Pause::Waits)
-            .unwrap_or_else(|why| panic!("{why}: {:?}", ended(host, id)));
+            .unwrap_or_else(|why| panic!("{why}"));
         id
     };
     let mut host = Host::new();
@@ -236,10 +236,23 @@ fn tainted_template_not_published() {
         host.step();
     }
     let child = host.fork(id, 1).expect("fork")[0];
+    // Records of earlier tests out of the way: nothing empties the ring
+    // in a test build.
+    while crate::audit::take().is_some() {}
     for template in [id, child] {
         assert!(host.freeze(template));
         assert_eq!(host.may_publish(template, false), Some(false), "refused");
         assert_eq!(host.may_publish(template, true), Some(true), "attested");
+        // Both audited (design D18), naming the template and its domain.
+        let domain = host.tree().root_of(template).expect("in the tree");
+        for kind in [crate::audit::Kind::Publish, crate::audit::Kind::Attested] {
+            let r = crate::audit::take().expect("an audit record");
+            assert_eq!(
+                (r.kind, r.cell, r.domain),
+                (kind, template, domain),
+                "{r:?}"
+            );
+        }
     }
 }
 
@@ -256,7 +269,7 @@ fn loads_of_a_copied_template_see_new_generations() {
     assert!(host.freeze(first));
     let copy = host.spawn_from_template(first, true, false).expect("copy");
     host.run_to_pause(copy, b"ready", Pause::Waits)
-        .unwrap_or_else(|why| panic!("{why}: {:?}", ended(&host, copy)));
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(host.freeze(copy));
     let crc = crate::arch::mem::crc32c;
     let bytes = host

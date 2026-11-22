@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       failed: ${{ steps.failed.outputs.metrics }}
+      runner: ${{ steps.failed.outputs.runner }}
     env:
       # Downloads and packs the pinned Node.js build (xtask/src/tools.rs)
       # and runs its tests and benchmarks (change `add-node-workload`).
@@ -71,6 +72,12 @@ jobs:
         run: |
           metrics=$(grep -oE 'benchmark (regression|not measured): [^ ]+' bench.log 2>/dev/null | sed 's/^benchmark //' | sort -u | head -40 | tr '\n' ';' || true)
           echo "metrics=${metrics:-the job failed before the gate (see the run)}" >> "$GITHUB_OUTPUT"
+          # The runner class (change `bench-runner-class`): what the gate
+          # compared the timings with, and the machine's identity.
+          # shellcheck disable=SC2016 # backticks in the pattern are literal
+          compared=$(grep -m1 -oE '(unknown runner class: .*|runner class `[^`]*`: .*)' bench.log 2>/dev/null || true)
+          machine=$(jq -r '.runner // empty | "class `\(.class)` (\(.model_name); family \(.cpu_family) model \(.model) stepping \(.stepping) microcode \(.microcode); \(.cores) CPUs; KVM: \(.kvm); guest PMU: \(if .guest_pmu == null then "unknown" else .guest_pmu end); TSC: \(if .tsc_mhz then "\(.tsc_mhz) MHz" else "unknown" end))"' bench-results.json 2>/dev/null || true)
+          echo "runner=${machine:-not recorded}${compared:+; $compared}" >> "$GITHUB_OUTPUT"
 
       - name: Save the CPython build
         # Also when a later check failed: the build itself is done once its
@@ -118,7 +125,25 @@ jobs:
             sed -n '30,39p' bench-pieces.txt | while IFS= read -r line; do
               echo "::notice title=bench-results-${line%% *}::${line#* }"
             done
-            [ "$(wc -l < bench-pieces.txt)" -le 39 ] || echo "::warning title=bench-results::more than 39 pieces; add a publishing step"
+          fi
+      - name: Publish results (pieces 40 to 49)
+        # The `runner` object comes after `metrics` in the compact JSON,
+        # and main's results already reached 40 pieces.
+        if: always()
+        run: |
+          if [ -f bench-pieces.txt ]; then
+            sed -n '40,49p' bench-pieces.txt | while IFS= read -r line; do
+              echo "::notice title=bench-results-${line%% *}::${line#* }"
+            done
+            [ "$(wc -l < bench-pieces.txt)" -le 49 ] || echo "::warning title=bench-results::more than 49 pieces; add a publishing step"
+          fi
+      - name: Publish the runner
+        # A step of its own: GitHub keeps 10 annotations per step, and the
+        # first publishing step already has ten.
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            echo "::notice title=bench-runner::$(jq -c '.runner' bench-results.json)"
           fi
 
   report:
@@ -139,6 +164,7 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           METRICS: ${{ needs.bench.outputs.failed }}
+          RUNNER: ${{ needs.bench.outputs.runner }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT: ${{ github.event_name }}
         run: |
@@ -151,8 +177,8 @@ jobs:
             commits="" since="No green timing run of this workflow yet."
           fi
           # shellcheck disable=SC2016 # backticks in printf formats are Markdown
-          body=$(printf 'The timing gate failed on `%s` (%s, %s).\n\nMetrics:\n%s\n\n%s\n%s\n\nReproduce: `cargo xtask --arch x86_64 bench --env ci --check`. A real regression is fixed or justified with a baseline update (rule 8); runner noise is noted here and the gate rerun.\n' \
-            "${SHA:0:7}" "$EVENT" "$RUN" "$(tr ';' '\n' <<< "$METRICS" | sed '/^$/d; s/^/- /')" "$since" "$commits")
+          body=$(printf 'The timing gate failed on `%s` (%s, %s).\n\nRunner: %s\n\nMetrics:\n%s\n\n%s\n%s\n\nReproduce: `cargo xtask --arch x86_64 bench --env ci --check`. A real regression is fixed or justified with a baseline update (rule 8); runner noise is noted here and the gate rerun.\n' \
+            "${SHA:0:7}" "$EVENT" "$RUN" "${RUNNER:-not recorded}" "$(tr ';' '\n' <<< "$METRICS" | sed '/^$/d; s/^/- /')" "$since" "$commits")
           number=$(gh api "repos/$REPO/issues?state=open&per_page=100" --jq ".[] | select(.pull_request == null and .title == \"$title\") | .number" | head -n 1)
           if [ -n "$number" ]; then
             gh api "repos/$REPO/issues/$number/comments" -f body="$body" --jq .html_url

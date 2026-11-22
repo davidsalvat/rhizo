@@ -158,6 +158,15 @@ fn pump(c: &mut Channel) {
     }) {}
     stream.expire(crate::cell::now_ns());
     if stream.refused() != *reported {
+        // Each refused connection is audited; repeats fold per second.
+        for _ in 0..stream.refused().wrapping_sub(*reported) {
+            crate::audit::deny(
+                crate::audit::Kind::Auth,
+                0,
+                0,
+                b"a vsock connection to the control channel without the secret",
+            );
+        }
         *reported = stream.refused();
         report(format_args!(
             "refused a connection without the secret ({} so far)",

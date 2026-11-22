@@ -253,7 +253,7 @@ impl Host {
 
     /// Moves the cells that ended into [`finished`](Self::finished) (other
     /// CPUs may be adding to them).
-    fn collect(&mut self) {
+    pub(super) fn collect(&mut self) {
         let ended = self.shared.with(|s| core::mem::take(&mut s.ended));
         if ended.is_empty() {
             return;
