@@ -95,6 +95,16 @@ pub fn copy_to<F: EntryFormat>(
     addr: u64,
     data: &[u8],
 ) -> Result<(), Fault> {
+    // Within one 4 KiB page, as most system calls write: one translation
+    // is both the check and the write's.
+    let len = data.len() as u64;
+    let in_page = (addr & 0xfff) + len <= 0x1000;
+    let user = addr.checked_add(len).is_some_and(|end| end <= USER_END);
+    if in_page && len > 0 && user {
+        let (phys, _) = user_phys(pt, mem, addr, true)?;
+        write_bytes(mem, phys, data);
+        return Ok(());
+    }
     for_each_piece(pt, mem, addr, data.len(), true, |_, _, _, _| {})?;
     for_each_piece(pt, mem, addr, data.len(), true, |m, phys, off, n| {
         write_bytes(m, phys, &data[off..off + n]);
@@ -291,6 +301,32 @@ mod tests {
         let mut two = [0u8; 2];
         copy_from(&pt, &mem, 0x1ffe, &mut two).unwrap();
         assert_eq!(two, [0, 0]);
+    }
+
+    /// A write within one page, as most system calls make, is checked as a
+    /// longer one: refused on a page the cell may not write, at the top
+    /// of the user half and past it.
+    #[test]
+    fn writes_within_a_page_are_checked() {
+        let (pt, mut mem) = setup();
+        copy_to(&pt, &mut mem, 0x1ff8, b"in page!").unwrap();
+        let mut back = [0u8; 8];
+        copy_from(&pt, &mem, 0x1ff8, &mut back).unwrap();
+        assert_eq!(&back, b"in page!");
+        assert_eq!(copy_to(&pt, &mut mem, 0x2ff8, b"x"), Err(Fault(0x2ff8)));
+        assert_eq!(copy_to(&pt, &mut mem, 0x3000, b"x"), Err(Fault(0x3000)));
+        assert_eq!(copy_to(&pt, &mut mem, 0x4000, b"x"), Err(Fault(0x4000)));
+        let (pt, mut mem) = kernel_mapped_for_the_user();
+        copy_to(&pt, &mut mem, USER_END - 8, b"top page").unwrap();
+        assert_eq!(
+            copy_to(&pt, &mut mem, USER_END - 4, b"past it!"),
+            Err(Fault(USER_END))
+        );
+        assert_eq!(
+            copy_to(&pt, &mut mem, u64::MAX - 3, b"wrap"),
+            Err(Fault(u64::MAX - 3))
+        );
+        assert_eq!(mem.read_u64(0x91_0000), 0, "kernel memory untouched");
     }
 
     /// Kernel memory mapped as if it were the cell's (a wrong user entry, as

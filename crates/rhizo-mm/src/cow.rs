@@ -293,10 +293,8 @@ impl<F: EntryFormat> PageTable<F> {
         }
         let root = frames.alloc().ok_or(MapError::OutOfFrames)?;
         mem.zero_frame(root);
-        for i in ENTRIES / 2..ENTRIES {
-            mem.write_u64(root + i * 8, mem.read_u64(self.root() + i * 8));
-        }
         let copy = Self::from_root(root);
+        copy.share_upper_half(mem, self);
         if let Err(e) = walk::<F>(mem, frames, keep, self.root(), root, 3, ENTRIES / 2, true) {
             copy.destroy_lower_half(mem, frames);
             return Err(e);

@@ -555,33 +555,37 @@ impl<F: EntryFormat> PageTable<F> {
     /// The flags are the effective ones: a page is writable only if its entry
     /// and every table entry above it allow writes (spec `virtual-memory`).
     pub fn translate(&self, mem: &impl PhysicalMemory, virt: u64) -> Option<Translation> {
-        let (_, entry, level) = self.leaf_slot(mem, virt)?;
-        let size = PageSize::from_leaf_level(level);
-        let offset = virt & (size.bytes() - 1);
-        let base = F::address(entry) & !(size.bytes() - 1);
-        let mut flags = F::flags(entry);
-        if !self.path_writable(mem, virt, level) {
-            flags = PageFlags(flags.0 & !PageFlags::WRITABLE.0);
+        if !is_canonical(virt) {
+            return None;
         }
-        Some(Translation {
-            phys: base + offset,
-            flags,
-            size,
-        })
-    }
-
-    /// Whether every table entry on the way to the leaf at `leaf_level` for
-    /// `virt` allows writes.
-    fn path_writable(&self, mem: &impl PhysicalMemory, virt: u64, leaf_level: u32) -> bool {
+        // One walk to the leaf, noting whether every table entry on the way
+        // allows writes (every system call that touches a cell's memory
+        // translates).
         let mut table = self.root;
-        for level in (leaf_level + 1..=3).rev() {
+        let mut writable = true;
+        for level in (0..=3).rev() {
             let entry = mem.read_u64(table + index(virt, level) * 8);
-            if !F::table_writable(entry) {
-                return false;
+            if !F::is_valid(entry) {
+                return None;
             }
+            if F::is_leaf(entry, level) {
+                let size = PageSize::from_leaf_level(level);
+                let offset = virt & (size.bytes() - 1);
+                let base = F::address(entry) & !(size.bytes() - 1);
+                let mut flags = F::flags(entry);
+                if !writable {
+                    flags = PageFlags(flags.0 & !PageFlags::WRITABLE.0);
+                }
+                return Some(Translation {
+                    phys: base + offset,
+                    flags,
+                    size,
+                });
+            }
+            writable &= F::table_writable(entry);
             table = F::address(entry);
         }
-        true
+        None
     }
 
     /// Removes the mapping of the page containing `virt`, invalidates its TLB
