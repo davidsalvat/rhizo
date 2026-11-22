@@ -4,7 +4,8 @@
 //! CPUs at once ([`Gangs`], design D1 of `add-parallel-threads`); and which
 //! idle CPU keeps a timer ([`IdleTimer`], design D1 of `add-tickless-idle`);
 //! and how domains and cells share the CPUs by weight, within caps
-//! ([`fair`], design D23 of `add-cell-hierarchy`).
+//! ([`fair`], design D23 of `add-cell-hierarchy`); and which CPUs each
+//! domain may run on ([`Sets`], design D17 there).
 //!
 //! The scheduler never reads a clock and never asks which CPU runs it:
 //! every operation that depends on time takes `now` in nanoseconds, and
@@ -22,9 +23,11 @@ use alloc::vec::Vec;
 pub mod fair;
 mod gangs;
 mod idle;
+mod sets;
 pub use fair::{Fair, Share};
 pub use gangs::Gangs;
 pub use idle::IdleTimer;
+pub use sets::Sets;
 
 /// Length of a time slice: how long a cell runs before it is preempted.
 pub const SLICE_NS: u64 = 10_000_000;
@@ -54,6 +57,11 @@ pub trait Keyed {
 /// nothing; with [`Fair`] ([`Scheduler::fair`]) a CPU takes from the queue
 /// it chose the entry owed the most CPU time by weight, and an entry whose
 /// subtree used its CPU cap sleeps until the cap's period ends.
+///
+/// With exclusive CPU sets ([`set_sets`](Self::set_sets)), an entry joins
+/// only the queues of the CPUs it may run on, and a CPU takes, steals and
+/// balances only among the queues of its class: sets restrict where, the
+/// share decides who among the entries allowed there.
 #[derive(Debug, Clone)]
 pub struct Scheduler<T, F = ()> {
     /// Per CPU: entries in arrival order, with their arrival number and key.
@@ -81,6 +89,8 @@ pub struct Scheduler<T, F = ()> {
     deadlines: BTreeSet<(u64, u32)>,
     /// How entries share the CPUs (design D23 of `add-cell-hierarchy`).
     share: F,
+    /// Which CPUs each entry may run on (design D17 there); `None`: all.
+    sets: Option<Sets>,
 }
 
 impl<T: Keyed> Scheduler<T> {
@@ -175,6 +185,84 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
             waiting: BTreeMap::new(),
             deadlines: BTreeSet::new(),
             share: F::new(cpus),
+            sets: None,
+        }
+    }
+
+    /// Restricts each entry to the CPUs `sets` gives it (`None`: every
+    /// CPU), and moves each queued entry a CPU no longer allowed to it holds
+    /// to the shortest queue it may join. An entry running elsewhere moves
+    /// when it is put back.
+    pub fn set_sets(&mut self, sets: Option<Sets>) {
+        self.sets = sets;
+        let mut moved = Vec::new();
+        for cpu in 0..self.queues.len() {
+            let mut i = 0;
+            while i < self.queues[cpu].len() {
+                let key = self.queues[cpu][i].1;
+                if self.allowed(key) & 1 << cpu == 0 {
+                    moved.extend(self.queues[cpu].remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for (_, key, entry) in moved {
+            let to = self.shortest_in(self.allowed(key));
+            self.queue(to, key, entry);
+        }
+        self.relearn();
+    }
+
+    /// The exclusive CPU sets, if any.
+    pub fn sets(&self) -> Option<&Sets> {
+        self.sets.as_ref()
+    }
+
+    /// The CPUs the entry known by `key` may run on (bit `n` for CPU `n`).
+    pub fn allowed(&self, key: u32) -> u64 {
+        self.sets.as_ref().map_or(u64::MAX, |s| s.allowed(key))
+    }
+
+    /// The CPUs whose queues `cpu` takes from: its class.
+    pub fn peers(&self, cpu: usize) -> u64 {
+        self.sets.as_ref().map_or(u64::MAX, |s| s.peers(cpu))
+    }
+
+    /// Of the CPUs `idle`, the ones to wake: in each class with queued
+    /// entries, its lowest idle CPU, if any (`taker`, about to take an
+    /// entry of its class, leaves one fewer there).
+    pub fn wanting(&self, idle: u64, taker: Option<usize>) -> u64 {
+        let (mut wake, mut seen) = (0, 0u64);
+        for cpu in 0..self.queues.len() {
+            if seen & 1 << cpu != 0 {
+                continue;
+            }
+            let class = self.peers(cpu);
+            seen |= class;
+            let mine = |c: &usize| class & 1 << c != 0;
+            let queued: usize = (0..self.queues.len())
+                .filter(mine)
+                .map(|c| self.queues[c].len())
+                .sum();
+            let taken = usize::from(taker.as_ref().is_some_and(mine));
+            let free = idle & class;
+            if queued > taken && free != 0 {
+                wake |= free & free.wrapping_neg();
+            }
+        }
+        wake
+    }
+
+    /// Where an entry known by `key`, made runnable by `cpu`, goes: `cpu`'s
+    /// queue if it may run there, else the shortest it may join.
+    #[inline(never)]
+    fn fit(&self, cpu: usize, key: u32) -> usize {
+        let allowed = self.allowed(key);
+        if allowed & 1 << cpu != 0 {
+            cpu
+        } else {
+            self.shortest_in(allowed)
         }
     }
 
@@ -184,6 +272,16 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// cap holds sleeps until its period ends.
     #[inline(always)]
     fn push(&mut self, cpu: usize, key: u32, entry: T, arrives: bool) {
+        let cpu = match self.sets {
+            Some(_) => self.fit(cpu, key),
+            None => cpu,
+        };
+        self.push_at(cpu, key, entry, arrives);
+    }
+
+    /// [`push`](Self::push) to `cpu`, which the entry may run on.
+    #[inline(always)]
+    fn push_at(&mut self, cpu: usize, key: u32, entry: T, arrives: bool) {
         if self.share.by_weight() {
             return self.push_by_weight(cpu, key, entry, arrives);
         }
@@ -241,12 +339,25 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
             .unwrap_or(0)
     }
 
+    /// Of the CPUs `mask`, the one with the shortest queue (the lowest
+    /// number on ties).
+    fn shortest_in(&self, mask: u64) -> usize {
+        (0..self.queues.len())
+            .filter(|&c| mask & 1 << c != 0)
+            .min_by_key(|&c| self.queues[c].len())
+            .unwrap_or(0)
+    }
+
     /// Makes a new entry runnable on the CPU with the shortest queue;
     /// returns that CPU.
     #[inline(always)]
     pub fn place(&mut self, entry: T) -> usize {
-        let cpu = self.shortest();
-        self.push(cpu, entry.key(), entry, true);
+        let key = entry.key();
+        let cpu = match self.sets {
+            Some(_) => self.shortest_in(self.allowed(key)),
+            None => self.shortest(),
+        };
+        self.push_at(cpu, key, entry, true);
         cpu
     }
 
@@ -256,8 +367,9 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     /// whose queue it joined.
     #[inline(always)]
     pub fn requeue(&mut self, cpu: usize, entry: T) -> usize {
-        let cpu = self.back_to(cpu);
-        self.push(cpu, entry.key(), entry, false);
+        let key = entry.key();
+        let cpu = self.back_to(cpu, key);
+        self.push_at(cpu, key, entry, false);
         cpu
     }
 
@@ -274,24 +386,41 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         if self.share.by_weight() {
             let (ns, now) = slice();
             self.charge(cpu, key, ns, now);
-            let to = self.back_to(cpu);
+            let to = self.back_to(cpu, key);
             self.enqueue(to, key, entry);
             return to;
         }
-        let to = self.back_to(cpu);
+        let to = self.back_to(cpu, key);
         self.queue(to, key, entry);
         to
     }
 
-    /// Where an entry that just ran on `cpu` goes back: `cpu`'s queue,
-    /// unless it holds more entries than the shortest.
+    /// Where the entry known by `key`, which just ran on `cpu`, goes back:
+    /// `cpu`'s queue, unless it holds more entries than the shortest (of
+    /// those it may join, with sets).
     #[inline]
-    fn back_to(&self, cpu: usize) -> usize {
+    fn back_to(&self, cpu: usize, key: u32) -> usize {
+        if self.sets.is_some() {
+            return self.back_within(cpu, key);
+        }
         let shortest = self.shortest();
         if self.queues[cpu].len() > self.queues[shortest].len() {
             shortest
         } else {
             cpu
+        }
+    }
+
+    /// [`back_to`](Self::back_to) with sets: among the queues the entry
+    /// may join (not `cpu`'s if the sets changed while it ran).
+    #[inline(never)]
+    fn back_within(&self, cpu: usize, key: u32) -> usize {
+        let allowed = self.allowed(key);
+        let shortest = self.shortest_in(allowed);
+        if allowed & 1 << cpu != 0 && self.queues[cpu].len() <= self.queues[shortest].len() {
+            cpu
+        } else {
+            shortest
         }
     }
 
@@ -395,10 +524,10 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
     }
 
     /// The CPU whose queue's first entry has waited longest, skipping
-    /// `except`.
-    fn oldest(&self, except: Option<usize>) -> Option<usize> {
+    /// `except`, among the CPUs `within`.
+    fn oldest(&self, except: Option<usize>, within: u64) -> Option<usize> {
         (0..self.queues.len())
-            .filter(|&c| Some(c) != except)
+            .filter(|&c| Some(c) != except && within & 1 << c != 0)
             .filter_map(|c| self.queues[c].front().map(|&(seq, _, _)| (seq, c)))
             .min()
             .map(|(_, c)| c)
@@ -426,11 +555,11 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
         self.take_by_weight(cpu, from..from + 1)
     }
 
-    /// The queue `cpu` takes from: its own, or the one whose first entry
-    /// has waited longest.
+    /// The queue `cpu` takes from: its own, or the one of its class whose
+    /// first entry has waited longest.
     fn next_from(&self, cpu: usize) -> Option<usize> {
         if self.queues[cpu].is_empty() {
-            self.oldest(Some(cpu))
+            self.oldest(Some(cpu), self.peers(cpu))
         } else {
             Some(cpu)
         }
@@ -438,15 +567,19 @@ impl<T: Keyed, F: Share> Scheduler<T, F> {
 
     /// Wakes the sleepers whose time has come (onto CPU 0's queue) and
     /// returns the entry that has waited longest in any queue (by weight:
-    /// the one owed the most CPU time in all of them).
+    /// the one owed the most CPU time in all of them). With sets, CPU 0
+    /// stepping alone runs only what it may: [`next`](Self::next) for it.
     pub fn next_oldest(&mut self, now: u64) -> Option<T> {
+        if self.sets.is_some() {
+            return self.next(0, now);
+        }
         if self.share.by_weight() {
             self.wake_due(0, now, |_| {});
-            self.oldest(None)?;
+            self.oldest(None, u64::MAX)?;
             return self.take_by_weight(0, 0..self.queues.len());
         }
         self.wake_sleepers(0, now, |_| {});
-        let from = self.oldest(None)?;
+        let from = self.oldest(None, u64::MAX)?;
         self.queues[from].pop_front().map(|(_, _, e)| e)
     }
 
@@ -960,6 +1093,244 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A step of a simulated CPU, or of the host, with exclusive sets.
+    #[derive(Debug, Clone, Copy)]
+    enum SetOp {
+        Take(usize),
+        Preempt(usize),
+        Sleep(usize, u64),
+        /// The CPU's running entry waits until it is woken.
+        Wait(usize),
+        /// The CPU wakes this entry if it waits.
+        Wake(usize, usize),
+        Tick(u64),
+        Host(usize),
+        /// The host gives the CPUs new classes: per CPU, 0 shared, else
+        /// the set of domain 1 or 2 (CPUs 0 and 1 stay shared: the boot CPU
+        /// and the one beside it a set leaves).
+        Classes([u8; 4]),
+    }
+
+    fn set_op() -> impl Strategy<Value = SetOp> {
+        prop_oneof![
+            4 => (0..4usize).prop_map(SetOp::Take),
+            3 => (0..4usize).prop_map(SetOp::Preempt),
+            1 => (0..4usize, 1u64..20).prop_map(|(c, d)| SetOp::Sleep(c, d)),
+            1 => (0..4usize).prop_map(SetOp::Wait),
+            1 => (0..4usize, 0..10usize).prop_map(|(c, e)| SetOp::Wake(c, e)),
+            1 => (1u64..10).prop_map(SetOp::Tick),
+            1 => (0..10usize).prop_map(SetOp::Host),
+            1 => proptest::array::uniform4(0u8..3).prop_map(SetOp::Classes),
+        ]
+    }
+
+    /// The model: the CPUs of domain `d`'s set when CPU `c` is in class
+    /// `classes[c]`, and each entry's allowed CPUs (the shared ones without
+    /// a set), computed apart from [`Sets`]; and the sets the host gives.
+    fn sets_of(cpus: usize, classes: [u8; 4], domains: &[u8]) -> (Option<Sets>, Vec<u64>) {
+        // A domain with no entry here holds no CPU: the host gives sets
+        // with cells.
+        let set = |d: u8| {
+            let mine = (2..cpus).filter(|&c| classes[c] == d && domains.contains(&d));
+            mine.fold(0u64, |m, c| m | 1 << c)
+        };
+        let shared = ((1u64 << cpus) - 1) & !set(1) & !set(2);
+        let with = |d: u8| d != 0 && set(d) != 0;
+        let allowed = domains
+            .iter()
+            .map(|&d| if with(d) { set(d) } else { shared })
+            .collect();
+        let keys = domains.iter().enumerate().filter(|&(_, &d)| with(d));
+        let keys = keys.map(|(e, &d)| (e as u32, set(d))).collect();
+        (Sets::new(cpus, keys), allowed)
+    }
+
+    /// CPUs and the host in any interleaving, with sets given and changed
+    /// at any time (see [`exclusive_sets_hold`]).
+    fn exclusive_sets_hold_in<F: Share>(
+        mut s: Scheduler<usize, F>,
+        cpus: usize,
+        domains: &[u8],
+        classes: [u8; 4],
+        ops: &[SetOp],
+    ) -> Result<(), TestCaseError> {
+        let entries = domains.len();
+        let (sets, mut allowed) = sets_of(cpus, classes, domains);
+        s.set_sets(sets);
+        for e in 0..entries {
+            s.place(e);
+        }
+        let mut running: Vec<Option<usize>> = vec![None; cpus];
+        let mut waiting = vec![false; entries];
+        let mut now = 0;
+        for &op in ops {
+            match op {
+                SetOp::Take(c) if c < cpus && running[c].is_none() => {
+                    running[c] = s.next(c, now);
+                    if let Some(e) = running[c] {
+                        prop_assert!(
+                            allowed[e] & 1 << c != 0,
+                            "entry {} (domain {}) ran on CPU {}, allowed {:#b}",
+                            e,
+                            domains[e],
+                            c,
+                            allowed[e]
+                        );
+                    } else {
+                        let queued = s.queues.iter().flatten();
+                        prop_assert!(
+                            queued.clone().all(|q| allowed[q.2] & 1 << c == 0),
+                            "CPU {} idles with work it may run",
+                            c
+                        );
+                    }
+                }
+                SetOp::Preempt(c) if c < cpus => {
+                    if let Some(e) = running[c].take() {
+                        s.requeue_charged(c, e, || (5, now));
+                    }
+                }
+                SetOp::Sleep(c, d) if c < cpus => {
+                    if let Some(e) = running[c].take() {
+                        s.sleep(e, now + d);
+                    }
+                }
+                SetOp::Wait(c) if c < cpus => {
+                    if let Some(e) = running[c].take() {
+                        s.wait(e as u32, e, None);
+                        waiting[e] = true;
+                    }
+                }
+                SetOp::Wake(c, e) if c < cpus && e < entries && waiting[e] => {
+                    let woke = s.wake(c, e as u32, |_| {});
+                    prop_assert!(woke, "{} waited", e);
+                    waiting[e] = false;
+                }
+                SetOp::Tick(d) => now += d,
+                SetOp::Host(e) if e < entries && !running.contains(&Some(e)) => {
+                    let (got, wake) = s.remove(e as u32).expect("not running");
+                    prop_assert_eq!(got, e);
+                    waiting[e] = false;
+                    match wake {
+                        Some(t) => s.sleep(e, t),
+                        None => {
+                            s.place(e);
+                        }
+                    }
+                }
+                SetOp::Classes(classes) => {
+                    let sets;
+                    (sets, allowed) = sets_of(cpus, classes, domains);
+                    s.set_sets(sets);
+                }
+                _ => {}
+            }
+            // Queued only where it may run, and lost nowhere.
+            for (q, queue) in s.queues.iter().enumerate() {
+                for &(_, _, e) in queue {
+                    prop_assert!(allowed[e] & 1 << q != 0, "{} queued on CPU {}", e, q);
+                }
+            }
+            prop_assert_eq!(s.len() + running.iter().flatten().count(), entries);
+            // An idle CPU that may run a queued entry is one a wake-up
+            // reaches: a CPU of its class.
+            let idle = (0..cpus)
+                .filter(|&c| running[c].is_none())
+                .fold(0u64, |m, c| m | 1 << c);
+            let wake = s.wanting(idle, None);
+            prop_assert_eq!(wake & !idle, 0);
+            for c in (0..cpus).filter(|&c| idle & 1 << c != 0) {
+                let work = s
+                    .queues
+                    .iter()
+                    .flatten()
+                    .any(|q| allowed[q.2] & 1 << c != 0);
+                prop_assert_eq!(work, wake & s.peers(c) != 0, "CPU {} with work {}", c, work);
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// Exclusive CPU sets (design D17 of `add-cell-hierarchy`): CPUs
+        /// taking, preempting, putting to sleep and waking entries, and the
+        /// host taking them out, putting them back and changing the sets,
+        /// in any interleaving, round robin or by weight: no entry ever
+        /// runs or is queued outside its domain's set, no entry of another
+        /// domain ever runs on a set's CPU, and a CPU (outside a set too)
+        /// idles only when nothing it may run is queued.
+        #[test]
+        fn exclusive_sets_hold(
+            cpus in 2usize..5,
+            domains in proptest::collection::vec(0u8..3, 1..10),
+            classes in proptest::array::uniform4(0u8..3),
+            ops in proptest::collection::vec(set_op(), 1..300),
+        ) {
+            exclusive_sets_hold_in(Scheduler::new(cpus), cpus, &domains, classes, &ops)?;
+            let mut s = Scheduler::fair(cpus);
+            for d in 0..3u8 {
+                s.shares().set_domain(d.into(), 100 * (u32::from(d) + 1));
+            }
+            for (e, &d) in domains.iter().enumerate() {
+                let share = fair::WHOLE / domains.iter().filter(|&&x| x == d).count() as u64;
+                s.shares().set_cell(e as u32, d.into(), share, Vec::new());
+            }
+            exclusive_sets_hold_in(s, cpus, &domains, classes, &ops)?;
+        }
+
+        /// A busy machine: every CPU takes and preempts in turn. Each CPU
+        /// of a domain's set runs that domain's entries while it has more
+        /// than its CPUs, and the shared CPUs serve every other entry:
+        /// none of them waits behind a set's idle CPU.
+        #[test]
+        fn exclusive_sets_leave_no_cpu_idle_with_work_it_may_run(
+            orders in proptest::collection::vec(
+                Just((0..4).collect::<Vec<usize>>()).prop_shuffle(), 1..40),
+        ) {
+            // CPUs 2 and 3 for domain 1's three entries; six others.
+            let domains = [1, 1, 1, 0, 0, 0, 0, 0, 0];
+            let (sets, allowed) = sets_of(4, [0, 0, 1, 1], &domains);
+            let mut s = Scheduler::new(4);
+            s.set_sets(sets);
+            for e in 0..domains.len() {
+                s.place(e);
+            }
+            for order in orders {
+                let mut ran = Vec::new();
+                for c in order {
+                    let e = s.next(c, 0).expect("every CPU has work it may run");
+                    prop_assert!(allowed[e] & 1 << c != 0);
+                    ran.push((c, e));
+                }
+                for (c, e) in ran {
+                    s.requeue(c, e);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exclusive_sets_move_queued_entries_when_they_change() {
+        let mut s = Scheduler::new(4);
+        for e in 0..8usize {
+            s.place(e);
+        }
+        // Entries 0 to 3 get CPUs 2 and 3; the others leave them.
+        let keys = (0..4).map(|k| (k, 0b1100)).collect();
+        s.set_sets(Sets::new(4, keys));
+        for (cpu, queue) in s.queues.iter().enumerate() {
+            let mine = |e: usize| (e < 4) == (cpu >= 2);
+            assert!(queue.iter().all(|q| mine(q.2)), "CPU {cpu}: {queue:?}");
+        }
+        assert_eq!(s.runnable(), 8);
+        // Stepping alone, CPU 0 runs only the shared entries.
+        let mut seen: Vec<usize> = core::iter::from_fn(|| s.next_oldest(0)).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [4, 5, 6, 7]);
+        s.set_sets(None);
+        assert_eq!(s.next(0, 0).map(|e| e < 4), Some(true), "steals again");
     }
 
     #[test]

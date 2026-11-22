@@ -3,23 +3,38 @@
 //! cap, where round robin gives each domain exactly its weight's part;
 //! otherwise by weight, domains then the cells of each, within caps. The
 //! scheduler's shares are computed from the tree when it changes, never
-//! when a cell runs.
+//! when a cell runs. So are the exclusive CPU sets (design D17): the CPUs
+//! each domain with one runs on alone, the others running on the rest.
 
 use super::*;
 use rhizo_cap::Node;
 use rhizo_cap::limits::WEIGHT_DEFAULT;
-use rhizo_sched::Share as _;
 use rhizo_sched::fair::{self, PERIOD_NS};
+use rhizo_sched::{Sets, Share as _};
 
 /// Whether node `n` takes from round robin what its weight gives it: a
 /// root (alone in its domain) of the default weight, without a cap.
-fn plain(n: &Node) -> bool {
+fn even(n: &Node) -> bool {
     n.is_root() && n.weight() == WEIGHT_DEFAULT && n.cpu_max() == u32::MAX
+}
+
+/// Whether node `n` leaves the scheduler as round robin over every CPU:
+/// [`even`], and without an exclusive CPU set.
+fn plain(n: &Node) -> bool {
+    even(n) && n.cpus() == 0
 }
 
 /// Whether a root placed with `spec` is plain (see [`plain`]).
 pub(super) fn plain_root(spec: &rhizo_cap::Spec) -> bool {
-    spec.weight == WEIGHT_DEFAULT && spec.cpu_max == u32::MAX
+    spec.weight == WEIGHT_DEFAULT && spec.cpu_max == u32::MAX && spec.cpus == 0
+}
+
+/// Whether root `id` may get the exclusive CPU set `set` (design D17): see
+/// [`Sets::fits`], beside every other root's set.
+pub(super) fn set_fits(tree: &rhizo_cap::Tree, id: u32, set: u64) -> bool {
+    let others = tree.iter().filter(|n| n.is_root() && n.id() != id);
+    let taken = others.fold(0, |t, n| t | n.cpus());
+    Sets::fits(crate::smp::count(), taken, set)
 }
 
 /// A CPU cap in thousandths of a CPU, in nanoseconds of CPU time per
@@ -54,15 +69,22 @@ impl Host {
         }
     }
 
-    /// Computes from the tree how cells share the CPUs: round robin while
-    /// every node is plain; otherwise each cell's domain, flattened share
-    /// and capped ancestors, each domain's weight and each cap. Time used so
-    /// far stays counted.
+    /// Computes from the tree how cells share the CPUs: round robin over
+    /// every CPU while every node is plain; otherwise the exclusive sets,
+    /// and, unless every node is [`even`], each cell's domain, flattened
+    /// share and capped ancestors, each domain's weight and each cap. Time
+    /// used so far stays counted.
     #[cold]
     #[inline(never)]
     pub(super) fn reshare(&mut self) {
         self.by_weight = !self.tree.iter().all(plain);
-        if !self.by_weight {
+        let sets = self.sets();
+        self.locked(|s| {
+            if sets.is_some() || s.sched.sets().is_some() {
+                s.sched.set_sets(sets);
+            }
+        });
+        if self.tree.iter().all(even) {
             self.locked(|s| *s.sched.shares() = None);
             return;
         }
@@ -105,6 +127,26 @@ impl Host {
                 f.set_cap(id, cap);
             }
         });
+    }
+
+    /// The exclusive CPU sets of the tree's cells (design D17): each cell
+    /// of a domain whose root has one, with it; `None` when no root has
+    /// one. The host gives only sets that fit ([`set_fits`]).
+    fn sets(&self) -> Option<Sets> {
+        let roots = self.tree.iter().filter(|n| n.is_root() && n.cpus() != 0);
+        let mut sets: Vec<(u32, u64)> = roots.map(|n| (n.domain(), n.cpus())).collect();
+        if sets.is_empty() {
+            return None;
+        }
+        sets.sort_unstable();
+        let set = |n: &Node| {
+            let at = sets.binary_search_by_key(&n.domain(), |s| s.0).ok()?;
+            Some((n.id(), sets[at].1))
+        };
+        Sets::new(
+            crate::smp::count(),
+            self.tree.iter().filter_map(set).collect(),
+        )
     }
 
     /// The CPU time live cell `id` has used, counted while it has a CPU

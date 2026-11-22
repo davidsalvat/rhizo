@@ -339,6 +339,13 @@ impl Host {
         if parent != HOST && self.tree.get(parent).is_none() {
             return Err(TreeError::NotFound);
         }
+        // An exclusive CPU set (design D17): CPUs the machine has, never
+        // the boot CPU, and none another root's set holds.
+        if parent == HOST && spec.cpus != 0 && !super::shares::set_fits(&self.tree, id, spec.cpus) {
+            // AUDIT(1.9b): a refused set is a tree denial for the audit
+            // log, to record here with `crate::audit` once it is on main.
+            return Err(TreeError::Invalid);
+        }
         let (saved, old, old_pid) = (n.spec(), n.parent(), n.pid());
         if parent == HOST {
             let (l, was) = (&mut spec.limits, saved.limits);

@@ -390,6 +390,7 @@ version = "0.1.0"
 name = "rhizo-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rhizo-control",
  "rhizo-snapshot",
  "xtask",

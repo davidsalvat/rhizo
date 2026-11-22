@@ -10,6 +10,7 @@ mod agent;
 mod args;
 mod chat;
 mod client;
+mod pin;
 mod scope;
 mod serve;
 mod state;
@@ -163,6 +164,7 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
         .args(["--memory", &up.memory_mib.to_string()])
         .args(["--cpus", &up.cpus.to_string()])
         .args(["--accel", up.accel.id()])
+        .args(up.pin.then_some("--pin"))
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(err);

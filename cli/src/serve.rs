@@ -75,6 +75,10 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
     }
     let _ = console.write_all(&std::mem::take(&mut vm.console));
     let _ = writeln!(console, "[rhizo] control frames over {}", vm.channel);
+    if up.pin {
+        let cpus = crate::pin::pin(vm.pid(), up.cpus as usize)?; // dropping the VM ends it
+        let _ = writeln!(console, "[rhizo] vCPUs on host CPUs {cpus:?}");
+    }
     let _ = fs::remove_file(dir.socket());
     let listener = UnixListener::bind(dir.socket())
         .map_err(|e| format!("cannot listen on {}: {e}", dir.socket().display()))?;
