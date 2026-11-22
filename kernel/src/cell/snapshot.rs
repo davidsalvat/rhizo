@@ -33,8 +33,11 @@ impl Host {
             return None;
         }
         let pt = PageTable::<Format>::from_root(live.cell.root);
-        if let Some(lazy) = live.demand.lazy.as_mut() {
-            lazy.finish(&pt, &live.frames);
+        if let Some(lazy) = live.demand.lazy.as_mut()
+            && !lazy.finish(&pt, &live.frames)
+        {
+            self.requeue(live, wake);
+            return None;
         }
         sync_fp(&mut live, true);
         let (files, sockets) = export_sockets(&live.fs);
@@ -148,16 +151,27 @@ impl Host {
             space::destroy(pt, &mut DirectMap, &mut KernelFrames);
             return Err(snapshot);
         }
+        let mut lazy = Lazy::new(snapshot);
+        // Resumed into another domain than it was taken in (a suspended
+        // cell moved meanwhile, a copy of a template's snapshot), it first
+        // stops referring to its old domain's frames (design D21 of
+        // `add-cell-hierarchy`). One comparison otherwise, the snapshot
+        // where it is.
+        if cell.domain != lazy.snapshot().domain() && !self.moved(lazy.snapshot_mut(), &cell) {
+            space::destroy(pt, &mut DirectMap, &mut KernelFrames);
+            return Err(lazy.into_snapshot());
+        }
+        let snapshot = lazy.snapshot();
         let deadlines = snapshot.deadlines(now);
-        let mut fs = files_of(&snapshot);
+        let mut fs = files_of(snapshot);
         if snapshot.has_sockets() {
             import_sockets(&mut fs, &snapshot.sockets(), id);
         }
         let wx = snapshot.wx();
-        let mut lazy = Lazy::new(snapshot);
         let used = Meter::new(1, u64::MAX); // the root
         if mode == Resume::Eager {
-            lazy.finish(&pt, &used);
+            // Short of frames, what is left stays pending, restored lazily.
+            let _ = lazy.finish(&pt, &used);
         }
         let mut live = self.new_live(cell, capture, echo, fs);
         live.frames.set_used(used.used());
@@ -182,8 +196,13 @@ impl Host {
             return None;
         }
         let pt = PageTable::<Format>::from_root(parent.cell.root);
-        if let Some(lazy) = parent.demand.lazy.as_mut() {
-            lazy.finish(&pt, &parent.frames);
+        // Pages still pending from a lazy resume come back first; short of
+        // frames, no copy is made and the cell keeps the rest pending.
+        if let Some(lazy) = parent.demand.lazy.as_mut()
+            && !lazy.finish(&pt, &parent.frames)
+        {
+            self.requeue(parent, wake);
+            return None;
         }
         parent.demand.lazy = None;
         sync_fp(&mut parent, false);
@@ -242,7 +261,9 @@ impl Host {
     /// files `fs` and its write-or-execute ranges `wx`. Only counts go up,
     /// on tables `cell` holds, and only `cell`'s root changes: no
     /// [`SHARING`], even while cells sharing those tables run (design D3 of
-    /// `host-ops-per-cell`). It is a copy (design D22 of
+    /// `host-ops-per-cell`). It stays in `cell`'s domain (design D13 of
+    /// `add-cell-hierarchy`), so sharing tells it nothing it does not hold.
+    /// It is a copy (design D22 of
     /// `add-cell-hierarchy`): its generation is one more, and its wipe
     /// ranges read as zero, the only work done for cells that have some.
     fn child_of(
@@ -298,12 +319,15 @@ impl Host {
     )]
     pub fn freeze(&mut self, id: u32) -> bool {
         let _p = cost::scope(Part::Spawn);
-        let Some((mut live, _)) = self.take_cell(id) else {
+        let Some((mut live, wake)) = self.take_cell(id) else {
             return false;
         };
         let pt = PageTable::<Format>::from_root(live.cell.root);
-        if let Some(lazy) = live.demand.lazy.as_mut() {
-            lazy.finish(&pt, &live.frames);
+        if let Some(lazy) = live.demand.lazy.as_mut()
+            && !lazy.finish(&pt, &live.frames)
+        {
+            self.requeue(live, wake);
+            return false;
         }
         sync_fp(&mut live, true);
         user::release_user(live.cell.root, live.tag);
@@ -358,11 +382,11 @@ impl Host {
     /// other domains (design D22 of `add-cell-hierarchy`): not if the cell
     /// it was made of reached the network card, unless the host attests
     /// (`attested`) that it holds no secret. `None` if there is no such
-    /// template. A refusal, and a publication on the host's word, are
-    /// audited (design D18). Publishing itself comes with task 1.8a.
+    /// template ([`publish`](Self::publish) asks it). A refusal, and a
+    /// publication on the host's word, are audited (design D18).
     #[cfg_attr(
-        not(feature = "ktest"),
-        allow(dead_code, reason = "publishing comes with task 1.8a")
+        not(any(feature = "ktest", feature = "control")),
+        allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn may_publish(&self, id: u32, attested: bool) -> Option<bool> {
         let (cell, ..) = self.templates.iter().find(|(c, ..)| c.id == id)?;
@@ -406,11 +430,7 @@ impl Host {
             return false;
         };
         let (template, fs, _) = self.templates.swap_remove(index);
-        space::destroy(
-            PageTable::<Format>::from_root(template.root),
-            &mut DirectMap,
-            &mut KernelFrames,
-        );
+        self.end_template_memory(template.id, template.root);
         release_sockets(&fs, template.id, true);
         true
     }
@@ -445,6 +465,25 @@ impl Host {
         self.enter_networks(core::iter::once(child_id));
         self.admit(|s| file(s, None, child));
         Some(child_id)
+    }
+}
+
+impl Host {
+    /// Makes `snapshot`, taken in another domain than the one `cell`,
+    /// restored from it, just entered, one of `cell`'s domain (design D21
+    /// of `add-cell-hierarchy`): it keeps referring only to public frames.
+    /// `false`, with `cell` taken out of the tree again, if memory cannot
+    /// hold the contents of the others.
+    #[cold]
+    #[inline(never)]
+    fn moved(&mut self, snapshot: &mut Snapshot, cell: &Cell) -> bool {
+        if snapshot.refers() && !cells_may_take(snapshot.shared_bytes()) {
+            self.leave_restored(cell, snapshot.origin());
+            return false;
+        }
+        let mut public = self.public_frames();
+        snapshot.move_to(cell.domain, &DirectMap, &mut public);
+        true
     }
 }
 

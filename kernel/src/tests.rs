@@ -46,6 +46,7 @@ mod packages;
 mod prof;
 mod quotas;
 mod shares;
+mod sharing;
 mod smp;
 mod snapshots;
 mod threads;
@@ -72,6 +73,7 @@ const AREAS: &[&[TestCase]] = &[
     quotas::ALL,
     leaks::ALL,
     hierarchy::ALL,
+    sharing::ALL,
     shares::ALL,
     micropython::ALL,
     net::ALL,

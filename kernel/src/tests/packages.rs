@@ -46,7 +46,7 @@ fn numpy_from_a_wheel_computes_as_on_linux() {
         (Ending::Exit(0), expected::NUMPY_STDOUT.into())
     );
     drop(host);
-    assert!(crate::cell::drop_images(), "file pages were kept");
+    assert!(crate::cell::kept_pages() > 0, "file pages were kept");
     assert_eq!(memory_balance(), before, "nothing leaked");
 }
 

@@ -130,6 +130,22 @@ impl Lazy {
         }
     }
 
+    /// The snapshot it restores from.
+    pub(super) fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// The snapshot it restores from, to change where none of its pages
+    /// is restored yet.
+    pub(super) fn snapshot_mut(&mut self) -> &mut Snapshot {
+        &mut self.snapshot
+    }
+
+    /// The snapshot back, nothing restored.
+    pub(super) fn into_snapshot(self) -> Snapshot {
+        self.snapshot
+    }
+
     /// Restores the page containing `addr` if it is still pending.
     pub(super) fn page_in(
         &mut self,
@@ -185,8 +201,10 @@ impl Lazy {
     }
 
     /// Restores every page still pending, counting them in `meter` (beyond
-    /// the quota if need be: they were the cell's already).
-    pub(super) fn finish(&mut self, pt: &PageTable<Format>, meter: &Meter) {
+    /// the quota if need be: they were the cell's already); returns whether
+    /// none is left. Short of frames, those it could not restore stay
+    /// pending: dropped, they would read as zeros.
+    pub(super) fn finish(&mut self, pt: &PageTable<Format>, meter: &Meter) -> bool {
         let limit = meter.limit();
         meter.set_limit(u64::MAX);
         for i in 0..self.pending.len() {
@@ -196,5 +214,6 @@ impl Lazy {
             }
         }
         meter.set_limit(limit);
+        self.left == 0
     }
 }

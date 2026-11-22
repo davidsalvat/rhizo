@@ -127,7 +127,10 @@ fn copies_draw_different_random() {
         })
         .collect();
     for _ in 0..2 {
-        let snapshot = host.template_snapshot(template).expect("snapshot");
+        let snapshot = host.template_snapshot(template).unwrap_or_else(|| {
+            let free = crate::memory::free_bytes() >> 20;
+            panic!("snapshot of template {template}: no room ({free} MiB free)")
+        });
         ids.push(
             host.resume(snapshot, Resume::Lazy, true, false)
                 .expect("load"),

@@ -162,6 +162,10 @@ pub fn serve() {
     // `add-cell-hierarchy`): the host's own addresses are in the floor
     // until `rhizo up` carves endpoints out of it (`floor`).
     server.host.wire_address(10_000_000_000);
+    // The file sets the kernel ships are published at start (design D21 of
+    // `add-cell-hierarchy`): every domain maps their programs on the same
+    // frames, and none learns which another used first.
+    let _ = (cell::cpython_files(), cell::dynamic_files());
     crate::vsock::init();
     send(0, &Message::Hello { version: VERSION });
     let mut fast_until = 0;
@@ -501,6 +505,17 @@ impl Server {
                 entry.place = Place::Template(cell);
                 Ok(Body::None)
             }
+            Request::Publish { cell, attest } => self.publish(cell, attest),
+            Request::Withdraw(target) => {
+                let template = self.template_of(target)?;
+                match self.host.withdraw(template) {
+                    true => Ok(Body::None),
+                    false => Err((
+                        Error::Invalid,
+                        format!("template {target} is not published"),
+                    )),
+                }
+            }
             Request::Save { cell, host } => self.save(cell, host),
             Request::Load {
                 size,
@@ -552,6 +567,34 @@ impl Server {
             None => "running",
         };
         Err((error, format!("{why}; the cell is {left}, a root")))
+    }
+
+    /// The kernel's identifier of template `target`.
+    fn template_of(&mut self, target: u32) -> Result<u32, (Error, String)> {
+        match self.entry(target)?.place {
+            Place::Template(template) => Ok(template),
+            _ => Err((Error::Invalid, format!("cell {target} is not a template"))),
+        }
+    }
+
+    /// Publishes template `target` (design D21 of `add-cell-hierarchy`):
+    /// refused if its cell reached the network card and the host does not
+    /// attest (`attest`) that it holds no secret. `Host::publish` asks
+    /// `Host::may_publish`, which audits the attestation or the refusal
+    /// (design D18).
+    fn publish(&mut self, target: u32, attest: bool) -> Outcome {
+        let template = self.template_of(target)?;
+        match self.host.publish(template, attest) {
+            Ok(()) => Ok(Body::None),
+            Err(cell::Refused::MayHoldSecret) => Err((
+                Error::Denied,
+                String::from(
+                    "its cell reached the network card and may hold a secret: publish it with \
+                     --attest only if it holds none",
+                ),
+            )),
+            Err(cell::Refused::NoTemplate) => refuse(Error::NoCell),
+        }
     }
 
     /// Cells made from template `template`, all or none.
@@ -890,6 +933,8 @@ fn about(request: &Request) -> (&'static str, u32) {
         Request::WriteFile { cell, .. } => ("write file", *cell),
         Request::Input { cell, .. } => ("input", *cell),
         Request::Save { cell, .. } => ("save", *cell),
+        Request::Publish { cell, .. } => ("publish", *cell),
+        Request::Withdraw(cell) => ("withdraw", *cell),
         Request::List => ("list", 0),
         Request::Stats => ("stats", 0),
         Request::Shutdown => ("shutdown", 0),

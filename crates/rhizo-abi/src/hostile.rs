@@ -180,7 +180,10 @@ impl<F: EntryFormat> Machine<F> {
         };
         assert_eq!(fs.open(None, b"/f", how, 2).unwrap() as u64, FILE_FD);
         Self {
-            cell: Cell::new(9, pt.root(), 0x40_0000, STACK_TOP - 64, HEAP),
+            cell: Cell {
+                domain: 9, // a root's domain is its identifier
+                ..Cell::new(9, pt.root(), 0x40_0000, STACK_TOP - 64, HEAP)
+            },
             abi: Abi::new(arch),
             mem,
             tlb,

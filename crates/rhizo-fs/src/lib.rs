@@ -130,6 +130,7 @@ type Shared = Arc<Box<Block>>;
 pub struct Page {
     block: Option<Shared>,
     len: usize,
+    public: bool,
 }
 
 impl Page {
@@ -155,6 +156,13 @@ impl Page {
     pub fn bytes(&self) -> &[u8] {
         self.block.as_ref().map_or(&[], |b| &b[..self.len])
     }
+
+    /// Whether the page is of a public file (design D21 of
+    /// `add-cell-hierarchy`): one of a set the host published, never
+    /// written since. Only such a page may be shared between domains.
+    pub fn is_public(&self) -> bool {
+        self.public
+    }
 }
 
 /// Contents of a regular file: blocks never written are holes (zeros).
@@ -162,6 +170,11 @@ impl Page {
 struct File {
     size: u64,
     blocks: Vec<Option<Shared>>,
+    /// Published by the host ([`Fs::publish`]) and not written since: its
+    /// pages may be shared with other domains (design D21 of
+    /// `add-cell-hierarchy`). Any write or truncation clears it, and no
+    /// encoding holds it, so a file from bytes is never public.
+    public: bool,
 }
 
 impl File {
@@ -909,6 +922,7 @@ impl Tables {
             return Ok(None);
         }
         file.size = file.size.max(end);
+        file.public = false;
         if new {
             self.used += 1;
         }
@@ -1013,6 +1027,7 @@ impl Tables {
             Arc::make_mut(last)[keep..].fill(0);
         }
         file.size = size;
+        file.public = false;
         self.used -= dropped;
         Ok(())
     }
@@ -1095,7 +1110,38 @@ impl Tables {
             .and_then(|i| file.blocks.get(i))
             .and_then(Clone::clone)
             .filter(|_| len > 0);
-        Ok(Page { block, len })
+        Ok(Page {
+            block,
+            len,
+            public: file.public,
+        })
+    }
+
+    /// Makes every regular file public (design D21 of `add-cell-hierarchy`):
+    /// the host publishes these files, the same for every cell given them
+    /// and holding no secret. A write or truncation makes a file private
+    /// again, in the cell that does it.
+    pub fn publish(&mut self) {
+        for ino in 0..self.inodes.len() as Ino {
+            let private = matches!(
+                self.inodes[ino as usize].as_deref().map(|i| &i.node),
+                Some(Node::File(f)) if !f.public
+            );
+            if private && let Node::File(f) = &mut self.inode_mut(ino).node {
+                f.public = true;
+            }
+        }
+    }
+
+    /// Every regular file, by inode, with its size.
+    pub fn files(&self) -> impl Iterator<Item = (Ino, u64)> + '_ {
+        self.inodes
+            .iter()
+            .enumerate()
+            .filter_map(|(ino, i)| match i.as_deref().map(|i| &i.node) {
+                Some(Node::File(f)) => Some((ino as Ino, f.size)),
+                _ => None,
+            })
     }
 
     /// `newfstatat` / `stat` by path.

@@ -374,20 +374,44 @@ fn copies_are_siblings_with_new_numbers() {
     assert!((3..=5).all(|c| t.get(c).unwrap().parent() == 1));
     assert_eq!(t.get(5).unwrap().pid(), 5);
     assert_eq!(t.own(1).unwrap().memory, 0);
-    // Copies of a root are roots of new domains; none takes its number.
+    // Copies of a root are roots in its domain (the same tenant),
+    // numbered after every cell it has, so never with the root's number.
     let mut seen = Vec::new();
     t.add_copies(1, &[7, 8], &none, &mut |k, pid, domain| {
         seen.push((k, pid, domain))
     })
     .unwrap();
     let (a, b) = (t.get(7).unwrap(), t.get(8).unwrap());
-    assert!(a.is_root() && a.domain() != b.domain() && a.domain() != 1);
-    assert_eq!((a.pid(), b.pid(), a.children()), (2, 2, 0));
-    assert_eq!(seen, [(0, 2, a.domain()), (1, 2, b.domain())]);
+    assert!(a.is_root() && b.is_root() && a.domain() == 1 && b.domain() == 1);
+    assert_eq!((a.pid(), b.pid(), a.children()), (6, 7, 0));
+    assert_eq!(seen, [(0, 6, 1), (1, 7, 1)]);
     assert_eq!(
         t.add_copies(1, &[9, 9], &none, &mut |_, _, _| {}),
         Err(Error::Exists)
     );
+    t.check().unwrap();
+    // The domain outlives the root it began with: numbers go on.
+    let mut fresh = 100;
+    t.end(1, &mut || {
+        fresh += 1;
+        fresh
+    })
+    .unwrap();
+    t.add_copies(7, &[10], &none, &mut |_, _, _| {}).unwrap();
+    assert_eq!(t.get(10).map(|n| (n.domain(), n.pid())), Some((1, 8)));
+    t.check().unwrap();
+    // Promotion still starts a domain of its own.
+    t.add_child(11, 7, spec(limits(MIB, 0)), Actor::Host, &none)
+        .unwrap();
+    assert_eq!(t.get(11).map(|n| (n.domain(), n.pid())), Some((1, 9)));
+    t.reparent(11, HOST, Actor::Host, &none, &mut || 200)
+        .unwrap();
+    assert_eq!(t.get(11).map(|n| (n.domain(), n.pid())), Some((200, 1)));
+    t.check().unwrap();
+    for id in [7, 8, 10, 11] {
+        t.end(id, &mut || 0).unwrap();
+    }
+    assert!(t.is_empty());
     t.check().unwrap();
 }
 

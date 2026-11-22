@@ -189,6 +189,15 @@ fn every_request_round_trips() {
                 hi: 11434,
             }],
         },
+        Request::Publish {
+            cell: 7,
+            attest: false,
+        },
+        Request::Publish {
+            cell: 8,
+            attest: true,
+        },
+        Request::Withdraw(7),
         Request::Scoped {
             root: 3,
             request: Box::new(Request::KillTree(9)),
@@ -610,6 +619,11 @@ fn version_4_requests_stay_in_version_4() {
             cell: 1,
             limits: Limits::NONE,
         },
+        Request::Publish {
+            cell: 1,
+            attest: true,
+        },
+        Request::Withdraw(1),
         Request::Scoped {
             root: 1,
             request: Box::new(Request::List),
@@ -922,6 +936,8 @@ fn request() -> impl Strategy<Value = Request> {
                 carved: rules(c),
             }
         }),
+        (any::<u32>(), any::<bool>()).prop_map(|(cell, attest)| Request::Publish { cell, attest }),
+        any::<u32>().prop_map(Request::Withdraw),
     ];
     prop_oneof![
         3 => leaf.clone(),

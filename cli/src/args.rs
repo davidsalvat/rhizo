@@ -71,6 +71,11 @@ Commands:
   resume <id> [--tree]       Resume a suspended cell (--tree: its subtree)
   freeze <id>                Freeze a running cell into a template, which
                              `fork` makes cells from
+  publish <id> [--attest]    Let the template's copies placed in other
+                             domains share its memory (--attest: it holds
+                             no secret, though its cell used the network)
+  withdraw <id>              End that: later copies placed in other domains
+                             are full copies
   save <id> <file>           Save a suspended cell or a template to a file
   load <file> [--template] [options]
                              Load a saved file as a suspended cell, or as a
@@ -174,6 +179,12 @@ pub enum Command {
     Resume(u32),
     ResumeTree(u32),
     Freeze(u32),
+    /// Publishes a template (`attest`: the host's word it holds no secret).
+    Publish {
+        id: u32,
+        attest: bool,
+    },
+    Withdraw(u32),
     Save {
         id: u32,
         file: PathBuf,
@@ -336,6 +347,18 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             (id, true) => Command::ResumeTree(id),
         },
         "freeze" => Command::Freeze(id(args, "freeze")?),
+        "publish" => match args {
+            [id] => Command::Publish {
+                id: number("cell", id)?,
+                attest: false,
+            },
+            [id, flag] if flag == "--attest" => Command::Publish {
+                id: number("cell", id)?,
+                attest: true,
+            },
+            _ => return Err("usage: rhizo publish <id> [--attest]".into()),
+        },
+        "withdraw" => Command::Withdraw(id(args, "withdraw")?),
         "save" => match args {
             [id, file] => Command::Save {
                 id: number("cell", id)?,
@@ -715,6 +738,36 @@ mod tests {
         assert!(parse_words("kill x").is_err());
         assert!(parse_words("fork 1 2 3").is_err());
         assert!(parse_words("teleport 1").is_err());
+    }
+
+    /// `publish` and `withdraw` name a template; only `--attest` follows.
+    #[test]
+    fn publication_takes_a_template() {
+        assert_eq!(
+            command("publish 7"),
+            Command::Publish {
+                id: 7,
+                attest: false
+            }
+        );
+        assert_eq!(
+            command("publish 7 --attest"),
+            Command::Publish {
+                id: 7,
+                attest: true
+            }
+        );
+        assert_eq!(command("withdraw 7"), Command::Withdraw(7));
+        for bad in [
+            "publish",
+            "publish x",
+            "publish 7 --attest-no-secrets",
+            "publish 7 --attest more",
+            "withdraw",
+            "withdraw 7 8",
+        ] {
+            assert!(parse_words(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

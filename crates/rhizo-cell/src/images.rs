@@ -44,6 +44,11 @@ impl<const N: usize> Images<N> {
         Some(self.remove_at(i))
     }
 
+    /// The spaces loaded, in no particular order.
+    pub fn roots(&self) -> impl Iterator<Item = u64> + '_ {
+        self.slots[..self.len].iter().map(|s| s.1)
+    }
+
     /// Takes the least recently used space out.
     pub fn pop(&mut self) -> Option<u64> {
         (self.len > 0).then(|| self.remove_at(0))
@@ -77,6 +82,9 @@ mod tests {
         assert_eq!(images.get((1, 10)), Some(0x1000), "1 is now the newest");
         assert_eq!(images.get((1, 11)), None, "the length is part of the key");
         assert_eq!(images.insert((4, 10), 0x4000), Some(0x2000));
+        let mut roots: Vec<u64> = images.roots().collect();
+        roots.sort_unstable();
+        assert_eq!(roots, [0x1000, 0x3000, 0x4000]);
         assert_eq!(images.get((2, 10)), None);
         assert_eq!(images.remove((3, 10)), Some(0x3000));
         assert_eq!(images.remove((3, 10)), None);

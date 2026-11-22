@@ -294,6 +294,21 @@ pub fn cells_may_take(bytes: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Allocates one frame kept for as long as the kernel runs or nearly (a
+/// published page, design D21 of `add-cell-hierarchy`), keeping the
+/// reserve and what is set aside for reserved domains: the highest free one, as the heap's, so frames that stay do not
+/// split the free runs low in memory where cells allocate.
+#[cfg(feature = "cells")]
+pub fn alloc_kept() -> Option<u64> {
+    with_frames(|f| {
+        if (f.free_frames() as u64) < kept_frames(f) + 1 {
+            return None;
+        }
+        f.alloc_high()
+    })
+    .flatten()
+}
+
 /// Allocates `count` contiguous frames for a cell or a cache, keeping the
 /// reserve and what is set aside for reserved domains (a reserved cell's
 /// meter took these frames out of it before asking).

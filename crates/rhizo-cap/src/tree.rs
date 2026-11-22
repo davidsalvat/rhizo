@@ -238,8 +238,6 @@ pub struct Node {
     next_sibling: u32,
     domain: u32,
     pid: u32,
-    /// For a root: the number the next cell made in its domain gets.
-    next_pid: u32,
     children: u16,
     depth: u8,
     on_parent_end: OnParentEnd,
@@ -267,7 +265,8 @@ impl Node {
     pub fn depth(&self) -> u8 {
         self.depth
     }
-    /// Its domain's identifier: never 0, unique among the domains that
+    /// Its domain's identifier, the tenant it belongs to: never 0, unique
+    /// among the domains that
     /// ever lived while the kernel's fresh identifiers are (see
     /// [`Tree::add_root`]), and unchanged while the domain lives.
     pub fn domain(&self) -> u32 {
@@ -342,8 +341,18 @@ pub struct Ended {
     pub promoted: Vec<u32>,
 }
 
+/// A domain's numbering: the number the next cell to join it gets, and
+/// how many cells it has (it goes with its last).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Domain {
+    id: u32,
+    next_pid: u32,
+    members: u32,
+}
+
 /// The ownership tree of a kernel's cells (design D1), ordered by
-/// identifier.
+/// identifier. A domain (the tenant, design D13) holds one root or more:
+/// a root the host made, and the roots copied from its cells.
 ///
 /// A cell that leaves the tree leaves a gone node in its place (depth
 /// [`GONE`]), dropped with the others once they outnumber the cells: the
@@ -352,6 +361,8 @@ pub struct Ended {
 #[derive(Debug, Clone)]
 pub struct Tree {
     nodes: Vec<Node>,
+    /// Every domain with a cell, by identifier.
+    domains: Vec<Domain>,
     /// Gone nodes among `nodes`.
     gone: usize,
     /// The default policies, shared by every cell that has them.
@@ -369,7 +380,9 @@ const _: () = assert!(DEPTH_MAX < GONE);
 /// nodes are.
 impl PartialEq for Tree {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter()) && self.default == other.default
+        self.iter().eq(other.iter())
+            && self.domains == other.domains
+            && self.default == other.default
     }
 }
 
@@ -390,6 +403,7 @@ impl Tree {
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
+            domains: Vec::new(),
             gone: 0,
             default: Arc::new(Policy::DEFAULT),
         }
@@ -419,7 +433,6 @@ impl Tree {
             next_sibling: HOST,
             domain: 0,
             pid: 0,
-            next_pid: 0,
             children: 0,
             depth: GONE,
             on_parent_end: OnParentEnd::Cascade,
@@ -604,14 +617,52 @@ impl Tree {
     /// its number: 1, or 2 when `skip` is 1 (`skip` is the source's number
     /// for a copy, so a copy's `getpid` differs, design D22; 0 for none).
     pub fn add_root(&mut self, id: u32, spec: Spec, skip: u32) -> Result<u32, Error> {
-        if id == HOST {
+        if id == HOST || self.domain_at(id).is_ok() {
             return Err(Error::Invalid);
         }
         let mut node = self.made(id, HOST, id, spec)?;
         let i = self.insert_at(id)?;
-        (node.pid, node.next_pid) = first_numbers(skip);
+        reserve(&mut self.domains, 1)?;
+        let (pid, next_pid) = first_numbers(skip);
+        node.pid = pid;
         self.nodes.insert(i, node);
-        Ok(self.nodes[i].pid)
+        self.open(id, next_pid, 1);
+        Ok(pid)
+    }
+
+    /// Where domain `id` is in the domains (`Ok`), or would go.
+    fn domain_at(&self, id: u32) -> Result<usize, usize> {
+        self.domains.binary_search_by_key(&id, |d| d.id)
+    }
+
+    /// Opens domain `id` with `members` cells, numbering from `next_pid`
+    /// (room reserved).
+    fn open(&mut self, id: u32, next_pid: u32, members: u32) {
+        if let Err(at) = self.domain_at(id) {
+            self.domains.insert(
+                at,
+                Domain {
+                    id,
+                    next_pid,
+                    members,
+                },
+            );
+        }
+    }
+
+    /// A cell joins domain `id`.
+    fn join(&mut self, id: u32) {
+        let at = self.domain_at(id).expect("an open domain");
+        self.domains[at].members += 1;
+    }
+
+    /// A cell leaves domain `id`, which closes with its last.
+    fn leave(&mut self, id: u32) {
+        let at = self.domain_at(id).expect("an open domain");
+        self.domains[at].members -= 1;
+        if self.domains[at].members == 0 {
+            self.domains.remove(at);
+        }
     }
 
     /// Adds cell `id` as a child of `parent`, at `by`'s request: its limits
@@ -659,11 +710,12 @@ impl Tree {
         if p.depth >= DEPTH_MAX {
             return Err(Error::TooDeep);
         }
-        let node = self.made(id, parent, p.domain, spec)?;
+        let domain = p.domain;
+        let node = self.made(id, parent, domain, spec)?;
         let i = self.insert_at(id)?;
         self.nodes.insert(i, node);
         self.link(id, parent);
-        let pid = self.number(id, skip);
+        let pid = self.enroll(domain, skip);
         self.node_mut(id).pid = pid;
         Ok(())
     }
@@ -717,7 +769,6 @@ impl Tree {
             next_sibling: HOST,
             domain,
             pid: 0,
-            next_pid: 1,
             children: 0,
             depth,
             on_parent_end: spec.on_parent_end,
@@ -800,23 +851,36 @@ impl Tree {
         n.next_sibling = HOST;
     }
 
-    /// The next number in cell `id`'s domain, never `skip`.
-    fn number(&mut self, id: u32, skip: u32) -> u32 {
-        let root = self.root_of(id).expect("a cell of the tree");
-        let r = self.node_mut(root);
-        let mut pid = r.next_pid;
+    /// A cell joins domain `domain` and takes its next number there, never
+    /// `skip`: one look in the domains.
+    fn enroll(&mut self, domain: u32, skip: u32) -> u32 {
+        let at = self.domain_at(domain).expect("an open domain");
+        self.domains[at].members += 1;
+        self.next_number(at, skip)
+    }
+
+    /// The next number in domain `domain`, never `skip`.
+    fn number(&mut self, domain: u32, skip: u32) -> u32 {
+        let at = self.domain_at(domain).expect("an open domain");
+        self.next_number(at, skip)
+    }
+
+    /// The next number in the domain at `at`, never `skip`.
+    fn next_number(&mut self, at: usize, skip: u32) -> u32 {
+        let d = &mut self.domains[at];
+        let mut pid = d.next_pid;
         if pid == skip {
             pid += 1;
         }
-        r.next_pid = pid + 1;
+        d.next_pid = pid + 1;
         pid
     }
 
     /// Adds the cells `ids` as copies of `source` (design D13): siblings of
-    /// it, all or none. Copies of a root are roots, each of a new domain
-    /// (its identifier the copy's), numbered from 1 but never with the
-    /// source's number;
-    /// copies of any other cell are carved from its parent's budget again.
+    /// it in its domain (a copy holds what its source held: the same
+    /// tenant), all or none, numbered there after every cell it had, so
+    /// never with the source's number. Copies of a root are roots; copies
+    /// of any other cell are carved from its parent's budget again.
     /// A copy has the source's limits and policies, and no children.
     /// `placed(k, pid, domain)` learns the number and domain of copy `k`.
     pub fn add_copies(
@@ -872,17 +936,13 @@ impl Tree {
             if let Some(p) = &policy {
                 n.policy = p.clone();
             }
-            if parent == HOST {
-                n.domain = id;
-                (n.pid, n.next_pid) = first_numbers(pid);
-                placed(k, n.pid, id);
-            } else {
-                let domain = n.domain;
+            let domain = n.domain;
+            if parent != HOST {
                 self.link(id, parent);
-                let p = self.number(id, 0);
-                self.node_mut(id).pid = p;
-                placed(k, p, domain);
             }
+            let p = self.enroll(domain, pid);
+            self.node_mut(id).pid = p;
+            placed(k, p, domain);
         }
         Ok(())
     }
@@ -933,7 +993,7 @@ impl Tree {
             n.parent = new;
             c = n.next_sibling;
         }
-        let pid = self.number(new, 0);
+        let pid = self.number(self.nodes[at].domain, 0);
         self.nodes[at].pid = pid;
         if self.gone > self.len() {
             self.tidy();
@@ -961,6 +1021,9 @@ impl Tree {
         usage: Usage,
         fresh: Fresh,
     ) -> Result<(), Error> {
+        if to == HOST {
+            reserve(&mut self.domains, 1)?; // room for its new domain
+        }
         let n = self.get(id).ok_or(Error::NotFound)?;
         if !self.controls(by, id) {
             return Err(Error::Denied);
@@ -1063,13 +1126,15 @@ impl Tree {
     /// its top is its root.
     fn renumber(&mut self, sub: &[u32], domain: u32, fresh: bool) {
         if fresh {
-            self.node_mut(sub[0]).next_pid = 1;
+            self.open(domain, 1, 0);
         }
         for &c in sub {
-            self.node_mut(c).domain = domain;
+            let old = core::mem::replace(&mut self.node_mut(c).domain, domain);
+            self.leave(old);
+            self.join(domain);
         }
         for &c in sub {
-            let pid = self.number(c, 0);
+            let pid = self.number(domain, 0);
             self.node_mut(c).pid = pid;
         }
     }
@@ -1083,7 +1148,9 @@ impl Tree {
     pub fn end(&mut self, id: u32, fresh: Fresh) -> Result<Ended, Error> {
         let n = self.get(id).ok_or(Error::NotFound)?;
         if n.children == 0 {
+            let domain = n.domain;
             self.unlink(id);
+            self.leave(domain);
             let i = self.index(id).expect("a cell of the tree");
             if self.nodes.len() - i > NEAR {
                 self.bury(i);
@@ -1115,6 +1182,7 @@ impl Tree {
         for &p in &ended.promoted {
             subs.push(self.subtree(p)?);
         }
+        reserve(&mut self.domains, ended.promoted.len())?;
         let domains: Vec<u32> = {
             let mut d = Vec::new();
             reserve(&mut d, ended.promoted.len())?;
@@ -1136,6 +1204,10 @@ impl Tree {
             self.renumber(&subs[k], domains[k], true);
         }
         self.unlink(id);
+        for k in 0..ended.gone.len() {
+            let domain = self.node(ended.gone[k]).domain;
+            self.leave(domain);
+        }
         self.nodes.retain(|n| !ended.gone.contains(&n.id));
         ended.gone.swap_remove(0); // the cell itself
         ended.gone.sort_unstable_by(|a, b| b.cmp(a));
@@ -1258,9 +1330,12 @@ impl Tree {
                 return Err("identifier, domain or number 0");
             }
             let root = self.root_of(n.id).ok_or("a broken parent chain")?;
-            let r = self.node(root);
-            if n.domain != r.domain || n.pid >= r.next_pid {
-                return Err("domain or number unlike its root's");
+            let d = self.domain_at(n.domain).map(|at| self.domains[at]);
+            if n.domain != self.node(root).domain || d.is_err() {
+                return Err("a domain unlike its root's, or closed");
+            }
+            if d.is_ok_and(|d| n.pid >= d.next_pid) {
+                return Err("a number not below its domain's counter");
             }
             if self
                 .iter()
@@ -1300,11 +1375,12 @@ impl Tree {
                 if !self.children(p.id).any(|c| c == n.id) {
                     return Err("a cell missing from its parent's children");
                 }
-            } else if self
-                .iter()
-                .any(|m| m.is_root() && m.id != n.id && m.domain == n.domain)
-            {
-                return Err("two roots in a domain");
+            }
+        }
+        for d in &self.domains {
+            let members = self.iter().filter(|n| n.domain == d.id).count();
+            if d.members == 0 || d.members as usize != members {
+                return Err("a domain's cells miscounted");
             }
         }
         Ok(())

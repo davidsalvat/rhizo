@@ -523,7 +523,12 @@ impl Server {
                     return Err((Error::Denied, String::from("a scoped client only narrows")));
                 }
             }
-            Request::Stats | Request::Shutdown | Request::Scoped { .. } | Request::Floor { .. } => {
+            Request::Stats
+            | Request::Shutdown
+            | Request::Scoped { .. }
+            | Request::Floor { .. }
+            | Request::Publish { .. }
+            | Request::Withdraw(_) => {
                 return Err((
                     Error::Denied,
                     String::from("not for a client scoped to a subtree"),

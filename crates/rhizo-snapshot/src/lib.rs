@@ -183,6 +183,10 @@ pub struct Snapshot {
     /// The identifier of the cell it was taken from in this kernel; 0 for
     /// one read from bytes, which names no cell here.
     origin: u32,
+    /// The domain of that cell when it was taken (design D21 of
+    /// `add-cell-hierarchy`): the frames it refers to are of this domain or
+    /// public. 0 for one read from bytes, which refers to no frame.
+    domain: u32,
     /// Where the tree section starts (its length), found once: every
     /// resume reads it.
     tree: usize,
@@ -430,6 +434,7 @@ impl Snapshot {
             release,
             records: data_start - pages * RECORD,
             origin: cell.id,
+            domain: cell.domain,
             tree: tail,
         }
     }
@@ -453,24 +458,43 @@ impl Snapshot {
             b.extend_from_slice(&self.bytes);
             return b;
         }
+        self.laid_out(mem, &mut |_| false)
+    }
+
+    /// The snapshot's bytes with the contents of the frames it refers to in
+    /// place, except those `keep` names, which stay references.
+    fn laid_out(&self, mem: &impl PhysicalMemory, keep: &mut impl FnMut(u64) -> bool) -> Vec<u8> {
         let (records, pages) = (self.records(), self.page_count());
-        let data_len: u64 = (0..pages).map(|i| self.page(i).size.bytes()).sum();
+        let mut data_len = 0;
+        let kept: Vec<bool> = (0..pages)
+            .map(|i| {
+                let page = self.page(i);
+                let kept = matches!(page.data, Data::Frame(phys) if keep(phys));
+                if !kept {
+                    data_len += page.size.bytes() as usize;
+                }
+                kept
+            })
+            .collect();
         let tail = &self.bytes[self.files_at()..];
-        let mut b = Vec::with_capacity(
-            records + pages * RECORD + data_len as usize + tail.len() + CHECKSUM,
-        );
+        let mut b = Vec::with_capacity(records + pages * RECORD + data_len + tail.len() + CHECKSUM);
         b.extend_from_slice(&self.bytes[..records]);
         let mut offset = 0u64;
-        for i in 0..pages {
+        for (i, &kept) in kept.iter().enumerate() {
             let rec = &self.bytes[records + i * RECORD..][..RECORD];
             b.extend_from_slice(&rec[..8]);
-            b.extend_from_slice(&offset.to_le_bytes());
+            if kept {
+                b.extend_from_slice(&rec[8..16]); // the frame's address
+            } else {
+                b.extend_from_slice(&offset.to_le_bytes());
+                offset += self.page(i).size.bytes();
+            }
             b.extend_from_slice(&rec[16..REFERS]);
-            b.extend_from_slice(&[0; 6]);
-            offset += self.page(i).size.bytes();
+            b.extend_from_slice(&[kept as u8, 0, 0, 0, 0, 0]);
         }
-        for i in 0..pages {
+        for (i, &kept) in kept.iter().enumerate() {
             match self.page(i).data {
+                _ if kept => {}
                 Data::Bytes(data) => b.extend_from_slice(data),
                 Data::Frame(phys) => {
                     let at = b.len();
@@ -483,9 +507,58 @@ impl Snapshot {
         b
     }
 
+    /// The domain of the cell it was taken from (design D21 of
+    /// `add-cell-hierarchy`), 0 for one read from bytes.
+    pub fn domain(&self) -> u32 {
+        self.domain
+    }
+
+    /// Makes the snapshot one of `domain` (design D21 of
+    /// `add-cell-hierarchy`): it keeps referring only to the frames `keep`
+    /// names (the new domain's and public ones), the contents of every
+    /// other frame it refers to are copied into it, and its reference to
+    /// those is given back. What it restores is unchanged.
+    pub fn move_to(
+        &mut self,
+        domain: u32,
+        mem: &impl PhysicalMemory,
+        keep: &mut impl FnMut(u64) -> bool,
+    ) {
+        self.domain = domain;
+        if self.frames == 0 {
+            return;
+        }
+        let bytes = self.laid_out(mem, keep);
+        let old = core::mem::replace(&mut self.bytes, bytes);
+        // The tree section ends both, unchanged.
+        self.tree = self.bytes.len() - (old.len() - self.tree);
+        let records = self.records;
+        let mut kept = 0;
+        for i in 0..self.page_count() {
+            let (was, is) = (
+                &old[records + i * RECORD..],
+                &self.bytes[records + i * RECORD..],
+            );
+            if was[REFERS] == 1 && is[REFERS] == 0 {
+                let size = match was[16] {
+                    1 => PageSize::Large,
+                    _ => PageSize::Small,
+                };
+                (self.release)(u64_at(was, 8), size);
+            }
+            kept += usize::from(is[REFERS]);
+        }
+        self.frames = kept;
+    }
+
     /// Bytes the snapshot takes in the kernel heap.
     pub fn heap_bytes(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Whether it refers to a frame instead of holding the page.
+    pub fn refers(&self) -> bool {
+        self.frames > 0
     }
 
     /// Bytes of the frames it refers to.
@@ -540,6 +613,7 @@ impl Snapshot {
             release: |_, _| {},
             records: 0,
             origin: 0,
+            domain: 0,
             tree: 0,
         };
         let pages = snapshot.page_count();

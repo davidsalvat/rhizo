@@ -70,6 +70,9 @@ pub struct Host {
     /// cell table (design D4 of `add-cell-hierarchy`), counted in
     /// [`RESERVED_SOCKETS`] and [`RESERVED_CELLS`].
     pub(super) reserved: rhizo_cap::Limits,
+    /// Templates published, and dropped ones still shared (design D21 of
+    /// `add-cell-hierarchy`).
+    pub(super) published: Published,
 }
 
 /// Words of a running cell's memory ([`Host::watch`]), read through the
@@ -128,6 +131,7 @@ impl Host {
             ends: Vec::new(),
             settling: false,
             reserved: rhizo_cap::Limits::ZERO,
+            published: Published::default(),
         }
     }
 
@@ -630,5 +634,6 @@ impl Drop for Host {
         }
         self.tree = rhizo_cap::Tree::new();
         self.refresh_reserved();
+        self.drop_held();
     }
 }

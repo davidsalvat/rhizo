@@ -35,8 +35,8 @@ pub(super) fn files_of(snapshot: &Snapshot) -> Fs {
 
 /// The files a CPython cell starts with (`cpython-files`, packed by `xtask`:
 /// the standard library under `/usr/lib/python3.13` and `/app/agent_demo.py`;
-/// design D2 of `add-cpython`), decoded once and then shared copy-on-write
-/// by every CPython cell; `None` when CPython was not built.
+/// design D2 of `add-cpython`), decoded once and published, then shared
+/// copy-on-write by every CPython cell; `None` when CPython was not built.
 #[cfg_attr(
     not(any(feature = "ktest", feature = "bench-cell")),
     allow(dead_code, reason = "used by in-kernel tests and benchmarks")
@@ -47,17 +47,28 @@ pub fn cpython_files() -> Option<Fs> {
     if bytes.is_empty() {
         return None;
     }
-    Some(FILES.with(|files| {
-        files
-            .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
-            .clone()
-    }))
+    Some(FILES.with(|files| files.get_or_insert_with(|| published(bytes)).clone()))
+}
+
+/// The host's file set `bytes`, decoded and published (design D21 of
+/// `add-cell-hierarchy`): public, the pages of its executables and
+/// libraries loaded now and kept as long as the kernel runs, shared by
+/// every domain.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+fn published(bytes: &[u8]) -> Fs {
+    let mut fs = Fs::decode(bytes).expect("xtask packs a valid file system");
+    publish_files(&mut fs);
+    fs
 }
 
 /// The files of the dynamically linked `hello` (`dynamic-files`, packed by
 /// `xtask` with its interpreter and libraries; change
-/// `add-dynamic-linking`), decoded once and then shared copy-on-write by
-/// every cell given them; `None` when they were not packed.
+/// `add-dynamic-linking`), decoded once and published, then shared
+/// copy-on-write by every cell given them; `None` when they were not
+/// packed.
 #[cfg_attr(
     not(any(feature = "ktest", feature = "bench-cell")),
     allow(dead_code, reason = "used by in-kernel tests and benchmarks")
@@ -68,16 +79,21 @@ pub fn dynamic_files() -> Option<Fs> {
 }
 
 /// The files of the distribution's programs (`distro-files`: `ls`, `sort`,
-/// `python3`, their interpreter, libraries and data), as
-/// [`dynamic_files`]; packed natively only, and embedded in test kernels
-/// only.
+/// `python3`, their interpreter, libraries and data), decoded once and
+/// shared copy-on-write like [`dynamic_files`]; packed natively only, and
+/// embedded in test kernels only. A test fixture, not a set the host ships:
+/// not published (design D21 of `add-cell-hierarchy`), so its pages are
+/// kept per domain and go once unmapped, instead of pinning about 16 MiB
+/// for as long as the kernel runs.
 #[cfg_attr(
     not(feature = "ktest"),
     allow(dead_code, reason = "used by in-kernel tests")
 )]
 pub fn distro_files() -> Option<Fs> {
     static FILES: Global<Option<Fs>> = Global::new(None);
-    decoded(&FILES, "distro-files")
+    let bytes = test_image("distro-files");
+    let decode = || Fs::decode(bytes).expect("xtask packs a valid file system");
+    (!bytes.is_empty()).then(|| FILES.with(|files| files.get_or_insert_with(decode).clone()))
 }
 
 /// The files of the dynamically linked CPython with packages from PyPI
@@ -116,9 +132,5 @@ fn decoded(slot: &Global<Option<Fs>>, name: &str) -> Option<Fs> {
     if bytes.is_empty() {
         return None;
     }
-    Some(slot.with(|files| {
-        files
-            .get_or_insert_with(|| Fs::decode(bytes).expect("xtask packs a valid file system"))
-            .clone()
-    }))
+    Some(slot.with(|files| files.get_or_insert_with(|| published(bytes)).clone()))
 }
