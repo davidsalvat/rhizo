@@ -13,6 +13,7 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(contiguous_frames),
     ktest_case!(page_zero_and_copy_match_byte_loops),
     ktest_case!(hardware_checksum_matches_the_table),
+    ktest_case!(memory_routines_match_a_byte_model),
     ktest_case!(map_use_and_unmap_a_page),
     ktest_case!(double_mapping_is_rejected),
     ktest_case!(box_and_vec_work),
@@ -159,6 +160,162 @@ fn page_zero_and_copy_match_byte_loops() {
     }
     for i in 0..2 * PAGES as u64 {
         memory::with_frames(|f| f.free(run + i * FRAME_SIZE));
+    }
+}
+
+// The kernel's memory routines (its own on AArch64, change
+// `fast-thread-switch-aarch64`; `compiler_builtins`' on x86_64), called by
+// symbol: a constant length would let the compiler inline the copy.
+unsafe extern "C" {
+    fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8;
+    fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32;
+}
+
+/// Byte `i` of the pattern `seed`: the reference the routines' results are
+/// checked against, byte by byte (never with a routine under test).
+fn pattern(seed: u64, i: usize) -> u8 {
+    ((i as u64 ^ seed).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8
+}
+
+/// Bytes `range` of `buf` as the pattern `seed`.
+fn fill(buf: &mut [u8], seed: u64, range: core::ops::Range<usize>) {
+    for i in range {
+        buf[i] = pattern(seed, i);
+    }
+}
+
+/// `start..end` and 16 bytes each side, within a buffer of `len` bytes.
+fn near(start: usize, end: usize, len: usize) -> core::ops::Range<usize> {
+    start.saturating_sub(16)..(end + 16).min(len)
+}
+
+/// `memcpy`, `memmove`, `memset` and `memcmp` give what a byte loop gives,
+/// and touch nothing else: every length 0–160 at every pair of offsets
+/// modulo 16, overlapping moves at every distance up to 72 bytes in both
+/// directions, and random lengths and offsets up to 4,096 (change
+/// `fast-thread-switch-aarch64`).
+fn memory_routines_match_a_byte_model() {
+    const LEN: usize = 4096;
+    const ROOM: usize = 2 * LEN + 64;
+    let (a_seed, b_seed) = (0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321);
+    let mut a = alloc::vec![0u8; ROOM];
+    let mut b = alloc::vec![0u8; ROOM];
+    fill(&mut a, a_seed, 0..ROOM);
+    // `n` bytes from `a[s..]` to `b[d..]`, with `b` as `b_seed` around
+    // them (16 bytes each side are checked).
+    let copy = |a: &[u8], b: &mut [u8], s: usize, d: usize, n: usize| {
+        let near = near(d, d + n, b.len());
+        fill(b, b_seed, near.clone());
+        // SAFETY: both ranges are inside their buffers, which are distinct.
+        let ret = unsafe { memcpy(b.as_mut_ptr().add(d), a.as_ptr().add(s), n) };
+        assert_eq!(ret, b[d..].as_mut_ptr(), "memcpy returns its destination");
+        for j in near {
+            let want = if (d..d + n).contains(&j) {
+                pattern(a_seed, s + j - d)
+            } else {
+                pattern(b_seed, j)
+            };
+            assert_eq!(b[j], want, "memcpy of {n} from {s} to {d}: byte {j}");
+        }
+    };
+    // `n` bytes within `b`, from `s` to `d`.
+    let mov = |b: &mut [u8], s: usize, d: usize, n: usize| {
+        let near = near(s.min(d), s.max(d) + n, b.len());
+        fill(b, b_seed, near.clone());
+        // SAFETY: both ranges are inside `b`; `memmove` allows overlap.
+        let ret = unsafe { memmove(b.as_mut_ptr().add(d), b.as_ptr().add(s), n) };
+        assert_eq!(ret, b[d..].as_mut_ptr(), "memmove returns its destination");
+        for j in near {
+            let at = if (d..d + n).contains(&j) {
+                s + j - d
+            } else {
+                j
+            };
+            assert_eq!(
+                b[j],
+                pattern(b_seed, at),
+                "memmove of {n} from {s} to {d}: byte {j}"
+            );
+        }
+    };
+    let set = |b: &mut [u8], d: usize, n: usize, c: u8| {
+        let near = near(d, d + n, b.len());
+        fill(b, b_seed, near.clone());
+        // SAFETY: the range is inside `b`. The high bits of `c` are ignored.
+        let ret = unsafe { memset(b.as_mut_ptr().add(d), 0x7700 | c as i32, n) };
+        assert_eq!(ret, b[d..].as_mut_ptr(), "memset returns its destination");
+        for j in near {
+            let want = if (d..d + n).contains(&j) {
+                c
+            } else {
+                pattern(b_seed, j)
+            };
+            assert_eq!(b[j], want, "memset of {n} at {d}: byte {j}");
+        }
+    };
+    // `a[s..s + n]` against a copy of it in `b[d..]` with byte `k` changed
+    // by `delta` (none if `k >= n`), and every byte after `k` scrambled.
+    let cmp = |a: &[u8], b: &mut [u8], s: usize, d: usize, n: usize, k: usize, delta: u8| {
+        for j in 0..n {
+            b[d + j] = match j.cmp(&k) {
+                core::cmp::Ordering::Less => a[s + j],
+                core::cmp::Ordering::Equal => a[s + j].wrapping_add(delta),
+                core::cmp::Ordering::Greater => pattern(b_seed, j),
+            };
+        }
+        // SAFETY: both ranges are inside their buffers.
+        let got = unsafe { memcmp(a.as_ptr().add(s), b.as_ptr().add(d), n) };
+        let want = if k < n {
+            a[s + k] as i32 - b[d + k] as i32
+        } else {
+            0
+        };
+        assert_eq!(
+            got.signum(),
+            want.signum(),
+            "memcmp of {n} at {s} and {d}, differing at {k}"
+        );
+    };
+    for n in 0..=160 {
+        for (s, d) in (0..16).flat_map(|s| (0..16).map(move |d| (s, d))) {
+            copy(&a, &mut b, 16 + s, 16 + d, n);
+            cmp(&a, &mut b, s, d, n, n, 0);
+            if n > 0 {
+                cmp(&a, &mut b, s, d, n, (s * 16 + d) % n, 1 + (n as u8 % 255));
+            }
+        }
+        for d in 0..16 {
+            set(&mut b, 16 + d, n, n as u8);
+        }
+        for dist in 0..=72 {
+            mov(&mut b, 100, 100 + dist, n);
+            mov(&mut b, 100 + dist, 100, n);
+        }
+    }
+    // Explicit edges: a whole page, page-aligned or not, and a byte more.
+    for (s, d, n) in [(0, 0, LEN), (0, LEN, LEN), (1, 7, LEN), (3, 0, LEN + 1)] {
+        copy(&a, &mut b, s, d, n);
+        mov(&mut b, s, d, n);
+        mov(&mut b, d, s, n);
+        set(&mut b, d, n, 0);
+        cmp(&a, &mut b, s, d, n, n - 1, 0x80);
+    }
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |below: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % below as u64) as usize
+    };
+    for _ in 0..300 {
+        let n = next(LEN + 1);
+        let (s, d) = (next(LEN + 1), next(LEN + 1));
+        copy(&a, &mut b, s, d, n);
+        mov(&mut b, s, d, n);
+        set(&mut b, d, n, next(256) as u8);
+        cmp(&a, &mut b, s, d, n, next(n + 1), 1 + next(255) as u8);
     }
 }
 
