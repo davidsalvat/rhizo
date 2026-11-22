@@ -18,6 +18,8 @@ pub struct Client {
     pub info: Info,
     /// The protocol the kernel speaks: [`VERSION`] or [`PREVIOUS`].
     pub protocol: u8,
+    /// The state directory of its VM.
+    pub dir: Dir,
 }
 
 /// A successful reply: the request's identifier, its body, the kernel's
@@ -94,6 +96,7 @@ impl Client {
             pending: VecDeque::new(),
             info,
             protocol,
+            dir: dir.clone(),
         })
     }
 

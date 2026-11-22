@@ -238,15 +238,17 @@ fn benchmarks(console: &mut impl Console) {
         "rhizo-files write_read_ns={write_read} fork_ns={fork_files}"
     );
     let (pipe, loopback, tcp_resume) = net();
+    let egress = egress_check();
     let _ = writeln!(
         rhizo_hal::ConsoleWriter(console),
-        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback} tcp_resume_ns={tcp_resume}"
+        "rhizo-net pipe_rtt_ns={pipe} loopback_rtt_ns={loopback} tcp_resume_ns={tcp_resume} \
+         egress_check_ns={egress}"
     );
-    match wire_rtt() {
-        Ok(rtt) => {
+    match wire_rtts() {
+        Ok((rtt, rules)) => {
             let _ = writeln!(
                 rhizo_hal::ConsoleWriter(console),
-                "rhizo-wire tcp_rtt_ns={rtt}"
+                "rhizo-wire tcp_rtt_ns={rtt} tcp_rtt_rules_ns={rules}"
             );
         }
         Err(why) => {

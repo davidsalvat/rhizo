@@ -1523,8 +1523,8 @@ Alternatives:
   read-only pages of the executables the kernel keeps loaded, and every
   page of a template published now. A cell that shares nothing else is
   left as it is.
-- **Publication** (`publish` and `withdraw`, protocol 4 requests 0x14 and
-  0x15, `rhizo publish N [--attest]` and `rhizo withdraw N`) therefore
+- **Publication** (`publish` and `withdraw`, protocol 4 requests 0x15 and
+  0x16, `rhizo publish N [--attest]` and `rhizo withdraw N`) therefore
   decides only what copies placed in other domains share. A client scoped
   to a subtree is refused both. The control kernel publishes the file sets
   it ships when it starts. `Host::publish` asks `Host::may_publish`, where

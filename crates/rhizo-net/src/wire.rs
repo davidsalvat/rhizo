@@ -5,6 +5,12 @@
 //! [`State::Wire`]; a UDP socket that sent to the outside also has a
 //! `smoltcp` socket on its port. [`Net::poll_wire`] moves frames between the
 //! card and `smoltcp` and wakes the wait queues of the sockets on the wire.
+//!
+//! Address translation (design D6 of `add-cell-hierarchy`): a socket keeps
+//! the port of its cell's loopback network, which `getsockname` shows with
+//! the card's address, while its `smoltcp` socket takes a card port drawn
+//! at random among the free ones ([`Net::card_port`]): no cell learns from
+//! the ports it gets, or from `EADDRINUSE`, what other cells opened.
 
 use super::*;
 use alloc::vec;
@@ -54,6 +60,10 @@ pub(crate) struct Wire {
     sockets: SocketSet<'static>,
     dhcp: Option<SocketHandle>,
     addr: Option<[u8; 4]>,
+    /// The host as the guest sees it: the gateway and the name servers
+    /// (always in the deny floor, design D7 of `add-cell-hierarchy`).
+    gateway: Option<[u8; 4]>,
+    dns: [Option<[u8; 4]>; 3],
     /// Connections closed by the cells, dropped from `smoltcp` once done,
     /// or aborted at the time given (a peer that never closes its side).
     closing: Vec<(SocketHandle, Option<Instant>)>,
@@ -170,6 +180,11 @@ impl Wire {
         self.sockets.get_mut::<tcp::Socket>(handle)
     }
 
+    /// Whether `ip` is the host's: the gateway or a name server.
+    pub(crate) fn is_host(&self, ip: [u8; 4]) -> bool {
+        self.gateway == Some(ip) || self.dns.contains(&Some(ip))
+    }
+
     fn set_address(&mut self, cidr: Option<([u8; 4], u8)>, gateway: Option<[u8; 4]>) {
         self.iface.update_ip_addrs(|addrs| {
             addrs.clear();
@@ -182,6 +197,7 @@ impl Wire {
             let _ = self.iface.routes_mut().add_default_ipv4_route(v4(gw));
         }
         self.addr = cidr.map(|(ip, _)| ip);
+        self.gateway = gateway;
     }
 }
 
@@ -200,6 +216,8 @@ impl Net {
             sockets: SocketSet::new(Vec::new()),
             dhcp: None,
             addr: None,
+            gateway: None,
+            dns: [None; 3],
             closing: Vec::new(),
             timeout: TIMEOUT,
         };
@@ -275,11 +293,17 @@ impl Net {
         }
         if let Some(h) = wire.dhcp {
             let lease = match wire.sockets.get_mut::<dhcpv4::Socket>(h).poll() {
-                Some(dhcpv4::Event::Configured(c)) => Some(Some((
-                    c.address.address().octets(),
-                    c.address.prefix_len(),
-                    c.router,
-                ))),
+                Some(dhcpv4::Event::Configured(c)) => {
+                    wire.dns = [None; 3];
+                    for (d, s) in wire.dns.iter_mut().zip(&c.dns_servers) {
+                        *d = Some(s.octets());
+                    }
+                    Some(Some((
+                        c.address.address().octets(),
+                        c.address.prefix_len(),
+                        c.router,
+                    )))
+                }
                 Some(dhcpv4::Event::Deconfigured) => Some(None),
                 None => None,
             };
@@ -290,11 +314,20 @@ impl Net {
                 }
                 Some(None) => {
                     wire.set_address(None, None);
+                    wire.dns = [None; 3];
                     self.changes += 1;
                 }
                 None => {}
             }
         }
+        // Datagrams from sources their socket's policy does not allow are
+        // dropped as they arrive, so they never show as readable.
+        if changed == PollResult::SocketStateChanged && self.has_policies() {
+            for h in 0..self.sockets.len() as Handle {
+                self.drop_denied(h);
+            }
+        }
+        let wire = self.wire.as_mut()?;
         let Wire {
             sockets, closing, ..
         } = wire;
@@ -327,6 +360,30 @@ impl Net {
         }
     }
 
+    /// A free port of the card, drawn at random (design D6): the card has
+    /// 28,232 and the kernel at most [`SOCKETS_MAX`] sockets plus those
+    /// still closing, so a few draws find one; a draw that finds it taken
+    /// is drawn again, unseen.
+    pub(crate) fn card_port(&mut self) -> Result<u16> {
+        let span = u64::from(EPHEMERAL.end() - EPHEMERAL.start()) + 1;
+        for _ in 0..64 {
+            // A domain of its own under the secret, apart from parked keys.
+            let draw = siphash24(self.secret, (1 << 63) | self.card_draws);
+            self.card_draws += 1;
+            let port = EPHEMERAL.start() + (draw % span) as u16;
+            let closing = self.wire.as_ref().is_some_and(|w| {
+                w.closing.iter().any(|&(c, _)| {
+                    let s = w.sockets.get::<tcp::Socket>(c);
+                    s.local_endpoint().is_some_and(|e| e.port == port)
+                })
+            });
+            if !closing && self.sockets.iter().flatten().all(|s| s.card != port) {
+                return Ok(port);
+            }
+        }
+        Err(Error::AddrInUse)
+    }
+
     /// Starts a TCP connection from `h` to `ip:port` outside: `InProgress`.
     pub(crate) fn wire_connect(&mut self, h: Handle, ip: [u8; 4], port: u16) -> Result<()> {
         let Some(mine) = self.wire_addr() else {
@@ -336,6 +393,7 @@ impl Net {
             Some(Addr::Inet { port, .. }) => port,
             _ => self.ephemeral(h, Type::Stream)?,
         };
+        let card = self.card_port()?;
         let wire = self.wire.as_mut().ok_or(Error::NetUnreach)?;
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
@@ -348,7 +406,7 @@ impl Net {
             .unwrap_or_default();
         socket.set_nagle_enabled(!opts.no_delay);
         if socket
-            .connect(wire.iface.context(), (v4(ip), port), (v4(mine), local))
+            .connect(wire.iface.context(), (v4(ip), port), (v4(mine), card))
             .is_err()
         {
             return Err(Error::Invalid);
@@ -360,6 +418,7 @@ impl Net {
             port: local,
         });
         s.remote = Some(Addr::Inet { ip, port });
+        s.card = card;
         s.state = State::Wire {
             handle,
             ever_open: false,
@@ -469,6 +528,15 @@ impl Net {
         }
     }
 
+    /// Connection `handle` is no longer allowed: reset (RST), then left to
+    /// `smoltcp`'s closing ones.
+    pub(crate) fn wire_abort(&mut self, handle: SocketHandle) {
+        if let Some(wire) = self.wire.as_mut() {
+            wire.tcp(handle).abort();
+            wire.closing.push((handle, None));
+        }
+    }
+
     /// The cells are done with connection `handle`: it closes, and leaves
     /// `smoltcp` once closed or after [`LINGER`].
     pub(crate) fn wire_close(&mut self, handle: SocketHandle) {
@@ -480,17 +548,16 @@ impl Net {
         }
     }
 
-    /// Sends a datagram from `h` (bound to `port`) to `ip:dport` outside;
+    /// Sends a datagram from `h` to `ip:dport` outside, from its card port;
     /// dropped if `smoltcp` has no room, as UDP would.
     pub(crate) fn wire_send_to(
         &mut self,
         h: Handle,
-        port: u16,
         data: &[u8],
         ip: [u8; 4],
         dport: u16,
     ) -> Result<()> {
-        let handle = self.wire_udp(h, port)?;
+        let handle = self.wire_udp(h)?;
         let wire = self.wire.as_mut().ok_or(Error::NetUnreach)?;
         let _ = wire
             .sockets
@@ -499,14 +566,16 @@ impl Net {
         Ok(())
     }
 
-    /// The `smoltcp` UDP socket of `h` on `port`, made the first time.
-    fn wire_udp(&mut self, h: Handle, port: u16) -> Result<SocketHandle> {
+    /// The `smoltcp` UDP socket of `h`, made the first time on a random
+    /// card port: datagrams from outside reach `h` by that port.
+    fn wire_udp(&mut self, h: Handle) -> Result<SocketHandle> {
         if self.wire_addr().is_none() {
             return Err(Error::NetUnreach);
         }
         if let Some(handle) = self.get(h)?.udp {
             return Ok(handle);
         }
+        let port = self.card_port()?;
         let wire = self.wire.as_mut().ok_or(Error::NetUnreach)?;
         let buffer = || {
             udp::PacketBuffer::new(
@@ -517,8 +586,34 @@ impl Net {
         let mut socket = udp::Socket::new(buffer(), buffer());
         socket.bind(port).map_err(|_| Error::AddrInUse)?;
         let handle = wire.sockets.add(socket);
-        self.get_mut(h)?.udp = Some(handle);
+        let s = self.get_mut(h)?;
+        s.udp = Some(handle);
+        s.card = port;
         Ok(handle)
+    }
+
+    /// Drops the datagrams waiting on `h`'s card port whose source its
+    /// network may not hear from (design D7: no command and control by
+    /// UDP), up to the first it may.
+    pub(crate) fn drop_denied(&mut self, h: Handle) {
+        let Some((udp, net)) = self.get(h).ok().and_then(|s| Some((s.udp?, s.net))) else {
+            return;
+        };
+        loop {
+            let Some(wire) = self.wire.as_mut() else {
+                return;
+            };
+            let Ok((_, meta)) = wire.sockets.get_mut::<udp::Socket>(udp).peek() else {
+                return;
+            };
+            let (IpAddress::Ipv4(ip), port) = (meta.endpoint.addr, meta.endpoint.port);
+            if self.allows(net, Proto::Udp, ip.octets(), port) {
+                return;
+            }
+            if let Some(wire) = self.wire.as_mut() {
+                let _ = wire.sockets.get_mut::<udp::Socket>(udp).recv();
+            }
+        }
     }
 
     /// The next datagram from the wire for UDP socket `handle`.

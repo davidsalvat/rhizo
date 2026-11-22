@@ -20,7 +20,121 @@ pub(super) const ALL: &[TestCase] = &[
     ktest_case!(pipes_and_sockets_of_a_fork),
     ktest_case!(a_cell_reaches_the_host, 31),
     ktest_case!(a_silent_connection_outlasts_the_timeout_and_reconnects_at_once),
+    ktest_case!(egress_levels_against_the_echo_server),
+    ktest_case!(ports_of_other_domains_do_not_show),
 ];
+
+/// `ADDR:PORT` of `at`.
+fn endpoint((ip, port): ([u8; 4], u16)) -> alloc::string::String {
+    alloc::format!("{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3])
+}
+
+/// Each egress level against the host (spec `networking`, "Each level",
+/// "Default" and "Host services behind the gateway"; design D7 of
+/// `add-cell-hierarchy`): cells with no policy, `model`, a rule for the
+/// echo server and `full` connect to the model endpoint, the echo server
+/// and another port of the host. Each connects exactly where its policy
+/// allows, and the host's other port, behind its gateway, is in the deny
+/// floor for all of them, `full` included. Not run without a card, an echo
+/// server and a model server.
+fn egress_levels_against_the_echo_server() {
+    let opts = crate::wire::options();
+    let (Some(echo), Some(model)) = (opts.echo, opts.llm) else {
+        arch::console::BootConsole
+            .write_bytes(b"(no network card, echo and model servers: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card gets an address"
+    );
+    let targets = [endpoint(model), endpoint(echo), endpoint((echo.0, 1))];
+    let argv: Vec<&[u8]> = targets.iter().map(|t| t.as_bytes()).collect();
+    for (egress, want) in [
+        (None, "DDD\n"),
+        (Some(crate::wire::model_egress()), "CDD\n"),
+        (Some(crate::wire::echo_egress()), "DCD\n"),
+        (Some(rhizo_net::Egress::Full), "CCD\n"),
+    ] {
+        // Records of earlier tests out of the way: nothing empties the ring
+        // in a test build.
+        while crate::audit::take().is_some() {}
+        let id = spawn(&mut host, "reach", &argv);
+        if let Some(egress) = egress {
+            assert!(host.set_egress(id, egress));
+        }
+        host.run(|h| h.finished(id).is_some());
+        assert_eq!(ended(&host, id), (Ending::Exit(0), want.into()));
+        // Each refusal is audited, naming the cell and the destination;
+        // those of one second fold into one more record, which leaves once
+        // the second is over (spec `networking`, "Egress denials are
+        // audited").
+        let pause = spawn(&mut host, "sleeper", &[b"1100"]);
+        host.run(|h| h.finished(pause).is_some());
+        let mut denied = Vec::new();
+        while let Some(r) = crate::audit::take() {
+            if r.kind == crate::audit::Kind::Egress && r.cell == id {
+                denied.push((r.count, r.detail));
+            }
+        }
+        let refusals = want.bytes().filter(|&b| b == b'D').count() as u32;
+        let first = alloc::format!("tcp {}", targets[want.find('D').unwrap_or(0)]);
+        match denied.first() {
+            Some((_, detail)) => assert_eq!(detail.as_slice(), first.as_bytes(), "{want}"),
+            None => assert_eq!(refusals, 0, "{want}: audited"),
+        }
+        let counted: u32 = denied.iter().map(|&(count, _)| count).sum();
+        assert_eq!(counted, refusals, "{want}: {denied:?}");
+    }
+    drop(host);
+    assert_eq!(crate::cell::open_sockets(), 0);
+}
+
+/// Hostile (spec `networking`, "Ports of other domains"; design D6 of
+/// `add-cell-hierarchy`): while a cell of another domain takes card ports
+/// (connections to the outside) and loopback ports, an observer's own
+/// ephemeral ports follow one another as when it runs alone. Not run
+/// without a card and an echo server.
+fn ports_of_other_domains_do_not_show() {
+    let Some(echo) = crate::wire::options().echo else {
+        arch::console::BootConsole.write_bytes(b"(no network card and echo server: not run) ");
+        return;
+    };
+    let mut host = Host::new();
+    assert!(
+        host.wire_address(10_000_000_000).is_some(),
+        "the card gets an address"
+    );
+    let observer = spawn(&mut host, "observer", &[b"ports"]);
+    while host.output(observer) != Some(b"ready\n") {
+        host.step();
+    }
+    let at = endpoint(echo);
+    let neighbour = spawn(&mut host, "reach", &[b"take", b"100", at.as_bytes()]);
+    assert!(host.set_egress(neighbour, crate::wire::echo_egress()));
+    assert_ne!(host.domain(neighbour), host.domain(observer));
+    while host.output(neighbour) != Some(b"holding\n") {
+        assert!(
+            host.finished(neighbour).is_none(),
+            "{:?}",
+            ended(&host, neighbour)
+        );
+        host.step();
+    }
+    assert!(host.wake(observer));
+    host.run(|h| h.finished(observer).is_some());
+    assert_eq!(
+        ended(&host, observer),
+        (Ending::Exit(0), "ready\nports +1\n".into())
+    );
+    assert!(host.wake(neighbour));
+    host.run(|_| false);
+    assert_eq!(
+        ended(&host, neighbour),
+        (Ending::Exit(0), "holding\n".into())
+    );
+}
 
 /// Pipes, event counters, `poll`, `epoll`, `select` and sockets through a
 /// real libc print what they print on Linux; every frame comes back.
@@ -217,8 +331,14 @@ fn a_discarded_snapshot_closes_its_connections() {
 /// Runs `loopback` with `argv`, suspending it after every scheduling step
 /// and resuming it at once, after `pause` when given (a cell run
 /// meanwhile); returns its whole output and the number of resumes.
-fn suspended_every_step(host: &mut Host, argv: &[&[u8]], pause: Option<&str>) -> (Vec<u8>, usize) {
+fn suspended_every_step(
+    host: &mut Host,
+    argv: &[&[u8]],
+    egress: rhizo_net::Egress,
+    pause: Option<&str>,
+) -> (Vec<u8>, usize) {
     let mut id = spawn(host, "loopback", argv);
+    assert!(host.set_egress(id, egress));
     let mut output = Vec::new();
     let mut resumes = 0;
     loop {
@@ -248,8 +368,12 @@ fn suspended_every_step(host: &mut Host, argv: &[&[u8]], pause: Option<&str>) ->
 /// design D5 of `add-cell-hierarchy`).
 fn loopback_connection_across_suspend_of_one_end() {
     let mut host = Host::new();
-    let (output, resumes) =
-        suspended_every_step(&mut host, &[b"pair", b"7304", b"20", b"yield"], None);
+    let (output, resumes) = suspended_every_step(
+        &mut host,
+        &[b"pair", b"7304", b"20", b"yield"],
+        Default::default(),
+        None,
+    );
     assert!(resumes >= 20, "suspended {resumes} times");
     assert_eq!(alloc::string::String::from_utf8_lossy(&output), "paired\n");
     drop(host);
@@ -274,6 +398,7 @@ fn a_connection_to_the_host_survives_suspend() {
     let (output, resumes) = suspended_every_step(
         &mut host,
         &[b"ping", port.as_bytes(), b"10", ip.as_bytes()],
+        crate::wire::echo_egress(),
         Some("sleeper"),
     );
     assert!(resumes >= 10, "suspended {resumes} times");
@@ -414,6 +539,8 @@ fn a_cell_reaches_the_host() {
         "loopback",
         &[b"ping", port.as_bytes(), b"20", ip.as_bytes()],
     );
+    // Egress `none` by default: it reaches the echo server by a rule.
+    assert!(host.set_egress(id, crate::wire::echo_egress()));
     host.run(|_| false);
     assert_eq!(ended(&host, id), (Ending::Exit(0), "pinged\n".into()));
 }
@@ -441,6 +568,7 @@ fn a_silent_connection_outlasts_the_timeout_and_reconnects_at_once() {
         "quiet",
         &[port.as_bytes(), b"1500", ip.as_bytes()],
     );
+    assert!(host.set_egress(id, crate::wire::echo_egress()));
     host.run(|_| false);
     crate::cell::set_wire_timeout(20_000_000_000);
     assert_eq!(ended(&host, id), (Ending::Exit(0), "quiet ok\n".into()));

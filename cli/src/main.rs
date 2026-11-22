@@ -11,6 +11,7 @@ mod args;
 mod audit;
 mod chat;
 mod client;
+mod floor;
 mod pin;
 mod scope;
 mod serve;
@@ -51,7 +52,7 @@ fn main() -> ExitCode {
             Command::Stats => cmd_stats(&dir),
             Command::Fork { id, n, place } => {
                 let mut client = Client::connect(&dir)?;
-                let request = match placement(&client, &place)? {
+                let request = match placement(&mut client, &place)? {
                     None => Request::fork(id, n),
                     Some(placement) => Request::Fork {
                         cell: id,
@@ -223,6 +224,7 @@ fn cmd_up(dir: &Dir, up: &args::Up) -> Result<(), String> {
         .args(["--cpus", &up.cpus.to_string()])
         .args(["--accel", up.accel.id()])
         .args(up.pin.then_some("--pin"))
+        .args(up.floor.args())
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(err);
@@ -360,18 +362,23 @@ fn template(run: &args::Run) -> Result<Run, String> {
     })
 }
 
-/// The rule of the model endpoint `--llm` names, as the guest reaches it.
-fn model_rule(client: &Client, llm: Option<&str>) -> Result<Option<Rule>, String> {
-    llm.map(|url| {
-        agent::guest_endpoint(url, Vmm::parse(&client.info.vmm)?)
-            .and_then(|e| tree::endpoint_rule(&e))
-    })
-    .transpose()
+/// The rule of the model endpoint `--egress model` names, as the guest
+/// reaches it: the one `--llm` gives, carved out of the deny floor if it is
+/// not yet, else the one `rhizo up --model` gave.
+fn model_rule(client: &mut Client, llm: Option<&str>) -> Result<Option<Rule>, String> {
+    let Some(url) = llm else {
+        return Ok(client.info.floor.as_ref().and_then(|f| f.model));
+    };
+    let rule = agent::guest_endpoint(url, Vmm::parse(&client.info.vmm)?)
+        .and_then(|e| tree::endpoint_rule(&e))?;
+    let dir = client.dir.clone();
+    floor::carve(client, &dir, rule)?;
+    Ok(Some(rule))
 }
 
 /// The placement `place` gives, `None` for the defaults (which version 3
 /// says too).
-fn placement(client: &Client, place: &tree::Place) -> Result<Option<Placement>, String> {
+fn placement(client: &mut Client, place: &tree::Place) -> Result<Option<Placement>, String> {
     if place.is_default() {
         return Ok(None);
     }
@@ -388,7 +395,7 @@ fn cmd_run(dir: &Dir, run: &args::Run) -> Result<(), String> {
     // Attached, its output comes right after the reply (protocol 4).
     let watch = !run.detach && client.current();
     let request = Run {
-        placement: placement(&client, &place)?.unwrap_or_else(Placement::root),
+        placement: placement(&mut client, &place)?.unwrap_or_else(Placement::root),
         watch,
         ..template(run)?
     };

@@ -714,6 +714,7 @@ fn measure_cells(
         let (mut file_write_read, mut fork_files) = (Vec::new(), Vec::new());
         let (mut pipe_rtt, mut loopback_rtt, mut tcp_resume) = (Vec::new(), Vec::new(), Vec::new());
         let (mut wire_rtt, mut wire_skipped) = (Vec::new(), None);
+        let mut wire_rtt_rules = Vec::new();
         let (mut py_cold, mut py_warm) = (Vec::new(), Vec::new());
         let (mut cpy_cold, mut cpy_warm) = (Vec::new(), Vec::new());
         let (mut agent_turn, mut agent_model) = (Vec::new(), Vec::new());
@@ -791,7 +792,10 @@ fn measure_cells(
                         tcp_resume.push(r as f64 / 1000.0);
                     }
                     match parse_wire_line(&out.output) {
-                        Some(Ok(rtt)) => wire_rtt.push(rtt as f64 / 1000.0),
+                        Some(Ok((rtt, rules))) => {
+                            wire_rtt.push(rtt as f64 / 1000.0);
+                            wire_rtt_rules.extend(rules.map(|r| r as f64 / 1000.0));
+                        }
                         Some(Err(why)) => wire_skipped = Some(why),
                         None => {}
                     }
@@ -920,6 +924,7 @@ fn measure_cells(
             ("cell.loopback_rtt_us", "us", &mut loopback_rtt),
             ("cell.tcp_resume_us", "us", &mut tcp_resume),
             ("net.tcp_rtt_us", "us", &mut wire_rtt),
+            ("net.tcp_rtt_rules_us", "us", &mut wire_rtt_rules),
             ("workload.python_cold_us", "us", &mut py_cold),
             ("workload.python_warm_us", "us", &mut py_warm),
             ("workload.cpython_cold_us", "us", &mut cpy_cold),
@@ -1260,14 +1265,16 @@ fn parse_density_line(output: &str) -> Option<(u64, u64)> {
 }
 
 /// The network card line of a `bench-cell` kernel: the round trip to the
-/// host's echo server in nanoseconds, or why it was not measured.
-fn parse_wire_line(output: &str) -> Option<std::result::Result<u64, String>> {
+/// host's echo server in nanoseconds with egress `full`, and with a policy
+/// of 16 rules when given (`tcp_rtt_rules_ns`), or why it was not measured.
+fn parse_wire_line(output: &str) -> Option<std::result::Result<(u64, Option<u64>), String>> {
     let line = output.lines().find(|l| l.starts_with("rhizo-wire "))?;
     if let Some(why) = line.strip_prefix("rhizo-wire skipped: ") {
         return Some(Err(why.trim().to_string()));
     }
-    let value = line.strip_prefix("rhizo-wire tcp_rtt_ns=")?;
-    Some(value.trim().parse().map_err(|_| line.to_string()))
+    let rtt = crate::profile::field(line, "rhizo-wire", "tcp_rtt_ns")?;
+    let rules = crate::profile::field(line, "rhizo-wire", "tcp_rtt_rules_ns");
+    Some(Ok((rtt, rules)))
 }
 
 /// `(pipe_rtt_ns, loopback_rtt_ns, tcp_resume_ns)` of the network line of
@@ -3451,7 +3458,11 @@ mod tests {
     fn wire_line_is_parsed() {
         assert_eq!(
             parse_wire_line("rhizo-wire tcp_rtt_ns=52000\n"),
-            Some(Ok(52_000))
+            Some(Ok((52_000, None)))
+        );
+        assert_eq!(
+            parse_wire_line("rhizo-wire tcp_rtt_ns=52000 tcp_rtt_rules_ns=52100\n"),
+            Some(Ok((52_000, Some(52_100))))
         );
         assert_eq!(
             parse_wire_line("rhizo-wire skipped: no card\n"),

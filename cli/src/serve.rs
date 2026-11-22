@@ -77,6 +77,19 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
         return Err(crate::client::upgrade(vm.protocol)); // dropping the VM ends it
     }
     let _ = console.write_all(&std::mem::take(&mut vm.console));
+    // The deny floor, before any client can start a cell (design D7 of
+    // `add-cell-hierarchy`). A kernel of protocol 3 has no egress at all.
+    let floor = if vm.protocol == VERSION {
+        let floor = up.floor.floor(vmm)?;
+        match vm.call(&floor.request())?.0 {
+            Message::Done { .. } => Some(floor),
+            other => return Err(format!("the kernel refused the deny floor: {other:?}")),
+        }
+    } else if up.floor != crate::floor::Options::default() {
+        return Err("a kernel of protocol 3 has no deny floor".into());
+    } else {
+        None
+    };
     let boot = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -105,6 +118,7 @@ pub fn serve(dir: &Dir, up: &Up) -> Result<(), String> {
         cpus: up.cpus,
         boot_ms,
         protocol: Some(vm.protocol),
+        floor,
     }
     .write(dir)?;
     let relay = Arc::new(Relay {

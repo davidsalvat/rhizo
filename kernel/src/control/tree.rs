@@ -109,6 +109,32 @@ pub(super) fn egress_of(e: &wire::Egress) -> Result<cap::Egress, (Error, String)
     })
 }
 
+/// The deny floor's rules from the wire's (`floor`, design D7): at most
+/// [`FLOOR_MAX`](cap::limits::FLOOR_MAX), each checked as an egress rule,
+/// kept as given.
+pub(super) fn floor_rules(rules: &[wire::Rule]) -> Result<Vec<cap::Rule>, (Error, String)> {
+    let max = cap::limits::FLOOR_MAX;
+    if rules.len() > max {
+        return Err(invalid(format!(
+            "{} floor rules; at most {max}",
+            rules.len()
+        )));
+    }
+    rules
+        .iter()
+        .enumerate()
+        .map(|(k, r)| {
+            let proto = match r.proto {
+                wire::Proto::Tcp => cap::Proto::Tcp,
+                wire::Proto::Udp => cap::Proto::Udp,
+                wire::Proto::Any => cap::Proto::Any,
+            };
+            cap::Rule::new(proto, r.addr, r.prefix, r.lo, r.hi)
+                .ok_or_else(|| invalid(format!("floor rule {}: {r:?}", k + 1)))
+        })
+        .collect()
+}
+
 /// The wire's egress policy from the tree's.
 fn wire_egress(e: &cap::Egress) -> wire::Egress {
     match e {
@@ -494,6 +520,7 @@ impl Server {
             Request::Stats
             | Request::Shutdown
             | Request::Scoped { .. }
+            | Request::Floor { .. }
             | Request::Publish { .. }
             | Request::Withdraw(_) => {
                 return Err((

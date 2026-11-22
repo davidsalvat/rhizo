@@ -11,6 +11,8 @@ publish = false
 
 [dependencies]
 rhizo-hal = { path = "../rhizo-hal" }
+# Egress policies, defined with the cell tree (design D7 of add-cell-hierarchy).
+rhizo-cap = { path = "../rhizo-cap" }
 # TCP/IP for the network card (design D2 of add-virtio-net): 0BSD.
 smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4"] }
 

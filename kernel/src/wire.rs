@@ -12,7 +12,7 @@ use alloc::string::String;
 use core::fmt::Write;
 use rhizo_core::options::{BootOptions, IpOption};
 use rhizo_hal::{ConsoleWriter, NetLink};
-use rhizo_net::{Net, WireConfig};
+use rhizo_net::{Egress, Net, Proto, Rule, WireConfig};
 use rhizo_virtio::{NET_DEVICE, ProbeError, VirtioNet, pci};
 
 type Card = VirtioNet<Mmio, DirectMap>;
@@ -92,7 +92,49 @@ pub fn init(net: &mut Net, now_ns: u64, seed: u64) {
     if let Some(config) = config {
         net.attach(&mut card, config, now_ns, seed);
     }
+    // The deny floor (design D7 of `add-cell-hierarchy`): the card's
+    // gateway and name servers, the host as the guest sees it, are always
+    // in it; carved out are the model endpoint and, for the kernels `xtask`
+    // tests and measures, its echo server (`echo=`, given to no other
+    // kernel), as `rhizo up --allow-host-port` would. At most two rules.
+    let opts = options();
+    let carved: alloc::vec::Vec<Rule> = [opts.llm, opts.echo]
+        .into_iter()
+        .flatten()
+        .filter_map(|(ip, port)| Rule::new(Proto::Tcp, ip, 32, port, port))
+        .collect();
+    let _ = net.set_floor(&[], &carved);
     LINK.with(|l| *l = Some(card));
+}
+
+/// The egress policy `model` (design D7 of `add-cell-hierarchy`): the
+/// host's model endpoint (`llm=` on the command line); `None` without one.
+#[cfg_attr(
+    not(any(feature = "ktest", feature = "bench-cell")),
+    allow(dead_code, reason = "used by in-kernel tests and benchmarks")
+)]
+pub fn model_egress() -> Egress {
+    let Some((ip, port)) = options().llm else {
+        return Egress::None;
+    };
+    Rule::new(Proto::Tcp, ip, 32, port, port)
+        .and_then(|r| Egress::rules(&[r]).ok())
+        .unwrap_or_default()
+}
+
+/// A policy allowing TCP to the in-kernel tests' echo server only (`echo=`);
+/// `None` without one.
+#[cfg_attr(
+    not(feature = "ktest"),
+    allow(dead_code, reason = "used by in-kernel tests")
+)]
+pub fn echo_egress() -> Egress {
+    let Some((ip, port)) = options().echo else {
+        return Egress::None;
+    };
+    Rule::new(Proto::Tcp, ip, 32, port, port)
+        .and_then(|r| Egress::rules(&[r]).ok())
+        .unwrap_or_default()
 }
 
 /// The first virtio network card on PCI bus 0 (function 0 of each device),

@@ -21,6 +21,13 @@ Commands:
                              it with `cargo xtask`)
       --pin                  Each vCPU on a host core of its own (QEMU,
                              Cloud Hypervisor), for exclusive CPU sets
+                             The deny floor no egress policy reaches holds
+                             the host's own addresses as the guest sees them:
+      --model <host:port>    The model endpoint, carved out of the floor
+                             (and what `--egress model` names); `rhizo chat`
+                             and `--egress model --llm` carve theirs too
+      --deny <cidr>          More addresses in the floor (A.B.C.D/N)
+      --allow-host-port <p>  One more host port carved out of the floor
   run <template> [options] [-- args...]
                              Start a cell and show its output until it ends
       --detach               Print its identifier and return at once
@@ -114,6 +121,8 @@ pub struct Up {
     /// Each vCPU pinned to a host core of its own (design D17 of
     /// `add-cell-hierarchy`).
     pub pin: bool,
+    /// The deny floor (`--model`, `--deny`, `--allow-host-port`).
+    pub floor: crate::floor::Options,
 }
 
 /// Contents of a `--file`.
@@ -475,6 +484,7 @@ fn parse_up(args: &[String]) -> Result<Up, String> {
         accel: Accel::Auto,
         kernel: None,
         pin: false,
+        floor: crate::floor::Options::default(),
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -490,6 +500,7 @@ fn parse_up(args: &[String]) -> Result<Up, String> {
             "--cpus" => up.cpus = number("--cpus", value)?,
             "--accel" => up.accel = Accel::parse(value)?,
             "--kernel" => up.kernel = Some(PathBuf::from(value)),
+            other if up.floor.take(other, value)? => {}
             other => return Err(format!("unknown option `{other}` for `up`")),
         }
     }

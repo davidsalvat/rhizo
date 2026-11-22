@@ -28,6 +28,11 @@ use rhizo_cell::space::WxRanges;
 pub(crate) const FIXED: usize = 64;
 const RULE: usize = 12;
 
+/// The most bytes a section takes, its length included: every rule of an
+/// egress policy and a ceiling, the longest label and every wipe range.
+pub(crate) const SECTION_MAX: usize =
+    8 + FIXED + 2 * RULES_MAX * RULE + LABEL_MAX + rhizo_cell::space::MAX_WX_RANGES * 16;
+
 /// A cell's place in the tree as a snapshot keeps it, with what tells its
 /// copies apart (design D22).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -89,8 +89,9 @@ mod kind {
     pub const POLICY: u8 = 0x11;
     pub const LIMITS: u8 = 0x12;
     pub const SCOPED: u8 = 0x13;
-    pub const PUBLISH: u8 = 0x14;
-    pub const WITHDRAW: u8 = 0x15;
+    pub const FLOOR: u8 = 0x14;
+    pub const PUBLISH: u8 = 0x15;
+    pub const WITHDRAW: u8 = 0x16;
     // Kernel to host.
     pub const HELLO: u8 = 0x80;
     pub const DONE: u8 = 0x81;
@@ -426,13 +427,16 @@ impl Writer {
     fn egress(&mut self, e: &Egress) -> &mut Self {
         match e {
             Egress::None => self.u8(0),
-            Egress::Rules(rules) => self.u8(1).list(rules, |w, r| {
-                w.u8(r.proto as u8);
-                w.0.extend_from_slice(&r.addr);
-                w.u8(r.prefix).u16(r.lo).u16(r.hi);
-            }),
+            Egress::Rules(rules) => self.u8(1).rules(rules),
             Egress::Full => self.u8(2),
         }
+    }
+    fn rules(&mut self, rules: &[Rule]) -> &mut Self {
+        self.list(rules, |w, r| {
+            w.u8(r.proto as u8);
+            w.0.extend_from_slice(&r.addr);
+            w.u8(r.prefix).u16(r.lo).u16(r.hi);
+        })
     }
     fn ceiling(&mut self, c: &Option<Egress>) -> &mut Self {
         match c {
@@ -510,25 +514,28 @@ impl<'a> Reader<'a> {
     fn egress(&mut self) -> Result<Egress, Error> {
         Ok(match self.u8()? {
             0 => Egress::None,
-            1 => Egress::Rules(self.list(|r| {
-                let proto = match r.u8()? {
-                    0 => Proto::Tcp,
-                    1 => Proto::Udp,
-                    2 => Proto::Any,
-                    _ => return Err(Error::Malformed),
-                };
-                let mut addr = [0; 4];
-                addr.copy_from_slice(r.take(4)?);
-                Ok(Rule {
-                    proto,
-                    addr,
-                    prefix: r.u8()?,
-                    lo: r.u16()?,
-                    hi: r.u16()?,
-                })
-            })?),
+            1 => Egress::Rules(self.rules()?),
             2 => Egress::Full,
             _ => return Err(Error::Malformed),
+        })
+    }
+    fn rules(&mut self) -> Result<Vec<Rule>, Error> {
+        self.list(|r| {
+            let proto = match r.u8()? {
+                0 => Proto::Tcp,
+                1 => Proto::Udp,
+                2 => Proto::Any,
+                _ => return Err(Error::Malformed),
+            };
+            let mut addr = [0; 4];
+            addr.copy_from_slice(r.take(4)?);
+            Ok(Rule {
+                proto,
+                addr,
+                prefix: r.u8()?,
+                lo: r.u16()?,
+                hi: r.u16()?,
+            })
         })
     }
     fn ceiling(&mut self) -> Result<Option<Egress>, Error> {
@@ -836,6 +843,12 @@ pub enum Request {
         /// suspended cell when it is resumed.
         placement: Placement,
     },
+    /// The deny floor no egress policy reaches (version 4, design D7 of
+    /// `add-cell-hierarchy`), in place of the one before: `deny`, beyond
+    /// the host's own addresses as the guest sees them (always in it), and
+    /// the exact endpoints `carved` out of it (the model's). Sent by
+    /// `rhizo up` after the hello; never scoped.
+    Floor { deny: Vec<Rule>, carved: Vec<Rule> },
 }
 
 /// Where the guest reaches the host's end of a transfer.
@@ -982,6 +995,10 @@ impl Request {
             Request::Limits { cell, limits } => {
                 w.u32(*cell).limits(limits);
                 kind::LIMITS
+            }
+            Request::Floor { deny, carved } => {
+                w.rules(deny).rules(carved);
+                kind::FLOOR
             }
             Request::Publish { cell, attest } => {
                 w.u32(*cell).u8(*attest as u8);
@@ -1132,6 +1149,10 @@ impl Request {
                 }
             }
             kind::SCOPED => return Err(Error::Malformed), // nested
+            kind::FLOOR => Request::Floor {
+                deny: r.rules()?,
+                carved: r.rules()?,
+            },
             _ => return Err(Error::UnknownKind),
         };
         Ok(request)

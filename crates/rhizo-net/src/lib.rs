@@ -15,7 +15,19 @@
 //! reaches, UDP delivery and Unix names are all looked up in the socket's
 //! network only, so no cell reaches, or sees the ports of, another's. A
 //! copy's sockets are bound again in the copy's network ([`Net::fork`]), a
-//! resumed cell's come back in its new one ([`Net::import`]). Every other address goes
+//! resumed cell's come back in its new one ([`Net::import`]).
+//!
+//! **Egress** (design D6 and D7 of `add-cell-hierarchy`). A cell's sockets
+//! reach outside the loopback network only where its network's egress
+//! policy allows ([`Net::set_egress`]; `None`, the default, allows
+//! nothing), and never where the host's deny floor forbids
+//! ([`Net::set_floor`]; by default the card's gateway and name servers,
+//! the host as the guest sees it). Connections and datagrams out are
+//! checked, datagrams in are dropped unless their source is allowed, and
+//! narrowing a policy resets the connections it no longer allows. A socket
+//! through the card keeps its network's port for its cell, while the port
+//! on the card is drawn at random by the kernel and shown to no cell. The
+//! kernel's own network 0 is not a cell's: it reaches everything. Every other address goes
 //! through the network card, with `smoltcp` (module `wire`). Nothing here
 //! reads a clock or touches hardware: time is passed in, the card is a
 //! [`rhizo_hal::NetLink`], and blocking is the caller's business
@@ -36,6 +48,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 pub use record::{DecodeError, Park, Record, Saved, decode_records, encode_records};
+pub use rhizo_cap::{Egress, Proto, Rule};
 use smoltcp::iface::SocketHandle;
 pub use wire::WireConfig;
 use wire::{Progress, Wire};
@@ -120,6 +133,9 @@ pub enum Error {
     TooMany,
     /// A connection to the outside has started (`EINPROGRESS`).
     InProgress,
+    /// The cell's egress policy or the host's deny floor forbids the
+    /// destination (`EACCES`, as Landlock: "denied", not "no route").
+    Access,
 }
 
 impl Error {
@@ -127,6 +143,7 @@ impl Error {
     pub const fn errno(self) -> i64 {
         match self {
             Error::Again => 11,
+            Error::Access => 13,
             Error::TooMany => 23,
             Error::Pipe => 32,
             Error::Invalid => 22,
@@ -253,6 +270,9 @@ struct Socket {
     dgram_bytes: usize,
     /// The `smoltcp` socket of a UDP socket that sent to the wire.
     udp: Option<SocketHandle>,
+    /// Its port on the network card, drawn at random and shown to no cell
+    /// (0: none).
+    card: u16,
     /// A reset connection was refused (it never opened).
     refused: bool,
     /// Its wait queue: the waiters that looked at it before they blocked,
@@ -278,6 +298,7 @@ impl Socket {
             dgrams: VecDeque::new(),
             dgram_bytes: 0,
             udp: None,
+            card: 0,
             refused: false,
             waiters: Vec::new(),
         }
@@ -310,6 +331,10 @@ pub struct Ports {
     /// The call reached the network card (set here, never cleared): the
     /// cell may now hold a secret (design D22 of `add-cell-hierarchy`).
     pub out: bool,
+    /// The last destination the call was refused by the cell's egress
+    /// policy or the deny floor (`EACCES`), for the audit log (design D7
+    /// and D18 of `add-cell-hierarchy`); `None` if none was.
+    pub denied: Option<(Proto, [u8; 4], u16)>,
 }
 
 impl Ports {
@@ -319,6 +344,7 @@ impl Ports {
             key,
             next: 0,
             out: false,
+            denied: None,
         }
     }
 }
@@ -352,6 +378,14 @@ pub struct Net {
     /// Waiters taken off the wait queues of sockets that changed, for the
     /// caller to wake ([`drain_woken`](Self::drain_woken)).
     woken: Vec<u32>,
+    /// The egress policies of the networks that have one but `None`.
+    policies: Vec<(u32, Egress)>,
+    /// The host's deny floor beyond the card's gateway and name servers,
+    /// and the destinations carved out of it.
+    floor: Vec<Rule>,
+    carved: Vec<Rule>,
+    /// Card ports drawn so far.
+    card_draws: u64,
     /// The sockets the current call looked at: its waiter joins their wait
     /// queues if it blocks ([`end_call`](Self::end_call)).
     looked: RefCell<Vec<Handle>>,
@@ -401,6 +435,105 @@ impl Net {
             parked: Vec::new(),
             woken: Vec::new(),
             looked: RefCell::new(Vec::new()),
+            policies: Vec::new(),
+            floor: Vec::new(),
+            carved: Vec::new(),
+            card_draws: 0,
+        }
+    }
+
+    /// Sets the egress policy of network `net` (design D7 of
+    /// `add-cell-hierarchy`); `Egress::None` is every network's until set.
+    /// Its connections through the card that the policy does not allow are
+    /// reset (each reports `ECONNRESET` at its next call), and datagrams
+    /// waiting from sources it does not allow are dropped.
+    pub fn set_egress(&mut self, net: u32, egress: Egress) {
+        self.policies.retain(|(n, _)| *n != net);
+        if egress != Egress::None {
+            self.policies.push((net, egress));
+        }
+        self.enforce(Some(net));
+    }
+
+    /// Network `net` is gone (its cell ended, or its snapshot was dropped):
+    /// its policy goes.
+    pub fn drop_network(&mut self, net: u32) {
+        self.policies.retain(|(n, _)| *n != net);
+    }
+
+    /// The cell of network `old` was resumed as `new`: its policy follows
+    /// (a suspended cell's network keeps it meanwhile).
+    pub fn rename_network(&mut self, old: u32, new: u32) {
+        if let Some((n, _)) = self.policies.iter_mut().find(|(n, _)| *n == old) {
+            *n = new;
+        }
+    }
+
+    /// Whether a network has a policy other than `None`.
+    pub fn has_policies(&self) -> bool {
+        !self.policies.is_empty()
+    }
+
+    /// Sets the host's deny floor (design D7): `deny` holds at most
+    /// [`FLOOR_MAX`](rhizo_cap::limits::FLOOR_MAX) rules no policy reaches,
+    /// beyond the card's gateway and name servers (always in the floor);
+    /// `carved` the exact destinations allowed through it all the same (the
+    /// model endpoints). Connections the floor now forbids are reset.
+    pub fn set_floor(&mut self, deny: &[Rule], carved: &[Rule]) -> Result<()> {
+        let max = rhizo_cap::limits::FLOOR_MAX;
+        if deny.len() > max || carved.len() > max {
+            return Err(Error::Invalid);
+        }
+        self.floor = deny.to_vec();
+        self.carved = carved.to_vec();
+        self.enforce(None);
+        Ok(())
+    }
+
+    /// Whether a socket of network `net` may reach `ip`:`port` outside with
+    /// `proto` (TCP or UDP), or receive a datagram from it: never through
+    /// the floor (unless carved out of it), then as the network's policy
+    /// says. The kernel's network 0 reaches everything.
+    pub fn allows(&self, net: u32, proto: Proto, ip: [u8; 4], port: u16) -> bool {
+        if net == 0 {
+            return true;
+        }
+        let Some((_, egress)) = self.policies.iter().find(|(n, _)| *n == net) else {
+            return false;
+        };
+        let host = self.wire.as_ref().is_some_and(|w| w.is_host(ip));
+        if (host || self.floor.iter().any(|r| r.allows(proto, ip, port)))
+            && !self.carved.iter().any(|r| r.allows(proto, ip, port))
+        {
+            return false;
+        }
+        egress.allows(proto, ip, port)
+    }
+
+    /// Resets the connections through the card of network `net` (every
+    /// network: `None`) that their policy no longer allows, and drops the
+    /// datagrams waiting from sources it does not allow.
+    fn enforce(&mut self, net: Option<u32>) {
+        for h in 0..self.sockets.len() as Handle {
+            let Some(s) = self.sockets[h as usize].as_ref() else {
+                continue;
+            };
+            if net.is_some_and(|n| n != s.net) {
+                continue;
+            }
+            if let (&State::Wire { handle, .. }, Some(Addr::Inet { ip, port })) =
+                (&s.state, s.remote.clone())
+                && !self.allows(s.net, Proto::Tcp, ip, port)
+            {
+                self.wire_abort(handle);
+                if let Ok(s) = self.get_mut(h) {
+                    s.state = State::Reset { pending: true };
+                    s.refused = false;
+                    s.eof = true;
+                }
+                self.touch(h);
+            }
+            self.drop_denied(h);
         }
     }
 
@@ -434,6 +567,15 @@ impl Net {
     /// the call left them.
     pub fn leave(&mut self) -> Option<Ports> {
         self.caller.take()
+    }
+
+    /// Notes that the calling cell's call was refused `proto` to `ip`:`port`
+    /// by its egress policy or the floor; returns the error to report.
+    fn deny(&mut self, proto: Proto, ip: [u8; 4], port: u16) -> Error {
+        if let Some(caller) = &mut self.caller {
+            caller.denied = Some((proto, ip, port));
+        }
+        Error::Access
     }
 
     /// Notes that the calling cell's call reaches the network card.
@@ -573,6 +715,12 @@ impl Net {
         }
         let net = self.caller_net();
         self.insert(Socket::new(family, ty, Options::default(), net))
+    }
+
+    /// Test builds: the card port of `h` (0: none), which the outside sees.
+    #[cfg(test)]
+    pub(crate) fn card_of(&self, h: Handle) -> u16 {
+        self.get(h).map_or(0, |s| s.card)
     }
 
     /// The network `h` belongs to.
@@ -931,6 +1079,13 @@ impl Net {
     /// `connect` to `ip:port` outside, through the network card: the first
     /// call starts it (`InProgress`), a call made again reports it.
     fn connect_out(&mut self, h: Handle, ty: Type, ip: [u8; 4], port: u16) -> Result<()> {
+        let proto = match ty {
+            Type::Stream => Proto::Tcp,
+            Type::Dgram => Proto::Udp,
+        };
+        if !self.allows(self.get(h)?.net, proto, ip, port) {
+            return Err(self.deny(proto, ip, port));
+        }
         if self.wire_addr().is_none() {
             return Err(Error::NetUnreach);
         }
@@ -1069,12 +1224,14 @@ impl Net {
             return Err(Error::MsgSize);
         }
         if !is_loopback(ip) {
+            // Every datagram out is checked, so a narrowed policy holds at
+            // once for connected sockets too.
+            if !self.allows(s.net, Proto::Udp, ip, port) {
+                return Err(self.deny(Proto::Udp, ip, port));
+            }
             self.went_out();
             self.autobind(h, ANY)?;
-            let Some(Addr::Inet { port: mine, .. }) = self.get(h)?.local else {
-                return Err(Error::Invalid);
-            };
-            self.wire_send_to(h, mine, data, ip, port)?;
+            self.wire_send_to(h, data, ip, port)?;
             return Ok(data.len());
         }
         self.autobind(h, ANY)?;
@@ -1120,6 +1277,10 @@ impl Net {
         self.settle(h);
         let s = self.get_mut(h)?;
         if s.ty == Type::Dgram && s.dgrams.is_empty() && !s.shut_rd {
+            if s.udp.is_some() {
+                self.drop_denied(h);
+            }
+            let s = self.get_mut(h)?;
             if let Some(udp) = s.udp
                 && let Some(got) = self.wire_recv_from(udp, len, peek, take)
             {

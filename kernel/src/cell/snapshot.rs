@@ -73,7 +73,14 @@ impl Host {
         echo: bool,
     ) -> Result<u32, Snapshot> {
         let _p = cost::scope(Part::Spawn);
+        // A cell suspended here keeps its node, and its network's policy
+        // (design D7); a loaded one starts with none, unless placed.
+        let origin = snapshot.origin();
+        let policy = has_policies() && self.suspended.contains(&origin);
         let live = self.restore(snapshot, mode, capture, echo)?;
+        if policy {
+            resume_network(origin, live.cell.id);
+        }
         let id = live.cell.id;
         // New to the scheduler: `file` lets its threads waiting on
         // descriptors make their calls again.
@@ -154,7 +161,9 @@ impl Host {
         let snapshot = lazy.snapshot();
         let deadlines = snapshot.deadlines(now);
         let mut fs = files_of(snapshot);
-        import_sockets(&mut fs, &snapshot.sockets(), id);
+        if snapshot.has_sockets() {
+            import_sockets(&mut fs, &snapshot.sockets(), id);
+        }
         let wx = snapshot.wx();
         let used = Meter::new(1, u64::MAX); // the root
         if mode == Resume::Eager {
@@ -210,7 +219,9 @@ impl Host {
             }
             return None;
         }
-        let ids = children.iter().map(|c| c.cell.id).collect();
+        let ids: Vec<u32> = children.iter().map(|c| c.cell.id).collect();
+        // Copies have their source's egress policy (design D7).
+        self.enter_networks(ids.iter().copied());
         for child in children {
             self.requeue(child, wake);
         }
@@ -223,7 +234,7 @@ impl Host {
         if live.tag != 0 {
             self.locked(|s| s.tags.free(live.tag));
         }
-        release_sockets(&live.fs, live.cell.id);
+        release_sockets(&live.fs, live.cell.id, true);
         sharing(true, || {
             space::destroy(
                 PageTable::<Format>::from_root(live.cell.root),
@@ -404,7 +415,7 @@ impl Host {
         };
         let (template, fs, _) = self.templates.swap_remove(index);
         self.end_template_memory(template.id, template.root);
-        release_sockets(&fs, template.id);
+        release_sockets(&fs, template.id, true);
         true
     }
 
@@ -432,6 +443,7 @@ impl Host {
         }
         let [child] = copies;
         let child_id = child.cell.id;
+        self.enter_networks(core::iter::once(child_id));
         self.admit(|s| file(s, None, child));
         Some(child_id)
     }

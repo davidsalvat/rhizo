@@ -1513,6 +1513,20 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
         }
     };
     let kernel_path = kernel.to_string_lossy().into_owned();
+    // Two services on the host (design D7 of `add-cell-hierarchy`): the
+    // model endpoint `rhizo up --model` carves out of the deny floor, and
+    // another one the floor keeps from every cell.
+    let bind = match vmm {
+        Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
+        other => crate::hostnet::host_address(other),
+    };
+    let listen = || {
+        std::net::TcpListener::bind((bind, 0))
+            .and_then(|l| Ok((l.local_addr()?.port(), l)))
+            .map_err(|e| format!("cannot listen on {bind}: {e}"))
+    };
+    let ((model_port, _model), (service_port, _service)) = (listen()?, listen()?);
+    let model = format!("{bind}:{model_port}");
     let up = || {
         ok(&[
             "up",
@@ -1524,6 +1538,8 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             accel.id(),
             "--kernel",
             &kernel_path,
+            "--model",
+            &model,
         ])
     };
     up()?;
@@ -1992,12 +2008,64 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             ok(&["kill", c])?; // forget it
         }
         ok(&["kill", &other])?;
+        // The deny floor (spec `networking`, "Host services behind the
+        // gateway"): a cell allowed everywhere connects to the host's other
+        // service and to the model endpoint, as the guest reaches them; the
+        // first is refused, the second carved out, and the refusal is
+        // audited.
+        let host = crate::hostnet::host_address(vmm);
+        let (service, endpoint) = (
+            format!("{host}:{service_port}"),
+            format!("{host}:{model_port}"),
+        );
+        let out = ok(&[
+            "run",
+            "reach",
+            "--egress",
+            "any:0.0.0.0/0:0-65535",
+            "--",
+            &service,
+            &endpoint,
+        ])?;
+        must(
+            out.contains("DC\n") && out.contains(" exited 0"),
+            "a cell with egress 0.0.0.0/0 reaches the model endpoint but no other host service",
+            "`DC` (denied, then connected) and `exited 0`",
+        )?;
+        let denied = format!("tcp {service}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let out = loop {
+            let out = ok(&["audit", "tail", "--kind", "egress-denied"])?;
+            if out.contains(&denied) || Instant::now() > deadline {
+                break out;
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        must(
+            out.lines()
+                .any(|l| l.contains("egress-denied") && l.contains(&denied)),
+            "`rhizo audit tail` shows the floor's refusal",
+            &format!("an `egress-denied` line with `{denied}`"),
+        )?;
+        // `--egress model` naming another endpoint, as `rhizo chat --llm`
+        // does, carves exactly that one out, audited.
+        let llm = format!("http://{bind}:{service_port}");
+        let out = ok(&[
+            "run", "reach", "--egress", "model", "--llm", &llm, "--", &service, &endpoint,
+        ])?;
+        must(
+            out.contains("CD\n"),
+            "`--egress model --llm` carves its endpoint out of the floor, and allows only it",
+            "`CD` (connected, then denied by its policy)",
+        )?;
+        let out = ok(&["audit", "tail", "--kind", "floor"])?;
+        must(
+            out.contains(&format!("tcp:{host}/32:{service_port}-{service_port}")),
+            "`rhizo audit tail` shows the floor changed with the endpoint carved out",
+            "a `floor` line naming it",
+        )?;
         // The agent, against the host's fake model.
         if crate::cpython::root().join("usr/bin/python3").exists() {
-            let bind = match vmm {
-                Vmm::QemuVirt | Vmm::QemuMicrovm | Vmm::QemuQ35 => "127.0.0.1",
-                other => crate::hostnet::host_address(other),
-            };
             let port = crate::hostnet::llm_server(bind, 0)?;
             let llm = format!("http://{bind}:{port}");
             let out = ok(&[
@@ -2195,7 +2263,14 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             refused(&["save", "99999", &path(&cell_file)])?;
             ok(&["down"])?;
             up()?;
-            let out = ok(&["load", &path(&template_file), "--template"])?;
+            let template_path = path(&template_file);
+            // A loaded file holds no authority (spec `snapshots`): the host
+            // gives it its egress, which carves the model endpoint out of
+            // the new VM's deny floor.
+            let model_egress = ["--egress", "model", "--llm", llm.as_str()];
+            let mut words = vec!["load", &template_path, "--template"];
+            words.extend(model_egress);
+            let out = ok(&words)?;
             let loaded = out
                 .split_once(" as template ")
                 .and_then(|(_, rest)| rest.split(' ').next())
@@ -2242,7 +2317,10 @@ pub fn check(vmm: Vmm, accel: Accel, kernel: &Path, rhizo: &Path, reproduce: &st
             for copy in &copies {
                 answer(copy, "")?;
             }
-            let out = ok(&["load", &path(&cell_file)])?;
+            let cell_path = path(&cell_file);
+            let mut words = vec!["load", cell_path.as_str()];
+            words.extend(model_egress);
+            let out = ok(&words)?;
             let resumed = out
                 .split_once(" as suspended cell ")
                 .and_then(|(_, rest)| rest.split(' ').next())
