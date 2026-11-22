@@ -9,7 +9,8 @@
 //! name, ino: u32`; for a file `size: u64`, `blocks: u32`, each a present
 //! byte and 4096 bytes when present; for a socket `name: u64`; for an entry
 //! of `/run/rhizo` `tag: u8`, 0 a socket then its index `u32` among the
-//! socket records, as a description's, 2 the copy generation),
+//! socket records, as a description's, 1 the inbox, 2 the copy
+//! generation),
 //! the descriptions (`count: u32`, per slot a present byte, then the target
 //! (`tag: u8`: 0 console, 1 inode, 2 pipe read end, 3 pipe write end,
 //! 4 event counter, 5 `epoll`, 6 socket; then `index: u32` but for the
@@ -96,8 +97,125 @@ impl Fs {
     /// second check. Bytes that were never checked may give a file system
     /// whose operations panic.
     pub fn decode_trusted(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
-        Ok(Fs(Arc::new(Tables::decode(bytes)?)))
+        Ok(Fs(Arc::new(Tables::decode_with(bytes, None)?)))
     }
+
+    /// [`Fs::decode_trusted`] sharing with `base` every inode encoded the
+    /// same at the same number: a cell's files resumed from a snapshot
+    /// share what they still have of the tree they started from (its
+    /// `/run/rhizo` among them) instead of holding copies, as forks share
+    /// them.
+    pub fn decode_trusted_sharing(
+        bytes: &[u8],
+        base: &Base,
+    ) -> core::result::Result<Self, DecodeError> {
+        Ok(Fs(Arc::new(Tables::decode_with(bytes, Some(base))?)))
+    }
+}
+
+/// Files cells start from, their encoding read once: decoding a cell's
+/// files against them shares what the cell kept of them
+/// ([`Fs::decode_trusted_sharing`]).
+#[derive(Debug, Clone)]
+pub struct Base {
+    fs: Fs,
+    bytes: Vec<u8>,
+    /// Where each slot of the inode table of `bytes` ends.
+    slots: Vec<usize>,
+}
+
+/// Where the inode table of an encoding starts: after `cwd` and its count.
+const TABLE: usize = 8;
+
+impl Base {
+    pub fn new(fs: Fs) -> Self {
+        let mut bytes = Vec::new();
+        fs.encode(&mut bytes);
+        let mut slots = Vec::new();
+        let mut r = Reader(&bytes);
+        if r.u32().is_ok()
+            && let Ok(n) = r.count()
+        {
+            for _ in 0..n {
+                if skip_inode(&mut r).is_err() {
+                    break;
+                }
+                slots.push(bytes.len() - r.0.len());
+            }
+        }
+        Self { fs, bytes, slots }
+    }
+
+    /// The files.
+    pub fn fs(&self) -> &Fs {
+        &self.fs
+    }
+
+    /// Their encoding.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The encoding of inode slot `i`, if the base has it.
+    fn slot(&self, i: usize) -> Option<&[u8]> {
+        let start = match i {
+            0 => TABLE,
+            _ => *self.slots.get(i - 1)?,
+        };
+        self.bytes.get(start..*self.slots.get(i)?)
+    }
+
+    /// Inode slot `i` shared, if `mine` starts with its encoding (a slot's
+    /// encoding delimits itself: the same bytes, the same slot), with that
+    /// encoding's length.
+    fn same(&self, i: usize, mine: &[u8]) -> Option<(usize, Option<Arc<Inode>>)> {
+        let theirs = self.slot(i)?;
+        if !mine.starts_with(theirs) {
+            return None;
+        }
+        match (theirs.first(), self.fs.inodes.get(i)) {
+            (Some(0), _) => Some((theirs.len(), None)),
+            (Some(_), Some(Some(inode))) => Some((theirs.len(), Some(inode.clone()))),
+            _ => None,
+        }
+    }
+}
+
+/// Moves `r` past one slot of the inode table, present or not, allocating
+/// nothing.
+fn skip_inode(r: &mut Reader) -> core::result::Result<(), DecodeError> {
+    if !r.flag()? {
+        return Ok(());
+    }
+    let kind = r.u8()?;
+    r.u32()?; // links
+    match kind {
+        0 | 4 => {
+            r.u32()?; // parent
+            for _ in 0..r.count()? {
+                let len = r.u16()? as usize;
+                r.take(len + 4)?;
+            }
+        }
+        1 => {
+            r.u64()?; // size
+            for _ in 0..r.count()? {
+                if r.flag()? {
+                    r.take(BLOCK)?;
+                }
+            }
+        }
+        2 => {
+            r.u64()?;
+        }
+        3 => {
+            if r.u8()? == 0 {
+                r.u32()?;
+            }
+        }
+        _ => return Err(DecodeError::Corrupt),
+    }
+    Ok(())
 }
 
 impl Tables {
@@ -141,6 +259,7 @@ impl Tables {
                             out.push(0);
                             out.extend_from_slice(&h.to_le_bytes());
                         }
+                        Kept::Inbox => out.push(1),
                         Kept::Generation => out.push(2),
                         Kept::Grant(_) => unreachable!("grants are left out"),
                     }
@@ -243,12 +362,53 @@ impl Tables {
     }
 
     fn decode(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
+        Self::decode_with(bytes, None)
+    }
+
+    /// [`decode`](Self::decode), taking from `base` (shared) each inode
+    /// its encoding has the same at the same number.
+    fn decode_with(bytes: &[u8], base: Option<&Base>) -> core::result::Result<Self, DecodeError> {
         let mut r = Reader(bytes);
         let cwd = r.u32()?;
         let count = r.count()?;
         let mut inodes = Vec::with_capacity(count);
         let mut rhizo = None;
-        for i in 0..count {
+        let mut kept_sockets = 0;
+        // The whole inode table as the base's (its count included): shared
+        // at once, with what it counts.
+        let whole = base.filter(|b| {
+            let end = b.slots.last().copied().unwrap_or(0);
+            end > TABLE
+                && b.slots.len() == b.fs.inodes.len()
+                && bytes.get(4..end) == b.bytes.get(4..end)
+        });
+        if let Some(b) = whole {
+            inodes.extend(b.fs.inodes.iter().cloned());
+            (rhizo, kept_sockets) = (b.fs.rhizo, b.fs.kept_sockets);
+            r.0 = &bytes[b.slots.last().copied().unwrap_or(TABLE)..];
+        }
+        for i in (0..count).filter(|_| whole.is_none()) {
+            if let Some(b) = base
+                && let Some((len, shared)) = b.same(i, r.0)
+            {
+                // Its kind (after the present byte): the directory
+                // `/run/rhizo`.
+                if r.0.get(1) == Some(&4) && len > 1 {
+                    if rhizo.is_some() {
+                        return Err(DecodeError::Corrupt);
+                    }
+                    rhizo = Some(i as Ino);
+                }
+                r.0 = &r.0[len..];
+                if shared
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.node, Node::Kept(Kept::Socket(_))))
+                {
+                    kept_sockets += 1;
+                }
+                inodes.push(shared);
+                continue;
+            }
             if !r.flag()? {
                 inodes.push(None);
                 continue;
@@ -305,11 +465,15 @@ impl Tables {
                 2 => Node::Socket(r.u64()?),
                 3 => Node::Kept(match r.u8()? {
                     0 => Kept::Socket(r.u32()?),
+                    1 => Kept::Inbox,
                     2 => Kept::Generation,
                     _ => return Err(DecodeError::Corrupt),
                 }),
                 _ => return Err(DecodeError::Corrupt),
             };
+            if let Node::Kept(Kept::Socket(_)) = node {
+                kept_sockets += 1;
+            }
             inodes.push(Some(Arc::new(Inode { links, node })));
         }
         let count = r.count()?;
@@ -389,24 +553,29 @@ impl Tables {
         if !r.0.is_empty() {
             return Err(DecodeError::Truncated);
         }
-        let used = inodes
-            .iter()
-            .flatten()
-            .map(|i| match &i.node {
-                Node::File(f) => f.held(),
-                _ => 0,
-            })
-            .sum();
-        let names = inodes
-            .iter()
-            .flatten()
-            .map(|i| match &i.node {
-                Node::Dir { entries, .. } => {
-                    entries.keys().map(|n| NAME_COST + n.len() as u64).sum()
-                }
-                _ => 0,
-            })
-            .sum();
+        let (used, names) = match whole {
+            Some(b) => (b.fs.used, b.fs.names),
+            None => (
+                inodes
+                    .iter()
+                    .flatten()
+                    .map(|i| match &i.node {
+                        Node::File(f) => f.held(),
+                        _ => 0,
+                    })
+                    .sum(),
+                inodes
+                    .iter()
+                    .flatten()
+                    .map(|i| match &i.node {
+                        Node::Dir { entries, .. } => {
+                            entries.keys().map(|n| NAME_COST + n.len() as u64).sum()
+                        }
+                        _ => 0,
+                    })
+                    .sum(),
+            ),
+        };
         let socket_descs = descs
             .iter()
             .flatten()
@@ -427,6 +596,7 @@ impl Tables {
             input,
             rhizo,
             dropped: Vec::new(),
+            kept_sockets,
 
             changes: 0,
         })

@@ -190,6 +190,10 @@ pub struct Snapshot {
     /// Where the tree section starts (its length), found once: every
     /// resume reads it.
     tree: usize,
+    /// Its files are the tree every cell given none starts with, as the
+    /// kernel says ([`mark_plain_files`](Self::mark_plain_files)); not
+    /// encoded.
+    plain_files: bool,
 }
 
 impl PartialEq for Snapshot {
@@ -436,6 +440,7 @@ impl Snapshot {
             origin: cell.id,
             domain: cell.domain,
             tree: tail,
+            plain_files: false,
         }
     }
 
@@ -615,6 +620,7 @@ impl Snapshot {
             origin: 0,
             domain: 0,
             tree: 0,
+            plain_files: false,
         };
         let pages = snapshot.page_count();
         // Counts are 32-bit: these products cannot overflow a 64-bit usize.
@@ -911,6 +917,19 @@ impl Snapshot {
             u64_at(&self.bytes, rec(i) + 8) as usize + size.bytes() as usize
         });
         data_start + data_len.unwrap_or(0)
+    }
+
+    /// The kernel notes that the files captured are the tree every cell
+    /// given none starts with, unchanged: a resume shares that tree
+    /// without reading [`files_bytes`](Self::files_bytes). Lost with the
+    /// bytes: a snapshot read from bytes compares them.
+    pub fn mark_plain_files(&mut self) {
+        self.plain_files = true;
+    }
+
+    /// Whether [`mark_plain_files`](Self::mark_plain_files) was called.
+    pub fn plain_files(&self) -> bool {
+        self.plain_files
     }
 
     /// The encoded file system (after the page data and its length).

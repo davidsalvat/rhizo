@@ -53,7 +53,7 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn tree(&self) -> &Tree {
-        &self.tree
+        self.tree.get()
     }
 
     /// The domain of cell `id` (live, suspended or a template): what kernel
@@ -63,7 +63,7 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn domain(&self, id: u32) -> Option<u32> {
-        self.tree.domain(id)
+        self.tree.get().domain(id)
     }
 
     /// Enters `cell`, new and not yet run, as the root of a new domain, its
@@ -73,14 +73,14 @@ impl Host {
         // A new cell is no reserved root: it may not take the room of the
         // kernel's cell table reserved roots hold (design D4).
         let reserved = u64::from(RESERVED_CELLS.load(Ordering::Relaxed));
-        if self.tree.len() as u64 + reserved >= u64::from(rhizo_cap::limits::CELLS_MAX) {
+        if self.tree.get().len() as u64 + reserved >= u64::from(rhizo_cap::limits::CELLS_MAX) {
             return false;
         }
         let spec = Spec {
             limits: root_limits(&cell.quota),
             ..Spec::default()
         };
-        let Ok(pid) = self.tree.add_root(cell.id, spec, 0) else {
+        let Ok(pid) = self.tree_mut(|t| t.add_root(cell.id, spec, 0)) else {
             return false;
         };
         cell.renumber(pid);
@@ -122,9 +122,11 @@ impl Host {
         ids: &[u32],
         placed: &mut dyn FnMut(usize, u32, u32),
     ) -> bool {
-        let parent = self.tree.get(source).map_or(0, |n| n.parent());
+        let parent = self.tree.get().get(source).map_or(0, |n| n.parent());
         let used = self.usage(parent);
-        let entered = self.tree.add_copies(source, ids, &|_| used, placed).is_ok();
+        let entered = self
+            .tree_mut(|t| t.add_copies(source, ids, &|_| used, placed))
+            .is_ok();
         if entered {
             self.reshare_if_by_weight();
         }
@@ -139,7 +141,7 @@ impl Host {
     #[cold]
     #[inline(never)]
     pub(super) fn copies_entered(&mut self, source: u32) {
-        match self.tree.get(source).map_or(HOST, |n| n.parent()) {
+        match self.tree.get().get(source).map_or(HOST, |n| n.parent()) {
             HOST => self.refresh_reserved(),
             parent => self.sync(parent),
         }
@@ -153,7 +155,7 @@ impl Host {
     #[cold]
     #[inline(never)]
     pub(super) fn admits_copies(&self, source: u32, n: usize) -> bool {
-        let Some(node) = self.tree.get(source).filter(|n| n.is_root()) else {
+        let Some(node) = self.tree.get().get(source).filter(|n| n.is_root()) else {
             return true;
         };
         let one = node.limits().reservation();
@@ -182,6 +184,7 @@ impl Host {
         }
         let old = self
             .tree
+            .get()
             .get(id)
             .filter(|n| n.is_root())
             .map_or(Limits::ZERO, |n| n.limits().reservation());
@@ -189,7 +192,7 @@ impl Host {
         let aside = self.held_aside.iter().find(|&&(c, _)| c == id);
         let (used, limit) = match aside {
             Some(&(_, frames)) => {
-                let limit = self.tree.get(id).map_or(0, |n| n.limits().memory) / FRAME_SIZE;
+                let limit = self.tree.get().get(id).map_or(0, |n| n.limits().memory) / FRAME_SIZE;
                 (limit.saturating_sub(frames), limit)
             }
             None => self
@@ -213,7 +216,7 @@ impl Host {
     /// a change to them: sockets kept from cells without a memory limit,
     /// and room in the cell table.
     pub(super) fn refresh_reserved(&mut self) {
-        let now = self.tree.reserved_roots();
+        let now = self.tree.get().reserved_roots();
         let was = core::mem::replace(&mut self.reserved, now);
         if (now.sockets, now.cells) == (was.sockets, was.cells) {
             return;
@@ -230,7 +233,7 @@ impl Host {
     /// Records in `snapshot`, taken of cell `id`, its node's limits and
     /// policies (format version 11, spec `snapshots`, tree state).
     pub(super) fn record_tree(&self, snapshot: &mut Snapshot, id: u32) {
-        let Some(n) = self.tree.get(id) else {
+        let Some(n) = self.tree.get().get(id) else {
             return;
         };
         snapshot.set_tree(&n.spec());
@@ -251,10 +254,11 @@ impl Host {
         let origin = snapshot.origin();
         // A cell with a memory limit has it in its quota.
         let limited = cell.quota.memory != u64::MAX;
+        let id = cell.id;
         if let Some(at) = self.suspended.iter().position(|&s| s == origin)
-            && let Some(n) = self.tree.rekey(origin, cell.id)
+            && let Some(n) = self.tree_mut(|t| t.rekey(origin, id).map(|n| (n.pid(), n.domain())))
         {
-            (cell.pid, cell.domain) = (n.pid(), n.domain());
+            (cell.pid, cell.domain) = n;
             // Its meter sets aside what was held for it while suspended.
             self.unsuspend(at);
             self.reshare_if_by_weight();
@@ -262,7 +266,7 @@ impl Host {
         }
         // A snapshot of a cell this host still holds (a template's) makes a
         // copy of it: a sibling in its domain (design D13).
-        if origin != 0 && self.tree.get(origin).is_some() {
+        if origin != 0 && self.tree.get().get(origin).is_some() {
             if limited && !self.admits_copies(origin, 1) {
                 return false;
             }
@@ -291,7 +295,7 @@ impl Host {
         if reserved && !self.admits_root(cell.id, spec.limits) {
             return false;
         }
-        let Ok(pid) = self.tree.add_root(cell.id, spec, source) else {
+        let Ok(pid) = self.tree_mut(|t| t.add_root(cell.id, spec, source)) else {
             return false;
         };
         (cell.pid, cell.domain) = (pid, cell.id);
@@ -316,9 +320,9 @@ impl Host {
     ///
     /// [`enter_restored`]: Self::enter_restored
     pub(super) fn leave_restored(&mut self, cell: &Cell, origin: u32) {
-        if cell.domain == cell.id || self.tree.get(origin).is_some() {
-            let _ = self.tree.end(cell.id, &mut fresh_domain); // a new root or a copy
-        } else if self.tree.rekey(cell.id, origin).is_some() {
+        if cell.domain == cell.id || self.tree.get().get(origin).is_some() {
+            let _ = self.tree_mut(|t| t.end(cell.id, &mut fresh_domain)); // a new root or a copy
+        } else if self.tree_mut(|t| t.rekey(cell.id, origin).is_some()) {
             self.suspended.push(origin);
         }
     }
@@ -343,6 +347,7 @@ impl Host {
     ///
     /// [`settle`]: Self::settle
     pub(super) fn ended(&mut self, id: u32, ending: Ending) {
+        self.cell_left(id, ending);
         if ending == Ending::Suspended {
             self.suspended.push(id);
         } else {
@@ -375,12 +380,13 @@ impl Host {
         }
         self.settling = true;
         while let Some(id) = self.ends.pop() {
-            let parent = self.tree.get(id).map_or(HOST, |n| n.parent());
-            let Ok(ended) = self.tree.end(id, &mut fresh_domain) else {
+            let parent = self.tree.get().get(id).map_or(HOST, |n| n.parent());
+            let Ok(ended) = self.tree_mut(|t| t.end(id, &mut fresh_domain)) else {
                 continue;
             };
             for &gone in &ended.gone {
                 forget_network(gone);
+                self.cell_left(gone, Ending::Killed);
                 if let Some(at) = self.suspended.iter().position(|&s| s == gone) {
                     self.unsuspend(at);
                     self.finished.push(Finished {
@@ -397,11 +403,16 @@ impl Host {
                 }
             }
             for &root in &ended.promoted {
-                for cell in self.tree.subtree(root).unwrap_or_default() {
+                let sub = self.tree.get().subtree(root).unwrap_or_default();
+                // Its former ancestors are no longer its trusted base: a
+                // subtree whose handles would now break an exposure ceiling
+                // (design D8) ends, as a promotion asked for is refused.
+                let admitted = self.handles_admit(self.tree.get(), &sub);
+                for cell in sub {
                     self.sync(cell);
                     // It left its domain (design D21): a cell that cannot
                     // take private copies of what it shared there ends.
-                    if !self.unshare(cell) && !self.kill(cell) {
+                    if (!admitted || !self.unshare(cell)) && !self.kill(cell) {
                         self.drop_template(cell);
                     }
                 }
@@ -421,7 +432,7 @@ impl Host {
     /// domain, and as its quotas what it may use itself (its limits less its
     /// children's reservations).
     fn sync(&mut self, id: u32) {
-        let (Some(n), Some(own)) = (self.tree.get(id), self.tree.own(id)) else {
+        let (Some(n), Some(own)) = (self.tree.get().get(id), self.tree.get().own(id)) else {
             return;
         };
         let (pid, domain) = (n.pid(), n.domain());
@@ -446,13 +457,13 @@ impl Host {
     fn sync_up(&mut self, mut id: u32) {
         while id != HOST {
             self.sync(id);
-            id = self.tree.get(id).map_or(HOST, |n| n.parent());
+            id = self.tree.get().get(id).map_or(HOST, |n| n.parent());
         }
     }
 
     /// [`sync`](Self::sync) for every cell of `id`'s subtree.
     fn sync_down(&mut self, id: u32) {
-        for cell in self.tree.subtree(id).unwrap_or_default() {
+        for cell in self.tree.get().subtree(id).unwrap_or_default() {
             self.sync(cell);
         }
     }
@@ -462,7 +473,7 @@ impl Host {
     /// may then use them less its children's reservations. `false` if they
     /// do not fit its parent's budget or its children's reservations.
     pub(super) fn set_limits_from(&mut self, id: u32, quota: &Quota, cells: Option<u32>) -> bool {
-        let Some(n) = self.tree.get(id) else {
+        let Some(n) = self.tree.get().get(id) else {
             return false;
         };
         let limits = Limits {
@@ -478,8 +489,7 @@ impl Host {
         }
         let usage = |c: u32| if c == id { Limits::ZERO } else { used };
         if self
-            .tree
-            .set_limits(id, limits, Actor::Host, &usage)
+            .tree_mut(|t| t.set_limits(id, limits, Actor::Host, &usage))
             .is_err()
         {
             return false;
@@ -503,11 +513,11 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn adopt(&mut self, id: u32, parent: u32, spec: Spec, by: Actor) -> Result<(), TreeError> {
-        let n = self.tree.get(id).ok_or(TreeError::NotFound)?;
+        let n = self.tree.get().get(id).ok_or(TreeError::NotFound)?;
         if by != Actor::Host {
             return Err(TreeError::Denied);
         }
-        if self.tree.get(parent).is_none() {
+        if self.tree.get().get(parent).is_none() {
             return Err(TreeError::NotFound);
         }
         if !n.is_root() {
@@ -536,16 +546,19 @@ impl Host {
         mut spec: Spec,
         skip: u32,
     ) -> Result<(), TreeError> {
-        let n = self.tree.get(id).ok_or(TreeError::NotFound)?;
+        let n = self.tree.get().get(id).ok_or(TreeError::NotFound)?;
         if n.children() > 0 {
             return Err(TreeError::Invalid);
         }
-        if parent != HOST && self.tree.get(parent).is_none() {
+        if parent != HOST && self.tree.get().get(parent).is_none() {
             return Err(TreeError::NotFound);
         }
         // An exclusive CPU set (design D17): CPUs the machine has, never
         // the boot CPU, and none another root's set holds.
-        if parent == HOST && spec.cpus != 0 && !super::shares::set_fits(&self.tree, id, spec.cpus) {
+        if parent == HOST
+            && spec.cpus != 0
+            && !super::shares::set_fits(self.tree.get(), id, spec.cpus)
+        {
             // The control kernel audits the refusal as a tree denial.
             return Err(TreeError::Invalid);
         }
@@ -553,7 +566,7 @@ impl Host {
         // Into another domain (a root's is new), it first takes private
         // copies of what it shares, or stays (design D21).
         let domain = n.domain();
-        if self.tree.domain(parent) != Some(domain) {
+        if self.tree.get().domain(parent) != Some(domain) {
             self.unshare_subtree(id)?;
         }
         if parent == HOST {
@@ -579,22 +592,28 @@ impl Host {
             return Err(TreeError::Budget);
         }
         let used = self.usage(parent);
-        self.tree.end(id, &mut fresh_domain)?; // a leaf: allocates nothing
+        self.tree_mut(|t| t.end(id, &mut fresh_domain))?; // a leaf: allocates nothing
         let placed = if parent == HOST {
-            self.tree.add_root(id, spec, skip).map(|_| ())
+            self.tree_mut(|t| t.add_root(id, spec, skip)).map(|_| ())
         } else {
-            self.tree
-                .add_child_unlike(id, parent, spec, Actor::Host, &|_| used, skip)
+            self.tree_mut(|t| t.add_child_unlike(id, parent, spec, Actor::Host, &|_| used, skip))
         };
+        // A new edge in the tree passes the exposure check (design D8).
+        let placed = placed.and_then(|()| match self.handles_admit(self.tree.get(), &[id]) {
+            true => Ok(()),
+            false => {
+                let _ = self.tree_mut(|t| t.end(id, &mut fresh_domain));
+                Err(TreeError::Denied)
+            }
+        });
         if let Err(e) = placed {
             // Back where it was, under the number it had as a root.
             let _ = if old == HOST {
-                self.tree
-                    .add_root(id, saved, u32::from(old_pid == 2))
+                self.tree_mut(|t| t.add_root(id, saved, u32::from(old_pid == 2)))
                     .map(|_| ())
             } else {
                 let used = self.usage(old);
-                self.tree.add_child(id, old, saved, Actor::Host, &|_| used)
+                self.tree_mut(|t| t.add_child(id, old, saved, Actor::Host, &|_| used))
             };
             self.sync(id);
             self.sync_networks(id);
@@ -607,7 +626,7 @@ impl Host {
         self.reshare_after(plain);
         self.refresh_reserved();
         // A cell placed before it ran: its thread takes its new number.
-        let pid = self.tree.get(id).map_or(0, |n| n.pid());
+        let pid = self.tree.get().get(id).map_or(0, |n| n.pid());
         self.with_live(id, |live| {
             let t = &live.cell.threads;
             if t.len() == 1 && t.current().tid == old_pid && live.cell.cpu_ns == 0 {
@@ -625,13 +644,14 @@ impl Host {
         allow(dead_code, reason = "used by the control kernel")
     )]
     pub fn set_tree_limits(&mut self, id: u32, limits: Limits, by: Actor) -> Result<(), TreeError> {
-        let parent = self.tree.get(id).ok_or(TreeError::NotFound)?.parent();
+        let by = self.acting(by, id)?;
+        let parent = self.tree.get().get(id).ok_or(TreeError::NotFound)?.parent();
         if parent == HOST && !self.admits_root(id, limits) {
             return Err(TreeError::Budget);
         }
         let (own, theirs) = (self.usage(id), self.usage(parent));
         let usage = |c: u32| if c == id { own } else { theirs };
-        self.tree.set_limits(id, limits, by, &usage)?;
+        self.tree_mut(|t| t.set_limits(id, limits, by, &usage))?;
         self.sync(id);
         self.sync_up(parent);
         self.refresh_reserved();
@@ -654,7 +674,20 @@ impl Host {
         ceiling: Egress,
         by: Actor,
     ) -> Result<(), TreeError> {
-        self.tree.set_egress(id, egress, ceiling, by)?;
+        let by = self.acting(by, id)?;
+        // A narrower ceiling must still hold what its cell's handles let
+        // reach it (design D8): checked on a copy of the tree first.
+        if any_handles() {
+            let mut trial = self.tree.get().clone();
+            trial.set_egress(id, egress, ceiling, by)?;
+            let sub = trial.subtree(id)?;
+            if !self.handles_admit(&trial, &sub) {
+                return Err(TreeError::Denied);
+            }
+            self.tree_mut(|t| *t = trial);
+        } else {
+            self.tree_mut(|t| t.set_egress(id, egress, ceiling, by))?;
+        }
         // Enforced from now on (design D7): narrowed connections reset.
         self.sync_networks(id);
         Ok(())
@@ -669,8 +702,26 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn reparent(&mut self, id: u32, to: u32, by: Actor) -> Result<(), TreeError> {
-        let n = self.tree.get(id).ok_or(TreeError::NotFound)?;
+        let n = self.tree.get().get(id).ok_or(TreeError::NotFound)?;
         let (old, limits) = (n.parent(), n.limits());
+        // The holder of a control handle moves the cell as its parent
+        // would, and only under a parent it controls too (design D2).
+        let asked = by;
+        let by = self.acting(asked, id)?;
+        if by != asked && to != HOST && !self.controls(asked, to) {
+            return Err(TreeError::Denied);
+        }
+        // The move is checked whole first, the exposure check of the
+        // handles included (design D8: a promoted cell's former ancestors
+        // no longer count as its trusted base), so a refused move takes no
+        // private copies. What may not happen is refused whatever memory
+        // the kernel has free.
+        let used = self.usage(to);
+        let mut moved = self.tree.get().clone();
+        moved.reparent(id, to, by, &|_| used, &mut fresh_domain)?;
+        if !self.handles_admit(&moved, &moved.subtree(id)?) {
+            return Err(TreeError::Denied);
+        }
         // The host's promotion keeps the parent's limits: the new root's
         // whole reservation is new to the kernel (a parent's moves it).
         if to == HOST && by == Actor::Host && old != HOST && !admits(limits.reservation()) {
@@ -679,15 +730,13 @@ impl Host {
         // Leaving its domain, its subtree first takes private copies of
         // what it shares there, or the move is refused (design D21).
         let leaves = match to {
-            HOST => self.tree.get(id).is_some_and(|n| !n.is_root()),
-            _ => self.tree.domain(to) != self.tree.domain(id),
+            HOST => old != HOST,
+            _ => self.tree.get().domain(to) != self.tree.get().domain(id),
         };
-        if leaves && self.tree.controls(by, id) {
+        if leaves {
             self.unshare_subtree(id)?;
         }
-        let used = self.usage(to);
-        self.tree
-            .reparent(id, to, by, &|_| used, &mut fresh_domain)?;
+        self.tree_mut(|t| *t = moved);
         self.sync_down(id);
         self.sync_networks(id);
         self.sync_up(old);
@@ -706,10 +755,10 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn kill_tree(&mut self, id: u32, by: Actor) -> Result<(), TreeError> {
-        if !self.tree.controls(by, id) {
+        if !self.controls(by, id) {
             return Err(self.refusal(id));
         }
-        let sub = self.tree.subtree(id)?;
+        let sub = self.tree.get().subtree(id)?;
         for &cell in sub.iter().rev() {
             self.end_node(cell);
         }
@@ -725,10 +774,10 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests and the control kernel")
     )]
     pub fn suspend_tree(&mut self, id: u32, by: Actor) -> Result<Vec<(u32, Snapshot)>, TreeError> {
-        if !self.tree.controls(by, id) {
+        if !self.controls(by, id) {
             return Err(self.refusal(id));
         }
-        let sub = self.tree.subtree(id)?;
+        let sub = self.tree.get().subtree(id)?;
         let mut out = Vec::new();
         for cell in sub {
             if let Some(snapshot) = self.suspend(cell) {
@@ -740,7 +789,7 @@ impl Host {
 
     /// Why `by` was refused an operation on cell `id`.
     fn refusal(&self, id: u32) -> TreeError {
-        match self.tree.get(id) {
+        match self.tree.get().get(id) {
             Some(_) => TreeError::Denied,
             None => TreeError::NotFound,
         }

@@ -222,7 +222,7 @@ fn rhizo_dir_unlink_drops() {
         "chan/ went with its last entry"
     );
     fs.unlink(None, b"/run/rhizo/cell/peer", false).unwrap();
-    assert_eq!(fs.take_dropped(), [3]);
+    assert_eq!(fs.take_dropped(), [(3, b"peer".to_vec())], "with its label");
     assert_eq!(
         names(&mut fs, b"/run/rhizo/cell"),
         list(&[b".", b"..", b"tools"])
@@ -292,4 +292,105 @@ fn rhizo_dir_in_copies_and_snapshots() {
         list(&[b".", b"..", b"generation"])
     );
     assert_eq!(old.mkdir(None, b"/run/rhizo/x"), Err(Error::ReadOnly));
+}
+
+/// A cell's files decoded against the tree they started from share every
+/// inode encoded the same (its `/run/rhizo` among them) and are otherwise
+/// what a plain decode gives.
+#[test]
+fn decode_shares_what_the_base_has() {
+    let mut base = Fs::new();
+    base.rhizo_dir().unwrap();
+    base.rhizo_put(Place::Inbox, Kept::Inbox).unwrap();
+    let shared_base = Base::new(base.clone());
+    let base_bytes = shared_base.bytes().to_vec();
+    let mut fs = base.clone();
+    fs.put_file(b"/notes", b"mine").unwrap();
+    fs.socket_fd(7, false, false).unwrap();
+    let mut bytes = Vec::new();
+    fs.encode(&mut bytes);
+    let shared = Fs::decode_trusted_sharing(&bytes, &shared_base).unwrap();
+    let plain = Fs::decode_trusted(&bytes).unwrap();
+    let mut again = Vec::new();
+    shared.encode(&mut again);
+    assert_eq!(again, bytes, "the same file system");
+    assert!(Fs::decode(&again).is_ok(), "a consistent one");
+    let ptr = |f: &Fs, i: usize| f.0.inodes[i].as_ref().map(Arc::as_ptr);
+    let rhizo = base.rhizo.unwrap() as usize;
+    for i in 1..base.inodes.len() {
+        assert_eq!(ptr(&shared, i), ptr(&base, i), "inode {i} shared");
+        assert_ne!(ptr(&plain, i), ptr(&base, i), "a plain decode copies");
+    }
+    assert_ne!(ptr(&shared, 0), ptr(&base, 0), "its root changed");
+    assert_eq!(shared.rhizo, Some(rhizo as Ino));
+    assert_eq!(
+        shared.rhizo_entry(None, b"/run/rhizo/inbox"),
+        Ok(Kept::Inbox)
+    );
+    assert_eq!(shared.sockets().collect::<Vec<_>>(), [7]);
+    // Unchanged, even the root is shared; a write copies only what it
+    // changes, as in a fork.
+    let mut same = Fs::decode_trusted_sharing(&base_bytes, &shared_base).unwrap();
+    assert_eq!(ptr(&same, 0), ptr(&base, 0));
+    assert_eq!(
+        (same.used, same.names, same.rhizo),
+        (base.used, base.names, base.rhizo)
+    );
+    same.put_file(b"/x", b"y").unwrap();
+    assert_eq!(
+        names(&mut base.clone(), b"/").len(),
+        3,
+        "the base is untouched"
+    );
+}
+
+/// Spec `cell-hierarchy`, "A new cell looks around": the inbox the kernel
+/// puts in every cell's tree is one entry for all of them, holding no
+/// socket of its own: it goes only at `inbox`, stays (`EROFS`), survives
+/// copies and snapshots, and costs a fork no walk of the tree.
+#[test]
+fn rhizo_dir_keeps_the_inbox() {
+    let mut fs = Fs::new();
+    fs.rhizo_dir().unwrap();
+    assert!(fs.has_rhizo());
+    assert_eq!(
+        fs.rhizo_put(Place::Chan(b"inbox"), Kept::Inbox),
+        Err(Error::Invalid),
+        "only at its place"
+    );
+    fs.rhizo_put(Place::Inbox, Kept::Inbox).unwrap();
+    assert_eq!(
+        names(&mut fs, b"/run/rhizo"),
+        list(&[b".", b"..", b"generation", b"inbox"])
+    );
+    assert_eq!(
+        fs.stat(None, b"/run/rhizo/inbox").unwrap().kind,
+        Kind::Socket
+    );
+    assert_eq!(fs.rhizo_entry(None, b"/run/rhizo/inbox"), Ok(Kept::Inbox));
+    assert!(!fs.has_sockets(), "no socket of its own");
+    assert_eq!(fs.sockets().count(), 0);
+    assert_eq!(
+        fs.unlink(None, b"/run/rhizo/inbox", false),
+        Err(Error::ReadOnly)
+    );
+    let copy = fs.clone();
+    assert!(copy.shares_with(&fs), "a copy shares the tree");
+    let mut bytes = Vec::new();
+    fs.encode(&mut bytes);
+    let back = Fs::decode(&bytes).unwrap();
+    assert_eq!(back.rhizo_entry(None, b"/run/rhizo/inbox"), Ok(Kept::Inbox));
+    assert!(back.has_rhizo() && !back.has_sockets());
+    // Entries holding sockets are counted as they come and go.
+    fs.rhizo_put(Place::Chan(b"a"), Kept::Socket(4)).unwrap();
+    assert!(fs.has_sockets());
+    let mut bytes = Vec::new();
+    fs.encode(&mut bytes);
+    assert!(Fs::decode(&bytes).unwrap().has_sockets());
+    assert_eq!(fs.rhizo_take(Place::Chan(b"a")), Ok(Kept::Socket(4)));
+    assert!(!fs.has_sockets());
+    fs.rhizo_put(Place::Chan(b"b"), Kept::Socket(5)).unwrap();
+    fs.unlink(None, b"/run/rhizo/chan/b", false).unwrap();
+    assert!(!fs.has_sockets());
+    assert_eq!(fs.take_released(), [5]);
 }

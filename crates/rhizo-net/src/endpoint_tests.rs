@@ -2,7 +2,7 @@
 //! `add-cell-hierarchy`), through the public operations.
 
 use super::*;
-use rhizo_cap::limits::{MESSAGE_HANDLES_MAX, QUEUE_MESSAGES_MAX};
+use rhizo_cap::limits::{INBOX_MAX, MESSAGE_HANDLES_MAX, QUEUE_MESSAGES_MAX};
 use rhizo_cap::{Actor, Limits, Recv, Tree};
 
 const ALL: Rights = Rights::SEND.union(Rights::RECEIVE).union(Rights::CARRY);
@@ -245,4 +245,205 @@ fn endpoint_copies_read_closed() {
     // A sequenced-packet record of the Inet family is refused.
     bytes[4] = 0;
     assert_eq!(decode_records(&bytes), Err(DecodeError::Corrupt));
+}
+
+/// A channel cell 7 made, both ends taken by the kernel's sockets of no
+/// grant: its endpoints.
+fn cell_channel(net: &mut Net, owner: u32) -> [u32; 2] {
+    let mut t = Tree::new();
+    let spec = rhizo_cap::Spec::default();
+    t.add_root(owner, spec, 0).unwrap();
+    let ch = net
+        .channels_mut()
+        .create(&t, Actor::Cell(owner), &|_| Limits::ZERO)
+        .unwrap();
+    Channels::endpoints(ch)
+}
+
+/// Spec `cell-hierarchy`, "Accepting from the inbox": a cell's inbox is
+/// one listener, made at its first use, where channels opened to it wait
+/// (at most 64) until accepted; with the cell it closes, and the channels
+/// still waiting there read as closed to their openers.
+#[test]
+fn inbox_queues_channels_until_accepted() {
+    let mut net = Net::new();
+    let inbox = net.inbox(5).unwrap();
+    assert_eq!(net.inbox(5), Ok(inbox), "one per cell");
+    assert_eq!(net.kind(inbox), Ok((Family::Unix, Type::SeqPacket)));
+    assert_eq!(net.poll(inbox), 0, "nothing waits");
+    net.end_call(|| Some(5)); // the cell waits on it
+    let [a, b] = cell_channel(&mut net, 6);
+    let opener = net.endpoint(a, 1, Rights::SEND | Rights::RECEIVE).unwrap();
+    let theirs = net.endpoint(b, 2, Rights::SEND | Rights::RECEIVE).unwrap();
+    net.deliver(5, theirs).unwrap();
+    let mut woken = Vec::new();
+    net.drain_woken(|k| woken.push(k));
+    assert_eq!(woken, [5], "the inbox's waiter");
+    assert_eq!(net.poll(inbox), events::IN);
+    net.send_message(opener, b"hi", &[]).unwrap();
+    assert!(!net.take_after(), "nothing for the kernel yet");
+    let got = net.accept(inbox).unwrap();
+    assert_eq!(got, theirs);
+    assert!(
+        net.take_after() && net.take_received(),
+        "a channel received"
+    );
+    assert!(!net.take_after() && !net.take_received(), "once");
+    assert_eq!(take(&mut net, got), Ok((b"hi".to_vec(), vec![])));
+    assert!(
+        net.take_after() && net.take_received(),
+        "a message received"
+    );
+    assert_eq!(net.accept(inbox), Err(Error::Again));
+    // A full inbox refuses the next channel, changing nothing.
+    let mut waiting = Vec::new();
+    for g in 0..INBOX_MAX {
+        let [_, e] = cell_channel(&mut net, 6);
+        let s = net.endpoint(e, 100 + g, Rights::RECEIVE).unwrap();
+        net.deliver(5, s).unwrap();
+        waiting.push(s);
+    }
+    let [c, d] = cell_channel(&mut net, 6);
+    let first = net.endpoint(c, 3, Rights::SEND).unwrap();
+    let late = net.endpoint(d, 4, Rights::RECEIVE).unwrap();
+    assert_eq!(net.deliver(5, late), Err(Error::ConnRefused));
+    net.release(late);
+    assert_eq!(net.send_message(first, b"x", &[]), Err(Error::Pipe));
+    // The inbox of a copy is its own; the one it inherited reads closed.
+    let copy = net.fork(inbox, 9).unwrap();
+    assert_eq!(net.accept(copy), Err(Error::Invalid));
+    let r = net.export(inbox).unwrap();
+    assert_eq!((r.state, r.parked), (Saved::Reset, None), "never parked");
+    // With the cell, the inbox and its waiting channels go.
+    let before = net.open();
+    net.take_dropped();
+    net.cell_ended(5, b"");
+    assert_eq!(net.open(), before - 1 - INBOX_MAX as usize);
+    assert_eq!(net.take_dropped().len(), INBOX_MAX as usize);
+    let new = net.inbox(5).unwrap();
+    assert_eq!(net.accept(new), Err(Error::Again), "a new one, empty");
+}
+
+/// The kernel holds an endpoint for a cell's observer: the cell's output
+/// goes there, what does not fit is dropped (the cell never waits), the
+/// last message comes before end of file, and an observer that goes
+/// takes the endpoint with it; its channel's room comes back to its
+/// creator.
+#[test]
+fn held_endpoints_observe_a_cell() {
+    let mut net = Net::new();
+    let [a, b] = cell_channel(&mut net, 6);
+    let watcher = net.endpoint(a, 1, Rights::RECEIVE).unwrap();
+    assert!(!net.observed());
+    net.hold(b, 5, 40, true, false).unwrap();
+    assert!(net.observed());
+    net.poll(watcher);
+    net.end_call(|| Some(6));
+    net.tell(5, b"out");
+    net.tell(8, b"another cell's");
+    let mut woken = Vec::new();
+    net.drain_woken(|k| woken.push(k));
+    assert_eq!(woken, [6]);
+    for _ in 0..QUEUE_MESSAGES_MAX {
+        net.tell(5, b"more");
+    }
+    assert_eq!(take(&mut net, watcher), Ok((b"out".to_vec(), vec![])));
+    let mut n = 0;
+    while take(&mut net, watcher).is_ok() {
+        n += 1;
+    }
+    assert_eq!(n, QUEUE_MESSAGES_MAX - 1, "the rest was dropped");
+    net.cell_ended(5, b"ended");
+    assert_eq!(take(&mut net, watcher), Ok((b"ended".to_vec(), vec![])));
+    let mut hs = [0; H];
+    assert_eq!(
+        net.recv_message(watcher, 8, &mut hs, &mut |_| true),
+        Ok(Recv::End)
+    );
+    assert!(!net.observed());
+    assert_eq!(net.take_refunds(6), 0, "the watcher still holds its end");
+    net.release(watcher);
+    assert!(net.has_refunds());
+    assert_eq!(net.take_refunds(6), 1);
+    // An observer that left first: the next output closes the endpoint.
+    let [c, d] = cell_channel(&mut net, 6);
+    let w = net.endpoint(c, 2, Rights::RECEIVE).unwrap();
+    net.hold(d, 5, 41, true, false).unwrap();
+    net.release(w);
+    net.tell(5, b"nobody");
+    assert!(!net.observed());
+    assert_eq!(net.take_refunds(6), 1);
+    // A revoked cell handle closes what it opened.
+    let [e, f] = cell_channel(&mut net, 6);
+    let w = net.endpoint(e, 3, Rights::RECEIVE).unwrap();
+    net.hold(f, 5, 42, true, false).unwrap();
+    net.grant_gone(42);
+    assert_eq!(
+        net.recv_message(w, 8, &mut hs, &mut |_| true),
+        Ok(Recv::End)
+    );
+}
+
+/// The kernel holds an endpoint for a cell's input: what its sender
+/// writes wakes the cell and waits there whole, never making the sender
+/// wait (past the queue's bound it is dropped), until the kernel hands it
+/// over as it fits the cell's standard input.
+#[test]
+fn held_endpoints_take_input_for_a_cell() {
+    let mut net = Net::new();
+    let [a, b] = cell_channel(&mut net, 6);
+    let writer = net.endpoint(a, 1, Rights::SEND).unwrap();
+    net.hold(b, 5, 40, false, true).unwrap();
+    assert!(!net.has_input() && !net.observed());
+    net.send_message(writer, b"first", &[]).unwrap();
+    net.send_message(writer, b"second", &[]).unwrap();
+    assert!(net.has_input() && net.input_for(5) && !net.input_for(6));
+    let mut woken = Vec::new();
+    net.drain_woken(|k| woken.push(k));
+    assert_eq!(woken, [5, 5], "the cell, to take its input");
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    net.take_input(5, 8, &mut |m| {
+        got.push(m.to_vec());
+        true
+    });
+    assert_eq!(got, [b"first".to_vec()], "only what fits");
+    assert!(net.input_for(5), "the rest waits");
+    net.take_input(5, 64, &mut |m| {
+        got.push(m.to_vec());
+        true
+    });
+    assert_eq!(got[1], b"second");
+    assert!(!net.has_input());
+    for _ in 0..QUEUE_MESSAGES_MAX + 3 {
+        assert_eq!(net.send_message(writer, b"m", &[]), Ok(()), "never waits");
+    }
+    net.cell_ended(5, b"");
+    assert!(!net.has_input());
+    assert_eq!(net.send_message(writer, b"m", &[]), Err(Error::Pipe));
+    // A sender that closed takes back nothing it sent (design D9): the
+    // input waits, and the endpoint goes once it was taken.
+    let [e, f] = cell_channel(&mut net, 6);
+    let gone = net.endpoint(e, 3, Rights::SEND).unwrap();
+    net.hold(f, 5, 42, false, true).unwrap();
+    net.forget_grant(42); // its handle dropped with its holder
+    net.send_message(gone, b"last words", &[]).unwrap();
+    net.release(gone);
+    net.grant_gone(42);
+    assert!(net.input_for(5), "a dropped handle closes nothing");
+    let mut late = Vec::new();
+    net.take_input(5, 64, &mut |m| {
+        late.push(m.to_vec());
+        true
+    });
+    assert_eq!(late, [b"last words".to_vec()]);
+    assert!(net.has_refunds(), "the channel ended");
+    assert_eq!(net.take_refunds(6), 1);
+    // A cell that takes no input: the endpoint closes.
+    let [c, d] = cell_channel(&mut net, 6);
+    let writer = net.endpoint(c, 2, Rights::SEND).unwrap();
+    net.hold(d, 5, 41, false, true).unwrap();
+    net.send_message(writer, b"lost", &[]).unwrap();
+    net.take_input(5, 64, &mut |_| false);
+    assert!(!net.has_input());
+    assert_eq!(net.send_message(writer, b"m", &[]), Err(Error::Pipe));
 }

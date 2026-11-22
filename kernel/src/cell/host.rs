@@ -51,14 +51,18 @@ pub struct Host {
     pub(super) peeked: Vec<u8>,
     /// Whether other CPUs run cells: during a run on several CPUs (see
     /// [`locked`](Self::locked)).
-    others: bool,
+    pub(super) others: bool,
     /// The time limit of the current run ([`run_until`](Self::run_until)):
     /// the boot CPU never waits past it (design D1 of
     /// `fix-lost-wakeup-smp`).
     until: Option<u64>,
     /// The ownership tree of every cell: live, suspended and templates
-    /// (spec `cell-hierarchy`).
-    pub(super) tree: rhizo_cap::Tree,
+    /// (spec `cell-hierarchy`). System calls read it, under the sockets'
+    /// lock, to check the handles they move.
+    pub(super) tree: TreeCell,
+    /// The handles of every cell (design D9 of `add-cell-hierarchy`),
+    /// which system calls change too, under the sockets' lock.
+    pub(super) grants: GrantsCell,
     /// Cells suspended into a snapshot the caller holds, whose node waits
     /// for their resume.
     pub(super) suspended: Vec<u32>,
@@ -130,7 +134,8 @@ impl Host {
             others: false,
             by_weight: false,
             until: None,
-            tree: rhizo_cap::Tree::new(),
+            tree: TreeCell::new(),
+            grants: GrantsCell::new(),
             suspended: Vec::new(),
             ends: Vec::new(),
             settling: false,
@@ -269,8 +274,17 @@ impl Host {
     /// CPUs may be adding to them).
     pub(super) fn collect(&mut self) {
         let ended = self.shared.with(|s| core::mem::take(&mut s.ended));
-        if ended.is_empty() {
-            return;
+        if !ended.is_empty() {
+            self.collect_ended(ended);
+        }
+    }
+
+    /// [`collect`](Self::collect) once cells ended: out of line, so the run
+    /// loop's look at them stays a test.
+    #[inline(never)]
+    fn collect_ended(&mut self, ended: Vec<Finished>) {
+        for f in &ended {
+            self.cell_left(f.id, f.ending);
         }
         self.ends.extend(ended.iter().map(|f| f.id));
         self.finished.extend(ended);
@@ -287,6 +301,10 @@ impl Host {
         mut fs: Fs,
         used: u64,
     ) -> Box<Live> {
+        // Its `/run/rhizo` (design D9 of `add-cell-hierarchy`): in the
+        // files every cell shares already, so made here only for files of
+        // its own.
+        rhizo_files(&mut fs);
         // Changed only when they differ: setting them copies shared tables.
         let limits = (cell.quota.files() as usize, cell.quota.sockets as usize);
         if fs.limits() != limits {
@@ -443,6 +461,7 @@ impl Host {
         allow(dead_code, reason = "used by in-kernel tests")
     )]
     pub fn step(&mut self) -> bool {
+        self.lend();
         self.poll_wire(now_ns());
         match take(&self.shared, 0, true) {
             Take::Run(live, now) => run_slice(&self.shared, 0, live, now, false),
@@ -517,6 +536,7 @@ impl Host {
         if stop(self) {
             return;
         }
+        self.lend();
         let cpus = crate::smp::count();
         if cpus > 1 {
             let shared = &self.shared as *const Global<Shared> as u64;
@@ -637,7 +657,8 @@ impl Drop for Host {
             let id = template.id;
             self.drop_template(id);
         }
-        self.tree = rhizo_cap::Tree::new();
+        self.lent_no_more();
+        *self.tree.get_mut() = rhizo_cap::Tree::new();
         self.refresh_reserved();
         for (_, frames) in core::mem::take(&mut self.held_aside) {
             memory::RESERVE.release(frames);

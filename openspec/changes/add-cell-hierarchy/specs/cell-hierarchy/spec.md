@@ -237,6 +237,58 @@ the target's `/run/rhizo/inbox`, which behaves as a listening
 - **WHEN** a cell with the message right connects to its handle on a server cell, which accepts on its inbox
 - **THEN** both ends exchange messages, and a cell without the right gets `EACCES`
 
+### Requirement: Observing a cell
+A cell holding the observe right on another SHALL read, through `open`
+of `/run/rhizo/cell/<label>` for reading, the other cell's output from
+then on and then how it ended, as control-protocol frames, followed by
+end of file. The observed cell SHALL never wait for its observers: a
+frame that does not fit is dropped.
+
+#### Scenario: Observer and writer
+- **WHEN** a cell observes an agent started with standard input, and another cell writes a line to it through its input handle
+- **THEN** the agent reads the line, and the observer reads the agent's answer, then its exit status, then end of file
+
+#### Scenario: Handle revoked
+- **WHEN** an observer's handle is revoked while it reads
+- **THEN** it reads end of file, and the handle refuses every use with `EACCES`
+
+### Requirement: Giving a cell input
+A cell holding the input right on another SHALL write, through `open` of
+`/run/rhizo/cell/<label>` for writing, messages delivered whole into the
+other cell's standard input, without ever making that cell wait: past
+the channel's bound a write is dropped. Each channel a cell opens through
+a cell handle SHALL be counted against its memory until it ends.
+
+#### Scenario: No input from the host
+- **WHEN** a cell writes through its input handle to a cell started without standard input
+- **THEN** its next writes fail with `EPIPE`
+
+#### Scenario: Room counted
+- **WHEN** a cell whose memory limit cannot hold a channel's room connects to or opens its handle
+- **THEN** it is refused with `ENOMEM` and no channel is made
+
+### Requirement: Control handles
+A cell holding the control right on another SHALL be able to do to it
+what that cell's parent may (suspend, kill, re-parent, narrow), never
+what only the host may. The kernel SHALL refuse, whoever asks, to grant
+a control handle to the cell it names or to a descendant of it.
+
+#### Scenario: Killing through a control handle
+- **WHEN** the host grants a cell a control handle on a sibling root, and the cell asks to kill it
+- **THEN** the sibling and its subtree end, while the same request without the handle is refused with `EACCES`
+
+### Requirement: Promotion keeps exposure within ceilings
+A move of a cell that takes it away from an ancestor, promotion
+included, SHALL pass the exposure check before the cell takes any
+private copy, and SHALL be refused with `EACCES`, changing nothing, if a
+handle would then let information flow from it to a cell whose egress
+exceeds its ceiling. A promotion at the parent's end that the check
+refuses SHALL end the cell instead.
+
+#### Scenario: An ancestor observes
+- **WHEN** a root with egress `full` holds an observe handle on its child with ceiling `none`, and the child is promoted
+- **THEN** the promotion is refused and the tree is unchanged; at its parent's end such a child ends instead of becoming a root
+
 ### Requirement: Kernel endpoint
 A cell given `/run/rhizo/kernel` SHALL be able to send it requests in the
 control protocol's frames to create a child, make channels, derive and

@@ -446,11 +446,52 @@ pub trait Sockets {
     /// kernel can take its locks in order. `None` where the kernel keeps
     /// no grants: no handle moves.
     ///
-    /// Grants whose holder let them go during the call
-    /// (`rhizo_net::Net::take_dropped`, `rhizo_fs::Tables::take_dropped`)
-    /// are the kernel's to drop from its table after the call.
+    /// Grants whose last socket closed during the call
+    /// (`rhizo_net::Net::take_dropped`) are the kernel's to drop from its
+    /// table after the call ([`drop_handed_back`]); those of `/run/rhizo`
+    /// entries the cell unlinked are dropped by the call itself.
     fn handles(&mut self) -> Option<Handles<'_>> {
         None
+    }
+    /// Cell `cell` wrote `bytes` to the console: the kernel sends them to
+    /// its observers, if it has any (task 2.5 of `add-cell-hierarchy`).
+    fn output(&mut self, cell: u32, bytes: &[u8]) {
+        let _ = (cell, bytes);
+    }
+    /// The call made an endpoint the kernel holds for a cell's observer
+    /// (`rhizo_net::Net::hold`): [`output`](Self::output) has somewhere to
+    /// go from now on.
+    fn observing(&mut self) {}
+}
+
+/// Moves the input waiting for cell `cell` in endpoints the kernel holds
+/// (`rhizo_net::Net::take_input`, task 2.5 of `add-cell-hierarchy`) into
+/// its standard input from the host, `fs`'s, each message whole and as
+/// far as they fit; a cell without that input, or that closed it, takes
+/// none, and the endpoints sending it close. Returns whether `fs` changed:
+/// the cell's threads waiting on descriptors look again.
+pub fn deliver_input(net: &mut rhizo_net::Net, cell: u32, fs: &mut rhizo_fs::Fs) -> bool {
+    let room = fs.input_room().unwrap_or(usize::MAX);
+    let mut moved = false;
+    net.take_input(cell, room, &mut |bytes| {
+        let ok = fs.push_input(bytes).is_ok();
+        moved |= ok;
+        ok
+    });
+    moved
+}
+
+/// Drops from the grant table the grants whose last socket closed
+/// (`rhizo_net::Net::take_dropped`): what was derived from each stays,
+/// derived from its source (design D9 of `add-cell-hierarchy`). The
+/// kernel calls it after a call that reached the sockets, and before any
+/// revocation, so a grant number waiting here never names a grant made
+/// since.
+pub fn drop_handed_back(grants: &mut rhizo_cap::Grants, net: &mut rhizo_net::Net) {
+    for g in net.take_dropped() {
+        if let Some(holder) = grants.get(g).map(rhizo_cap::Grant::holder) {
+            let _ = grants.unlink(holder, g);
+        }
     }
 }
 
@@ -664,9 +705,9 @@ impl Abi {
                 Ok(args) => threads::clone(cell, cx, args),
                 Err(e) => e,
             },
-            Some(Sys::Write) => files::write(cx, a[0], a[1], a[2], None),
-            Some(Sys::Writev) => writev(cx, a[0], a[1], a[2], false),
-            Some(Sys::Readv) => writev(cx, a[0], a[1], a[2], true),
+            Some(Sys::Write) => files::write(cx, cell.id, a[0], a[1], a[2], None),
+            Some(Sys::Writev) => writev(cx, cell.id, a[0], a[1], a[2], false),
+            Some(Sys::Readv) => writev(cx, cell.id, a[0], a[1], a[2], true),
             Some(Sys::Pipe2) => poll::pipe2(cx, a[0], a[1]),
             Some(Sys::Pipe) => poll::pipe2(cx, a[0], 0),
             Some(Sys::Eventfd2) => poll::eventfd2(cx, a[0], a[1]),
@@ -697,7 +738,8 @@ impl Abi {
             Some(Sys::Accept) => sockets::accept(cx, a[0], a[1], a[2], 0),
             Some(Sys::Accept4) => sockets::accept(cx, a[0], a[1], a[2], a[3]),
             Some(Sys::Connect) => {
-                self.with_ports(cell, cx, |cx| sockets::connect(cx, a[0], a[1], a[2]))
+                let id = cell.id;
+                self.with_ports(cell, cx, |cx| sockets::connect(cx, id, a[0], a[1], a[2]))
             }
             Some(Sys::Getsockname) => sockets::name(cx, a[0], a[1], a[2], false),
             Some(Sys::Getpeername) => sockets::name(cx, a[0], a[1], a[2], true),
@@ -786,15 +828,15 @@ impl Abi {
             },
             Some(Sys::Pwrite) => match a[3] as i64 {
                 at if at < 0 => -EINVAL,
-                at => files::write(cx, a[0], a[1], a[2], Some(at as u64)),
+                at => files::write(cx, cell.id, a[0], a[1], a[2], Some(at as u64)),
             },
             Some(Sys::Lseek) => files::lseek(cx, a[0], a[1], a[2]),
             Some(Sys::Getdents64) => files::getdents64(cx, a[0], a[1], a[2]),
             Some(Sys::Mkdirat) => files::mkdirat(cx, a[0], a[1]),
             Some(Sys::Mkdir) => files::mkdirat(cx, AT_FDCWD, a[0]),
-            Some(Sys::Unlinkat) => files::unlinkat(cx, a[0], a[1], a[2]),
-            Some(Sys::Unlink) => files::unlinkat(cx, AT_FDCWD, a[0], 0),
-            Some(Sys::Rmdir) => files::unlinkat(cx, AT_FDCWD, a[0], 0x200),
+            Some(Sys::Unlinkat) => files::unlinkat(cx, cell.id, a[0], a[1], a[2]),
+            Some(Sys::Unlink) => files::unlinkat(cx, cell.id, AT_FDCWD, a[0], 0),
+            Some(Sys::Rmdir) => files::unlinkat(cx, cell.id, AT_FDCWD, a[0], 0x200),
             Some(Sys::Renameat) => files::renameat(cx, a, 0),
             Some(Sys::Renameat2) => files::renameat(cx, a, a[4]),
             Some(Sys::Rename) => files::renameat(cx, [AT_FDCWD, a[0], AT_FDCWD, a[1], 0, 0], 0),
@@ -923,6 +965,7 @@ fn sleep(cell: &mut Cell, until: u64) -> Outcome {
 /// `writev`, or `readv` with `read`.
 fn writev<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     fd: u64,
     iov: u64,
     count: u64,
@@ -942,7 +985,7 @@ fn writev<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
         let n = if read {
             files::read(cx, fd, base, len, None)
         } else {
-            files::write(cx, fd, base, len, None)
+            files::write(cx, cell, fd, base, len, None)
         };
         if n < 0 {
             return if total == 0 { n } else { total };

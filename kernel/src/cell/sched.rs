@@ -252,16 +252,24 @@ fn cover(s: &mut Shared, cpu: usize) {
 /// `add-socket-wait-queues`): a waiting one joins `cpu`'s queue and makes
 /// its calls again; any other is nudged ([`Shared::nudged`]). Called under
 /// the host's lock, so a cell filed to wait cannot miss its wake-up.
+#[inline(always)]
 fn wake_woken(s: &mut Shared, cpu: usize, now: impl FnOnce() -> u64) {
     // Set under the sockets' lock after a change woke waiters: clear, it
     // means nothing waits to be drained (a change after this load sets it
     // again, for the next drain, which comes before its cell is filed).
-    if !WOKEN.swap(false, Ordering::Acquire) {
-        return;
+    if WOKEN.swap(false, Ordering::Acquire) {
+        wake_all(s, cpu, now());
     }
-    let now = now();
+}
+
+/// [`wake_woken`] once a change woke waiters: out of line, so that taking
+/// and giving back a cell carry none of it.
+#[inline(never)]
+fn wake_all(s: &mut Shared, cpu: usize, now: u64) {
     // Lock order: the host's, then the sockets.
     NET.with(|net| {
+        // Input sent to a cell wakes it: it is in its standard input first.
+        deliver_waiting(&mut s.sched, net);
         net.drain_woken(|id| {
             let waited = s.sched.wake(cpu, id, |live| {
                 live.cell.threads.wake_io();
@@ -277,8 +285,20 @@ fn wake_woken(s: &mut Shared, cpu: usize, now: impl FnOnce() -> u64) {
 
 /// Lets the threads of `live` waiting on descriptors look again if a
 /// socket they waited on changed while the cell was out of the waiting set.
+#[inline(always)]
 fn nudge(s: &mut Shared, live: &mut Live) {
-    if !s.nudged.is_empty() && s.nudged.remove(&live.cell.id) {
+    if !s.nudged.is_empty() {
+        nudged(s, live);
+    }
+}
+
+/// [`nudge`] while cells are nudged: out of line, as [`wake_all`].
+#[cold]
+#[inline(never)]
+fn nudged(s: &mut Shared, live: &mut Live) {
+    if s.nudged.remove(&live.cell.id) {
+        // Input sent to it while it ran (task 2.5 of `add-cell-hierarchy`).
+        take_input(live);
         live.cell.threads.wake_io();
     }
 }

@@ -221,7 +221,7 @@ impl Host {
     /// before the subtree moves into another domain (design D21):
     /// `NoMemory` if one of them cannot hold them.
     pub(super) fn unshare_subtree(&mut self, id: u32) -> Result<(), rhizo_cap::Error> {
-        for cell in self.tree.subtree(id)? {
+        for cell in self.tree.get().subtree(id)? {
             if !self.unshare(cell) {
                 return Err(rhizo_cap::Error::NoMemory);
             }

@@ -152,6 +152,15 @@ impl Tables {
         self.input.is_some()
     }
 
+    /// Bytes the cell's standard input from the host has room for (`None`
+    /// without host input).
+    pub fn input_room(&self) -> Option<usize> {
+        match self.object(self.input?) {
+            Object::Pipe { data, .. } => Some(PIPE_CAP - data.len()),
+            _ => None,
+        }
+    }
+
     /// Writes `bytes` from the host into the cell's standard input, whole
     /// or not at all: `BadFd` without host input (or once the host closed
     /// it), `Pipe` once the cell closed every read end, `Again` when the
@@ -228,7 +237,7 @@ impl Tables {
     /// [`sockets`](Self::sockets) would find, asked on every fork and end
     /// of a cell, so the cell's files are never walked for it.
     pub fn has_sockets(&self) -> bool {
-        self.socket_descs > 0 || (self.rhizo.is_some() && self.sockets().next().is_some())
+        self.socket_descs > 0 || self.kept_sockets > 0
     }
 
     /// The socket handles every description and every `/run/rhizo` entry
@@ -238,10 +247,14 @@ impl Tables {
             Target::Socket(h) => Some(h),
             _ => None,
         });
-        let kept = self.kept_inos().filter_map(|i| match self.inode(i).node {
-            Node::Kept(Kept::Socket(h)) => Some(h),
-            _ => None,
-        });
+        // Only entries holding sockets are worth a walk of `/run/rhizo`.
+        let rhizo = self.rhizo.filter(|_| self.kept_sockets > 0);
+        let kept = self
+            .kept_inos_in(rhizo)
+            .filter_map(|i| match self.inode(i).node {
+                Node::Kept(Kept::Socket(h)) => Some(h),
+                _ => None,
+            });
         descs.chain(kept)
     }
 
@@ -252,6 +265,9 @@ impl Tables {
             if let Target::Socket(h) = &mut d.target {
                 *h = f(*h);
             }
+        }
+        if self.kept_sockets == 0 {
+            return;
         }
         let kept: Vec<Ino> = self.kept_inos().collect();
         for i in kept {

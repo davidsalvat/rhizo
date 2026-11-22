@@ -330,10 +330,15 @@ pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Service
         Err(e) => return net_err(e),
     };
     let new = open_fd(cx, conn, flags);
+    // A channel taken from the inbox is a handle received from another
+    // cell (design D22 of `add-cell-hierarchy`).
+    if ty == Type::SeqPacket && new >= 0 {
+        cx.services.received();
+    }
     if new < 0 || addr == 0 {
         return new;
     }
-    let peer = cx.net.net().peer_addr(conn).unwrap_or(Addr::UnixUnnamed);
+    let peer = peer_of(cx, conn);
     match write_addr(cx, &peer, addr, lenp) {
         0 => new,
         e => {
@@ -343,8 +348,9 @@ pub(crate) fn accept<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Service
     }
 }
 
-pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
+pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A: Frames, S: Services>(
     cx: &mut Context<'_, F, M, T, A, S>,
+    cell: u32,
     fd: u64,
     addr: u64,
     len: u64,
@@ -354,7 +360,7 @@ pub(crate) fn connect<F: EntryFormat, M: PhysicalMemory, T, A, S: Services>(
         let to = match read_addr(cx, family, addr, len)? {
             Given::Inet(ip, port) => Addr::Inet { ip, port },
             Given::UnixPath(path) if ty == Type::SeqPacket => {
-                return Ok(crate::packets::connect(cx, fd, h, &path));
+                return Ok(crate::packets::connect(cx, cell, fd, h, &path));
             }
             Given::UnixPath(path) => {
                 let name = cx.fs.socket_name(None, &path).map_err(err)?;
@@ -778,6 +784,7 @@ pub(crate) fn name<F: EntryFormat, M: PhysicalMemory, T, A, S>(
     };
     let a = if peer {
         match cx.net.net().peer_addr(h) {
+            Ok(Addr::UnixUnnamed) => peer_of(cx, h),
             Ok(a) => a,
             Err(e) => return net_err(e),
         }
@@ -793,6 +800,18 @@ pub(crate) fn name<F: EntryFormat, M: PhysicalMemory, T, A, S>(
         }
     };
     write_addr(cx, &a, addr, lenp)
+}
+
+/// The peer address of connected socket `h`: for a channel endpoint a
+/// cell opened to its holder, the label of the holder's handle on that
+/// cell (design D10 of `add-cell-hierarchy`).
+fn peer_of<F, M, T, A, S>(cx: &mut Context<'_, F, M, T, A, S>, h: u32) -> Addr {
+    match cx.net.net().peer_addr(h) {
+        Ok(Addr::UnixUnnamed) => crate::packets::opener_label(cx, h)
+            .map_or(Addr::UnixUnnamed, |path| Addr::Unix { name: 0, path }),
+        Ok(a) => a,
+        Err(_) => Addr::UnixUnnamed,
+    }
 }
 
 /// Socket options (`SO_*`, `TCP_*`).

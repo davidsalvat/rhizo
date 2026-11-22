@@ -78,6 +78,8 @@ fn channels_keep_message_boundaries() {
     let (mut ch, a, b) = host_channel();
     ch.send(a, b"hello world", &[3, 4]).unwrap();
     ch.send(a, b"next", &[]).unwrap();
+    assert_eq!(ch.peek(b), Some(11), "the oldest message's length");
+    assert_eq!(ch.peek(a), None, "nothing queued the other way");
     let mut buf = [0; 5];
     let mut hs = [0; H];
     assert_eq!(
@@ -88,6 +90,7 @@ fn channels_keep_message_boundaries() {
         })
     );
     assert_eq!((&buf, &hs[..2]), (b"hello", &[3, 4][..]));
+    assert_eq!(ch.peek(b), Some(4));
     let mut buf = [0; 16];
     assert_eq!(
         ch.recv(b, &mut buf, &mut hs),

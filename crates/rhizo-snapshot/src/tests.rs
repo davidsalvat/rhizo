@@ -100,7 +100,12 @@ fn round_trip<F: EntryFormat>() {
         ),
         "deterministic"
     );
+    let mut snap = snap;
+    assert!(!snap.plain_files());
+    snap.mark_plain_files();
+    assert!(snap.plain_files(), "the kernel's note");
     let snap = Snapshot::from_bytes(snap.export(&mem, crc32c), Machine::Aarch64, crc32c).unwrap();
+    assert!(!snap.plain_files(), "not in the bytes");
     assert_eq!(snap.pages(), 3);
     assert_eq!(snap.page(2).size, PageSize::Large);
     assert_eq!(snap.find(0x60_0fff), Some(1));

@@ -796,9 +796,9 @@ Alternatives:
   its grant. The sockets hand back the grants whose last socket closed,
   and the kernel drops them after the call. Unlinked cell handles are
   handed back the same way. A grant revoked, or gone with its holder or
-  object, makes its sockets read as closed. The system call takes the
-  tree and the grant table before the sockets, and only when it moves
-  handles.
+  object, makes its sockets read as closed. The system call reaches the
+  tree and the grant table only when it moves handles (under the
+  sockets' lock, as built in task 2.5).
 - Endpoints that travel in each other's queues, with no socket outside a
   message left on them, stay until their grants go with the cell that
   holds them. There is no collector as Linux has for Unix sockets. The
@@ -819,11 +819,132 @@ Alternatives:
   socket record type. It leaves out cell-handle entries, since a grant
   number confers nothing outside the kernel that made it.
 - Receiving a message or a handle calls the kernel's `received` hook,
-  which sets the sticky bit of D22 once the kernel wires it (task 2.5).
+  which sets the sticky bit of D22 (wired in task 2.5).
 - Not done yet: `MSG_PEEK` on an endpoint (`EOPNOTSUPP`); `readv` and
   `writev`, which take and send one message per buffer, as they do on
-  datagram sockets today; the inbox and `connect` to a cell handle (task
-  2.5).
+  datagram sockets today. The inbox and `connect` to a cell handle came
+  with task 2.5 (below).
+
+**As built in phase 2 (task 2.5): cell handles.** D9 names the four
+rights of a cell handle and D10 how a channel is opened, but leaves the
+observe stream, input and control without a form. The choices below take
+the stricter reading wherever the design left one open.
+
+- **Where they are used.** A cell handle is the entry
+  `/run/rhizo/cell/<label>` and nothing else: `connect` of a
+  `SOCK_SEQPACKET` socket to it uses the message right, `open` for
+  reading the observe right, for writing the input right, for both both
+  rights. An entry whose grant is not the cell's under that label (an
+  entry a copy inherited from its source, one whose grant was revoked or
+  went with its cell) refuses every use with `EACCES`, and unlinking it
+  drops nothing. Unlinking a valid entry drops the handle at once; what
+  was opened through it stays open until its descriptors close, as a
+  sender's close takes back nothing it sent (D9: dropping is not
+  revoking), and it no longer answers to the grant's number, which may
+  name another grant from then on. A holder that ends drops its handles
+  the same way, so input it wrote before it ended still arrives.
+- **Message (D10).** `connect` makes a channel the opener owns, its room
+  counted against the opener's memory, and gives it one endpoint while
+  the other waits in the target's inbox. Both endpoints send and receive;
+  neither carries handles, since the opener granted no carry right. Both
+  grants have the opener as grantor, so it can revoke the target's end.
+  The exposure check of D8 runs when the channel is opened (both edges at
+  once); the target accepting it adds no edge. At most 64 channels wait
+  in an inbox (D19), the next opener gets `ECONNREFUSED`. Accepting a
+  channel is receiving a handle: it sets the sticky bit of D22.
+  `getpeername` on an endpoint another cell granted names the label of
+  the holder's handle on that cell, or `?`; the opener's own end, and an
+  endpoint the host granted, stay unnamed as before.
+- **The inbox.** `/run/rhizo/inbox` is the same entry in every cell's
+  tree (no socket is made for it), so the files every cell shares stay
+  shared and a spawn or a fork copies nothing for it. The kernel makes
+  the cell's listener when the cell first opens its inbox or a channel
+  first arrives, keeps it until the cell ends, and closes the channels
+  still waiting then: their openers read end of file. A copy has its own
+  inbox; a descriptor of the source's that it inherited reads as closed,
+  and a snapshot records one as closed.
+- **Observe.** `open` for reading makes a channel the observer owns (its
+  room counted against the observer) whose other endpoint the kernel
+  holds for the target. The observer reads the target's output from the
+  moment it opened the handle, each console write a message holding an
+  `output` frame of the control protocol (D14's encoding, already the
+  one cells and the kernel speak for the kernel endpoint, with the cell
+  field 0: no identifier of the kernel's), then an `ended` frame with how
+  the cell ended (D12, item 37), then end of file. A revoked handle and a
+  suspended target end the stream without the last frame.
+  D8 counts observe as a flow from the target to the holder only, so the
+  target never waits for an observer: an output frame its queue cannot
+  take is dropped.
+- **Input.** `open` for writing makes a channel the writer owns whose
+  other endpoint the kernel holds for the target. Each write is one
+  message, delivered whole into the target's standard input from the host
+  (its 64 KiB pipe, spec `control-plane`) as far as it has room; the
+  target is woken to read it. For the same reason as observe, the writer
+  never waits for the target: past the channel's queue (64 messages,
+  256 KiB) a write is dropped, so the target's reading tells the writer
+  nothing. A target without input from the host, or that closed it, takes
+  none: the endpoint closes and the writer's next writes fail with
+  `EPIPE`.
+- **Control (D2).** A cell holding a handle with the control right on a
+  cell controls it as an ancestor does, for the host operations that take
+  an actor (`kill_tree`, `suspend_tree`, `reparent`, `set_policy`,
+  `set_tree_limits`; the kernel endpoint of phase 4 will reach them). It
+  acts with the authority of the cell's parent, never the host's: on a
+  root, whose parent is the host, the changes made in the tree's name
+  (re-parenting, policy, limits) are refused, while killing and
+  suspending it are not. The handle covers the cell it names
+  and what an operation on that cell does to its subtree, not operations
+  on a descendant. Moving the cell under a new parent also needs control
+  over that parent. Control is never granted to the cell it names or to a
+  descendant (`EACCES`), whoever asks.
+- **Promotion and exposure (D8, D21).** A cell's ancestors are its
+  trusted base, so a handle may let its data reach them; a promoted cell
+  leaves them. A re-parenting or promotion is now checked whole on a copy
+  of the tree first, the exposure check and control never flowing up
+  included, and only then does the cell take its private copies (D21):
+  a move that would let a former ancestor's wider egress reach the cell
+  through a handle is refused with `EACCES` and changes nothing, private
+  copies included. The exposure check comes before the kernel's budget
+  for the new root, so a move that may not happen is refused with
+  `EACCES` whatever memory the kernel has free. Narrowing a ceiling
+  below what a cell's handles let reach it is refused the same way, and
+  so is a placement. A promotion
+  at the parent's end (D3), which cannot be refused, ends the cells of
+  the subtree the check refuses, as a promoted cell that cannot take its
+  private copies does (D21).
+- **Suspension and copies until format version 12 (task 2.6).** A
+  suspended cell's handles go: those it held are dropped and those on it
+  revoked, as when it ends, since the snapshot records none and the cell
+  comes back under a new identifier. A copy inherits none (D13's
+  inheritance comes with 2.6).
+- **Room (open point O9).** A channel a cell makes (through the message,
+  observe or input right) is counted against its memory, `ROOM` bytes,
+  before it is made, so a cell whose limit cannot hold it is refused with
+  `ENOMEM`, and its free budget in the tree no longer covers it (D10:
+  reserved from the creator's budget). The room comes back when the
+  channel ends, at the creator's next call that reaches the sockets. A
+  channel the host makes is charged to nobody, and one that outlives its
+  creator to nobody either: what it can still hold is the one queue its
+  peer drains, since nothing can be sent to it any more.
+- **Locks.** The sockets' lock guards the grant table and, while other
+  CPUs run cells, the tree: a call that moves handles holds it already
+  and takes no other lock, so a call that moves none pays nothing. The
+  host reads its tree without a lock, as its only writer, and changes it
+  under the sockets' lock while other CPUs run cells. The grants the
+  sockets hand back are dropped before any revocation, so a number
+  waiting there never names a grant made since.
+- **Host grants.** The kernel has `Host::grant` and `Host::revoke` for
+  cell handles (in-kernel tests); the control protocol's requests come
+  with task 2.7.
+- **Cost.** Every cell's tree now holds `/run/rhizo` with its two entries:
+  four inodes, 89 bytes of a snapshot (`cell.suspended_bytes`), nothing
+  more for cells sharing a tree. So that resuming a cell does not copy
+  them, a cell's files decoded from its snapshot share with the empty tree
+  every inode encoded the same (all of them at once when the inode table
+  is the same), and a snapshot of a cell whose files never changed
+  resumes without comparing their bytes. A call that moves no handle pays
+  one test after it reaches the sockets; the scheduler's rare paths
+  (socket wake-ups, nudges, ended cells) stay out of line.
 
 ## D11. Shared file views (phase 3)
 

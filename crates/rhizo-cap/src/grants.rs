@@ -564,6 +564,60 @@ impl Grants {
         self.add(tree, g)
     }
 
+    /// Opening a channel to a cell (design D10): cell `by`, through its
+    /// grant `via` on a cell `t` with the message right, gives channel
+    /// `ch`, which it made, to itself and to `t`, one endpoint each with
+    /// the send and receive rights, both granted by `by` (so `by` can
+    /// revoke them). Refused, changing nothing: `via` not `by`'s or without
+    /// the message right, `ch` not `by`'s, either holder's channels at
+    /// their bound, or a flow edge that breaks a cell's exposure ceiling
+    /// (design D8). Returns the grants of `by`'s endpoint and of `t`'s.
+    pub fn open_channel(
+        &mut self,
+        tree: &Tree,
+        channels: &Channels,
+        by: u32,
+        via: u32,
+        ch: u32,
+    ) -> Result<(u32, u32), Error> {
+        let v = self.get(via).ok_or(Error::NotFound)?;
+        let Object::Cell(t) = v.object else {
+            return Err(Error::Invalid);
+        };
+        if v.holder != by || !v.rights.contains(Rights::MESSAGE) {
+            return Err(Error::Denied);
+        }
+        if channels.owner(ch) != Some(by) {
+            return Err(Error::Denied);
+        }
+        let [e0, e1] = Channels::endpoints(ch);
+        let ends = |e, holder| {
+            let ask = Ask {
+                rights: Rights::SEND | Rights::RECEIVE,
+                holder,
+                ..Ask::default()
+            };
+            Self::made(Object::Endpoint(e), ask, by, None, NIL)
+        };
+        let (mine, theirs) = (ends(e0, by), ends(e1, t));
+        self.valid(tree, &mine)?;
+        self.valid(tree, &theirs)?;
+        // A cell opening a channel to itself holds both ends.
+        if t == by && self.counts(by).1 + 2 > CHANNELS_MAX {
+            return Err(Error::TooManyHandles);
+        }
+        self.room(2)?;
+        self.exposed(tree, &[by, t], &[Rec::of(&mine), Rec::of(&theirs)])?;
+        Ok((self.insert(mine), self.insert(theirs)))
+    }
+
+    /// Whether cell `holder` holds a grant on `object` with every right of
+    /// `rights`.
+    pub fn holds(&self, holder: u32, object: Object, rights: Rights) -> bool {
+        self.iter()
+            .any(|(_, g)| g.holder == holder && g.object == object && g.rights.contains(rights))
+    }
+
     /// A message carrying grant `id` (made by [`transfer`](Self::transfer)
     /// for one holder of the endpoint it was sent to) is taken by `holder`,
     /// another holder of that endpoint `on`: `id` becomes `holder`'s, with
